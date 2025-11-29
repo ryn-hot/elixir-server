@@ -1,0 +1,33 @@
+[package]
+name = "elixir-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["macros", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+config = "0.14"
+dotenvy = "0.15"
+globwalk = "0.9"
+jsonwebtoken = "9.3"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tempfile = "3.10"
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "any", "macros", "uuid", "chrono", "migrate"] }
+thiserror = "1.0"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "signal", "process"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.4", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.7", features = ["serde", "v4"] }
+argon2 = "0.5"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+urlencoding = "2.1"
+html-escape = "0.2"
+tokio-util = { version = "0.7", features = ["io"] }
+http-range = "0.1"
