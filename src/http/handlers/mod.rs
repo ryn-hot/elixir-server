@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod control;
 pub mod health;
 pub mod library;
 pub mod playback;

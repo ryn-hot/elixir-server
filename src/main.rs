@@ -6,6 +6,7 @@ mod http;
 mod library;
 mod media;
 mod metadata;
+mod network;
 mod playback;
 mod state;
 mod telemetry;
@@ -17,6 +18,8 @@ use crate::extensions::ExtensionManager;
 use crate::http::router;
 use crate::library::start_periodic_scan;
 use crate::metadata::MetadataService;
+use crate::network::start_mdns;
+use crate::playback::start_session_cleanup;
 use crate::state::AppState;
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -67,6 +70,31 @@ async fn main() -> anyhow::Result<()> {
     let scan_state = state.clone();
     tokio::spawn(async move { start_periodic_scan(scan_state, scan_interval).await });
 
+    // Announce via mDNS if enabled.
+    if state.settings.network.mdns_enabled {
+        match start_mdns(&state.settings.server, &state.settings.network.mdns_name) {
+            Ok(_) => {
+                tracing::info!(
+                    "mDNS announced: {}:{} ({})",
+                    state.settings.server.host,
+                    state.settings.server.port,
+                    state.settings.network.mdns_name
+                );
+            }
+            Err(err) => {
+                tracing::warn!("failed to start mDNS announcer: {err}");
+            }
+        }
+    }
+
+    // Cleanup stale playback sessions and transcode leftovers.
+    let cleanup_state = state.clone();
+    let cleanup_interval = settings.playback.cleanup_interval_seconds;
+    let session_ttl = settings.playback.session_ttl_seconds;
+    tokio::spawn(async move {
+        start_session_cleanup(cleanup_state, session_ttl, cleanup_interval).await;
+    });
+
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {}", addr))?;
@@ -77,6 +105,9 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+
+    // Clean up any lingering transcodes/temp files on shutdown.
+    state.transcodes.stop_all().await;
 
     tracing::info!("Elixir server shutdown complete");
     Ok(())

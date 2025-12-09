@@ -32,6 +32,19 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/:id/seek",
             post(handlers::playback::seek_transcode),
         )
+        .route(
+            "/api/v1/sessions/:id",
+            get(handlers::playback::session_detail),
+        )
+        .route(
+            "/api/v1/sessions/:id/end",
+            post(handlers::playback::end_session),
+        )
+        .route(
+            "/api/v1/servers/register",
+            post(handlers::control::register),
+        )
+        .route("/api/v1/me/servers", get(handlers::control::list))
         .with_state(state)
 }
 

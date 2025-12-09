@@ -11,6 +11,8 @@ pub struct Settings {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -18,6 +20,8 @@ pub struct Settings {
     pub library: LibraryConfig,
     #[serde(default)]
     pub metadata: MetadataConfig,
+    #[serde(default)]
+    pub playback: PlaybackConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
 }
@@ -30,6 +34,8 @@ impl Settings {
             .set_default("environment", RunEnvironment::default().as_str())?
             .set_default("server.host", default_host())?
             .set_default("server.port", default_port())?
+            .set_default("network.mdns_enabled", true)?
+            .set_default("network.mdns_name", default_mdns_name())?
             .set_default("database.url", default_database_url())?
             .set_default(
                 "auth.access_token_ttl_minutes",
@@ -48,6 +54,35 @@ impl Settings {
             .set_default("metadata.enable_consumet", true)?
             .set_default("metadata.request_timeout_seconds", 10)?
             .set_default("metadata.ttl_seconds", 604800)?
+            .set_default(
+                "playback.session_ttl_seconds",
+                default_session_ttl_seconds(),
+            )?
+            .set_default(
+                "playback.cleanup_interval_seconds",
+                default_cleanup_interval_seconds(),
+            )?
+            .set_default("playback.default_max_resolution", default_max_resolution())?
+            .set_default(
+                "playback.default_supported_containers",
+                default_supported_containers(),
+            )?
+            .set_default(
+                "playback.default_supported_video_codecs",
+                default_supported_video_codecs(),
+            )?
+            .set_default(
+                "playback.default_supported_audio_codecs",
+                default_supported_audio_codecs(),
+            )?
+            .set_default(
+                "playback.default_wan_max_bitrate_bps",
+                default_wan_bitrate_bps(),
+            )?
+            .set_default(
+                "playback.default_lan_max_bitrate_bps",
+                default_lan_bitrate_bps(),
+            )?
             .set_default("telemetry.log_directives", default_log_directives())?
             .add_source(File::with_name("config/default").required(false))
             .add_source(File::with_name("config/local").required(false))
@@ -125,6 +160,23 @@ impl ServerConfig {
         format!("{}:{}", self.host, self.port)
             .parse()
             .context("invalid server bind address")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_true")]
+    pub mdns_enabled: bool,
+    #[serde(default = "default_mdns_name")]
+    pub mdns_name: String,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            mdns_enabled: default_true(),
+            mdns_name: default_mdns_name(),
+        }
     }
 }
 
@@ -215,6 +267,41 @@ impl Default for MetadataConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PlaybackConfig {
+    #[serde(default = "default_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+    #[serde(default = "default_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+    #[serde(default = "default_max_resolution")]
+    pub default_max_resolution: String,
+    #[serde(default = "default_supported_containers")]
+    pub default_supported_containers: Vec<String>,
+    #[serde(default = "default_supported_video_codecs")]
+    pub default_supported_video_codecs: Vec<String>,
+    #[serde(default = "default_supported_audio_codecs")]
+    pub default_supported_audio_codecs: Vec<String>,
+    #[serde(default = "default_wan_bitrate_bps")]
+    pub default_wan_max_bitrate_bps: Option<i64>,
+    #[serde(default = "default_lan_bitrate_bps")]
+    pub default_lan_max_bitrate_bps: Option<i64>,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_seconds: default_session_ttl_seconds(),
+            cleanup_interval_seconds: default_cleanup_interval_seconds(),
+            default_max_resolution: default_max_resolution(),
+            default_supported_containers: default_supported_containers(),
+            default_supported_video_codecs: default_supported_video_codecs(),
+            default_supported_audio_codecs: default_supported_audio_codecs(),
+            default_wan_max_bitrate_bps: default_wan_bitrate_bps(),
+            default_lan_max_bitrate_bps: default_lan_bitrate_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     #[serde(default = "default_log_directives")]
     pub log_directives: String,
@@ -279,4 +366,40 @@ fn default_request_timeout() -> u64 {
 
 fn default_ttl_seconds() -> u64 {
     60 * 60 * 24 * 7
+}
+
+fn default_session_ttl_seconds() -> u64 {
+    60 * 60 * 6 // 6 hours
+}
+
+fn default_cleanup_interval_seconds() -> u64 {
+    15 * 60 // 15 minutes
+}
+
+fn default_mdns_name() -> String {
+    "Elixir Server".to_string()
+}
+
+fn default_max_resolution() -> String {
+    "1080p".to_string()
+}
+
+fn default_supported_containers() -> Vec<String> {
+    vec!["mkv".to_string(), "mp4".to_string()]
+}
+
+fn default_supported_video_codecs() -> Vec<String> {
+    vec!["h264".to_string(), "hevc".to_string()]
+}
+
+fn default_supported_audio_codecs() -> Vec<String> {
+    vec!["aac".to_string(), "ac3".to_string(), "opus".to_string()]
+}
+
+fn default_wan_bitrate_bps() -> Option<i64> {
+    Some(8_000_000)
+}
+
+fn default_lan_bitrate_bps() -> Option<i64> {
+    None
 }
