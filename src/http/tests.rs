@@ -410,8 +410,14 @@ async fn direct_stream_supports_range() -> Result<()> {
         )
         .await?;
 
-    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let status = resp.status();
     let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::PARTIAL_CONTENT,
+        "body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     assert_eq!(&bytes[..], b"abcd");
 
     Ok(())

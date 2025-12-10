@@ -9,6 +9,7 @@ use crate::{
     playback::TranscodeManager,
 };
 use sqlx::AnyPool;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct AppState {
     pub metadata: Arc<MetadataService>,
     pub transcodes: Arc<TranscodeManager>,
     pub server_registry: Arc<RwLock<Vec<RegistryEntry>>>,
+    pub mdns_active: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -40,6 +42,7 @@ impl AppState {
             metadata: Arc::new(metadata),
             transcodes: Arc::new(TranscodeManager::new()),
             server_registry: Arc::new(RwLock::new(Vec::new())),
+            mdns_active: Arc::new(AtomicBool::new(false)),
         }
     }
 }

@@ -14,6 +14,7 @@ pub struct HealthResponse {
     environment: &'static str,
     timestamp_utc: DateTime<Utc>,
     database: DatabaseHealth,
+    mdns: MdnsHealth,
 }
 
 #[derive(Serialize)]
@@ -25,15 +26,24 @@ pub struct DatabaseHealth {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MdnsHealth {
+    status: &'static str,
+    name: Option<String>,
+}
+
 pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<HealthResponse>> {
     let environment = app_state.settings.environment.as_str();
     let database = check_database(&app_state).await;
+    let mdns_status = check_mdns(&app_state);
 
     Ok(Json(HealthResponse {
         status: "ok",
         environment,
         timestamp_utc: Utc::now(),
         database,
+        mdns: mdns_status,
     }))
 }
 
@@ -57,5 +67,20 @@ async fn check_database(state: &AppState) -> DatabaseHealth {
             latency_ms: Some(start.elapsed().as_millis()),
             error: Some(err.to_string()),
         },
+    }
+}
+
+fn check_mdns(state: &AppState) -> MdnsHealth {
+    if !state.settings.network.mdns_enabled {
+        return MdnsHealth {
+            status: "disabled",
+            name: None,
+        };
+    }
+
+    let active = state.mdns_active.load(std::sync::atomic::Ordering::Relaxed);
+    MdnsHealth {
+        status: if active { "ok" } else { "error" },
+        name: Some(state.settings.network.mdns_name.clone()),
     }
 }

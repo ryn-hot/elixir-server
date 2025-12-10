@@ -28,6 +28,15 @@ pub enum PlaybackMode {
     Transcode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackState {
+    Active,
+    Ended,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
     pub id: Uuid,
@@ -116,11 +125,16 @@ pub struct MediaFile {
 pub struct PlaybackSession {
     pub id: Uuid,
     pub user_id: Uuid,
+    pub server_id: Option<Uuid>,
     pub media_file_id: Uuid,
     pub mode: PlaybackMode,
+    pub state: PlaybackState,
     pub network_type: Option<String>,
+    pub logical_position_seconds: f32,
+    pub duration_seconds: Option<i32>,
     pub client_capabilities: Option<serde_json::Value>,
     pub transcode_state: Option<serde_json::Value>,
+    pub token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

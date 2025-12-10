@@ -171,12 +171,16 @@ pub async fn play(
         _ => None,
     };
 
-    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, media_file_id, mode, network_type, client_capabilities, transcode_state, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(session_id.to_string())
         .bind(user.user_id.to_string())
+        .bind(None::<String>) // server_id not wired yet
         .bind(&selected.id)
         .bind(decision.mode_as_str())
+        .bind("active")
         .bind(body.network_type.clone())
+        .bind(0f32)
+        .bind(item.runtime_seconds)
         .bind(caps_json.as_ref().map(|v| v.to_string()))
         .bind(transcode_state.as_ref().map(|s| s.to_string()))
         .bind(session_id.to_string()) // simple token equal to session id for now
@@ -431,9 +435,7 @@ pub async fn stream_direct(
         .session
         .as_deref()
         .ok_or_else(|| ApiError::unauthorized("session token required"))?;
-    let _ = get_session(&state, &user, session_id, Some("direct_play"))
-        .await
-        .map_err(|_| ApiError::unauthorized("invalid session"))?;
+    let _ = get_session(&state, &user, session_id, Some("direct_play"), true).await?;
 
     let file_row = sqlx::query(
         "SELECT path, container FROM media_files WHERE id = ? AND scan_state = 'ok' LIMIT 1",
@@ -581,8 +583,9 @@ pub async fn master_playlist(
 
     // Touch updated_at for TTL and store log_path/seek for debugging.
     let _ = sqlx::query::<sqlx::Any>(
-        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP, transcode_state = ? WHERE id = ?",
+        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP, state = 'active', logical_position_seconds = ?, transcode_state = ? WHERE id = ?",
     )
+    .bind(seek_seconds)
     .bind(
         serde_json::json!({
             "seek_seconds": seek_seconds,
@@ -663,7 +666,10 @@ pub struct SessionDetailResponse {
     pub id: String,
     pub media_file_id: String,
     pub mode: String,
+    pub state: String,
     pub network_type: Option<String>,
+    pub logical_position_seconds: f32,
+    pub duration_seconds: Option<i32>,
     pub transcode_state: Option<serde_json::Value>,
     pub log_path: Option<String>,
     pub updated_at: Option<String>,
@@ -674,8 +680,9 @@ async fn get_session(
     user: &CurrentUser,
     session_id: &str,
     expected_mode: Option<&str>,
+    require_active: bool,
 ) -> ApiResult<AnyRow> {
-    let row = sqlx::query("SELECT id, user_id, media_file_id, mode, transcode_state, token FROM playback_sessions WHERE id = ? LIMIT 1")
+    let row = sqlx::query("SELECT id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, transcode_state, token, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
         .bind(session_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -686,6 +693,13 @@ async fn get_session(
     let user_id: String = row.get("user_id");
     if user_id != user.user_id.to_string() {
         return Err(ApiError::unauthorized("invalid session"));
+    }
+
+    if require_active {
+        let state_value: String = row.get("state");
+        if state_value.to_ascii_lowercase() != "active" {
+            return Err(ApiError::unauthorized("invalid session"));
+        }
     }
 
     if let Some(expected) = expected_mode {
@@ -733,7 +747,7 @@ async fn get_session_with_token(
     expected_mode: Option<&str>,
     token: &str,
 ) -> ApiResult<AnyRow> {
-    let row = get_session(state, user, session_id, expected_mode).await?;
+    let row = get_session(state, user, session_id, expected_mode, true).await?;
     let stored_token: Option<String> = row.try_get("token").ok();
     if let Some(stored) = stored_token {
         if stored != token {
@@ -769,7 +783,7 @@ pub async fn session_detail(
     AxumPath(id): AxumPath<String>,
     user: CurrentUser,
 ) -> ApiResult<Json<SessionDetailResponse>> {
-    let session = get_session(&state, &user, &id, None).await?;
+    let session = get_session(&state, &user, &id, None, false).await?;
     let transcode_state: Option<serde_json::Value> = session
         .try_get::<String, _>("transcode_state")
         .ok()
@@ -779,11 +793,23 @@ pub async fn session_detail(
         .and_then(|v| v.get("log_path").and_then(Value::as_str))
         .map(|s| s.to_string());
 
+    let logical_position_seconds = session
+        .try_get::<f64, _>("logical_position_seconds")
+        .ok()
+        .map(|v| v as f32)
+        .unwrap_or(0.0);
+
     let response = SessionDetailResponse {
         id: id.clone(),
         media_file_id: session.get("media_file_id"),
         mode: session.get("mode"),
+        state: session.get("state"),
         network_type: session.try_get("network_type").ok(),
+        logical_position_seconds,
+        duration_seconds: session
+            .try_get::<i64, _>("duration_seconds")
+            .ok()
+            .map(|v| v as i32),
         transcode_state,
         log_path,
         updated_at: session.try_get("updated_at").ok(),
@@ -800,14 +826,16 @@ pub async fn end_session(
     let session_id =
         Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("invalid session id"))?;
     // Validate ownership.
-    let _ = get_session(&state, &user, &id, None).await?;
+    let _ = get_session(&state, &user, &id, None, false).await?;
 
     state.transcodes.stop_and_remove(session_id).await;
-    sqlx::query::<sqlx::Any>("DELETE FROM playback_sessions WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE playback_sessions SET state = 'ended', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(&id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     info!(session = %id, "session ended and cleaned up");
     Ok(Json("ok"))
@@ -820,8 +848,14 @@ pub async fn seek_transcode(
     Json(body): Json<SeekRequest>,
 ) -> ApiResult<Json<&'static str>> {
     let session_id = Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("invalid session"))?;
-    let session_row =
-        get_session(&state, &user, &session_id.to_string(), Some("transcode")).await?;
+    let session_row = get_session(
+        &state,
+        &user,
+        &session_id.to_string(),
+        Some("transcode"),
+        true,
+    )
+    .await?;
     let media_file_id: String = session_row.get("media_file_id");
 
     let media_path: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
@@ -840,13 +874,14 @@ pub async fn seek_transcode(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET transcode_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET transcode_state = ?, logical_position_seconds = ?, state = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(
             serde_json::json!({
                 "seek_seconds": body.position_seconds
             })
             .to_string(),
         )
+        .bind(body.position_seconds)
         .bind(&id)
         .execute(&state.db_pool)
         .await

@@ -22,6 +22,7 @@ use crate::network::start_mdns;
 use crate::playback::start_session_cleanup;
 use crate::state::AppState;
 use anyhow::Context;
+use std::sync::atomic::Ordering;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -70,22 +71,27 @@ async fn main() -> anyhow::Result<()> {
     let scan_state = state.clone();
     tokio::spawn(async move { start_periodic_scan(scan_state, scan_interval).await });
 
-    // Announce via mDNS if enabled.
-    if state.settings.network.mdns_enabled {
+    // Announce via mDNS if enabled; keep guard alive for process lifetime.
+    let _mdns_guard = if state.settings.network.mdns_enabled {
         match start_mdns(&state.settings.server, &state.settings.network.mdns_name) {
-            Ok(_) => {
+            Ok(handle) => {
+                state.mdns_active.store(true, Ordering::Relaxed);
                 tracing::info!(
                     "mDNS announced: {}:{} ({})",
                     state.settings.server.host,
                     state.settings.server.port,
                     state.settings.network.mdns_name
                 );
+                Some(handle)
             }
             Err(err) => {
                 tracing::warn!("failed to start mDNS announcer: {err}");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Cleanup stale playback sessions and transcode leftovers.
     let cleanup_state = state.clone();
