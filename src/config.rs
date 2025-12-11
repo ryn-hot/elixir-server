@@ -389,7 +389,7 @@ fn default_max_resolution() -> String {
 }
 
 fn default_supported_containers() -> Vec<String> {
-    vec!["mkv".to_string(), "mp4".to_string()]
+    vec!["mp4".to_string(), "mkv".to_string()]
 }
 
 fn default_supported_video_codecs() -> Vec<String> {
@@ -401,9 +401,9 @@ fn default_supported_audio_codecs() -> Vec<String> {
 }
 
 fn default_wan_bitrate_bps() -> Option<i64> {
-    Some(8_000_000)
+    Some(6_000_000)
 }
 
 fn default_lan_bitrate_bps() -> Option<i64> {
-    None
+    Some(20_000_000)
 }

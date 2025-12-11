@@ -42,6 +42,13 @@ pub async fn register(
     user: CurrentUser,
     Json(body): Json<RegisterServerRequest>,
 ) -> ApiResult<Json<&'static str>> {
+    if body.device_name.trim().is_empty() {
+        return Err(ApiError::bad_request("device_name is required"));
+    }
+    if body.lan_addresses.is_empty() {
+        return Err(ApiError::bad_request("lan_addresses must not be empty"));
+    }
+
     let server_id = body
         .server_id
         .as_deref()
@@ -101,4 +108,25 @@ pub async fn list(
 
 pub async fn health() -> ApiResult<Json<&'static str>> {
     Ok(Json("ok"))
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterSchema {
+    pub required: Vec<&'static str>,
+    pub properties: serde_json::Value,
+    pub description: &'static str,
+}
+
+pub async fn schema() -> ApiResult<Json<RegisterSchema>> {
+    Ok(Json(RegisterSchema {
+        required: vec!["device_name", "lan_addresses"],
+        description: "Schema for /api/v1/servers/register",
+        properties: serde_json::json!({
+            "server_id": { "type": "string", "description": "Existing server UUID (optional)" },
+            "device_name": { "type": "string", "description": "Human-readable name of the server device" },
+            "lan_addresses": { "type": "array", "items": { "type": "string", "description": "host:port entries reachable on LAN" } },
+            "wan_direct_endpoint": { "type": "string", "description": "Public host:port if WAN mapping succeeded" },
+            "overlay_endpoint": { "type": "string", "description": "Overlay/relay endpoint if applicable" }
+        }),
+    }))
 }

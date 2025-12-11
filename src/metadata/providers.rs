@@ -24,6 +24,7 @@ pub mod cinemeta {
         pub runtime: Option<i32>, // minutes
         pub description: Option<String>,
         pub genres: Option<Vec<String>>,
+        pub year: Option<i32>,
         #[serde(flatten)]
         pub rest: serde_json::Value,
     }

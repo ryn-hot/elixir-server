@@ -96,11 +96,12 @@ impl MetadataService {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or_else(|| query)
                                 .to_string();
-                            let year = meta
-                                .rest
-                                .get("year")
-                                .and_then(serde_json::Value::as_i64)
-                                .map(|v| v as i32);
+                            let year = meta.year.or_else(|| {
+                                meta.rest
+                                    .get("year")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .map(|v| v as i32)
+                            });
                             DiscoveryResult {
                                 title,
                                 r#type: r#type.unwrap_or(MediaType::Movie),

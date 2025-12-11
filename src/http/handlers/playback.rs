@@ -53,6 +53,8 @@ pub struct PlayResponse {
     pub media_file_id: String,
     pub server_id: String,
     pub wan_direct_endpoint: Option<String>,
+    pub state: String,
+    pub logical_position_seconds: f32,
 }
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientCapabilities {
@@ -219,6 +221,8 @@ pub async fn play(
         media_file_id: selected.id.clone(),
         server_id: server_id.to_string(),
         wan_direct_endpoint,
+        state: "active".to_string(),
+        logical_position_seconds: 0.0,
     };
 
     Ok(Json(response))

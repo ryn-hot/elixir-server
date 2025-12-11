@@ -4,4 +4,5 @@ pub mod discovery;
 pub mod health;
 pub mod library;
 pub mod playback;
+pub mod profile;
 pub mod settings;

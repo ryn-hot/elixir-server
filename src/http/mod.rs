@@ -50,7 +50,12 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/servers/register/health",
             get(handlers::control::health),
         )
+        .route(
+            "/api/v1/servers/register/schema",
+            get(handlers::control::schema),
+        )
         .route("/api/v1/discovery/search", get(handlers::discovery::search))
+        .route("/api/v1/profile/playback", get(handlers::profile::profile))
         .with_state(state)
 }
 

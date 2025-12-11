@@ -24,6 +24,11 @@ pub static REGISTRY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["action", "result"]).expect("counter vec created")
 });
 
+pub static WAN_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new("elixir_wan_events_total", "Count of WAN setup events");
+    IntCounterVec::new(opts, &["step", "result"]).expect("counter vec created")
+});
+
 pub static PLAY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "elixir_play_decision_latency_seconds",
@@ -36,6 +41,7 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
     REGISTRY.register(Box::new(REGISTRY_ACTIONS.clone())).ok();
+    REGISTRY.register(Box::new(WAN_EVENTS.clone())).ok();
     REGISTRY.register(Box::new(PLAY_LATENCY.clone())).ok();
 }
 

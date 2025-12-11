@@ -2,7 +2,7 @@ use anyhow::Context;
 use reqwest::Client;
 use uuid::Uuid;
 
-use crate::{network::registry::ensure_server_instance, state::AppState};
+use crate::{metrics::WAN_EVENTS, network::registry::ensure_server_instance, state::AppState};
 
 pub fn start_wan_tasks(state: AppState) {
     if !state.settings.network.wan_enabled {
@@ -11,7 +11,10 @@ pub fn start_wan_tasks(state: AppState) {
 
     tokio::spawn(async move {
         if let Err(err) = attempt_wan_registration(&state).await {
+            WAN_EVENTS.with_label_values(&["register", "error"]).inc();
             tracing::warn!("WAN setup failed: {err}");
+        } else {
+            WAN_EVENTS.with_label_values(&["register", "ok"]).inc();
         }
     });
 }
@@ -20,10 +23,25 @@ async fn attempt_wan_registration(state: &AppState) -> anyhow::Result<()> {
     let port = state.settings.server.port;
 
     // Try UPnP/NAT-PMP to open a port and learn external IP; fall back to HTTP public IP.
-    let upnp_ip = try_upnp_map(port).await.unwrap_or(None);
-    let public_ip = upnp_ip.or(fetch_public_ip().await.unwrap_or(None));
+    let upnp_ip = try_upnp_map(port).await.unwrap_or_else(|e| {
+        WAN_EVENTS.with_label_values(&["upnp", "error"]).inc();
+        tracing::warn!("WAN: UPnP mapping failed: {e}");
+        None
+    });
+    if upnp_ip.is_some() {
+        WAN_EVENTS.with_label_values(&["upnp", "ok"]).inc();
+    }
+
+    let public_ip = upnp_ip.or(fetch_public_ip().await.unwrap_or_else(|e| {
+        WAN_EVENTS.with_label_values(&["public_ip", "error"]).inc();
+        tracing::warn!("WAN: public IP fetch failed: {e}");
+        None
+    }));
 
     let wan_endpoint = public_ip.map(|ip| format!("{ip}:{port}"));
+    if wan_endpoint.is_none() {
+        tracing::info!("WAN: no public IP discovered; registering without wan_direct_endpoint");
+    }
 
     // Choose a LAN address to advertise.
     let host = if state.settings.server.host == "0.0.0.0" {
@@ -112,21 +130,29 @@ async fn try_upnp_map(port: u16) -> anyhow::Result<Option<String>> {
 
 async fn fetch_public_ip() -> anyhow::Result<Option<String>> {
     let client = Client::new();
-    let resp = client
-        .get("https://api.ipify.org")
-        .send()
-        .await?
-        .error_for_status();
-    let resp = match resp {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    let text = resp.text().await.unwrap_or_default();
-    if text.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(text.trim().to_string()))
+    let endpoints = vec![
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+    ];
+
+    for url in endpoints {
+        let resp = client.get(url).send().await;
+        match resp {
+            Ok(r) => {
+                if !r.status().is_success() {
+                    continue;
+                }
+                let text = r.text().await.unwrap_or_default();
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Ok(Some(trimmed.to_string()));
+                }
+            }
+            Err(_) => continue,
+        }
     }
+    Ok(None)
 }
 
 fn local_ipv4() -> Option<std::net::Ipv4Addr> {

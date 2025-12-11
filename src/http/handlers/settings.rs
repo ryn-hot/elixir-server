@@ -27,6 +27,9 @@ pub struct NetworkSettings {
     mdns_name: String,
     wan_enabled: bool,
     wan_direct_endpoint: Option<String>,
+    default_lan_max_bitrate_bps: Option<i64>,
+    default_wan_max_bitrate_bps: Option<i64>,
+    wan_status: String,
 }
 
 #[derive(Serialize)]
@@ -57,6 +60,9 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             mdns_name: settings.network.mdns_name.clone(),
             wan_enabled: settings.network.wan_enabled,
             wan_direct_endpoint: latest_wan_endpoint(&app_state).await,
+            default_lan_max_bitrate_bps: settings.playback.default_lan_max_bitrate_bps,
+            default_wan_max_bitrate_bps: settings.playback.default_wan_max_bitrate_bps,
+            wan_status: wan_status(&app_state).await,
         },
         database: DatabaseSettings {
             driver: app_state.db_driver.as_str(),
@@ -77,4 +83,16 @@ async fn latest_wan_endpoint(state: &AppState) -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+async fn wan_status(state: &AppState) -> String {
+    if !state.settings.network.wan_enabled {
+        return "disabled".to_string();
+    }
+    let endpoint = latest_wan_endpoint(state).await;
+    if endpoint.is_some() {
+        "ok".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }

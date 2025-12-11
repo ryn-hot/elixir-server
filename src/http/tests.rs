@@ -234,6 +234,22 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
         .await?;
     assert_eq!(register_resp.status(), StatusCode::OK);
 
+    // Bad payload should 400
+    let bad_body = serde_json::json!({
+        "device_name": "",
+        "lan_addresses": []
+    });
+    let bad_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/servers/register")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(bad_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
     // Authenticated list should return the registered server
     let list_resp = app
         .clone()
@@ -256,12 +272,20 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
 
     // Registry health should be open (no auth)
     let health_resp = app
+        .clone()
         .oneshot(Request::get("/api/v1/servers/register/health").body(Body::empty())?)
         .await?;
     assert_eq!(health_resp.status(), StatusCode::OK);
     let health_body = body::to_bytes(health_resp.into_body(), 1_048_576).await?;
     let health_json: Value = serde_json::from_slice(&health_body)?;
     assert_eq!(health_json, Value::String("ok".to_string()));
+
+    // Schema should be accessible without auth
+    let schema_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/servers/register/schema").body(Body::empty())?)
+        .await?;
+    assert_eq!(schema_resp.status(), StatusCode::OK);
 
     Ok(())
 }
@@ -273,18 +297,72 @@ async fn discovery_requires_auth() -> Result<()> {
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let app = router(AppState::new(
+    let state = AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
-    ));
+    );
+    let app = router(state.clone());
 
     let resp = app
         .oneshot(Request::get("/api/v1/discovery/search?q=test").body(Body::empty())?)
         .await?;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_profile_requires_auth() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "profile-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+    );
+    let app = router(state.clone());
+
+    // Seed user
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("profile@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    // Unauth should fail
+    let unauth = app
+        .clone()
+        .oneshot(Request::get("/api/v1/profile/playback").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // Auth should return profile
+    let auth_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/profile/playback")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(auth_resp.status(), StatusCode::OK);
+    let body = body::to_bytes(auth_resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert!(json.get("profile").is_some());
+
     Ok(())
 }
 
@@ -439,6 +517,14 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     assert_eq!(
         json.get("mode").and_then(Value::as_str),
         Some("direct_play")
+    );
+    assert_eq!(json.get("state").and_then(Value::as_str), Some("active"));
+    assert_eq!(
+        json.get("logicalPositionSeconds")
+            .or_else(|| json.get("logical_position_seconds"))
+            .and_then(Value::as_f64)
+            .unwrap_or(-1.0) as i32,
+        0
     );
 
     Ok(())
