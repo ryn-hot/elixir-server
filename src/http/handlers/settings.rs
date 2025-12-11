@@ -8,6 +8,7 @@ use crate::{http::error::ApiResult, state::AppState};
 pub struct SettingsResponse {
     environment: String,
     server: ServerSettings,
+    network: NetworkSettings,
     database: DatabaseSettings,
     telemetry: TelemetrySettings,
 }
@@ -17,6 +18,15 @@ pub struct SettingsResponse {
 pub struct ServerSettings {
     host: String,
     port: u16,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSettings {
+    mdns_enabled: bool,
+    mdns_name: String,
+    wan_enabled: bool,
+    wan_direct_endpoint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +52,12 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             host: settings.server.host.clone(),
             port: settings.server.port,
         },
+        network: NetworkSettings {
+            mdns_enabled: settings.network.mdns_enabled,
+            mdns_name: settings.network.mdns_name.clone(),
+            wan_enabled: settings.network.wan_enabled,
+            wan_direct_endpoint: latest_wan_endpoint(&app_state).await,
+        },
         database: DatabaseSettings {
             driver: app_state.db_driver.as_str(),
             max_connections: settings.database.max_connections,
@@ -51,4 +67,14 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             log_directives: settings.telemetry.log_directives.clone(),
         },
     }))
+}
+
+async fn latest_wan_endpoint(state: &AppState) -> Option<String> {
+    sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT wan_direct_endpoint FROM server_registry ORDER BY last_seen_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten()
 }

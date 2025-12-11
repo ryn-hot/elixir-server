@@ -18,7 +18,7 @@ use crate::extensions::ExtensionManager;
 use crate::http::router;
 use crate::library::start_periodic_scan;
 use crate::metadata::MetadataService;
-use crate::network::start_mdns;
+use crate::network::{start_mdns, wan::start_wan_tasks};
 use crate::playback::start_session_cleanup;
 use crate::state::AppState;
 use anyhow::Context;
@@ -92,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Attempt WAN mapping/registration asynchronously.
+    start_wan_tasks(state.clone());
 
     // Cleanup stale playback sessions and transcode leftovers.
     let cleanup_state = state.clone();

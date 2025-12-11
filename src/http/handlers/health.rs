@@ -15,6 +15,7 @@ pub struct HealthResponse {
     timestamp_utc: DateTime<Utc>,
     database: DatabaseHealth,
     mdns: MdnsHealth,
+    wan: WanHealth,
 }
 
 #[derive(Serialize)]
@@ -33,10 +34,18 @@ pub struct MdnsHealth {
     name: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WanHealth {
+    status: &'static str,
+    wan_direct_endpoint: Option<String>,
+}
+
 pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<HealthResponse>> {
     let environment = app_state.settings.environment.as_str();
     let database = check_database(&app_state).await;
     let mdns_status = check_mdns(&app_state);
+    let wan_status = check_wan(&app_state).await;
 
     Ok(Json(HealthResponse {
         status: "ok",
@@ -44,6 +53,7 @@ pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<He
         timestamp_utc: Utc::now(),
         database,
         mdns: mdns_status,
+        wan: wan_status,
     }))
 }
 
@@ -67,6 +77,32 @@ async fn check_database(state: &AppState) -> DatabaseHealth {
             latency_ms: Some(start.elapsed().as_millis()),
             error: Some(err.to_string()),
         },
+    }
+}
+
+async fn check_wan(state: &AppState) -> WanHealth {
+    if !state.settings.network.wan_enabled {
+        return WanHealth {
+            status: "disabled",
+            wan_direct_endpoint: None,
+        };
+    }
+
+    let wan_direct_endpoint: Option<String> = sqlx::query_scalar(
+        "SELECT wan_direct_endpoint FROM server_registry ORDER BY last_seen_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten();
+
+    WanHealth {
+        status: if wan_direct_endpoint.is_some() {
+            "ok"
+        } else {
+            "unknown"
+        },
+        wan_direct_endpoint,
     }
 }
 

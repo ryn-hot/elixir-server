@@ -36,6 +36,7 @@ impl Settings {
             .set_default("server.port", default_port())?
             .set_default("network.mdns_enabled", true)?
             .set_default("network.mdns_name", default_mdns_name())?
+            .set_default("network.wan_enabled", true)?
             .set_default("database.url", default_database_url())?
             .set_default(
                 "auth.access_token_ttl_minutes",
@@ -169,6 +170,8 @@ pub struct NetworkConfig {
     pub mdns_enabled: bool,
     #[serde(default = "default_mdns_name")]
     pub mdns_name: String,
+    #[serde(default = "default_true")]
+    pub wan_enabled: bool,
 }
 
 impl Default for NetworkConfig {
@@ -176,6 +179,7 @@ impl Default for NetworkConfig {
         Self {
             mdns_enabled: default_true(),
             mdns_name: default_mdns_name(),
+            wan_enabled: default_true(),
         }
     }
 }

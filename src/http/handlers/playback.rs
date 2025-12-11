@@ -21,6 +21,7 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
+    network::registry::ensure_server_instance,
     playback::TranscodeParams,
     state::AppState,
 };
@@ -49,6 +50,8 @@ pub struct PlayResponse {
     pub duration_seconds: Option<i32>,
     pub logical_start_seconds: i32,
     pub media_file_id: String,
+    pub server_id: String,
+    pub wan_direct_endpoint: Option<String>,
 }
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientCapabilities {
@@ -152,6 +155,15 @@ pub async fn play(
         "play decision"
     );
 
+    let server_id = ensure_server_instance(&state.db_pool, &state.settings, user.user_id).await?;
+    let wan_direct_endpoint: Option<String> = sqlx::query_scalar(
+        "SELECT wan_direct_endpoint FROM server_registry ORDER BY last_seen_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten();
+
     let stream_url = match decision.mode {
         PlaybackMode::DirectPlay => {
             format!("/stream/direct/{}?session={}", selected.id, session_id)
@@ -174,7 +186,7 @@ pub async fn play(
     sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(session_id.to_string())
         .bind(user.user_id.to_string())
-        .bind(None::<String>) // server_id not wired yet
+        .bind(server_id.to_string())
         .bind(&selected.id)
         .bind(decision.mode_as_str())
         .bind("active")
@@ -195,6 +207,8 @@ pub async fn play(
         duration_seconds: item.runtime_seconds,
         logical_start_seconds: 0,
         media_file_id: selected.id.clone(),
+        server_id: server_id.to_string(),
+        wan_direct_endpoint,
     };
 
     Ok(Json(response))
@@ -665,11 +679,13 @@ pub struct StreamQuery {
 pub struct SessionDetailResponse {
     pub id: String,
     pub media_file_id: String,
+    pub server_id: Option<String>,
     pub mode: String,
     pub state: String,
     pub network_type: Option<String>,
     pub logical_position_seconds: f32,
     pub duration_seconds: Option<i32>,
+    pub wan_direct_endpoint: Option<String>,
     pub transcode_state: Option<serde_json::Value>,
     pub log_path: Option<String>,
     pub updated_at: Option<String>,
@@ -682,7 +698,7 @@ async fn get_session(
     expected_mode: Option<&str>,
     require_active: bool,
 ) -> ApiResult<AnyRow> {
-    let row = sqlx::query("SELECT id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, transcode_state, token, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
+    let row = sqlx::query("SELECT id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, transcode_state, token, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
         .bind(session_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -799,9 +815,18 @@ pub async fn session_detail(
         .map(|v| v as f32)
         .unwrap_or(0.0);
 
+    let wan_direct_endpoint: Option<String> = sqlx::query_scalar(
+        "SELECT wan_direct_endpoint FROM server_registry ORDER BY last_seen_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten();
+
     let response = SessionDetailResponse {
         id: id.clone(),
         media_file_id: session.get("media_file_id"),
+        server_id: session.try_get("server_id").ok(),
         mode: session.get("mode"),
         state: session.get("state"),
         network_type: session.try_get("network_type").ok(),
@@ -810,6 +835,7 @@ pub async fn session_detail(
             .try_get::<i64, _>("duration_seconds")
             .ok()
             .map(|v| v as i32),
+        wan_direct_endpoint,
         transcode_state,
         log_path,
         updated_at: session.try_get("updated_at").ok(),

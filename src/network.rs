@@ -1,3 +1,6 @@
+pub mod registry;
+pub mod wan;
+
 use anyhow::Result;
 use hostname;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
