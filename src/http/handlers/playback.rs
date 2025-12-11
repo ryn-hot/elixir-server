@@ -21,6 +21,7 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
+    metrics::{PLAY_DECISIONS, PLAY_LATENCY, TRANSCODE_STARTS},
     network::registry::ensure_server_instance,
     playback::TranscodeParams,
     state::AppState,
@@ -85,6 +86,7 @@ pub async fn play(
     user: CurrentUser,
     Json(body): Json<PlayRequest>,
 ) -> ApiResult<Json<PlayResponse>> {
+    let latency_timer = PLAY_LATENCY.with_label_values(&["pending"]).start_timer();
     let item: Option<MediaItemRow> =
         sqlx::query("SELECT type, runtime_seconds FROM media_items WHERE id = ? LIMIT 1")
             .bind(&body.media_item_id)
@@ -154,6 +156,12 @@ pub async fn play(
         reason = %decision.reason,
         "play decision"
     );
+    PLAY_DECISIONS
+        .with_label_values(&[
+            decision.mode_as_str(),
+            body.network_type.as_deref().unwrap_or("unknown"),
+        ])
+        .inc();
 
     let server_id = ensure_server_instance(&state.db_pool, &state.settings, user.user_id).await?;
     let wan_direct_endpoint: Option<String> = sqlx::query_scalar(
@@ -199,6 +207,8 @@ pub async fn play(
         .execute(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    latency_timer.stop_and_record();
 
     let response = PlayResponse {
         session_id: session_id.to_string(),
@@ -582,7 +592,16 @@ pub async fn master_playlist(
         .transcodes
         .start_or_get(session_id, &media_path, TranscodeParams { seek_seconds })
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| {
+            let msg = format!("transcode spawn failed: {e}");
+            let session_id = id.clone();
+            let state_clone = state.clone();
+            let _ = tokio::spawn(async move {
+                mark_session_error(state_clone, &session_id, Some(msg)).await
+            });
+            ApiError::internal(e.to_string())
+        })?;
+    TRANSCODE_STARTS.with_label_values(&["ok"]).inc();
     info!(
         session = %session_id,
         file = %media_file_id,
@@ -591,8 +610,26 @@ pub async fn master_playlist(
     );
 
     // Wait briefly for playlist to appear; retry a few times to avoid flakiness.
-    let content =
-        read_playlist_with_retry(&handle.playlist_path, 60, 250, Some(&handle.log_path)).await?;
+    let content = match read_playlist_with_retry(
+        &handle.playlist_path,
+        60,
+        250,
+        Some(&handle.log_path),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(err) => {
+            let msg = format!("{err:?}");
+            let session_id = id.clone();
+            let state_clone = state.clone();
+            TRANSCODE_STARTS.with_label_values(&["error"]).inc();
+            let _ = tokio::spawn(async move {
+                mark_session_error(state_clone, &session_id, Some(msg)).await
+            });
+            return Err(err);
+        }
+    };
     let playlist_body = rewrite_playlist_with_token(&content, session_token);
 
     // Touch updated_at for TTL and store log_path/seek for debugging.
@@ -794,6 +831,22 @@ fn rewrite_playlist_with_token(content: &str, token: &str) -> String {
         .join("\n")
 }
 
+async fn mark_session_error(state: AppState, session_id: &str, message: Option<String>) {
+    let transcode_state = message.as_deref().map(|m| {
+        serde_json::json!({
+            "error": m,
+        })
+        .to_string()
+    });
+    let _ = sqlx::query::<sqlx::Any>(
+        "UPDATE playback_sessions SET state = 'error', updated_at = CURRENT_TIMESTAMP, transcode_state = COALESCE(?, transcode_state) WHERE id = ?",
+    )
+    .bind(transcode_state)
+    .bind(session_id)
+    .execute(&state.db_pool)
+    .await;
+}
+
 pub async fn session_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -898,7 +951,16 @@ pub async fn seek_transcode(
         .transcodes
         .restart(session_id, &media_path, body.position_seconds)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| {
+            let msg = format!("transcode restart failed: {e}");
+            let session_id = id.clone();
+            let state_clone = state.clone();
+            let _ = tokio::spawn(async move {
+                mark_session_error(state_clone, &session_id, Some(msg)).await
+            });
+            ApiError::internal(e.to_string())
+        })?;
+    TRANSCODE_STARTS.with_label_values(&["restart"]).inc();
 
     sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET transcode_state = ?, logical_position_seconds = ?, state = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(

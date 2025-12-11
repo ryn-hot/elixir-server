@@ -6,6 +6,7 @@ mod http;
 mod library;
 mod media;
 mod metadata;
+mod metrics;
 mod network;
 mod playback;
 mod state;
@@ -32,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     let settings = Settings::load().context("failed to load configuration")?;
     telemetry::init_tracing(&settings.telemetry).context("failed to initialize tracing")?;
+    metrics::init_metrics();
 
     let database = Database::connect(&settings.database)
         .await

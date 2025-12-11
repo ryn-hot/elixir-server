@@ -8,6 +8,7 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
+    metrics::REGISTRY_ACTIONS,
     state::AppState,
 };
 
@@ -61,6 +62,9 @@ pub async fn register(
         .execute(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    REGISTRY_ACTIONS
+        .with_label_values(&["register", "ok"])
+        .inc();
 
     Ok(Json("ok"))
 }
@@ -74,6 +78,7 @@ pub async fn list(
         .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    REGISTRY_ACTIONS.with_label_values(&["list", "ok"]).inc();
 
     let mut servers = Vec::new();
     for row in rows {
@@ -92,4 +97,8 @@ pub async fn list(
     }
 
     Ok(Json(ServersResponse { servers }))
+}
+
+pub async fn health() -> ApiResult<Json<&'static str>> {
+    Ok(Json("ok"))
 }

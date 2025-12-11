@@ -13,6 +13,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health::healthcheck))
         .route("/api/v1/health", get(handlers::health::healthcheck))
+        .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/library/items", get(handlers::library::list_items))
@@ -45,6 +46,11 @@ pub fn router(state: AppState) -> Router {
             post(handlers::control::register),
         )
         .route("/api/v1/me/servers", get(handlers::control::list))
+        .route(
+            "/api/v1/servers/register/health",
+            get(handlers::control::health),
+        )
+        .route("/api/v1/discovery/search", get(handlers::discovery::search))
         .with_state(state)
 }
 

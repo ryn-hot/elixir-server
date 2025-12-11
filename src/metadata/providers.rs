@@ -18,14 +18,14 @@ pub mod cinemeta {
     }
 
     #[derive(Debug, Deserialize, Serialize)]
-    struct CineMetaItem {
+    pub struct CineMetaItem {
         #[serde(rename = "imdb_id")]
-        imdb_id: Option<String>,
-        runtime: Option<i32>, // minutes
-        description: Option<String>,
-        genres: Option<Vec<String>>,
+        pub imdb_id: Option<String>,
+        pub runtime: Option<i32>, // minutes
+        pub description: Option<String>,
+        pub genres: Option<Vec<String>>,
         #[serde(flatten)]
-        rest: serde_json::Value,
+        pub rest: serde_json::Value,
     }
 
     pub async fn fetch(
@@ -91,6 +91,28 @@ pub mod cinemeta {
             }));
         }
         Ok(None)
+    }
+
+    pub async fn search(
+        client: &Client,
+        query: &str,
+        media_kind: &str,
+    ) -> Result<Vec<CineMetaItem>> {
+        #[derive(Debug, Deserialize)]
+        struct SearchResp {
+            metas: Option<Vec<CineMetaItem>>,
+        }
+        let encoded = urlencoding::encode(query);
+        let url = format!(
+            "https://v3-cinemeta.strem.io/meta/{}/search={}.json",
+            media_kind, encoded
+        );
+        let res = client.get(&url).send().await?;
+        if !res.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let body: SearchResp = res.json().await?;
+        Ok(body.metas.unwrap_or_default())
     }
 }
 

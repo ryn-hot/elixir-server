@@ -1,11 +1,11 @@
 use std::time::Instant;
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::Row;
 
-use crate::{http::error::ApiResult, state::AppState};
+use crate::{http::error::ApiResult, metrics, state::AppState};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,4 +119,16 @@ fn check_mdns(state: &AppState) -> MdnsHealth {
         status: if active { "ok" } else { "error" },
         name: Some(state.settings.network.mdns_name.clone()),
     }
+}
+
+pub async fn metrics() -> impl IntoResponse {
+    let body = metrics::gather();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }

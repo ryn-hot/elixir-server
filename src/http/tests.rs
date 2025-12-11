@@ -166,6 +166,128 @@ async fn login_returns_access_token() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "wan-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+    );
+    let app = router(state.clone());
+
+    // Seed user
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("wan@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    // Unauth access should fail
+    let unauth_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/me/servers").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Authenticated settings should include network fields
+    let settings_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(settings_resp.status(), StatusCode::OK);
+    let settings_body = body::to_bytes(settings_resp.into_body(), 1_048_576).await?;
+    let settings_json: Value = serde_json::from_slice(&settings_body)?;
+    assert!(settings_json.get("network").is_some());
+
+    // Register with auth should succeed
+    let register_body = serde_json::json!({
+        "device_name": "Test Device",
+        "lan_addresses": ["127.0.0.1:1234"],
+        "wan_direct_endpoint": "203.0.113.1:1234",
+        "overlay_endpoint": null
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/servers/register")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(register_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(register_resp.status(), StatusCode::OK);
+
+    // Authenticated list should return the registered server
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/me/servers")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = body::to_bytes(list_resp.into_body(), 1_048_576).await?;
+    let list_json: Value = serde_json::from_slice(&list_body)?;
+    let servers = list_json
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(!servers.is_empty());
+    assert!(servers[0].get("wan_direct_endpoint").is_some());
+
+    // Registry health should be open (no auth)
+    let health_resp = app
+        .oneshot(Request::get("/api/v1/servers/register/health").body(Body::empty())?)
+        .await?;
+    assert_eq!(health_resp.status(), StatusCode::OK);
+    let health_body = body::to_bytes(health_resp.into_body(), 1_048_576).await?;
+    let health_json: Value = serde_json::from_slice(&health_body)?;
+    assert_eq!(health_json, Value::String("ok".to_string()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_requires_auth() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+    ));
+
+    let resp = app
+        .oneshot(Request::get("/api/v1/discovery/search?q=test").body(Body::empty())?)
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
 fn hash_password(password: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
