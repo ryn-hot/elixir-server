@@ -9,12 +9,30 @@ pub fn start_wan_tasks(state: AppState) {
         return;
     }
 
+    // Initial attempt
+    let init_state = state.clone();
     tokio::spawn(async move {
-        if let Err(err) = attempt_wan_registration(&state).await {
+        if let Err(err) = attempt_wan_registration(&init_state).await {
             WAN_EVENTS.with_label_values(&["register", "error"]).inc();
             tracing::warn!("WAN setup failed: {err}");
         } else {
             WAN_EVENTS.with_label_values(&["register", "ok"]).inc();
+            tracing::info!("WAN initial registration ok");
+        }
+    });
+
+    // Periodic refresh
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(err) = attempt_wan_registration(&state).await {
+                WAN_EVENTS.with_label_values(&["refresh", "error"]).inc();
+                tracing::warn!("WAN refresh failed: {err}");
+            } else {
+                WAN_EVENTS.with_label_values(&["refresh", "ok"]).inc();
+                tracing::info!("WAN refresh ok");
+            }
         }
     });
 }
@@ -32,11 +50,22 @@ async fn attempt_wan_registration(state: &AppState) -> anyhow::Result<()> {
         WAN_EVENTS.with_label_values(&["upnp", "ok"]).inc();
     }
 
-    let public_ip = upnp_ip.or(fetch_public_ip().await.unwrap_or_else(|e| {
-        WAN_EVENTS.with_label_values(&["public_ip", "error"]).inc();
-        tracing::warn!("WAN: public IP fetch failed: {e}");
+    let natpmp_ip = try_natpmp_map(port).await.unwrap_or_else(|e| {
+        WAN_EVENTS.with_label_values(&["natpmp", "error"]).inc();
+        tracing::warn!("WAN: NAT-PMP mapping failed: {e}");
         None
-    }));
+    });
+    if natpmp_ip.is_some() {
+        WAN_EVENTS.with_label_values(&["natpmp", "ok"]).inc();
+    }
+
+    let public_ip = upnp_ip
+        .or(natpmp_ip)
+        .or(fetch_public_ip().await.unwrap_or_else(|e| {
+            WAN_EVENTS.with_label_values(&["public_ip", "error"]).inc();
+            tracing::warn!("WAN: public IP fetch failed: {e}");
+            None
+        }));
 
     let wan_endpoint = public_ip.map(|ip| format!("{ip}:{port}"));
     if wan_endpoint.is_none() {
@@ -44,11 +73,13 @@ async fn attempt_wan_registration(state: &AppState) -> anyhow::Result<()> {
     }
 
     // Choose a LAN address to advertise.
-    let host = if state.settings.server.host == "0.0.0.0" {
-        "127.0.0.1".to_string()
-    } else {
-        state.settings.server.host.clone()
-    };
+    let host = best_lan_ipv4().unwrap_or_else(|| {
+        if state.settings.server.host == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            state.settings.server.host.clone()
+        }
+    });
     let lan_addresses = vec![format!("{}:{}", host, port)];
 
     // Grab any user to own this server instance; best-effort.
@@ -128,6 +159,27 @@ async fn try_upnp_map(port: u16) -> anyhow::Result<Option<String>> {
     }
 }
 
+async fn try_natpmp_map(port: u16) -> anyhow::Result<Option<String>> {
+    let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let mut client = natpmp::Natpmp::new()?;
+        client.send_public_address_request()?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let resp = client.read_response_or_retry()?;
+        let public_ip = match resp {
+            natpmp::Response::Gateway(gw) => gw.public_address().to_string(),
+            _ => return Ok(None),
+        };
+        client.send_port_mapping_request(natpmp::Protocol::TCP, port, port, 3600)?;
+        let _ = client.read_response_or_retry();
+        Ok(Some(public_ip))
+    });
+
+    match handle.await {
+        Ok(res) => Ok(res.unwrap_or(None)),
+        Err(_) => Ok(None),
+    }
+}
+
 async fn fetch_public_ip() -> anyhow::Result<Option<String>> {
     let client = Client::new();
     let endpoints = vec![
@@ -160,6 +212,24 @@ fn local_ipv4() -> Option<std::net::Ipv4Addr> {
     for (_iface, ip) in addrs {
         if let std::net::IpAddr::V4(v4) = ip {
             return Some(v4);
+        }
+    }
+    None
+}
+
+fn best_lan_ipv4() -> Option<String> {
+    let addrs = local_ip_address::list_afinet_netifas().ok()?;
+    for (_iface, ip) in addrs {
+        if let std::net::IpAddr::V4(v4) = ip {
+            let octets = v4.octets();
+            let first = octets[0];
+            let second = octets[1];
+            if first == 10
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+            {
+                return Some(v4.to_string());
+            }
         }
     }
     None

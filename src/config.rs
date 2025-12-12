@@ -288,6 +288,8 @@ pub struct PlaybackConfig {
     pub default_wan_max_bitrate_bps: Option<i64>,
     #[serde(default = "default_lan_bitrate_bps")]
     pub default_lan_max_bitrate_bps: Option<i64>,
+    #[serde(default)]
+    pub profiles: PlaybackProfiles,
 }
 
 impl Default for PlaybackConfig {
@@ -301,8 +303,26 @@ impl Default for PlaybackConfig {
             default_supported_audio_codecs: default_supported_audio_codecs(),
             default_wan_max_bitrate_bps: default_wan_bitrate_bps(),
             default_lan_max_bitrate_bps: default_lan_bitrate_bps(),
+            profiles: PlaybackProfiles::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PlaybackProfiles {
+    pub lan: Option<PlaybackProfileOverride>,
+    pub wan: Option<PlaybackProfileOverride>,
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, PlaybackProfileOverride>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybackProfileOverride {
+    pub max_resolution: Option<String>,
+    pub supported_containers: Option<Vec<String>>,
+    pub supported_video_codecs: Option<Vec<String>>,
+    pub supported_audio_codecs: Option<Vec<String>>,
+    pub max_bitrate_bps: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

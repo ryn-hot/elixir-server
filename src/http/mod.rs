@@ -16,6 +16,15 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
         .route("/api/v1/auth/login", post(handlers::auth::login))
+        .route("/api/v1/auth/signup", post(handlers::auth::signup))
+        .route(
+            "/api/v1/auth/reset/start",
+            post(handlers::auth::start_password_reset),
+        )
+        .route(
+            "/api/v1/auth/reset/complete",
+            post(handlers::auth::complete_password_reset),
+        )
         .route("/api/v1/library/items", get(handlers::library::list_items))
         .route("/api/v1/library/items/:id", get(handlers::library::detail))
         .route("/api/v1/library/scan", post(handlers::library::scan))
@@ -38,6 +47,14 @@ pub fn router(state: AppState) -> Router {
             get(handlers::playback::session_detail),
         )
         .route(
+            "/api/v1/sessions/:id/resume",
+            get(handlers::playback::resume_session),
+        )
+        .route(
+            "/api/v1/sessions/:id/poll",
+            get(handlers::playback::poll_session),
+        )
+        .route(
             "/api/v1/sessions/:id/end",
             post(handlers::playback::end_session),
         )
@@ -55,6 +72,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::control::schema),
         )
         .route("/api/v1/discovery/search", get(handlers::discovery::search))
+        .route(
+            "/api/v1/discovery/suggest",
+            get(handlers::discovery::suggest),
+        )
         .route("/api/v1/profile/playback", get(handlers::profile::profile))
         .with_state(state)
 }

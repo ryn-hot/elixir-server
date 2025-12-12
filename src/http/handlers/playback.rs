@@ -21,7 +21,10 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
-    metrics::{PLAY_DECISIONS, PLAY_LATENCY, TRANSCODE_STARTS},
+    metrics::{
+        PLAY_DECISIONS, PLAY_LATENCY, SEGMENT_SERVED, TRANSCODE_DURATION, TRANSCODE_ERRORS,
+        TRANSCODE_STARTS,
+    },
     network::registry::ensure_server_instance,
     playback::TranscodeParams,
     state::AppState,
@@ -56,6 +59,15 @@ pub struct PlayResponse {
     pub state: String,
     pub logical_position_seconds: f32,
 }
+
+#[derive(Debug, Clone)]
+pub struct EffectiveProfile {
+    pub max_resolution: String,
+    pub supported_containers: Vec<String>,
+    pub supported_video_codecs: Vec<String>,
+    pub supported_audio_codecs: Vec<String>,
+    pub max_bitrate_bps: Option<i64>,
+}
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientCapabilities {
     pub max_resolution: Option<String>,
@@ -81,6 +93,7 @@ struct FileRow {
     width: i32,
     height: i32,
     bitrate_bps: i64,
+    size_bytes: Option<i64>,
 }
 
 pub async fn play(
@@ -107,7 +120,7 @@ pub async fn play(
     let item = item.ok_or_else(|| ApiError::not_found("media item not found"))?;
 
     let rows = sqlx::query(
-        "SELECT id, path, container, video_codec, audio_codec, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(bitrate_bps, 0) as bitrate_bps FROM media_files WHERE media_item_id = ? AND scan_state = 'ok'",
+        "SELECT id, path, container, video_codec, audio_codec, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(bitrate_bps, 0) as bitrate_bps, size_bytes FROM media_files WHERE media_item_id = ? AND scan_state = 'ok'",
     )
     .bind(&body.media_item_id)
     .fetch_all(&state.db_pool)
@@ -125,6 +138,7 @@ pub async fn play(
             width: row.get::<i64, _>("width") as i32,
             height: row.get::<i64, _>("height") as i32,
             bitrate_bps: row.get::<i64, _>("bitrate_bps"),
+            size_bytes: row.try_get::<i64, _>("size_bytes").ok(),
         });
     }
 
@@ -132,22 +146,46 @@ pub async fn play(
         return Err(ApiError::not_found("no playable files for item"));
     }
 
+    let profile = profile_for_network(&state.settings.playback, body.network_type.as_deref());
     let caps_json = body.client_capabilities.clone();
-    let caps = caps_json
+    let mut caps = caps_json
         .clone()
         .and_then(|v| serde_json::from_value::<ClientCapabilities>(v).ok())
         .unwrap_or_else(|| {
-            default_capabilities(&state.settings.playback, body.network_type.as_deref())
+            default_capabilities(
+                &state.settings.playback,
+                body.network_type.as_deref(),
+                &profile,
+            )
         });
+    // Intersect client caps with profile caps to be conservative.
+    caps = merge_caps_with_profile(caps, &profile);
 
     let selected = select_file(
         &files,
         body.preferred_file_id.as_deref(),
         &caps,
+        &profile,
         body.network_type.as_deref(),
+        item.runtime_seconds,
     )
     .ok_or_else(|| ApiError::not_found("requested file not found"))?;
-    let decision = decide_playback(selected, &caps, body.network_type.as_deref());
+    let decision = decide_playback(
+        selected,
+        &caps,
+        &profile,
+        body.network_type.as_deref(),
+        item.runtime_seconds,
+    );
+    if decision.mode == PlaybackMode::Transcode {
+        TRANSCODE_STARTS
+            .with_label_values(&[
+                "pending",
+                selected.container.as_deref().unwrap_or("unknown"),
+                selected.video_codec.as_deref().unwrap_or("unknown"),
+            ])
+            .inc();
+    }
     let session_id = Uuid::new_v4();
     info!(
         user = %user.user_id,
@@ -162,6 +200,8 @@ pub async fn play(
         .with_label_values(&[
             decision.mode_as_str(),
             body.network_type.as_deref().unwrap_or("unknown"),
+            selected.container.as_deref().unwrap_or("unknown"),
+            selected.video_codec.as_deref().unwrap_or("unknown"),
         ])
         .inc();
 
@@ -232,7 +272,9 @@ fn select_file<'a>(
     files: &'a [FileRow],
     preferred: Option<&str>,
     caps: &ClientCapabilities,
+    profile: &EffectiveProfile,
     network: Option<&str>,
+    item_duration: Option<i32>,
 ) -> Option<&'a FileRow> {
     if let Some(pref) = preferred {
         if let Some(f) = files.iter().find(|f| f.id == pref) {
@@ -242,30 +284,32 @@ fn select_file<'a>(
 
     files
         .iter()
-        .max_by(|a, b| compare_files(a, b, caps, network))
+        .max_by(|a, b| compare_files(a, b, caps, profile, network, item_duration))
 }
 
 fn compare_files(
     a: &FileRow,
     b: &FileRow,
     caps: &ClientCapabilities,
+    profile: &EffectiveProfile,
     network: Option<&str>,
+    item_duration: Option<i32>,
 ) -> Ordering {
     let cmp_tuple = |f: &FileRow| -> (bool, i32, i64, i64, i32) {
         let container_match = caps
             .supported_containers
             .as_ref()
-            .map(|c| c.iter().any(|s| eq_ci(f.container.as_deref(), Some(s))))
+            .map(|c| matches_or_unknown(f.container.as_deref(), c))
             .unwrap_or(true);
         let video_match = caps
             .supported_video_codecs
             .as_ref()
-            .map(|c| c.iter().any(|s| eq_ci(f.video_codec.as_deref(), Some(s))))
+            .map(|c| matches_or_unknown(f.video_codec.as_deref(), c))
             .unwrap_or(true);
         let audio_match = caps
             .supported_audio_codecs
             .as_ref()
-            .map(|c| c.iter().any(|s| eq_ci(f.audio_codec.as_deref(), Some(s))))
+            .map(|c| matches_or_unknown(f.audio_codec.as_deref(), c))
             .unwrap_or(true);
 
         let res_ok = match caps.max_resolution.as_deref() {
@@ -279,13 +323,10 @@ fn compare_files(
         let bitrate_cap = match (network, caps.max_bitrate_bps) {
             (Some("wan"), Some(max)) => Some(max.min(8_000_000)),
             (Some("wan"), None) => Some(8_000_000),
-            (_, max) => max,
+            (_, max) => max.or(profile.max_bitrate_bps),
         };
-        let bitrate_ok = if let Some(max) = bitrate_cap {
-            f.bitrate_bps <= max || f.bitrate_bps == 0
-        } else {
-            true
-        };
+        let bitrate_val = effective_bitrate(f, item_duration);
+        let bitrate_ok = bitrate_cap.map(|max| bitrate_val <= max).unwrap_or(true);
 
         let direct_candidate =
             container_match && video_match && audio_match && res_ok && bitrate_ok;
@@ -312,8 +353,8 @@ fn compare_files(
 
         // Prefer lower bitrate when capped; otherwise higher.
         let bitrate_pref = match bitrate_cap {
-            Some(_) => -f.bitrate_bps,
-            None => f.bitrate_bps,
+            Some(_) => -(bitrate_val as i64),
+            None => bitrate_val as i64,
         };
 
         (
@@ -354,46 +395,134 @@ impl PlaybackDecision {
 fn default_capabilities(
     config: &crate::config::PlaybackConfig,
     network: Option<&str>,
+    profile: &EffectiveProfile,
 ) -> ClientCapabilities {
     let max_bitrate = match network {
-        Some("wan") => config.default_wan_max_bitrate_bps,
-        _ => config.default_lan_max_bitrate_bps,
+        Some("wan") => profile
+            .max_bitrate_bps
+            .or(config.default_wan_max_bitrate_bps),
+        _ => profile
+            .max_bitrate_bps
+            .or(config.default_lan_max_bitrate_bps),
     };
 
     ClientCapabilities {
-        max_resolution: Some(config.default_max_resolution.clone()),
-        supported_containers: Some(config.default_supported_containers.clone()),
-        supported_video_codecs: Some(config.default_supported_video_codecs.clone()),
-        supported_audio_codecs: Some(config.default_supported_audio_codecs.clone()),
+        max_resolution: Some(profile.max_resolution.clone()),
+        supported_containers: Some(profile.supported_containers.clone()),
+        supported_video_codecs: Some(profile.supported_video_codecs.clone()),
+        supported_audio_codecs: Some(profile.supported_audio_codecs.clone()),
         max_bitrate_bps: max_bitrate,
+    }
+}
+
+fn merge_caps_with_profile(
+    mut caps: ClientCapabilities,
+    profile: &EffectiveProfile,
+) -> ClientCapabilities {
+    // Merge supported containers/codecs by intersection when both present.
+    if let Some(client) = caps.supported_containers.as_ref() {
+        let merged: Vec<String> = client
+            .iter()
+            .filter(|c| {
+                profile
+                    .supported_containers
+                    .iter()
+                    .any(|p| eq_ci(Some(c.as_str()), Some(p.as_str())))
+            })
+            .cloned()
+            .collect();
+        caps.supported_containers = Some(merged);
+    } else {
+        caps.supported_containers = Some(profile.supported_containers.clone());
+    }
+    if let Some(client) = caps.supported_video_codecs.as_ref() {
+        let merged: Vec<String> = client
+            .iter()
+            .filter(|c| {
+                profile
+                    .supported_video_codecs
+                    .iter()
+                    .any(|p| eq_ci(Some(c.as_str()), Some(p.as_str())))
+            })
+            .cloned()
+            .collect();
+        caps.supported_video_codecs = Some(merged);
+    } else {
+        caps.supported_video_codecs = Some(profile.supported_video_codecs.clone());
+    }
+    if let Some(client) = caps.supported_audio_codecs.as_ref() {
+        let merged: Vec<String> = client
+            .iter()
+            .filter(|c| {
+                profile
+                    .supported_audio_codecs
+                    .iter()
+                    .any(|p| eq_ci(Some(c.as_str()), Some(p.as_str())))
+            })
+            .cloned()
+            .collect();
+        caps.supported_audio_codecs = Some(merged);
+    } else {
+        caps.supported_audio_codecs = Some(profile.supported_audio_codecs.clone());
+    }
+
+    // Min resolution
+    caps.max_resolution = match (
+        caps.max_resolution.clone(),
+        Some(profile.max_resolution.clone()),
+    ) {
+        (Some(client), Some(profile)) => Some(min_resolution(&client, &profile)),
+        (_, profile) => profile,
+    };
+
+    // Min bitrate cap if both present
+    if let (Some(client), Some(profile_bps)) = (caps.max_bitrate_bps, profile.max_bitrate_bps) {
+        caps.max_bitrate_bps = Some(client.min(profile_bps));
+    } else if caps.max_bitrate_bps.is_none() {
+        caps.max_bitrate_bps = profile.max_bitrate_bps;
+    }
+
+    caps
+}
+
+fn min_resolution(a: &str, b: &str) -> String {
+    let rank = |r: &str| -> i32 {
+        match r.to_ascii_lowercase().as_str() {
+            "720p" => 1,
+            "1080p" => 2,
+            "1440p" => 3,
+            "4k" | "2160p" => 4,
+            _ => 0,
+        }
+    };
+    if rank(a) <= rank(b) {
+        a.to_string()
+    } else {
+        b.to_string()
     }
 }
 
 fn decide_playback(
     file: &FileRow,
     caps: &ClientCapabilities,
+    profile: &EffectiveProfile,
     network_type: Option<&str>,
+    item_duration: Option<i32>,
 ) -> PlaybackDecision {
     let allow_container = caps
         .supported_containers
         .as_ref()
-        .map(|c| c.iter().any(|s| eq_ci(file.container.as_deref(), Some(s))))
+        .map(|c| matches_or_unknown(file.container.as_deref(), c))
         .unwrap_or(true);
     let allow_video = caps
         .supported_video_codecs
         .as_ref()
-        .map(|c| {
-            c.iter()
-                .any(|s| eq_ci(file.video_codec.as_deref(), Some(s)))
-        })
+        .map(|c| matches_or_unknown(file.video_codec.as_deref(), c))
         .unwrap_or(true);
     let allow_audio = caps
         .supported_audio_codecs
         .as_ref()
-        .map(|c| {
-            c.iter()
-                .any(|s| eq_ci(file.audio_codec.as_deref(), Some(s)))
-        })
+        .map(|c| matches_or_unknown(file.audio_codec.as_deref(), c))
         .unwrap_or(true);
 
     let res_ok = match caps.max_resolution.as_deref() {
@@ -407,14 +536,11 @@ fn decide_playback(
     let bitrate_cap = match (network_type, caps.max_bitrate_bps) {
         (Some("wan"), Some(max)) => Some(max.min(8_000_000)), // cap WAN more tightly
         (Some("wan"), None) => Some(8_000_000),
-        (_, max) => max,
+        (_, max) => max.or(profile.max_bitrate_bps),
     };
 
-    let bitrate_ok = if let Some(max) = bitrate_cap {
-        file.bitrate_bps <= max || file.bitrate_bps == 0
-    } else {
-        true
-    };
+    let bitrate_val = effective_bitrate(file, item_duration);
+    let bitrate_ok = bitrate_cap.map(|max| bitrate_val <= max).unwrap_or(true);
     let mut reasons = Vec::new();
     if !allow_container {
         reasons.push("container unsupported");
@@ -450,6 +576,64 @@ fn eq_ci(a: Option<&str>, b: Option<&str>) -> bool {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
     }
+}
+
+fn matches_or_unknown(value: Option<&str>, allowed: &[String]) -> bool {
+    match value {
+        None => true,
+        Some(v) => allowed.iter().any(|s| v.eq_ignore_ascii_case(s.as_str())),
+    }
+}
+
+pub fn profile_for_network(
+    config: &crate::config::PlaybackConfig,
+    network: Option<&str>,
+) -> EffectiveProfile {
+    let base = match network {
+        Some("lan") => config.profiles.lan.as_ref(),
+        Some("wan") => config.profiles.wan.as_ref(),
+        _ => None,
+    };
+
+    let fallback = match network {
+        Some("lan") => config.profiles.wan.as_ref(),
+        _ => None,
+    };
+
+    let merged = base.or(fallback);
+
+    EffectiveProfile {
+        max_resolution: merged
+            .and_then(|p| p.max_resolution.clone())
+            .unwrap_or_else(|| config.default_max_resolution.clone()),
+        supported_containers: merged
+            .and_then(|p| p.supported_containers.clone())
+            .unwrap_or_else(|| config.default_supported_containers.clone()),
+        supported_video_codecs: merged
+            .and_then(|p| p.supported_video_codecs.clone())
+            .unwrap_or_else(|| config.default_supported_video_codecs.clone()),
+        supported_audio_codecs: merged
+            .and_then(|p| p.supported_audio_codecs.clone())
+            .unwrap_or_else(|| config.default_supported_audio_codecs.clone()),
+        max_bitrate_bps: merged
+            .and_then(|p| p.max_bitrate_bps)
+            .or_else(|| match network {
+                Some("lan") => config.default_lan_max_bitrate_bps,
+                _ => config.default_wan_max_bitrate_bps,
+            }),
+    }
+}
+
+fn effective_bitrate(file: &FileRow, duration_seconds: Option<i32>) -> i64 {
+    if file.bitrate_bps > 0 {
+        return file.bitrate_bps;
+    }
+    if let (Some(size), Some(dur)) = (file.size_bytes, duration_seconds) {
+        if dur > 0 {
+            return ((size as f64 * 8.0) / dur as f64).round() as i64;
+        }
+    }
+    0
 }
 
 pub async fn stream_direct(
@@ -600,6 +784,7 @@ pub async fn master_playlist(
             let msg = format!("transcode spawn failed: {e}");
             let session_id = id.clone();
             let state_clone = state.clone();
+            TRANSCODE_ERRORS.with_label_values(&["spawn_failed"]).inc();
             let _ = tokio::spawn(async move {
                 mark_session_error(state_clone, &session_id, Some(msg)).await
             });
@@ -612,6 +797,7 @@ pub async fn master_playlist(
         log = %handle.log_path.to_string_lossy(),
         "transcode start or resume"
     );
+    let start_time = std::time::Instant::now();
 
     // Wait briefly for playlist to appear; retry a few times to avoid flakiness.
     let content = match read_playlist_with_retry(
@@ -628,6 +814,7 @@ pub async fn master_playlist(
             let session_id = id.clone();
             let state_clone = state.clone();
             TRANSCODE_STARTS.with_label_values(&["error"]).inc();
+            TRANSCODE_ERRORS.with_label_values(&["playlist_read"]).inc();
             let _ = tokio::spawn(async move {
                 mark_session_error(state_clone, &session_id, Some(msg)).await
             });
@@ -651,6 +838,9 @@ pub async fn master_playlist(
     .bind(&id)
     .execute(&state.db_pool)
     .await;
+    TRANSCODE_DURATION
+        .with_label_values(&["ok"])
+        .observe(start_time.elapsed().as_secs_f64());
 
     Ok((
         StatusCode::OK,
@@ -693,11 +883,14 @@ pub async fn serve_segment(
         .await
         .ok_or_else(|| ApiError::not_found("segment not found"))?;
     if !path.exists() {
+        SEGMENT_SERVED.with_label_values(&["missing"]).inc();
         return Err(ApiError::not_found("segment not found"));
     }
-    let data = fs::read(&path)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let data = fs::read(&path).await.map_err(|e| {
+        SEGMENT_SERVED.with_label_values(&["error"]).inc();
+        ApiError::internal(e.to_string())
+    })?;
+    SEGMENT_SERVED.with_label_values(&["ok"]).inc();
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, HeaderValue::from_static("video/MP2T"))],
@@ -729,6 +922,7 @@ pub struct SessionDetailResponse {
     pub wan_direct_endpoint: Option<String>,
     pub transcode_state: Option<serde_json::Value>,
     pub log_path: Option<String>,
+    pub error: Option<String>,
     pub updated_at: Option<String>,
 }
 
@@ -865,6 +1059,10 @@ pub async fn session_detail(
         .as_ref()
         .and_then(|v| v.get("log_path").and_then(Value::as_str))
         .map(|s| s.to_string());
+    let error = transcode_state
+        .as_ref()
+        .and_then(|v| v.get("error").and_then(Value::as_str))
+        .map(|s| s.to_string());
 
     let logical_position_seconds = session
         .try_get::<f64, _>("logical_position_seconds")
@@ -895,7 +1093,68 @@ pub async fn session_detail(
         wan_direct_endpoint,
         transcode_state,
         log_path,
+        error,
         updated_at: session.try_get("updated_at").ok(),
+    };
+
+    Ok(Json(response))
+}
+
+pub async fn resume_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    user: CurrentUser,
+) -> ApiResult<Json<SessionDetailResponse>> {
+    session_detail(State(state), AxumPath(id), user).await
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPollResponse {
+    pub id: String,
+    pub state: String,
+    pub mode: String,
+    pub logical_position_seconds: f32,
+    pub duration_seconds: Option<i32>,
+    pub log_path: Option<String>,
+    pub error: Option<String>,
+}
+
+pub async fn poll_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    user: CurrentUser,
+) -> ApiResult<Json<SessionPollResponse>> {
+    let session = get_session(&state, &user, &id, None, false).await?;
+    let transcode_state: Option<serde_json::Value> = session
+        .try_get::<String, _>("transcode_state")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let log_path = transcode_state
+        .as_ref()
+        .and_then(|v| v.get("log_path").and_then(Value::as_str))
+        .map(|s| s.to_string());
+    let error = transcode_state
+        .as_ref()
+        .and_then(|v| v.get("error").and_then(Value::as_str))
+        .map(|s| s.to_string());
+    let logical_position_seconds = session
+        .try_get::<f64, _>("logical_position_seconds")
+        .ok()
+        .map(|v| v as f32)
+        .unwrap_or(0.0);
+
+    let response = SessionPollResponse {
+        id: id.clone(),
+        state: session.get("state"),
+        mode: session.get("mode"),
+        logical_position_seconds,
+        duration_seconds: session
+            .try_get::<i64, _>("duration_seconds")
+            .ok()
+            .map(|v| v as i32),
+        log_path,
+        error,
     };
 
     Ok(Json(response))
@@ -962,6 +1221,9 @@ pub async fn seek_transcode(
             let _ = tokio::spawn(async move {
                 mark_session_error(state_clone, &session_id, Some(msg)).await
             });
+            TRANSCODE_ERRORS
+                .with_label_values(&["restart_failed"])
+                .inc();
             ApiError::internal(e.to_string())
         })?;
     TRANSCODE_STARTS.with_label_values(&["restart"]).inc();

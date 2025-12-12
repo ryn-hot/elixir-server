@@ -78,8 +78,50 @@ impl MetadataService {
     ) -> Result<Vec<DiscoveryResult>> {
         let media_kind = match r#type.unwrap_or(MediaType::Movie) {
             MediaType::Movie => "movie",
-            _ => "series",
+            MediaType::Series => "series",
+            MediaType::Anime => "series",
         };
+
+        // Anime-specific search via Anilist
+        if matches!(r#type, Some(MediaType::Anime)) && self.config.enable_anilist {
+            if let Ok(items) = providers::anilist::search(&self.client, query).await {
+                if !items.is_empty() {
+                    let mapped = items
+                        .into_iter()
+                        .map(|media| {
+                            let title = media
+                                .title
+                                .as_ref()
+                                .and_then(|t| {
+                                    t.get("romaji")
+                                        .or_else(|| t.get("english"))
+                                        .or_else(|| t.get("native"))
+                                })
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(query)
+                                .to_string();
+                            let year = media
+                                .startDate
+                                .as_ref()
+                                .and_then(|d| d.get("year"))
+                                .and_then(serde_json::Value::as_i64)
+                                .map(|v| v as i32);
+                            DiscoveryResult {
+                                title,
+                                r#type: MediaType::Anime,
+                                year,
+                                external_ids: Some(ExternalIds {
+                                    anilist: Some(media.id.to_string()),
+                                    ..Default::default()
+                                }),
+                                description: media.description.clone(),
+                            }
+                        })
+                        .collect();
+                    return Ok(mapped);
+                }
+            }
+        }
 
         // Try Cinemeta first.
         if self.config.enable_cinemeta {

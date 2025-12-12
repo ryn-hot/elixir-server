@@ -164,6 +164,18 @@ pub mod anilist {
     use super::*;
     use serde::Deserialize;
 
+    #[derive(Debug, Deserialize, Serialize)]
+    pub struct MediaItem {
+        pub id: i32,
+        pub title: Option<serde_json::Value>,
+        pub episodes: Option<i32>,
+        pub duration: Option<i32>,
+        pub format: Option<String>,
+        pub description: Option<String>,
+        pub genres: Option<Vec<String>>,
+        pub startDate: Option<serde_json::Value>,
+    }
+
     pub async fn fetch(
         client: &Client,
         identity: &MediaIdentity,
@@ -187,25 +199,6 @@ pub mod anilist {
             search: &'a str,
         }
 
-        #[derive(Deserialize)]
-        struct MediaResp {
-            data: Option<MediaData>,
-        }
-        #[derive(Deserialize)]
-        struct MediaData {
-            Media: Option<MediaItem>,
-        }
-        #[derive(Deserialize, Serialize)]
-        struct MediaItem {
-            id: i32,
-            title: Option<serde_json::Value>,
-            episodes: Option<i32>,
-            duration: Option<i32>,
-            format: Option<String>,
-            description: Option<String>,
-            genres: Option<Vec<String>>,
-        }
-
         let res = client
             .post("https://graphql.anilist.co")
             .json(&serde_json::json!({ "query": query, "variables": Variables { search: &identity.title } }))
@@ -215,8 +208,18 @@ pub mod anilist {
         if !res.status().is_success() {
             return Ok(None);
         }
+        #[derive(Deserialize)]
+        struct MediaResp {
+            data: Option<MediaData>,
+        }
+        #[derive(Deserialize)]
+        struct MediaData {
+            #[serde(rename = "Media")]
+            media: Option<MediaItem>,
+        }
+
         let body: MediaResp = res.json().await?;
-        if let Some(media) = body.data.and_then(|d| d.Media) {
+        if let Some(media) = body.data.and_then(|d| d.media) {
             let runtime_seconds = media
                 .duration
                 .and_then(|d| media.episodes.map(|e| d * 60 * e).or(Some(d * 60)));
@@ -233,6 +236,59 @@ pub mod anilist {
             }));
         }
         Ok(None)
+    }
+
+    pub async fn search(client: &Client, query: &str) -> Result<Vec<MediaItem>> {
+        let gql = r#"
+            query ($search: String) {
+              Page(perPage: 5) {
+                media(search: $search, type: ANIME) {
+                  id
+                  title { romaji english native }
+                  episodes
+                  duration
+                  format
+                  description
+                  genres
+                  startDate { year }
+                }
+              }
+            }
+        "#;
+
+        #[derive(Serialize)]
+        struct Variables<'a> {
+            search: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct PageData {
+            media: Option<Vec<MediaItem>>,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Option<Data>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            #[serde(rename = "Page")]
+            page: Option<PageData>,
+        }
+
+        let res = client
+            .post("https://graphql.anilist.co")
+            .json(&serde_json::json!({ "query": gql, "variables": Variables { search: query } }))
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let body: Resp = res.json().await?;
+        Ok(body
+            .data
+            .and_then(|d| d.page)
+            .and_then(|p| p.media)
+            .unwrap_or_default())
     }
 }
 

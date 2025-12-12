@@ -92,6 +92,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         json.get("environment").and_then(Value::as_str),
         Some("development")
     );
+    assert!(json.get("network").is_some());
     assert_eq!(
         json.get("database")
             .and_then(|d| d.get("driver"))
@@ -162,6 +163,136 @@ async fn login_returns_access_token() -> Result<()> {
         access_token.is_some(),
         "missing access token in login response"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn signup_and_password_reset_flow() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "signup-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+    ));
+
+    // Signup
+    let signup_body = serde_json::json!({
+        "email": "newuser@example.com",
+        "password": "strongpassword"
+    });
+    let signup_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(signup_body.to_string()))?,
+        )
+        .await?;
+    let signup_status = signup_resp.status();
+    let signup_bytes = body::to_bytes(signup_resp.into_body(), 1_048_576).await?;
+    let signup_json: Value = serde_json::from_slice(&signup_bytes)?;
+    assert_eq!(
+        signup_status,
+        StatusCode::OK,
+        "signup body: {}",
+        signup_json
+    );
+    assert!(signup_json.get("accessToken").is_some() || signup_json.get("access_token").is_some());
+
+    // Duplicate signup should fail
+    let dup_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(signup_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(dup_resp.status(), StatusCode::CONFLICT);
+
+    // Start reset
+    let reset_start_body = serde_json::json!({
+        "email": "newuser@example.com"
+    });
+    let reset_start_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/reset/start")
+                .header("content-type", "application/json")
+                .body(Body::from(reset_start_body.to_string()))?,
+        )
+        .await?;
+    let reset_status = reset_start_resp.status();
+    let reset_bytes = body::to_bytes(reset_start_resp.into_body(), 1_048_576).await?;
+    let reset_json: Value = serde_json::from_slice(&reset_bytes)?;
+    eprintln!("reset_start_status={} body={}", reset_status, reset_json);
+    assert_eq!(reset_status, StatusCode::OK);
+    let token = reset_json
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(!token.is_empty());
+
+    // Complete reset
+    let complete_body = serde_json::json!({
+        "token": token,
+        "new_password": "newstrongpassword"
+    });
+    let complete_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/reset/complete")
+                .header("content-type", "application/json")
+                .body(Body::from(complete_body.to_string()))?,
+        )
+        .await?;
+    let complete_status = complete_resp.status();
+    let complete_bytes = body::to_bytes(complete_resp.into_body(), 1_048_576).await?;
+    let complete_json: Value = serde_json::from_slice(&complete_bytes)?;
+    assert_eq!(
+        complete_status,
+        StatusCode::OK,
+        "reset complete body: {}",
+        complete_json
+    );
+
+    // Login with new password should succeed
+    let login_body = serde_json::json!({
+        "email": "newuser@example.com",
+        "password": "newstrongpassword"
+    });
+    let login_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(login_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    // Invalid reset should fail
+    let bad_complete = serde_json::json!({
+        "token": "bad-token",
+        "new_password": "anotherpassword"
+    });
+    let bad_resp = app
+        .oneshot(
+            Request::post("/api/v1/auth/reset/complete")
+                .header("content-type", "application/json")
+                .body(Body::from(bad_complete.to_string()))?,
+        )
+        .await?;
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
 
     Ok(())
 }
@@ -305,6 +436,13 @@ async fn discovery_requires_auth() -> Result<()> {
         metadata,
     );
     let app = router(state.clone());
+
+    // Suggest should also require auth
+    let suggest_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/discovery/suggest?q=test").body(Body::empty())?)
+        .await?;
+    assert_eq!(suggest_resp.status(), StatusCode::UNAUTHORIZED);
 
     let resp = app
         .oneshot(Request::get("/api/v1/discovery/search?q=test").body(Body::empty())?)

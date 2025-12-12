@@ -8,7 +8,8 @@ pub static PLAY_DECISIONS: Lazy<IntCounterVec> = Lazy::new(|| {
         "elixir_play_decisions_total",
         "Count of play decisions by mode and network",
     );
-    IntCounterVec::new(opts, &["mode", "network"]).expect("counter vec created")
+    IntCounterVec::new(opts, &["mode", "network", "container", "video_codec"])
+        .expect("counter vec created")
 });
 
 pub static TRANSCODE_STARTS: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -16,7 +17,7 @@ pub static TRANSCODE_STARTS: Lazy<IntCounterVec> = Lazy::new(|| {
         "elixir_transcode_starts_total",
         "Count of transcode start attempts",
     );
-    IntCounterVec::new(opts, &["result"]).expect("counter vec created")
+    IntCounterVec::new(opts, &["result", "container", "video_codec"]).expect("counter vec created")
 });
 
 pub static REGISTRY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -27,6 +28,32 @@ pub static REGISTRY_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
 pub static WAN_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new("elixir_wan_events_total", "Count of WAN setup events");
     IntCounterVec::new(opts, &["step", "result"]).expect("counter vec created")
+});
+
+pub static TRANSCODE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_transcode_duration_seconds",
+        "Duration of transcode sessions",
+    );
+    HistogramVec::new(opts, &["result"]).expect("histogram vec created")
+});
+
+pub static TRANSCODE_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new("elixir_transcode_errors_total", "Count of transcode errors");
+    IntCounterVec::new(opts, &["reason"]).expect("counter vec created")
+});
+
+pub static SEGMENT_SERVED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_segments_served_total",
+        "Count of HLS segments served",
+    );
+    IntCounterVec::new(opts, &["result"]).expect("counter vec created")
+});
+
+pub static PLAY_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new("elixir_play_errors_total", "Count of play errors");
+    IntCounterVec::new(opts, &["reason"]).expect("counter vec created")
 });
 
 pub static PLAY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
@@ -42,6 +69,10 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
     REGISTRY.register(Box::new(REGISTRY_ACTIONS.clone())).ok();
     REGISTRY.register(Box::new(WAN_EVENTS.clone())).ok();
+    REGISTRY.register(Box::new(TRANSCODE_DURATION.clone())).ok();
+    REGISTRY.register(Box::new(TRANSCODE_ERRORS.clone())).ok();
+    REGISTRY.register(Box::new(SEGMENT_SERVED.clone())).ok();
+    REGISTRY.register(Box::new(PLAY_ERRORS.clone())).ok();
     REGISTRY.register(Box::new(PLAY_LATENCY.clone())).ok();
 }
 

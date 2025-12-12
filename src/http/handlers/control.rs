@@ -42,6 +42,7 @@ pub async fn register(
     user: CurrentUser,
     Json(body): Json<RegisterServerRequest>,
 ) -> ApiResult<Json<&'static str>> {
+    let start = std::time::Instant::now();
     if body.device_name.trim().is_empty() {
         return Err(ApiError::bad_request("device_name is required"));
     }
@@ -64,14 +65,22 @@ pub async fn register(
         .bind(server_id.to_string())
         .bind(body.device_name)
         .bind(lan_addresses)
-        .bind(body.wan_direct_endpoint)
-        .bind(body.overlay_endpoint)
+        .bind(body.wan_direct_endpoint.clone())
+        .bind(body.overlay_endpoint.clone())
         .execute(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     REGISTRY_ACTIONS
         .with_label_values(&["register", "ok"])
         .inc();
+    tracing::info!(
+        user = %user.user_id,
+        server_id = %server_id,
+        elapsed_ms = start.elapsed().as_millis(),
+        lan = ?body.lan_addresses,
+        wan = ?body.wan_direct_endpoint,
+        "registry register"
+    );
 
     Ok(Json("ok"))
 }
@@ -82,10 +91,15 @@ pub async fn list(
 ) -> ApiResult<Json<ServersResponse>> {
     let rows = sqlx::query("SELECT server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, datetime(last_seen_at) as last_seen_at FROM server_registry WHERE user_id = ? ORDER BY last_seen_at DESC")
         .bind(user.user_id.to_string())
-        .fetch_all(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     REGISTRY_ACTIONS.with_label_values(&["list", "ok"]).inc();
+    tracing::info!(
+        user = %user.user_id,
+        count = rows.len(),
+        "registry list"
+    );
 
     let mut servers = Vec::new();
     for row in rows {
