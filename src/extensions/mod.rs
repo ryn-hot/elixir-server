@@ -5,11 +5,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use globwalk::GlobWalkerBuilder;
 use serde::{Deserialize, Serialize};
+use sqlx::AnyPool;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 use tracing::debug;
+use uuid::Uuid;
 
-use crate::db::models::MediaType;
+use crate::{config::SonarrConfig, db::models::MediaType, extensions::sonarr::load_sonarr_sources};
+
+mod sonarr;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtensionManifest {
@@ -65,6 +69,8 @@ pub struct MediaFileCandidate {
     pub files: Vec<FileDescriptor>,
     #[serde(default)]
     pub extension_metadata: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub source_config_id: Option<Uuid>,
 }
 
 #[async_trait]
@@ -97,7 +103,7 @@ impl ExtensionManager {
             .push(RegisteredFileSource { manifest, source });
     }
 
-    pub async fn load_from_dir(path: &str, local_root: &str) -> Result<Self> {
+    pub async fn load_from_dir(path: &str, local_root: &str, hash_files: bool) -> Result<Self> {
         let mut manager = Self::new();
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries {
@@ -123,18 +129,35 @@ impl ExtensionManager {
             },
             Box::new(LocalFolderSource {
                 root_path: local_root.to_string(),
+                hash_files,
             }),
         );
+
         Ok(manager)
     }
 
-    pub async fn scan_all(&self) -> Result<Vec<MediaFileCandidate>> {
+    pub async fn scan_all(&self, since: Option<DateTime<Utc>>) -> Result<Vec<MediaFileCandidate>> {
         let mut results = Vec::new();
         for reg in &self.file_sources {
             if reg.manifest.capabilities.file_source {
-                let mut entries = reg.source.scan(None).await?;
+                let mut entries = reg.source.scan(since).await?;
                 results.append(&mut entries);
             }
+        }
+        Ok(results)
+    }
+
+    pub async fn scan_all_with_db(
+        &self,
+        pool: &AnyPool,
+        sonarr_config: &SonarrConfig,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<MediaFileCandidate>> {
+        let mut results = self.scan_all(since).await?;
+        let sonarr_sources = load_sonarr_sources(pool, sonarr_config).await?;
+        for source in sonarr_sources {
+            let mut entries = source.scan(since).await?;
+            results.append(&mut entries);
         }
         Ok(results)
     }
@@ -163,11 +186,12 @@ impl FileSource for NullFileSource {
 /// Built-in local folder file source. Reads from a configured root path.
 pub struct LocalFolderSource {
     pub root_path: String,
+    pub hash_files: bool,
 }
 
 #[async_trait]
 impl FileSource for LocalFolderSource {
-    async fn scan(&self, _since: Option<DateTime<Utc>>) -> Result<Vec<MediaFileCandidate>> {
+    async fn scan(&self, since: Option<DateTime<Utc>>) -> Result<Vec<MediaFileCandidate>> {
         if !Path::new(&self.root_path).exists() {
             return Ok(vec![]);
         }
@@ -184,7 +208,17 @@ impl FileSource for LocalFolderSource {
             if !path.is_file() {
                 continue;
             }
-            if let Some(candidate) = build_candidate_from_path(path) {
+            if let Some(since_ts) = since {
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        let modified: DateTime<Utc> = modified.into();
+                        if modified < since_ts {
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some(candidate) = build_candidate_from_path(path, self.hash_files).await {
                 debug!("found media candidate at {}", candidate.files[0].path);
                 candidates.push(candidate);
             }
@@ -193,17 +227,18 @@ impl FileSource for LocalFolderSource {
     }
 }
 
-fn build_candidate_from_path(path: &Path) -> Option<MediaFileCandidate> {
+async fn build_candidate_from_path(path: &Path, hash_files: bool) -> Option<MediaFileCandidate> {
     let file_name = path.file_stem()?.to_string_lossy().to_string();
     let mut parts = file_name.split(['.', ' ']).collect::<Vec<_>>();
     if parts.is_empty() {
         return None;
     }
 
-    // crude parse: "Title (Year)" or "Title.Year"
     let mut title = parts.join(" ");
-    let mut year = None;
-    if let Some(last) = parts.last() {
+    let mut year = extract_year(&title);
+    if year.is_some() {
+        title = strip_year_suffix(&title);
+    } else if let Some(last) = parts.last() {
         if let Ok(y) = last.parse::<i32>() {
             year = Some(y);
             parts.pop();
@@ -211,19 +246,31 @@ fn build_candidate_from_path(path: &Path) -> Option<MediaFileCandidate> {
         }
     }
 
+    let (season, episode) = parse_season_episode(&file_name);
+
     let identity = MediaIdentity {
-        r#type: MediaType::Movie,
+        r#type: if season.is_some() || episode.is_some() {
+            MediaType::Series
+        } else {
+            MediaType::Movie
+        },
         external_ids: ExternalIds::default(),
         title: title.trim().to_string(),
         year,
-        season: None,
-        episode: None,
+        season,
+        episode,
+    };
+
+    let hash = if hash_files {
+        compute_hash(&path.to_string_lossy()).await
+    } else {
+        None
     };
 
     let desc = FileDescriptor {
         path: path.to_string_lossy().to_string(),
         size_bytes: path.metadata().ok().map(|m| m.len() as i64),
-        hash: None,
+        hash,
         container: path.extension().map(|e| e.to_string_lossy().to_string()),
         video_codec: None,
         audio_codec: None,
@@ -233,7 +280,72 @@ fn build_candidate_from_path(path: &Path) -> Option<MediaFileCandidate> {
         identity,
         files: vec![desc],
         extension_metadata: HashMap::new(),
+        source_config_id: None,
     })
+}
+
+fn extract_year(title: &str) -> Option<i32> {
+    if let Some(start) = title.find('(') {
+        if let Some(end) = title[start + 1..].find(')') {
+            let year_str = &title[start + 1..start + 1 + end];
+            if let Ok(y) = year_str.parse::<i32>() {
+                return Some(y);
+            }
+        }
+    }
+    None
+}
+
+fn strip_year_suffix(title: &str) -> String {
+    if let Some(idx) = title.rfind('(') {
+        return title[..idx].trim().to_string();
+    }
+    title.to_string()
+}
+
+fn parse_season_episode(name: &str) -> (Option<i32>, Option<i32>) {
+    let upper = name.to_ascii_uppercase();
+    if let Some(idx) = upper.find('S') {
+        let rest = &upper[idx + 1..];
+        let season = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if let Some(e_idx) = rest.find('E') {
+            let after_e = &rest[e_idx + 1..];
+            let episode = after_e
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+            let s_num = season.parse::<i32>().ok();
+            let e_num = episode.parse::<i32>().ok();
+            return (s_num, e_num);
+        }
+    }
+    (None, None)
+}
+
+async fn compute_hash(path: &str) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 8192];
+    let mut read = 0usize;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                read += n;
+                if read > 10 * 1024 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -252,6 +364,7 @@ mod tests {
 
         let source = LocalFolderSource {
             root_path: dir.path().to_string_lossy().to_string(),
+            hash_files: false,
         };
 
         let items = source.scan(None).await?;

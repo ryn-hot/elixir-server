@@ -34,6 +34,8 @@ pub struct TranscodeJob {
 pub struct TranscodeHandle {
     pub playlist_path: PathBuf,
     pub log_path: PathBuf,
+    pub temp_dir: PathBuf,
+    pub pid: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -61,8 +63,20 @@ impl TranscodeManager {
                     return Ok(TranscodeHandle {
                         playlist_path: job.temp_dir.join("index.m3u8"),
                         log_path: job.log_path.clone(),
+                        temp_dir: job.temp_dir.clone(),
+                        pid: child.id(),
                     });
                 }
+            }
+            // Child ended; reuse existing playlist if present.
+            let playlist_path = job.temp_dir.join("index.m3u8");
+            if playlist_path.exists() {
+                return Ok(TranscodeHandle {
+                    playlist_path,
+                    log_path: job.log_path.clone(),
+                    temp_dir: job.temp_dir.clone(),
+                    pid: None,
+                });
             }
         }
 
@@ -79,6 +93,7 @@ impl TranscodeManager {
             &log_path,
         )
         .await?;
+        let pid = child.id();
 
         let job = TranscodeJob {
             temp_dir: temp_dir.clone(),
@@ -92,6 +107,8 @@ impl TranscodeManager {
         Ok(TranscodeHandle {
             playlist_path,
             log_path,
+            temp_dir,
+            pid,
         })
     }
 
@@ -100,7 +117,7 @@ impl TranscodeManager {
         session_id: Uuid,
         media_path: &str,
         seek_seconds: f32,
-    ) -> Result<()> {
+    ) -> Result<TranscodeHandle> {
         let mut guard = self.inner.lock().await;
         if let Some(mut job) = guard.remove(&session_id) {
             if let Some(mut child) = job.child.take() {
@@ -121,16 +138,22 @@ impl TranscodeManager {
             &log_path,
         )
         .await?;
+        let pid = child.id();
 
         let job = TranscodeJob {
-            temp_dir,
+            temp_dir: temp_dir.clone(),
             media_path: media_path.to_string(),
             seek_seconds,
-            log_path,
+            log_path: log_path.clone(),
             child: Some(child),
         };
         guard.insert(session_id, job);
-        Ok(())
+        Ok(TranscodeHandle {
+            playlist_path,
+            log_path,
+            temp_dir,
+            pid,
+        })
     }
 
     pub async fn segment_path(&self, session_id: Uuid, name: &str) -> Option<PathBuf> {

@@ -48,6 +48,8 @@ impl Settings {
                 "library.scan_interval_seconds",
                 default_scan_interval_seconds(),
             )?
+            .set_default("library.hash_dedupe_enabled", default_false())?
+            .set_default("library.sonarr.enabled", default_false())?
             .set_default("metadata.enable_cinemeta", true)?
             .set_default("metadata.enable_wikidata", true)?
             .set_default("metadata.enable_anilist", true)?
@@ -227,6 +229,10 @@ pub struct LibraryConfig {
     pub local_root: String,
     #[serde(default = "default_scan_interval_seconds")]
     pub scan_interval_seconds: u64,
+    #[serde(default)]
+    pub sonarr: SonarrConfig,
+    #[serde(default = "default_false")]
+    pub hash_dedupe_enabled: bool,
 }
 
 impl Default for LibraryConfig {
@@ -234,8 +240,18 @@ impl Default for LibraryConfig {
         Self {
             local_root: default_local_root(),
             scan_interval_seconds: default_scan_interval_seconds(),
+            sonarr: SonarrConfig::default(),
+            hash_dedupe_enabled: default_false(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SonarrConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -382,6 +398,10 @@ fn default_scan_interval_seconds() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_request_timeout() -> u64 {

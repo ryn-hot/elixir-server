@@ -37,7 +37,7 @@ pub async fn list_items(
             id: row.get::<String, _>("id"),
             title: row.get::<String, _>("title"),
             r#type: row.get::<String, _>("type"),
-            year: row.get::<Option<i32>, _>("year"),
+            year: row.try_get::<i64, _>("year").ok().map(|v| v as i32),
             updated_at: row.get::<String, _>("updated_at"),
             runtime_seconds: row
                 .try_get::<String, _>("runtime_seconds")
@@ -66,7 +66,7 @@ pub async fn scan(
 ) -> ApiResult<Json<&'static str>> {
     let candidates = state
         .extensions
-        .scan_all()
+        .scan_all_with_db(&state.db_pool, &state.settings.library.sonarr, None)
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
     run_full_scan_with_metadata(
@@ -74,6 +74,7 @@ pub async fn scan(
         Some(&state.metadata),
         candidates,
         params.force_metadata,
+        state.settings.library.hash_dedupe_enabled,
     )
     .await
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
@@ -105,6 +106,8 @@ pub struct LibraryFileResponse {
     pub audio_codec: Option<String>,
     pub size_bytes: Option<i64>,
     pub scan_state: String,
+    pub source_config_id: Option<String>,
+    pub extension_metadata: Option<serde_json::Value>,
 }
 
 pub async fn detail(
@@ -119,7 +122,7 @@ pub async fn detail(
 
     let item = item.ok_or_else(|| crate::http::error::ApiError::not_found("item not found"))?;
 
-    let files = sqlx::query("SELECT id, path, container, video_codec, audio_codec, size_bytes, scan_state FROM media_files WHERE media_item_id = ?")
+    let files = sqlx::query("SELECT id, path, container, video_codec, audio_codec, size_bytes, scan_state, source_config_id, extension_metadata FROM media_files WHERE media_item_id = ?")
         .bind(&id)
         .fetch_all(&state.db_pool)
         .await
@@ -135,6 +138,11 @@ pub async fn detail(
             audio_codec: row.try_get::<String, _>("audio_codec").ok(),
             size_bytes: row.try_get::<i64, _>("size_bytes").ok(),
             scan_state: row.get::<String, _>("scan_state"),
+            source_config_id: row.try_get("source_config_id").ok(),
+            extension_metadata: row
+                .try_get::<String, _>("extension_metadata")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
         .collect();
 
@@ -148,7 +156,7 @@ pub async fn detail(
         id: item.get::<String, _>("id"),
         title: item.get::<String, _>("title"),
         r#type: item.get::<String, _>("type"),
-        year: item.get::<Option<i32>, _>("year"),
+        year: item.try_get::<i64, _>("year").ok().map(|v| v as i32),
         runtime_seconds: item
             .try_get::<String, _>("runtime_seconds")
             .ok()

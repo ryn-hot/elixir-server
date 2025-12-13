@@ -543,8 +543,9 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
             audio_codec: None,
         }],
         extension_metadata: Default::default(),
+        source_config_id: None,
     };
-    run_full_scan(&state.db_pool, vec![candidate]).await?;
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let resp = app
         .clone()
@@ -613,8 +614,9 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
             audio_codec: None,
         }],
         extension_metadata: Default::default(),
+        source_config_id: None,
     };
-    run_full_scan(&state.db_pool, vec![candidate]).await?;
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let user_id = Uuid::new_v4();
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
@@ -703,8 +705,9 @@ async fn direct_stream_supports_range() -> Result<()> {
             audio_codec: None,
         }],
         extension_metadata: Default::default(),
+        source_config_id: None,
     };
-    run_full_scan(&state.db_pool, vec![candidate]).await?;
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     // Create a user and session via /play.
     let user_id = Uuid::new_v4();
@@ -822,8 +825,9 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
             audio_codec: None,
         }],
         extension_metadata: Default::default(),
+        source_config_id: None,
     };
-    run_full_scan(&state.db_pool, vec![candidate]).await?;
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let token = state.auth_service.issue_access_token(user_id)?.token;
     let media_item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")

@@ -116,6 +116,7 @@ pub struct MediaFile {
     pub height: Option<i32>,
     pub bitrate_bps: Option<i64>,
     pub hash: Option<String>,
+    pub extension_metadata: Option<serde_json::Value>,
     pub scan_state: ScanState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

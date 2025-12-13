@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
-use crate::extensions::ExternalIds;
+use crate::extensions::{ExternalIds, make_identity_key};
 use crate::{
     db::models::MediaType,
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
@@ -14,8 +14,12 @@ use crate::{
     state::AppState,
 };
 
-pub async fn run_full_scan(pool: &AnyPool, candidates: Vec<MediaFileCandidate>) -> Result<()> {
-    run_full_scan_with_metadata(pool, None, candidates, false).await
+pub async fn run_full_scan(
+    pool: &AnyPool,
+    candidates: Vec<MediaFileCandidate>,
+    hash_dedupe: bool,
+) -> Result<()> {
+    run_full_scan_with_metadata(pool, None, candidates, false, hash_dedupe).await
 }
 
 pub async fn run_full_scan_with_metadata(
@@ -23,10 +27,12 @@ pub async fn run_full_scan_with_metadata(
     metadata: Option<&MetadataService>,
     candidates: Vec<MediaFileCandidate>,
     force_metadata: bool,
+    hash_dedupe: bool,
 ) -> Result<()> {
-    let mut seen_paths: HashSet<String> = HashSet::new();
+    let (merged, mut seen_paths): (Vec<AggregatedCandidate>, HashSet<String>) =
+        merge_candidates(candidates, hash_dedupe);
 
-    for candidate in candidates {
+    for candidate in merged {
         let meta = if let Some(service) = metadata {
             let should_refresh = should_refresh_metadata(
                 pool,
@@ -49,8 +55,16 @@ pub async fn run_full_scan_with_metadata(
         };
         let media_item_id = upsert_media_item(pool, &candidate.identity, meta.as_ref()).await?;
         for file in candidate.files {
-            seen_paths.insert(file.path.clone());
-            upsert_media_file(pool, media_item_id, &file).await?;
+            seen_paths.insert(file.descriptor.path.clone());
+            upsert_media_file(
+                pool,
+                media_item_id,
+                file.source_config_id,
+                &file.descriptor,
+                Some(&file.extension_metadata),
+                hash_dedupe,
+            )
+            .await?;
         }
     }
 
@@ -73,6 +87,55 @@ pub async fn run_full_scan_with_metadata(
     }
 
     Ok(())
+}
+
+struct AggregatedFile {
+    descriptor: FileDescriptor,
+    source_config_id: Option<Uuid>,
+    extension_metadata: HashMap<String, serde_json::Value>,
+}
+
+struct AggregatedCandidate {
+    identity: MediaIdentity,
+    files: Vec<AggregatedFile>,
+}
+
+fn merge_candidates(
+    candidates: Vec<MediaFileCandidate>,
+    hash_dedupe: bool,
+) -> (Vec<AggregatedCandidate>, HashSet<String>) {
+    let mut map: HashMap<String, AggregatedCandidate> = HashMap::new();
+    let mut all_paths: HashSet<String> = HashSet::new();
+
+    for candidate in candidates {
+        let key = make_identity_key(&candidate.identity);
+        let entry = map.entry(key).or_insert_with(|| AggregatedCandidate {
+            identity: candidate.identity.clone(),
+            files: Vec::new(),
+        });
+
+        for file in candidate.files {
+            all_paths.insert(file.path.clone());
+            let dup = entry.files.iter().any(|existing| {
+                if hash_dedupe {
+                    if let (Some(h1), Some(h2)) = (&existing.descriptor.hash, &file.hash) {
+                        return h1 == h2;
+                    }
+                }
+                existing.descriptor.path == file.path
+            });
+            if dup {
+                continue;
+            }
+            entry.files.push(AggregatedFile {
+                descriptor: file,
+                source_config_id: candidate.source_config_id,
+                extension_metadata: candidate.extension_metadata.clone(),
+            });
+        }
+    }
+
+    (map.into_values().collect(), all_paths)
 }
 
 fn merge_external_ids(base: &ExternalIds, incoming: Option<ExternalIds>) -> ExternalIds {
@@ -100,7 +163,7 @@ async fn should_refresh_metadata(
     }
 
     let existing = sqlx::query::<sqlx::Any>(
-        "SELECT metadata_json, updated_at FROM media_items WHERE type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
+        "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM media_items WHERE type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
     )
     .bind(identity.r#type.as_str())
     .bind(&identity.title)
@@ -128,12 +191,16 @@ async fn should_refresh_metadata(
 }
 
 pub async fn run_extension_scan(state: &AppState, force_metadata: bool) -> Result<()> {
-    let candidates = state.extensions.scan_all().await?;
+    let candidates = state
+        .extensions
+        .scan_all_with_db(&state.db_pool, &state.settings.library.sonarr, None)
+        .await?;
     run_full_scan_with_metadata(
         &state.db_pool,
         Some(&state.metadata),
         candidates,
         force_metadata,
+        state.settings.library.hash_dedupe_enabled,
     )
     .await?;
     Ok(())
@@ -206,18 +273,42 @@ async fn upsert_media_item(
 async fn upsert_media_file(
     pool: &AnyPool,
     media_item_id: Uuid,
+    source_config_id: Option<Uuid>,
     file: &FileDescriptor,
+    extension_metadata: Option<&HashMap<String, serde_json::Value>>,
+    hash_dedupe: bool,
 ) -> Result<()> {
     let metadata = ffprobe::probe(&file.path).await.unwrap_or_default();
 
-    let existing = sqlx::query::<sqlx::Any>("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+    let mut existing = None;
+    if hash_dedupe {
+        if let Some(hash) = &file.hash {
+            existing = sqlx::query::<sqlx::Any>(
+                "SELECT id, source_config_id FROM media_files WHERE hash = ? LIMIT 1",
+            )
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?;
+        }
+    }
+    if existing.is_none() {
+        existing = sqlx::query::<sqlx::Any>(
+            "SELECT id, source_config_id FROM media_files WHERE path = ? LIMIT 1",
+        )
         .bind(&file.path)
         .fetch_optional(pool)
         .await?;
+    }
 
     if let Some(row) = existing {
         let id_str: String = row.get(0);
-        sqlx::query::<sqlx::Any>("UPDATE media_files SET size_bytes = ?, container = ?, video_codec = ?, audio_codec = ?, width = COALESCE(?, width), height = COALESCE(?, height), bitrate_bps = COALESCE(?, bitrate_bps), updated_at = CURRENT_TIMESTAMP, scan_state = 'ok' WHERE id = ?")
+        let existing_source: Option<String> = row.try_get("source_config_id").ok();
+        let desired_source = match (existing_source, source_config_id) {
+            (None, Some(src)) => Some(src.to_string()),
+            (Some(current), _) => Some(current),
+            _ => None,
+        };
+        sqlx::query::<sqlx::Any>("UPDATE media_files SET size_bytes = ?, container = ?, video_codec = ?, audio_codec = ?, width = COALESCE(?, width), height = COALESCE(?, height), bitrate_bps = COALESCE(?, bitrate_bps), hash = COALESCE(?, hash), extension_metadata = COALESCE(?, extension_metadata), updated_at = CURRENT_TIMESTAMP, scan_state = 'ok', source_config_id = COALESCE(source_config_id, ?) WHERE id = ?")
             .bind(file.size_bytes)
             .bind(metadata.container.as_ref().or(file.container.as_ref()))
             .bind(metadata.video_codec.as_ref().or(file.video_codec.as_ref()))
@@ -225,6 +316,12 @@ async fn upsert_media_file(
             .bind(metadata.width)
             .bind(metadata.height)
             .bind(metadata.bitrate_bps)
+            .bind(file.hash.as_ref())
+            .bind(
+                extension_metadata
+                    .and_then(|m| serde_json::to_string(m).ok()),
+            )
+            .bind(desired_source)
             .bind(&id_str)
             .execute(pool)
             .await?;
@@ -232,9 +329,10 @@ async fn upsert_media_file(
     }
 
     let id = Uuid::new_v4();
-    sqlx::query::<sqlx::Any>("INSERT INTO media_files (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+    sqlx::query::<sqlx::Any>("INSERT INTO media_files (id, media_item_id, source_config_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, hash, extension_metadata, scan_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
         .bind(id.to_string())
         .bind(media_item_id.to_string())
+        .bind(source_config_id.map(|u| u.to_string()))
         .bind(&file.path)
         .bind(file.size_bytes)
         .bind(metadata.container.as_ref().or(file.container.as_ref()))
@@ -243,6 +341,11 @@ async fn upsert_media_file(
         .bind(metadata.width)
         .bind(metadata.height)
         .bind(metadata.bitrate_bps)
+        .bind(file.hash.as_ref())
+        .bind(
+            extension_metadata
+                .and_then(|m| serde_json::to_string(m).ok()),
+        )
         .execute(pool)
         .await?;
 
@@ -305,8 +408,9 @@ mod tests {
                 audio_codec: Some("aac".to_string()),
             }],
             extension_metadata: HashMap::new(),
+            source_config_id: None,
         }];
-        run_full_scan(&database.pool, candidates).await?;
+        run_full_scan(&database.pool, candidates, false).await?;
 
         let (count_ok,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE scan_state = 'ok'")
@@ -315,7 +419,7 @@ mod tests {
         assert_eq!(count_ok, 1);
 
         // Second scan with no files should mark missing
-        run_full_scan(&database.pool, Vec::new()).await?;
+        run_full_scan(&database.pool, Vec::new(), false).await?;
         let (count_missing,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE scan_state = 'missing'")
                 .fetch_one(&database.pool)

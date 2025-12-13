@@ -187,6 +187,7 @@ pub async fn play(
             .inc();
     }
     let session_id = Uuid::new_v4();
+    let session_token = Uuid::new_v4().to_string();
     info!(
         user = %user.user_id,
         item = %body.media_item_id,
@@ -216,12 +217,15 @@ pub async fn play(
 
     let stream_url = match decision.mode {
         PlaybackMode::DirectPlay => {
-            format!("/stream/direct/{}?session={}", selected.id, session_id)
+            format!(
+                "/stream/direct/{}?sid={}&session={}",
+                selected.id, session_id, session_token
+            )
         }
         PlaybackMode::Transcode => {
             format!(
                 "/sessions/{}/master.m3u8?session={}",
-                session_id, session_id
+                session_id, session_token
             )
         }
     };
@@ -245,7 +249,7 @@ pub async fn play(
         .bind(item.runtime_seconds)
         .bind(caps_json.as_ref().map(|v| v.to_string()))
         .bind(transcode_state.as_ref().map(|s| s.to_string()))
-        .bind(session_id.to_string()) // simple token equal to session id for now
+        .bind(session_token.clone())
         .execute(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -323,6 +327,7 @@ fn compare_files(
         let bitrate_cap = match (network, caps.max_bitrate_bps) {
             (Some("wan"), Some(max)) => Some(max.min(8_000_000)),
             (Some("wan"), None) => Some(8_000_000),
+            (Some("lan"), _) => None,
             (_, max) => max.or(profile.max_bitrate_bps),
         };
         let bitrate_val = effective_bitrate(f, item_duration);
@@ -536,6 +541,7 @@ fn decide_playback(
     let bitrate_cap = match (network_type, caps.max_bitrate_bps) {
         (Some("wan"), Some(max)) => Some(max.min(8_000_000)), // cap WAN more tightly
         (Some("wan"), None) => Some(8_000_000),
+        (Some("lan"), _) => None, // relax bitrate enforcement on LAN
         (_, max) => max.or(profile.max_bitrate_bps),
     };
 
@@ -581,7 +587,26 @@ fn eq_ci(a: Option<&str>, b: Option<&str>) -> bool {
 fn matches_or_unknown(value: Option<&str>, allowed: &[String]) -> bool {
     match value {
         None => true,
-        Some(v) => allowed.iter().any(|s| v.eq_ignore_ascii_case(s.as_str())),
+        Some(v) => {
+            let norm_allowed: Vec<String> =
+                allowed.iter().map(|s| normalize_container(s)).collect();
+            let tokens: Vec<String> = v
+                .split(',')
+                .map(|t| normalize_container(t.trim()))
+                .collect();
+            tokens.iter().any(|t| norm_allowed.iter().any(|a| a == t))
+        }
+    }
+}
+
+fn normalize_container(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("matroska") {
+        "mkv".to_string()
+    } else if lower.contains("mp4") || lower.contains("mov") {
+        "mp4".to_string()
+    } else {
+        lower
     }
 }
 
@@ -644,10 +669,21 @@ pub async fn stream_direct(
     user: CurrentUser,
 ) -> ApiResult<impl IntoResponse> {
     let session_id = params
+        .sid
+        .as_deref()
+        .ok_or_else(|| ApiError::unauthorized("session id required"))?;
+    let session_token = params
         .session
         .as_deref()
         .ok_or_else(|| ApiError::unauthorized("session token required"))?;
-    let _ = get_session(&state, &user, session_id, Some("direct_play"), true).await?;
+    let _ = get_session_with_token(
+        &state,
+        &user,
+        session_id,
+        Some("direct_play"),
+        session_token,
+    )
+    .await?;
 
     let file_row = sqlx::query(
         "SELECT path, container FROM media_files WHERE id = ? AND scan_state = 'ok' LIMIT 1",
@@ -786,11 +822,13 @@ pub async fn master_playlist(
             let state_clone = state.clone();
             TRANSCODE_ERRORS.with_label_values(&["spawn_failed"]).inc();
             let _ = tokio::spawn(async move {
-                mark_session_error(state_clone, &session_id, Some(msg)).await
+                mark_session_error(state_clone, &session_id, Some(msg), None).await
             });
             ApiError::internal(e.to_string())
         })?;
-    TRANSCODE_STARTS.with_label_values(&["ok"]).inc();
+    TRANSCODE_STARTS
+        .with_label_values(&["ok", "unknown", "unknown"])
+        .inc();
     info!(
         session = %session_id,
         file = %media_file_id,
@@ -813,10 +851,18 @@ pub async fn master_playlist(
             let msg = format!("{err:?}");
             let session_id = id.clone();
             let state_clone = state.clone();
-            TRANSCODE_STARTS.with_label_values(&["error"]).inc();
+            TRANSCODE_STARTS
+                .with_label_values(&["error", "unknown", "unknown"])
+                .inc();
             TRANSCODE_ERRORS.with_label_values(&["playlist_read"]).inc();
             let _ = tokio::spawn(async move {
-                mark_session_error(state_clone, &session_id, Some(msg)).await
+                mark_session_error(
+                    state_clone,
+                    &session_id,
+                    Some(msg),
+                    Some(handle.log_path.to_string_lossy().to_string()),
+                )
+                .await
             });
             return Err(err);
         }
@@ -832,6 +878,8 @@ pub async fn master_playlist(
         serde_json::json!({
             "seek_seconds": seek_seconds,
             "log_path": handle.log_path.to_string_lossy(),
+            "temp_dir": handle.temp_dir.to_string_lossy(),
+            "pid": handle.pid,
         })
         .to_string(),
     )
@@ -906,6 +954,7 @@ pub struct SeekRequest {
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
     pub session: Option<String>,
+    pub sid: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1029,10 +1078,16 @@ fn rewrite_playlist_with_token(content: &str, token: &str) -> String {
         .join("\n")
 }
 
-async fn mark_session_error(state: AppState, session_id: &str, message: Option<String>) {
+async fn mark_session_error(
+    state: AppState,
+    session_id: &str,
+    message: Option<String>,
+    log_path: Option<String>,
+) {
     let transcode_state = message.as_deref().map(|m| {
         serde_json::json!({
             "error": m,
+            "log_path": log_path,
         })
         .to_string()
     });
@@ -1210,7 +1265,7 @@ pub async fn seek_transcode(
 
     let media_path = media_path.ok_or_else(|| ApiError::not_found("file not found"))?;
 
-    state
+    let handle = state
         .transcodes
         .restart(session_id, &media_path, body.position_seconds)
         .await
@@ -1219,19 +1274,24 @@ pub async fn seek_transcode(
             let session_id = id.clone();
             let state_clone = state.clone();
             let _ = tokio::spawn(async move {
-                mark_session_error(state_clone, &session_id, Some(msg)).await
+                mark_session_error(state_clone, &session_id, Some(msg), None).await
             });
             TRANSCODE_ERRORS
                 .with_label_values(&["restart_failed"])
                 .inc();
             ApiError::internal(e.to_string())
         })?;
-    TRANSCODE_STARTS.with_label_values(&["restart"]).inc();
+    TRANSCODE_STARTS
+        .with_label_values(&["restart", "unknown", "unknown"])
+        .inc();
 
     sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET transcode_state = ?, logical_position_seconds = ?, state = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(
             serde_json::json!({
-                "seek_seconds": body.position_seconds
+                "seek_seconds": body.position_seconds,
+                "log_path": handle.log_path.to_string_lossy(),
+                "temp_dir": handle.temp_dir.to_string_lossy(),
+                "pid": handle.pid,
             })
             .to_string(),
         )

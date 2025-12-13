@@ -45,12 +45,16 @@ async fn main() -> anyhow::Result<()> {
 
     let auth_service =
         AuthService::new(settings.auth.clone()).context("failed to initialize auth service")?;
-    let extensions = ExtensionManager::load_from_dir("extensions", &settings.library.local_root)
-        .await
-        .unwrap_or_else(|err| {
-            tracing::warn!("failed to load extensions directory: {err}");
-            ExtensionManager::new()
-        });
+    let extensions = ExtensionManager::load_from_dir(
+        "extensions",
+        &settings.library.local_root,
+        settings.library.hash_dedupe_enabled,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!("failed to load extensions directory: {err}");
+        ExtensionManager::new()
+    });
     let metadata = MetadataService::new(settings.metadata.clone())
         .context("failed to initialize metadata service")?;
 
