@@ -46,7 +46,6 @@ pub struct PlayRequest {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PlayResponse {
     pub session_id: String,
     pub mode: &'static str,
@@ -867,7 +866,8 @@ pub async fn master_playlist(
             return Err(err);
         }
     };
-    let playlist_body = rewrite_playlist_with_token(&content, session_token);
+    let playlist_body =
+        rewrite_playlist_with_token(&content, session_token, params.token.as_deref());
 
     // Touch updated_at for TTL and store log_path/seek for debugging.
     let _ = sqlx::query::<sqlx::Any>(
@@ -955,10 +955,10 @@ pub struct SeekRequest {
 pub struct StreamQuery {
     pub session: Option<String>,
     pub sid: Option<String>,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionDetailResponse {
     pub id: String,
     pub media_file_id: String,
@@ -1058,20 +1058,41 @@ async fn get_session_with_token(
     Ok(row)
 }
 
-fn rewrite_playlist_with_token(content: &str, token: &str) -> String {
+fn rewrite_playlist_with_token(
+    content: &str,
+    session_token: &str,
+    auth_token: Option<&str>,
+) -> String {
     content
         .lines()
         .map(|line| {
             if line.starts_with('#') {
                 line.to_string()
             } else if line.contains("seg_") {
-                if line.contains('?') {
-                    format!("{line}&session={token}")
+                let mut url = if line.contains('?') {
+                    format!("{line}&session={session_token}")
                 } else {
-                    format!("{line}?session={token}")
+                    format!("{line}?session={session_token}")
+                };
+                if let Some(tok) = auth_token {
+                    url.push('&');
+                    url.push_str("token=");
+                    url.push_str(tok);
                 }
+                url
             } else {
-                line.to_string()
+                let mut url = line.to_string();
+                if let Some(tok) = auth_token {
+                    if url.contains('?') {
+                        url.push('&');
+                        url.push_str("token=");
+                        url.push_str(tok);
+                    } else {
+                        url.push_str("?token=");
+                        url.push_str(tok);
+                    }
+                }
+                url
             }
         })
         .collect::<Vec<_>>()
@@ -1164,7 +1185,6 @@ pub async fn resume_session(
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionPollResponse {
     pub id: String,
     pub state: String,

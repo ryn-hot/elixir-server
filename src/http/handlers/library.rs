@@ -12,7 +12,6 @@ use crate::{
 };
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LibraryItemResponse {
     pub id: String,
     pub title: String,
@@ -82,7 +81,6 @@ pub async fn scan(
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LibraryDetailResponse {
     pub id: String,
     pub title: String,
@@ -97,7 +95,6 @@ pub struct LibraryDetailResponse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LibraryFileResponse {
     pub id: String,
     pub path: String,

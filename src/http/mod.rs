@@ -3,9 +3,11 @@ pub mod error;
 pub mod handlers;
 
 use axum::{
+    http::{header, Method},
     Router,
     routing::{get, post},
 };
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::AppState;
 
@@ -78,6 +80,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/profile/playback", get(handlers::profile::profile))
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
 }
 
 #[cfg(test)]

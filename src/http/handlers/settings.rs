@@ -4,7 +4,6 @@ use serde::Serialize;
 use crate::{http::error::ApiResult, state::AppState};
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SettingsResponse {
     environment: String,
     server: ServerSettings,
@@ -14,14 +13,12 @@ pub struct SettingsResponse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
     host: String,
     port: u16,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct NetworkSettings {
     mdns_enabled: bool,
     mdns_name: String,
@@ -33,7 +30,6 @@ pub struct NetworkSettings {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DatabaseSettings {
     driver: &'static str,
     max_connections: u32,
@@ -41,7 +37,6 @@ pub struct DatabaseSettings {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TelemetrySettings {
     log_directives: String,
 }

@@ -15,7 +15,6 @@ pub struct LoginRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
     pub access_token: String,
     pub access_expires_at: DateTime<Utc>,
@@ -39,7 +38,6 @@ pub struct SignupRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SignupResponse {
     pub access_token: String,
     pub access_expires_at: DateTime<Utc>,
@@ -52,7 +50,6 @@ pub struct PasswordResetStartRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PasswordResetStartResponse {
     pub token: String,
     pub expires_at: DateTime<Utc>,

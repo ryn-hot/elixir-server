@@ -21,34 +21,49 @@ impl FromRequestParts<AppState> for CurrentUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        parse_user_from_headers(&parts.headers, &state.auth_service)
+        parse_user(parts, &state.auth_service)
     }
 }
 
-fn parse_user_from_headers(
-    headers: &HeaderMap,
-    auth: &AuthService,
-) -> Result<CurrentUser, ApiError> {
-    let raw = headers
-        .get("authorization")
-        .ok_or_else(|| ApiError::unauthorized("missing authorization header"))?;
-
-    let raw_str = raw
-        .to_str()
-        .map_err(|_| ApiError::bad_request("invalid authorization header"))?;
-
-    let token = raw_str
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| ApiError::unauthorized("invalid authorization scheme"))?;
-
+fn parse_user(parts: &Parts, auth: &AuthService) -> Result<CurrentUser, ApiError> {
+    let token = extract_token(parts)?;
     let (user_id, session_id) = auth
-        .verify_access_token(token)
+        .verify_access_token(&token)
         .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
 
-    Ok(CurrentUser {
-        user_id,
-        session_id,
-    })
+    Ok(CurrentUser { user_id, session_id })
+}
+
+fn extract_token(parts: &Parts) -> Result<String, ApiError> {
+    if let Some(tok) = bearer_from_headers(&parts.headers) {
+        return Ok(tok);
+    }
+
+    if let Some(tok) = token_from_query(parts.uri.query()) {
+        return Ok(tok);
+    }
+
+    Err(ApiError::unauthorized("missing authorization token"))
+}
+
+fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("authorization")?;
+    let raw_str = raw.to_str().ok()?;
+    raw_str
+        .strip_prefix("Bearer ")
+        .map(|s| s.to_string())
+}
+
+fn token_from_query(query: Option<&str>) -> Option<String> {
+    let q = query?;
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if matches!(k, "token" | "access_token") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -70,8 +85,12 @@ mod tests {
             format!("Bearer {}", token).parse().unwrap(),
         );
 
-        let current_user =
-            parse_user_from_headers(&headers, &auth).expect("should parse bearer token");
+        let parts = Parts {
+            headers,
+            ..Default::default()
+        };
+
+        let current_user = parse_user(&parts, &auth).expect("should parse bearer token");
         assert_eq!(current_user.user_id, user_id);
         assert_eq!(current_user.session_id, session_id);
     }

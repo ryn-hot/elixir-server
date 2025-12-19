@@ -8,7 +8,6 @@ use sqlx::Row;
 use crate::{http::error::ApiResult, metrics, state::AppState};
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     status: &'static str,
     environment: &'static str,
@@ -19,7 +18,6 @@ pub struct HealthResponse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DatabaseHealth {
     status: &'static str,
     driver: &'static str,
@@ -28,14 +26,12 @@ pub struct DatabaseHealth {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MdnsHealth {
     status: &'static str,
     name: Option<String>,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WanHealth {
     status: &'static str,
     wan_direct_endpoint: Option<String>,

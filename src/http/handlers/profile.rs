@@ -12,7 +12,6 @@ pub struct ProfileQuery {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PlaybackProfile {
     max_resolution: String,
     supported_containers: Vec<String>,
@@ -22,7 +21,6 @@ pub struct PlaybackProfile {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProfileResponse {
     network_type: String,
     profile: PlaybackProfile,

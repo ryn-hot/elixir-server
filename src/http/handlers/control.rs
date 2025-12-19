@@ -22,11 +22,6 @@ pub struct RegisterServerRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ServersResponse {
-    pub servers: Vec<RegistryEntry>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct RegistryEntry {
     pub server_id: String,
     pub device_name: String,
@@ -88,7 +83,7 @@ pub async fn register(
 pub async fn list(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> ApiResult<Json<ServersResponse>> {
+) -> ApiResult<Json<Vec<RegistryEntry>>> {
     let rows = sqlx::query("SELECT server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, datetime(last_seen_at) as last_seen_at FROM server_registry WHERE user_id = ? ORDER BY last_seen_at DESC")
         .bind(user.user_id.to_string())
     .fetch_all(&state.db_pool)
@@ -117,7 +112,7 @@ pub async fn list(
         });
     }
 
-    Ok(Json(ServersResponse { servers }))
+    Ok(Json(servers))
 }
 
 pub async fn health() -> ApiResult<Json<&'static str>> {
