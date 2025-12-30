@@ -70,15 +70,18 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
         serde_json::from_slice(&output.stdout).context("failed to parse ffprobe json")?;
 
     let mut meta = MediaMetadata::default();
+    let mut format_duration_seconds: Option<i32> = None;
+    let mut stream_duration_seconds: Option<i32> = None;
 
     if let Some(fmt) = parsed.format {
         meta.container = fmt.format_name;
         meta.bitrate_bps = fmt.bit_rate.as_ref().and_then(|b| b.parse::<i64>().ok());
-        meta.duration_seconds = fmt
+        format_duration_seconds = fmt
             .duration
             .as_ref()
             .and_then(|d| d.parse::<f32>().ok())
             .map(|d| d.round() as i32);
+        meta.duration_seconds = format_duration_seconds;
     }
 
     for stream in parsed.streams {
@@ -87,12 +90,15 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
                 meta.video_codec = stream.codec_name.clone();
                 meta.width = stream.width;
                 meta.height = stream.height;
-                if meta.duration_seconds.is_none() {
-                    meta.duration_seconds = stream
+                if stream_duration_seconds.is_none() {
+                    stream_duration_seconds = stream
                         .duration
                         .as_ref()
                         .and_then(|d| d.parse::<f32>().ok())
                         .map(|d| d.round() as i32);
+                    if stream_duration_seconds.is_some() {
+                        meta.duration_seconds = stream_duration_seconds;
+                    }
                 }
             }
             Some("audio") => {
@@ -102,5 +108,58 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
         }
     }
 
+    if stream_duration_seconds.is_none() {
+        if let Ok(packet_duration) = probe_video_duration_by_packets(path).await {
+            let packet_seconds = packet_duration.round() as i32;
+            if packet_seconds > 0 {
+                match format_duration_seconds {
+                    Some(format_seconds)
+                        if format_seconds as f64 > (packet_seconds as f64 * 1.1) =>
+                    {
+                        meta.duration_seconds = Some(packet_seconds);
+                    }
+                    None => {
+                        meta.duration_seconds = Some(packet_seconds);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     Ok(meta)
+}
+
+async fn probe_video_duration_by_packets(path: &str) -> anyhow::Result<f32> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("packet=pts_time")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .output()
+        .await
+        .context("failed to probe packet timestamps")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe packets failed with code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout.lines().rev().find(|line| !line.trim().is_empty());
+    let last = last.ok_or_else(|| anyhow::anyhow!("no packet timestamps found"))?;
+    let value = last
+        .trim()
+        .parse::<f32>()
+        .context("failed to parse packet pts_time")?;
+    Ok(value)
 }

@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, path::Path};
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -21,19 +25,21 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
+    media::ffprobe,
     metrics::{
         PLAY_DECISIONS, PLAY_LATENCY, SEGMENT_SERVED, TRANSCODE_DURATION, TRANSCODE_ERRORS,
         TRANSCODE_STARTS,
     },
     network::registry::ensure_server_instance,
-    playback::TranscodeParams,
+    playback::{SubtitleInfo, TranscodeParams},
     state::AppState,
 };
-use tokio::time::sleep;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    process::Command,
 };
+use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 use tracing::info;
 
@@ -229,6 +235,10 @@ pub async fn play(
         }
     };
 
+    let resolved_duration =
+        resolve_duration_seconds(&state, &body.media_item_id, &selected.path, item.runtime_seconds)
+            .await;
+
     let transcode_state = match decision.mode {
         PlaybackMode::Transcode => Some(serde_json::json!({
             "seek_seconds": 0.0,
@@ -245,7 +255,7 @@ pub async fn play(
         .bind("active")
         .bind(body.network_type.clone())
         .bind(0f32)
-        .bind(item.runtime_seconds)
+        .bind(resolved_duration)
         .bind(caps_json.as_ref().map(|v| v.to_string()))
         .bind(transcode_state.as_ref().map(|s| s.to_string()))
         .bind(session_token.clone())
@@ -259,7 +269,7 @@ pub async fn play(
         session_id: session_id.to_string(),
         mode: decision.mode_as_str(),
         stream_url,
-        duration_seconds: item.runtime_seconds,
+        duration_seconds: resolved_duration,
         logical_start_seconds: 0,
         media_file_id: selected.id.clone(),
         server_id: server_id.to_string(),
@@ -269,6 +279,48 @@ pub async fn play(
     };
 
     Ok(Json(response))
+}
+
+async fn resolve_duration_seconds(
+    state: &AppState,
+    media_item_id: &str,
+    media_path: &str,
+    item_duration: Option<i32>,
+) -> Option<i32> {
+    let probe_duration = match ffprobe::probe(media_path).await {
+        Ok(meta) => meta.duration_seconds,
+        Err(err) => {
+            tracing::warn!(%media_item_id, error = %err, "ffprobe duration lookup failed");
+            None
+        }
+    };
+
+    let Some(actual) = probe_duration else {
+        return item_duration;
+    };
+
+    let should_replace = match item_duration {
+        None => true,
+        Some(existing) if existing <= 0 => true,
+        Some(existing) => {
+            let diff = (existing - actual).abs();
+            let rel = diff as f64 / existing.max(1) as f64;
+            diff >= 30 && rel >= 0.1
+        }
+    };
+
+    if should_replace {
+        let _ = sqlx::query::<sqlx::Any>(
+            "UPDATE media_items SET runtime_seconds = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(actual)
+        .bind(media_item_id)
+        .execute(&state.db_pool)
+        .await;
+        return Some(actual);
+    }
+
+    item_duration
 }
 
 fn select_file<'a>(
@@ -866,8 +918,35 @@ pub async fn master_playlist(
             return Err(err);
         }
     };
-    let playlist_body =
-        rewrite_playlist_with_token(&content, session_token, params.token.as_deref());
+    let mut playlist_body = content;
+    if !handle.subtitles.is_empty() {
+        let renditions = build_subtitle_renditions(&handle.subtitles, &handle.temp_dir).await;
+        if !renditions.is_empty() {
+            let ready = wait_for_subtitle_segments(&handle.temp_dir, renditions.len(), 20, 150).await;
+            if !ready {
+                tracing::warn!(
+                    session = %session_id,
+                    count = renditions.len(),
+                    "subtitle playlists not ready before master response"
+                );
+            }
+        }
+        if !renditions.is_empty() {
+            playlist_body = inject_subtitle_media(
+                &playlist_body,
+                &renditions,
+                session_token,
+                params.token.as_deref(),
+                params.ts.as_deref(),
+            );
+        }
+    }
+    let playlist_body = rewrite_playlist_with_token(
+        &playlist_body,
+        session_token,
+        params.token.as_deref(),
+        params.ts.as_deref(),
+    );
 
     // Touch updated_at for TTL and store log_path/seek for debugging.
     let _ = sqlx::query::<sqlx::Any>(
@@ -912,7 +991,7 @@ pub async fn serve_segment(
         .session
         .as_deref()
         .ok_or_else(|| ApiError::unauthorized("session token required"))?;
-    let _ = get_session_with_token(
+    let _session_row = get_session_with_token(
         &state,
         &user,
         &session_id.to_string(),
@@ -934,14 +1013,69 @@ pub async fn serve_segment(
         SEGMENT_SERVED.with_label_values(&["missing"]).inc();
         return Err(ApiError::not_found("segment not found"));
     }
+    let ext = Path::new(&segment)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let subtitle_delay = if ext == "vtt" {
+        resolve_subtitle_delay(&state, session_id).await
+    } else {
+        None
+    };
+
+    if ext == "m3u8" {
+        let raw = fs::read_to_string(&path).await.map_err(|e| {
+            SEGMENT_SERVED.with_label_values(&["error"]).inc();
+            ApiError::internal(e.to_string())
+        })?;
+        let rewritten = rewrite_playlist_with_token(
+            &raw,
+            session_token,
+            params.token.as_deref(),
+            params.ts.as_deref(),
+        );
+        SEGMENT_SERVED.with_label_values(&["ok"]).inc();
+        return Ok((
+            StatusCode::OK,
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            )],
+            rewritten.into_bytes(),
+        ));
+    }
+
+    if ext == "vtt" {
+        let raw = fs::read_to_string(&path).await.map_err(|e| {
+            SEGMENT_SERVED.with_label_values(&["error"]).inc();
+            ApiError::internal(e.to_string())
+        })?;
+        let adjusted = match subtitle_delay {
+            Some(delay) if delay.abs() >= 0.01 => shift_vtt_cues(&raw, delay),
+            _ => raw,
+        };
+        SEGMENT_SERVED.with_label_values(&["ok"]).inc();
+        return Ok((
+            StatusCode::OK,
+            [(CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"))],
+            adjusted.into_bytes(),
+        ));
+    }
+
     let data = fs::read(&path).await.map_err(|e| {
         SEGMENT_SERVED.with_label_values(&["error"]).inc();
         ApiError::internal(e.to_string())
     })?;
     SEGMENT_SERVED.with_label_values(&["ok"]).inc();
+    let content_type = match ext.as_str() {
+        "ts" => "video/MP2T",
+        "m4s" => "video/iso.segment",
+        _ => "application/octet-stream",
+    };
     Ok((
         StatusCode::OK,
-        [(CONTENT_TYPE, HeaderValue::from_static("video/MP2T"))],
+        [(CONTENT_TYPE, HeaderValue::from_static(content_type))],
         data,
     ))
 }
@@ -956,6 +1090,7 @@ pub struct StreamQuery {
     pub session: Option<String>,
     pub sid: Option<String>,
     pub token: Option<String>,
+    pub ts: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1062,41 +1197,379 @@ fn rewrite_playlist_with_token(
     content: &str,
     session_token: &str,
     auth_token: Option<&str>,
+    cache_bust: Option<&str>,
 ) -> String {
     content
         .lines()
         .map(|line| {
-            if line.starts_with('#') {
-                line.to_string()
-            } else if line.contains("seg_") {
-                let mut url = if line.contains('?') {
-                    format!("{line}&session={session_token}")
-                } else {
-                    format!("{line}?session={session_token}")
-                };
-                if let Some(tok) = auth_token {
-                    url.push('&');
-                    url.push_str("token=");
-                    url.push_str(tok);
-                }
-                url
-            } else {
-                let mut url = line.to_string();
-                if let Some(tok) = auth_token {
-                    if url.contains('?') {
-                        url.push('&');
-                        url.push_str("token=");
-                        url.push_str(tok);
-                    } else {
-                        url.push_str("?token=");
-                        url.push_str(tok);
-                    }
-                }
-                url
+            if line.starts_with('#') || line.trim().is_empty() {
+                return line.to_string();
             }
+
+            let mut url = append_query_param(line, "session", session_token);
+            if let Some(tok) = auth_token {
+                url = append_query_param(&url, "token", tok);
+            }
+            if let Some(ts) = cache_bust {
+                url = append_query_param(&url, "ts", ts);
+            }
+            url
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Debug, Clone)]
+struct SubtitleRendition {
+    name: String,
+    language: Option<String>,
+    is_default: bool,
+    is_forced: bool,
+    uri: String,
+}
+
+async fn build_subtitle_renditions(
+    subtitles: &[SubtitleInfo],
+    temp_dir: &Path,
+) -> Vec<SubtitleRendition> {
+    let default_index = subtitles
+        .iter()
+        .position(|s| s.is_default)
+        .unwrap_or(0);
+    let mut renditions = Vec::new();
+
+    for (idx, sub) in subtitles.iter().enumerate() {
+        let playlist_name = subtitle_playlist_name(idx);
+        let path = temp_dir.join(&playlist_name);
+        ensure_subtitle_playlist(&path).await;
+
+        let name = subtitle_display_name(sub, idx);
+        renditions.push(SubtitleRendition {
+            name,
+            language: sub.language.clone(),
+            is_default: idx == default_index,
+            is_forced: sub.is_forced,
+            uri: playlist_name,
+        });
+    }
+
+    renditions
+}
+
+async fn ensure_subtitle_playlist(path: &Path) {
+    if fs::metadata(path).await.is_ok() {
+        return;
+    }
+    let placeholder = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-TARGETDURATION:4",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PLAYLIST-TYPE:EVENT",
+        "",
+    ]
+    .join("\n");
+    let _ = fs::write(path, placeholder).await;
+}
+
+async fn wait_for_subtitle_segments(
+    temp_dir: &Path,
+    count: usize,
+    retries: usize,
+    delay_ms: u64,
+) -> bool {
+    for _ in 0..retries {
+        if subtitles_ready(temp_dir, count).await {
+            return true;
+        }
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+    false
+}
+
+async fn subtitles_ready(temp_dir: &Path, count: usize) -> bool {
+    for idx in 0..count {
+        let path = temp_dir.join(subtitle_playlist_name(idx));
+        if !subtitle_playlist_has_segment(&path).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn subtitle_playlist_has_segment(path: &Path) -> bool {
+    let data = match fs::read_to_string(path).await {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+    data.lines().any(|line| line.starts_with("#EXTINF"))
+}
+
+fn subtitle_playlist_name(index: usize) -> String {
+    format!("sub_{index}.m3u8")
+}
+
+fn subtitle_display_name(info: &SubtitleInfo, index: usize) -> String {
+    if let Some(title) = info.title.as_ref().filter(|t| !t.trim().is_empty()) {
+        return title.to_string();
+    }
+    if let Some(language) = info
+        .language
+        .as_ref()
+        .filter(|lang| !lang.trim().is_empty())
+    {
+        return language.to_string();
+    }
+    format!("Subtitle {}", index + 1)
+}
+
+fn escape_attribute(value: &str) -> String {
+    value.replace('"', "'").replace('\n', " ").replace('\r', " ")
+}
+
+fn inject_subtitle_media(
+    content: &str,
+    renditions: &[SubtitleRendition],
+    session_token: &str,
+    auth_token: Option<&str>,
+    cache_bust: Option<&str>,
+) -> String {
+    if renditions.is_empty() || content.contains("EXT-X-MEDIA:TYPE=SUBTITLES") {
+        return content.to_string();
+    }
+
+    let mut media_lines = Vec::new();
+    for rendition in renditions {
+        let mut subtitle_url = append_query_param(&rendition.uri, "session", session_token);
+        if let Some(tok) = auth_token {
+            subtitle_url = append_query_param(&subtitle_url, "token", tok);
+        }
+        if let Some(ts) = cache_bust {
+            subtitle_url = append_query_param(&subtitle_url, "ts", ts);
+        }
+
+        let mut attrs = vec![
+            "TYPE=SUBTITLES".to_string(),
+            "GROUP-ID=\"subs\"".to_string(),
+            format!("NAME=\"{}\"", escape_attribute(&rendition.name)),
+            format!(
+                "DEFAULT={}",
+                if rendition.is_default { "YES" } else { "NO" }
+            ),
+            "AUTOSELECT=YES".to_string(),
+        ];
+        if let Some(lang) = rendition
+            .language
+            .as_ref()
+            .filter(|lang| !lang.trim().is_empty())
+        {
+            attrs.push(format!("LANGUAGE=\"{}\"", escape_attribute(lang)));
+        }
+        if rendition.is_forced {
+            attrs.push("FORCED=YES".to_string());
+        }
+        attrs.push(format!("URI=\"{}\"", subtitle_url));
+        media_lines.push(format!("#EXT-X-MEDIA:{}", attrs.join(",")));
+    }
+
+    if media_lines.is_empty() {
+        return content.to_string();
+    }
+
+    let mut lines = Vec::new();
+    let mut inserted = false;
+    for line in content.lines() {
+        if !inserted && line.starts_with("#EXT-X-STREAM-INF") {
+            lines.extend(media_lines.clone());
+            inserted = true;
+        }
+        if line.starts_with("#EXT-X-STREAM-INF") && !line.contains("SUBTITLES=") {
+            lines.push(format!("{line},SUBTITLES=\"subs\""));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !inserted {
+        lines.extend(media_lines);
+    }
+
+    lines.join("\n")
+}
+
+fn append_query_param(url: &str, key: &str, value: &str) -> String {
+    if value.trim().is_empty() || url.contains(&format!("{key}=")) {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{key}={value}")
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentProbe {
+    streams: Vec<SegmentStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentStream {
+    start_time: Option<String>,
+}
+
+async fn resolve_subtitle_delay(state: &AppState, session_id: Uuid) -> Option<f64> {
+    if let Some(delay) = state.transcodes.subtitle_delay(session_id).await {
+        return Some(delay);
+    }
+    let temp_anchor = state
+        .transcodes
+        .segment_path(session_id, "seg_0_00000.ts")
+        .await?;
+    let temp_dir = temp_anchor.parent().map(PathBuf::from)?;
+    for _ in 0..6 {
+        if let Some(segment) = find_first_segment(&temp_dir).await {
+            if let Some(delay) = probe_segment_start_time(&segment).await {
+                state.transcodes.set_subtitle_delay(session_id, delay).await;
+                return Some(delay);
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+async fn find_first_segment(temp_dir: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(temp_dir).await.ok()?;
+    let mut candidates = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("seg_0_") && name.ends_with(".ts") {
+            candidates.push(name);
+        }
+    }
+    candidates.sort();
+    candidates.first().map(|name| temp_dir.join(name))
+}
+
+async fn probe_segment_start_time(path: &Path) -> Option<f64> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("quiet")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_streams")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: SegmentProbe = serde_json::from_slice(&output.stdout).ok()?;
+    let start = parsed
+        .streams
+        .iter()
+        .find_map(|stream| stream.start_time.as_ref())?;
+    start.parse::<f64>().ok()
+}
+
+fn shift_vtt_cues(content: &str, offset_seconds: f64) -> String {
+    if offset_seconds.abs() < 0.001 {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut first = true;
+    for line in content.lines() {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        if let Some(shifted) = shift_vtt_line(line, offset_seconds) {
+            out.push_str(&shifted);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn shift_vtt_line(line: &str, offset_seconds: f64) -> Option<String> {
+    if !line.contains("-->") {
+        return None;
+    }
+    let mut parts = line.splitn(2, "-->");
+    let left = parts.next()?.trim();
+    let right = parts.next()?.trim();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    let (right_time, right_settings) = split_time_and_settings(right);
+    let start = parse_vtt_time(left)?;
+    let end = parse_vtt_time(right_time)?;
+    let shifted_start = format_vtt_time((start + offset_seconds).max(0.0));
+    let shifted_end = format_vtt_time((end + offset_seconds).max(0.0));
+    let mut out = format!("{shifted_start} --> {shifted_end}");
+    if let Some(settings) = right_settings {
+        let trimmed = settings.trim();
+        if !trimmed.is_empty() {
+            out.push(' ');
+            out.push_str(trimmed);
+        }
+    }
+    Some(out)
+}
+
+fn split_time_and_settings(raw: &str) -> (&str, Option<&str>) {
+    let mut iter = raw.splitn(2, |c: char| c.is_whitespace());
+    let time = iter.next().unwrap_or("");
+    let settings = iter.next();
+    (time, settings)
+}
+
+fn parse_vtt_time(raw: &str) -> Option<f64> {
+    let cleaned = raw.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = cleaned.split(':').collect();
+    let (hours, minutes, seconds_raw) = match parts.len() {
+        3 => (
+            parts[0].parse::<f64>().ok()?,
+            parts[1].parse::<f64>().ok()?,
+            parts[2],
+        ),
+        2 => (0.0, parts[0].parse::<f64>().ok()?, parts[1]),
+        _ => return None,
+    };
+    let (sec_str, frac_str) = if let Some((sec, frac)) = seconds_raw.split_once('.') {
+        (sec, frac)
+    } else if let Some((sec, frac)) = seconds_raw.split_once(',') {
+        (sec, frac)
+    } else {
+        (seconds_raw, "")
+    };
+    let secs = sec_str.parse::<f64>().ok()?;
+    let frac = if frac_str.is_empty() {
+        0.0
+    } else {
+        let scale = 10_f64.powi(frac_str.len() as i32);
+        frac_str.parse::<f64>().ok()? / scale
+    };
+    Some(hours * 3600.0 + minutes * 60.0 + secs + frac)
+}
+
+fn format_vtt_time(seconds: f64) -> String {
+    let mut total_ms = (seconds * 1000.0).round() as i64;
+    if total_ms < 0 {
+        total_ms = 0;
+    }
+    let ms = (total_ms % 1000) as i64;
+    let total_seconds = total_ms / 1000;
+    let secs = (total_seconds % 60) as i64;
+    let total_minutes = total_seconds / 60;
+    let mins = (total_minutes % 60) as i64;
+    let hours = total_minutes / 60;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, ms)
 }
 
 async fn mark_session_error(
@@ -1239,7 +1712,7 @@ pub async fn end_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     user: CurrentUser,
-) -> ApiResult<Json<&'static str>> {
+) -> ApiResult<Json<Value>> {
     let session_id =
         Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("invalid session id"))?;
     // Validate ownership.
@@ -1255,7 +1728,7 @@ pub async fn end_session(
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     info!(session = %id, "session ended and cleaned up");
-    Ok(Json("ok"))
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn seek_transcode(
@@ -1263,7 +1736,7 @@ pub async fn seek_transcode(
     AxumPath(id): AxumPath<String>,
     user: CurrentUser,
     Json(body): Json<SeekRequest>,
-) -> ApiResult<Json<&'static str>> {
+) -> ApiResult<Json<Value>> {
     let session_id = Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("invalid session"))?;
     let session_row = get_session(
         &state,
@@ -1321,5 +1794,5 @@ pub async fn seek_transcode(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(Json("ok"))
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
