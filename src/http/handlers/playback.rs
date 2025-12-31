@@ -31,7 +31,7 @@ use crate::{
         TRANSCODE_STARTS,
     },
     network::registry::ensure_server_instance,
-    playback::{SubtitleInfo, TranscodeParams},
+    playback::{HLS_SEGMENT_SECONDS, SubtitleInfo, TranscodeParams},
     state::AppState,
 };
 use tokio::{
@@ -1410,6 +1410,13 @@ struct SegmentProbe {
     streams: Vec<SegmentStream>,
 }
 
+#[derive(Debug)]
+struct SegmentInfo {
+    path: PathBuf,
+    index: i64,
+    name: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SegmentStream {
     start_time: Option<String>,
@@ -1424,11 +1431,20 @@ async fn resolve_subtitle_delay(state: &AppState, session_id: Uuid) -> Option<f6
         .segment_path(session_id, "seg_0_00000.ts")
         .await?;
     let temp_dir = temp_anchor.parent().map(PathBuf::from)?;
-    for _ in 0..6 {
+    for _ in 0..20 {
         if let Some(segment) = find_first_segment(&temp_dir).await {
-            if let Some(delay) = probe_segment_start_time(&segment).await {
-                state.transcodes.set_subtitle_delay(session_id, delay).await;
-                return Some(delay);
+            if let Some(start_time) = probe_segment_start_time(&segment.path).await {
+                let offset = start_time - (segment.index as f64 * HLS_SEGMENT_SECONDS);
+                state.transcodes.set_subtitle_delay(session_id, offset).await;
+                info!(
+                    session = %session_id,
+                    segment = %segment.name,
+                    segment_index = segment.index,
+                    segment_start = start_time,
+                    subtitle_delay = offset,
+                    "resolved subtitle delay"
+                );
+                return Some(offset);
             }
         }
         sleep(Duration::from_millis(100)).await;
@@ -1436,17 +1452,23 @@ async fn resolve_subtitle_delay(state: &AppState, session_id: Uuid) -> Option<f6
     None
 }
 
-async fn find_first_segment(temp_dir: &Path) -> Option<PathBuf> {
+async fn find_first_segment(temp_dir: &Path) -> Option<SegmentInfo> {
     let mut entries = fs::read_dir(temp_dir).await.ok()?;
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<SegmentInfo> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with("seg_0_") && name.ends_with(".ts") {
-            candidates.push(name);
+            if let Some(index) = parse_segment_index(&name) {
+                candidates.push(SegmentInfo {
+                    path: temp_dir.join(&name),
+                    index,
+                    name,
+                });
+            }
         }
     }
-    candidates.sort();
-    candidates.first().map(|name| temp_dir.join(name))
+    candidates.sort_by(|a, b| a.index.cmp(&b.index));
+    candidates.into_iter().next()
 }
 
 async fn probe_segment_start_time(path: &Path) -> Option<f64> {
@@ -1473,27 +1495,48 @@ async fn probe_segment_start_time(path: &Path) -> Option<f64> {
     start.parse::<f64>().ok()
 }
 
+fn parse_segment_index(name: &str) -> Option<i64> {
+    let base = name.strip_suffix(".ts")?;
+    let (_, index) = base.rsplit_once('_')?;
+    index.parse::<i64>().ok()
+}
+
+enum ShiftedLine {
+    Replace(String),
+    DropCue,
+}
+
 fn shift_vtt_cues(content: &str, offset_seconds: f64) -> String {
     if offset_seconds.abs() < 0.001 {
         return content.to_string();
     }
-    let mut out = String::with_capacity(content.len());
-    let mut first = true;
+    let mut out: Vec<String> = Vec::new();
+    let mut drop_cue = false;
     for line in content.lines() {
-        if !first {
-            out.push('\n');
+        if drop_cue {
+            if line.trim().is_empty() {
+                drop_cue = false;
+                if !matches!(out.last(), Some(last) if last.is_empty()) {
+                    out.push(String::new());
+                }
+            }
+            continue;
         }
-        first = false;
         if let Some(shifted) = shift_vtt_line(line, offset_seconds) {
-            out.push_str(&shifted);
+            match shifted {
+                ShiftedLine::Replace(line) => out.push(line),
+                ShiftedLine::DropCue => {
+                    drop_cue = true;
+                }
+            }
         } else {
-            out.push_str(line);
+            out.push(line.to_string());
         }
     }
-    out
+    out.join("\n")
 }
 
-fn shift_vtt_line(line: &str, offset_seconds: f64) -> Option<String> {
+fn shift_vtt_line(line: &str, offset_seconds: f64) -> Option<ShiftedLine> {
     if !line.contains("-->") {
         return None;
     }
@@ -1506,8 +1549,13 @@ fn shift_vtt_line(line: &str, offset_seconds: f64) -> Option<String> {
     let (right_time, right_settings) = split_time_and_settings(right);
     let start = parse_vtt_time(left)?;
     let end = parse_vtt_time(right_time)?;
-    let shifted_start = format_vtt_time((start + offset_seconds).max(0.0));
-    let shifted_end = format_vtt_time((end + offset_seconds).max(0.0));
+    let shifted_start = start + offset_seconds;
+    let shifted_end = end + offset_seconds;
+    if shifted_end <= 0.0 {
+        return Some(ShiftedLine::DropCue);
+    }
+    let shifted_start = format_vtt_time(shifted_start.max(0.0));
+    let shifted_end = format_vtt_time(shifted_end.max(0.0));
     let mut out = format!("{shifted_start} --> {shifted_end}");
     if let Some(settings) = right_settings {
         let trimmed = settings.trim();
@@ -1516,7 +1564,7 @@ fn shift_vtt_line(line: &str, offset_seconds: f64) -> Option<String> {
             out.push_str(trimmed);
         }
     }
-    Some(out)
+    Some(ShiftedLine::Replace(out))
 }
 
 fn split_time_and_settings(raw: &str) -> (&str, Option<&str>) {

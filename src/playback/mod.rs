@@ -17,6 +17,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
+pub(crate) const HLS_SEGMENT_SECONDS: f64 = 4.0;
+const DEFAULT_FPS: f64 = 24.0;
+const MIN_GOP: i64 = 12;
+const MAX_GOP: i64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct TranscodeParams {
     pub seek_seconds: f32,
@@ -197,6 +202,11 @@ impl TranscodeManager {
             .and_then(|job| job.subtitle_delay_seconds)
     }
 
+    pub async fn seek_seconds(&self, session_id: Uuid) -> Option<f64> {
+        let guard = self.inner.lock().await;
+        guard.get(&session_id).map(|job| job.seek_seconds as f64)
+    }
+
     pub async fn set_subtitle_delay(&self, session_id: Uuid, delay: f64) {
         let mut guard = self.inner.lock().await;
         if let Some(job) = guard.get_mut(&session_id) {
@@ -251,12 +261,20 @@ async fn spawn_ffmpeg(
     subtitles: &[SubtitleInfo],
 ) -> Result<Child> {
     let log_file = StdFile::create(log_path).context("creating ffmpeg log file")?;
+    let fps = probe_video_fps(input).await.unwrap_or(DEFAULT_FPS);
+    let gop = ((fps * HLS_SEGMENT_SECONDS).round() as i64)
+        .max(MIN_GOP)
+        .min(MAX_GOP);
+    let force_keyframes = format!("expr:gte(t,n_forced*{})", HLS_SEGMENT_SECONDS);
+    let segment_seconds = format!("{}", HLS_SEGMENT_SECONDS);
 
     let mut command = Command::new("ffmpeg");
     command
         .arg("-y")
         .arg("-loglevel")
-        .arg("warning");
+        .arg("warning")
+        .arg("-copyts")
+        .arg("-start_at_zero");
 
     if subtitles.is_empty() {
         command
@@ -270,6 +288,8 @@ async fn spawn_ffmpeg(
             .arg(format!("{seek_seconds}"))
             .arg("-i")
             .arg(input)
+            .arg("-itsoffset")
+            .arg(format!("-{seek_seconds}"))
             .arg("-ss")
             .arg(format!("{seek_seconds}"))
             .arg("-i")
@@ -289,14 +309,26 @@ async fn spawn_ffmpeg(
         .arg("veryfast")
         .arg("-crf")
         .arg("20")
+        .arg("-g")
+        .arg(gop.to_string())
+        .arg("-keyint_min")
+        .arg(gop.to_string())
+        .arg("-sc_threshold")
+        .arg("0")
+        .arg("-force_key_frames")
+        .arg(&force_keyframes)
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
         .arg("128k")
         .arg("-f")
         .arg("hls")
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
         .arg("-hls_time")
-        .arg("4")
+        .arg(&segment_seconds)
+        .arg("-hls_flags")
+        .arg("independent_segments")
         .arg("-hls_playlist_type")
         .arg("event")
         .arg("-master_pl_name")
@@ -318,7 +350,7 @@ async fn spawn_ffmpeg(
             .arg("-f")
             .arg("segment")
             .arg("-segment_time")
-            .arg("4")
+            .arg(&segment_seconds)
             .arg("-segment_format")
             .arg("webvtt")
             .arg("-segment_list")
@@ -340,6 +372,55 @@ async fn spawn_ffmpeg(
         .context("failed to spawn ffmpeg")?;
 
     Ok(child)
+}
+
+async fn probe_video_fps(path: &str) -> Option<f64> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=avg_frame_rate,r_frame_rate")
+        .arg("-of")
+        .arg("default=nw=1:nk=1")
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(fps) = parse_fps(line.trim()) {
+            return Some(fps);
+        }
+    }
+    None
+}
+
+fn parse_fps(raw: &str) -> Option<f64> {
+    if raw.is_empty() || raw == "0/0" {
+        return None;
+    }
+    if let Some((num, den)) = raw.split_once('/') {
+        let num = num.parse::<f64>().ok()?;
+        let den = den.parse::<f64>().ok()?;
+        if den > 0.0 {
+            let fps = num / den;
+            if fps.is_finite() && fps > 0.0 {
+                return Some(fps);
+            }
+        }
+    } else if let Ok(val) = raw.parse::<f64>() {
+        if val.is_finite() && val > 0.0 {
+            return Some(val);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
