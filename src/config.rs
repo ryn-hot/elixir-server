@@ -21,6 +21,8 @@ pub struct Settings {
     #[serde(default)]
     pub metadata: MetadataConfig,
     #[serde(default)]
+    pub classifier: ClassifierConfig,
+    #[serde(default)]
     pub playback: PlaybackConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -57,6 +59,12 @@ impl Settings {
             .set_default("metadata.enable_consumet", true)?
             .set_default("metadata.request_timeout_seconds", 10)?
             .set_default("metadata.ttl_seconds", 604800)?
+            .set_default("classifier.tvdb_base_url", default_tvdb_base_url())?
+            .set_default("classifier.anizip_base_url", default_anizip_base_url())?
+            .set_default(
+                "classifier.request_timeout_seconds",
+                default_classifier_timeout_seconds(),
+            )?
             .set_default(
                 "playback.session_ttl_seconds",
                 default_session_ttl_seconds(),
@@ -287,6 +295,29 @@ impl Default for MetadataConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ClassifierConfig {
+    #[serde(default = "default_tvdb_base_url")]
+    pub tvdb_base_url: String,
+    #[serde(default)]
+    pub tvdb_api_key: Option<String>,
+    #[serde(default = "default_anizip_base_url")]
+    pub anizip_base_url: String,
+    #[serde(default = "default_classifier_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            tvdb_base_url: default_tvdb_base_url(),
+            tvdb_api_key: None,
+            anizip_base_url: default_anizip_base_url(),
+            request_timeout_seconds: default_classifier_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlaybackConfig {
     #[serde(default = "default_session_ttl_seconds")]
     pub session_ttl_seconds: u64,
@@ -410,6 +441,18 @@ fn default_request_timeout() -> u64 {
 
 fn default_ttl_seconds() -> u64 {
     60 * 60 * 24 * 7
+}
+
+fn default_classifier_timeout_seconds() -> u64 {
+    12
+}
+
+fn default_tvdb_base_url() -> String {
+    "https://api4.thetvdb.com/v4".to_string()
+}
+
+fn default_anizip_base_url() -> String {
+    "https://api.ani.zip".to_string()
 }
 
 fn default_session_ttl_seconds() -> u64 {

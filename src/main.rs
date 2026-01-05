@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::http::router;
 use crate::library::start_periodic_scan;
+use crate::library::LinkerService;
 use crate::metadata::MetadataService;
 use crate::network::{start_mdns, wan::start_wan_tasks};
 use crate::playback::start_session_cleanup;
@@ -57,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
     });
     let metadata = MetadataService::new(settings.metadata.clone())
         .context("failed to initialize metadata service")?;
+    let linkers = LinkerService::new(settings.classifier.clone())
+        .context("failed to initialize classifier linkers")?;
 
     let addr = settings
         .server
@@ -69,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         auth_service,
         extensions,
         metadata,
+        linkers,
     );
     let app = router(state.clone());
 

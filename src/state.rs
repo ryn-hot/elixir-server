@@ -5,6 +5,7 @@ use crate::{
     config::Settings,
     db::{Database, DatabaseDriver},
     extensions::ExtensionManager,
+    library::LinkerService,
     metadata::MetadataService,
     playback::TranscodeManager,
 };
@@ -19,6 +20,7 @@ pub struct AppState {
     pub auth_service: AuthService,
     pub extensions: Arc<ExtensionManager>,
     pub metadata: Arc<MetadataService>,
+    pub linkers: Arc<LinkerService>,
     pub transcodes: Arc<TranscodeManager>,
     pub mdns_active: Arc<AtomicBool>,
 }
@@ -30,6 +32,7 @@ impl AppState {
         auth_service: AuthService,
         extensions: ExtensionManager,
         metadata: MetadataService,
+        linkers: LinkerService,
     ) -> Self {
         Self {
             settings: Arc::new(settings),
@@ -38,6 +41,7 @@ impl AppState {
             auth_service,
             extensions: Arc::new(extensions),
             metadata: Arc::new(metadata),
+            linkers: Arc::new(linkers),
             transcodes: Arc::new(TranscodeManager::new()),
             mdns_active: Arc::new(AtomicBool::new(false)),
         }

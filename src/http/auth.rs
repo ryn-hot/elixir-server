@@ -70,7 +70,7 @@ fn token_from_query(query: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::AuthConfig;
-    use axum::http::HeaderMap;
+    use axum::http::Request;
 
     #[test]
     fn parses_valid_bearer_token() {
@@ -79,16 +79,11 @@ mod tests {
         let session_id = Uuid::new_v4();
         let (token, _) = auth.sign_access_token(user_id, session_id).unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-
-        let parts = Parts {
-            headers,
-            ..Default::default()
-        };
+        let request = Request::builder()
+            .header("authorization", format!("Bearer {}", token))
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
 
         let current_user = parse_user(&parts, &auth).expect("should parse bearer token");
         assert_eq!(current_user.user_id, user_id);

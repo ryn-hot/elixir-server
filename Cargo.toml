@@ -41,3 +41,4 @@ once_cell = "1.19"
 itertools = "0.13"
 natpmp = "0.5"
 blake3 = "1.5"
+elixir_classifier = { path = "../crates/elixir_classifier" }

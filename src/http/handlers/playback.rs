@@ -107,29 +107,52 @@ pub async fn play(
     Json(body): Json<PlayRequest>,
 ) -> ApiResult<Json<PlayResponse>> {
     let latency_timer = PLAY_LATENCY.with_label_values(&["pending"]).start_timer();
-    let item: Option<MediaItemRow> =
-        sqlx::query("SELECT type, runtime_seconds FROM media_items WHERE id = ? LIMIT 1")
+    let movie = sqlx::query("SELECT runtime_seconds FROM movies WHERE id = ? LIMIT 1")
+        .bind(&body.media_item_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let item = if let Some(row) = movie {
+        MediaItemRow {
+            r#type: MediaType::Movie,
+            runtime_seconds: row
+                .try_get::<i64, _>("runtime_seconds")
+                .ok()
+                .map(|v| v as i32),
+        }
+    } else {
+        let series = sqlx::query("SELECT library_type FROM series WHERE id = ? LIMIT 1")
             .bind(&body.media_item_id)
             .fetch_optional(&state.db_pool)
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .map(|row| MediaItemRow {
-                r#type: item_type(row.get::<String, _>("type").as_str())
-                    .unwrap_or(MediaType::Movie),
-                runtime_seconds: row
-                    .try_get::<i64, _>("runtime_seconds")
-                    .ok()
-                    .map(|v| v as i32),
-            });
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let series = series.ok_or_else(|| ApiError::not_found("media item not found"))?;
+        MediaItemRow {
+            r#type: item_type(series.get::<String, _>("library_type").as_str())
+                .unwrap_or(MediaType::Series),
+            runtime_seconds: None,
+        }
+    };
 
-    let item = item.ok_or_else(|| ApiError::not_found("media item not found"))?;
-
-    let rows = sqlx::query(
-        "SELECT id, path, container, video_codec, audio_codec, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(bitrate_bps, 0) as bitrate_bps, size_bytes FROM media_files WHERE media_item_id = ? AND scan_state = 'ok'",
-    )
-    .bind(&body.media_item_id)
-    .fetch_all(&state.db_pool)
-    .await
+    let rows = match item.r#type {
+        MediaType::Movie => {
+            sqlx::query(
+                "SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = ? AND mf.scan_state = 'ok'",
+            )
+            .bind(&body.media_item_id)
+            .fetch_all(&state.db_pool)
+            .await
+        }
+        _ => {
+            sqlx::query(
+                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = ? AND mf.scan_state = 'ok'",
+            )
+            .bind(&body.media_item_id)
+            .fetch_all(&state.db_pool)
+            .await
+        }
+    }
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let mut files = Vec::new();
@@ -235,9 +258,14 @@ pub async fn play(
         }
     };
 
-    let resolved_duration =
-        resolve_duration_seconds(&state, &body.media_item_id, &selected.path, item.runtime_seconds)
-            .await;
+    let resolved_duration = resolve_duration_seconds(
+        &state,
+        &body.media_item_id,
+        &selected.path,
+        item.runtime_seconds,
+        item.r#type,
+    )
+    .await;
 
     let transcode_state = match decision.mode {
         PlaybackMode::Transcode => Some(serde_json::json!({
@@ -286,6 +314,7 @@ async fn resolve_duration_seconds(
     media_item_id: &str,
     media_path: &str,
     item_duration: Option<i32>,
+    item_type: MediaType,
 ) -> Option<i32> {
     let probe_duration = match ffprobe::probe(media_path).await {
         Ok(meta) => meta.duration_seconds,
@@ -310,6 +339,15 @@ async fn resolve_duration_seconds(
     };
 
     if should_replace {
+        if matches!(item_type, MediaType::Movie) {
+            let _ = sqlx::query::<sqlx::Any>(
+                "UPDATE movies SET runtime_seconds = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(actual)
+            .bind(media_item_id)
+            .execute(&state.db_pool)
+            .await;
+        }
         let _ = sqlx::query::<sqlx::Any>(
             "UPDATE media_items SET runtime_seconds = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )

@@ -30,6 +30,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/library/items", get(handlers::library::list_items))
         .route("/api/v1/library/items/:id", get(handlers::library::detail))
         .route("/api/v1/library/scan", post(handlers::library::scan))
+        .route(
+            "/api/v1/library/review/queue",
+            get(handlers::review::list_queue),
+        )
+        .route(
+            "/api/v1/library/review/queue/:id",
+            get(handlers::review::queue_detail),
+        )
+        .route(
+            "/api/v1/library/review/queue/:id/apply",
+            post(handlers::review::apply_review),
+        )
+        .route(
+            "/api/v1/library/overrides",
+            post(handlers::review::set_override),
+        )
         .route("/api/v1/play", post(handlers::playback::play))
         .route("/stream/direct/:id", get(handlers::playback::stream_direct))
         .route(

@@ -1,30 +1,42 @@
 use std::process::Stdio;
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FfprobeStreams {
     pub streams: Vec<Stream>,
     pub format: Option<Format>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stream {
+    pub index: Option<i32>,
     #[serde(rename = "codec_type")]
     pub codec_type: Option<String>,
     #[serde(rename = "codec_name")]
     pub codec_name: Option<String>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub channels: Option<i32>,
     #[serde(rename = "bit_rate")]
     pub bit_rate: Option<String>,
     #[serde(rename = "duration")]
     pub duration: Option<String>,
+    pub tags: Option<HashMap<String, String>>,
+    pub disposition: Option<Disposition>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Disposition {
+    #[serde(rename = "default")]
+    pub default_flag: Option<i32>,
+    pub forced: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Format {
     pub duration: Option<String>,
     #[serde(rename = "bit_rate")]
@@ -42,6 +54,7 @@ pub struct MediaMetadata {
     pub height: Option<i32>,
     pub bitrate_bps: Option<i64>,
     pub duration_seconds: Option<i32>,
+    pub streams: Vec<Stream>,
 }
 
 pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
@@ -84,6 +97,7 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
         meta.duration_seconds = format_duration_seconds;
     }
 
+    meta.streams = parsed.streams.clone();
     for stream in parsed.streams {
         match stream.codec_type.as_deref() {
             Some("video") => {

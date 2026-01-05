@@ -16,8 +16,8 @@ use uuid::Uuid;
 use crate::{
     auth::AuthService,
     config::{
-        AuthConfig, DatabaseConfig, LibraryConfig, RunEnvironment, ServerConfig, Settings,
-        TelemetryConfig,
+        AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, ServerConfig,
+        Settings, TelemetryConfig,
     },
     db::Database,
     extensions::ExtensionManager,
@@ -26,6 +26,8 @@ use crate::{
     extensions::MediaFileCandidate,
     extensions::MediaIdentity,
     http::router,
+    library::LinkerService,
+    library::normalize_override_key,
     library::run_full_scan,
     metadata::MetadataService,
     state::AppState,
@@ -44,6 +46,7 @@ fn test_settings_with_db() -> Settings {
         auth: AuthConfig::default(),
         telemetry: TelemetryConfig::default(),
         metadata: crate::config::MetadataConfig::default(),
+        classifier: ClassifierConfig::default(),
         playback: crate::config::PlaybackConfig::default(),
         network: crate::config::NetworkConfig::default(),
     }
@@ -55,6 +58,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
 
     let app = router(AppState::new(
         settings,
@@ -62,6 +66,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         auth_service,
         ExtensionManager::new(),
         MetadataService::new(crate::config::MetadataConfig::default())?,
+        linkers,
     ));
 
     let health_response = app
@@ -112,12 +117,14 @@ async fn login_returns_access_token() -> Result<()> {
     let db_pool = database.pool.clone();
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
     let app = router(AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
+        linkers,
     ));
 
     let user_id = Uuid::new_v4().to_string();
@@ -175,12 +182,14 @@ async fn signup_and_password_reset_flow() -> Result<()> {
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
     let app = router(AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
+        linkers,
     ));
 
     // Signup
@@ -306,12 +315,14 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
     let db_pool = database.pool.clone();
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
     let state = AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
+        linkers,
     );
     let app = router(state.clone());
 
@@ -394,8 +405,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
     let list_body = body::to_bytes(list_resp.into_body(), 1_048_576).await?;
     let list_json: Value = serde_json::from_slice(&list_body)?;
     let servers = list_json
-        .get("servers")
-        .and_then(Value::as_array)
+        .as_array()
         .cloned()
         .unwrap_or_default();
     assert!(!servers.is_empty());
@@ -428,12 +438,14 @@ async fn discovery_requires_auth() -> Result<()> {
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
     let state = AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
+        linkers,
     );
     let app = router(state.clone());
 
@@ -460,12 +472,14 @@ async fn playback_profile_requires_auth() -> Result<()> {
     let db_pool = database.pool.clone();
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
     let state = AppState::new(
         settings,
         database,
         auth_service,
         ExtensionManager::new(),
         metadata,
+        linkers,
     );
     let app = router(state.clone());
 
@@ -521,7 +535,8 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata);
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
     let app = router(state.clone());
 
     // Seed media via run_full_scan directly.
@@ -580,6 +595,125 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
 }
 
 #[tokio::test]
+async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+    );
+    let app = router(state.clone());
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("review@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let dir = tempdir()?;
+    let media_path = dir.path().join("Review.Movie.2024.mkv");
+    std::fs::write(&media_path, b"")?;
+
+    let candidate = MediaFileCandidate {
+        identity: MediaIdentity {
+            r#type: crate::db::models::MediaType::Movie,
+            external_ids: ExternalIds::default(),
+            title: "Review Movie".to_string(),
+            year: Some(2024),
+            season: None,
+            episode: None,
+        },
+        files: vec![FileDescriptor {
+            path: media_path.to_string_lossy().to_string(),
+            size_bytes: Some(1234),
+            hash: None,
+            container: Some("mkv".to_string()),
+            video_codec: None,
+            audio_codec: None,
+        }],
+        extension_metadata: Default::default(),
+        source_config_id: None,
+    };
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
+
+    let media_file_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_files WHERE path = ? LIMIT 1",
+    )
+    .bind(media_path.to_string_lossy().to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+
+    let review_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO review_queue (id, media_file_id, status, confidence, hint_json, candidates_json) VALUES (?, ?, 'pending', ?, ?, ?)",
+    )
+    .bind(&review_id)
+    .bind(&media_file_id)
+    .bind(0.4_f32)
+    .bind(r#"{"title":"Review Movie"}"#)
+    .bind(r#"{"candidates":[]}"#)
+    .execute(&state.db_pool)
+    .await?;
+
+    let apply_body = serde_json::json!({
+        "library_type": "movie",
+        "external_ids": {
+            "imdb": "tt1234567",
+            "tmdb": 9999
+        }
+    });
+    let response = app
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/library/review/queue/{review_id}/apply"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(apply_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let imdb_id: Option<String> = sqlx::query_scalar(
+        "SELECT external_imdb FROM movies LIMIT 1",
+    )
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(imdb_id.as_deref(), Some("tt1234567"));
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM review_queue WHERE id = ? LIMIT 1",
+    )
+    .bind(&review_id)
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(status, "applied");
+
+    let override_key: String = sqlx::query_scalar(
+        "SELECT normalized_key FROM classifier_overrides WHERE library_type = 'movie' LIMIT 1",
+    )
+    .fetch_one(&state.db_pool)
+    .await?;
+    let expected_key =
+        normalize_override_key("Review.Movie.2024").expect("normalized key");
+    assert_eq!(override_key, expected_key);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn play_endpoint_returns_stream_url() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "play-secret-key".to_string();
@@ -588,7 +722,8 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata);
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
     let app = router(state.clone());
 
     // Create a real file on disk to serve.
@@ -626,7 +761,7 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
         .execute(&state.db_pool)
         .await?;
 
-    let (item_id,): (String,) = sqlx::query_as("SELECT id FROM media_items LIMIT 1")
+    let (item_id,): (String,) = sqlx::query_as("SELECT id FROM movies LIMIT 1")
         .fetch_one(&state.db_pool)
         .await?;
 
@@ -679,7 +814,8 @@ async fn direct_stream_supports_range() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata);
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
     let app = router(state.clone());
 
     let dir = tempdir()?;
@@ -720,7 +856,7 @@ async fn direct_stream_supports_range() -> Result<()> {
 
     let token = state.auth_service.issue_access_token(user_id)?.token;
 
-    let media_item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+    let media_item_id: String = sqlx::query_scalar("SELECT id FROM movies LIMIT 1")
         .fetch_one(&state.db_pool)
         .await?;
 
@@ -793,7 +929,8 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata);
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
@@ -830,7 +967,7 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let token = state.auth_service.issue_access_token(user_id)?.token;
-    let media_item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+    let media_item_id: String = sqlx::query_scalar("SELECT id FROM movies LIMIT 1")
         .fetch_one(&state.db_pool)
         .await?;
 

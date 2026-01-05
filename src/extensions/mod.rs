@@ -41,14 +41,18 @@ pub struct MediaIdentity {
     pub episode: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalIds {
-    pub tmdb: Option<String>,
     pub imdb: Option<String>,
+    pub tmdb: Option<String>,
     pub tvdb: Option<String>,
+    pub tvdb_series: Option<String>,
+    pub tvdb_movie: Option<String>,
     pub anilist: Option<String>,
+    pub anidb: Option<String>,
     pub mal: Option<String>,
+    pub kitsu: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,10 +381,24 @@ mod tests {
 }
 
 pub fn make_identity_key(identity: &MediaIdentity) -> String {
-    if let Some(tmdb) = &identity.external_ids.tmdb {
-        format!("tmdb:{tmdb}")
-    } else if let Some(imdb) = &identity.external_ids.imdb {
+    if let Some(imdb) = &identity.external_ids.imdb {
         format!("imdb:{imdb}")
+    } else if let Some(tmdb) = &identity.external_ids.tmdb {
+        format!("tmdb:{tmdb}")
+    } else if let Some(tvdb) = &identity.external_ids.tvdb_series {
+        format!("tvdb_series:{tvdb}")
+    } else if let Some(tvdb) = &identity.external_ids.tvdb_movie {
+        format!("tvdb_movie:{tvdb}")
+    } else if let Some(anilist) = &identity.external_ids.anilist {
+        format!("anilist:{anilist}")
+    } else if let Some(mal) = &identity.external_ids.mal {
+        format!("mal:{mal}")
+    } else if let Some(anidb) = &identity.external_ids.anidb {
+        format!("anidb:{anidb}")
+    } else if let Some(kitsu) = &identity.external_ids.kitsu {
+        format!("kitsu:{kitsu}")
+    } else if let Some(tvdb) = &identity.external_ids.tvdb {
+        format!("tvdb:{tvdb}")
     } else {
         format!(
             "{}:{}:{}",
