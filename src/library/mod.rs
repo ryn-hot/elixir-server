@@ -90,40 +90,15 @@ pub async fn run_full_scan_with_metadata_and_linkers(
         identity_for_meta.season = None;
         identity_for_meta.episode = None;
 
-        let meta = if let Some(service) = metadata {
-            let should_refresh = should_refresh_metadata(
-                pool,
-                &identity_for_meta,
-                service.ttl_seconds(),
-                force_metadata,
-            )
-            .await?;
-            if should_refresh {
-                service
-                    .fetch_metadata(&identity_for_meta)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let merged_ids = merge_external_ids(
-            &candidate.identity.external_ids,
-            meta.as_ref().and_then(|m| m.external_ids.clone()),
-        );
-
-        let (merged_ids, review_outcomes) = classify_candidate_files(
+        let mut merged_ids = candidate.identity.external_ids.clone();
+        let (classified_ids, review_outcomes) = classify_candidate_files(
             pool,
             &classifier,
             &candidate,
             &merged_ids,
         )
         .await?;
-        let mut merged_ids = merged_ids;
+        merged_ids = classified_ids;
 
         let mut anizip_mapping: Option<AniZipMapping> = None;
         if let Some(linker) = linkers {
@@ -147,6 +122,32 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     }
                 }
             }
+        }
+
+        identity_for_meta.external_ids = merged_ids.clone();
+        let meta = if let Some(service) = metadata {
+            let should_refresh = should_refresh_metadata(
+                pool,
+                &identity_for_meta,
+                service.ttl_seconds(),
+                force_metadata,
+            )
+            .await?;
+            if should_refresh {
+                service
+                    .fetch_metadata(&identity_for_meta)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(meta_ids) = meta.as_ref().and_then(|m| m.external_ids.clone()) {
+            merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
         }
 
         match candidate.identity.r#type {
@@ -890,25 +891,73 @@ async fn should_refresh_metadata(
 
     let existing = match identity.r#type {
         MediaType::Movie => {
-            sqlx::query::<sqlx::Any>(
-                "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
-            )
-            .bind(&identity.title)
-            .bind(identity.year)
-            .bind(identity.year)
-            .fetch_optional(pool)
-            .await?
+            if let Some(imdb) = identity.external_ids.imdb.as_ref() {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_imdb = ? LIMIT 1",
+                )
+                .bind(imdb)
+                .fetch_optional(pool)
+                .await?
+            } else if let Some(tmdb) = identity.external_ids.tmdb.as_ref() {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_tmdb = ? LIMIT 1",
+                )
+                .bind(tmdb)
+                .fetch_optional(pool)
+                .await?
+            } else {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
+                )
+                .bind(&identity.title)
+                .bind(identity.year)
+                .bind(identity.year)
+                .fetch_optional(pool)
+                .await?
+            }
         }
         MediaType::Series | MediaType::Anime => {
-            sqlx::query::<sqlx::Any>(
-                "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
-            )
-            .bind(identity.r#type.as_str())
-            .bind(&identity.title)
-            .bind(identity.year)
-            .bind(identity.year)
-            .fetch_optional(pool)
-            .await?
+            let library_type = identity.r#type.as_str();
+            if let Some(anilist) = identity.external_ids.anilist.as_ref() {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_anilist = ? LIMIT 1",
+                )
+                .bind(library_type)
+                .bind(anilist)
+                .fetch_optional(pool)
+                .await?
+            } else if let Some(tvdb) = identity
+                .external_ids
+                .tvdb_series
+                .as_ref()
+                .or(identity.external_ids.tvdb.as_ref())
+            {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_tvdb_series = ? LIMIT 1",
+                )
+                .bind(library_type)
+                .bind(tvdb)
+                .fetch_optional(pool)
+                .await?
+            } else if let Some(imdb) = identity.external_ids.imdb.as_ref() {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_imdb = ? LIMIT 1",
+                )
+                .bind(library_type)
+                .bind(imdb)
+                .fetch_optional(pool)
+                .await?
+            } else {
+                sqlx::query::<sqlx::Any>(
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
+                )
+                .bind(library_type)
+                .bind(&identity.title)
+                .bind(identity.year)
+                .bind(identity.year)
+                .fetch_optional(pool)
+                .await?
+            }
         }
     };
 

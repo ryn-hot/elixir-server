@@ -180,61 +180,27 @@ pub mod anilist {
         client: &Client,
         identity: &MediaIdentity,
     ) -> Result<Option<MetadataResult>> {
-        let query = r#"
-            query ($search: String) {
-              Media(search: $search, type: ANIME) {
-                id
-                title { romaji english native }
-                episodes
-                duration
-                format
-                description
-                genres
-              }
+        if let Some(anilist_id) = identity.external_ids.anilist.as_ref() {
+            if let Ok(parsed) = anilist_id.parse::<i32>() {
+                if let Some(meta) = fetch_by_id(client, parsed).await? {
+                    return Ok(Some(meta));
+                }
             }
-        "#;
-
-        #[derive(Serialize)]
-        struct Variables<'a> {
-            search: &'a str,
         }
 
-        let res = client
-            .post("https://graphql.anilist.co")
-            .json(&serde_json::json!({ "query": query, "variables": Variables { search: &identity.title } }))
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Ok(None);
-        }
-        #[derive(Deserialize)]
-        struct MediaResp {
-            data: Option<MediaData>,
-        }
-        #[derive(Deserialize)]
-        struct MediaData {
-            #[serde(rename = "Media")]
-            media: Option<MediaItem>,
+        if let Some(meta) = fetch_by_search(client, &identity.title).await? {
+            return Ok(Some(meta));
         }
 
-        let body: MediaResp = res.json().await?;
-        if let Some(media) = body.data.and_then(|d| d.media) {
-            let runtime_seconds = media
-                .duration
-                .and_then(|d| media.episodes.map(|e| d * 60 * e).or(Some(d * 60)));
-            let json = serde_json::to_value(&media)?;
-            return Ok(Some(MetadataResult {
-                metadata_json: json,
-                runtime_seconds,
-                external_ids: Some(ExternalIds {
-                    anilist: Some(media.id.to_string()),
-                    ..Default::default()
-                }),
-                description: media.description.clone(),
-                genres: media.genres.clone(),
-            }));
+        if let Some(season) = identity.season {
+            if season > 1 {
+                let season_title = format!("{} Season {}", identity.title, season);
+                if let Some(meta) = fetch_by_search(client, &season_title).await? {
+                    return Ok(Some(meta));
+                }
+            }
         }
+
         Ok(None)
     }
 
@@ -289,6 +255,115 @@ pub mod anilist {
             .and_then(|d| d.page)
             .and_then(|p| p.media)
             .unwrap_or_default())
+    }
+
+    async fn fetch_by_search(client: &Client, search: &str) -> Result<Option<MetadataResult>> {
+        let query = r#"
+            query ($search: String) {
+              Media(search: $search, type: ANIME) {
+                id
+                title { romaji english native }
+                episodes
+                duration
+                format
+                description
+                genres
+              }
+            }
+        "#;
+
+        #[derive(Serialize)]
+        struct Variables<'a> {
+            search: &'a str,
+        }
+
+        let res = client
+            .post("https://graphql.anilist.co")
+            .json(&serde_json::json!({ "query": query, "variables": Variables { search } }))
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Ok(None);
+        }
+        #[derive(Deserialize)]
+        struct MediaResp {
+            data: Option<MediaData>,
+        }
+        #[derive(Deserialize)]
+        struct MediaData {
+            #[serde(rename = "Media")]
+            media: Option<MediaItem>,
+        }
+
+        let body: MediaResp = res.json().await?;
+        if let Some(media) = body.data.and_then(|d| d.media) {
+            return Ok(Some(metadata_from_media(&media)?));
+        }
+        Ok(None)
+    }
+
+    async fn fetch_by_id(client: &Client, id: i32) -> Result<Option<MetadataResult>> {
+        let query = r#"
+            query ($id: Int) {
+              Media(id: $id, type: ANIME) {
+                id
+                title { romaji english native }
+                episodes
+                duration
+                format
+                description
+                genres
+              }
+            }
+        "#;
+
+        #[derive(Serialize)]
+        struct Variables {
+            id: i32,
+        }
+
+        let res = client
+            .post("https://graphql.anilist.co")
+            .json(&serde_json::json!({ "query": query, "variables": Variables { id } }))
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Ok(None);
+        }
+        #[derive(Deserialize)]
+        struct MediaResp {
+            data: Option<MediaData>,
+        }
+        #[derive(Deserialize)]
+        struct MediaData {
+            #[serde(rename = "Media")]
+            media: Option<MediaItem>,
+        }
+
+        let body: MediaResp = res.json().await?;
+        if let Some(media) = body.data.and_then(|d| d.media) {
+            return Ok(Some(metadata_from_media(&media)?));
+        }
+        Ok(None)
+    }
+
+    fn metadata_from_media(media: &MediaItem) -> Result<MetadataResult> {
+        let runtime_seconds = media
+            .duration
+            .and_then(|d| media.episodes.map(|e| d * 60 * e).or(Some(d * 60)));
+        let json = serde_json::to_value(media)?;
+        Ok(MetadataResult {
+            metadata_json: json,
+            runtime_seconds,
+            external_ids: Some(ExternalIds {
+                anilist: Some(media.id.to_string()),
+                ..Default::default()
+            }),
+            description: media.description.clone(),
+            genres: media.genres.clone(),
+        })
     }
 }
 
