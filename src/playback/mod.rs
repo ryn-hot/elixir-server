@@ -525,7 +525,9 @@ pub async fn start_session_cleanup(
 }
 
 async fn cleanup_stale_sessions(state: &crate::state::AppState, ttl_seconds: u64) -> Result<()> {
-    let rows = sqlx::query("SELECT id, updated_at FROM playback_sessions")
+    let rows = sqlx::query(
+        "SELECT id, COALESCE(CAST(updated_at AS TEXT), '') AS updated_at FROM playback_sessions",
+    )
         .fetch_all(&state.db_pool)
         .await?;
 
@@ -533,8 +535,8 @@ async fn cleanup_stale_sessions(state: &crate::state::AppState, ttl_seconds: u64
     let mut expired_ids = Vec::new();
     for row in rows {
         let id_str: String = row.get("id");
-        let updated_str: String = row.try_get("updated_at")?;
-        if let Some(updated_ts) = parse_timestamp(&updated_str) {
+        let updated_str: String = row.get("updated_at");
+        if let Some(updated_ts) = parse_timestamp(updated_str.trim()) {
             let age = now - updated_ts;
             if age.num_seconds() as u64 > ttl_seconds {
                 if let Ok(id) = Uuid::parse_str(&id_str) {

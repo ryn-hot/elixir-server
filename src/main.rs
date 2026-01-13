@@ -1,4 +1,5 @@
 mod auth;
+mod artwork;
 mod config;
 mod db;
 mod extensions;
@@ -13,6 +14,7 @@ mod state;
 mod telemetry;
 
 use crate::auth::AuthService;
+use crate::artwork::ArtworkService;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
@@ -27,10 +29,22 @@ use anyhow::Context;
 use std::sync::atomic::Ordering;
 use tokio::net::TcpListener;
 
+fn load_env() {
+    if let Ok(cwd) = std::env::current_dir() {
+        for dir in cwd.ancestors() {
+            let candidate = dir.join(".env");
+            if candidate.is_file() {
+                let _ = dotenvy::from_path(&candidate);
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load environment variables from a local .env file when present for developer convenience.
-    dotenvy::dotenv().ok();
+    // Load environment variables from the closest .env, walking up to repo root.
+    load_env();
 
     let settings = Settings::load().context("failed to load configuration")?;
     telemetry::init_tracing(&settings.telemetry).context("failed to initialize tracing")?;
@@ -60,6 +74,11 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize metadata service")?;
     let linkers = LinkerService::new(settings.classifier.clone())
         .context("failed to initialize classifier linkers")?;
+    let artwork = ArtworkService::new(
+        settings.library.artwork_cache_dir.clone(),
+        settings.metadata.request_timeout_seconds,
+    )
+    .context("failed to initialize artwork cache")?;
 
     let addr = settings
         .server
@@ -73,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         extensions,
         metadata,
         linkers,
+        artwork,
     );
     let app = router(state.clone());
 

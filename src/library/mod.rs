@@ -17,13 +17,21 @@ use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::id_extractor_parser::IdExtractorParser;
 use elixir_classifier::identify::anilist::AniListIdentifier;
 use elixir_classifier::identify::cinemeta::CinemetaIdentifier;
-use elixir_classifier::identify::{CanonicalMatch as ClassifierCanonicalMatch, ExternalIds as ClassifierExternalIds};
+use elixir_classifier::identify::tvdb::TvdbIdentifier;
+use elixir_classifier::identify::{
+    CandidateScorer, CanonicalMatch as ClassifierCanonicalMatch, DefaultScorer,
+    ExternalIds as ClassifierExternalIds, IdentifierProvider,
+};
 use elixir_classifier::link::anizip_linker::AniZipLinker;
 use elixir_classifier::link::tvdb_linker::TvdbLinker;
 use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
 use crate::{
+    artwork::{
+        extract_anilist_artwork, extract_cinemeta_artwork, extract_tvdb_artworks,
+        extract_tvdb_series_artwork, ArtworkCandidate, ArtworkKind, ArtworkService,
+    },
     config::ClassifierConfig,
     db::models::MediaType,
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
@@ -36,6 +44,8 @@ use crate::{
 pub use linkers::LinkerService;
 use linkers::{AniZipEpisodeRecord, AniZipMapping};
 
+const ANILIST_ENDPOINT: &str = "https://graphql.anilist.co";
+
 pub async fn run_full_scan(
     pool: &AnyPool,
     candidates: Vec<MediaFileCandidate>,
@@ -46,7 +56,9 @@ pub async fn run_full_scan(
         None,
         None,
         None,
+        None,
         candidates,
+        false,
         false,
         hash_dedupe,
     )
@@ -65,8 +77,10 @@ pub async fn run_full_scan_with_metadata(
         metadata,
         None,
         None,
+        None,
         candidates,
         force_metadata,
+        false,
         hash_dedupe,
     )
     .await
@@ -77,53 +91,187 @@ pub async fn run_full_scan_with_metadata_and_linkers(
     metadata: Option<&MetadataService>,
     linkers: Option<&LinkerService>,
     classifier_config: Option<&ClassifierConfig>,
+    artwork: Option<&ArtworkService>,
     candidates: Vec<MediaFileCandidate>,
     force_metadata: bool,
+    force_reclassify: bool,
     hash_dedupe: bool,
 ) -> Result<()> {
     let (merged, mut seen_paths): (Vec<AggregatedCandidate>, HashSet<String>) =
         merge_candidates(candidates, hash_dedupe);
     let classifier = build_classifier_pipeline(classifier_config);
+    let anilist_bridge = build_anilist_identifier(classifier_config);
+    let anilist_scorer = DefaultScorer::default();
+    let hydration_ttl_seconds = metadata.map(|service| service.ttl_seconds()).unwrap_or(0);
 
-    for candidate in merged {
-        let mut identity_for_meta = candidate.identity.clone();
-        identity_for_meta.season = None;
-        identity_for_meta.episode = None;
-
+    for mut candidate in merged {
         let mut merged_ids = candidate.identity.external_ids.clone();
-        let (classified_ids, review_outcomes) = classify_candidate_files(
+        let (
+            classified_ids,
+            mut review_outcomes,
+            mut prefer_anime,
+            tvdb_seeds,
+            mut season_anilist_seeds,
+        ) = classify_candidate_files(
             pool,
             &classifier,
             &candidate,
             &merged_ids,
+            force_reclassify,
         )
         .await?;
         merged_ids = classified_ids;
 
-        let mut anizip_mapping: Option<AniZipMapping> = None;
+        let mut anizip_mappings: HashMap<i32, AniZipMapping> = HashMap::new();
+        let mut bridge_result = AnimeBridgeResult::default();
         if let Some(linker) = linkers {
-            if matches!(
-                candidate.identity.r#type,
-                MediaType::Series | MediaType::Anime
-            ) {
+            if matches!(candidate.identity.r#type, MediaType::Series | MediaType::Anime) {
                 if merged_ids.tvdb_series.is_none() {
                     if let Some(imdb) = merged_ids.imdb.as_ref() {
                         if let Ok(Some(tvdb_id)) = linker.link_tvdb_series_by_imdb(imdb).await {
+                            tracing::trace!(
+                                imdb = %imdb,
+                                tvdb_id = %tvdb_id,
+                                "linked tvdb series id from imdb"
+                            );
                             merged_ids.tvdb_series = Some(tvdb_id);
                         }
                     }
                 }
-                if matches!(candidate.identity.r#type, MediaType::Anime) {
-                    if let Some(anilist) = merged_ids.anilist.as_ref() {
-                        if let Ok(Some(mapping)) = linker.fetch_anizip_mapping(anilist).await {
-                            merged_ids = merge_external_ids(&merged_ids, Some(mapping.ids.clone()));
-                            anizip_mapping = Some(mapping);
+            }
+            if merged_ids.anilist.is_none() && !tvdb_seeds.is_empty() {
+                if let Some(tvdb_id) = merged_ids
+                    .tvdb_series
+                    .as_ref()
+                    .or(merged_ids.tvdb.as_ref())
+                    .cloned()
+                {
+                    tracing::trace!(
+                        tvdb_id = %tvdb_id,
+                        tvdb_seeds = tvdb_seeds.len(),
+                        "considering tvdb anime bridge"
+                    );
+                    if let Ok(Some(series_meta)) = linker.fetch_tvdb_series(&tvdb_id).await {
+                        if tvdb_indicates_anime(&series_meta) {
+                            tracing::trace!(
+                                tvdb_id = %tvdb_id,
+                                "tvdb indicates anime; running anilist bridge"
+                            );
+                            bridge_result.prefer_anime = true;
+                            let mut seeds: Vec<TvdbBridgeSeed> =
+                                tvdb_seeds.values().cloned().collect();
+                            seeds.sort_by(|a, b| {
+                                b.confidence
+                                    .partial_cmp(&a.confidence)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let mut season_years: HashMap<i32, i32> = HashMap::new();
+                            if let Ok(seasons) =
+                                linker.fetch_tvdb_series_seasons(&tvdb_id).await
+                            {
+                                for season_meta in seasons {
+                                    let Some(season_number) =
+                                        extract_tvdb_season_number(&season_meta)
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some(year) =
+                                        extract_tvdb_season_year(&season_meta)
+                                    {
+                                        season_years.insert(season_number, year);
+                                    }
+                                }
+                            }
+
+                            for seed in seeds {
+                                let season_year = season_years.get(&seed.season_number).copied();
+                                let seed_result = apply_tvdb_anime_bridge(
+                                    &series_meta,
+                                    &anilist_bridge,
+                                    &anilist_scorer,
+                                    &mut merged_ids,
+                                    &mut review_outcomes,
+                                    &seed,
+                                    season_year,
+                                )
+                                .await?;
+                                for (season_number, seed) in seed_result.season_anilist_ids {
+                                    insert_season_anilist_seed(
+                                        &mut season_anilist_seeds,
+                                        season_number,
+                                        seed,
+                                    );
+                                }
+                            }
+                            tracing::trace!(
+                                tvdb_id = %tvdb_id,
+                                season_anilist_seeds = season_anilist_seeds.len(),
+                                "tvdb anime bridge complete"
+                            );
                         }
+                    }
+                }
+            }
+            if bridge_result.prefer_anime {
+                tracing::trace!("prefer_anime enabled by tvdb bridge");
+                prefer_anime = true;
+            }
+        }
+
+        let mut expanded_chain: Vec<AniListSeasonChainEntry> = Vec::new();
+        if !season_anilist_seeds.is_empty() {
+            if let Some((seed_season, seed)) = season_anilist_seeds
+                .iter()
+                .max_by(|a, b| {
+                    a.1.confidence
+                        .partial_cmp(&b.1.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                let expanded = expand_anilist_season_chain(
+                    &anilist_bridge,
+                    *seed_season,
+                    seed,
+                )
+                .await?;
+                if !expanded.is_empty() {
+                    tracing::trace!(
+                        seed_season = seed_season,
+                        expanded = expanded.len(),
+                        "expanded anilist season chain"
+                    );
+                    expanded_chain = expanded.clone();
+                    for entry in expanded {
+                        insert_season_anilist_seed(
+                            &mut season_anilist_seeds,
+                            entry.season_number,
+                            SeasonAnilistSeed {
+                                anilist_id: entry.anilist_id,
+                                confidence: entry.confidence,
+                            },
+                        );
                     }
                 }
             }
         }
 
+        if prefer_anime && candidate.identity.r#type != MediaType::Anime {
+            candidate.identity.r#type = MediaType::Anime;
+        }
+
+        if let Some(root_id) = select_root_anilist_id(&expanded_chain, &season_anilist_seeds) {
+            if merged_ids.anilist.as_deref() != Some(root_id.as_str()) {
+                tracing::trace!(
+                    anilist_id = %root_id,
+                    "using root anilist id for series metadata"
+                );
+            }
+            merged_ids.anilist = Some(root_id);
+        }
+
+        let mut identity_for_meta = candidate.identity.clone();
+        identity_for_meta.season = None;
+        identity_for_meta.episode = None;
         identity_for_meta.external_ids = merged_ids.clone();
         let meta = if let Some(service) = metadata {
             let should_refresh = should_refresh_metadata(
@@ -150,6 +298,14 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
         }
 
+        let has_anime_ids = merged_ids.anilist.is_some()
+            || merged_ids.anidb.is_some()
+            || merged_ids.mal.is_some()
+            || merged_ids.kitsu.is_some();
+        if has_anime_ids && candidate.identity.r#type != MediaType::Anime {
+            candidate.identity.r#type = MediaType::Anime;
+        }
+
         match candidate.identity.r#type {
             MediaType::Movie => {
                 let movie_id =
@@ -162,6 +318,9 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     meta.as_ref(),
                 )
                 .await?;
+                if let Some(artwork_service) = artwork {
+                    sync_movie_artwork(pool, artwork_service, movie_id, meta.as_ref()).await?;
+                }
                 for file in candidate.files {
                     seen_paths.insert(file.descriptor.path.clone());
                     let media_file = upsert_media_file(
@@ -183,17 +342,22 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                 }
             }
             MediaType::Series | MediaType::Anime => {
+                let mut series_ids = if candidate.identity.r#type == MediaType::Anime {
+                    strip_anime_ids(&merged_ids)
+                } else {
+                    merged_ids.clone()
+                };
                 let series_id =
-                    upsert_series(pool, &candidate.identity, &merged_ids, meta.as_ref()).await?;
+                    upsert_series(pool, &candidate.identity, &series_ids, meta.as_ref()).await?;
                 upsert_legacy_media_item(
                     pool,
                     series_id,
                     &candidate.identity,
-                    &merged_ids,
+                    &series_ids,
                     meta.as_ref(),
                 )
                 .await?;
-                persist_series_external_ids(pool, series_id, &merged_ids, "classifier").await?;
+                persist_series_external_ids(pool, series_id, &series_ids, "classifier").await?;
 
                 let mut resolved_numbers: HashMap<String, ResolvedEpisodeNumbers> = HashMap::new();
                 for file in &candidate.files {
@@ -202,7 +366,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                         file,
                         outcome,
                         candidate.identity.r#type,
-                        anizip_mapping.as_ref(),
+                        &anizip_mappings,
                     );
                     resolved_numbers.insert(file.descriptor.path.clone(), resolved);
                 }
@@ -224,33 +388,203 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     }
                 }
 
+                if candidate.identity.r#type == MediaType::Anime
+                    && !season_anilist_seeds.is_empty()
+                {
+                    for season_number in season_anilist_seeds.keys() {
+                        if season_ids.contains_key(season_number) {
+                            continue;
+                        }
+                        let season_id = upsert_season(pool, series_id, *season_number).await?;
+                        season_ids.insert(*season_number, season_id);
+                    }
+                }
+
+                if candidate.identity.r#type == MediaType::Series {
+                    if let (Some(linker), Some(tvdb_id)) = (
+                        linkers,
+                        merged_ids
+                            .tvdb_series
+                            .as_ref()
+                            .or(merged_ids.tvdb.as_ref()),
+                    ) {
+                        let should_refresh = !series_seasons_scaffolded_recent(
+                            pool,
+                            series_id,
+                            Some("tvdb"),
+                            hydration_ttl_seconds,
+                            force_metadata,
+                        )
+                        .await?;
+                        if should_refresh {
+                            if let Ok(seasons_meta) =
+                                linker.fetch_tvdb_series_seasons(tvdb_id).await
+                            {
+                                for season_meta in &seasons_meta {
+                                    let Some(season_number) =
+                                        extract_tvdb_season_number(season_meta)
+                                    else {
+                                        continue;
+                                    };
+                                    if season_number < 1 {
+                                        continue;
+                                    }
+                                    if season_ids.contains_key(&season_number) {
+                                        continue;
+                                    }
+                                    let season_id =
+                                        upsert_season(pool, series_id, season_number).await?;
+                                    season_ids.insert(season_number, season_id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (season_number, season_id) in &season_ids {
+                    if !season_anilist_seeds.contains_key(season_number) {
+                        if let Some(raw) = sqlx::query_scalar::<sqlx::Any, String>(
+                            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = ? LIMIT 1",
+                        )
+                        .bind(season_id.to_string())
+                        .fetch_optional(pool)
+                        .await?
+                        {
+                            let trimmed = raw.trim();
+                            if !trimmed.is_empty() {
+                                tracing::trace!(
+                                    season = season_number,
+                                    anilist_id = %trimmed,
+                                    "loaded season anilist id from db"
+                                );
+                                insert_season_anilist_seed(
+                                    &mut season_anilist_seeds,
+                                    *season_number,
+                                    SeasonAnilistSeed {
+                                        anilist_id: trimmed.to_string(),
+                                        confidence: 0.5,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if candidate.identity.r#type == MediaType::Anime
+                    || prefer_anime
+                    || merged_ids.anilist.is_some()
+                    || !season_anilist_seeds.is_empty()
+                {
+                    mark_series_as_anime(pool, series_id).await?;
+                }
+
+                if let Some(linker) = linkers {
+                    for (season_number, seed) in &season_anilist_seeds {
+                        if anizip_mappings.contains_key(season_number) {
+                            continue;
+                        }
+                        if let Some(season_id) = season_ids.get(season_number) {
+                            let is_fresh = season_scaffolded_recent(
+                                pool,
+                                *season_id,
+                                Some("anizip"),
+                                hydration_ttl_seconds,
+                                force_metadata,
+                            )
+                            .await?;
+                            if is_fresh {
+                                continue;
+                            }
+                        }
+                        if let Ok(Some(mapping)) =
+                            linker.fetch_anizip_mapping(&seed.anilist_id).await
+                        {
+                            merged_ids = merge_external_ids(&merged_ids, Some(mapping.ids.clone()));
+                            anizip_mappings.insert(*season_number, mapping);
+                        }
+                    }
+                }
+
+                let refreshed_series_ids = if candidate.identity.r#type == MediaType::Anime {
+                    strip_anime_ids(&merged_ids)
+                } else {
+                    merged_ids.clone()
+                };
+                if refreshed_series_ids != series_ids {
+                    apply_external_ids_to_series(
+                        pool,
+                        series_id,
+                        &refreshed_series_ids,
+                        "anizip",
+                    )
+                    .await?;
+                    series_ids = refreshed_series_ids;
+                }
+
+                for (season_number, season_id) in &season_ids {
+                    if let Some(seed) = season_anilist_seeds.get(season_number) {
+                        let ids = ExternalIds {
+                            anilist: Some(seed.anilist_id.clone()),
+                            ..Default::default()
+                        };
+                        apply_external_ids_to_season(
+                            pool,
+                            *season_id,
+                            &ids,
+                            "classifier",
+                            Some(seed.confidence),
+                        )
+                            .await?;
+                        persist_series_external_ids(pool, series_id, &ids, "anilist_chain")
+                            .await?;
+                    }
+                    if let Some(mapping) = anizip_mappings.get(season_number) {
+                        apply_external_ids_to_season(pool, *season_id, &mapping.ids, "anizip", None)
+                            .await?;
+                    }
+                }
+
+                if let Some(artwork_service) = artwork {
+                    sync_series_artwork(
+                        pool,
+                        artwork_service,
+                        series_id,
+                        meta.as_ref(),
+                        &series_ids,
+                        candidate.identity.r#type == MediaType::Anime,
+                        linkers,
+                        &season_ids,
+                        hydration_ttl_seconds,
+                        force_metadata,
+                    )
+                    .await?;
+                }
+
                 if let Some(linker) = linkers {
                     for (season_number, season_id) in &season_ids {
-                        if matches!(candidate.identity.r#type, MediaType::Anime) {
-                            let mapping = if let Some(existing) = anizip_mapping.as_ref() {
-                                Some(existing)
-                            } else if let Some(anilist) = merged_ids.anilist.as_ref() {
-                                if let Ok(Some(fetched)) =
-                                    linker.fetch_anizip_mapping(anilist).await
-                                {
-                                    anizip_mapping = Some(fetched);
-                                    anizip_mapping.as_ref()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some(mapping) = mapping {
-                                ensure_anizip_season_scaffold(
-                                    pool,
-                                    series_id,
-                                    *season_id,
-                                    *season_number,
-                                    mapping,
-                                )
-                                .await?;
-                            }
+                        if season_scaffolded_recent(
+                            pool,
+                            *season_id,
+                            None,
+                            hydration_ttl_seconds,
+                            force_metadata,
+                        )
+                        .await?
+                        {
+                            continue;
+                        }
+                        if let Some(mapping) = anizip_mappings.get(season_number) {
+                            ensure_anizip_season_scaffold(
+                                pool,
+                                series_id,
+                                *season_id,
+                                *season_number,
+                                mapping,
+                                artwork,
+                                hydration_ttl_seconds,
+                                force_metadata,
+                            )
+                            .await?;
                         } else if let Some(tvdb_id) = merged_ids.tvdb_series.as_ref() {
                             ensure_tvdb_season_scaffold(
                                 pool,
@@ -259,6 +593,9 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                                 tvdb_id,
                                 *season_number,
                                 linker,
+                                artwork,
+                                hydration_ttl_seconds,
+                                force_metadata,
                             )
                             .await?;
                         }
@@ -447,24 +784,220 @@ struct ResolvedEpisodeNumbers {
     absolute_episode: Option<i32>,
 }
 
+#[derive(Debug, Clone)]
+struct TvdbBridgeSeed {
+    hint: elixir_classifier::hint::ClassificationHint,
+    confidence: f32,
+    season_number: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnimeBridgeResult {
+    prefer_anime: bool,
+    season_anilist_ids: HashMap<i32, SeasonAnilistSeed>,
+}
+
+#[derive(Debug, Clone)]
+struct SeasonAnilistSeed {
+    anilist_id: String,
+    confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingFileClassification {
+    ids: ExternalIds,
+    prefer_anime: bool,
+    media_file_id: String,
+}
+
+async fn load_existing_classification_for_path(
+    pool: &AnyPool,
+    path: &str,
+    expected_type: MediaType,
+) -> Result<Option<ExistingFileClassification>> {
+    let media_file_id: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT id FROM media_files WHERE path = ? LIMIT 1",
+    )
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    let Some(media_file_id) = media_file_id else {
+        return Ok(None);
+    };
+
+    let mut movie_id: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT movie_id FROM movie_files WHERE media_file_id = ? LIMIT 1",
+    )
+    .bind(&media_file_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let mut episode_row = sqlx::query(
+        "SELECT e.series_id as series_id, e.season_id as season_id \
+         FROM episode_files ef JOIN episodes e ON e.id = ef.episode_id \
+         WHERE ef.media_file_id = ? LIMIT 1",
+    )
+    .bind(&media_file_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let has_review: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT 1 FROM review_queue WHERE media_file_id = ? LIMIT 1",
+    )
+    .bind(&media_file_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if movie_id.is_some() && episode_row.is_some() {
+        tracing::warn!(
+            media_file_id = %media_file_id,
+            expected_type = ?expected_type,
+            "media file linked to both movie and episode; cleaning up stale link"
+        );
+        match expected_type {
+            MediaType::Movie => {
+                unlink_episode_links_for_media_file(pool, &media_file_id).await?;
+                episode_row = None;
+            }
+            MediaType::Series | MediaType::Anime => {
+                unlink_movie_links_for_media_file(pool, &media_file_id).await?;
+                movie_id = None;
+            }
+        }
+    }
+
+    if movie_id.is_none() && episode_row.is_none() && has_review.is_none() {
+        return Ok(None);
+    }
+
+    let mut ids = ExternalIds::default();
+
+    if let Some(movie_id) = movie_id {
+        if let Some(row) = sqlx::query(
+            "SELECT external_imdb, external_tmdb FROM movies WHERE id = ? LIMIT 1",
+        )
+        .bind(&movie_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            ids.imdb = row.try_get::<String, _>("external_imdb").ok();
+            ids.tmdb = row.try_get::<String, _>("external_tmdb").ok();
+        }
+    }
+
+    if let Some(row) = episode_row {
+        let series_id: String = row.get("series_id");
+        let season_id: String = row.get("season_id");
+
+        if let Some(series_row) = sqlx::query(
+            "SELECT external_imdb, external_tvdb_series, external_anilist \
+             FROM series WHERE id = ? LIMIT 1",
+        )
+        .bind(&series_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            ids.imdb = series_row.try_get::<String, _>("external_imdb").ok();
+            ids.tvdb_series = series_row
+                .try_get::<String, _>("external_tvdb_series")
+                .ok();
+            if ids.anilist.is_none() {
+                ids.anilist = series_row.try_get::<String, _>("external_anilist").ok();
+            }
+        }
+
+        if let Some(season_row) = sqlx::query(
+            "SELECT external_anilist FROM seasons WHERE id = ? LIMIT 1",
+        )
+        .bind(&season_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            if ids.anilist.is_none() {
+                ids.anilist = season_row.try_get::<String, _>("external_anilist").ok();
+            }
+        }
+    }
+
+    let prefer_anime = ids.anilist.is_some()
+        || ids.anidb.is_some()
+        || ids.mal.is_some()
+        || ids.kitsu.is_some();
+
+    Ok(Some(ExistingFileClassification {
+        ids,
+        prefer_anime,
+        media_file_id,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct AniListSeasonChainEntry {
+    season_number: i32,
+    anilist_id: String,
+    confidence: f32,
+}
+
 async fn classify_candidate_files(
     pool: &AnyPool,
     classifier: &ClassifierPipeline,
     candidate: &AggregatedCandidate,
     merged_ids: &ExternalIds,
-) -> Result<(ExternalIds, HashMap<String, ReviewOutcome>)> {
+    force_reclassify: bool,
+) -> Result<(
+    ExternalIds,
+    HashMap<String, ReviewOutcome>,
+    bool,
+    HashMap<i32, TvdbBridgeSeed>,
+    HashMap<i32, SeasonAnilistSeed>,
+)> {
     let library_type = candidate.identity.r#type;
     let library_type_key = library_type_string(library_type);
     let mut updated_ids = merged_ids.clone();
     let mut outcomes: HashMap<String, ReviewOutcome> = HashMap::new();
     let mut override_cache: HashMap<String, Option<ExternalIds>> = HashMap::new();
+    let mut prefer_anime = false;
+    let mut tvdb_seeds: HashMap<i32, TvdbBridgeSeed> = HashMap::new();
+    let mut anilist_seeds: HashMap<i32, SeasonAnilistSeed> = HashMap::new();
 
     for file in &candidate.files {
+        let effective_type = if prefer_anime {
+            MediaType::Anime
+        } else {
+            library_type
+        };
         let path = &file.descriptor.path;
+        tracing::trace!(
+            path = %path,
+            library_type = ?library_type,
+            effective_type = ?effective_type,
+            prefer_anime,
+            "classifier starting file"
+        );
         if let Some(override_ids) =
             lookup_override_for_path(pool, library_type_key, path, &mut override_cache).await?
         {
+            tracing::trace!(
+                path = %path,
+                override_ids = ?override_ids,
+                "classifier override applied"
+            );
             updated_ids = merge_external_ids(&updated_ids, Some(override_ids));
+            let before_prefer = prefer_anime;
+            if updated_ids.anilist.is_some()
+                || updated_ids.anidb.is_some()
+                || updated_ids.mal.is_some()
+                || updated_ids.kitsu.is_some()
+            {
+                prefer_anime = true;
+            }
+            if prefer_anime != before_prefer {
+                tracing::trace!(
+                    path = %path,
+                    prefer_anime,
+                    "classifier prefer_anime enabled from override ids"
+                );
+            }
             outcomes.insert(
                 path.clone(),
                 ReviewOutcome {
@@ -478,7 +1011,30 @@ async fn classify_candidate_files(
             continue;
         }
 
-        if has_strong_ids(library_type, &updated_ids) {
+        if let Some(existing) =
+            load_existing_classification_for_path(pool, path, effective_type).await?
+        {
+            if !force_reclassify {
+                updated_ids = merge_external_ids(&updated_ids, Some(existing.ids));
+                if existing.prefer_anime {
+                    prefer_anime = true;
+                }
+                tracing::trace!(
+                    path = %path,
+                    media_file_id = %existing.media_file_id,
+                    "classifier skipping existing file"
+                );
+                continue;
+            }
+        }
+
+        if has_strong_ids(effective_type, &updated_ids) {
+            tracing::trace!(
+                path = %path,
+                effective_type = ?effective_type,
+                ids = ?updated_ids,
+                "classifier strong ids present; skipping identify"
+            );
             outcomes.insert(
                 path.clone(),
                 ReviewOutcome {
@@ -492,9 +1048,40 @@ async fn classify_candidate_files(
             continue;
         }
 
-        let input = build_classifier_input(file, library_type, &updated_ids);
+        let input = build_classifier_input(file, effective_type, &updated_ids);
         let results = classifier.classify_file(&input).await?;
+        for item in &results {
+            let best_confidence = item.canonical.as_ref().map(|c| c.confidence);
+            let candidate_count = item
+                .canonical
+                .as_ref()
+                .map(|c| c.considered.len())
+                .unwrap_or(0);
+            let providers: Vec<&str> = item
+                .canonical
+                .as_ref()
+                .map(|c| {
+                    let mut set = std::collections::BTreeSet::new();
+                    for candidate in &c.considered {
+                        set.insert(candidate.provider);
+                    }
+                    set.into_iter().collect()
+                })
+                .unwrap_or_default();
+            tracing::trace!(
+                path = %input.path,
+                hint_type = ?item.hint.library_type,
+                hint_title = %item.hint.title,
+                season = ?item.hint.season,
+                episode = ?item.hint.episode,
+                candidates = candidate_count,
+                providers = ?providers,
+                confidence = ?best_confidence,
+                "classifier hint results"
+            );
+        }
         let selection = select_best_classification(results);
+
         let outcome = match selection {
             Some((hint, canonical)) => {
                 let decision = review_decision_from_match(canonical.as_ref());
@@ -502,12 +1089,79 @@ async fn classify_candidate_files(
                     .as_ref()
                     .map(|c| c.confidence >= 0.65 && c.confidence < 0.85)
                     .unwrap_or(false);
+                tracing::trace!(
+                    path = %path,
+                    hint_type = ?hint.library_type,
+                    hint_title = %hint.title,
+                    chosen_provider = canonical.as_ref().map(|c| c.chosen_provider),
+                    confidence = canonical.as_ref().map(|c| c.confidence),
+                    decision = %decision.as_str(),
+                    review_recommended,
+                    "classifier selected hint"
+                );
                 let (hint_json, candidates_json) =
                     build_review_payloads(&hint, canonical.as_ref(), review_recommended)?;
                 if let Some(canonical) = canonical.as_ref() {
-                    if canonical.confidence >= 0.65 {
-                        let mapped = classifier_ids_to_server(&canonical.ids, library_type);
-                        updated_ids = merge_external_ids(&updated_ids, Some(mapped));
+                    let season_number = hint
+                        .season
+                        .or(file.season)
+                        .unwrap_or(1);
+                    if canonical.chosen_provider == "tvdb" {
+                        let seed = TvdbBridgeSeed {
+                            hint: hint.clone(),
+                            confidence: canonical.confidence,
+                            season_number,
+                        };
+                        let replace = tvdb_seeds
+                            .get(&season_number)
+                            .map(|current| seed.confidence > current.confidence)
+                            .unwrap_or(true);
+                        if replace {
+                            tvdb_seeds.insert(season_number, seed);
+                            tracing::trace!(
+                                path = %path,
+                                season = season_number,
+                                confidence = canonical.confidence,
+                                "classifier stored tvdb seed"
+                            );
+                        }
+                    }
+                    if let Some(anilist_id) = canonical.ids.anilist.as_ref() {
+                        let seed = SeasonAnilistSeed {
+                            anilist_id: anilist_id.clone(),
+                            confidence: canonical.confidence,
+                        };
+                        let replace = anilist_seeds
+                            .get(&season_number)
+                            .map(|current| seed.confidence > current.confidence)
+                            .unwrap_or(true);
+                        if replace {
+                            anilist_seeds.insert(season_number, seed);
+                            tracing::trace!(
+                                path = %path,
+                                season = season_number,
+                                anilist_id = %anilist_id,
+                                confidence = canonical.confidence,
+                                "classifier stored anilist season seed"
+                            );
+                        }
+                    }
+                    let mapped = classifier_ids_to_server(&canonical.ids, effective_type);
+                    updated_ids = merge_external_ids(&updated_ids, Some(mapped));
+                    let before_prefer = prefer_anime;
+                    if canonical.ids.anilist.is_some()
+                        || canonical.ids.anidb.is_some()
+                        || canonical.ids.mal.is_some()
+                        || canonical.ids.kitsu.is_some()
+                    {
+                        prefer_anime = true;
+                    }
+                    if prefer_anime != before_prefer {
+                        tracing::trace!(
+                            path = %path,
+                            prefer_anime,
+                            "classifier prefer_anime enabled from candidate ids"
+                        );
                     }
                 }
                 ReviewOutcome {
@@ -529,14 +1183,22 @@ async fn classify_candidate_files(
         outcomes.insert(path.clone(), outcome);
     }
 
-    Ok((updated_ids, outcomes))
+    tracing::trace!(
+        library_type = ?library_type,
+        prefer_anime,
+        tvdb_seeds = tvdb_seeds.len(),
+        anilist_seeds = anilist_seeds.len(),
+        ids = ?updated_ids,
+        "classifier file batch complete"
+    );
+    Ok((updated_ids, outcomes, prefer_anime, tvdb_seeds, anilist_seeds))
 }
 
 fn resolve_episode_numbers(
     file: &AggregatedFile,
     outcome: Option<&ReviewOutcome>,
     media_type: MediaType,
-    anizip_mapping: Option<&AniZipMapping>,
+    anizip_mappings: &HashMap<i32, AniZipMapping>,
 ) -> ResolvedEpisodeNumbers {
     let mut season = file.season;
     let mut episode = file.episode;
@@ -557,11 +1219,26 @@ fn resolve_episode_numbers(
     }
 
     if matches!(media_type, MediaType::Anime) {
-        if (season.is_none() || episode.is_none()) {
+        if season.is_none() || episode.is_none() {
             if let Some(abs) = absolute_episode {
-                if let Some((mapped_season, mapped_episode)) =
-                    lookup_anizip_absolute_episode(anizip_mapping, abs)
-                {
+                let mapped = if let Some(current_season) = season {
+                    anizip_mappings
+                        .get(&current_season)
+                        .and_then(|mapping| lookup_anizip_absolute_episode(Some(mapping), abs))
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    lookup_anizip_absolute_episode_from_maps(anizip_mappings, abs)
+                });
+                if let Some((mapped_season, mapped_episode)) = mapped {
+                    tracing::trace!(
+                        path = %file.descriptor.path,
+                        absolute_episode = ?absolute_episode,
+                        mapped_season,
+                        mapped_episode,
+                        "anizip absolute episode mapped"
+                    );
                     if season.is_none() {
                         season = Some(mapped_season);
                     }
@@ -596,6 +1273,20 @@ fn lookup_anizip_absolute_episode(
         })
 }
 
+fn lookup_anizip_absolute_episode_from_maps(
+    mappings: &HashMap<i32, AniZipMapping>,
+    absolute_episode: i32,
+) -> Option<(i32, i32)> {
+    for mapping in mappings.values() {
+        if let Some(found) =
+            lookup_anizip_absolute_episode(Some(mapping), absolute_episode)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn review_decision_from_match(match_opt: Option<&ClassifierCanonicalMatch>) -> ReviewQueueStatus {
     match match_opt {
         Some(matched) if matched.confidence >= 0.85 => ReviewQueueStatus::Applied,
@@ -628,6 +1319,610 @@ fn build_review_payloads(
     Ok((hint_json, candidates_json))
 }
 
+fn insert_season_anilist_seed(
+    seeds: &mut HashMap<i32, SeasonAnilistSeed>,
+    season_number: i32,
+    seed: SeasonAnilistSeed,
+) {
+    let replace = seeds
+        .get(&season_number)
+        .map(|current| seed.confidence > current.confidence)
+        .unwrap_or(true);
+    if replace {
+        tracing::trace!(
+            season = season_number,
+            anilist_id = %seed.anilist_id,
+            confidence = seed.confidence,
+            "season anilist seed updated"
+        );
+        seeds.insert(season_number, seed);
+    } else {
+        tracing::trace!(
+            season = season_number,
+            anilist_id = %seed.anilist_id,
+            confidence = seed.confidence,
+            "season anilist seed retained"
+        );
+    }
+}
+
+fn select_root_anilist_id(
+    expanded: &[AniListSeasonChainEntry],
+    seeds: &HashMap<i32, SeasonAnilistSeed>,
+) -> Option<String> {
+    if let Some(entry) = expanded.iter().min_by_key(|entry| entry.season_number) {
+        return Some(entry.anilist_id.clone());
+    }
+    seeds
+        .iter()
+        .min_by_key(|(season, _)| *season)
+        .map(|(_, seed)| seed.anilist_id.clone())
+}
+
+fn is_anilist_season_format(format: Option<&str>) -> bool {
+    matches!(format, Some("TV") | Some("TV_SHORT") | Some("ONA"))
+}
+
+async fn expand_anilist_season_chain(
+    anilist: &AniListIdentifier,
+    seed_season: i32,
+    seed: &SeasonAnilistSeed,
+) -> Result<Vec<AniListSeasonChainEntry>> {
+    let Ok(seed_id) = seed.anilist_id.parse::<i32>() else {
+        tracing::warn!(
+            anilist_id = %seed.anilist_id,
+            "invalid anilist id for season chain"
+        );
+        return Ok(Vec::new());
+    };
+
+    let chain = anilist.relation_chain(seed_id).await?;
+    if chain.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    for node in &chain {
+        tracing::trace!(
+            seed_anilist_id = %seed.anilist_id,
+            node_id = node.id,
+            node_format = ?node.format,
+            node_title = %node.title,
+            "anilist chain node"
+        );
+    }
+
+    let mut filtered: Vec<_> = chain
+        .iter()
+        .cloned()
+        .filter(|node| is_anilist_season_format(node.format.as_deref()))
+        .collect();
+
+    if filtered.iter().all(|node| node.id != seed_id) {
+        let fallback: Vec<_> = chain
+            .iter()
+            .cloned()
+            .filter(|node| {
+                is_anilist_season_format(node.format.as_deref()) || node.format.is_none()
+            })
+            .collect();
+        if fallback.iter().any(|node| node.id == seed_id) {
+            tracing::warn!(
+                anilist_id = %seed.anilist_id,
+                "anilist chain formats missing; using fallback filter"
+            );
+            filtered = fallback;
+        }
+    }
+
+    if filtered.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let seed_index = match filtered.iter().position(|node| node.id == seed_id) {
+        Some(idx) => idx,
+        None => {
+            tracing::warn!(
+                anilist_id = %seed.anilist_id,
+                "anilist seed id not found in relation chain"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut expanded = Vec::new();
+    for (idx, node) in filtered.iter().enumerate() {
+        let offset = idx as i32 - seed_index as i32;
+        let season_number = seed_season + offset;
+        if season_number < 1 {
+            continue;
+        }
+        let confidence = if node.id == seed_id {
+            seed.confidence
+        } else {
+            seed.confidence * 0.8
+        };
+        expanded.push(AniListSeasonChainEntry {
+            season_number,
+            anilist_id: node.id.to_string(),
+            confidence,
+        });
+    }
+
+    if !expanded.is_empty() {
+        tracing::trace!(
+            seed_anilist_id = %seed.anilist_id,
+            seasons = expanded.len(),
+            "anilist season chain resolved"
+        );
+    }
+
+    Ok(expanded)
+}
+
+fn build_anilist_identifier(config: Option<&ClassifierConfig>) -> AniListIdentifier {
+    let timeout = config
+        .map(|cfg| cfg.request_timeout_seconds)
+        .unwrap_or(10);
+    AniListIdentifier::new(ANILIST_ENDPOINT.to_string(), timeout)
+}
+
+async fn apply_tvdb_anime_bridge(
+    series_meta: &serde_json::Value,
+    anilist: &AniListIdentifier,
+    scorer: &DefaultScorer,
+    merged_ids: &mut ExternalIds,
+    review_outcomes: &mut HashMap<String, ReviewOutcome>,
+    seed: &TvdbBridgeSeed,
+    season_year: Option<i32>,
+) -> Result<AnimeBridgeResult> {
+    let mut result = AnimeBridgeResult::default();
+    result.prefer_anime = true;
+
+    let tvdb_id = merged_ids
+        .tvdb_series
+        .as_ref()
+        .or(merged_ids.tvdb.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    tracing::debug!(tvdb_id = %tvdb_id, season = seed.season_number, "tvdb indicates anime; attempting anilist bridge");
+
+    let seed_hint = &seed.hint;
+    let title = extract_tvdb_title(series_meta)
+        .or_else(|| Some(seed_hint.title.clone()))
+        .filter(|value| !value.trim().is_empty());
+    let Some(title) = title else {
+        return Ok(result);
+    };
+
+    let mut alt_titles = seed_hint.alt_titles.clone();
+    if seed_hint.title != title {
+        alt_titles.push(seed_hint.title.clone());
+    }
+    if seed.season_number > 1 {
+        alt_titles.push(format!("{} Season {}", seed_hint.title, seed.season_number));
+        if seed_hint.title != title {
+            alt_titles.push(format!("{} Season {}", title, seed.season_number));
+        }
+    }
+    alt_titles = dedupe_titles(alt_titles);
+
+    let year = if seed.season_number > 1 {
+        season_year
+    } else {
+        extract_tvdb_year(series_meta).or(seed_hint.year)
+    };
+
+    let mut hint = ClassifierHint {
+        library_type: ClassifierLibraryType::Anime,
+        title,
+        alt_titles,
+        year,
+        season: Some(seed.season_number),
+        episode: seed_hint.episode,
+        absolute_episode: seed_hint.absolute_episode,
+        duration_seconds: seed_hint.duration_seconds,
+        embedded_ids: classifier_ids_from_server(merged_ids, MediaType::Anime),
+        parser: "tvdb_bridge",
+        parser_confidence: seed_hint.parser_confidence,
+        source_path: seed_hint.source_path.clone(),
+    };
+
+    let candidates = match anilist.identify(&hint).await {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!("tvdb anime bridge anilist lookup failed: {err}");
+            return Ok(result);
+        }
+    };
+    let mut scored_candidates = candidates;
+    if let Some(season) = hint.season {
+        let filtered: Vec<_> = scored_candidates
+            .iter()
+            .cloned()
+            .filter(|candidate| candidate.season == Some(season))
+            .collect();
+        if !filtered.is_empty() {
+            tracing::trace!(
+                tvdb_id = %tvdb_id,
+                season,
+                before = scored_candidates.len(),
+                after = filtered.len(),
+                "tvdb anime bridge filtered candidates by season"
+            );
+            scored_candidates = filtered;
+        }
+    }
+    let mut canonical = scorer.score(&hint, &scored_candidates);
+
+    if canonical
+        .as_ref()
+        .map(|value| value.confidence < 0.65)
+        .unwrap_or(true)
+    {
+        tracing::trace!(
+            tvdb_id = %tvdb_id,
+            season = seed.season_number,
+            confidence = canonical.as_ref().map(|value| value.confidence),
+            "anilist bridge below threshold; trying tvdb aliases"
+        );
+        let mut alias_titles = extract_tvdb_aliases(series_meta);
+        alias_titles.extend(hint.alt_titles.clone());
+        alias_titles = dedupe_titles(alias_titles);
+        if !alias_titles.is_empty() {
+            hint.alt_titles = alias_titles;
+            let alias_candidates = match anilist.identify(&hint).await {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!("tvdb anime bridge alias lookup failed: {err}");
+                    Vec::new()
+                }
+            };
+            let mut alias_scored = alias_candidates;
+            if let Some(season) = hint.season {
+                let filtered: Vec<_> = alias_scored
+                    .iter()
+                    .cloned()
+                    .filter(|candidate| candidate.season == Some(season))
+                    .collect();
+                if !filtered.is_empty() {
+                    tracing::trace!(
+                        tvdb_id = %tvdb_id,
+                        season,
+                        before = alias_scored.len(),
+                        after = filtered.len(),
+                        "tvdb anime bridge filtered alias candidates by season"
+                    );
+                    alias_scored = filtered;
+                }
+            }
+            let alias_canonical = scorer.score(&hint, &alias_scored);
+            let alias_confidence = alias_canonical.as_ref().map(|c| c.confidence).unwrap_or(0.0);
+            let current_confidence = canonical.as_ref().map(|c| c.confidence).unwrap_or(0.0);
+            if alias_confidence > current_confidence {
+                canonical = alias_canonical;
+            }
+        }
+    }
+    if let Some(canonical) = canonical.as_ref() {
+        tracing::debug!(
+            tvdb_id = %tvdb_id,
+            anilist_id = ?canonical.ids.anilist,
+            confidence = canonical.confidence,
+            "anilist bridge result"
+        );
+    } else {
+        tracing::debug!(tvdb_id = %tvdb_id, "anilist bridge produced no candidates");
+    }
+
+    if let Some(canonical) = canonical.as_ref() {
+        let meets_season_bridge_threshold = canonical.considered.first().map_or(false, |best| {
+            canonical.confidence >= 0.55
+                && best.features.title_similarity >= 0.5
+                && best.features.season_match >= 0.99
+        });
+        if canonical.confidence >= 0.65 || meets_season_bridge_threshold {
+            if let Some(anilist_id) = canonical.ids.anilist.as_ref() {
+                let season_seed = SeasonAnilistSeed {
+                    anilist_id: anilist_id.clone(),
+                    confidence: canonical.confidence,
+                };
+                result
+                    .season_anilist_ids
+                    .insert(seed.season_number, season_seed);
+            }
+            if merged_ids.anilist.is_none() {
+                let mapped = classifier_ids_to_server(&canonical.ids, MediaType::Anime);
+                *merged_ids = merge_external_ids(merged_ids, Some(mapped));
+            }
+        }
+    }
+
+    let decision = review_decision_from_match(canonical.as_ref());
+    let review_recommended = canonical
+        .as_ref()
+        .map(|c| c.confidence >= 0.65 && c.confidence < 0.85)
+        .unwrap_or(false);
+    let (hint_json, candidates_json) =
+        build_review_payloads(&hint, canonical.as_ref(), review_recommended)?;
+
+    for outcome in review_outcomes.values_mut() {
+        let season = outcome
+            .parsed_hint
+            .as_ref()
+            .and_then(|hint| hint.season)
+            .unwrap_or(seed.season_number);
+        if season != seed.season_number {
+            continue;
+        }
+        outcome.status = decision;
+        outcome.confidence = canonical.as_ref().map(|c| c.confidence);
+        outcome.hint_json = hint_json.clone();
+        outcome.candidates_json = candidates_json.clone();
+    }
+
+    Ok(result)
+}
+
+fn extract_tvdb_title(meta: &serde_json::Value) -> Option<String> {
+    let keys = ["name", "seriesName", "series_name", "title"];
+    let mut raw = None;
+    for key in keys {
+        if let Some(value) = meta.get(key).and_then(serde_json::Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                raw = Some(trimmed.to_string());
+                if !contains_non_ascii(trimmed) {
+                    return raw;
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(translation) = extract_tvdb_translation(meta, &["eng", "en"]) {
+        if !contains_non_ascii(&translation) {
+            return Some(translation);
+        }
+    }
+
+    for alias in extract_tvdb_aliases(meta) {
+        let trimmed = alias.trim();
+        if !trimmed.is_empty() && !contains_non_ascii(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    raw.filter(|value| !contains_non_ascii(value))
+}
+
+fn extract_tvdb_translation(meta: &serde_json::Value, langs: &[&str]) -> Option<String> {
+    for key in ["nameTranslations", "translations"] {
+        if let Some(obj) = meta.get(key).and_then(serde_json::Value::as_object) {
+            for lang in langs {
+                if let Some(value) = obj.get(*lang).and_then(serde_json::Value::as_str) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() && !looks_like_language_code(trimmed) {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            for value in obj.values() {
+                if let Some(text) = value.as_str() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && !looks_like_language_code(trimmed) {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        } else if let Some(array) = meta.get(key).and_then(serde_json::Value::as_array) {
+            for lang in langs {
+                if let Some(text) = extract_translation_from_array(array, lang) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_tvdb_aliases(meta: &serde_json::Value) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(eng) = extract_tvdb_translation(meta, &["eng", "en"]) {
+        aliases.push(eng);
+    }
+    for key in ["aliases", "aka", "nameTranslations", "translations"] {
+        if let Some(values) = meta.get(key).and_then(serde_json::Value::as_array) {
+            for entry in values {
+                if let Some(value) = extract_tvdb_alias_text(entry) {
+                    if !looks_like_language_code(&value) {
+                        aliases.push(value);
+                    }
+                }
+            }
+        } else if let Some(obj) = meta.get(key).and_then(serde_json::Value::as_object) {
+            for value in obj.values() {
+                if let Some(text) = value.as_str() {
+                    if !looks_like_language_code(text) {
+                        aliases.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    dedupe_titles(aliases)
+}
+
+fn extract_tvdb_alias_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let obj = value.as_object()?;
+    for key in ["name", "title", "alias", "text", "translation"] {
+        if let Some(text) = obj.get(key).and_then(serde_json::Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn extract_translation_from_array(
+    values: &[serde_json::Value],
+    lang: &str,
+) -> Option<String> {
+    for entry in values {
+        if let Some(obj) = entry.as_object() {
+            let language = obj
+                .get("language")
+                .or_else(|| obj.get("languageCode"))
+                .or_else(|| obj.get("lang"))
+                .and_then(serde_json::Value::as_str);
+            if language.map(|value| value.eq_ignore_ascii_case(lang)) != Some(true) {
+                continue;
+            }
+            if let Some(text) = extract_tvdb_alias_text(entry) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() && !looks_like_language_code(trimmed) {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn contains_non_ascii(value: &str) -> bool {
+    value.chars().any(|c| !c.is_ascii())
+}
+
+fn looks_like_language_code(value: &str) -> bool {
+    let trimmed = value.trim();
+    let len = trimmed.len();
+    if !(len == 2 || len == 3) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase())
+}
+
+fn extract_tvdb_genres(meta: &serde_json::Value) -> Vec<String> {
+    let mut genres = Vec::new();
+    if let Some(values) = meta.get("genres").and_then(serde_json::Value::as_array) {
+        for entry in values {
+            if let Some(value) = entry.as_str() {
+                genres.push(value.to_string());
+            } else if let Some(value) = entry
+                .get("name")
+                .or_else(|| entry.get("genre"))
+                .and_then(serde_json::Value::as_str)
+            {
+                genres.push(value.to_string());
+            }
+        }
+    }
+    if genres.is_empty() {
+        if let Some(value) = meta.get("genre").and_then(serde_json::Value::as_str) {
+            genres.push(value.to_string());
+        }
+    }
+    genres
+}
+
+fn extract_tvdb_year(meta: &serde_json::Value) -> Option<i32> {
+    if let Some(year) = meta
+        .get("year")
+        .or_else(|| meta.get("releaseYear"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        return Some(year as i32);
+    }
+    if let Some(year) = meta
+        .get("year")
+        .or_else(|| meta.get("releaseYear"))
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Some(parsed) = parse_year_str(year) {
+            return Some(parsed);
+        }
+    }
+    let date_keys = ["firstAired", "first_air_date", "startDate", "premiereDate"];
+    for key in date_keys {
+        if let Some(value) = meta.get(key).and_then(serde_json::Value::as_str) {
+            if let Some(year) = parse_year_str(value) {
+                return Some(year);
+            }
+        }
+    }
+    None
+}
+
+fn parse_year_str(value: &str) -> Option<i32> {
+    let trimmed = value.trim();
+    let prefix = trimmed.get(0..4)?;
+    if prefix.chars().all(|c| c.is_ascii_digit()) {
+        return prefix.parse::<i32>().ok();
+    }
+    None
+}
+
+fn extract_tvdb_country(meta: &serde_json::Value) -> Option<String> {
+    let keys = ["country", "originalCountry", "original_country", "primaryCountry"];
+    for key in keys {
+        if let Some(value) = meta.get(key).and_then(serde_json::Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn tvdb_indicates_anime(meta: &serde_json::Value) -> bool {
+    if let Some(country) = extract_tvdb_country(meta) {
+        let lower = country.to_ascii_lowercase();
+        if lower == "jpn" {
+            return true;
+        }
+    }
+    let genres = extract_tvdb_genres(meta);
+    let mut has_animation = false;
+    for genre in genres {
+        let lower = genre.to_ascii_lowercase();
+        if lower.contains("anime") {
+            return true;
+        }
+        if lower.contains("animation") {
+            has_animation = true;
+        }
+    }
+    if has_animation {
+        if let Some(country) = extract_tvdb_country(meta) {
+            let lower = country.to_ascii_lowercase();
+            if lower.contains("japan") || lower == "jp" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn dedupe_titles(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 fn select_best_classification(
     results: Vec<ClassifiedHint>,
 ) -> Option<(elixir_classifier::hint::ClassificationHint, Option<ClassifierCanonicalMatch>)> {
@@ -646,14 +1941,32 @@ fn select_best_classification(
             _ => {}
         }
     }
+    if let Some((hint, canonical)) = best.as_ref() {
+        tracing::trace!(
+            hint_type = ?hint.library_type,
+            hint_title = %hint.title,
+            confidence = canonical.as_ref().map(|c| c.confidence),
+            chosen_provider = canonical.as_ref().map(|c| c.chosen_provider),
+            "classifier selected best hint"
+        );
+    } else {
+        tracing::trace!("classifier selected no hint");
+    }
     best
 }
 
 fn build_classifier_pipeline(classifier_config: Option<&ClassifierConfig>) -> ClassifierPipeline {
     let config = classifier_config.cloned().unwrap_or_default();
+    let tvdb_base_url = config.tvdb_base_url.clone();
+    let tvdb_api_key = config.tvdb_api_key.clone();
+    let tvdb_identifier = TvdbIdentifier::new(
+        tvdb_base_url.clone(),
+        tvdb_api_key.clone(),
+        config.request_timeout_seconds,
+    );
     let tvdb_linker = TvdbLinker::new(
-        config.tvdb_base_url,
-        config.tvdb_api_key,
+        tvdb_base_url,
+        tvdb_api_key,
         config.request_timeout_seconds,
     );
     ClassifierPipeline::new()
@@ -661,8 +1974,9 @@ fn build_classifier_pipeline(classifier_config: Option<&ClassifierConfig>) -> Cl
         .register_hint_parser(Arc::new(IdExtractorParser::default()))
         .register_hint_parser(Arc::new(FolderContextParser::default()))
         .register_hint_parser(Arc::new(AnimeParserAdapter::default()))
-        .register_identifier_provider(Arc::new(CinemetaIdentifier::default()))
+        .register_identifier_provider(Arc::new(tvdb_identifier))
         .register_identifier_provider(Arc::new(AniListIdentifier::default()))
+        .register_identifier_provider(Arc::new(CinemetaIdentifier::default()))
         .register_linker(Arc::new(tvdb_linker))
         .register_linker(Arc::new(AniZipLinker::default()))
 }
@@ -761,6 +2075,22 @@ fn library_type_string(media_type: MediaType) -> &'static str {
         MediaType::Series => "series",
         MediaType::Anime => "anime",
     }
+}
+
+fn strip_anime_ids(ids: &ExternalIds) -> ExternalIds {
+    if ids.anidb.is_some() || ids.mal.is_some() || ids.kitsu.is_some() {
+        tracing::trace!(
+            anidb = ?ids.anidb,
+            mal = ?ids.mal,
+            kitsu = ?ids.kitsu,
+            "stripping secondary anime ids from series-level storage"
+        );
+    }
+    let mut cleaned = ids.clone();
+    cleaned.anidb = None;
+    cleaned.mal = None;
+    cleaned.kitsu = None;
+    cleaned
 }
 
 async fn lookup_override_for_path(
@@ -980,7 +2310,11 @@ async fn should_refresh_metadata(
     Ok(true)
 }
 
-pub async fn run_extension_scan(state: &AppState, force_metadata: bool) -> Result<()> {
+pub async fn run_extension_scan(
+    state: &AppState,
+    force_metadata: bool,
+    force_reclassify: bool,
+) -> Result<()> {
     let candidates = state
         .extensions
         .scan_all_with_db(&state.db_pool, &state.settings.library.sonarr, None)
@@ -990,8 +2324,10 @@ pub async fn run_extension_scan(state: &AppState, force_metadata: bool) -> Resul
         Some(&state.metadata),
         Some(&state.linkers),
         Some(&state.settings.classifier),
+        Some(&state.artwork),
         candidates,
         force_metadata,
+        force_reclassify,
         state.settings.library.hash_dedupe_enabled,
     )
     .await?;
@@ -1002,7 +2338,7 @@ pub async fn start_periodic_scan(state: AppState, interval_seconds: u64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
     loop {
         interval.tick().await;
-        if let Err(err) = run_extension_scan(&state, false).await {
+        if let Err(err) = run_extension_scan(&state, false, false).await {
             tracing::warn!("periodic scan failed: {err}");
         }
     }
@@ -1079,12 +2415,22 @@ async fn upsert_series(
     meta: Option<&MetadataResult>,
 ) -> Result<Uuid> {
     let existing = if let Some(anilist) = merged_ids.anilist.as_ref() {
-        sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM series WHERE external_anilist = ? LIMIT 1",
+        let by_external = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT series_id FROM series_external_ids WHERE provider = 'anilist' AND external_id = ? LIMIT 1",
         )
         .bind(anilist)
         .fetch_optional(pool)
-        .await?
+        .await?;
+        if by_external.is_some() {
+            by_external
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT id FROM series WHERE external_anilist = ? LIMIT 1",
+            )
+            .bind(anilist)
+            .fetch_optional(pool)
+            .await?
+        }
     } else if let Some(imdb) = merged_ids.imdb.as_ref() {
         sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT id FROM series WHERE external_imdb = ? LIMIT 1",
@@ -1100,15 +2446,29 @@ async fn upsert_series(
         .fetch_optional(pool)
         .await?
     } else {
-        sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM series WHERE library_type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
+        // Fallback: match by title, allowing for loose type/year matching
+        let rows = sqlx::query(
+            "SELECT id, year FROM series WHERE title = ?",
         )
-        .bind(identity.r#type.as_str())
         .bind(&identity.title)
-        .bind(identity.year)
-        .bind(identity.year)
-        .fetch_optional(pool)
-        .await?
+        .fetch_all(pool)
+        .await?;
+
+        let mut best_match: Option<String> = None;
+        for row in rows {
+            let db_year: Option<i32> = row.try_get::<i64, _>("year").ok().map(|v| v as i32);
+            
+            let year_match = match (identity.year, db_year) {
+                (Some(y1), Some(y2)) => y1 == y2,
+                _ => true, // If either is missing, assume match
+            };
+
+            if year_match {
+                best_match = Some(row.get::<String, _>("id"));
+                break;
+            }
+        }
+        best_match
     };
 
     if let Some(id_str) = existing {
@@ -1123,7 +2483,7 @@ async fn upsert_series(
         .bind(merged_ids.tvdb_series.as_ref().or(merged_ids.tvdb.as_ref()))
         .bind(merged_ids.anilist.as_ref())
         .bind(meta.and_then(|m| serde_json::to_string(&m.metadata_json).ok()))
-        .bind(id_str)
+        .bind(&id_str)
         .execute(pool)
         .await?;
         return Ok(id);
@@ -2238,24 +3598,112 @@ fn is_season_folder_name(name: &str) -> bool {
 }
 
 async fn link_movie_file(pool: &AnyPool, movie_id: Uuid, media_file_id: Uuid) -> Result<()> {
+    let media_file_id_str = media_file_id.to_string();
+    unlink_episode_links_for_media_file(pool, &media_file_id_str).await?;
     sqlx::query::<sqlx::Any>(
         "INSERT INTO movie_files (movie_id, media_file_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
     )
     .bind(movie_id.to_string())
-    .bind(media_file_id.to_string())
+    .bind(media_file_id_str)
     .execute(pool)
     .await?;
     Ok(())
 }
 
 async fn link_episode_file(pool: &AnyPool, episode_id: Uuid, media_file_id: Uuid) -> Result<()> {
+    let media_file_id_str = media_file_id.to_string();
+    unlink_movie_links_for_media_file(pool, &media_file_id_str).await?;
     sqlx::query::<sqlx::Any>(
         "INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
     )
     .bind(episode_id.to_string())
-    .bind(media_file_id.to_string())
+    .bind(media_file_id_str)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn mark_series_as_anime(pool: &AnyPool, series_id: Uuid) -> Result<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE series SET library_type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND library_type != 'anime'",
+    )
+    .bind(series_id.to_string())
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query::<sqlx::Any>(
+        "UPDATE media_items SET type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(series_id.to_string())
+    .execute(pool)
+    .await;
+    Ok(())
+}
+
+async fn unlink_movie_links_for_media_file(pool: &AnyPool, media_file_id: &str) -> Result<()> {
+    let movie_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT movie_id FROM movie_files WHERE media_file_id = ?",
+    )
+    .bind(media_file_id)
+    .fetch_all(pool)
+    .await?;
+    if movie_ids.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        media_file_id = %media_file_id,
+        movie_count = movie_ids.len(),
+        "removing movie links for episode-classified file"
+    );
+    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = ?")
+        .bind(media_file_id)
+        .execute(pool)
+        .await?;
+    for movie_id in movie_ids {
+        cleanup_orphan_movie(pool, &movie_id).await?;
+    }
+    Ok(())
+}
+
+async fn unlink_episode_links_for_media_file(pool: &AnyPool, media_file_id: &str) -> Result<()> {
+    let has_episode: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT 1 FROM episode_files WHERE media_file_id = ? LIMIT 1",
+    )
+    .bind(media_file_id)
+    .fetch_optional(pool)
+    .await?;
+    if has_episode.is_none() {
+        return Ok(());
+    }
+    tracing::warn!(
+        media_file_id = %media_file_id,
+        "removing episode links for movie-classified file"
+    );
+    sqlx::query::<sqlx::Any>("DELETE FROM episode_files WHERE media_file_id = ?")
+        .bind(media_file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn cleanup_orphan_movie(pool: &AnyPool, movie_id: &str) -> Result<()> {
+    let has_file: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT 1 FROM movie_files WHERE movie_id = ? LIMIT 1",
+    )
+    .bind(movie_id)
+    .fetch_optional(pool)
+    .await?;
+    if has_file.is_some() {
+        return Ok(());
+    }
+    tracing::info!(movie_id = %movie_id, "removing orphan movie");
+    sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
+        .bind(movie_id)
+        .execute(pool)
+        .await?;
+    let _ = sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
+        .bind(movie_id)
+        .execute(pool)
+        .await;
     Ok(())
 }
 
@@ -2342,6 +3790,12 @@ pub(crate) async fn apply_external_ids_to_series(
     ids: &ExternalIds,
     source: &str,
 ) -> Result<()> {
+    tracing::trace!(
+        series_id = %series_id,
+        source,
+        ids = ?ids,
+        "apply external ids to series"
+    );
     let tvdb = ids
         .tvdb_series
         .as_ref()
@@ -2358,6 +3812,65 @@ pub(crate) async fn apply_external_ids_to_series(
     .await?;
 
     persist_series_external_ids(pool, series_id, ids, source).await?;
+    Ok(())
+}
+
+pub(crate) async fn apply_external_ids_to_season(
+    pool: &AnyPool,
+    season_id: Uuid,
+    ids: &ExternalIds,
+    source: &str,
+    confidence: Option<f32>,
+) -> Result<()> {
+    tracing::trace!(
+        season_id = %season_id,
+        source,
+        ids = ?ids,
+        "apply external ids to season"
+    );
+    if let Some(new_id) = ids.anilist.as_ref() {
+        let existing = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = ? LIMIT 1",
+        )
+        .bind(season_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+        let mut should_update = existing.is_none();
+        if let Some(existing_id) = existing.as_ref() {
+            if existing_id == new_id {
+                should_update = false;
+            } else if source == "override" {
+                should_update = true;
+            } else if let Some(new_confidence) = confidence {
+                let existing_confidence = sqlx::query_scalar::<sqlx::Any, f32>(
+                    "SELECT MAX(confidence) FROM season_external_ids WHERE season_id = ? AND provider = 'anilist' AND external_id = ?",
+                )
+                .bind(season_id.to_string())
+                .bind(existing_id)
+                .fetch_optional(pool)
+                .await?
+                .unwrap_or(0.0);
+                if new_confidence > existing_confidence {
+                    should_update = true;
+                }
+            }
+        }
+
+        if should_update {
+            sqlx::query::<sqlx::Any>(
+                "UPDATE seasons SET external_anilist = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(new_id)
+            .bind(season_id.to_string())
+            .execute(pool)
+            .await?;
+        }
+    }
+
+    persist_season_external_ids(pool, season_id, ids, source, confidence).await?;
     Ok(())
 }
 
@@ -2378,6 +3891,7 @@ async fn persist_movie_external_ids(
         entries.push(("tvdb", tvdb.clone()));
     }
 
+    let stored_count = entries.len();
     for (provider, external_id) in entries {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO movie_external_ids (id, movie_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
@@ -2392,6 +3906,12 @@ async fn persist_movie_external_ids(
         .await?;
     }
 
+    tracing::trace!(
+        movie_id = %movie_id,
+        source,
+        stored = stored_count,
+        "persisted movie external ids"
+    );
     Ok(())
 }
 
@@ -2424,6 +3944,7 @@ async fn persist_series_external_ids(
         entries.push(("tmdb", tmdb.clone()));
     }
 
+    let stored_count = entries.len();
     for (provider, external_id) in entries {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
@@ -2438,6 +3959,62 @@ async fn persist_series_external_ids(
         .await?;
     }
 
+    tracing::trace!(
+        series_id = %series_id,
+        source,
+        stored = stored_count,
+        "persisted series external ids"
+    );
+    Ok(())
+}
+
+async fn persist_season_external_ids(
+    pool: &AnyPool,
+    season_id: Uuid,
+    ids: &ExternalIds,
+    source: &str,
+    confidence: Option<f32>,
+) -> Result<()> {
+    let mut entries: Vec<(&'static str, String)> = Vec::new();
+    if let Some(anilist) = ids.anilist.as_ref() {
+        entries.push(("anilist", anilist.clone()));
+    }
+    if let Some(anidb) = ids.anidb.as_ref() {
+        entries.push(("anidb", anidb.clone()));
+    }
+    if let Some(mal) = ids.mal.as_ref() {
+        entries.push(("mal", mal.clone()));
+    }
+    if let Some(kitsu) = ids.kitsu.as_ref() {
+        entries.push(("kitsu", kitsu.clone()));
+    }
+
+    let stored_count = entries.len();
+    for (provider, external_id) in entries {
+        let stored_confidence = if provider == "anilist" {
+            confidence.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO season_external_ids (id, season_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(season_id.to_string())
+        .bind(provider)
+        .bind(external_id)
+        .bind(stored_confidence)
+        .bind(source)
+        .execute(pool)
+        .await?;
+    }
+
+    tracing::trace!(
+        season_id = %season_id,
+        source,
+        stored = stored_count,
+        "persisted season external ids"
+    );
     Ok(())
 }
 
@@ -2448,7 +4025,13 @@ async fn ensure_tvdb_season_scaffold(
     tvdb_series_id: &str,
     season_number: i32,
     linker: &LinkerService,
+    artwork: Option<&ArtworkService>,
+    ttl_seconds: u64,
+    force_metadata: bool,
 ) -> Result<()> {
+    if season_scaffolded_recent(pool, season_id, Some("tvdb"), ttl_seconds, force_metadata).await? {
+        return Ok(());
+    }
     if season_scaffolded(pool, season_id).await? {
         return Ok(());
     }
@@ -2484,6 +4067,16 @@ async fn ensure_tvdb_season_scaffold(
             &episode.raw,
         )
         .await?;
+        if let (Some(artwork_service), Some(url)) = (artwork, episode.image.as_deref()) {
+            sync_episode_artwork(
+                pool,
+                artwork_service,
+                episode_id,
+                url,
+                "tvdb",
+            )
+            .await?;
+        }
         if let Some(tvdb_episode_id) = episode.tvdb_episode_id.as_ref() {
             insert_episode_external_id(
                 pool,
@@ -2509,7 +4102,13 @@ async fn ensure_anizip_season_scaffold(
     season_id: Uuid,
     season_number: i32,
     mapping: &AniZipMapping,
+    artwork: Option<&ArtworkService>,
+    ttl_seconds: u64,
+    force_metadata: bool,
 ) -> Result<()> {
+    if season_scaffolded_recent(pool, season_id, Some("anizip"), ttl_seconds, force_metadata).await? {
+        return Ok(());
+    }
     if season_scaffolded(pool, season_id).await? {
         return Ok(());
     }
@@ -2548,6 +4147,16 @@ async fn ensure_anizip_season_scaffold(
             episode,
         )
         .await?;
+        if let (Some(artwork_service), Some(url)) = (artwork, episode.image.as_deref()) {
+            sync_episode_artwork(
+                pool,
+                artwork_service,
+                episode_id,
+                url,
+                "anizip",
+            )
+            .await?;
+        }
         if let Some(tvdb_id) = episode.tvdb_id.as_ref() {
             insert_episode_external_id(
                 pool,
@@ -2684,13 +4293,312 @@ async fn insert_episode_provider_key(
     Ok(())
 }
 
+async fn sync_movie_artwork(
+    pool: &AnyPool,
+    artwork: &ArtworkService,
+    movie_id: Uuid,
+    meta: Option<&MetadataResult>,
+) -> Result<()> {
+    let Some(meta) = meta else {
+        return Ok(());
+    };
+    let mut refs = Vec::new();
+    refs.extend(extract_cinemeta_artwork(&meta.metadata_json));
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let stored = artwork
+        .upsert_refs(pool, "movie", movie_id, &refs)
+        .await?;
+    artwork
+        .cache_primary(pool, &stored, &["cinemeta"])
+        .await?;
+    Ok(())
+}
+
+async fn sync_series_artwork(
+    pool: &AnyPool,
+    artwork: &ArtworkService,
+    series_id: Uuid,
+    meta: Option<&MetadataResult>,
+    ids: &ExternalIds,
+    is_anime: bool,
+    linkers: Option<&LinkerService>,
+    season_ids: &HashMap<i32, Uuid>,
+    ttl_seconds: u64,
+    force_metadata: bool,
+) -> Result<()> {
+    let mut refs = Vec::new();
+    if let Some(meta) = meta {
+        refs.extend(extract_anilist_artwork(&meta.metadata_json));
+        refs.extend(extract_cinemeta_artwork(&meta.metadata_json));
+    }
+
+    let mut season_refs: HashMap<i32, Vec<ArtworkCandidate>> = HashMap::new();
+    if let (Some(linker), Some(tvdb_id)) = (
+        linkers,
+        ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()),
+    ) {
+        let should_refresh = !series_seasons_scaffolded_recent(
+            pool,
+            series_id,
+            None,
+            ttl_seconds,
+            force_metadata,
+        )
+        .await?;
+        if should_refresh {
+            if let Ok(Some(series_meta)) = linker.fetch_tvdb_series(tvdb_id).await {
+                update_series_metadata_from_tvdb(pool, series_id, &series_meta).await?;
+                refs.extend(extract_tvdb_series_artwork(&series_meta));
+            }
+            if let Ok(seasons) = linker.fetch_tvdb_series_seasons(tvdb_id).await {
+                update_season_metadata_from_tvdb(pool, &seasons, season_ids).await?;
+            }
+            if let Ok(Some(artworks_meta)) = linker.fetch_tvdb_series_artworks(tvdb_id).await {
+                for entry in extract_tvdb_artworks(&artworks_meta) {
+                    let candidate = ArtworkCandidate {
+                        kind: entry.kind,
+                        url: entry.url,
+                        language: entry.language,
+                        width: None,
+                        height: None,
+                        provider: Some("tvdb".to_string()),
+                        score: entry.score,
+                        metadata_json: None,
+                    };
+                    if let Some(season_number) = entry.season_number {
+                        season_refs.entry(season_number).or_default().push(candidate);
+                    } else {
+                        refs.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    if !refs.is_empty() {
+        let stored = artwork
+            .upsert_refs(pool, "series", series_id, &refs)
+            .await?;
+        if !stored.is_empty() {
+            const ANIME_PRIORITY: [&str; 3] = ["anilist", "tvdb", "cinemeta"];
+            const SERIES_PRIORITY: [&str; 2] = ["tvdb", "cinemeta"];
+            let provider_priority: &[&str] = if is_anime {
+                &ANIME_PRIORITY
+            } else {
+                &SERIES_PRIORITY
+            };
+            artwork
+                .cache_primary(pool, &stored, provider_priority)
+                .await?;
+        }
+    }
+
+    for (season_number, refs) in season_refs {
+        let Some(season_id) = season_ids.get(&season_number).copied() else {
+            continue;
+        };
+        let stored = artwork
+            .upsert_refs(pool, "season", season_id, &refs)
+            .await?;
+        if !stored.is_empty() {
+            artwork.cache_primary(pool, &stored, &["tvdb"]).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn sync_episode_artwork(
+    pool: &AnyPool,
+    artwork: &ArtworkService,
+    episode_id: Uuid,
+    url: &str,
+    provider: &str,
+) -> Result<()> {
+    if url.trim().is_empty() {
+        return Ok(());
+    }
+    let candidate = ArtworkCandidate {
+        kind: ArtworkKind::Thumbnail,
+        url: url.to_string(),
+        language: None,
+        width: None,
+        height: None,
+        provider: Some(provider.to_string()),
+        score: None,
+        metadata_json: None,
+    };
+    let stored = artwork
+        .upsert_refs(pool, "episode", episode_id, &[candidate])
+        .await?;
+    if !stored.is_empty() {
+        artwork
+            .cache_primary(pool, &stored, &["tvdb", "anizip"])
+            .await?;
+    }
+    Ok(())
+}
+
+async fn update_series_metadata_from_tvdb(
+    pool: &AnyPool,
+    series_id: Uuid,
+    meta: &serde_json::Value,
+) -> Result<()> {
+    let raw_json = serde_json::to_string(meta).ok();
+    let Some(raw_json) = raw_json else {
+        return Ok(());
+    };
+    let existing = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = ? LIMIT 1",
+    )
+    .bind(series_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let existing = existing.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let merged_json = if let Some(existing) = existing {
+        let mut merged =
+            serde_json::from_str::<serde_json::Value>(&existing).unwrap_or_else(|_| {
+                serde_json::json!({})
+            });
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert("tvdb".to_string(), parsed);
+            } else {
+                merged = serde_json::json!({ "tvdb": parsed });
+            }
+        }
+        serde_json::to_string(&merged).ok()
+    } else {
+        Some(raw_json)
+    };
+    let Some(merged_json) = merged_json else {
+        return Ok(());
+    };
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE series SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(merged_json)
+    .bind(series_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn update_season_metadata_from_tvdb(
+    pool: &AnyPool,
+    seasons: &[serde_json::Value],
+    season_ids: &HashMap<i32, Uuid>,
+) -> Result<()> {
+    for season_meta in seasons {
+        let Some(season_number) = extract_tvdb_season_number(season_meta) else {
+            continue;
+        };
+        let Some(season_id) = season_ids.get(&season_number).copied() else {
+            continue;
+        };
+        let title = extract_tvdb_season_title(season_meta);
+        let raw_json = serde_json::to_string(season_meta).ok();
+        let existing = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
+        )
+        .bind(season_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+        let existing = existing.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let mut merged = existing
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        if let Some(obj) = merged.as_object_mut() {
+            if let Some(raw_json) = raw_json {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+                    obj.insert("tvdb".to_string(), parsed);
+                }
+            }
+        }
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE seasons SET title = COALESCE(?, title), metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(title.as_deref())
+        .bind(serde_json::to_string(&merged).ok())
+        .bind(season_id.to_string())
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+fn extract_tvdb_season_number(value: &serde_json::Value) -> Option<i32> {
+    value
+        .get("number")
+        .or_else(|| value.get("seasonNumber"))
+        .or_else(|| value.get("season_number"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|v| v as i32)
+}
+
+fn extract_tvdb_season_title(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("name")
+        .or_else(|| value.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn extract_tvdb_season_year(value: &serde_json::Value) -> Option<i32> {
+    if let Some(year) = value.get("year").and_then(serde_json::Value::as_i64) {
+        return Some(year as i32);
+    }
+    if let Some(year) = value.get("year").and_then(serde_json::Value::as_str) {
+        return parse_year_str(year);
+    }
+    let date_keys = ["firstAired", "first_air_date", "startDate", "premiereDate", "airDate"];
+    for key in date_keys {
+        if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
+            if let Some(year) = value.get(0..4).and_then(|s| s.parse::<i32>().ok()) {
+                return Some(year);
+            }
+        }
+    }
+    None
+}
+
 async fn season_scaffolded(pool: &AnyPool, season_id: Uuid) -> Result<bool> {
-    let meta: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT metadata_json FROM seasons WHERE id = ? LIMIT 1",
+    let meta = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
     )
     .bind(season_id.to_string())
     .fetch_optional(pool)
     .await?;
+    let meta = meta.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
     let Some(meta) = meta else {
         return Ok(false);
     };
@@ -2701,17 +4609,124 @@ async fn season_scaffolded(pool: &AnyPool, season_id: Uuid) -> Result<bool> {
         .unwrap_or(false))
 }
 
+async fn season_scaffolded_recent(
+    pool: &AnyPool,
+    season_id: Uuid,
+    provider: Option<&str>,
+    ttl_seconds: u64,
+    force: bool,
+) -> Result<bool> {
+    if force || ttl_seconds == 0 {
+        return Ok(false);
+    }
+
+    let row = sqlx::query(
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') as meta, CAST(updated_at AS TEXT) as updated_at \
+         FROM seasons WHERE id = ? LIMIT 1",
+    )
+    .bind(season_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+
+    let meta: String = row.get("meta");
+    let meta = meta.trim();
+    if meta.is_empty() {
+        return Ok(false);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(meta).unwrap_or_default();
+    if !parsed
+        .get("scaffolded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    if let Some(expected) = provider {
+        let actual = parsed
+            .get("scaffold_provider")
+            .and_then(serde_json::Value::as_str);
+        if actual != Some(expected) {
+            return Ok(false);
+        }
+    }
+
+    let mut timestamp = parsed
+        .get("scaffolded_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    if timestamp.is_none() {
+        let updated_at: Option<String> = row.try_get("updated_at").ok();
+        if let Some(updated_at) = updated_at {
+            if let Ok(parsed) = updated_at.parse::<chrono::NaiveDateTime>() {
+                timestamp = Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                    parsed,
+                    Utc,
+                ));
+            }
+        }
+    }
+
+    let Some(timestamp) = timestamp else {
+        return Ok(false);
+    };
+    let age = Utc::now() - timestamp;
+    Ok(age.num_seconds() as u64 <= ttl_seconds)
+}
+
+async fn series_seasons_scaffolded_recent(
+    pool: &AnyPool,
+    series_id: Uuid,
+    provider: Option<&str>,
+    ttl_seconds: u64,
+    force: bool,
+) -> Result<bool> {
+    if force || ttl_seconds == 0 {
+        return Ok(false);
+    }
+    let season_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT id FROM seasons WHERE series_id = ?",
+    )
+    .bind(series_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    if season_ids.is_empty() {
+        return Ok(false);
+    }
+
+    for season_id in season_ids {
+        let id = Uuid::parse_str(&season_id)?;
+        if !season_scaffolded_recent(pool, id, provider, ttl_seconds, force).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn mark_season_scaffolded(
     pool: &AnyPool,
     season_id: Uuid,
     provider: &str,
 ) -> Result<()> {
-    let existing: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT metadata_json FROM seasons WHERE id = ? LIMIT 1",
+    let existing = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
     )
     .bind(season_id.to_string())
     .fetch_optional(pool)
     .await?;
+    let existing = existing.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     let mut meta = existing
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())

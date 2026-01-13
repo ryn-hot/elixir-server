@@ -63,6 +63,7 @@ pub mod cinemeta {
                     }
                 }
             }
+            return Ok(None);
         }
 
         // Fallback to search by title.
@@ -83,10 +84,14 @@ pub mod cinemeta {
         if let Some(first) = body.metas.and_then(|mut m| m.pop()) {
             let runtime_seconds = first.runtime.map(|m| m * 60);
             let json = serde_json::to_value(&first)?;
+            let external_ids = first.imdb_id.clone().map(|imdb| ExternalIds {
+                imdb: Some(imdb),
+                ..Default::default()
+            });
             return Ok(Some(MetadataResult {
                 metadata_json: json,
                 runtime_seconds,
-                external_ids: None,
+                external_ids,
                 description: first.description.clone(),
                 genres: first.genres.clone(),
             }));
@@ -117,49 +122,6 @@ pub mod cinemeta {
     }
 }
 
-pub mod wikidata {
-    use super::*;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    struct SearchResult {
-        search: Option<Vec<SearchItem>>,
-    }
-
-    #[derive(Debug, Deserialize, Serialize, Clone)]
-    struct SearchItem {
-        id: String,
-        label: Option<String>,
-        description: Option<String>,
-    }
-
-    pub async fn fetch(
-        client: &Client,
-        identity: &MediaIdentity,
-    ) -> Result<Option<MetadataResult>> {
-        let url = format!(
-            "https://www.wikidata.org/w/api.php?action=wbsearchentities&language=en&format=json&search={}",
-            urlencoding::encode(&identity.title)
-        );
-        let res = client.get(&url).send().await?;
-        if !res.status().is_success() {
-            return Ok(None);
-        }
-        let body: SearchResult = res.json().await?;
-        if let Some(first) = body.search.and_then(|mut s| s.pop()) {
-            let json = serde_json::to_value(first.clone())?;
-            return Ok(Some(MetadataResult {
-                metadata_json: json,
-                runtime_seconds: None,
-                external_ids: None,
-                description: first.description,
-                genres: None,
-            }));
-        }
-        Ok(None)
-    }
-}
-
 pub mod anilist {
     use super::*;
     use serde::Deserialize;
@@ -174,6 +136,8 @@ pub mod anilist {
         pub description: Option<String>,
         pub genres: Option<Vec<String>>,
         pub startDate: Option<serde_json::Value>,
+        pub coverImage: Option<serde_json::Value>,
+        pub bannerImage: Option<String>,
     }
 
     pub async fn fetch(
@@ -182,10 +146,9 @@ pub mod anilist {
     ) -> Result<Option<MetadataResult>> {
         if let Some(anilist_id) = identity.external_ids.anilist.as_ref() {
             if let Ok(parsed) = anilist_id.parse::<i32>() {
-                if let Some(meta) = fetch_by_id(client, parsed).await? {
-                    return Ok(Some(meta));
-                }
+                return fetch_by_id(client, parsed).await;
             }
+            return Ok(None);
         }
 
         if let Some(meta) = fetch_by_search(client, &identity.title).await? {
@@ -268,6 +231,8 @@ pub mod anilist {
                 format
                 description
                 genres
+                coverImage { extraLarge large medium }
+                bannerImage
               }
             }
         "#;
@@ -314,6 +279,8 @@ pub mod anilist {
                 format
                 description
                 genres
+                coverImage { extraLarge large medium }
+                bannerImage
               }
             }
         "#;

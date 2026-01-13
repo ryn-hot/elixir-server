@@ -29,7 +29,20 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/library/items", get(handlers::library::list_items))
         .route("/api/v1/library/items/:id", get(handlers::library::detail))
+        .route(
+            "/api/v1/library/series/:id/seasons",
+            get(handlers::library::list_seasons),
+        )
+        .route(
+            "/api/v1/library/seasons/:id",
+            get(handlers::library::season_detail),
+        )
+        .route(
+            "/api/v1/library/seasons/:id/episodes",
+            get(handlers::library::list_episodes),
+        )
         .route("/api/v1/library/scan", post(handlers::library::scan))
+        .route("/api/v1/artwork/:id", get(handlers::artwork::get_artwork))
         .route(
             "/api/v1/library/review/queue",
             get(handlers::review::list_queue),

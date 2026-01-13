@@ -38,6 +38,9 @@ impl MetadataService {
     pub async fn fetch_metadata(&self, identity: &MediaIdentity) -> Result<Option<MetadataResult>> {
         match identity.r#type {
             MediaType::Anime => {
+                if identity.external_ids.anilist.is_none() {
+                    return Ok(None);
+                }
                 if self.config.enable_anilist {
                     if let Some(meta) = providers::anilist::fetch(&self.client, identity).await? {
                         return Ok(Some(meta));
@@ -55,13 +58,11 @@ impl MetadataService {
                 }
             }
             _ => {
+                if identity.external_ids.imdb.is_none() {
+                    return Ok(None);
+                }
                 if self.config.enable_cinemeta {
                     if let Some(meta) = providers::cinemeta::fetch(&self.client, identity).await? {
-                        return Ok(Some(meta));
-                    }
-                }
-                if self.config.enable_wikidata {
-                    if let Some(meta) = providers::wikidata::fetch(&self.client, identity).await? {
                         return Ok(Some(meta));
                     }
                 }
@@ -158,36 +159,6 @@ impl MetadataService {
                         .collect();
                     return Ok(mapped);
                 }
-            }
-        }
-
-        // Fallback to Wikidata simple search.
-        if self.config.enable_wikidata {
-            if let Ok(Some(meta)) = providers::wikidata::fetch(
-                &self.client,
-                &MediaIdentity {
-                    r#type: r#type.unwrap_or(MediaType::Movie),
-                    external_ids: ExternalIds::default(),
-                    title: query.to_string(),
-                    year: None,
-                    season: None,
-                    episode: None,
-                },
-            )
-            .await
-            {
-                return Ok(vec![DiscoveryResult {
-                    title: meta
-                        .metadata_json
-                        .get("label")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(query)
-                        .to_string(),
-                    r#type: r#type.unwrap_or(MediaType::Movie),
-                    year: None,
-                    external_ids: None,
-                    description: meta.description,
-                }]);
             }
         }
 

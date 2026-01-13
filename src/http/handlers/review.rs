@@ -13,7 +13,10 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
-    library::{apply_external_ids_to_movie, apply_external_ids_to_series, derive_override_key, normalize_override_key},
+    library::{
+        apply_external_ids_to_movie, apply_external_ids_to_season,
+        apply_external_ids_to_series, derive_override_key, normalize_override_key,
+    },
     state::AppState,
 };
 
@@ -280,6 +283,7 @@ pub async fn apply_review(
         }
         ReviewTarget::Series {
             id: series_id,
+            season_id,
             library_type: series_type,
         } => {
             if library_type != series_type {
@@ -287,9 +291,21 @@ pub async fn apply_review(
                     "library_type does not match current media item",
                 ));
             }
-            apply_external_ids_to_series(&state.db_pool, series_id, &external_ids, "override")
+            if library_type == "anime" {
+                apply_external_ids_to_season(
+                    &state.db_pool,
+                    season_id,
+                    &external_ids,
+                    "override",
+                    Some(1.0),
+                )
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))?;
+            } else {
+                apply_external_ids_to_series(&state.db_pool, series_id, &external_ids, "override")
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            }
         }
     }
 
@@ -438,7 +454,11 @@ async fn load_current_match(
 
 enum ReviewTarget {
     Movie { id: Uuid },
-    Series { id: Uuid, library_type: String },
+    Series {
+        id: Uuid,
+        season_id: Uuid,
+        library_type: String,
+    },
 }
 
 async fn resolve_review_target(
@@ -459,7 +479,7 @@ async fn resolve_review_target(
     }
 
     if let Some(row) = sqlx::query(
-        "SELECT s.id, s.library_type FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = ? LIMIT 1",
+        "SELECT s.id, s.library_type, e.season_id FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = ? LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -469,8 +489,12 @@ async fn resolve_review_target(
         let series_id = row.get::<String, _>("id");
         let series_uuid = Uuid::parse_str(&series_id)
             .map_err(|_| ApiError::bad_request("invalid series_id"))?;
+        let season_id = row.get::<String, _>("season_id");
+        let season_uuid = Uuid::parse_str(&season_id)
+            .map_err(|_| ApiError::bad_request("invalid season_id"))?;
         return Ok(ReviewTarget::Series {
             id: series_uuid,
+            season_id: season_uuid,
             library_type: row.get::<String, _>("library_type"),
         });
     }

@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use serde::de::Deserializer;
 use tokio::sync::Mutex;
 
 use crate::{config::ClassifierConfig, extensions::ExternalIds};
@@ -104,6 +105,77 @@ impl LinkerService {
         Ok(episodes)
     }
 
+    pub async fn fetch_tvdb_series(
+        &self,
+        tvdb_series_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        if tvdb_series_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let resp: Option<serde_json::Value> = self
+            .tvdb_get_json(&format!("/series/{}", tvdb_series_id), &[])
+            .await?;
+        if let Some(value) = resp {
+            if let Some(data) = value.get("data") {
+                return Ok(Some(data.clone()));
+            }
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    pub async fn fetch_tvdb_series_artworks(
+        &self,
+        tvdb_series_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        if tvdb_series_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let resp: Option<serde_json::Value> = self
+            .tvdb_get_json(&format!("/series/{}/artworks", tvdb_series_id), &[])
+            .await?;
+        if let Some(value) = resp {
+            if let Some(data) = value.get("data") {
+                return Ok(Some(data.clone()));
+            }
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    pub async fn fetch_tvdb_series_seasons(
+        &self,
+        tvdb_series_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        if tvdb_series_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let resp: Option<serde_json::Value> = self
+            .tvdb_get_json(&format!("/series/{}/seasons", tvdb_series_id), &[])
+            .await?;
+        let Some(value) = resp else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(arr) = value.as_array() {
+            return Ok(arr.clone());
+        }
+        if let Some(arr) = value.get("data").and_then(serde_json::Value::as_array) {
+            return Ok(arr.clone());
+        }
+        if let Some(arr) = value
+            .get("data")
+            .and_then(|v| v.get("seasons"))
+            .and_then(serde_json::Value::as_array)
+        {
+            return Ok(arr.clone());
+        }
+        if let Some(arr) = value.get("seasons").and_then(serde_json::Value::as_array) {
+            return Ok(arr.clone());
+        }
+        Ok(Vec::new())
+    }
+
     pub async fn fetch_anizip_mapping(&self, anilist_id: &str) -> Result<Option<AniZipMapping>> {
         if anilist_id.trim().is_empty() {
             return Ok(None);
@@ -113,6 +185,7 @@ impl LinkerService {
             return Ok(None);
         }
         let url = format!("{}/mappings?anilist_id={}", base, anilist_id);
+        tracing::debug!(%anilist_id, %url, "fetching ani.zip mapping");
         let resp = self.client.get(&url).send().await?;
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -124,15 +197,12 @@ impl LinkerService {
 
         let ids = ExternalIds {
             imdb: payload.mappings.imdb_id.clone(),
-            tmdb: payload
-                .mappings
-                .themoviedb_id
-                .map(|id| id.to_string()),
-            tvdb_series: payload.mappings.thetvdb_id.map(|id| id.to_string()),
-            anilist: payload.mappings.anilist_id.map(|id| id.to_string()),
-            anidb: payload.mappings.anidb_id.map(|id| id.to_string()),
-            mal: payload.mappings.mal_id.map(|id| id.to_string()),
-            kitsu: payload.mappings.kitsu_id.map(|id| id.to_string()),
+            tmdb: payload.mappings.themoviedb_id.clone(),
+            tvdb_series: payload.mappings.thetvdb_id.clone(),
+            anilist: payload.mappings.anilist_id.clone(),
+            anidb: payload.mappings.anidb_id.clone(),
+            mal: payload.mappings.mal_id.clone(),
+            kitsu: payload.mappings.kitsu_id.clone(),
             ..Default::default()
         };
 
@@ -153,6 +223,13 @@ impl LinkerService {
                 raw,
             });
         }
+        let with_season = episodes.iter().filter(|ep| ep.season_number.is_some()).count();
+        tracing::debug!(
+            anilist_id = %payload.mappings.anilist_id.clone().unwrap_or_default(),
+            episodes = episodes.len(),
+            with_season,
+            "ani.zip mapping parsed"
+        );
 
         Ok(Some(AniZipMapping {
             ids,
@@ -350,15 +427,22 @@ struct TvdbEpisodeBaseRecord {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AniZipEpisode {
+    #[serde(default, deserialize_with = "deserialize_opt_i32")]
     season_number: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_opt_i32")]
     episode_number: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_opt_i32")]
     absolute_episode_number: Option<i32>,
     title: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_i32")]
     runtime: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_opt_i32")]
     length: Option<i32>,
     overview: Option<String>,
     image: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
     tvdb_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
     anidb_eid: Option<i64>,
 }
 
@@ -372,24 +456,61 @@ struct AniZipResponse {
 
 #[derive(Debug, Deserialize)]
 struct AniZipMappings {
-    #[serde(rename = "animeplanet_id")]
-    animeplanet_id: Option<i64>,
-    #[serde(rename = "kitsu_id")]
-    kitsu_id: Option<i64>,
-    #[serde(rename = "mal_id")]
-    mal_id: Option<i64>,
-    #[serde(rename = "anilist_id")]
-    anilist_id: Option<i64>,
-    #[serde(rename = "anisearch_id")]
-    anisearch_id: Option<i64>,
-    #[serde(rename = "anidb_id")]
-    anidb_id: Option<i64>,
-    #[serde(rename = "thetvdb_id")]
-    thetvdb_id: Option<i64>,
-    #[serde(rename = "themoviedb_id")]
-    themoviedb_id: Option<i64>,
-    #[serde(rename = "imdb_id")]
+    #[serde(rename = "animeplanet_id", default, deserialize_with = "deserialize_opt_string")]
+    animeplanet_id: Option<String>,
+    #[serde(rename = "kitsu_id", default, deserialize_with = "deserialize_opt_string")]
+    kitsu_id: Option<String>,
+    #[serde(rename = "mal_id", default, deserialize_with = "deserialize_opt_string")]
+    mal_id: Option<String>,
+    #[serde(rename = "anilist_id", default, deserialize_with = "deserialize_opt_string")]
+    anilist_id: Option<String>,
+    #[serde(rename = "anisearch_id", default, deserialize_with = "deserialize_opt_string")]
+    anisearch_id: Option<String>,
+    #[serde(rename = "anidb_id", default, deserialize_with = "deserialize_opt_string")]
+    anidb_id: Option<String>,
+    #[serde(rename = "thetvdb_id", default, deserialize_with = "deserialize_opt_string")]
+    thetvdb_id: Option<String>,
+    #[serde(rename = "themoviedb_id", default, deserialize_with = "deserialize_opt_string")]
+    themoviedb_id: Option<String>,
+    #[serde(rename = "imdb_id", default, deserialize_with = "deserialize_opt_string")]
     imdb_id: Option<String>,
+}
+
+fn deserialize_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
+fn deserialize_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v as i32),
+        Some(serde_json::Value::String(s)) => s.parse::<i32>().ok(),
+        _ => None,
+    })
+}
+
+fn deserialize_opt_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+        _ => None,
+    })
 }
 
 fn select_title(title_map: Option<&HashMap<String, String>>) -> Option<String> {

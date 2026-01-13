@@ -12,6 +12,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{config::SonarrConfig, db::models::MediaType, extensions::sonarr::load_sonarr_sources};
+use elixir_classifier::hint::general_parser::GeneralParser;
+use elixir_classifier::hint::{FileInput, LibraryType};
+use elixir_classifier::HintParser;
 
 mod sonarr;
 
@@ -251,15 +254,18 @@ async fn build_candidate_from_path(path: &Path, hash_files: bool) -> Option<Medi
     }
 
     let (season, episode) = parse_season_episode(&file_name);
+    let media_type = if season.is_some() || episode.is_some() {
+        MediaType::Series
+    } else {
+        MediaType::Movie
+    };
+    let cleaned_title = derive_clean_title(&file_name, media_type)
+        .unwrap_or_else(|| title.trim().to_string());
 
     let identity = MediaIdentity {
-        r#type: if season.is_some() || episode.is_some() {
-            MediaType::Series
-        } else {
-            MediaType::Movie
-        },
+        r#type: media_type,
         external_ids: ExternalIds::default(),
-        title: title.trim().to_string(),
+        title: cleaned_title,
         year,
         season,
         episode,
@@ -309,24 +315,180 @@ fn strip_year_suffix(title: &str) -> String {
 
 fn parse_season_episode(name: &str) -> (Option<i32>, Option<i32>) {
     let upper = name.to_ascii_uppercase();
-    if let Some(idx) = upper.find('S') {
-        let rest = &upper[idx + 1..];
-        let season = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>();
-        if let Some(e_idx) = rest.find('E') {
-            let after_e = &rest[e_idx + 1..];
-            let episode = after_e
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>();
-            let s_num = season.parse::<i32>().ok();
-            let e_num = episode.parse::<i32>().ok();
-            return (s_num, e_num);
-        }
+    if let Some((season, episode)) = parse_sxxeyy(&upper) {
+        return (Some(season), Some(episode));
+    }
+    if let Some((season, episode)) = parse_season_episode_words(&upper) {
+        return (Some(season), Some(episode));
+    }
+    if let Some((season, episode)) = parse_x_pattern(&upper) {
+        return (Some(season), Some(episode));
     }
     (None, None)
+}
+
+fn derive_clean_title(file_name: &str, media_type: MediaType) -> Option<String> {
+    let library_type = match media_type {
+        MediaType::Movie => LibraryType::Movie,
+        MediaType::Series => LibraryType::Series,
+        MediaType::Anime => LibraryType::Anime,
+    };
+    let mut input = FileInput::new(file_name.to_string());
+    input.file_name = Some(file_name.to_string());
+    input.library_type_hint = Some(library_type);
+    let parser = GeneralParser::default();
+    parser
+        .parse(&input)
+        .into_iter()
+        .next()
+        .map(|hint| hint.title)
+        .filter(|title: &String| !title.trim().is_empty())
+}
+
+fn parse_sxxeyy(value: &str) -> Option<(i32, i32)> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'S' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut season = String::new();
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            season.push(bytes[j] as char);
+            j += 1;
+            if season.len() >= 3 {
+                break;
+            }
+        }
+        if season.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut k = j;
+        while k < bytes.len() {
+            let ch = bytes[k];
+            if ch == b'E' {
+                break;
+            }
+            if ch.is_ascii_alphanumeric() && !is_separator(ch) {
+                break;
+            }
+            k += 1;
+        }
+        if k >= bytes.len() || bytes[k] != b'E' {
+            i += 1;
+            continue;
+        }
+
+        let mut l = k + 1;
+        let mut episode = String::new();
+        while l < bytes.len() && bytes[l].is_ascii_digit() {
+            episode.push(bytes[l] as char);
+            l += 1;
+            if episode.len() >= 3 {
+                break;
+            }
+        }
+        if episode.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let s_num = season.parse::<i32>().ok()?;
+        let e_num = episode.parse::<i32>().ok()?;
+        return Some((s_num, e_num));
+    }
+    None
+}
+
+fn parse_season_episode_words(value: &str) -> Option<(i32, i32)> {
+    let season_idx = value.find("SEASON")?;
+    let after = &value[season_idx + "SEASON".len()..];
+    let (season, season_end) = parse_number_after(after)?;
+    let rest = &after[season_end..];
+    let ep_idx = rest
+        .find("EPISODE")
+        .or_else(|| rest.find("EP"))?;
+    let ep_label_len = if rest[ep_idx..].starts_with("EPISODE") {
+        "EPISODE".len()
+    } else {
+        "EP".len()
+    };
+    let after_ep = &rest[ep_idx + ep_label_len..];
+    let (episode, _) = parse_number_after(after_ep)?;
+    Some((season, episode))
+}
+
+fn parse_x_pattern(value: &str) -> Option<(i32, i32)> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        let mut season = String::new();
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            season.push(bytes[j] as char);
+            j += 1;
+            if season.len() >= 3 {
+                break;
+            }
+        }
+        if season.is_empty() || j >= bytes.len() || bytes[j] != b'X' {
+            i += 1;
+            continue;
+        }
+        let mut k = j + 1;
+        let mut episode = String::new();
+        while k < bytes.len() && bytes[k].is_ascii_digit() {
+            episode.push(bytes[k] as char);
+            k += 1;
+            if episode.len() >= 3 {
+                break;
+            }
+        }
+        if episode.is_empty() {
+            i += 1;
+            continue;
+        }
+        let s_num = season.parse::<i32>().ok()?;
+        let e_num = episode.parse::<i32>().ok()?;
+        return Some((s_num, e_num));
+    }
+    None
+}
+
+fn parse_number_after(value: &str) -> Option<(i32, usize)> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut digits = String::new();
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        digits.push(bytes[i] as char);
+        i += 1;
+        if digits.len() >= 3 {
+            break;
+        }
+    }
+    let num = digits.parse::<i32>().ok()?;
+    Some((num, i))
+}
+
+fn is_separator(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'.' | b'_' | b'-' | b' ' | b'(' | b')' | b'[' | b']'
+    )
 }
 
 async fn compute_hash(path: &str) -> Option<String> {
@@ -358,6 +520,25 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs::File;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn parse_season_episode_detects_patterns() {
+        let (season, episode) = parse_season_episode("Solo.Leveling.S02E02.I.Suppose.You.Arent.Aware");
+        assert_eq!(season, Some(2));
+        assert_eq!(episode, Some(2));
+
+        let (season, episode) = parse_season_episode("Show.Name.1x02.1080p");
+        assert_eq!(season, Some(1));
+        assert_eq!(episode, Some(2));
+
+        let (season, episode) = parse_season_episode("Show Name Season 3 Episode 4");
+        assert_eq!(season, Some(3));
+        assert_eq!(episode, Some(4));
+
+        let (season, episode) = parse_season_episode("Movie.Title.2024");
+        assert_eq!(season, None);
+        assert_eq!(episode, None);
+    }
 
     #[tokio::test]
     async fn local_folder_scans_media_files() -> Result<()> {

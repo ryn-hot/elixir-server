@@ -50,10 +50,10 @@ impl Settings {
                 "library.scan_interval_seconds",
                 default_scan_interval_seconds(),
             )?
+            .set_default("library.artwork_cache_dir", default_artwork_cache_dir())?
             .set_default("library.hash_dedupe_enabled", default_false())?
             .set_default("library.sonarr.enabled", default_false())?
             .set_default("metadata.enable_cinemeta", true)?
-            .set_default("metadata.enable_wikidata", true)?
             .set_default("metadata.enable_anilist", true)?
             .set_default("metadata.enable_aniapi", true)?
             .set_default("metadata.enable_consumet", true)?
@@ -237,6 +237,8 @@ pub struct LibraryConfig {
     pub local_root: String,
     #[serde(default = "default_scan_interval_seconds")]
     pub scan_interval_seconds: u64,
+    #[serde(default = "default_artwork_cache_dir")]
+    pub artwork_cache_dir: String,
     #[serde(default)]
     pub sonarr: SonarrConfig,
     #[serde(default = "default_false")]
@@ -248,6 +250,7 @@ impl Default for LibraryConfig {
         Self {
             local_root: default_local_root(),
             scan_interval_seconds: default_scan_interval_seconds(),
+            artwork_cache_dir: default_artwork_cache_dir(),
             sonarr: SonarrConfig::default(),
             hash_dedupe_enabled: default_false(),
         }
@@ -267,8 +270,6 @@ pub struct MetadataConfig {
     #[serde(default = "default_true")]
     pub enable_cinemeta: bool,
     #[serde(default = "default_true")]
-    pub enable_wikidata: bool,
-    #[serde(default = "default_true")]
     pub enable_anilist: bool,
     #[serde(default = "default_true")]
     pub enable_aniapi: bool,
@@ -284,7 +285,6 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             enable_cinemeta: default_true(),
-            enable_wikidata: default_true(),
             enable_anilist: default_true(),
             enable_aniapi: default_true(),
             enable_consumet: default_true(),
@@ -425,6 +425,10 @@ fn default_local_root() -> String {
 
 fn default_scan_interval_seconds() -> u64 {
     600
+}
+
+fn default_artwork_cache_dir() -> String {
+    "data/artwork".to_string()
 }
 
 fn default_true() -> bool {

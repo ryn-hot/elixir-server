@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthService,
+    artwork::ArtworkService,
     config::{
         AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, ServerConfig,
         Settings, TelemetryConfig,
@@ -52,6 +53,13 @@ fn test_settings_with_db() -> Settings {
     }
 }
 
+fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
+    ArtworkService::new(
+        settings.library.artwork_cache_dir.clone(),
+        settings.metadata.request_timeout_seconds,
+    )
+}
+
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
     let settings = test_settings_with_db();
@@ -59,6 +67,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
 
     let app = router(AppState::new(
         settings,
@@ -67,6 +76,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         ExtensionManager::new(),
         MetadataService::new(crate::config::MetadataConfig::default())?,
         linkers,
+        artwork,
     ));
 
     let health_response = app
@@ -118,6 +128,7 @@ async fn login_returns_access_token() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -125,6 +136,7 @@ async fn login_returns_access_token() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     ));
 
     let user_id = Uuid::new_v4().to_string();
@@ -183,6 +195,7 @@ async fn signup_and_password_reset_flow() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -190,6 +203,7 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     ));
 
     // Signup
@@ -316,6 +330,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -323,6 +338,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     );
     let app = router(state.clone());
 
@@ -439,6 +455,7 @@ async fn discovery_requires_auth() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -446,6 +463,7 @@ async fn discovery_requires_auth() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     );
     let app = router(state.clone());
 
@@ -473,6 +491,7 @@ async fn playback_profile_requires_auth() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -480,6 +499,7 @@ async fn playback_profile_requires_auth() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     );
     let app = router(state.clone());
 
@@ -536,7 +556,8 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
+    let artwork = test_artwork_service(&settings)?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
     let app = router(state.clone());
 
     // Seed media via run_full_scan directly.
@@ -603,6 +624,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -610,6 +632,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
         ExtensionManager::new(),
         metadata,
         linkers,
+        artwork,
     );
     let app = router(state.clone());
 
@@ -723,7 +746,8 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
+    let artwork = test_artwork_service(&settings)?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
     let app = router(state.clone());
 
     // Create a real file on disk to serve.
@@ -815,7 +839,8 @@ async fn direct_stream_supports_range() -> Result<()> {
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
+    let artwork = test_artwork_service(&settings)?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
     let app = router(state.clone());
 
     let dir = tempdir()?;
@@ -930,7 +955,8 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     let extensions = ExtensionManager::new();
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers);
+    let artwork = test_artwork_service(&settings)?;
+    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();

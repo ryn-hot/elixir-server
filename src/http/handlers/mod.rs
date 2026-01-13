@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod artwork;
 pub mod control;
 pub mod discovery;
 pub mod health;

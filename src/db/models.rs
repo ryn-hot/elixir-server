@@ -163,6 +163,7 @@ pub struct Season {
     pub series_id: Uuid,
     pub season_number: i32,
     pub title: Option<String>,
+    pub external_anilist: Option<String>,
     pub metadata_json: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -297,6 +298,17 @@ pub struct EpisodeProviderKey {
     pub episode_id: Uuid,
     pub provider: String,
     pub provider_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SeasonExternalId {
+    pub id: Uuid,
+    pub season_id: Uuid,
+    pub provider: String,
+    pub external_id: String,
+    pub confidence: Option<f32>,
+    pub source: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

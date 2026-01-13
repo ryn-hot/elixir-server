@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     auth::AuthService,
+    artwork::ArtworkService,
     config::Settings,
     db::{Database, DatabaseDriver},
     extensions::ExtensionManager,
@@ -21,6 +22,7 @@ pub struct AppState {
     pub extensions: Arc<ExtensionManager>,
     pub metadata: Arc<MetadataService>,
     pub linkers: Arc<LinkerService>,
+    pub artwork: Arc<ArtworkService>,
     pub transcodes: Arc<TranscodeManager>,
     pub mdns_active: Arc<AtomicBool>,
 }
@@ -33,6 +35,7 @@ impl AppState {
         extensions: ExtensionManager,
         metadata: MetadataService,
         linkers: LinkerService,
+        artwork: ArtworkService,
     ) -> Self {
         Self {
             settings: Arc::new(settings),
@@ -42,6 +45,7 @@ impl AppState {
             extensions: Arc::new(extensions),
             metadata: Arc::new(metadata),
             linkers: Arc::new(linkers),
+            artwork: Arc::new(artwork),
             transcodes: Arc::new(TranscodeManager::new()),
             mdns_active: Arc::new(AtomicBool::new(false)),
         }
