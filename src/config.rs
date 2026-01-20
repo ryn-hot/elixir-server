@@ -19,6 +19,8 @@ pub struct Settings {
     #[serde(default)]
     pub library: LibraryConfig,
     #[serde(default)]
+    pub extensions: ExtensionsConfig,
+    #[serde(default)]
     pub metadata: MetadataConfig,
     #[serde(default)]
     pub classifier: ClassifierConfig,
@@ -53,6 +55,10 @@ impl Settings {
             .set_default("library.artwork_cache_dir", default_artwork_cache_dir())?
             .set_default("library.hash_dedupe_enabled", default_false())?
             .set_default("library.sonarr.enabled", default_false())?
+            .set_default("extensions.registries", Vec::<String>::new())?
+            .set_default("extensions.storage_root", default_extensions_root())?
+            .set_default("extensions.allow_unsigned", default_false())?
+            .set_default("extensions.allow_directory_install", default_false())?
             .set_default("metadata.enable_cinemeta", true)?
             .set_default("metadata.enable_anilist", true)?
             .set_default("metadata.enable_aniapi", true)?
@@ -266,6 +272,29 @@ pub struct SonarrConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ExtensionsConfig {
+    #[serde(default)]
+    pub registries: Vec<String>,
+    #[serde(default = "default_extensions_root")]
+    pub storage_root: String,
+    #[serde(default = "default_false")]
+    pub allow_unsigned: bool,
+    #[serde(default = "default_false")]
+    pub allow_directory_install: bool,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            registries: Vec::new(),
+            storage_root: default_extensions_root(),
+            allow_unsigned: default_false(),
+            allow_directory_install: default_false(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MetadataConfig {
     #[serde(default = "default_true")]
     pub enable_cinemeta: bool,
@@ -429,6 +458,10 @@ fn default_scan_interval_seconds() -> u64 {
 
 fn default_artwork_cache_dir() -> String {
     "data/artwork".to_string()
+}
+
+fn default_extensions_root() -> String {
+    "data/extensions".to_string()
 }
 
 fn default_true() -> bool {

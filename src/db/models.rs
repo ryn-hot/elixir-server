@@ -37,6 +37,83 @@ pub enum PlaybackState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionKind {
+    Module,
+    Connector,
+    Blueprint,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionTrustLevel {
+    Verified,
+    Community,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "snake_case")]
+pub enum SlotCardinality {
+    One,
+    Many,
+    ZeroOrOne,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderHealthState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum BindingStatus {
+    Pending,
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum OrchestratorRunStatus {
+    Pending,
+    Running,
+    Failed,
+    Completed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum OperationStepStatus {
+    Pending,
+    Running,
+    Failed,
+    Completed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
+#[serde(rename_all = "lowercase")]
+pub enum SecretScope {
+    Instance,
+    Provider,
+    Global,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
     pub id: Uuid,
@@ -92,6 +169,118 @@ pub struct SourceConfig {
     pub extension_id: String,
     pub config_json: Option<serde_json::Value>,
     pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Extension {
+    pub extension_id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: ExtensionKind,
+    pub publisher_name: Option<String>,
+    pub signing_key_id: Option<String>,
+    pub trust_level: ExtensionTrustLevel,
+    pub manifest_json: serde_json::Value,
+    pub package_hash: Option<String>,
+    pub installed_at: DateTime<Utc>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExtensionInstance {
+    pub instance_id: Uuid,
+    pub extension_id: String,
+    pub instance_name: String,
+    pub config_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Provider {
+    pub provider_id: Uuid,
+    pub instance_id: Uuid,
+    pub capability: String,
+    pub slot_id: String,
+    pub cardinality: SlotCardinality,
+    pub implementation: Option<String>,
+    pub endpoint_json: Option<serde_json::Value>,
+    pub health_state: ProviderHealthState,
+    pub last_healthcheck_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Binding {
+    pub binding_id: Uuid,
+    pub consumer_provider_id: Uuid,
+    pub requires_capability: String,
+    pub requires_slot_id: String,
+    pub target_provider_id: Uuid,
+    pub binding_params_json: Option<serde_json::Value>,
+    pub status: BindingStatus,
+    pub last_error: Option<String>,
+    pub last_applied_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DesiredBlueprint {
+    pub desired_id: Uuid,
+    pub blueprint_extension_id: String,
+    pub blueprint_version: String,
+    pub params_json: Option<serde_json::Value>,
+    pub applied: bool,
+    pub created_at: DateTime<Utc>,
+    pub applied_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Secret {
+    pub secret_id: Uuid,
+    pub scope: SecretScope,
+    pub scope_id: Option<Uuid>,
+    pub key: String,
+    pub value_encrypted: String,
+    pub created_at: DateTime<Utc>,
+    pub rotatable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OrchestratorRun {
+    pub run_id: Uuid,
+    pub status: OrchestratorRunStatus,
+    pub phase: Option<String>,
+    pub plan_json: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OperationStep {
+    pub step_id: Uuid,
+    pub run_id: Uuid,
+    pub step_index: i32,
+    pub action_type: String,
+    pub action_json: Option<serde_json::Value>,
+    pub status: OperationStepStatus,
+    pub error: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RuntimeLog {
+    pub log_id: Uuid,
+    pub instance_id: Uuid,
+    pub log_uri: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -331,3 +520,197 @@ pub struct PlaybackSession {
 }
 
 // refresh tokens removed for simplified auth
+
+impl ExtensionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtensionKind::Module => "module",
+            ExtensionKind::Connector => "connector",
+            ExtensionKind::Blueprint => "blueprint",
+        }
+    }
+}
+
+impl ExtensionTrustLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtensionTrustLevel::Verified => "verified",
+            ExtensionTrustLevel::Community => "community",
+            ExtensionTrustLevel::Untrusted => "untrusted",
+        }
+    }
+}
+
+impl SlotCardinality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SlotCardinality::One => "one",
+            SlotCardinality::Many => "many",
+            SlotCardinality::ZeroOrOne => "zero_or_one",
+        }
+    }
+}
+
+impl ProviderHealthState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderHealthState::Unknown => "unknown",
+            ProviderHealthState::Healthy => "healthy",
+            ProviderHealthState::Degraded => "degraded",
+            ProviderHealthState::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+impl BindingStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BindingStatus::Pending => "pending",
+            BindingStatus::Applied => "applied",
+            BindingStatus::Failed => "failed",
+        }
+    }
+}
+
+impl OrchestratorRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrchestratorRunStatus::Pending => "pending",
+            OrchestratorRunStatus::Running => "running",
+            OrchestratorRunStatus::Failed => "failed",
+            OrchestratorRunStatus::Completed => "completed",
+            OrchestratorRunStatus::Canceled => "canceled",
+        }
+    }
+}
+
+impl OperationStepStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OperationStepStatus::Pending => "pending",
+            OperationStepStatus::Running => "running",
+            OperationStepStatus::Failed => "failed",
+            OperationStepStatus::Completed => "completed",
+            OperationStepStatus::Skipped => "skipped",
+        }
+    }
+}
+
+impl SecretScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SecretScope::Instance => "instance",
+            SecretScope::Provider => "provider",
+            SecretScope::Global => "global",
+        }
+    }
+}
+
+impl std::str::FromStr for ExtensionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "module" => Ok(ExtensionKind::Module),
+            "connector" => Ok(ExtensionKind::Connector),
+            "blueprint" => Ok(ExtensionKind::Blueprint),
+            other => Err(format!("unknown extension kind '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for ExtensionTrustLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "verified" => Ok(ExtensionTrustLevel::Verified),
+            "community" => Ok(ExtensionTrustLevel::Community),
+            "untrusted" => Ok(ExtensionTrustLevel::Untrusted),
+            other => Err(format!("unknown trust level '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for SlotCardinality {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "one" => Ok(SlotCardinality::One),
+            "many" => Ok(SlotCardinality::Many),
+            "zero_or_one" => Ok(SlotCardinality::ZeroOrOne),
+            other => Err(format!("unknown cardinality '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for ProviderHealthState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unknown" => Ok(ProviderHealthState::Unknown),
+            "healthy" => Ok(ProviderHealthState::Healthy),
+            "degraded" => Ok(ProviderHealthState::Degraded),
+            "unhealthy" => Ok(ProviderHealthState::Unhealthy),
+            other => Err(format!("unknown health state '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for BindingStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(BindingStatus::Pending),
+            "applied" => Ok(BindingStatus::Applied),
+            "failed" => Ok(BindingStatus::Failed),
+            other => Err(format!("unknown binding status '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for OrchestratorRunStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(OrchestratorRunStatus::Pending),
+            "running" => Ok(OrchestratorRunStatus::Running),
+            "failed" => Ok(OrchestratorRunStatus::Failed),
+            "completed" => Ok(OrchestratorRunStatus::Completed),
+            "canceled" => Ok(OrchestratorRunStatus::Canceled),
+            other => Err(format!("unknown orchestrator run status '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for OperationStepStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(OperationStepStatus::Pending),
+            "running" => Ok(OperationStepStatus::Running),
+            "failed" => Ok(OperationStepStatus::Failed),
+            "completed" => Ok(OperationStepStatus::Completed),
+            "skipped" => Ok(OperationStepStatus::Skipped),
+            other => Err(format!("unknown operation step status '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for SecretScope {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "instance" => Ok(SecretScope::Instance),
+            "provider" => Ok(SecretScope::Provider),
+            "global" => Ok(SecretScope::Global),
+            other => Err(format!("unknown secret scope '{other}'")),
+        }
+    }
+}

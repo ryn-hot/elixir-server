@@ -5,7 +5,7 @@ pub mod handlers;
 use axum::{
     http::{header, Method},
     Router,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -17,6 +17,74 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(handlers::health::healthcheck))
         .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
+        .route(
+            "/api/v1/extensions/catalog",
+            get(handlers::extensions::catalog),
+        )
+        .route(
+            "/api/v1/extensions/:id",
+            get(handlers::extensions::get_extension),
+        )
+        .route(
+            "/api/v1/extensions/install",
+            post(handlers::extensions::install_extension),
+        )
+        .route(
+            "/api/v1/extensions/:id/enable",
+            post(handlers::extensions::enable_extension),
+        )
+        .route(
+            "/api/v1/extensions/:id/disable",
+            post(handlers::extensions::disable_extension),
+        )
+        .route(
+            "/api/v1/extensions/:id/uninstall",
+            post(handlers::extensions::uninstall_extension),
+        )
+        .route(
+            "/api/v1/extensions/:id/instances",
+            post(handlers::extensions::create_instance),
+        )
+        .route(
+            "/api/v1/extensions/instances",
+            get(handlers::extensions::list_instances),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id",
+            patch(handlers::extensions::update_instance),
+        )
+        .route(
+            "/api/v1/extensions/blueprints/apply",
+            post(handlers::extensions::apply_blueprint),
+        )
+        .route(
+            "/api/v1/extensions/plan/:id/confirm",
+            post(handlers::extensions::confirm_plan),
+        )
+        .route(
+            "/api/v1/extensions/plan/:id/cancel",
+            post(handlers::extensions::cancel_plan),
+        )
+        .route(
+            "/api/v1/extensions/runs",
+            get(handlers::extensions::list_runs),
+        )
+        .route(
+            "/api/v1/extensions/runs/:id",
+            get(handlers::extensions::run_detail),
+        )
+        .route(
+            "/api/v1/extensions/graph",
+            get(handlers::extensions::graph),
+        )
+        .route(
+            "/api/v1/extensions/providers/:id/health",
+            get(handlers::extensions::provider_health),
+        )
+        .route(
+            "/api/v1/extensions/runtime/:id/logs",
+            get(handlers::extensions::runtime_logs),
+        )
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/signup", post(handlers::auth::signup))
         .route(
@@ -112,7 +180,7 @@ pub fn router(state: AppState) -> Router {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
         )
 }

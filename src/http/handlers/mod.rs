@@ -2,6 +2,7 @@ pub mod auth;
 pub mod artwork;
 pub mod control;
 pub mod discovery;
+pub mod extensions;
 pub mod health;
 pub mod library;
 pub mod playback;

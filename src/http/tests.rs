@@ -1,17 +1,33 @@
+use std::fs::File;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use anyhow::Result;
 use argon2::{
     Argon2,
     password_hash::{PasswordHasher, SaltString},
 };
 use axum::{
+    Json,
     body::{self, Body},
+    extract::State,
     http::{Request, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
 };
-use rand::rngs::OsRng;
-use serde_json::Value;
+use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::{Signer, SigningKey};
+use rand::{RngCore, rngs::OsRng};
+use serde_json::{Value, json};
 use tempfile::tempdir;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 use uuid::Uuid;
+use zip::{ZipWriter, write::FileOptions};
 
 use crate::{
     auth::AuthService,
@@ -26,6 +42,7 @@ use crate::{
     extensions::FileDescriptor,
     extensions::MediaFileCandidate,
     extensions::MediaIdentity,
+    extensions::package::compute_sha256,
     http::router,
     library::LinkerService,
     library::normalize_override_key,
@@ -44,6 +61,7 @@ fn test_settings_with_db() -> Settings {
             connect_timeout_seconds: 5,
         },
         library: LibraryConfig::default(),
+        extensions: crate::config::ExtensionsConfig::default(),
         auth: AuthConfig::default(),
         telemetry: TelemetryConfig::default(),
         metadata: crate::config::MetadataConfig::default(),
@@ -58,6 +76,97 @@ fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
         settings.library.artwork_cache_dir.clone(),
         settings.metadata.request_timeout_seconds,
     )
+}
+
+struct TestPackage {
+    path: PathBuf,
+    hash: String,
+    signature: String,
+    publisher_key_id: String,
+    extension_id: String,
+    version: String,
+}
+
+struct RegistryState {
+    registry_json: Value,
+    package_bytes: Vec<u8>,
+}
+
+async fn build_signed_package(temp_dir: &std::path::Path) -> Result<TestPackage> {
+    let extension_id = "elixir.test.signed".to_string();
+    let version = "0.1.0".to_string();
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let signing_key = SigningKey::from_bytes(&secret);
+    let public_key = signing_key.verifying_key();
+    let publisher_key_id = format!(
+        "ed25519:{}",
+        general_purpose::STANDARD.encode(public_key.to_bytes())
+    );
+
+    let manifest = format!(
+        "id: {extension_id}\nversion: {version}\nkind: module\nname: \"Signed Test\"\npublisher:\n  name: \"Test Publisher\"\n  key_id: \"{publisher_key_id}\"\nprovides:\n  - capability: media.manager.tv\n    slot: default\n    implementation: \"sonarr\"\nruntime:\n  type: container\n  image: \"example/test:1\"\n"
+    );
+
+    let package_path = temp_dir.join("signed.elx");
+    let file = File::create(&package_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::<()>::default();
+    zip.start_file("manifest.yaml", options)?;
+    zip.write_all(manifest.as_bytes())?;
+    zip.start_file("README.txt", options)?;
+    zip.write_all(b"signed package test")?;
+    zip.finish()?;
+
+    let hash = compute_sha256(&package_path).await?;
+    let signature = signing_key.sign(hash.as_bytes());
+    let signature = general_purpose::STANDARD.encode(signature.to_bytes());
+
+    Ok(TestPackage {
+        path: package_path,
+        hash,
+        signature,
+        publisher_key_id,
+        extension_id,
+        version,
+    })
+}
+
+async fn start_registry_server(
+    build_registry: impl FnOnce(SocketAddr) -> Value + Send + 'static,
+    package_bytes: Vec<u8>,
+) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let registry_json = build_registry(addr);
+    let state = Arc::new(RegistryState {
+        registry_json,
+        package_bytes,
+    });
+
+    let app = Router::new()
+        .route("/registry.json", get(registry_handler))
+        .route("/package.elx", get(package_handler))
+        .with_state(state);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    Ok((addr, shutdown_tx))
+}
+
+async fn registry_handler(State(state): State<Arc<RegistryState>>) -> Json<Value> {
+    Json(state.registry_json.clone())
+}
+
+async fn package_handler(State(state): State<Arc<RegistryState>>) -> impl IntoResponse {
+    (StatusCode::OK, state.package_bytes.clone())
 }
 
 #[tokio::test]
@@ -1077,5 +1186,173 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     );
     assert!(!seg_bytes.is_empty(), "segment should return data");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_install_signed_package() -> Result<()> {
+    let temp = tempdir()?;
+    let package = build_signed_package(temp.path()).await?;
+    let package_bytes = tokio::fs::read(&package.path).await?;
+
+    let extension_id = package.extension_id.clone();
+    let version = package.version.clone();
+    let hash = package.hash.clone();
+    let signature = package.signature.clone();
+    let publisher_key_id = package.publisher_key_id.clone();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "sha256": hash,
+                        "signature": signature,
+                        "publisher_key_id": publisher_key_id
+                    }
+                ]
+            })
+        },
+        package_bytes,
+    )
+    .await?;
+
+    let download_url = format!("http://{addr}/package.elx");
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let storage_root = settings.extensions.storage_root.clone();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+    ));
+
+    let install_body = json!({
+        "downloadUrl": download_url
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let install_status = install_resp.status();
+    let install_body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let install_json: Value = serde_json::from_slice(&install_body)?;
+    assert_eq!(
+        install_status,
+        StatusCode::OK,
+        "install failed body: {}",
+        install_json
+    );
+
+    let unpacked_dir = PathBuf::from(storage_root)
+        .join("unpacked")
+        .join(&package.extension_id)
+        .join(&package.version);
+    let manifest_path = unpacked_dir.join("manifest.yaml");
+    assert!(
+        tokio::fs::metadata(&manifest_path).await.is_ok(),
+        "manifest not unpacked at {}",
+        manifest_path.display()
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_rejects_bad_signature() -> Result<()> {
+    let temp = tempdir()?;
+    let package = build_signed_package(temp.path()).await?;
+    let package_bytes = tokio::fs::read(&package.path).await?;
+
+    let bad_signature = "deadbeef".to_string();
+    let extension_id = package.extension_id.clone();
+    let version = package.version.clone();
+    let hash = package.hash.clone();
+    let publisher_key_id = package.publisher_key_id.clone();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "sha256": hash,
+                        "signature": bad_signature,
+                        "publisher_key_id": publisher_key_id
+                    }
+                ]
+            })
+        },
+        package_bytes,
+    )
+    .await?;
+
+    let download_url = format!("http://{addr}/package.elx");
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+    ));
+
+    let install_body = json!({
+        "downloadUrl": download_url
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = shutdown_tx.send(());
     Ok(())
 }

@@ -16,19 +16,24 @@ use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
 use elixir_classifier::HintParser;
 
+pub mod manifest;
+pub mod package;
+pub mod registry;
+pub mod store;
+
 mod sonarr;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ExtensionManifest {
+pub struct FileSourceManifest {
     pub id: String,
     pub name: String,
     pub version: String,
     #[serde(default)]
-    pub capabilities: ExtensionCapabilities,
+    pub capabilities: FileSourceCapabilities,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct ExtensionCapabilities {
+pub struct FileSourceCapabilities {
     #[serde(default)]
     pub file_source: bool,
 }
@@ -90,7 +95,7 @@ pub struct ExtensionManager {
 }
 
 struct RegisteredFileSource {
-    manifest: ExtensionManifest,
+    manifest: FileSourceManifest,
     source: Box<dyn FileSource>,
 }
 
@@ -103,7 +108,7 @@ impl ExtensionManager {
 
     pub fn register_file_source(
         &mut self,
-        manifest: ExtensionManifest,
+        manifest: FileSourceManifest,
         source: Box<dyn FileSource>,
     ) {
         self.file_sources
@@ -117,7 +122,7 @@ impl ExtensionManager {
                 let entry = entry?;
                 let manifest_path = entry.path().join("manifest.json");
                 if manifest_path.exists() {
-                    let manifest = read_manifest(&manifest_path.to_string_lossy()).await?;
+                    let manifest = read_file_source_manifest(&manifest_path.to_string_lossy()).await?;
                     if manifest.capabilities.file_source {
                         // Placeholder: actual per-extension implementation should be loaded here.
                         // For now we register a no-op source to keep the manager aware of the manifest.
@@ -128,11 +133,11 @@ impl ExtensionManager {
         }
         // Always include built-in localfolder source (reads from env/config later).
         manager.register_file_source(
-            ExtensionManifest {
+            FileSourceManifest {
                 id: "elixir.localfolder".to_string(),
                 name: "Local Folder".to_string(),
                 version: "0.0.1".to_string(),
-                capabilities: ExtensionCapabilities { file_source: true },
+                capabilities: FileSourceCapabilities { file_source: true },
             },
             Box::new(LocalFolderSource {
                 root_path: local_root.to_string(),
@@ -170,13 +175,13 @@ impl ExtensionManager {
     }
 }
 
-async fn read_manifest(path: &str) -> Result<ExtensionManifest> {
+async fn read_file_source_manifest(path: &str) -> Result<FileSourceManifest> {
     let mut file = tokio_fs::File::open(path)
         .await
         .with_context(|| format!("opening manifest at {path}"))?;
     let mut buf = String::new();
     file.read_to_string(&mut buf).await?;
-    let manifest: ExtensionManifest =
+    let manifest: FileSourceManifest =
         serde_json::from_str(&buf).context("parsing extension manifest")?;
     Ok(manifest)
 }

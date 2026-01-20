@@ -2,7 +2,9 @@ mod auth;
 mod artwork;
 mod config;
 mod db;
+mod drivers;
 mod extensions;
+mod orchestrator;
 mod http;
 mod library;
 mod media;
@@ -10,6 +12,7 @@ mod metadata;
 mod metrics;
 mod network;
 mod playback;
+mod runtime;
 mod state;
 mod telemetry;
 

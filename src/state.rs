@@ -8,6 +8,7 @@ use crate::{
     extensions::ExtensionManager,
     library::LinkerService,
     metadata::MetadataService,
+    orchestrator::OrchestratorService,
     playback::TranscodeManager,
 };
 use sqlx::AnyPool;
@@ -25,6 +26,7 @@ pub struct AppState {
     pub artwork: Arc<ArtworkService>,
     pub transcodes: Arc<TranscodeManager>,
     pub mdns_active: Arc<AtomicBool>,
+    pub orchestrator: Arc<OrchestratorService>,
 }
 
 impl AppState {
@@ -37,10 +39,16 @@ impl AppState {
         linkers: LinkerService,
         artwork: ArtworkService,
     ) -> Self {
+        let db_pool = database.pool.clone();
+        let orchestrator = OrchestratorService::new(
+            db_pool.clone(),
+            settings.extensions.storage_root.clone(),
+            settings.library.local_root.clone(),
+        );
         Self {
             settings: Arc::new(settings),
             db_driver: database.driver,
-            db_pool: database.pool,
+            db_pool,
             auth_service,
             extensions: Arc::new(extensions),
             metadata: Arc::new(metadata),
@@ -48,6 +56,7 @@ impl AppState {
             artwork: Arc::new(artwork),
             transcodes: Arc::new(TranscodeManager::new()),
             mdns_active: Arc::new(AtomicBool::new(false)),
+            orchestrator: Arc::new(orchestrator),
         }
     }
 }
