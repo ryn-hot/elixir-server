@@ -18,6 +18,8 @@ use elixir_classifier::HintParser;
 
 pub mod manifest;
 pub mod package;
+pub mod permissions;
+pub mod required_secrets;
 pub mod registry;
 pub mod store;
 

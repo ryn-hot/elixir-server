@@ -10,6 +10,7 @@ use crate::{
     metadata::MetadataService,
     orchestrator::OrchestratorService,
     playback::TranscodeManager,
+    secrets::SecretsManager,
 };
 use sqlx::AnyPool;
 use std::sync::atomic::AtomicBool;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub db_pool: AnyPool,
     pub db_driver: DatabaseDriver,
     pub auth_service: AuthService,
+    pub secrets: Arc<SecretsManager>,
     pub extensions: Arc<ExtensionManager>,
     pub metadata: Arc<MetadataService>,
     pub linkers: Arc<LinkerService>,
@@ -38,18 +40,22 @@ impl AppState {
         metadata: MetadataService,
         linkers: LinkerService,
         artwork: ArtworkService,
+        secrets: SecretsManager,
     ) -> Self {
         let db_pool = database.pool.clone();
+        let secrets = Arc::new(secrets);
         let orchestrator = OrchestratorService::new(
             db_pool.clone(),
             settings.extensions.storage_root.clone(),
             settings.library.local_root.clone(),
+            secrets.clone(),
         );
         Self {
             settings: Arc::new(settings),
             db_driver: database.driver,
             db_pool,
             auth_service,
+            secrets,
             extensions: Arc::new(extensions),
             metadata: Arc::new(metadata),
             linkers: Arc::new(linkers),

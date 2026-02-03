@@ -33,25 +33,32 @@ use crate::{
     auth::AuthService,
     artwork::ArtworkService,
     config::{
-        AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, ServerConfig,
-        Settings, TelemetryConfig,
+        AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, SecretsConfig,
+        ServerConfig, Settings, TelemetryConfig,
     },
     db::Database,
+    db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SecretScope, SlotCardinality},
     extensions::ExtensionManager,
     extensions::ExternalIds,
     extensions::FileDescriptor,
     extensions::MediaFileCandidate,
     extensions::MediaIdentity,
     extensions::package::compute_sha256,
+    extensions::store::{
+        ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance, NewProvider,
+        NewSecret,
+    },
     http::router,
     library::LinkerService,
     library::normalize_override_key,
     library::run_full_scan,
     metadata::MetadataService,
     state::AppState,
+    secrets::SecretsManager,
 };
 
 fn test_settings_with_db() -> Settings {
+    let master_key = general_purpose::STANDARD.encode([0u8; 32]);
     Settings {
         environment: RunEnvironment::Development,
         server: ServerConfig::default(),
@@ -63,6 +70,9 @@ fn test_settings_with_db() -> Settings {
         library: LibraryConfig::default(),
         extensions: crate::config::ExtensionsConfig::default(),
         auth: AuthConfig::default(),
+        secrets: SecretsConfig {
+            master_key: Some(master_key),
+        },
         telemetry: TelemetryConfig::default(),
         metadata: crate::config::MetadataConfig::default(),
         classifier: ClassifierConfig::default(),
@@ -76,6 +86,106 @@ fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
         settings.library.artwork_cache_dir.clone(),
         settings.metadata.request_timeout_seconds,
     )
+}
+
+async fn setup_extension_instance(
+    extension_id: &str,
+    name: &str,
+    runtime_env: Option<Vec<Value>>,
+    instance_enabled: bool,
+) -> Result<(Router, Uuid)> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let mut runtime = json!({
+        "type": "container",
+        "image": "example/test:1"
+    });
+    if let Some(env) = runtime_env {
+        if let Some(obj) = runtime.as_object_mut() {
+            obj.insert("env".to_string(), Value::Array(env));
+        }
+    }
+
+    let manifest = json!({
+        "id": extension_id,
+        "version": "0.1.0",
+        "kind": "module",
+        "name": name,
+        "provides": [
+            {
+                "capability": "media.manager.tv",
+                "slot": "default",
+                "implementation": "sonarr"
+            }
+        ],
+        "runtime": runtime
+    });
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manifest,
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = if instance_enabled {
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/extensions/{extension_id}/instances"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body = body::to_bytes(create_resp.into_body(), 1_048_576).await?;
+        let create_json: Value = serde_json::from_slice(&create_body)?;
+        let instance_id = create_json
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance_id");
+        Uuid::parse_str(instance_id).expect("valid instance_id")
+    } else {
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: false,
+            })
+            .await?;
+        instance_id
+    };
+
+    Ok((app, instance_id))
 }
 
 struct TestPackage {
@@ -171,12 +281,13 @@ async fn package_handler(State(state): State<Arc<RegistryState>>) -> impl IntoRe
 
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
-    let settings = test_settings_with_db();
+    let mut settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
 
     let app = router(AppState::new(
         settings,
@@ -186,6 +297,7 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         MetadataService::new(crate::config::MetadataConfig::default())?,
         linkers,
         artwork,
+        secrets,
     ));
 
     let health_response = app
@@ -238,6 +350,7 @@ async fn login_returns_access_token() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -246,6 +359,7 @@ async fn login_returns_access_token() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     ));
 
     let user_id = Uuid::new_v4().to_string();
@@ -305,6 +419,7 @@ async fn signup_and_password_reset_flow() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -313,6 +428,7 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     ));
 
     // Signup
@@ -440,6 +556,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -448,6 +565,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     );
     let app = router(state.clone());
 
@@ -565,6 +683,7 @@ async fn discovery_requires_auth() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -573,6 +692,7 @@ async fn discovery_requires_auth() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     );
     let app = router(state.clone());
 
@@ -601,6 +721,7 @@ async fn playback_profile_requires_auth() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -609,6 +730,7 @@ async fn playback_profile_requires_auth() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     );
     let app = router(state.clone());
 
@@ -666,7 +788,17 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
     let app = router(state.clone());
 
     // Seed media via run_full_scan directly.
@@ -734,6 +866,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let state = AppState::new(
         settings,
         database,
@@ -742,6 +875,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     );
     let app = router(state.clone());
 
@@ -856,7 +990,17 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
     let app = router(state.clone());
 
     // Create a real file on disk to serve.
@@ -949,7 +1093,17 @@ async fn direct_stream_supports_range() -> Result<()> {
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
     let app = router(state.clone());
 
     let dir = tempdir()?;
@@ -1065,7 +1219,17 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
-    let state = AppState::new(settings, database, auth_service, extensions, metadata, linkers, artwork);
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
@@ -1237,6 +1401,7 @@ async fn extensions_install_signed_package() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -1245,6 +1410,7 @@ async fn extensions_install_signed_package() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     ));
 
     let install_body = json!({
@@ -1280,6 +1446,590 @@ async fn extensions_install_signed_package() -> Result<()> {
     );
 
     let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_rejects_downgrade_install() -> Result<()> {
+    let temp = tempdir()?;
+    let package = build_signed_package(temp.path()).await?;
+    let package_bytes = tokio::fs::read(&package.path).await?;
+
+    let extension_id = package.extension_id.clone();
+    let version = package.version.clone();
+    let hash = package.hash.clone();
+    let signature = package.signature.clone();
+    let publisher_key_id = package.publisher_key_id.clone();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "sha256": hash,
+                        "signature": signature,
+                        "publisher_key_id": publisher_key_id
+                    }
+                ]
+            })
+        },
+        package_bytes,
+    )
+    .await?;
+
+    let download_url = format!("http://{addr}/package.elx");
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let store = ExtensionStore::new(&database.pool);
+    let manifest_json = json!({
+        "id": package.extension_id,
+        "version": "1.0.0",
+        "kind": "module",
+        "name": "Signed Test",
+        "provides": [
+            {
+                "capability": "media.manager.tv",
+                "slot": "default",
+                "implementation": "sonarr"
+            }
+        ],
+        "runtime": {
+            "type": "container",
+            "image": "example/test:1"
+        }
+    });
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: package.extension_id.clone(),
+            name: "Signed Test".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json,
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "downloadUrl": download_url
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let error_json: Value = serde_json::from_slice(&body)?;
+    let message = error_json
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains("downgrade"),
+        "expected downgrade rejection, got: {}",
+        message
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_allows_reinstall_same_version_hash() -> Result<()> {
+    let temp = tempdir()?;
+    let package = build_signed_package(temp.path()).await?;
+    let package_bytes = tokio::fs::read(&package.path).await?;
+
+    let extension_id = package.extension_id.clone();
+    let version = package.version.clone();
+    let hash = package.hash.clone();
+    let signature = package.signature.clone();
+    let publisher_key_id = package.publisher_key_id.clone();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "sha256": hash,
+                        "signature": signature,
+                        "publisher_key_id": publisher_key_id
+                    }
+                ]
+            })
+        },
+        package_bytes,
+    )
+    .await?;
+
+    let download_url = format!("http://{addr}/package.elx");
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let store = ExtensionStore::new(&database.pool);
+    let manifest_json = json!({
+        "id": package.extension_id,
+        "version": package.version,
+        "kind": "module",
+        "name": "Signed Test",
+        "provides": [
+            {
+                "capability": "media.manager.tv",
+                "slot": "default",
+                "implementation": "sonarr"
+            }
+        ],
+        "runtime": {
+            "type": "container",
+            "image": "example/test:1"
+        }
+    });
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: package.extension_id.clone(),
+            name: "Signed Test".to_string(),
+            version: package.version.clone(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json,
+            package_hash: Some(package.hash.clone()),
+            enabled: true,
+        })
+        .await?;
+
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "downloadUrl": download_url
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let install_status = install_resp.status();
+    let install_body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let install_json: Value = serde_json::from_slice(&install_body)?;
+    assert_eq!(
+        install_status,
+        StatusCode::OK,
+        "install failed body: {}",
+        install_json
+    );
+    assert_eq!(
+        install_json.get("extension_id").and_then(Value::as_str),
+        Some(package.extension_id.as_str())
+    );
+    assert_eq!(
+        install_json.get("version").and_then(Value::as_str),
+        Some(package.version.as_str())
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_rejects_same_version_different_hash() -> Result<()> {
+    let temp = tempdir()?;
+    let package = build_signed_package(temp.path()).await?;
+    let package_bytes = tokio::fs::read(&package.path).await?;
+
+    let extension_id = package.extension_id.clone();
+    let version = package.version.clone();
+    let hash = package.hash.clone();
+    let signature = package.signature.clone();
+    let publisher_key_id = package.publisher_key_id.clone();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "sha256": hash,
+                        "signature": signature,
+                        "publisher_key_id": publisher_key_id
+                    }
+                ]
+            })
+        },
+        package_bytes,
+    )
+    .await?;
+
+    let download_url = format!("http://{addr}/package.elx");
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let store = ExtensionStore::new(&database.pool);
+    let manifest_json = json!({
+        "id": package.extension_id,
+        "version": package.version,
+        "kind": "module",
+        "name": "Signed Test",
+        "provides": [
+            {
+                "capability": "media.manager.tv",
+                "slot": "default",
+                "implementation": "sonarr"
+            }
+        ],
+        "runtime": {
+            "type": "container",
+            "image": "example/test:1"
+        }
+    });
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: package.extension_id.clone(),
+            name: "Signed Test".to_string(),
+            version: package.version.clone(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json,
+            package_hash: Some(format!("{}-different", package.hash)),
+            enabled: true,
+        })
+        .await?;
+
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "downloadUrl": download_url
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let error_json: Value = serde_json::from_slice(&body)?;
+    let message = error_json
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains("already installed"),
+        "expected duplicate version rejection, got: {}",
+        message
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_catalog_refresh_uses_cache() -> Result<()> {
+    let temp = tempdir()?;
+    let extension_id = "elixir.test.catalog".to_string();
+    let version = "1.0.0".to_string();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "trust": "community"
+                    }
+                ]
+            })
+        },
+        b"test".to_vec(),
+    )
+    .await?;
+
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url];
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let refresh_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/registries/refresh")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(refresh_resp.status(), StatusCode::OK);
+    let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
+    let refresh_json: Value = serde_json::from_slice(&refresh_body)?;
+    assert_eq!(
+        refresh_json["available"]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or(0),
+        1
+    );
+    assert!(
+        refresh_json["last_refreshed_at"].is_string(),
+        "expected last_refreshed_at in refresh response"
+    );
+    assert!(
+        refresh_json["last_refresh_success_at"].is_string(),
+        "expected last_refresh_success_at in refresh response"
+    );
+    assert!(
+        refresh_json["last_refresh_error"].is_null(),
+        "expected last_refresh_error to be null on success"
+    );
+
+    let _ = shutdown_tx.send(());
+
+    let catalog_resp = app
+        .oneshot(Request::get("/api/v1/extensions/catalog").body(Body::empty())?)
+        .await?;
+    assert_eq!(catalog_resp.status(), StatusCode::OK);
+    let catalog_body = body::to_bytes(catalog_resp.into_body(), 1_048_576).await?;
+    let catalog_json: Value = serde_json::from_slice(&catalog_body)?;
+    assert_eq!(
+        catalog_json["available"]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or(0),
+        1
+    );
+    assert!(
+        catalog_json["last_refreshed_at"].is_string(),
+        "expected last_refreshed_at in catalog response"
+    );
+    assert!(
+        catalog_json["last_refresh_success_at"].is_string(),
+        "expected last_refresh_success_at in catalog response"
+    );
+    assert!(
+        catalog_json["last_refresh_error"].is_null(),
+        "expected last_refresh_error to be null on success"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_catalog_refresh_preserves_last_success_on_failure() -> Result<()> {
+    let temp = tempdir()?;
+    let extension_id = "elixir.test.catalog.failure".to_string();
+    let version = "1.0.0".to_string();
+    let (addr, shutdown_tx) = start_registry_server(
+        move |addr| {
+            let download_url = format!("http://{addr}/package.elx");
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": extension_id,
+                        "version": version,
+                        "download_url": download_url,
+                        "trust": "community"
+                    }
+                ]
+            })
+        },
+        b"test".to_vec(),
+    )
+    .await?;
+
+    let registry_url = format!("http://{addr}/registry.json");
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![registry_url.clone()];
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let refresh_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/registries/refresh")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(refresh_resp.status(), StatusCode::OK);
+    let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
+    let refresh_json: Value = serde_json::from_slice(&refresh_body)?;
+    let first_success = refresh_json["last_refresh_success_at"]
+        .as_str()
+        .expect("expected last_refresh_success_at")
+        .to_string();
+    assert!(
+        refresh_json["last_refresh_error"].is_null(),
+        "expected last_refresh_error to be null on success"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let refresh_resp = app
+        .oneshot(
+            Request::post("/api/v1/extensions/registries/refresh")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(refresh_resp.status(), StatusCode::OK);
+    let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
+    let refresh_json: Value = serde_json::from_slice(&refresh_body)?;
+    let second_success = refresh_json["last_refresh_success_at"]
+        .as_str()
+        .expect("expected last_refresh_success_at on failure")
+        .to_string();
+    assert_eq!(
+        second_success, first_success,
+        "last_refresh_success_at should remain from prior success"
+    );
+    let last_error = refresh_json["last_refresh_error"]
+        .as_object()
+        .expect("expected last_refresh_error object");
+    assert_eq!(
+        last_error
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        registry_url
+    );
+    assert!(
+        last_error
+            .get("occurred_at")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "expected occurred_at timestamp on last_refresh_error"
+    );
+
     Ok(())
 }
 
@@ -1330,6 +2080,7 @@ async fn extensions_rejects_bad_signature() -> Result<()> {
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
     let app = router(AppState::new(
         settings,
         database,
@@ -1338,6 +2089,7 @@ async fn extensions_rejects_bad_signature() -> Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     ));
 
     let install_body = json!({
@@ -1354,5 +2106,1177 @@ async fn extensions_rejects_bad_signature() -> Result<()> {
     assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
 
     let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_rejects_untrusted_extension() -> Result<()> {
+    let temp = tempdir()?;
+    let package_dir = temp.path().join("package");
+    std::fs::create_dir_all(&package_dir)?;
+    let manifest = r#"id: elixir.test.permission
+version: 0.1.0
+kind: module
+name: "Permission Test"
+trust: untrusted
+permissions:
+  - runtime.manage_containers
+provides:
+  - capability: media.manager.tv
+    slot: default
+    implementation: "sonarr"
+runtime:
+  type: container
+  image: "example/test:1"
+"#;
+    std::fs::write(package_dir.join("manifest.yaml"), manifest)?;
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = true;
+    settings.extensions.allow_directory_install = true;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_dir.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_secrets_crud_and_rotate() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let create_body = json!({
+        "scope": "global",
+        "key": "api_key",
+        "value": "initial-secret",
+        "rotatable": true
+    });
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let create_body = body::to_bytes(create_resp.into_body(), 1_048_576).await?;
+    let create_json: Value = serde_json::from_slice(&create_body)?;
+    let secret_id = create_json
+        .get("secretId")
+        .and_then(Value::as_str)
+        .expect("secretId");
+
+    let list_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/secrets?scope=global").body(Body::empty())?)
+        .await?;
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = body::to_bytes(list_resp.into_body(), 1_048_576).await?;
+    let list_json: Value = serde_json::from_slice(&list_body)?;
+    assert!(
+        list_json
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("key"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "expected secret list entry"
+    );
+
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/extensions/secrets/{secret_id}")).body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let update_body = json!({
+        "value": "updated-secret"
+    });
+    let update_resp = app
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/v1/extensions/secrets/{secret_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(update_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let rotate_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/extensions/secrets/{secret_id}/rotate"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(rotate_resp.status(), StatusCode::OK);
+    let rotate_body = body::to_bytes(rotate_resp.into_body(), 1_048_576).await?;
+    let rotate_json: Value = serde_json::from_slice(&rotate_body)?;
+    let rotated_value = rotate_json
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(!rotated_value.is_empty(), "rotate should return a value");
+
+    let delete_resp = app
+        .clone()
+        .oneshot(Request::delete(format!("/api/v1/extensions/secrets/{secret_id}")).body(Body::empty())?)
+        .await?;
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/extensions/secrets/{secret_id}")).body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_install_requires_global_secret() -> Result<()> {
+    let temp = tempdir()?;
+    let package_dir = temp.path().join("package");
+    std::fs::create_dir_all(&package_dir)?;
+    let manifest = r#"id: elixir.test.secret_install
+version: 0.1.0
+kind: module
+name: "Secret Install"
+provides:
+  - capability: media.manager.tv
+    slot: default
+    implementation: "sonarr"
+runtime:
+  type: container
+  image: "example/test:1"
+  env:
+    - name: "API_KEY"
+      from_secret: "global:api_key"
+"#;
+    std::fs::write(package_dir.join("manifest.yaml"), manifest)?;
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = true;
+    settings.extensions.allow_directory_install = true;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let secrets_for_store = secrets.clone();
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_dir.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
+
+    let store = ExtensionStore::new(&db_pool);
+    let encrypted = secrets_for_store.encrypt("api-key")?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Global,
+            scope_id: None,
+            key: "api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await?;
+
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(install_resp.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_enable_requires_global_secret() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let secrets_for_store = secrets.clone();
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let manifest = json!({
+        "id": "elixir.test.secret_enable",
+        "version": "0.1.0",
+        "kind": "module",
+        "name": "Secret Enable",
+        "provides": [
+            {
+                "capability": "media.manager.tv",
+                "slot": "default",
+                "implementation": "sonarr"
+            }
+        ],
+        "runtime": {
+            "type": "container",
+            "image": "example/test:1",
+            "env": [
+                {
+                    "name": "API_KEY",
+                    "from_secret": "global:api_key"
+                }
+            ]
+        }
+    });
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.test.secret_enable".to_string(),
+            name: "Secret Enable".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manifest,
+            package_hash: None,
+            enabled: false,
+        })
+        .await?;
+
+    let enable_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/elixir.test.secret_enable/enable")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(enable_resp.status(), StatusCode::BAD_REQUEST);
+
+    let encrypted = secrets_for_store.encrypt("api-key")?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Global,
+            scope_id: None,
+            key: "api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await?;
+
+    let enable_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/elixir.test.secret_enable/enable")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(enable_resp.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_enable_instance_requires_secret() -> Result<()> {
+    let runtime_env = vec![json!({
+        "name": "API_KEY",
+        "from_secret": "instance:api_key"
+    })];
+    let (app, instance_id) = setup_extension_instance(
+        "elixir.test.instance_secret",
+        "Instance Secret",
+        Some(runtime_env),
+        false,
+    )
+    .await?;
+
+    let enable_body = json!({ "enabled": true });
+    let enable_resp = app
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/v1/extensions/instances/{instance_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(enable_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(enable_resp.status(), StatusCode::BAD_REQUEST);
+
+    let secret_body = json!({
+        "scope": "instance",
+        "scopeId": instance_id.to_string(),
+        "key": "api_key",
+        "value": "instance-key"
+    });
+    let secret_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(secret_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(secret_resp.status(), StatusCode::OK);
+
+    let enable_resp = app
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/v1/extensions/instances/{instance_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(enable_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(enable_resp.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "ext.existing".to_string(),
+            name: "Existing Module".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "ext.existing",
+                "version": "0.1.0",
+                "kind": "module",
+                "name": "Existing Module",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/test:1"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8989
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "ext.prompt".to_string(),
+            name: "Prompt Module".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "ext.prompt",
+                "version": "0.1.0",
+                "kind": "module",
+                "name": "Prompt Module",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "conflicts": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "policy": "prompt_replace"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/test:1"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8989
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "blueprint.conflict".to_string(),
+            name: "Conflict Blueprint".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "blueprint.conflict",
+                "version": "0.1.0",
+                "kind": "blueprint",
+                "name": "Conflict Blueprint",
+                "wants": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default"
+                    }
+                ],
+                "preferences": {
+                    "providers": {
+                        "media.manager.tv/default": {
+                            "prefer": ["ext.prompt"]
+                        }
+                    }
+                },
+                "policies": {
+                    "reuse_existing": false
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let existing_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: existing_instance_id,
+            extension_id: "ext.existing".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .update_instance_runtime_version(existing_instance_id, "0.1.0", None)
+        .await?;
+
+    let existing_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: existing_provider_id,
+            instance_id: existing_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            endpoint_json: None,
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let plan_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/blueprints/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "blueprint_id": "blueprint.conflict"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(plan_response.status(), StatusCode::OK);
+    let body = body::to_bytes(plan_response.into_body(), 1_048_576).await?;
+    let plan_json: Value = serde_json::from_slice(&body)?;
+    let plan_id = plan_json
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .expect("plan_id");
+    let plan_uuid = Uuid::parse_str(plan_id)?;
+    let desired = store.list_desired_blueprints(None).await?;
+    let desired_entry = desired
+        .iter()
+        .find(|item| item.desired_id == plan_uuid)
+        .expect("desired blueprint");
+    assert_eq!(desired_entry.blueprint_extension_id, "blueprint.conflict");
+    assert!(!desired_entry.applied, "expected desired blueprint to be pending");
+
+    let conflicts = plan_json
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        conflicts.iter().any(|conflict| {
+            conflict.get("code") == Some(&json!("slot_conflict"))
+                && conflict.get("policy") == Some(&json!("prompt"))
+        }),
+        "expected prompt slot conflict"
+    );
+
+    let confirm_response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/extensions/plan/{plan_id}/confirm"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "decisions": {
+                            "slotConflicts": [
+                                {
+                                    "conflictId": "media.manager.tv/default",
+                                    "action": "keep_existing"
+                                }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(confirm_response.status(), StatusCode::OK);
+    let body = body::to_bytes(confirm_response.into_body(), 1_048_576).await?;
+    let confirm_json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        confirm_json.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    let run_id = confirm_json
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("run_id");
+    let run = store
+        .get_run(Uuid::parse_str(run_id)?)
+        .await?
+        .expect("run exists");
+    let resolved_plan = run.plan_json.expect("plan_json");
+    let resolved_conflicts = resolved_plan
+        .get("conflicts")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !resolved_conflicts.iter().any(|conflict| {
+            conflict.get("code") == Some(&json!("slot_conflict"))
+        }),
+        "expected slot conflict to be resolved"
+    );
+
+    let desired = store.list_desired_blueprints(None).await?;
+    let desired_entry = desired
+        .iter()
+        .find(|item| item.desired_id == plan_uuid)
+        .expect("desired blueprint");
+    assert!(desired_entry.applied, "expected desired blueprint applied");
+    let decisions = desired_entry
+        .decisions_json
+        .as_ref()
+        .and_then(|value| value.get("slotConflicts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.get("conflictId") == Some(&json!("media.manager.tv/default"))
+                && decision.get("action") == Some(&json!("keep_existing"))
+        }),
+        "expected keep_existing decision to persist"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "blueprint.keep".to_string(),
+            name: "Keep Blueprint".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "blueprint.keep",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "Keep Blueprint",
+                "wants": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default"
+                    }
+                ]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let applied_id = Uuid::new_v4();
+    let applied_id_str = applied_id.to_string();
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id: applied_id,
+            blueprint_extension_id: "blueprint.keep".to_string(),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+            decisions_json: None,
+        })
+        .await?;
+    store.mark_desired_applied(applied_id, true).await?;
+
+    let pending_id = Uuid::new_v4();
+    let pending_id_str = pending_id.to_string();
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id: pending_id,
+            blueprint_extension_id: "blueprint.keep".to_string(),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+            decisions_json: None,
+        })
+        .await?;
+
+    let applied_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/desired-blueprints?applied=true")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(applied_resp.status(), StatusCode::OK);
+    let applied_body = body::to_bytes(applied_resp.into_body(), 1_048_576).await?;
+    let applied_items: Vec<Value> = serde_json::from_slice(&applied_body)?;
+    assert_eq!(applied_items.len(), 1);
+    assert_eq!(
+        applied_items[0]
+            .get("desired_id")
+            .and_then(Value::as_str),
+        Some(applied_id_str.as_str())
+    );
+
+    let pending_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/desired-blueprints?applied=false")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(pending_resp.status(), StatusCode::OK);
+    let pending_body = body::to_bytes(pending_resp.into_body(), 1_048_576).await?;
+    let pending_items: Vec<Value> = serde_json::from_slice(&pending_body)?;
+    assert_eq!(pending_items.len(), 1);
+    assert_eq!(
+        pending_items[0]
+            .get("desired_id")
+            .and_then(Value::as_str),
+        Some(pending_id_str.as_str())
+    );
+
+    let delete_resp = app
+        .clone()
+        .oneshot(
+            Request::delete("/api/v1/extensions/desired-blueprints?applied=false")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+    let delete_body = body::to_bytes(delete_resp.into_body(), 1_048_576).await?;
+    let delete_json: Value = serde_json::from_slice(&delete_body)?;
+    assert_eq!(
+        delete_json.get("deleted").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let remaining_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/desired-blueprints")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(remaining_resp.status(), StatusCode::OK);
+    let remaining_body = body::to_bytes(remaining_resp.into_body(), 1_048_576).await?;
+    let remaining_items: Vec<Value> = serde_json::from_slice(&remaining_body)?;
+    assert_eq!(remaining_items.len(), 1);
+    assert_eq!(
+        remaining_items[0]
+            .get("desired_id")
+            .and_then(Value::as_str),
+        Some(applied_id_str.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_reconcile_now_and_latest() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let latest_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/reconcile/latest")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(latest_resp.status(), StatusCode::OK);
+    let latest_body = body::to_bytes(latest_resp.into_body(), 1_048_576).await?;
+    let latest_json: Value = serde_json::from_slice(&latest_body)?;
+    assert!(
+        latest_json.get("run").is_none() || latest_json.get("run") == Some(&Value::Null),
+        "expected no reconcile run yet"
+    );
+
+    let now_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/reconcile/now")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(now_resp.status(), StatusCode::OK);
+    let now_body = body::to_bytes(now_resp.into_body(), 1_048_576).await?;
+    let now_json: Value = serde_json::from_slice(&now_body)?;
+    let run_id = now_json
+        .get("run")
+        .and_then(|value| value.get("run_id"))
+        .and_then(Value::as_str)
+        .expect("run_id");
+
+    let latest_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/reconcile/latest")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(latest_resp.status(), StatusCode::OK);
+    let latest_body = body::to_bytes(latest_resp.into_body(), 1_048_576).await?;
+    let latest_json: Value = serde_json::from_slice(&latest_body)?;
+    let latest_run_id = latest_json
+        .get("run")
+        .and_then(|value| value.get("run_id"))
+        .and_then(Value::as_str)
+        .expect("latest run_id");
+    assert_eq!(latest_run_id, run_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_rollback_plan_previews_availability() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "ext.rollback".to_string(),
+            name: "Rollback Module".to_string(),
+            version: "1.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "ext.rollback",
+                "version": "1.1.0",
+                "kind": "module",
+                "name": "Rollback Module",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/test:1"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let unavailable_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: unavailable_instance_id,
+            extension_id: "ext.rollback".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+
+    let unavailable_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/extensions/instances/{unavailable_instance_id}/rollback"
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(unavailable_resp.status(), StatusCode::OK);
+    let body = body::to_bytes(unavailable_resp.into_body(), 1_048_576).await?;
+    let plan_json: Value = serde_json::from_slice(&body)?;
+    let conflicts = plan_json
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        conflicts.iter().any(|conflict| {
+            conflict.get("code") == Some(&json!("rollback_unavailable"))
+        }),
+        "expected rollback_unavailable conflict"
+    );
+
+    let available_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: available_instance_id,
+            extension_id: "ext.rollback".to_string(),
+            instance_name: "default-2".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .update_instance_runtime_version(available_instance_id, "1.1.0", Some("1.0.0"))
+        .await?;
+
+    let available_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/extensions/instances/{available_instance_id}/rollback"
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(available_resp.status(), StatusCode::OK);
+    let body = body::to_bytes(available_resp.into_body(), 1_048_576).await?;
+    let plan_json: Value = serde_json::from_slice(&body)?;
+    let conflicts = plan_json
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+    let actions = plan_json
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let available_instance_str = available_instance_id.to_string();
+    assert!(
+        actions.iter().any(|action| {
+            action.get("type") == Some(&json!("rollback_runtime"))
+                && action.get("instance_id").and_then(Value::as_str)
+                    == Some(available_instance_str.as_str())
+        }),
+        "expected rollback_runtime action"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_delete_instance_cleans_secrets() -> Result<()> {
+    let (app, instance_id) = setup_extension_instance(
+        "elixir.test.instance_delete",
+        "Instance Delete",
+        None,
+        true,
+    )
+    .await?;
+
+    let instance_secret = json!({
+        "scope": "instance",
+        "scopeId": instance_id.to_string(),
+        "key": "api_key",
+        "value": "instance-secret"
+    });
+    let secret_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(instance_secret.to_string()))?,
+        )
+        .await?;
+    assert_eq!(secret_resp.status(), StatusCode::OK);
+
+    let global_secret = json!({
+        "scope": "global",
+        "key": "global_key",
+        "value": "global-secret"
+    });
+    let global_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(global_secret.to_string()))?,
+        )
+        .await?;
+    assert_eq!(global_resp.status(), StatusCode::OK);
+
+    let delete_resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/extensions/instances/{instance_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/extensions/secrets?scope=instance&scopeId={instance_id}"
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = body::to_bytes(list_resp.into_body(), 1_048_576).await?;
+    let list_json: Value = serde_json::from_slice(&list_body)?;
+    assert_eq!(
+        list_json.as_array().map(|items| items.len()),
+        Some(0),
+        "instance secrets should be deleted"
+    );
+
+    let global_list_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/secrets?scope=global").body(Body::empty())?)
+        .await?;
+    assert_eq!(global_list_resp.status(), StatusCode::OK);
+    let global_body = body::to_bytes(global_list_resp.into_body(), 1_048_576).await?;
+    let global_json: Value = serde_json::from_slice(&global_body)?;
+    assert!(
+        global_json.as_array().map(|items| {
+            items.iter().any(|item| {
+                item.get("key")
+                    .and_then(Value::as_str)
+                    .map(|key| key == "global_key")
+                    .unwrap_or(false)
+            })
+        }) == Some(true),
+        "global secret should remain"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_delete_instance_is_idempotent() -> Result<()> {
+    let (app, instance_id) = setup_extension_instance(
+        "elixir.test.instance_delete_idempotent",
+        "Instance Delete Idempotent",
+        None,
+        true,
+    )
+    .await?;
+
+    let delete_resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/extensions/instances/{instance_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let delete_again = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/extensions/instances/{instance_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_again.status(), StatusCode::NOT_FOUND);
+
     Ok(())
 }

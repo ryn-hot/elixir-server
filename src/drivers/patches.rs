@@ -7,18 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub enum DriverPatch {
     MediaManagerTv(MediaManagerTvPatch),
+    IndexerRegistry(IndexerRegistryPatch),
+    DownloaderTorrent(DownloaderTorrentPatch),
 }
 
 impl DriverPatch {
     pub fn capability(&self) -> &'static str {
         match self {
             DriverPatch::MediaManagerTv(_) => "media.manager.tv",
+            DriverPatch::IndexerRegistry(_) => "indexer.registry",
+            DriverPatch::DownloaderTorrent(_) => "downloader.torrent",
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         match self {
             DriverPatch::MediaManagerTv(patch) => patch.validate(),
+            DriverPatch::IndexerRegistry(patch) => patch.validate(),
+            DriverPatch::DownloaderTorrent(patch) => patch.validate(),
         }
     }
 
@@ -28,6 +34,16 @@ impl DriverPatch {
                 let patch: MediaManagerTvPatch =
                     serde_json::from_value(patch).context("parsing media.manager.tv patch")?;
                 Ok(DriverPatch::MediaManagerTv(patch))
+            }
+            "indexer.registry" => {
+                let patch: IndexerRegistryPatch =
+                    serde_json::from_value(patch).context("parsing indexer.registry patch")?;
+                Ok(DriverPatch::IndexerRegistry(patch))
+            }
+            "downloader.torrent" => {
+                let patch: DownloaderTorrentPatch =
+                    serde_json::from_value(patch).context("parsing downloader.torrent patch")?;
+                Ok(DriverPatch::DownloaderTorrent(patch))
             }
             _ => bail!("no driver patch type registered for capability '{capability}'"),
         }
@@ -148,6 +164,76 @@ impl MediaManagerTvPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum IndexerRegistryPatch {
+    RegisterIndexers {
+        indexers: Vec<IndexerSpec>,
+    },
+}
+
+impl IndexerRegistryPatch {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            IndexerRegistryPatch::RegisterIndexers { indexers } => {
+                ensure_non_empty_list(indexers, "indexers")?;
+                for indexer in indexers {
+                    indexer.validate()?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DownloaderTorrentPatch {
+    SetCategories {
+        categories: Vec<DownloadCategorySpec>,
+    },
+    SetPreferences {
+        #[serde(default)]
+        default_save_path: Option<String>,
+        #[serde(default)]
+        incomplete_path: Option<String>,
+        #[serde(default)]
+        use_incomplete: Option<bool>,
+    },
+}
+
+impl DownloaderTorrentPatch {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            DownloaderTorrentPatch::SetCategories { categories } => {
+                ensure_non_empty_list(categories, "categories")?;
+                for category in categories {
+                    category.validate()?;
+                }
+                Ok(())
+            }
+            DownloaderTorrentPatch::SetPreferences {
+                default_save_path,
+                incomplete_path,
+                use_incomplete,
+            } => {
+                if default_save_path.is_none()
+                    && incomplete_path.is_none()
+                    && use_incomplete.is_none()
+                {
+                    bail!("preferences must include at least one value");
+                }
+                ensure_optional_non_empty(
+                    default_save_path.as_deref(),
+                    "default_save_path",
+                )?;
+                ensure_optional_non_empty(incomplete_path.as_deref(), "incomplete_path")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerSpec {
     pub name: String,
     pub implementation: String,
@@ -202,6 +288,21 @@ impl DownloaderSpec {
         ensure_optional_non_empty(self.api_key.as_deref(), "downloader.api_key")?;
         ensure_optional_non_empty(self.category.as_deref(), "downloader.category")?;
         validate_tags(&self.tags, "downloader.tags")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadCategorySpec {
+    pub name: String,
+    #[serde(default)]
+    pub save_path: Option<String>,
+}
+
+impl DownloadCategorySpec {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.name, "category.name")?;
+        ensure_optional_non_empty(self.save_path.as_deref(), "category.save_path")?;
         Ok(())
     }
 }
@@ -444,6 +545,28 @@ mod tests {
                 events: vec!["grab".to_string()],
                 enabled: None,
             }],
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn indexer_registry_patch_requires_indexers() {
+        let patch = IndexerRegistryPatch::RegisterIndexers { indexers: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn downloader_torrent_patch_requires_categories() {
+        let patch = DownloaderTorrentPatch::SetCategories { categories: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn downloader_torrent_patch_requires_preferences() {
+        let patch = DownloaderTorrentPatch::SetPreferences {
+            default_save_path: None,
+            incomplete_path: None,
+            use_incomplete: None,
         };
         assert!(patch.validate().is_err());
     }

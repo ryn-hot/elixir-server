@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::{Client, Method, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,6 +39,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
         let patch = match patch {
             DriverPatch::MediaManagerTv(patch) => patch,
+            _ => bail!("media.manager.tv patch mismatch"),
         };
         let implementation = ctx
             .implementation
@@ -138,24 +140,34 @@ struct SonarrClient {
     client: Client,
     root: Url,
     api_base: Url,
-    api_key: String,
+    api_version: &'static str,
+    product_major: Option<u32>,
 }
 
 impl SonarrClient {
     async fn from_config(config: SonarrDriverConfig, endpoint_url: String) -> Result<Self> {
-        let base_url = config.base_url.unwrap_or(endpoint_url);
+        let api_key = config
+            .api_key
+            .ok_or_else(|| anyhow::anyhow!("sonarr api_key is required"))?;
+        let root = resolve_base_url(config.base_url.as_deref(), &endpoint_url)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Api-Key",
+            HeaderValue::from_str(&api_key).context("invalid sonarr api key header")?,
+        );
+        headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .default_headers(headers)
             .build()
             .context("building sonarr http client")?;
-        let root = normalize_root_url(&base_url)?;
         let mut client = Self {
             client,
             root,
             api_base: Url::parse("http://127.0.0.1/").expect("fallback url"),
-            api_key: config
-                .api_key
-                .ok_or_else(|| anyhow::anyhow!("sonarr api_key is required"))?,
+            api_version: "v3",
+            product_major: None,
         };
 
         if let Some(version) = config.api_version.as_deref() {
@@ -163,6 +175,7 @@ impl SonarrClient {
         } else {
             client.detect_api_version().await?;
         }
+        client.load_product_major().await?;
         Ok(client)
     }
 
@@ -183,7 +196,6 @@ impl SonarrClient {
         let resp = self
             .client
             .get(url)
-            .header("X-Api-Key", &self.api_key)
             .send()
             .await
             .context("probing sonarr api")?;
@@ -202,6 +214,13 @@ impl SonarrClient {
     fn set_api_version(&mut self, version: &str) -> Result<()> {
         let version = normalize_version(version)?;
         self.api_base = build_api_base(&self.root, version)?;
+        self.api_version = version;
+        Ok(())
+    }
+
+    async fn load_product_major(&mut self) -> Result<()> {
+        let status = self.get_json::<Value>("system/status").await?;
+        self.product_major = parse_sonarr_major(&status);
         Ok(())
     }
 
@@ -213,56 +232,55 @@ impl SonarrClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.api_url(path)?;
-        let resp = self
-            .client
-            .get(url)
-            .header("X-Api-Key", &self.api_key)
-            .send()
-            .await
-            .with_context(|| format!("GET {path}"))?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("GET {path} failed"))?;
-        resp.json::<T>()
-            .await
+        let value = self
+            .request_json_value(Method::GET, path, None)
+            .await?;
+        serde_json::from_value(value)
             .with_context(|| format!("parsing GET {path} response"))
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = self.api_url(path)?;
-        let resp = self
-            .client
-            .post(url)
-            .header("X-Api-Key", &self.api_key)
-            .json(body)
-            .send()
+        self.request_json_value(Method::POST, path, Some(body))
             .await
-            .with_context(|| format!("POST {path}"))?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("POST {path} failed"))?;
-        resp.json::<Value>()
-            .await
-            .with_context(|| format!("parsing POST {path} response"))
     }
 
     async fn put_json(&self, path: &str, body: &Value) -> Result<Value> {
+        self.request_json_value(Method::PUT, path, Some(body))
+            .await
+    }
+
+    async fn request_json_value(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let url = self.api_url(path)?;
-        let resp = self
-            .client
-            .put(url)
-            .header("X-Api-Key", &self.api_key)
-            .json(body)
+        let mut request = self.client.request(method.clone(), url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request
             .send()
             .await
-            .with_context(|| format!("PUT {path}"))?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("PUT {path} failed"))?;
-        resp.json::<Value>()
+            .with_context(|| format!("{} {path}", method.as_str()))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
             .await
-            .with_context(|| format!("parsing PUT {path} response"))
+            .with_context(|| format!("reading {} {path} response", method.as_str()))?;
+        if !status.is_success() {
+            let detail = describe_error_body(&bytes);
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                bail!("sonarr api key rejected ({status}): {detail}");
+            }
+            bail!("sonarr {} {path} failed ({status}): {detail}", method.as_str());
+        }
+        if bytes.is_empty() {
+            bail!("sonarr {} {path} returned empty response", method.as_str());
+        }
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {} {path} response", method.as_str()))
     }
 
     async fn upsert_indexers(&self, indexers: &[IndexerSpec]) -> Result<()> {
@@ -275,7 +293,8 @@ impl SonarrClient {
         for indexer in indexers {
             let tags = self.ensure_tags(&indexer.tags).await?;
             let schema_item = find_schema(&schema, &indexer.implementation)?;
-            let mut target = match find_by_name(&existing, &indexer.name) {
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => schema_item,
             };
@@ -290,6 +309,12 @@ impl SonarrClient {
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
             apply_indexer_fields(fields, indexer)?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("indexer/{id}");
@@ -312,7 +337,8 @@ impl SonarrClient {
         for downloader in downloaders {
             let tags = self.ensure_tags(&downloader.tags).await?;
             let schema_item = find_schema(&schema, &downloader.r#type)?;
-            let mut target = match find_by_name(&existing, &downloader.name) {
+            let existing_item = find_by_name(&existing, &downloader.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => schema_item,
             };
@@ -327,6 +353,12 @@ impl SonarrClient {
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| anyhow::anyhow!("download client fields missing"))?;
             apply_downloader_fields(fields, downloader)?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("downloadclient/{id}");
@@ -365,7 +397,8 @@ impl SonarrClient {
             .ok_or_else(|| anyhow::anyhow!("quality profile template missing"))?;
 
         for profile in profiles {
-            let mut target = match find_by_name(&existing, &profile.name) {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => template.clone(),
             };
@@ -386,6 +419,12 @@ impl SonarrClient {
                 bail!("quality cutoff '{}' not found", profile.cutoff.as_deref().unwrap_or(""));
             }
 
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
+
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("qualityprofile/{id}");
                 self.put_json(&path, &target).await?;
@@ -401,6 +440,7 @@ impl SonarrClient {
         if profiles.is_empty() {
             return Ok(());
         }
+        self.ensure_sonarr_v3("language profiles")?;
         let existing = self
             .get_json::<Vec<Value>>("languageprofile")
             .await
@@ -411,7 +451,8 @@ impl SonarrClient {
             .ok_or_else(|| anyhow::anyhow!("language profile template missing"))?;
 
         for profile in profiles {
-            let mut target = match find_by_name(&existing, &profile.name) {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => template.clone(),
             };
@@ -423,6 +464,12 @@ impl SonarrClient {
                 set_i64(&mut target, "cutoff", cutoff_id)?;
             } else if profile.cutoff.is_some() {
                 bail!("language cutoff '{}' not found", profile.cutoff.as_deref().unwrap_or(""));
+            }
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
             }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
@@ -443,6 +490,9 @@ impl SonarrClient {
             None => None,
         };
 
+        if defaults.language_profile.is_some() {
+            self.ensure_sonarr_v3("language profiles")?;
+        }
         let language_profiles = if defaults.language_profile.is_some() {
             Some(self.get_json::<Vec<Value>>("languageprofile").await?)
         } else {
@@ -484,12 +534,15 @@ impl SonarrClient {
             }
             set_bool(&mut updated, "seasonFolder", defaults.season_folder)?;
             if !tags.is_empty() {
-                merge_tags(&mut updated, &tags)?;
+                let _ = merge_tags(&mut updated, &tags)?;
             }
             let id = updated
                 .get("id")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow::anyhow!("series id missing"))?;
+            if updated == series {
+                continue;
+            }
             let path = format!("series/{id}");
             self.put_json(&path, &updated).await?;
         }
@@ -543,7 +596,10 @@ impl SonarrClient {
             let path = format!("series/{series_id}");
             let series = self.get_json::<Value>(&path).await?;
             let mut updated = series.clone();
-            merge_tags(&mut updated, &tag_ids)?;
+            let changed = merge_tags(&mut updated, &tag_ids)?;
+            if !changed {
+                continue;
+            }
             self.put_json(&path, &updated).await?;
         }
         Ok(())
@@ -562,7 +618,8 @@ impl SonarrClient {
             .ok_or_else(|| anyhow::anyhow!("webhook schema not found"))?;
 
         for webhook in webhooks {
-            let mut target = match find_by_name(&existing, &webhook.name) {
+            let existing_item = find_by_name(&existing, &webhook.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => schema_item.clone(),
             };
@@ -576,6 +633,12 @@ impl SonarrClient {
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| anyhow::anyhow!("notification fields missing"))?;
             set_field_value_optional(fields, "url", Value::String(webhook.url.clone()))?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("notification/{id}");
@@ -594,7 +657,8 @@ impl SonarrClient {
         }
         let existing = self.get_json::<Vec<Value>>("customformat").await?;
         for format in formats {
-            let mut target = match find_by_name(&existing, &format.name) {
+            let existing_item = find_by_name(&existing, &format.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => json!({}),
             };
@@ -605,6 +669,12 @@ impl SonarrClient {
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("custom format object missing"))?
                 .insert("specifications".to_string(), Value::Array(specs));
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("customformat/{id}");
@@ -621,9 +691,11 @@ impl SonarrClient {
         if profiles.is_empty() {
             return Ok(());
         }
+        self.ensure_sonarr_v3("release profiles")?;
         let existing = self.get_json::<Vec<Value>>("releaseprofile").await?;
         for profile in profiles {
-            let mut target = match find_by_name(&existing, &profile.name) {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => json!({}),
             };
@@ -639,6 +711,12 @@ impl SonarrClient {
                 "preferred",
                 join_lines(&profile.preferred),
             )?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
 
             if let Some(id) = target.get("id").and_then(Value::as_i64) {
                 let path = format!("releaseprofile/{id}");
@@ -669,15 +747,22 @@ impl SonarrClient {
         let quality_profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
         for profile in quality_profiles {
             let mut updated = profile.clone();
-            apply_format_items(&mut updated, &score_map)?;
+            let changed = apply_format_items(&mut updated, &score_map)?;
             let id = updated
                 .get("id")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow::anyhow!("quality profile id missing"))?;
+            if !changed {
+                continue;
+            }
             let path = format!("qualityprofile/{id}");
             self.put_json(&path, &updated).await?;
         }
         Ok(())
+    }
+
+    fn ensure_sonarr_v3(&self, feature: &str) -> Result<()> {
+        ensure_sonarr_v3(self.product_major, self.api_version, feature)
     }
 }
 
@@ -696,6 +781,34 @@ fn normalize_root_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn resolve_base_url(config_base_url: Option<&str>, endpoint_url: &str) -> Result<Url> {
+    let endpoint = normalize_root_url(endpoint_url)?;
+    if let Some(base_url) = config_base_url {
+        let base = normalize_root_url(base_url)?;
+        ensure_same_origin(&base, &endpoint)?;
+        return Ok(base);
+    }
+    Ok(endpoint)
+}
+
+fn ensure_same_origin(candidate: &Url, endpoint: &Url) -> Result<()> {
+    let candidate_host = candidate
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("sonarr base_url host is missing"))?;
+    let endpoint_host = endpoint
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("sonarr endpoint host is missing"))?;
+    let candidate_port = candidate.port_or_known_default().unwrap_or(80);
+    let endpoint_port = endpoint.port_or_known_default().unwrap_or(80);
+    if candidate.scheme() != endpoint.scheme()
+        || candidate_host != endpoint_host
+        || candidate_port != endpoint_port
+    {
+        bail!("sonarr base_url must match provider endpoint scheme/host/port");
+    }
+    Ok(())
+}
+
 fn normalize_version(version: &str) -> Result<&'static str> {
     let trimmed = version.trim().to_ascii_lowercase();
     match trimmed.as_str() {
@@ -703,6 +816,29 @@ fn normalize_version(version: &str) -> Result<&'static str> {
         "v4" | "4" => Ok("v4"),
         _ => bail!("unsupported sonarr api version '{version}'"),
     }
+}
+
+fn ensure_sonarr_v3(
+    product_major: Option<u32>,
+    api_version: &str,
+    feature: &str,
+) -> Result<()> {
+    if let Some(major) = product_major {
+        if major >= 4 {
+            bail!("sonarr {feature} require Sonarr v3, detected v{major}");
+        }
+        return Ok(());
+    }
+    if api_version == "v4" {
+        bail!("sonarr {feature} require Sonarr v3, detected api v4");
+    }
+    Ok(())
+}
+
+fn parse_sonarr_major(status: &Value) -> Option<u32> {
+    let version = status.get("version").and_then(Value::as_str)?;
+    let major = version.split('.').next()?.trim();
+    major.parse().ok()
 }
 
 fn build_api_base(root: &Url, version: &str) -> Result<Url> {
@@ -1031,20 +1167,23 @@ fn apply_language_items(
     Ok(cutoff_id)
 }
 
-fn merge_tags(target: &mut Value, tags: &[i64]) -> Result<()> {
+fn merge_tags(target: &mut Value, tags: &[i64]) -> Result<bool> {
     let existing = target
         .get("tags")
         .and_then(Value::as_array)
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(Value::as_i64)
-                .collect::<HashSet<i64>>()
-        })
+        .map(|array| array.iter().filter_map(Value::as_i64).collect::<Vec<i64>>())
         .unwrap_or_default();
-    let mut merged: HashSet<i64> = existing;
+    let mut seen: HashSet<i64> = existing.iter().copied().collect();
+    let mut merged = existing.clone();
+    let mut changed = false;
     for tag in tags {
-        merged.insert(*tag);
+        if seen.insert(*tag) {
+            merged.push(*tag);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
     }
     let mut array = Vec::new();
     for tag in merged {
@@ -1052,7 +1191,7 @@ fn merge_tags(target: &mut Value, tags: &[i64]) -> Result<()> {
     }
     if let Some(obj) = target.as_object_mut() {
         obj.insert("tags".to_string(), Value::Array(array));
-        return Ok(());
+        return Ok(true);
     }
     bail!("expected object for tag merge");
 }
@@ -1122,11 +1261,13 @@ fn join_lines(values: &[String]) -> String {
     values.join("\n")
 }
 
-fn apply_format_items(profile: &mut Value, scores: &HashMap<i64, i32>) -> Result<()> {
+fn apply_format_items(profile: &mut Value, scores: &HashMap<i64, i32>) -> Result<bool> {
+    let mut changed = false;
     let needs_insert = !profile.get("formatItems").is_some();
     if needs_insert {
         if let Some(obj) = profile.as_object_mut() {
             obj.insert("formatItems".to_string(), Value::Array(Vec::new()));
+            changed = true;
         }
     }
     let items = profile
@@ -1143,8 +1284,12 @@ fn apply_format_items(profile: &mut Value, scores: &HashMap<i64, i32>) -> Result
                 .and_then(Value::as_i64)
                 .or_else(|| item.get("formatId").and_then(Value::as_i64));
             if current_id == Some(*format_id) {
+                let current_score = item.get("score").and_then(Value::as_i64);
                 if let Some(obj) = item.as_object_mut() {
-                    obj.insert("score".to_string(), Value::Number((*score).into()));
+                    if current_score != Some(i64::from(*score)) {
+                        obj.insert("score".to_string(), Value::Number((*score).into()));
+                        changed = true;
+                    }
                 }
                 found = true;
                 break;
@@ -1155,7 +1300,338 @@ fn apply_format_items(profile: &mut Value, scores: &HashMap<i64, i32>) -> Result
                 "format": { "id": format_id },
                 "score": score,
             }));
+            changed = true;
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+fn describe_error_body(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "empty response".to_string();
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(message) = extract_error_message(&value) {
+            return message;
+        }
+        return value.to_string();
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "empty response".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_error_message(value: &Value) -> Option<String> {
+    let message_keys = ["message", "errorMessage", "error", "detail", "description"];
+    for key in message_keys {
+        if let Some(message) = value.get(key).and_then(Value::as_str) {
+            if !message.trim().is_empty() {
+                return Some(message.to_string());
+            }
+        }
+    }
+    let list_keys = ["errors", "validationErrors", "validationFailures"];
+    for key in list_keys {
+        if let Some(entries) = value.get(key) {
+            return Some(entries.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    #[test]
+    fn resolve_base_url_requires_same_origin() {
+        let result = resolve_base_url(Some("http://other-host:8989"), "http://svc:8989/");
+        assert!(result.is_err());
+
+        let resolved =
+            resolve_base_url(Some("http://svc:8989/sonarr"), "http://svc:8989/").unwrap();
+        assert_eq!(resolved.path(), "/sonarr");
+    }
+
+    #[test]
+    fn merge_tags_preserves_order_and_detects_change() {
+        let mut target = json!({ "tags": [2, 1] });
+        let changed = merge_tags(&mut target, &[1, 3]).expect("merge tags");
+        assert!(changed);
+        assert_eq!(target.get("tags"), Some(&json!([2, 1, 3])));
+
+        let changed = merge_tags(&mut target, &[3]).expect("merge tags");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn apply_format_items_reports_changes() {
+        let mut profile = json!({
+            "formatItems": [
+                { "formatId": 1, "score": 10 }
+            ]
+        });
+        let mut scores = HashMap::new();
+        scores.insert(1, 10);
+        let changed = apply_format_items(&mut profile, &scores).expect("apply scores");
+        assert!(!changed);
+
+        scores.insert(1, 20);
+        let changed = apply_format_items(&mut profile, &scores).expect("apply scores");
+        assert!(changed);
+
+        scores.insert(2, 5);
+        let changed = apply_format_items(&mut profile, &scores).expect("apply scores");
+        assert!(changed);
+    }
+
+    #[test]
+    fn ensure_sonarr_v3_reports_mismatch() {
+        let err = ensure_sonarr_v3(Some(4), "v3", "release profiles").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("release profiles require Sonarr v3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sonarr_major_handles_version() {
+        let status = json!({ "version": "4.0.1.1234" });
+        assert_eq!(parse_sonarr_major(&status), Some(4));
+    }
+}
+
+#[cfg(all(test, feature = "docker-sonarr-tests"))]
+mod docker_tests {
+    use super::*;
+
+    use anyhow::{Context, Result, bail};
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+    use tempfile::TempDir;
+    use tokio::fs;
+    use tokio::process::Command;
+    use tokio::time::{Duration, Instant, sleep};
+    use uuid::Uuid;
+
+    const SONARR_IMAGE_DEFAULT: &str = "lscr.io/linuxserver/sonarr:4.0.0";
+    const SONARR_PORT: u16 = 8989;
+
+    struct DockerContainer {
+        name: String,
+    }
+
+    impl Drop for DockerContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.name])
+                .output();
+        }
+    }
+
+    async fn docker_output(args: &[&str]) -> Result<String> {
+        let output = Command::new("docker")
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("running docker {}", args.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("docker {} failed: {}", args.join(" "), stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn ensure_docker_available() -> Result<()> {
+        let output = Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .context("checking docker availability")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("docker is not available: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    fn sonarr_image() -> String {
+        std::env::var("SONARR_IMAGE").unwrap_or_else(|_| SONARR_IMAGE_DEFAULT.to_string())
+    }
+
+    async fn start_sonarr_container(config_dir: &TempDir) -> Result<DockerContainer> {
+        let name = format!("elixir-sonarr-{}", Uuid::new_v4());
+        let image = sonarr_image();
+        let config_path = config_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("config dir path is invalid"))?;
+        docker_output(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "-p",
+            &SONARR_PORT.to_string(),
+            "-v",
+            &format!("{config_path}:/config"),
+            "-e",
+            "TZ=UTC",
+            &image,
+        ])
+        .await?;
+        Ok(DockerContainer { name })
+    }
+
+    async fn container_host_port(name: &str) -> Result<u16> {
+        let output = docker_output(&["port", name, &format!("{SONARR_PORT}/tcp")]).await?;
+        let line = output
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("docker port output empty"))?;
+        let port_str = line
+            .rsplit(':')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("docker port output invalid"))?;
+        port_str
+            .parse::<u16>()
+            .with_context(|| format!("invalid host port '{}'", port_str))
+    }
+
+    async fn wait_for_api_key(config_dir: &TempDir) -> Result<String> {
+        let path = config_dir.path().join("config.xml");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok(content) = fs::read_to_string(&path).await {
+                if let Some(key) = parse_sonarr_api_key(&content)? {
+                    return Ok(key);
+                }
+            }
+            if Instant::now() > deadline {
+                bail!("timed out waiting for sonarr config.xml api key");
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    fn parse_sonarr_api_key(xml: &str) -> Result<Option<String>> {
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+        let mut buf = Vec::new();
+        let mut in_key = false;
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(event)) => {
+                    if event.name().as_ref() == b"ApiKey" {
+                        in_key = true;
+                    }
+                }
+                Ok(Event::End(event)) => {
+                    if event.name().as_ref() == b"ApiKey" {
+                        in_key = false;
+                    }
+                }
+                Ok(Event::Text(event)) if in_key => {
+                    let value = event.unescape().context("decoding ApiKey")?;
+                    return Ok(Some(value.to_string()));
+                }
+                Ok(Event::Eof) => break,
+                Err(err) => return Err(err.into()),
+                _ => {}
+            }
+            buf.clear();
+        }
+        Ok(None)
+    }
+
+    async fn wait_for_system_status(base_url: &str, api_key: &str) -> Result<Value> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("building readiness http client")?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let urls = [
+            format!("{base_url}/api/v3/system/status"),
+            format!("{base_url}/api/v4/system/status"),
+        ];
+        loop {
+            for url in &urls {
+                if let Ok(resp) = client.get(url).header("X-Api-Key", api_key).send().await {
+                    if resp.status().is_success() {
+                        let value = resp.json::<Value>().await?;
+                        return Ok(value);
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                bail!("timed out waiting for sonarr api readiness");
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sonarr_v4_guard_messages() -> Result<()> {
+        ensure_docker_available().await?;
+        let config_dir = TempDir::new().context("creating temp config dir")?;
+        let container = start_sonarr_container(&config_dir).await?;
+        let api_key = wait_for_api_key(&config_dir).await?;
+        let host_port = container_host_port(&container.name).await?;
+        let base_url = format!("http://127.0.0.1:{host_port}");
+        let status = wait_for_system_status(&base_url, &api_key).await?;
+        let major = parse_sonarr_major(&status).unwrap_or(0);
+        if major < 4 {
+            bail!("expected Sonarr v4+, detected v{major}");
+        }
+
+        let config = SonarrDriverConfig {
+            api_key: Some(api_key),
+            base_url: Some(base_url.clone()),
+            api_version: None,
+        };
+        let client = SonarrClient::from_config(config, base_url.clone()).await?;
+        assert_eq!(client.product_major, Some(major));
+
+        let language_profiles = vec![LanguageProfileSpec {
+            name: "English".to_string(),
+            languages: vec!["English".to_string()],
+            cutoff: Some("English".to_string()),
+        }];
+        let err = client
+            .upsert_language_profiles(&language_profiles)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("require Sonarr v3"), "unexpected error: {message}");
+        assert!(
+            message.contains(&format!("v{major}")),
+            "unexpected version in error: {message}"
+        );
+
+        let release_profiles = vec![ReleaseProfileSpec {
+            name: "x265".to_string(),
+            required: vec!["x265".to_string()],
+            ignored: Vec::new(),
+            preferred: Vec::new(),
+        }];
+        let err = client
+            .upsert_release_profiles(&release_profiles)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("require Sonarr v3"), "unexpected error: {message}");
+        assert!(
+            message.contains(&format!("v{major}")),
+            "unexpected version in error: {message}"
+        );
+        Ok(())
+    }
 }

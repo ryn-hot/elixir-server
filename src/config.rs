@@ -17,6 +17,8 @@ pub struct Settings {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
     pub library: LibraryConfig,
     #[serde(default)]
     pub extensions: ExtensionsConfig,
@@ -59,6 +61,26 @@ impl Settings {
             .set_default("extensions.storage_root", default_extensions_root())?
             .set_default("extensions.allow_unsigned", default_false())?
             .set_default("extensions.allow_directory_install", default_false())?
+            .set_default(
+                "extensions.reconcile_interval_seconds",
+                default_reconcile_interval_seconds(),
+            )?
+            .set_default(
+                "extensions.registry_refresh_interval_seconds",
+                default_registry_refresh_interval_seconds(),
+            )?
+            .set_default(
+                "extensions.reconcile_retry_attempts",
+                default_reconcile_retry_attempts(),
+            )?
+            .set_default(
+                "extensions.reconcile_retry_backoff_seconds",
+                default_reconcile_retry_backoff_seconds(),
+            )?
+            .set_default(
+                "extensions.apply_lock_ttl_seconds",
+                default_apply_lock_ttl_seconds(),
+            )?
             .set_default("metadata.enable_cinemeta", true)?
             .set_default("metadata.enable_anilist", true)?
             .set_default("metadata.enable_aniapi", true)?
@@ -238,6 +260,18 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SecretsConfig {
+    #[serde(default)]
+    pub master_key: Option<String>,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self { master_key: None }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LibraryConfig {
     #[serde(default = "default_local_root")]
     pub local_root: String,
@@ -281,6 +315,16 @@ pub struct ExtensionsConfig {
     pub allow_unsigned: bool,
     #[serde(default = "default_false")]
     pub allow_directory_install: bool,
+    #[serde(default = "default_reconcile_interval_seconds")]
+    pub reconcile_interval_seconds: u64,
+    #[serde(default = "default_registry_refresh_interval_seconds")]
+    pub registry_refresh_interval_seconds: u64,
+    #[serde(default = "default_reconcile_retry_attempts")]
+    pub reconcile_retry_attempts: u32,
+    #[serde(default = "default_reconcile_retry_backoff_seconds")]
+    pub reconcile_retry_backoff_seconds: u64,
+    #[serde(default = "default_apply_lock_ttl_seconds")]
+    pub apply_lock_ttl_seconds: u64,
 }
 
 impl Default for ExtensionsConfig {
@@ -290,6 +334,11 @@ impl Default for ExtensionsConfig {
             storage_root: default_extensions_root(),
             allow_unsigned: default_false(),
             allow_directory_install: default_false(),
+            reconcile_interval_seconds: default_reconcile_interval_seconds(),
+            registry_refresh_interval_seconds: default_registry_refresh_interval_seconds(),
+            reconcile_retry_attempts: default_reconcile_retry_attempts(),
+            reconcile_retry_backoff_seconds: default_reconcile_retry_backoff_seconds(),
+            apply_lock_ttl_seconds: default_apply_lock_ttl_seconds(),
         }
     }
 }
@@ -462,6 +511,26 @@ fn default_artwork_cache_dir() -> String {
 
 fn default_extensions_root() -> String {
     "data/extensions".to_string()
+}
+
+fn default_reconcile_interval_seconds() -> u64 {
+    60
+}
+
+fn default_registry_refresh_interval_seconds() -> u64 {
+    900
+}
+
+fn default_reconcile_retry_attempts() -> u32 {
+    2
+}
+
+fn default_reconcile_retry_backoff_seconds() -> u64 {
+    5
+}
+
+fn default_apply_lock_ttl_seconds() -> u64 {
+    300
 }
 
 fn default_true() -> bool {

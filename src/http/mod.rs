@@ -5,7 +5,7 @@ pub mod handlers;
 use axum::{
     http::{header, Method},
     Router,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -20,6 +20,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/extensions/catalog",
             get(handlers::extensions::catalog),
+        )
+        .route(
+            "/api/v1/extensions/registries/refresh",
+            post(handlers::extensions::refresh_catalog),
         )
         .route(
             "/api/v1/extensions/:id",
@@ -54,6 +58,14 @@ pub fn router(state: AppState) -> Router {
             patch(handlers::extensions::update_instance),
         )
         .route(
+            "/api/v1/extensions/instances/:id",
+            delete(handlers::extensions::delete_instance),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id/rollback",
+            post(handlers::extensions::rollback_instance),
+        )
+        .route(
             "/api/v1/extensions/blueprints/apply",
             post(handlers::extensions::apply_blueprint),
         )
@@ -66,8 +78,24 @@ pub fn router(state: AppState) -> Router {
             post(handlers::extensions::cancel_plan),
         )
         .route(
+            "/api/v1/extensions/reconcile/now",
+            post(handlers::extensions::reconcile_now),
+        )
+        .route(
+            "/api/v1/extensions/reconcile/latest",
+            get(handlers::extensions::reconcile_latest),
+        )
+        .route(
             "/api/v1/extensions/runs",
             get(handlers::extensions::list_runs),
+        )
+        .route(
+            "/api/v1/extensions/desired-blueprints",
+            get(handlers::extensions::list_desired_blueprints),
+        )
+        .route(
+            "/api/v1/extensions/desired-blueprints",
+            delete(handlers::extensions::clear_desired_blueprints),
         )
         .route(
             "/api/v1/extensions/runs/:id",
@@ -84,6 +112,30 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/extensions/runtime/:id/logs",
             get(handlers::extensions::runtime_logs),
+        )
+        .route(
+            "/api/v1/extensions/secrets",
+            get(handlers::extensions::list_secrets),
+        )
+        .route(
+            "/api/v1/extensions/secrets",
+            post(handlers::extensions::create_secret),
+        )
+        .route(
+            "/api/v1/extensions/secrets/:id",
+            get(handlers::extensions::get_secret),
+        )
+        .route(
+            "/api/v1/extensions/secrets/:id",
+            patch(handlers::extensions::update_secret),
+        )
+        .route(
+            "/api/v1/extensions/secrets/:id",
+            delete(handlers::extensions::delete_secret),
+        )
+        .route(
+            "/api/v1/extensions/secrets/:id/rotate",
+            post(handlers::extensions::rotate_secret),
         )
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/signup", post(handlers::auth::signup))

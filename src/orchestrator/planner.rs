@@ -8,11 +8,16 @@ use crate::db::models::{
     BindingStatus, ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
 };
 use crate::extensions::manifest::{
-    ExtensionManifest, ManifestBinding, ManifestCapabilityRef, ManifestPreferences,
-    ManifestRuntime, ManifestNetworking,
+    ConflictPolicy as ManifestConflictPolicy, ExtensionManifest, ManifestBinding,
+    ManifestCapabilityRef, ManifestPolicies, ManifestPreferences, ManifestRuntime,
+    ManifestNetworking,
+};
+use crate::extensions::required_secrets::{
+    missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
 use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
 use crate::orchestrator::executor::ExecutorAction;
+use crate::orchestrator::naming::build_aliases;
 use crate::orchestrator::model::ProviderEndpoint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +30,63 @@ pub struct Plan {
     pub actions: Vec<PlanAction>,
     #[serde(default)]
     pub conflicts: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotConflictResolution {
+    KeepExisting,
+    Replace,
+    Abort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotConflictDecision {
+    pub conflict_id: String,
+    pub action: SlotConflictResolution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDecisions {
+    #[serde(default)]
+    pub slot_conflicts: Vec<SlotConflictDecision>,
+}
+
+impl PlanDecisions {
+    pub fn from_conflicts(conflicts: &[serde_json::Value]) -> Option<Self> {
+        let mut slot_conflicts = Vec::new();
+        for conflict in conflicts {
+            let code = conflict.get("code").and_then(|value| value.as_str());
+            if code != Some("slot_conflict") {
+                continue;
+            }
+            let conflict_id = match conflict.get("conflict_id").and_then(|value| value.as_str()) {
+                Some(value) => value,
+                None => continue,
+            };
+            let decision = match conflict.get("decision").and_then(|value| value.as_str()) {
+                Some(value) => value,
+                None => continue,
+            };
+            let action = match decision {
+                "keep_existing" => SlotConflictResolution::KeepExisting,
+                "replace" => SlotConflictResolution::Replace,
+                "abort" => SlotConflictResolution::Abort,
+                _ => continue,
+            };
+            slot_conflicts.push(SlotConflictDecision {
+                conflict_id: conflict_id.to_string(),
+                action,
+            });
+        }
+        if slot_conflicts.is_empty() {
+            None
+        } else {
+            Some(Self { slot_conflicts })
+        }
+    }
 }
 
 impl Plan {
@@ -52,8 +114,14 @@ pub enum PlanAction {
     EnsureInstanceInstalled {
         instance: InstanceSpec,
     },
+    DeleteProvider {
+        provider_id: Uuid,
+    },
     EnsureRuntimeRunning {
         runtime: RuntimeSpec,
+    },
+    RollbackRuntime {
+        instance_id: Uuid,
     },
     HealthGate {
         provider_id: Uuid,
@@ -79,7 +147,9 @@ impl PlanAction {
     pub fn action_type(&self) -> &'static str {
         match self {
             PlanAction::EnsureInstanceInstalled { .. } => "ensure_instance_installed",
+            PlanAction::DeleteProvider { .. } => "delete_provider",
             PlanAction::EnsureRuntimeRunning { .. } => "ensure_runtime_running",
+            PlanAction::RollbackRuntime { .. } => "rollback_runtime",
             PlanAction::HealthGate { .. } => "health_gate",
             PlanAction::CreateOrUpdateProvider { .. } => "create_or_update_provider",
             PlanAction::ApplyDriverPatch { .. } => "apply_driver_patch",
@@ -100,6 +170,9 @@ impl TryFrom<PlanAction> for ExecutorAction {
                 config_json: instance.config_json,
                 enabled: instance.enabled,
             }),
+            PlanAction::DeleteProvider { provider_id } => {
+                Ok(ExecutorAction::DeleteProvider { provider_id })
+            }
             PlanAction::EnsureRuntimeRunning { runtime } => Ok(ExecutorAction::EnsureRuntimeRunning {
                 instance_id: runtime.instance_id,
                 extension_id: runtime.extension_id,
@@ -108,6 +181,9 @@ impl TryFrom<PlanAction> for ExecutorAction {
                 networking: runtime.networking,
                 aliases: runtime.aliases,
             }),
+            PlanAction::RollbackRuntime { instance_id } => {
+                Ok(ExecutorAction::RollbackRuntime { instance_id })
+            }
             PlanAction::HealthGate {
                 provider_id,
                 timeout_seconds,
@@ -235,6 +311,17 @@ impl Planner {
         blueprint_id: String,
         params: Option<serde_json::Value>,
     ) -> Result<Plan> {
+        self.plan_blueprint_with_decisions(store, blueprint_id, params, None)
+            .await
+    }
+
+    pub async fn plan_blueprint_with_decisions(
+        &self,
+        store: &ExtensionStore<'_>,
+        blueprint_id: String,
+        params: Option<serde_json::Value>,
+        decisions: Option<&PlanDecisions>,
+    ) -> Result<Plan> {
         ensure_non_empty(&blueprint_id, "blueprint_id")?;
         let blueprint = store
             .get_extension(&blueprint_id)
@@ -265,10 +352,21 @@ impl Planner {
         let providers = store.list_provider_details().await?;
         let extensions = store.list_extensions().await?;
         let instances = store.list_instances(None).await?;
+        let decisions_map = decisions_map(decisions);
 
         let mut used_instance_names = group_instance_names(&instances);
         let module_catalog = build_module_catalog(&extensions, allow_community)?;
         let connector_catalog = build_connector_catalog(&extensions, allow_community)?;
+        let extension_map: HashMap<String, crate::db::models::Extension> = extensions
+            .iter()
+            .cloned()
+            .map(|extension| (extension.extension_id.clone(), extension))
+            .collect();
+        let instance_map: HashMap<Uuid, crate::db::models::ExtensionInstance> = instances
+            .iter()
+            .cloned()
+            .map(|instance| (instance.instance_id, instance))
+            .collect();
 
         let mut plan = Plan::new(blueprint_id, params);
         let mut selections: HashMap<String, ProviderSelection> = HashMap::new();
@@ -280,11 +378,31 @@ impl Planner {
                 continue;
             }
 
-            if reuse_existing {
+            let decision = decisions_map.get(&key);
+            let force_keep = matches!(decision, Some(SlotConflictResolution::KeepExisting));
+            let force_replace = matches!(decision, Some(SlotConflictResolution::Replace));
+
+            if force_keep {
                 let candidates = providers_for_want(&providers, want, allow_community);
-                if let Some(selected) =
-                    select_existing_provider(candidates, manifest.preferences.as_ref(), want, &mut plan.conflicts)
-                {
+                if let Some(selected) = select_existing_provider_for_keep(candidates) {
+                    selections.insert(key, ProviderSelection::Existing(selected.clone()));
+                } else {
+                    plan.conflicts.push(conflict_missing_provider(
+                        want,
+                        Some("no existing provider to keep"),
+                    ));
+                }
+                continue;
+            }
+
+            if reuse_existing && !force_replace {
+                let candidates = providers_for_want(&providers, want, allow_community);
+                if let Some(selected) = select_existing_provider(
+                    candidates.clone(),
+                    manifest.preferences.as_ref(),
+                    want,
+                    &mut plan.conflicts,
+                ) {
                     selections.insert(key, ProviderSelection::Existing(selected.clone()));
                     continue;
                 }
@@ -305,9 +423,92 @@ impl Planner {
             plan.conflicts.push(conflict_missing_provider(want, None));
         }
 
+        let mut upgrade_instances: HashMap<Uuid, RuntimeSpec> = HashMap::new();
+        let module_manifest_map: HashMap<String, ExtensionManifest> = module_catalog
+            .iter()
+            .map(|candidate| (candidate.extension_id.clone(), candidate.manifest.clone()))
+            .collect();
+        for selection in selections.values() {
+            let ProviderSelection::Existing(detail) = selection else {
+                continue;
+            };
+            let provider = &detail.provider;
+            let instance = match instance_map.get(&provider.instance_id) {
+                Some(instance) if instance.enabled => instance,
+                _ => continue,
+            };
+            let extension = match extension_map.get(&instance.extension_id) {
+                Some(extension) if extension.enabled => extension,
+                _ => continue,
+            };
+            if extension.kind != ExtensionKind::Module {
+                continue;
+            }
+            if instance.runtime_version.as_deref() == Some(extension.version.as_str()) {
+                continue;
+            }
+            let manifest = match module_manifest_map.get(&instance.extension_id) {
+                Some(manifest) => manifest,
+                None => continue,
+            };
+            let runtime = match manifest.runtime.clone() {
+                Some(runtime) => runtime,
+                None => continue,
+            };
+            let networking = manifest.networking.clone();
+            let (aliases, _) = build_aliases(
+                &instance.extension_id,
+                &instance.instance_name,
+                instance.instance_id,
+                runtime.service_name.clone(),
+            );
+            upgrade_instances.entry(instance.instance_id).or_insert(RuntimeSpec {
+                instance_id: instance.instance_id,
+                extension_id: instance.extension_id.clone(),
+                instance_name: instance.instance_name.clone(),
+                runtime,
+                networking,
+                aliases,
+            });
+        }
+
         let mut actions = Vec::new();
         let mut instance_entries: Vec<&PlannedInstance> = planned_instances.values().collect();
         instance_entries.sort_by(|a, b| a.instance.extension_id.cmp(&b.instance.extension_id));
+        for instance in &instance_entries {
+            let required = required_secrets_from_runtime(&instance.runtime.runtime.env)?;
+            if required.is_empty() {
+                continue;
+            }
+            let missing =
+                missing_required_secrets_for_instance(store, instance.instance.instance_id, &required)
+                    .await?;
+            if !missing.is_empty() {
+                plan.conflicts.push(conflict_missing_required_secrets(
+                    &instance.instance.extension_id,
+                    instance.instance.instance_id,
+                    &instance.instance.instance_name,
+                    &missing,
+                ));
+            }
+        }
+        for runtime in upgrade_instances.values() {
+            let required = required_secrets_from_runtime(&runtime.runtime.env)?;
+            if required.is_empty() {
+                continue;
+            }
+            let missing =
+                missing_required_secrets_for_instance(store, runtime.instance_id, &required)
+                    .await?;
+            if !missing.is_empty() {
+                plan.conflicts.push(conflict_missing_required_secrets(
+                    &runtime.extension_id,
+                    runtime.instance_id,
+                    &runtime.instance_name,
+                    &missing,
+                ));
+            }
+        }
         for instance in instance_entries {
             actions.push(PlanAction::EnsureInstanceInstalled {
                 instance: instance.instance.clone(),
@@ -320,6 +521,13 @@ impl Planner {
                     provider: provider.clone(),
                 });
             }
+        }
+        let mut upgrade_runtime_entries: Vec<&RuntimeSpec> = upgrade_instances.values().collect();
+        upgrade_runtime_entries.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
+        for runtime in upgrade_runtime_entries {
+            actions.push(PlanAction::EnsureRuntimeRunning {
+                runtime: runtime.clone(),
+            });
         }
 
         let mut connector_entries: Vec<&ConnectorCandidate> = connector_catalog.iter().collect();
@@ -384,9 +592,30 @@ impl Planner {
             }
         }
 
+        let mut pre_actions = resolve_slot_collisions(
+            &mut plan,
+            &providers,
+            &planned_instances,
+            &module_catalog,
+            manifest.policies.as_ref(),
+            &decisions_map,
+            &instances,
+        );
+        if !pre_actions.is_empty() {
+            pre_actions.extend(actions);
+            actions = pre_actions;
+        }
+
         plan.actions = actions;
         Ok(plan)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotConflictPolicy {
+    Prompt,
+    AutoReplace,
+    Deny,
 }
 
 #[derive(Clone)]
@@ -553,8 +782,12 @@ fn plan_module_instance(
     let instance_name = next_instance_name(used_names);
     used_names.insert(instance_name.clone());
 
-    let (aliases, primary_alias) =
-        build_aliases(&candidate.extension_id, &instance_name, instance_id, runtime.service_name.clone());
+    let (aliases, primary_alias) = build_aliases(
+        &candidate.extension_id,
+        &instance_name,
+        instance_id,
+        runtime.service_name.clone(),
+    );
 
     let mut providers = Vec::new();
     for provide in &candidate.manifest.provides {
@@ -620,24 +853,6 @@ fn next_instance_name(used_names: &HashSet<String>) -> String {
         }
     }
     format!("default-{}", Uuid::new_v4().simple())
-}
-
-fn build_aliases(
-    extension_id: &str,
-    instance_name: &str,
-    instance_id: Uuid,
-    service_name: Option<String>,
-) -> (Vec<String>, String) {
-    let short_id = short_instance_id(instance_id);
-    let slug = slugify(extension_id);
-    let primary_alias = format!("svc-{}-{}", slug, instance_name);
-    let mut aliases = vec![format!("svc-{}", short_id), primary_alias.clone()];
-    if let Some(service_name) = service_name {
-        if !aliases.contains(&service_name) {
-            aliases.push(service_name);
-        }
-    }
-    (aliases, primary_alias)
 }
 
 fn build_provider_endpoint(
@@ -809,6 +1024,34 @@ fn select_existing_provider<'a>(
     None
 }
 
+fn select_existing_provider_for_keep<'a>(
+    mut candidates: Vec<&'a ProviderDetails>,
+) -> Option<&'a ProviderDetails> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let healthy: Vec<&ProviderDetails> = candidates
+        .iter()
+        .filter(|provider| provider.provider.health_state != ProviderHealthState::Unhealthy)
+        .copied()
+        .collect();
+    if !healthy.is_empty() {
+        candidates = healthy;
+    }
+
+    candidates.sort_by(|left, right| {
+        let by_extension = left.extension_id.cmp(&right.extension_id);
+        if by_extension == std::cmp::Ordering::Equal {
+            left.provider.provider_id.cmp(&right.provider.provider_id)
+        } else {
+            by_extension
+        }
+    });
+
+    Some(candidates[0])
+}
+
 fn build_binding_action(
     binding: &ManifestBinding,
     selections: &HashMap<String, ProviderSelection>,
@@ -969,32 +1212,255 @@ fn conflict_driver_patch(
     })
 }
 
+fn conflict_missing_required_secrets(
+    extension_id: &str,
+    instance_id: Uuid,
+    instance_name: &str,
+    missing: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "code": "missing_required_secrets",
+        "extension_id": extension_id,
+        "instance_id": instance_id,
+        "instance_name": instance_name,
+        "missing": missing,
+    })
+}
+
+fn decisions_map(decisions: Option<&PlanDecisions>) -> HashMap<String, SlotConflictResolution> {
+    let mut map = HashMap::new();
+    if let Some(decisions) = decisions {
+        for decision in &decisions.slot_conflicts {
+            map.insert(decision.conflict_id.clone(), decision.action.clone());
+        }
+    }
+    map
+}
+
+fn resolve_slot_collisions(
+    plan: &mut Plan,
+    providers: &[ProviderDetails],
+    planned_instances: &HashMap<String, PlannedInstance>,
+    module_catalog: &[ModuleCandidate],
+    policies: Option<&ManifestPolicies>,
+    decisions: &HashMap<String, SlotConflictResolution>,
+    instances: &[crate::db::models::ExtensionInstance],
+) -> Vec<PlanAction> {
+    if planned_instances.is_empty() {
+        return Vec::new();
+    }
+
+    let instance_names: HashMap<Uuid, String> = instances
+        .iter()
+        .map(|instance| (instance.instance_id, instance.instance_name.clone()))
+        .collect();
+    let module_map: HashMap<String, ExtensionManifest> = module_catalog
+        .iter()
+        .map(|candidate| (candidate.extension_id.clone(), candidate.manifest.clone()))
+        .collect();
+    let planned_by_instance: HashMap<Uuid, &PlannedInstance> = planned_instances
+        .values()
+        .map(|instance| (instance.instance.instance_id, instance))
+        .collect();
+
+    let mut delete_actions = Vec::new();
+    let mut deleted_providers = HashSet::new();
+    let mut seen_conflicts = HashSet::new();
+
+    for planned_instance in planned_instances.values() {
+        for planned_provider in &planned_instance.providers {
+            if planned_provider.cardinality == SlotCardinality::Many {
+                continue;
+            }
+
+            let existing: Vec<&ProviderDetails> = providers
+                .iter()
+                .filter(|provider| {
+                    provider.provider.capability == planned_provider.capability
+                        && provider.provider.slot_id == planned_provider.slot_id
+                })
+                .collect();
+            if existing.is_empty() {
+                continue;
+            }
+
+            let conflict_id = format!(
+                "{}/{}",
+                planned_provider.capability, planned_provider.slot_id
+            );
+            let policy = slot_conflict_policy(
+                module_map.get(&planned_instance.instance.extension_id),
+                &planned_provider.capability,
+                &planned_provider.slot_id,
+                policies,
+            );
+            let decision = decisions.get(&conflict_id);
+            let mut resolved = false;
+            let mut replace = false;
+
+            match decision {
+                Some(SlotConflictResolution::Replace) => {
+                    if policy == SlotConflictPolicy::Deny {
+                        resolved = false;
+                    } else {
+                        resolved = true;
+                        replace = true;
+                    }
+                }
+                Some(SlotConflictResolution::KeepExisting) => {
+                    resolved = true;
+                }
+                Some(SlotConflictResolution::Abort) => {
+                    resolved = false;
+                }
+                None => {
+                    if policy == SlotConflictPolicy::AutoReplace {
+                        resolved = true;
+                        replace = true;
+                    }
+                }
+            }
+
+            if replace {
+                for provider in &existing {
+                    if deleted_providers.insert(provider.provider.provider_id) {
+                        delete_actions.push(PlanAction::DeleteProvider {
+                            provider_id: provider.provider.provider_id,
+                        });
+                    }
+                }
+            }
+
+            if seen_conflicts.insert(conflict_id.clone()) {
+                let planned_info = planned_by_instance
+                    .get(&planned_provider.instance_id)
+                    .copied()
+                    .unwrap_or(planned_instance);
+                plan.conflicts.push(conflict_slot_collision(
+                    &conflict_id,
+                    planned_provider,
+                    planned_info,
+                    &existing,
+                    &instance_names,
+                    policy,
+                    resolved,
+                    decision.cloned(),
+                ));
+            }
+        }
+    }
+
+    delete_actions
+}
+
+fn slot_conflict_policy(
+    manifest: Option<&ExtensionManifest>,
+    capability: &str,
+    slot: &str,
+    policies: Option<&ManifestPolicies>,
+) -> SlotConflictPolicy {
+    if let Some(manifest) = manifest {
+        if let Some(conflict) = manifest.conflicts.iter().find(|entry| {
+            entry.capability == capability && entry.slot == slot
+        }) {
+            return match conflict.policy {
+                ManifestConflictPolicy::PromptReplace => SlotConflictPolicy::Prompt,
+                ManifestConflictPolicy::AutoReplace => SlotConflictPolicy::AutoReplace,
+                ManifestConflictPolicy::Deny => SlotConflictPolicy::Deny,
+            };
+        }
+    }
+
+    let policy = policies
+        .and_then(|policies| policies.conflicts.as_deref())
+        .map(|value| value.trim().to_lowercase());
+
+    match policy.as_deref() {
+        Some("auto_replace") | Some("autoreplace") => SlotConflictPolicy::AutoReplace,
+        Some("deny") => SlotConflictPolicy::Deny,
+        Some("prompt") | Some("prompt_replace") => SlotConflictPolicy::Prompt,
+        _ => SlotConflictPolicy::Prompt,
+    }
+}
+
+fn conflict_slot_collision(
+    conflict_id: &str,
+    planned_provider: &ProviderSpec,
+    planned_instance: &PlannedInstance,
+    existing: &[&ProviderDetails],
+    instance_names: &HashMap<Uuid, String>,
+    policy: SlotConflictPolicy,
+    resolved: bool,
+    decision: Option<SlotConflictResolution>,
+) -> serde_json::Value {
+    let existing_values: Vec<serde_json::Value> = existing
+        .iter()
+        .map(|provider| {
+            serde_json::json!({
+                "provider_id": provider.provider.provider_id,
+                "instance_id": provider.provider.instance_id,
+                "instance_name": instance_names.get(&provider.provider.instance_id),
+                "extension_id": provider.extension_id,
+                "cardinality": provider.provider.cardinality,
+                "health": provider.provider.health_state,
+            })
+        })
+        .collect();
+
+    let planned_value = serde_json::json!({
+        "provider_id": planned_provider.provider_id,
+        "instance_id": planned_provider.instance_id,
+        "instance_name": planned_instance.instance.instance_name,
+        "extension_id": planned_instance.instance.extension_id,
+        "cardinality": planned_provider.cardinality,
+    });
+
+    let policy_str = match policy {
+        SlotConflictPolicy::Prompt => "prompt",
+        SlotConflictPolicy::AutoReplace => "auto_replace",
+        SlotConflictPolicy::Deny => "deny",
+    };
+    let resolution_options = match policy {
+        SlotConflictPolicy::Prompt => vec!["keep_existing", "replace", "abort"],
+        SlotConflictPolicy::AutoReplace => vec!["auto_replace"],
+        SlotConflictPolicy::Deny => vec!["deny"],
+    };
+
+    let mut conflict = serde_json::json!({
+        "code": "slot_conflict",
+        "conflict_id": conflict_id,
+        "capability": planned_provider.capability,
+        "slot": planned_provider.slot_id,
+        "policy": policy_str,
+        "existing": existing_values,
+        "planned": vec![planned_value],
+        "resolution_options": resolution_options,
+        "resolved": resolved,
+    });
+
+    if let Some(decision) = decision {
+        if let Some(obj) = conflict.as_object_mut() {
+            obj.insert(
+                "decision".to_string(),
+                serde_json::Value::String(match decision {
+                    SlotConflictResolution::KeepExisting => "keep_existing",
+                    SlotConflictResolution::Replace => "replace",
+                    SlotConflictResolution::Abort => "abort",
+                }
+                .to_string()),
+            );
+        }
+    }
+
+    conflict
+}
+
 fn trust_allowed(level: ExtensionTrustLevel, allow_community: bool) -> bool {
     match level {
         ExtensionTrustLevel::Verified => true,
         ExtensionTrustLevel::Community => allow_community,
         ExtensionTrustLevel::Untrusted => false,
     }
-}
-
-fn slugify(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-    out.trim_matches('-').to_string()
-}
-
-fn short_instance_id(instance_id: Uuid) -> String {
-    let raw = instance_id.simple().to_string();
-    raw.chars().take(6).collect()
 }
 
 fn default_slot() -> String {
@@ -1052,6 +1518,56 @@ mod tests {
         })
     }
 
+    fn module_manifest_with_conflict(
+        id: &str,
+        capability: &str,
+        policy: &str,
+    ) -> serde_json::Value {
+        let mut manifest = module_manifest(id, capability);
+        let conflicts = json!([
+            {
+                "capability": capability,
+                "slot": "default",
+                "policy": policy
+            }
+        ]);
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("conflicts".to_string(), conflicts);
+        manifest
+    }
+
+    fn module_manifest_with_secret(id: &str, capability: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": id,
+            "provides": [
+                {
+                    "capability": capability,
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": "test"
+                }
+            ],
+            "runtime": {
+                "type": "container",
+                "image": "example/module:1.0.0",
+                "env": [
+                    {
+                        "name": "API_KEY",
+                        "from_secret": "instance:api_key"
+                    }
+                ]
+            },
+            "networking": {
+                "service_port": { "scheme": "http", "container_port": 8080 }
+            }
+        })
+    }
+
     fn connector_manifest(id: &str, target_capability: &str) -> serde_json::Value {
         json!({
             "id": id,
@@ -1081,6 +1597,19 @@ mod tests {
                 { "capability": capability, "slot": "default" }
             ]
         })
+    }
+
+    fn blueprint_single_want_with_policies(
+        id: &str,
+        capability: &str,
+        reuse_existing: bool,
+    ) -> serde_json::Value {
+        let mut manifest = blueprint_single_want(id, capability);
+        manifest.as_object_mut().unwrap().insert(
+            "policies".to_string(),
+            json!({ "reuse_existing": reuse_existing }),
+        );
+        manifest
     }
 
     fn blueprint_manifest(prefer: Option<Vec<&str>>, include_binding: bool) -> serde_json::Value {
@@ -1422,6 +1951,306 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planner_conflicts_on_missing_required_secrets() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.secret",
+            ExtensionKind::Module,
+            module_manifest_with_secret("ext.secret", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.secret",
+            ExtensionKind::Blueprint,
+            blueprint_single_want("blueprint.secret", "media.manager.tv"),
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.secret".to_string(), None)
+            .await?;
+        assert!(plan.conflicts.iter().any(|conflict| {
+            conflict.get("code") == Some(&json!("missing_required_secrets"))
+                && conflict.get("missing")
+                    .and_then(|missing| missing.as_array())
+                    .map(|missing| {
+                        missing.iter().any(|entry| {
+                            entry
+                                .as_str()
+                                .map(|value| value.contains("instance:") && value.ends_with(":api_key"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_slot_conflict_auto_replace_adds_delete() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.existing",
+            ExtensionKind::Module,
+            module_manifest("ext.existing", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.replacer",
+            ExtensionKind::Module,
+            module_manifest_with_conflict("ext.replacer", "media.manager.tv", "auto_replace"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.conflict",
+            ExtensionKind::Blueprint,
+            {
+                let mut manifest = blueprint_single_want_with_policies(
+                    "blueprint.conflict",
+                    "media.manager.tv",
+                    false,
+                );
+                manifest.as_object_mut().unwrap().insert(
+                    "preferences".to_string(),
+                    json!({
+                        "providers": {
+                            "media.manager.tv/default": { "prefer": ["ext.replacer"] }
+                        }
+                    }),
+                );
+                manifest
+            },
+        )
+        .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-existing".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let (_, existing_provider_id) = insert_provider(
+            &store,
+            "ext.existing",
+            "media.manager.tv",
+            serde_json::to_value(endpoint)?,
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.conflict".to_string(), None)
+            .await?;
+
+        assert!(
+            plan.conflicts.iter().any(|conflict| {
+                conflict.get("code") == Some(&json!("slot_conflict"))
+                    && conflict.get("policy") == Some(&json!("auto_replace"))
+            }),
+            "expected auto_replace slot conflict"
+        );
+        assert!(
+            plan.actions.iter().any(|action| matches!(
+                action,
+                PlanAction::DeleteProvider {
+                    provider_id
+                } if *provider_id == existing_provider_id
+            )),
+            "expected delete_provider action"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_slot_conflict_prompt_requires_resolution() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.existing",
+            ExtensionKind::Module,
+            module_manifest("ext.existing", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.prompt",
+            ExtensionKind::Module,
+            module_manifest_with_conflict("ext.prompt", "media.manager.tv", "prompt_replace"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.conflict",
+            ExtensionKind::Blueprint,
+            {
+                let mut manifest = blueprint_single_want_with_policies(
+                    "blueprint.conflict",
+                    "media.manager.tv",
+                    false,
+                );
+                manifest.as_object_mut().unwrap().insert(
+                    "preferences".to_string(),
+                    json!({
+                        "providers": {
+                            "media.manager.tv/default": { "prefer": ["ext.prompt"] }
+                        }
+                    }),
+                );
+                manifest
+            },
+        )
+        .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-existing".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let _ = insert_provider(
+            &store,
+            "ext.existing",
+            "media.manager.tv",
+            serde_json::to_value(endpoint)?,
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.conflict".to_string(), None)
+            .await?;
+
+        assert!(
+            plan.conflicts.iter().any(|conflict| {
+                conflict.get("code") == Some(&json!("slot_conflict"))
+                    && conflict.get("policy") == Some(&json!("prompt"))
+                    && conflict.get("resolved") == Some(&json!(false))
+            }),
+            "expected prompt slot conflict"
+        );
+        assert!(
+            !plan.actions.iter().any(|action| matches!(
+                action,
+                PlanAction::DeleteProvider { .. }
+            )),
+            "did not expect delete_provider action"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_keep_existing_skips_module_install() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.existing",
+            ExtensionKind::Module,
+            module_manifest("ext.existing", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.prompt",
+            ExtensionKind::Module,
+            module_manifest_with_conflict("ext.prompt", "media.manager.tv", "prompt_replace"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.conflict",
+            ExtensionKind::Blueprint,
+            {
+                let mut manifest = blueprint_single_want_with_policies(
+                    "blueprint.conflict",
+                    "media.manager.tv",
+                    false,
+                );
+                manifest.as_object_mut().unwrap().insert(
+                    "preferences".to_string(),
+                    json!({
+                        "providers": {
+                            "media.manager.tv/default": { "prefer": ["ext.prompt"] }
+                        }
+                    }),
+                );
+                manifest
+            },
+        )
+        .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-existing".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let (existing_instance_id, _) = insert_provider(
+            &store,
+            "ext.existing",
+            "media.manager.tv",
+            serde_json::to_value(endpoint)?,
+        )
+        .await?;
+        store
+            .update_instance_runtime_version(existing_instance_id, "1.0.0", None)
+            .await?;
+
+        let decisions = PlanDecisions {
+            slot_conflicts: vec![SlotConflictDecision {
+                conflict_id: "media.manager.tv/default".to_string(),
+                action: SlotConflictResolution::KeepExisting,
+            }],
+        };
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint_with_decisions(
+                &store,
+                "blueprint.conflict".to_string(),
+                None,
+                Some(&decisions),
+            )
+            .await?;
+
+        assert!(
+            !plan.actions.iter().any(|action| matches!(
+                action,
+                PlanAction::EnsureInstanceInstalled { instance }
+                    if instance.extension_id == "ext.prompt"
+            )),
+            "did not expect module install when keep_existing is chosen"
+        );
+        assert!(
+            !plan.conflicts.iter().any(|conflict| {
+                conflict.get("code") == Some(&json!("slot_conflict"))
+            }),
+            "did not expect slot_conflict once keep_existing is chosen"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn planner_orders_health_gate_before_driver_patch() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -1490,6 +2319,58 @@ mod tests {
             health_index < patch_index,
             "health gate should precede driver patch"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_schedules_runtime_upgrade_for_existing_instance() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.upgrade",
+            ExtensionKind::Module,
+            module_manifest("ext.upgrade", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.upgrade",
+            ExtensionKind::Blueprint,
+            blueprint_single_want("blueprint.upgrade", "media.manager.tv"),
+        )
+        .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-upgrade".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let (instance_id, _) = insert_provider(
+            &store,
+            "ext.upgrade",
+            "media.manager.tv",
+            serde_json::to_value(endpoint)?,
+        )
+        .await?;
+        store
+            .update_instance_runtime_version(instance_id, "0.9.0", None)
+            .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.upgrade".to_string(), None)
+            .await?;
+
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            PlanAction::EnsureRuntimeRunning { runtime }
+                if runtime.instance_id == instance_id
+        )));
+
         Ok(())
     }
 }

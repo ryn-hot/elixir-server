@@ -34,7 +34,15 @@ impl RuntimePaths {
 pub trait RuntimeManager: Send + Sync {
     async fn ensure_network(&self, name: &str) -> anyhow::Result<()>;
     async fn ensure_container(&self, spec: &ContainerSpec) -> anyhow::Result<ContainerHandle>;
+    async fn get_container_handle(&self, name: &str) -> anyhow::Result<Option<ContainerHandle>>;
+    async fn start_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
     async fn stop_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
+    async fn rename_container(
+        &self,
+        handle: &ContainerHandle,
+        new_name: &str,
+    ) -> anyhow::Result<ContainerHandle>;
+    async fn remove_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
     async fn container_logs(
         &self,
         handle: &ContainerHandle,

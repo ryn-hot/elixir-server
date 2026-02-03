@@ -64,6 +64,22 @@ pub static PLAY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(opts, &["mode"]).expect("histogram vec created")
 });
 
+pub static RECONCILE_RUNS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_reconcile_runs_total",
+        "Count of reconcile runs by result",
+    );
+    IntCounterVec::new(opts, &["result"]).expect("counter vec created")
+});
+
+pub static RECONCILE_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_reconcile_actions_total",
+        "Count of reconcile actions by type and result",
+    );
+    IntCounterVec::new(opts, &["action", "result"]).expect("counter vec created")
+});
+
 pub fn init_metrics() {
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
@@ -74,6 +90,8 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(SEGMENT_SERVED.clone())).ok();
     REGISTRY.register(Box::new(PLAY_ERRORS.clone())).ok();
     REGISTRY.register(Box::new(PLAY_LATENCY.clone())).ok();
+    REGISTRY.register(Box::new(RECONCILE_RUNS.clone())).ok();
+    REGISTRY.register(Box::new(RECONCILE_ACTIONS.clone())).ok();
 }
 
 pub fn gather() -> Vec<u8> {

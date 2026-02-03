@@ -13,15 +13,20 @@ use uuid::Uuid;
 
 use crate::db::models::{BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality};
 use crate::drivers::{ApplyStatus, DriverCtx, DriverPatch, DriverRegistry};
-use crate::extensions::manifest::{ManifestNetworking, ManifestRuntime};
+use crate::extensions::manifest::{ManifestNetworking, ManifestRuntime, ManifestRuntimeEnv};
+use crate::extensions::required_secrets::{
+    missing_required_secrets_for_instance, required_secrets_from_runtime,
+};
 use crate::extensions::store::{
     ExtensionStore, NewBinding, NewExtensionInstance, NewProvider, NewSecret,
 };
 use crate::orchestrator::bindings::ensure_binding_connectivity;
 use crate::orchestrator::model::ProviderEndpoint;
-use crate::runtime::model::{ContainerSpec, EnvVar, PortMapping, VolumeMount};
+use crate::orchestrator::naming::container_name;
+use crate::runtime::model::{ContainerHandle, ContainerSpec, EnvVar, PortMapping, VolumeMount};
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
+use crate::secrets::SecretsManager;
 
 pub enum ExecutorAction {
     EnsureInstanceInstalled {
@@ -31,6 +36,9 @@ pub enum ExecutorAction {
         config_json: Option<serde_json::Value>,
         enabled: bool,
     },
+    DeleteProvider {
+        provider_id: Uuid,
+    },
     EnsureRuntimeRunning {
         instance_id: Uuid,
         extension_id: String,
@@ -38,6 +46,9 @@ pub enum ExecutorAction {
         runtime: ManifestRuntime,
         networking: Option<ManifestNetworking>,
         aliases: Vec<String>,
+    },
+    RollbackRuntime {
+        instance_id: Uuid,
     },
     HealthGate {
         provider_id: Uuid,
@@ -71,6 +82,7 @@ pub struct Executor<'a> {
     drivers: &'a DriverRegistry,
     runtime: &'a dyn RuntimeManager,
     runtime_paths: RuntimePaths,
+    secrets: &'a SecretsManager,
 }
 
 impl<'a> Executor<'a> {
@@ -80,6 +92,7 @@ impl<'a> Executor<'a> {
         drivers: &'a DriverRegistry,
         runtime: &'a dyn RuntimeManager,
         runtime_paths: RuntimePaths,
+        secrets: &'a SecretsManager,
     ) -> Self {
         Self {
             store: ExtensionStore::new(pool),
@@ -87,6 +100,7 @@ impl<'a> Executor<'a> {
             drivers,
             runtime,
             runtime_paths,
+            secrets,
         }
     }
 
@@ -108,6 +122,9 @@ impl<'a> Executor<'a> {
                 )
                 .await
             }
+            ExecutorAction::DeleteProvider { provider_id } => {
+                self.delete_provider(provider_id).await
+            }
             ExecutorAction::EnsureRuntimeRunning {
                 instance_id,
                 extension_id,
@@ -125,6 +142,9 @@ impl<'a> Executor<'a> {
                     aliases,
                 )
                 .await
+            }
+            ExecutorAction::RollbackRuntime { instance_id } => {
+                self.rollback_runtime(instance_id).await
             }
             ExecutorAction::HealthGate {
                 provider_id,
@@ -169,6 +189,10 @@ impl<'a> Executor<'a> {
         }
     }
 
+    pub async fn check_provider_health(&self, provider_id: Uuid) -> Result<()> {
+        self.health_gate_once(provider_id).await
+    }
+
     async fn ensure_instance_installed(
         &self,
         instance_id: Uuid,
@@ -192,6 +216,11 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    async fn delete_provider(&self, provider_id: Uuid) -> Result<()> {
+        self.store.delete_provider(provider_id).await?;
+        Ok(())
+    }
+
     async fn ensure_runtime_running(
         &self,
         instance_id: Uuid,
@@ -201,6 +230,20 @@ impl<'a> Executor<'a> {
         _networking: Option<ManifestNetworking>,
         aliases: Vec<String>,
     ) -> Result<()> {
+        let instance = self
+            .store
+            .get_instance(instance_id)
+            .await?
+            .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
+        let extension = self
+            .store
+            .get_extension(&extension_id)
+            .await?
+            .ok_or_else(|| anyhow!("extension {} not found", extension_id))?;
+        let desired_version = extension.version.clone();
+        let current_version = instance.runtime_version.clone();
+        let rollback_version = instance.rollback_version.clone();
+
         if runtime.r#type != "container" {
             bail!("runtime type '{}' is not supported yet", runtime.r#type);
         }
@@ -216,7 +259,9 @@ impl<'a> Executor<'a> {
             bail!("runtime network must be 'elixir_net'");
         }
 
-        let name = format!("elx-{}", short_instance_id(instance_id));
+        ensure_runtime_secrets_present(&self.store, instance_id, &runtime.env).await?;
+
+        let name = container_name(instance_id);
         let mut alias_list = aliases;
         if let Some(service_name) = runtime.service_name.clone() {
             if !alias_list.contains(&service_name) {
@@ -227,19 +272,10 @@ impl<'a> Executor<'a> {
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), instance_id.to_string());
         labels.insert("elixir.extension_id".to_string(), extension_id.clone());
+        labels.insert("elixir.extension_version".to_string(), desired_version.clone());
         labels.insert("elixir.managed".to_string(), "true".to_string());
 
-        let env = runtime
-            .env
-            .into_iter()
-            .map(|env| match env.value {
-                Some(value) => Ok(EnvVar {
-                    name: env.name,
-                    value,
-                }),
-                None => bail!("runtime.env '{}' requires secrets support", env.name),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let env = resolve_runtime_env(&self.store, self.secrets, instance_id, runtime.env).await?;
 
         let volumes = runtime
             .volumes
@@ -259,7 +295,7 @@ impl<'a> Executor<'a> {
             .collect();
 
         let spec = ContainerSpec {
-            name,
+            name: name.clone(),
             image,
             network,
             aliases: alias_list,
@@ -271,8 +307,123 @@ impl<'a> Executor<'a> {
         };
 
         self.runtime.ensure_network(&spec.network).await?;
+
+        let needs_upgrade = current_version.as_deref() != Some(desired_version.as_str());
+        if needs_upgrade {
+            let rollback_name = format!("{name}-rollback");
+            if let Some(handle) = self.runtime.get_container_handle(&rollback_name).await? {
+                let _ = self.runtime.stop_container(&handle).await;
+                let _ = self.runtime.remove_container(&handle).await;
+            }
+
+            let mut backup_created = false;
+            if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+                let _ = self.runtime.stop_container(&handle).await;
+                if let Err(err) = self.runtime.rename_container(&handle, &rollback_name).await {
+                    tracing::warn!(
+                        "upgrade: failed to rename container {} -> {}: {}",
+                        handle.name,
+                        rollback_name,
+                        err
+                    );
+                } else {
+                    backup_created = true;
+                }
+            }
+
+            if let Err(err) = self.runtime.ensure_container(&spec).await {
+                if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+                    let _ = self.runtime.remove_container(&handle).await;
+                }
+                if backup_created {
+                    let rollback_handle = ContainerHandle {
+                        id: rollback_name.clone(),
+                        name: rollback_name.clone(),
+                    };
+                    if let Err(rename_err) =
+                        self.runtime.rename_container(&rollback_handle, &name).await
+                    {
+                        tracing::warn!(
+                            "upgrade: failed to restore rollback container {}: {}",
+                            rollback_name,
+                            rename_err
+                        );
+                    } else {
+                        let _ = self
+                            .runtime
+                            .start_container(&ContainerHandle {
+                                id: name.clone(),
+                                name: name.clone(),
+                            })
+                            .await;
+                    }
+                }
+                return Err(err);
+            }
+
+            persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
+            let next_rollback = if backup_created {
+                current_version.as_deref().or(rollback_version.as_deref())
+            } else {
+                rollback_version.as_deref()
+            };
+            self.store
+                .update_instance_runtime_version(
+                    instance_id,
+                    &desired_version,
+                    next_rollback,
+                )
+                .await?;
+            return Ok(());
+        }
+
         self.runtime.ensure_container(&spec).await?;
         persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
+        if current_version.is_none() {
+            self.store
+                .update_instance_runtime_version(
+                    instance_id,
+                    &desired_version,
+                    rollback_version.as_deref(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_runtime(&self, instance_id: Uuid) -> Result<()> {
+        let instance = self
+            .store
+            .get_instance(instance_id)
+            .await?
+            .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
+        let rollback_version = instance
+            .rollback_version
+            .clone()
+            .ok_or_else(|| anyhow!("instance {} has no rollback version", instance_id))?;
+
+        let name = container_name(instance_id);
+        let rollback_name = format!("{name}-rollback");
+        let rollback_handle = self
+            .runtime
+            .get_container_handle(&rollback_name)
+            .await?
+            .ok_or_else(|| anyhow!("rollback container '{}' not found", rollback_name))?;
+
+        if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+            let _ = self.runtime.stop_container(&handle).await;
+            let _ = self.runtime.remove_container(&handle).await;
+        }
+
+        let renamed = self
+            .runtime
+            .rename_container(&rollback_handle, &name)
+            .await?;
+        self.runtime.start_container(&renamed).await?;
+
+        self.store
+            .update_instance_runtime_version(instance_id, &rollback_version, None)
+            .await?;
         Ok(())
     }
 
@@ -357,8 +508,22 @@ impl<'a> Executor<'a> {
         if provider.capability == "media.manager.tv"
             && provider.implementation.as_deref() == Some("sonarr")
         {
-            let api_key = resolve_sonarr_api_key(&self.store, &instance).await?;
+            let api_key = resolve_sonarr_api_key(&self.store, self.secrets, &instance).await?;
             secrets.insert("sonarr_api_key".to_string(), api_key);
+        }
+        if provider.capability == "indexer.registry"
+            && provider.implementation.as_deref() == Some("prowlarr")
+        {
+            let api_key = resolve_prowlarr_api_key(&self.store, self.secrets, &instance).await?;
+            secrets.insert("prowlarr_api_key".to_string(), api_key);
+        }
+        if provider.capability == "downloader.torrent"
+            && provider.implementation.as_deref() == Some("qbittorrent")
+        {
+            let (username, password) =
+                resolve_qbittorrent_credentials(&self.store, self.secrets, &instance).await?;
+            secrets.insert("qbittorrent_username".to_string(), username);
+            secrets.insert("qbittorrent_password".to_string(), password);
         }
 
         let ctx = DriverCtx::new(
@@ -473,7 +638,8 @@ impl<'a> Executor<'a> {
             let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
             if let Some(config_dir) = config.config_dir {
                 if let Some(key) = read_sonarr_api_key_from_config(&config_dir).await? {
-                    upsert_sonarr_secret(&self.store, provider.instance_id, &key).await?;
+                    upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key)
+                        .await?;
                     self.probe
                         .probe_dns(&endpoint.host)
                         .await
@@ -489,6 +655,30 @@ impl<'a> Executor<'a> {
                 }
             }
             bail!("sonarr config.xml not ready");
+        }
+        if provider.capability == "indexer.registry"
+            && provider.implementation.as_deref() == Some("prowlarr")
+        {
+            let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
+            if let Some(config_dir) = config.config_dir {
+                if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
+                    upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
+                        .await?;
+                    self.probe
+                        .probe_dns(&endpoint.host)
+                        .await
+                        .and_then(|result| ensure_probe_ok(result, "dns"))?;
+                    self.probe
+                        .probe_tcp(&endpoint.host, endpoint.port)
+                        .await
+                        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                    self.store
+                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            bail!("prowlarr config.xml not ready");
         }
 
         self.probe
@@ -508,11 +698,12 @@ impl<'a> Executor<'a> {
 
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
     let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
     if let Some(key) = config.api_key {
-        upsert_sonarr_secret(store, instance.instance_id, &key).await?;
+        upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
         return Ok(key);
     }
 
@@ -520,12 +711,12 @@ async fn resolve_sonarr_api_key(
         .get_secret(SecretScope::Instance, Some(instance.instance_id), "sonarr_api_key")
         .await?
     {
-        return Ok(secret.value_encrypted);
+        return secrets.decrypt(&secret.value_encrypted);
     }
 
     if let Some(config_dir) = config.config_dir {
         if let Some(key) = read_sonarr_api_key_from_config(&config_dir).await? {
-            upsert_sonarr_secret(store, instance.instance_id, &key).await?;
+            upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
             return Ok(key);
         }
     }
@@ -535,19 +726,139 @@ async fn resolve_sonarr_api_key(
 
 async fn upsert_sonarr_secret(
     store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
     instance_id: Uuid,
     api_key: &str,
 ) -> Result<()> {
+    let encrypted = secrets.encrypt(api_key)?;
     store
         .upsert_secret(&NewSecret {
             secret_id: Uuid::new_v4(),
             scope: SecretScope::Instance,
             scope_id: Some(instance_id),
             key: "sonarr_api_key".to_string(),
-            value_encrypted: api_key.to_string(),
+            value_encrypted: encrypted,
             rotatable: false,
         })
         .await
+}
+
+async fn resolve_prowlarr_api_key(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<String> {
+    let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
+    if let Some(key) = config.api_key {
+        upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
+        return Ok(key);
+    }
+
+    if let Some(secret) = store
+        .get_secret(SecretScope::Instance, Some(instance.instance_id), "prowlarr_api_key")
+        .await?
+    {
+        return secrets.decrypt(&secret.value_encrypted);
+    }
+
+    if let Some(config_dir) = config.config_dir {
+        if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
+            upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
+            return Ok(key);
+        }
+    }
+
+    bail!("prowlarr api key is not available yet");
+}
+
+async fn upsert_prowlarr_secret(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    api_key: &str,
+) -> Result<()> {
+    let encrypted = secrets.encrypt(api_key)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "prowlarr_api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await
+}
+
+async fn resolve_qbittorrent_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<(String, String)> {
+    let config = parse_qbittorrent_instance_config(instance.config_json.as_ref())?;
+    if let (Some(username), Some(password)) = (config.username, config.password) {
+        upsert_qbittorrent_secrets(store, secrets, instance.instance_id, &username, &password)
+            .await?;
+        return Ok((username, password));
+    }
+
+    let username = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance.instance_id),
+            "qbittorrent_username",
+        )
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+    let password = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance.instance_id),
+            "qbittorrent_password",
+        )
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok((username, password)),
+        _ => bail!("qbittorrent credentials are not available yet"),
+    }
+}
+
+async fn upsert_qbittorrent_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let encrypted_username = secrets.encrypt(username)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "qbittorrent_username".to_string(),
+            value_encrypted: encrypted_username,
+            rotatable: false,
+        })
+        .await?;
+    let encrypted_password = secrets.encrypt(password)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "qbittorrent_password".to_string(),
+            value_encrypted: encrypted_password,
+            rotatable: false,
+        })
+        .await?;
+    Ok(())
 }
 
 #[derive(Default, Deserialize)]
@@ -564,9 +875,41 @@ struct SonarrRuntimeConfig {
     config_dir: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+struct ProwlarrInstanceConfig {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    runtime: Option<ProwlarrRuntimeConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct ProwlarrRuntimeConfig {
+    #[serde(default)]
+    config_dir: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct QbittorrentInstanceConfig {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
 struct ParsedSonarrConfig {
     api_key: Option<String>,
     config_dir: Option<String>,
+}
+
+struct ParsedProwlarrConfig {
+    api_key: Option<String>,
+    config_dir: Option<String>,
+}
+
+struct ParsedQbittorrentConfig {
+    username: Option<String>,
+    password: Option<String>,
 }
 
 fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedSonarrConfig> {
@@ -584,17 +927,59 @@ fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<Par
     })
 }
 
+fn parse_prowlarr_instance_config(
+    value: Option<&serde_json::Value>,
+) -> Result<ParsedProwlarrConfig> {
+    let Some(value) = value else {
+        return Ok(ParsedProwlarrConfig {
+            api_key: None,
+            config_dir: None,
+        });
+    };
+    let config: ProwlarrInstanceConfig =
+        serde_json::from_value(value.clone()).context("parsing prowlarr instance config")?;
+    Ok(ParsedProwlarrConfig {
+        api_key: config.api_key,
+        config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
+    })
+}
+
+fn parse_qbittorrent_instance_config(
+    value: Option<&serde_json::Value>,
+) -> Result<ParsedQbittorrentConfig> {
+    let Some(value) = value else {
+        return Ok(ParsedQbittorrentConfig {
+            username: None,
+            password: None,
+        });
+    };
+    let config: QbittorrentInstanceConfig =
+        serde_json::from_value(value.clone()).context("parsing qbittorrent instance config")?;
+    Ok(ParsedQbittorrentConfig {
+        username: config.username,
+        password: config.password,
+    })
+}
+
 async fn read_sonarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
+    read_arr_api_key_from_config(config_dir).await
+}
+
+async fn read_prowlarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
+    read_arr_api_key_from_config(config_dir).await
+}
+
+async fn read_arr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
     let path = Path::new(config_dir).join("config.xml");
     let content = match fs::read_to_string(&path).await {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    parse_sonarr_api_key(&content)
+    parse_arr_api_key(&content)
 }
 
-fn parse_sonarr_api_key(xml: &str) -> Result<Option<String>> {
+fn parse_arr_api_key(xml: &str) -> Result<Option<String>> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut buf = Vec::new();
@@ -725,6 +1110,112 @@ fn ensure_provider_healthy(provider: &Provider) -> Result<()> {
     }
 }
 
+async fn ensure_runtime_secrets_present(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    env: &[ManifestRuntimeEnv],
+) -> Result<()> {
+    let required = required_secrets_from_runtime(env)?;
+    if required.is_empty() {
+        return Ok(());
+    }
+    let missing = missing_required_secrets_for_instance(store, instance_id, &required).await?;
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        bail!("missing required secrets: {}", missing.join(", "));
+    }
+}
+
+struct SecretReference {
+    scope: SecretScope,
+    scope_id: Option<Uuid>,
+    key: String,
+}
+
+fn parse_secret_reference(raw: &str, instance_id: Uuid) -> Result<SecretReference> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("from_secret value must not be empty");
+    }
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    match parts.as_slice() {
+        ["instance", key] => {
+            if key.trim().is_empty() {
+                bail!("from_secret instance key must not be empty");
+            }
+            Ok(SecretReference {
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: (*key).to_string(),
+            })
+        }
+        ["global", key] => {
+            if key.trim().is_empty() {
+                bail!("from_secret global key must not be empty");
+            }
+            Ok(SecretReference {
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: (*key).to_string(),
+            })
+        }
+        ["provider", provider_id, key] => {
+            if key.trim().is_empty() {
+                bail!("from_secret provider key must not be empty");
+            }
+            let scope_id = Uuid::parse_str(provider_id)
+                .map_err(|_| anyhow!("from_secret provider id is invalid"))?;
+            Ok(SecretReference {
+                scope: SecretScope::Provider,
+                scope_id: Some(scope_id),
+                key: (*key).to_string(),
+            })
+        }
+        _ => bail!(
+            "from_secret must be instance:<key>, global:<key>, or provider:<uuid>:<key>"
+        ),
+    }
+}
+
+async fn resolve_runtime_env(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    env: Vec<ManifestRuntimeEnv>,
+) -> Result<Vec<EnvVar>> {
+    let mut resolved = Vec::with_capacity(env.len());
+    for env in env {
+        let name = env.name.clone();
+        let value = match (env.value, env.from_secret) {
+            (Some(value), None) => value,
+            (None, Some(from_secret)) => {
+                let reference = parse_secret_reference(&from_secret, instance_id)?;
+                let secret = store
+                    .get_secret(reference.scope, reference.scope_id, &reference.key)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "secret '{}' not found for runtime.env '{}'",
+                            reference.key,
+                            name
+                        )
+                    })?;
+                secrets
+                    .decrypt(&secret.value_encrypted)
+                    .with_context(|| format!("decrypting secret for runtime.env '{name}'"))?
+            }
+            (Some(_), Some(_)) => bail!(
+                "runtime.env '{}' must not define both value and from_secret",
+                name
+            ),
+            (None, None) => bail!("runtime.env '{}' requires value or from_secret", name),
+        };
+        resolved.push(EnvVar { name, value });
+    }
+    Ok(resolved)
+}
+
 fn resolve_volume_mount(raw: &str, paths: &RuntimePaths) -> Result<VolumeMount> {
     let parts: Vec<&str> = raw.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
@@ -756,11 +1247,6 @@ fn resolve_placeholders(raw: &str, paths: &RuntimePaths) -> Result<String> {
     Ok(resolved)
 }
 
-fn short_instance_id(instance_id: Uuid) -> String {
-    let raw = instance_id.simple().to_string();
-    raw.chars().take(6).collect()
-}
-
 pub fn new_binding_id() -> Uuid {
     Uuid::new_v4()
 }
@@ -779,7 +1265,9 @@ mod tests {
     use crate::db::Database;
     use crate::db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality};
     use crate::extensions::store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider};
+    use crate::orchestrator::naming::container_name;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
+    use crate::secrets::SecretsManager;
 
     #[derive(Default)]
     struct StubProbe {
@@ -847,8 +1335,361 @@ mod tests {
             bail!("unexpected runtime call")
         }
 
+        async fn get_container_handle(&self, _name: &str) -> Result<Option<ContainerHandle>> {
+            Ok(None)
+        }
+
+        async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
         async fn stop_container(&self, _handle: &ContainerHandle) -> Result<()> {
             bail!("unexpected runtime call")
+        }
+
+        async fn rename_container(
+            &self,
+            _handle: &ContainerHandle,
+            _new_name: &str,
+        ) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn remove_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureRuntime {
+        spec: Mutex<Option<ContainerSpec>>,
+    }
+
+    impl CaptureRuntime {
+        fn last_spec(&self) -> Option<ContainerSpec> {
+            self.spec.lock().expect("capture runtime lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for CaptureRuntime {
+        async fn ensure_network(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
+            *self.spec.lock().expect("capture runtime lock") = Some(spec.clone());
+            Ok(ContainerHandle {
+                id: "capture".to_string(),
+                name: spec.name.clone(),
+            })
+        }
+
+        async fn get_container_handle(&self, _name: &str) -> Result<Option<ContainerHandle>> {
+            Ok(None)
+        }
+
+        async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn stop_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn rename_container(
+            &self,
+            _handle: &ContainerHandle,
+            _new_name: &str,
+        ) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn remove_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+    }
+
+    #[derive(Default)]
+    struct UpgradeState {
+        base_exists: bool,
+        rollback_exists: bool,
+    }
+
+    struct UpgradeRuntime {
+        calls: Mutex<Vec<String>>,
+        base_name: String,
+        state: Mutex<UpgradeState>,
+        fail_create: bool,
+    }
+
+    impl UpgradeRuntime {
+        fn new(base_name: String) -> Self {
+            Self::new_with_failure(base_name, true)
+        }
+
+        fn new_with_failure(base_name: String, fail_create: bool) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                base_name,
+                state: Mutex::new(UpgradeState {
+                    base_exists: true,
+                    rollback_exists: false,
+                }),
+                fail_create,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("upgrade runtime calls lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for UpgradeRuntime {
+        async fn ensure_network(&self, _name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push("ensure_network".to_string());
+            Ok(())
+        }
+
+        async fn ensure_container(&self, _spec: &ContainerSpec) -> Result<ContainerHandle> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push("ensure_container".to_string());
+            if self.fail_create {
+                bail!("create failed");
+            }
+            let mut state = self.state.lock().expect("upgrade runtime state lock");
+            state.base_exists = true;
+            Ok(ContainerHandle {
+                id: self.base_name.clone(),
+                name: self.base_name.clone(),
+            })
+        }
+
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push(format!("get:{name}"));
+            let state = self.state.lock().expect("upgrade runtime state lock");
+            if name == self.base_name && state.base_exists {
+                return Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }));
+            }
+            let rollback_name = format!("{}-rollback", self.base_name);
+            if name == rollback_name && state.rollback_exists {
+                return Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }));
+            }
+            Ok(None)
+        }
+
+        async fn start_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push(format!("start:{}", handle.name));
+            Ok(())
+        }
+
+        async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push(format!("stop:{}", handle.name));
+            Ok(())
+        }
+
+        async fn rename_container(
+            &self,
+            handle: &ContainerHandle,
+            new_name: &str,
+        ) -> Result<ContainerHandle> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push(format!("rename:{}->{new_name}", handle.name));
+            let mut state = self.state.lock().expect("upgrade runtime state lock");
+            let rollback_name = format!("{}-rollback", self.base_name);
+            if handle.name == self.base_name && new_name == rollback_name {
+                state.base_exists = false;
+                state.rollback_exists = true;
+            } else if handle.name == rollback_name && new_name == self.base_name {
+                state.rollback_exists = false;
+                state.base_exists = true;
+            }
+            Ok(ContainerHandle {
+                id: handle.id.clone(),
+                name: new_name.to_string(),
+            })
+        }
+
+        async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .push(format!("remove:{}", handle.name));
+            Ok(())
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+    }
+
+    #[derive(Default)]
+    struct RollbackState {
+        base_exists: bool,
+        rollback_exists: bool,
+    }
+
+    struct RollbackRuntime {
+        calls: Mutex<Vec<String>>,
+        base_name: String,
+        state: Mutex<RollbackState>,
+    }
+
+    impl RollbackRuntime {
+        fn new(base_name: String) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                base_name,
+                state: Mutex::new(RollbackState {
+                    base_exists: true,
+                    rollback_exists: true,
+                }),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("rollback runtime calls lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for RollbackRuntime {
+        async fn ensure_network(&self, _name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push("ensure_network".to_string());
+            Ok(())
+        }
+
+        async fn ensure_container(&self, _spec: &ContainerSpec) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push(format!("get:{name}"));
+            let state = self.state.lock().expect("rollback runtime state lock");
+            if name == self.base_name && state.base_exists {
+                return Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }));
+            }
+            let rollback_name = format!("{}-rollback", self.base_name);
+            if name == rollback_name && state.rollback_exists {
+                return Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }));
+            }
+            Ok(None)
+        }
+
+        async fn start_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push(format!("start:{}", handle.name));
+            Ok(())
+        }
+
+        async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push(format!("stop:{}", handle.name));
+            Ok(())
+        }
+
+        async fn rename_container(
+            &self,
+            handle: &ContainerHandle,
+            new_name: &str,
+        ) -> Result<ContainerHandle> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push(format!("rename:{}->{new_name}", handle.name));
+            let mut state = self.state.lock().expect("rollback runtime state lock");
+            let rollback_name = format!("{}-rollback", self.base_name);
+            if handle.name == rollback_name && new_name == self.base_name {
+                state.rollback_exists = false;
+                state.base_exists = true;
+            }
+            Ok(ContainerHandle {
+                id: handle.id.clone(),
+                name: new_name.to_string(),
+            })
+        }
+
+        async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .push(format!("remove:{}", handle.name));
+            let mut state = self.state.lock().expect("rollback runtime state lock");
+            if handle.name == self.base_name {
+                state.base_exists = false;
+            }
+            Ok(())
         }
 
         async fn container_logs(
@@ -917,6 +1758,33 @@ mod tests {
         })
     }
 
+    fn runtime_env_manifest(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": id,
+            "provides": [
+                {
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": "sonarr"
+                }
+            ],
+            "runtime": {
+                "type": "container",
+                "image": "example/runtime:latest",
+                "env": [
+                    {
+                        "name": "API_KEY",
+                        "from_secret": "instance:api_key"
+                    }
+                ]
+            }
+        })
+    }
+
     #[tokio::test]
     async fn sonarr_health_gate_reads_config_xml() -> Result<()> {
         let database = setup_db().await?;
@@ -977,12 +1845,14 @@ mod tests {
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
         let executor = Executor::new(
             &database.pool,
             &probe,
             &drivers,
             &runtime,
             runtime_paths,
+            &secrets,
         );
 
         executor.health_gate(provider_id, 5).await?;
@@ -997,11 +1867,475 @@ mod tests {
             .get_secret(SecretScope::Instance, Some(instance_id), "sonarr_api_key")
             .await?
             .expect("sonarr api key secret");
-        assert_eq!(secret.value_encrypted, "test-api-key");
+        let decrypted = secrets.decrypt(&secret.value_encrypted)?;
+        assert_eq!(decrypted, "test-api-key");
 
         let calls = probe.calls();
         assert!(calls.iter().any(|call| call == "dns:svc-sonarr"));
         assert!(calls.iter().any(|call| call == "tcp:svc-sonarr:8989"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_env_resolves_instance_secret() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.secret", runtime_env_manifest("ext.secret")).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.secret".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([3u8; 32], false);
+        let encrypted = secrets.encrypt("super-secret")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: "api_key".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: vec![ManifestRuntimeEnv {
+                name: "API_KEY".to_string(),
+                value: None,
+                from_secret: Some("instance:api_key".to_string()),
+            }],
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.secret".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await?;
+
+        let spec = runtime.last_spec().expect("container spec captured");
+        let env_value = spec
+            .env
+            .iter()
+            .find(|env| env.name == "API_KEY")
+            .map(|env| env.value.clone());
+        assert_eq!(env_value.as_deref(), Some("super-secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_env_rejects_plaintext_secret_in_prod() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.secret", runtime_env_manifest("ext.secret")).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.secret".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: "api_key".to_string(),
+                value_encrypted: "plaintext".to_string(),
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+
+        let secrets = SecretsManager::from_key_bytes([9u8; 32], false);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: vec![ManifestRuntimeEnv {
+                name: "API_KEY".to_string(),
+                value: None,
+                from_secret: Some("instance:api_key".to_string()),
+            }],
+        };
+
+        let err = executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.secret".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        let root = err.root_cause().to_string();
+        assert!(
+            root.contains("not encrypted"),
+            "unexpected error: {root}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_env_missing_instance_secret_fails_fast() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.secret", runtime_env_manifest("ext.secret")).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.secret".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], false);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: vec![ManifestRuntimeEnv {
+                name: "API_KEY".to_string(),
+                value: None,
+                from_secret: Some("instance:api_key".to_string()),
+            }],
+        };
+
+        let err = executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.secret".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing required secrets"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_upgrade_rolls_back_on_failed_create() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.upgrade", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.upgrade".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "0.9.0", None)
+            .await?;
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: Vec::new(),
+        };
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = UpgradeRuntime::new(container_name(instance_id));
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+
+        let secrets = SecretsManager::from_key_bytes([3u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let err = executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.upgrade".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("create failed"));
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("instance");
+        assert_eq!(instance.runtime_version.as_deref(), Some("0.9.0"));
+        assert!(instance.rollback_version.is_none());
+
+        let base_name = container_name(instance_id);
+        let rollback_name = format!("{base_name}-rollback");
+        let expected = vec![
+            "ensure_network".to_string(),
+            format!("get:{rollback_name}"),
+            format!("get:{base_name}"),
+            format!("stop:{base_name}"),
+            format!("rename:{base_name}->{rollback_name}"),
+            "ensure_container".to_string(),
+            format!("get:{base_name}"),
+            format!("rename:{rollback_name}->{base_name}"),
+            format!("start:{base_name}"),
+        ];
+        assert_eq!(runtime.calls(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_upgrade_updates_versions_and_sets_rollback() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.upgrade", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.upgrade".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "0.9.0", Some("0.8.0"))
+            .await?;
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: Vec::new(),
+        };
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = UpgradeRuntime::new_with_failure(container_name(instance_id), false);
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.upgrade".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await?;
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("instance");
+        assert_eq!(instance.runtime_version.as_deref(), Some("1.0.0"));
+        assert_eq!(instance.rollback_version.as_deref(), Some("0.9.0"));
+
+        let base_name = container_name(instance_id);
+        let rollback_name = format!("{base_name}-rollback");
+        let expected = vec![
+            "ensure_network".to_string(),
+            format!("get:{rollback_name}"),
+            format!("get:{base_name}"),
+            format!("stop:{base_name}"),
+            format!("rename:{base_name}->{rollback_name}"),
+            "ensure_container".to_string(),
+        ];
+        assert_eq!(runtime.calls(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_runtime_restores_previous_version() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.rollback", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.rollback".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.1.0", Some("1.0.0"))
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = RollbackRuntime::new(container_name(instance_id));
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([4u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor
+            .apply(ExecutorAction::RollbackRuntime { instance_id })
+            .await?;
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("instance");
+        assert_eq!(instance.runtime_version.as_deref(), Some("1.0.0"));
+        assert!(instance.rollback_version.is_none());
+
+        let base_name = container_name(instance_id);
+        let rollback_name = format!("{base_name}-rollback");
+        let expected = vec![
+            format!("get:{rollback_name}"),
+            format!("get:{base_name}"),
+            format!("stop:{base_name}"),
+            format!("remove:{base_name}"),
+            format!("rename:{rollback_name}->{base_name}"),
+            format!("start:{base_name}"),
+        ];
+        assert_eq!(runtime.calls(), expected);
         Ok(())
     }
 }

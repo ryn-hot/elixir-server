@@ -3,9 +3,11 @@ use sqlx::AnyPool;
 
 use crate::drivers::DriverRegistry;
 use crate::orchestrator::executor::{Executor, ExecutorAction};
+use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
 use crate::runtime::docker::DockerRuntimeManager;
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
 use crate::runtime::RuntimePaths;
+use crate::secrets::SecretsManager;
 
 #[derive(Clone)]
 pub struct OrchestratorService {
@@ -13,16 +15,23 @@ pub struct OrchestratorService {
     storage_root: String,
     runtime_paths: RuntimePaths,
     drivers: std::sync::Arc<DriverRegistry>,
+    secrets: std::sync::Arc<SecretsManager>,
 }
 
 impl OrchestratorService {
-    pub fn new(pool: AnyPool, storage_root: String, media_root: String) -> Self {
+    pub fn new(
+        pool: AnyPool,
+        storage_root: String,
+        media_root: String,
+        secrets: std::sync::Arc<SecretsManager>,
+    ) -> Self {
         let runtime_paths = RuntimePaths::from_roots(&storage_root, &media_root);
         Self {
             pool,
             storage_root,
             runtime_paths,
             drivers: std::sync::Arc::new(DriverRegistry::with_defaults()),
+            secrets,
         }
     }
 
@@ -30,6 +39,46 @@ impl OrchestratorService {
         let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
         let runtime = DockerRuntimeManager::new(None);
         self.apply_actions_with_probe(actions, &probe, &runtime).await
+    }
+
+    pub fn start_reconcile_loop(self: std::sync::Arc<Self>, config: ReconcileConfig) {
+        if config.interval.is_zero() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(config.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if let Err(err) = self.reconcile_once(&config).await {
+                    tracing::warn!("reconcile loop error: {}", err);
+                }
+            }
+        });
+    }
+
+    pub async fn reconcile_once(&self, config: &ReconcileConfig) -> Result<()> {
+        let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
+        let runtime = DockerRuntimeManager::new(None);
+        self.reconcile_once_with_probe(config, &probe, &runtime).await
+    }
+
+    pub(crate) async fn reconcile_once_with_probe(
+        &self,
+        config: &ReconcileConfig,
+        probe: &dyn ProbeRunner,
+        runtime: &dyn crate::runtime::RuntimeManager,
+    ) -> Result<()> {
+        let reconciler = Reconciler::new(
+            &self.pool,
+            probe,
+            runtime,
+            &self.drivers,
+            self.runtime_paths.clone(),
+            self.secrets.as_ref(),
+            config,
+        );
+        reconciler.run_once().await
     }
 
     pub(crate) async fn apply_actions_with_probe(
@@ -44,6 +93,7 @@ impl OrchestratorService {
             &self.drivers,
             runtime,
             self.runtime_paths.clone(),
+            self.secrets.as_ref(),
         );
         for action in actions {
             executor.apply(action).await?;
@@ -72,6 +122,7 @@ mod tests {
     };
     use crate::orchestrator::model::ProviderEndpoint;
     use crate::runtime::probe::{ProbeResult, ProbeRunner};
+    use crate::secrets::SecretsManager;
 
     #[derive(Clone, Default)]
     struct MockProbe {
@@ -209,10 +260,12 @@ mod tests {
             Some("elixir_net".to_string()),
         )?;
 
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
         let service = OrchestratorService::new(
             database.pool.clone(),
             "data/extensions".to_string(),
             "data/library".to_string(),
+            Arc::new(secrets),
         );
         let probe = MockProbe::default();
 

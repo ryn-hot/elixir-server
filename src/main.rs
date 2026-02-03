@@ -13,6 +13,7 @@ mod metrics;
 mod network;
 mod playback;
 mod runtime;
+mod secrets;
 mod state;
 mod telemetry;
 
@@ -21,12 +22,15 @@ use crate::artwork::ArtworkService;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
+use crate::extensions::registry::start_registry_refresh_loop;
 use crate::http::router;
 use crate::library::start_periodic_scan;
 use crate::library::LinkerService;
 use crate::metadata::MetadataService;
 use crate::network::{start_mdns, wan::start_wan_tasks};
 use crate::playback::start_session_cleanup;
+use crate::orchestrator::reconcile::ReconcileConfig;
+use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
 use std::sync::atomic::Ordering;
@@ -82,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         settings.metadata.request_timeout_seconds,
     )
     .context("failed to initialize artwork cache")?;
+    let secrets = SecretsManager::from_settings(&settings)
+        .context("failed to initialize secrets manager")?;
 
     let addr = settings
         .server
@@ -96,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         metadata,
         linkers,
         artwork,
+        secrets,
     );
     let app = router(state.clone());
 
@@ -103,6 +110,26 @@ async fn main() -> anyhow::Result<()> {
     let scan_interval = settings.library.scan_interval_seconds;
     let scan_state = state.clone();
     tokio::spawn(async move { start_periodic_scan(scan_state, scan_interval).await });
+
+    // Start extensions reconcile loop.
+    let reconcile_config = ReconcileConfig::from_settings(&settings);
+    state
+        .orchestrator
+        .clone()
+        .start_reconcile_loop(reconcile_config);
+
+    // Refresh extension registries on an interval.
+    let registries = settings.extensions.registries.clone();
+    let storage_root = settings.extensions.storage_root.clone();
+    let registry_interval = settings.extensions.registry_refresh_interval_seconds;
+    tokio::spawn(async move {
+        start_registry_refresh_loop(
+            registries,
+            storage_root,
+            std::time::Duration::from_secs(registry_interval),
+        )
+        .await;
+    });
 
     // Announce via mDNS if enabled; keep guard alive for process lifetime.
     let _mdns_guard = if state.settings.network.mdns_enabled {

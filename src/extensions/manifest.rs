@@ -49,6 +49,12 @@ impl ExtensionManifest {
         ensure_non_empty(&self.version, "version")?;
         ensure_non_empty(&self.name, "name")?;
 
+        for permission in &self.permissions {
+            if permission.trim().is_empty() {
+                bail!("manifest permissions must be non-empty");
+            }
+        }
+
         for provide in &self.provides {
             ensure_non_empty(&provide.capability, "provides.capability")?;
             ensure_non_empty(&provide.slot, "provides.slot")?;
@@ -108,6 +114,14 @@ impl ExtensionManifest {
                 ensure_non_empty(&env.name, "runtime.env.name")?;
                 if env.value.is_none() && env.from_secret.is_none() {
                     bail!("runtime.env entry must include value or from_secret");
+                }
+                if env.value.is_some() && env.from_secret.is_some() {
+                    bail!("runtime.env entry must not include both value and from_secret");
+                }
+                if let Some(from_secret) = env.from_secret.as_ref() {
+                    if from_secret.trim().is_empty() {
+                        bail!("runtime.env from_secret must not be empty");
+                    }
                 }
             }
         }

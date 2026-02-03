@@ -279,8 +279,47 @@ impl RuntimeManager for DockerRuntimeManager {
         self.create_container(spec).await
     }
 
+    async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+        if let Some(id) = self.find_container_id(name).await? {
+            return Ok(Some(ContainerHandle {
+                id,
+                name: name.to_string(),
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn start_container(&self, handle: &ContainerHandle) -> Result<()> {
+        let args = vec!["start".to_string(), handle.name.clone()];
+        self.run_capture(&args).await?;
+        Ok(())
+    }
+
     async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
         let args = vec!["stop".to_string(), handle.name.clone()];
+        self.run_capture(&args).await?;
+        Ok(())
+    }
+
+    async fn rename_container(
+        &self,
+        handle: &ContainerHandle,
+        new_name: &str,
+    ) -> Result<ContainerHandle> {
+        let args = vec![
+            "rename".to_string(),
+            handle.name.clone(),
+            new_name.to_string(),
+        ];
+        self.run_capture(&args).await?;
+        Ok(ContainerHandle {
+            id: handle.id.clone(),
+            name: new_name.to_string(),
+        })
+    }
+
+    async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
+        let args = vec!["rm".to_string(), "-f".to_string(), handle.name.clone()];
         self.run_capture(&args).await?;
         Ok(())
     }

@@ -6,6 +6,9 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use base64::{Engine as _, engine::general_purpose};
+use rand::{RngCore, rngs::OsRng};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
@@ -14,32 +17,44 @@ use crate::config::RunEnvironment;
 use crate::db::models::{
     Binding, Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel, OperationStep,
     OperationStepStatus, OrchestratorRun, OrchestratorRunStatus, Provider, ProviderHealthState,
-    RuntimeLog,
+    RuntimeLog, Secret, SecretScope, DesiredBlueprint,
 };
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
     unpack_package, verify_signature,
 };
-use crate::extensions::registry::{RegistryClient, RegistryEntry, merge_indexes};
+use crate::extensions::permissions::PermissionPolicy;
+use crate::extensions::required_secrets::{
+    missing_required_secrets_for_instance, missing_required_secrets_for_instances,
+    required_secrets_from_manifest,
+};
+use crate::extensions::registry::{
+    RegistryCacheStore, RegistryClient, RegistryEntry, RegistryFetchError,
+    refresh_registry_cache,
+};
 use crate::extensions::store::{
-    ExtensionStore, NewExtension, NewExtensionInstance, NewOperationStep, NewOrchestratorRun,
+    ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance, NewOperationStep,
+    NewOrchestratorRun, NewSecret,
 };
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
-use crate::orchestrator::planner::{Plan, Planner};
+use crate::orchestrator::plan_validation::{
+    has_unresolved_conflicts, missing_required_secrets_for_plan,
+};
+use crate::orchestrator::planner::{
+    Plan, PlanAction, PlanDecisions, Planner, SlotConflictResolution,
+};
+use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
 pub struct CatalogResponse {
     pub installed: Vec<Extension>,
     pub available: Vec<RegistryEntry>,
-    pub registry_errors: Vec<RegistryError>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RegistryError {
-    pub url: String,
-    pub error: String,
+    pub registry_errors: Vec<RegistryFetchError>,
+    pub last_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_refresh_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_refresh_error: Option<RegistryFetchError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,10 +118,75 @@ pub struct RunsQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DesiredBlueprintsQuery {
+    pub applied: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunDetailResponse {
     pub run: OrchestratorRun,
     pub steps: Vec<OperationStep>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileRunResponse {
+    pub run: Option<OrchestratorRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DesiredBlueprintsClearResponse {
+    pub deleted: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretsQuery {
+    pub scope: Option<String>,
+    pub scope_id: Option<String>,
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSecretRequest {
+    pub scope: String,
+    pub scope_id: Option<String>,
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub rotatable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSecretRequest {
+    pub value: Option<String>,
+    pub rotatable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateSecretRequest {
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretResponse {
+    pub secret_id: Uuid,
+    pub scope: SecretScope,
+    pub scope_id: Option<Uuid>,
+    pub key: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub rotatable: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateSecretResponse {
+    pub secret_id: Uuid,
+    pub value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +205,21 @@ pub async fn apply_blueprint(
     let planner = Planner::new();
     let plan = planner
         .plan_blueprint(&store, payload.blueprint_id, payload.params)
+        .await
+        .map_err(ApiError::from)?;
+    let blueprint = store
+        .get_extension(&plan.blueprint_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id: plan.plan_id,
+            blueprint_extension_id: blueprint.extension_id.clone(),
+            blueprint_version: blueprint.version.clone(),
+            params_json: plan.params.clone(),
+            decisions_json: None,
+        })
         .await
         .map_err(ApiError::from)?;
     let plan_json = serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
@@ -148,9 +243,17 @@ pub struct PlanRunResponse {
     pub status: OrchestratorRunStatus,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmPlanRequest {
+    #[serde(default)]
+    pub decisions: Option<PlanDecisions>,
+}
+
 pub async fn confirm_plan(
     State(state): State<AppState>,
     Path(plan_id): Path<String>,
+    payload: Option<Json<ConfirmPlanRequest>>,
 ) -> ApiResult<Json<PlanRunResponse>> {
     let run_id =
         Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
@@ -173,9 +276,67 @@ pub async fn confirm_plan(
     let plan: Plan = serde_json::from_value(plan_json)
         .map_err(|err| ApiError::bad_request(format!("invalid plan payload: {err}")))?;
 
-    if !plan.conflicts.is_empty() {
+    let decisions = payload.and_then(|payload| payload.decisions.clone());
+    if let Some(decisions) = decisions.as_ref() {
+        if decisions
+            .slot_conflicts
+            .iter()
+            .any(|decision| matches!(decision.action, SlotConflictResolution::Abort))
+        {
+            return Err(ApiError::conflict("plan confirmation aborted"));
+        }
+    }
+
+    let plan = if let Some(decisions) = decisions.as_ref() {
+        let planner = Planner::new();
+        let mut resolved = planner
+            .plan_blueprint_with_decisions(
+                &store,
+                plan.blueprint_id.clone(),
+                plan.params.clone(),
+                Some(decisions),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        resolved.plan_id = run_id;
+        let plan_json =
+            serde_json::to_value(&resolved).map_err(|err| ApiError::internal(err.to_string()))?;
+        store
+            .update_run_plan(run_id, plan_json)
+            .await
+            .map_err(ApiError::from)?;
+        resolved
+    } else {
+        plan
+    };
+
+    let missing = missing_required_secrets_for_plan(&store, &plan.actions)
+        .await
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !missing.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "missing required secrets: {}",
+            missing.join(", ")
+        )));
+    }
+
+    if has_unresolved_conflicts(&plan.conflicts) {
         return Err(ApiError::conflict("plan has unresolved conflicts"));
     }
+
+    let decisions_json = decisions
+        .as_ref()
+        .map(|value| serde_json::to_value(value))
+        .transpose()
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    store
+        .update_desired_decisions(run_id, decisions_json)
+        .await
+        .map_err(ApiError::from)?;
+    store
+        .mark_desired_applied(run_id, true)
+        .await
+        .map_err(ApiError::from)?;
 
     let mut steps = Vec::with_capacity(plan.actions.len());
     for (index, action) in plan.actions.iter().enumerate() {
@@ -266,33 +427,67 @@ pub async fn cancel_plan(
 }
 
 pub async fn catalog(State(state): State<AppState>) -> ApiResult<Json<CatalogResponse>> {
+    let response = build_catalog(&state, false).await?;
+    Ok(Json(response))
+}
+
+pub async fn refresh_catalog(State(state): State<AppState>) -> ApiResult<Json<CatalogResponse>> {
+    let response = build_catalog(&state, true).await?;
+    Ok(Json(response))
+}
+
+async fn build_catalog(state: &AppState, force_refresh: bool) -> Result<CatalogResponse, ApiError> {
     let store = ExtensionStore::new(&state.db_pool);
     let installed = store.list_extensions().await.map_err(ApiError::from)?;
 
-    let mut registry_errors = Vec::new();
-    let mut available = Vec::new();
-    if !state.settings.extensions.registries.is_empty() {
-        let client = RegistryClient::new(Duration::from_secs(10))
-            .map_err(|err| ApiError::internal(err.to_string()))?;
-        let mut indexes = Vec::new();
-        for url in &state.settings.extensions.registries {
-            match client.fetch(url).await {
-                Ok(index) => indexes.push(index),
-                Err(err) => registry_errors.push(RegistryError {
-                    url: url.clone(),
-                    error: err.to_string(),
-                }),
-            }
-        }
-        let merged = merge_indexes(indexes);
-        available = merged.extensions;
+    if state.settings.extensions.registries.is_empty() {
+        return Ok(CatalogResponse {
+            installed,
+            available: Vec::new(),
+            registry_errors: Vec::new(),
+            last_refreshed_at: None,
+            last_refresh_success_at: None,
+            last_refresh_error: None,
+        });
     }
 
-    Ok(Json(CatalogResponse {
+    let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+    let cache_store = RegistryCacheStore::new(storage_paths.registry_cache_dir.clone());
+    let cache = cache_store.load().await.map_err(ApiError::from)?;
+    let needs_refresh = force_refresh
+        || cache
+            .as_ref()
+            .map(|cache| cache.registry_urls != state.settings.extensions.registries)
+            .unwrap_or(true);
+
+    let cache = if needs_refresh {
+        refresh_registry_cache(
+            &state.settings.extensions.registries,
+            Duration::from_secs(10),
+            &cache_store,
+        )
+        .await
+        .map_err(ApiError::from)?
+    } else if let Some(cache) = cache {
+        cache
+    } else {
+        refresh_registry_cache(
+            &state.settings.extensions.registries,
+            Duration::from_secs(10),
+            &cache_store,
+        )
+        .await
+        .map_err(ApiError::from)?
+    };
+
+    Ok(CatalogResponse {
         installed,
-        available,
-        registry_errors,
-    }))
+        available: cache.index.extensions,
+        registry_errors: cache.registry_errors,
+        last_refreshed_at: Some(cache.fetched_at),
+        last_refresh_success_at: cache.last_success_at,
+        last_refresh_error: cache.last_error,
+    })
 }
 
 pub async fn get_extension(
@@ -450,6 +645,44 @@ pub async fn install_extension(
     let publisher_name = publisher.as_ref().map(|publisher| publisher.name.clone());
     let signing_key_id = publisher_key_id.take().map(|value| value.to_string());
 
+    let policy = PermissionPolicy::new();
+    policy
+        .enforce(trust_level, &manifest.permissions, &manifest.id)
+        .map_err(|err| ApiError::forbidden(err.to_string()))?;
+
+    let new_version = Version::parse(&manifest.version)
+        .map_err(|_| ApiError::bad_request("extension version is not valid semver"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    if let Some(existing) = store
+        .get_extension(&manifest.id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        validate_semver_upgrade(&existing, &new_version, package_hash.as_deref())?;
+    }
+    let required = required_secrets_from_manifest(&manifest)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !required.is_empty() {
+        let instances = store
+            .list_instances(Some(&manifest.id))
+            .await
+            .map_err(ApiError::from)?;
+        let instance_ids: Vec<_> = instances
+            .into_iter()
+            .filter(|instance| instance.enabled)
+            .map(|instance| instance.instance_id)
+            .collect();
+        let missing = missing_required_secrets_for_instances(&store, &instance_ids, &required)
+            .await
+            .map_err(ApiError::from)?;
+        if !missing.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "missing required secrets: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
     let extension_id = manifest.id;
     let name = manifest.name;
     let version = manifest.version;
@@ -469,7 +702,6 @@ pub async fn install_extension(
         .await
         .map_err(|err| ApiError::internal(err.to_string()))?;
 
-    let store = ExtensionStore::new(&state.db_pool);
     store
         .upsert_extension(&NewExtension {
             extension_id: extension_id.clone(),
@@ -501,6 +733,44 @@ pub async fn enable_extension(
     Path(extension_id): Path<String>,
 ) -> ApiResult<Json<Extension>> {
     let store = ExtensionStore::new(&state.db_pool);
+    let extension = store
+        .get_extension(&extension_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("extension not found"))?;
+    let manifest: crate::extensions::manifest::ExtensionManifest =
+        serde_json::from_value(extension.manifest_json.clone())
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if let Err(err) = manifest.validate() {
+        return Err(ApiError::bad_request(err.to_string()));
+    }
+    let policy = PermissionPolicy::new();
+    policy
+        .enforce(extension.trust_level, &manifest.permissions, &extension.extension_id)
+        .map_err(|err| ApiError::forbidden(err.to_string()))?;
+    let required = required_secrets_from_manifest(&manifest)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !required.is_empty() {
+        let instances = store
+            .list_instances(Some(&extension.extension_id))
+            .await
+            .map_err(ApiError::from)?;
+        let instance_ids: Vec<_> = instances
+            .into_iter()
+            .filter(|instance| instance.enabled)
+            .map(|instance| instance.instance_id)
+            .collect();
+        let missing = missing_required_secrets_for_instances(&store, &instance_ids, &required)
+            .await
+            .map_err(ApiError::from)?;
+        if !missing.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "missing required secrets: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
     store
         .set_extension_enabled(&extension_id, true)
         .await
@@ -625,6 +895,38 @@ pub async fn update_instance(
             .map_err(ApiError::from)?;
     }
     if let Some(enabled) = payload.enabled {
+        if enabled {
+            let instance = store
+                .get_instance(instance_id)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| ApiError::not_found("instance not found"))?;
+            let extension = store
+                .get_extension(&instance.extension_id)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| ApiError::not_found("extension not found"))?;
+            let manifest: crate::extensions::manifest::ExtensionManifest =
+                serde_json::from_value(extension.manifest_json.clone())
+                    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            if let Err(err) = manifest.validate() {
+                return Err(ApiError::bad_request(err.to_string()));
+            }
+            let required = required_secrets_from_manifest(&manifest)
+                .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            if !required.is_empty() {
+                let missing =
+                    missing_required_secrets_for_instance(&store, instance_id, &required)
+                        .await
+                        .map_err(ApiError::from)?;
+                if !missing.is_empty() {
+                    return Err(ApiError::bad_request(format!(
+                        "missing required secrets: {}",
+                        missing.join(", ")
+                    )));
+                }
+            }
+        }
         store
             .set_instance_enabled(instance_id, enabled)
             .await
@@ -637,6 +939,79 @@ pub async fn update_instance(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("instance not found"))?;
     Ok(Json(instance))
+}
+
+pub async fn delete_instance(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let instance_id =
+        Uuid::parse_str(&instance_id).map_err(|_| ApiError::bad_request("invalid instance id"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let instance = store
+        .get_instance(instance_id)
+        .await
+        .map_err(ApiError::from)?;
+    if instance.is_none() {
+        return Err(ApiError::not_found("instance not found"));
+    }
+
+    store
+        .delete_secrets_by_scope(SecretScope::Instance, Some(instance_id))
+        .await
+        .map_err(ApiError::from)?;
+    store
+        .delete_instance(instance_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+pub async fn rollback_instance(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> ApiResult<Json<Plan>> {
+    let instance_id =
+        Uuid::parse_str(&instance_id).map_err(|_| ApiError::bad_request("invalid instance id"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let instance = store
+        .get_instance(instance_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("instance not found"))?;
+
+    let blueprint_id = format!(
+        "rollback:{}:{}",
+        instance.extension_id, instance.instance_name
+    );
+    let mut plan = Plan::new(blueprint_id, None);
+    plan.actions
+        .push(PlanAction::RollbackRuntime { instance_id });
+
+    if instance.rollback_version.is_none() {
+        plan.conflicts.push(serde_json::json!({
+            "code": "rollback_unavailable",
+            "extension_id": instance.extension_id,
+            "instance_id": instance.instance_id,
+            "instance_name": instance.instance_name,
+            "detail": "no rollback version recorded for instance"
+        }));
+    }
+
+    let plan_json = serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: plan.plan_id,
+            status: OrchestratorRunStatus::Pending,
+            phase: Some("planned".to_string()),
+            plan_json: Some(plan_json),
+            error: None,
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(plan))
 }
 
 pub async fn graph(State(state): State<AppState>) -> ApiResult<Json<GraphResponse>> {
@@ -691,6 +1066,222 @@ pub async fn runtime_logs(
     Ok(Json(RuntimeLogsResponse { instance_id, logs }))
 }
 
+pub async fn list_secrets(
+    State(state): State<AppState>,
+    Query(query): Query<SecretsQuery>,
+) -> ApiResult<Json<Vec<SecretResponse>>> {
+    let store = ExtensionStore::new(&state.db_pool);
+
+    let scope = match query.scope.as_deref() {
+        Some(value) => Some(parse_secret_scope(value)?),
+        None => None,
+    };
+    if scope.is_none() && query.scope_id.is_some() {
+        return Err(ApiError::bad_request("scope is required when scope_id is provided"));
+    }
+    let scope_id = match (scope, query.scope_id.as_deref()) {
+        (Some(scope), Some(raw)) => parse_scope_id(scope, Some(raw), false)?,
+        (Some(scope), None) => parse_scope_id(scope, None, false)?,
+        (None, None) => None,
+        (None, Some(_)) => None,
+    };
+
+    let secrets = store
+        .list_secrets(scope, scope_id, query.key.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    let response = secrets.into_iter().map(secret_response).collect();
+    Ok(Json(response))
+}
+
+pub async fn get_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+) -> ApiResult<Json<SecretResponse>> {
+    let secret_id =
+        Uuid::parse_str(&secret_id).map_err(|_| ApiError::bad_request("invalid secret id"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let secret = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("secret not found"))?;
+    Ok(Json(secret_response(secret)))
+}
+
+pub async fn create_secret(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateSecretRequest>,
+) -> ApiResult<Json<SecretResponse>> {
+    if payload.key.trim().is_empty() {
+        return Err(ApiError::bad_request("secret key is required"));
+    }
+    let (scope, scope_id) = parse_scope_and_id(&payload.scope, payload.scope_id.as_deref(), true)?;
+
+    let store = ExtensionStore::new(&state.db_pool);
+    if store
+        .get_secret(scope, scope_id, &payload.key)
+        .await
+        .map_err(ApiError::from)?
+        .is_some()
+    {
+        return Err(ApiError::conflict("secret already exists"));
+    }
+
+    let encrypted = state
+        .secrets
+        .encrypt(&payload.value)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    let secret_id = Uuid::new_v4();
+    store
+        .upsert_secret(&NewSecret {
+            secret_id,
+            scope,
+            scope_id,
+            key: payload.key,
+            value_encrypted: encrypted,
+            rotatable: payload.rotatable.unwrap_or(false),
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    let secret = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::internal("secret lookup failed"))?;
+    Ok(Json(secret_response(secret)))
+}
+
+pub async fn update_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    Json(payload): Json<UpdateSecretRequest>,
+) -> ApiResult<Json<SecretResponse>> {
+    let secret_id =
+        Uuid::parse_str(&secret_id).map_err(|_| ApiError::bad_request("invalid secret id"))?;
+    if payload.value.is_none() && payload.rotatable.is_none() {
+        return Err(ApiError::bad_request("value or rotatable is required"));
+    }
+    let store = ExtensionStore::new(&state.db_pool);
+    let existing = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("secret not found"))?;
+
+    let value_encrypted = if let Some(value) = payload.value.as_deref() {
+        state
+            .secrets
+            .encrypt(value)
+            .map_err(|err| ApiError::internal(err.to_string()))?
+    } else {
+        existing.value_encrypted.clone()
+    };
+    let rotatable = payload.rotatable.unwrap_or(existing.rotatable);
+
+    store
+        .update_secret(secret_id, &value_encrypted, rotatable)
+        .await
+        .map_err(ApiError::from)?;
+
+    let updated = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::internal("secret lookup failed"))?;
+    Ok(Json(secret_response(updated)))
+}
+
+pub async fn rotate_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    Json(payload): Json<RotateSecretRequest>,
+) -> ApiResult<Json<RotateSecretResponse>> {
+    let secret_id =
+        Uuid::parse_str(&secret_id).map_err(|_| ApiError::bad_request("invalid secret id"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let secret = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("secret not found"))?;
+    if !secret.rotatable {
+        return Err(ApiError::conflict("secret is not rotatable"));
+    }
+
+    let value = match payload.value {
+        Some(value) => value,
+        None => {
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            general_purpose::STANDARD.encode(bytes)
+        }
+    };
+    let encrypted = state
+        .secrets
+        .encrypt(&value)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    store
+        .update_secret(secret_id, &encrypted, secret.rotatable)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(RotateSecretResponse { secret_id, value }))
+}
+
+pub async fn delete_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let secret_id =
+        Uuid::parse_str(&secret_id).map_err(|_| ApiError::bad_request("invalid secret id"))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let exists = store
+        .get_secret_by_id(secret_id)
+        .await
+        .map_err(ApiError::from)?
+        .is_some();
+    if !exists {
+        return Err(ApiError::not_found("secret not found"));
+    }
+    store
+        .delete_secret(secret_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+pub async fn reconcile_now(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ReconcileRunResponse>> {
+    let config = ReconcileConfig::from_settings(&state.settings);
+    state
+        .orchestrator
+        .reconcile_once(&config)
+        .await
+        .map_err(ApiError::from)?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let run = store
+        .get_latest_run_by_phase("reconcile")
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ReconcileRunResponse { run }))
+}
+
+pub async fn reconcile_latest(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ReconcileRunResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let run = store
+        .get_latest_run_by_phase("reconcile")
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ReconcileRunResponse { run }))
+}
+
 pub async fn list_runs(
     State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
@@ -698,6 +1289,30 @@ pub async fn list_runs(
     let store = ExtensionStore::new(&state.db_pool);
     let runs = store.list_runs(query.limit).await.map_err(ApiError::from)?;
     Ok(Json(runs))
+}
+
+pub async fn list_desired_blueprints(
+    State(state): State<AppState>,
+    Query(query): Query<DesiredBlueprintsQuery>,
+) -> ApiResult<Json<Vec<DesiredBlueprint>>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let desired = store
+        .list_desired_blueprints(query.applied)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(desired))
+}
+
+pub async fn clear_desired_blueprints(
+    State(state): State<AppState>,
+    Query(query): Query<DesiredBlueprintsQuery>,
+) -> ApiResult<Json<DesiredBlueprintsClearResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let deleted = store
+        .delete_desired_blueprints(query.applied)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(DesiredBlueprintsClearResponse { deleted }))
 }
 
 pub async fn run_detail(
@@ -721,6 +1336,7 @@ struct ExtensionStoragePaths {
     packages_dir: PathBuf,
     unpacked_dir: PathBuf,
     tmp_dir: PathBuf,
+    registry_cache_dir: PathBuf,
 }
 
 impl ExtensionStoragePaths {
@@ -731,6 +1347,7 @@ impl ExtensionStoragePaths {
             packages_dir: root.join("packages"),
             unpacked_dir: root.join("unpacked"),
             tmp_dir: root.join("tmp"),
+            registry_cache_dir: root.join("registry-cache"),
         }
     }
 
@@ -739,6 +1356,7 @@ impl ExtensionStoragePaths {
         fs::create_dir_all(&self.packages_dir).await?;
         fs::create_dir_all(&self.unpacked_dir).await?;
         fs::create_dir_all(&self.tmp_dir).await?;
+        fs::create_dir_all(&self.registry_cache_dir).await?;
         Ok(())
     }
 }
@@ -762,6 +1380,86 @@ fn map_unique_violation(err: anyhow::Error, message: &str) -> ApiError {
         return ApiError::conflict(message);
     }
     ApiError::internal(details)
+}
+
+fn validate_semver_upgrade(
+    existing: &Extension,
+    new_version: &Version,
+    package_hash: Option<&str>,
+) -> ApiResult<()> {
+    let existing_version = Version::parse(&existing.version)
+        .map_err(|_| ApiError::bad_request("existing extension version is not valid semver"))?;
+    if new_version < &existing_version {
+        return Err(ApiError::bad_request(
+            "extension version downgrade is not allowed",
+        ));
+    }
+    if new_version == &existing_version {
+        if let (Some(existing_hash), Some(new_hash)) =
+            (existing.package_hash.as_deref(), package_hash)
+        {
+            if existing_hash.eq_ignore_ascii_case(new_hash) {
+                return Ok(());
+            }
+        }
+        return Err(ApiError::bad_request(
+            "extension version is already installed",
+        ));
+    }
+    Ok(())
+}
+
+fn secret_response(secret: Secret) -> SecretResponse {
+    SecretResponse {
+        secret_id: secret.secret_id,
+        scope: secret.scope,
+        scope_id: secret.scope_id,
+        key: secret.key,
+        created_at: secret.created_at,
+        rotatable: secret.rotatable,
+    }
+}
+
+fn parse_secret_scope(raw: &str) -> ApiResult<SecretScope> {
+    raw.parse()
+        .map_err(|_| ApiError::bad_request("invalid secret scope"))
+}
+
+fn parse_scope_id(
+    scope: SecretScope,
+    scope_id: Option<&str>,
+    require_id: bool,
+) -> ApiResult<Option<Uuid>> {
+    match scope {
+        SecretScope::Global => {
+            if scope_id.is_some() {
+                return Err(ApiError::bad_request("global secrets do not use scope_id"));
+            }
+            Ok(None)
+        }
+        SecretScope::Instance | SecretScope::Provider => match scope_id {
+            Some(value) => Uuid::parse_str(value)
+                .map(Some)
+                .map_err(|_| ApiError::bad_request("invalid scope_id")),
+            None => {
+                if require_id {
+                    Err(ApiError::bad_request("scope_id is required for this scope"))
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+    }
+}
+
+fn parse_scope_and_id(
+    scope: &str,
+    scope_id: Option<&str>,
+    require_id: bool,
+) -> ApiResult<(SecretScope, Option<Uuid>)> {
+    let scope = parse_secret_scope(scope)?;
+    let scope_id = parse_scope_id(scope, scope_id, require_id)?;
+    Ok((scope, scope_id))
 }
 
 async fn copy_dir_recursive(
