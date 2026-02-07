@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep};
 use tower::ServiceExt;
 use uuid::Uuid;
 use zip::{ZipWriter, write::FileOptions};
@@ -37,7 +38,10 @@ use crate::{
         ServerConfig, Settings, TelemetryConfig,
     },
     db::Database,
-    db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SecretScope, SlotCardinality},
+    db::models::{
+        ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus, ProviderHealthState, SecretScope,
+        SlotCardinality,
+    },
     extensions::ExtensionManager,
     extensions::ExternalIds,
     extensions::FileDescriptor,
@@ -45,14 +49,15 @@ use crate::{
     extensions::MediaIdentity,
     extensions::package::compute_sha256,
     extensions::store::{
-        ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance, NewProvider,
-        NewSecret,
+        ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
+        NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
     library::normalize_override_key,
     library::run_full_scan,
     metadata::MetadataService,
+    orchestrator::planner::{Plan, Planner},
     state::AppState,
     secrets::SecretsManager,
 };
@@ -3017,6 +3022,239 @@ async fn extensions_reconcile_now_and_latest() -> Result<()> {
         .and_then(Value::as_str)
         .expect("latest run_id");
     assert_eq!(latest_run_id, run_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_auto_wire_status_default() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let status_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/auto-wire")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(status_resp.status(), StatusCode::OK);
+    let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
+    let status_json: Value = serde_json::from_slice(&status_body)?;
+    assert_eq!(status_json.get("enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(status_json.get("pendingPlanId"), Some(&Value::Null));
+    assert_eq!(status_json.get("pendingReason"), Some(&Value::Null));
+    assert_eq!(status_json.get("pendingConflicts"), Some(&Value::Null));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_auto_wire_status_and_plan_pending() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let db_pool = database.pool.clone();
+    let store = ExtensionStore::new(&db_pool);
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let plan_id = Uuid::new_v4();
+    let instance_id = Uuid::new_v4();
+    let plan = Plan {
+        plan_id,
+        blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
+        params: None,
+        actions: Vec::new(),
+        conflicts: vec![json!({
+            "code": "missing_required_secrets",
+            "extension_id": "ext.indexer",
+            "instance_id": instance_id,
+            "instance_name": "default",
+            "missing": [format!("instance:{instance_id}:indexer.test-indexer.api_key")],
+        })],
+    };
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: plan_id,
+            source: "auto_wire".to_string(),
+            status: OrchestratorRunStatus::Pending,
+            phase: Some("auto_wire".to_string()),
+            plan_json: Some(serde_json::to_value(&plan)?),
+            error: None,
+        })
+        .await?;
+
+    let status_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/auto-wire")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(status_resp.status(), StatusCode::OK);
+    let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
+    let status_json: Value = serde_json::from_slice(&status_body)?;
+    assert_eq!(status_json.get("enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        status_json.get("pendingPlanId").and_then(Value::as_str),
+        Some(plan_id.to_string().as_str())
+    );
+    assert_eq!(
+        status_json.get("pendingReason").and_then(Value::as_str),
+        Some("Missing required secrets")
+    );
+    assert_eq!(
+        status_json.get("pendingConflicts").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let plan_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/auto-wire/plan")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(plan_resp.status(), StatusCode::OK);
+    let plan_body = body::to_bytes(plan_resp.into_body(), 1_048_576).await?;
+    let plan_json: Value = serde_json::from_slice(&plan_body)?;
+    assert_eq!(
+        plan_json.get("plan_id").and_then(Value::as_str),
+        Some(plan_id.to_string().as_str())
+    );
+    assert_eq!(
+        plan_json.get("blueprint_id").and_then(Value::as_str),
+        Some(Planner::AUTO_WIRE_BLUEPRINT_ID)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_auto_wire_toggle_disables_and_triggers_reconcile() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let db_pool = database.pool.clone();
+    let store = ExtensionStore::new(&db_pool);
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let plan_id = Uuid::new_v4();
+    let pending_plan = Plan {
+        plan_id,
+        blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
+        params: None,
+        actions: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: plan_id,
+            source: "auto_wire".to_string(),
+            status: OrchestratorRunStatus::Pending,
+            phase: Some("auto_wire".to_string()),
+            plan_json: Some(serde_json::to_value(&pending_plan)?),
+            error: None,
+        })
+        .await?;
+
+    let disable_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/auto-wire")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"enabled\":false}"))?,
+        )
+        .await?;
+    assert_eq!(disable_resp.status(), StatusCode::OK);
+
+    let canceled = store
+        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Canceled))
+        .await?
+        .expect("auto-wire run canceled");
+    assert_eq!(canceled.run_id, plan_id);
+
+    let disabled_body = body::to_bytes(disable_resp.into_body(), 1_048_576).await?;
+    let disabled_json: Value = serde_json::from_slice(&disabled_body)?;
+    assert_eq!(
+        disabled_json.get("pendingConflicts"),
+        Some(&Value::Null),
+        "pending_conflicts should be cleared after disable"
+    );
+    assert_eq!(
+        disabled_json.get("pendingPlanId"),
+        Some(&Value::Null),
+        "pending_plan_id should be cleared after disable"
+    );
+    assert_eq!(
+        disabled_json.get("pendingReason"),
+        Some(&Value::Null),
+        "pending_reason should be cleared after disable"
+    );
+
+    let enable_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/auto-wire")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"enabled\":true}"))?,
+        )
+        .await?;
+    assert_eq!(enable_resp.status(), StatusCode::OK);
+
+    let mut reconcile_run = None;
+    for _ in 0..20 {
+        reconcile_run = store.get_latest_run_by_phase("reconcile").await?;
+        if reconcile_run.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(reconcile_run.is_some(), "expected reconcile run after enable");
 
     Ok(())
 }

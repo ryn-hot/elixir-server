@@ -55,6 +55,7 @@ pub struct CatalogResponse {
     pub last_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_refresh_success_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_refresh_error: Option<RegistryFetchError>,
+    pub core_extensions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +119,21 @@ pub struct RunsQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoWireStatusResponse {
+    pub enabled: bool,
+    pub pending_plan_id: Option<Uuid>,
+    pub pending_reason: Option<String>,
+    pub pending_conflicts: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoWireUpdateRequest {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DesiredBlueprintsQuery {
     pub applied: Option<bool>,
@@ -136,6 +152,11 @@ pub struct ReconcileRunResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DesiredBlueprintsClearResponse {
+    pub deleted: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunsClearResponse {
     pub deleted: u64,
 }
 
@@ -226,6 +247,7 @@ pub async fn apply_blueprint(
     store
         .create_run(&NewOrchestratorRun {
             run_id: plan.plan_id,
+            source: "blueprint".to_string(),
             status: OrchestratorRunStatus::Pending,
             phase: Some("planned".to_string()),
             plan_json: Some(plan_json),
@@ -448,6 +470,7 @@ async fn build_catalog(state: &AppState, force_refresh: bool) -> Result<CatalogR
             last_refreshed_at: None,
             last_refresh_success_at: None,
             last_refresh_error: None,
+            core_extensions: state.settings.extensions.core_extensions.clone(),
         });
     }
 
@@ -487,6 +510,7 @@ async fn build_catalog(state: &AppState, force_refresh: bool) -> Result<CatalogR
         last_refreshed_at: Some(cache.fetched_at),
         last_refresh_success_at: cache.last_success_at,
         last_refresh_error: cache.last_error,
+        core_extensions: state.settings.extensions.core_extensions.clone(),
     })
 }
 
@@ -804,6 +828,17 @@ pub async fn uninstall_extension(
     State(state): State<AppState>,
     Path(extension_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if state
+        .settings
+        .extensions
+        .core_extensions
+        .iter()
+        .any(|id| id == &extension_id)
+    {
+        return Err(ApiError::forbidden(
+            "core extensions cannot be uninstalled",
+        ));
+    }
     let store = ExtensionStore::new(&state.db_pool);
     let existing = store
         .get_extension(&extension_id)
@@ -819,6 +854,16 @@ pub async fn uninstall_extension(
 
     let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
     let _ = fs::remove_dir_all(storage_paths.unpacked_dir.join(&extension_id)).await;
+    if let Some(hash) = existing.and_then(|extension| extension.package_hash) {
+        if let Err(err) =
+            remove_downloaded_package(&storage_paths.packages_dir, &hash).await
+        {
+            tracing::warn!(
+                "failed to remove package for {}: {err}",
+                extension_id
+            );
+        }
+    }
 
     Ok(Json(serde_json::json!({ "status": "deleted" })))
 }
@@ -1003,6 +1048,7 @@ pub async fn rollback_instance(
     store
         .create_run(&NewOrchestratorRun {
             run_id: plan.plan_id,
+            source: "rollback".to_string(),
             status: OrchestratorRunStatus::Pending,
             phase: Some("planned".to_string()),
             plan_json: Some(plan_json),
@@ -1282,6 +1328,96 @@ pub async fn reconcile_latest(
     Ok(Json(ReconcileRunResponse { run }))
 }
 
+pub async fn auto_wire_status(
+    State(state): State<AppState>,
+) -> ApiResult<Json<AutoWireStatusResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let enabled = store.get_auto_wire_enabled().await.map_err(ApiError::from)?;
+    let pending = store
+        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut pending_plan_id = None;
+    let mut pending_reason = None;
+    let mut pending_conflicts = None;
+
+    if let Some(run) = pending {
+        if let Some(plan_json) = run.plan_json {
+            if let Ok(plan) = serde_json::from_value::<Plan>(plan_json) {
+                pending_plan_id = Some(plan.plan_id);
+                pending_conflicts = Some(plan.conflicts.len());
+                let has_missing = plan.conflicts.iter().any(|conflict| {
+                    conflict
+                        .get("code")
+                        .and_then(|value| value.as_str())
+                        == Some("missing_required_secrets")
+                });
+                pending_reason = Some(if has_missing {
+                    "Missing required secrets".to_string()
+                } else if !plan.conflicts.is_empty() {
+                    "Conflicts require review".to_string()
+                } else {
+                    "Pending auto-wire actions".to_string()
+                });
+            } else {
+                pending_plan_id = Some(run.run_id);
+            }
+        } else {
+            pending_plan_id = Some(run.run_id);
+        }
+    }
+
+    Ok(Json(AutoWireStatusResponse {
+        enabled,
+        pending_plan_id,
+        pending_reason,
+        pending_conflicts,
+    }))
+}
+
+pub async fn update_auto_wire(
+    State(state): State<AppState>,
+    Json(payload): Json<AutoWireUpdateRequest>,
+) -> ApiResult<Json<AutoWireStatusResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    store
+        .set_auto_wire_enabled(payload.enabled)
+        .await
+        .map_err(ApiError::from)?;
+
+    if !payload.enabled {
+        let _ = store
+            .cancel_pending_runs_by_source("auto_wire", Some("auto-wire disabled"))
+            .await;
+    } else {
+        let config = ReconcileConfig::from_settings(&state.settings);
+        let orchestrator = state.orchestrator.clone();
+        tokio::spawn(async move {
+            let _ = orchestrator.reconcile_once(&config).await;
+        });
+    }
+
+    auto_wire_status(State(state)).await
+}
+
+pub async fn auto_wire_plan(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Plan>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let run = store
+        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("no pending auto-wire plan"))?;
+    let plan_json = run
+        .plan_json
+        .ok_or_else(|| ApiError::not_found("auto-wire plan missing"))?;
+    let plan: Plan = serde_json::from_value(plan_json)
+        .map_err(|err| ApiError::bad_request(format!("invalid plan payload: {err}")))?;
+    Ok(Json(plan))
+}
+
 pub async fn list_runs(
     State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
@@ -1289,6 +1425,14 @@ pub async fn list_runs(
     let store = ExtensionStore::new(&state.db_pool);
     let runs = store.list_runs(query.limit).await.map_err(ApiError::from)?;
     Ok(Json(runs))
+}
+
+pub async fn clear_runs(
+    State(state): State<AppState>,
+) -> ApiResult<Json<RunsClearResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let deleted = store.delete_run_history().await.map_err(ApiError::from)?;
+    Ok(Json(RunsClearResponse { deleted }))
 }
 
 pub async fn list_desired_blueprints(
@@ -1372,6 +1516,47 @@ async fn download_package(url: &str, dest_dir: &std::path::Path) -> Result<PathB
     let dest_path = dest_dir.join(filename);
     fs::write(&dest_path, &bytes).await?;
     Ok(dest_path)
+}
+
+async fn remove_downloaded_package(
+    packages_dir: &std::path::Path,
+    package_hash: &str,
+) -> Result<(), anyhow::Error> {
+    let mut entries = match fs::read_dir(packages_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_elx = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("elx"))
+            .unwrap_or(false);
+        if !is_elx {
+            continue;
+        }
+        let hash = match compute_sha256(&path).await {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to hash extension package {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if hash.eq_ignore_ascii_case(package_hash) {
+            let _ = fs::remove_file(&path).await;
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn map_unique_violation(err: anyhow::Error, message: &str) -> ApiError {

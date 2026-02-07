@@ -86,8 +86,18 @@ pub fn router(state: AppState) -> Router {
             get(handlers::extensions::reconcile_latest),
         )
         .route(
+            "/api/v1/extensions/auto-wire",
+            get(handlers::extensions::auto_wire_status)
+                .post(handlers::extensions::update_auto_wire),
+        )
+        .route(
+            "/api/v1/extensions/auto-wire/plan",
+            get(handlers::extensions::auto_wire_plan),
+        )
+        .route(
             "/api/v1/extensions/runs",
-            get(handlers::extensions::list_runs),
+            get(handlers::extensions::list_runs)
+                .delete(handlers::extensions::clear_runs),
         )
         .route(
             "/api/v1/extensions/desired-blueprints",

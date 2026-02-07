@@ -32,6 +32,8 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub actions: Vec<ManifestAction>,
     #[serde(default)]
+    pub connectors: Vec<String>,
+    #[serde(default)]
     pub wants: Vec<ManifestCapabilityRef>,
     #[serde(default)]
     pub preferences: Option<ManifestPreferences>,
@@ -136,6 +138,10 @@ impl ExtensionManifest {
                     bail!("driver_patch actions require a patch");
                 }
             }
+        }
+
+        for connector in &self.connectors {
+            ensure_non_empty(connector, "connectors")?;
         }
 
         Ok(())

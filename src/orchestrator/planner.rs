@@ -12,6 +12,10 @@ use crate::extensions::manifest::{
     ManifestCapabilityRef, ManifestPolicies, ManifestPreferences, ManifestRuntime,
     ManifestNetworking,
 };
+use crate::drivers::DriverPatch;
+use crate::drivers::{
+    DownloaderSpec, IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
+};
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
@@ -301,6 +305,8 @@ impl BindingSpec {
 pub struct Planner;
 
 impl Planner {
+    pub const AUTO_WIRE_BLUEPRINT_ID: &'static str = "auto_wire";
+
     pub fn new() -> Self {
         Self
     }
@@ -313,6 +319,180 @@ impl Planner {
     ) -> Result<Plan> {
         self.plan_blueprint_with_decisions(store, blueprint_id, params, None)
             .await
+    }
+
+    pub async fn plan_auto_wire(&self, store: &ExtensionStore<'_>) -> Result<Plan> {
+        let providers = store.list_provider_details().await?;
+        let extensions = store.list_extensions().await?;
+        let instances = store.list_instances(None).await?;
+
+        let instance_map: HashMap<Uuid, _> = instances
+            .iter()
+            .cloned()
+            .map(|instance| (instance.instance_id, instance))
+            .collect();
+        let extension_map: HashMap<String, crate::db::models::Extension> = extensions
+            .iter()
+            .cloned()
+            .map(|extension| (extension.extension_id.clone(), extension))
+            .collect();
+
+        let allow_community = true;
+        let connector_catalog = build_connector_catalog(&extensions, allow_community, None)?;
+
+        let filtered_providers: Vec<ProviderDetails> = providers
+            .into_iter()
+            .filter(|provider| {
+                let instance = match instance_map.get(&provider.provider.instance_id) {
+                    Some(instance) if instance.enabled => instance,
+                    _ => return false,
+                };
+                let extension = match extension_map.get(&instance.extension_id) {
+                    Some(extension) if extension.enabled => extension,
+                    _ => return false,
+                };
+                trust_allowed(provider.trust_level, allow_community)
+                    && extension.kind == ExtensionKind::Module
+            })
+            .collect();
+
+        let mut wants = Vec::new();
+        let mut seen = HashSet::new();
+        for provider in &filtered_providers {
+            let capability = provider.provider.capability.clone();
+            let slot = provider.provider.slot_id.clone();
+            let key = format!("{capability}/{slot}");
+            if seen.insert(key) {
+                wants.push(ManifestCapabilityRef { capability, slot });
+            }
+        }
+        wants.sort_by(|a, b| {
+            let by_capability = a.capability.cmp(&b.capability);
+            if by_capability == std::cmp::Ordering::Equal {
+                a.slot.cmp(&b.slot)
+            } else {
+                by_capability
+            }
+        });
+
+        let mut plan = Plan::new(Self::AUTO_WIRE_BLUEPRINT_ID.to_string(), None);
+        let mut selections: HashMap<String, ProviderSelection> = HashMap::new();
+
+        for want in &wants {
+            let key = capability_key(want);
+            let candidates = providers_for_want(&filtered_providers, want, allow_community);
+            if let Some(selected) =
+                select_existing_provider(candidates, None, want, &mut plan.conflicts)
+            {
+                selections.insert(key, ProviderSelection::Existing(selected.clone()));
+            }
+        }
+
+        let mut actions = Vec::new();
+        let mut health_gate_targets: HashSet<Uuid> = HashSet::new();
+        let mut missing_secrets_by_instance: HashMap<Uuid, HashSet<String>> = HashMap::new();
+
+        let mut connector_entries: Vec<&ConnectorCandidate> = connector_catalog.iter().collect();
+        connector_entries.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
+        for connector in connector_entries {
+            for action in &connector.manifest.actions {
+                if action.r#type != "driver_patch" {
+                    continue;
+                }
+                let target = match action.target.as_ref() {
+                    Some(target) => target,
+                    None => continue,
+                };
+                let key = capability_key(target);
+                let selection = match selections.get(&key) {
+                    Some(selection) => selection,
+                    None => {
+                        // Auto-wire ignores missing targets; connectors apply when present.
+                        continue;
+                    }
+                };
+                let patch = match action.patch.as_ref() {
+                    Some(patch) => patch.clone(),
+                    None => {
+                        plan.conflicts.push(conflict_driver_patch(
+                            target,
+                            &connector.extension_id,
+                            "missing patch payload",
+                        ));
+                        continue;
+                    }
+                };
+                let driver_patch =
+                    match DriverPatch::from_manifest(&target.capability, patch.clone()) {
+                        Ok(patch) => patch,
+                        Err(err) => {
+                            plan.conflicts.push(conflict_driver_patch(
+                                target,
+                                &connector.extension_id,
+                                &err.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(err) = driver_patch.validate() {
+                    plan.conflicts.push(conflict_driver_patch(
+                        target,
+                        &connector.extension_id,
+                        &err.to_string(),
+                    ));
+                    continue;
+                }
+
+                let instance_id = selection.instance_id();
+                let mut missing =
+                    missing_indexer_secrets_for_patch(store, instance_id, &driver_patch).await?;
+                missing.extend(missing_downloader_secrets_for_patch(store, &driver_patch).await?);
+                if !missing.is_empty() {
+                    missing_secrets_by_instance
+                        .entry(instance_id)
+                        .or_default()
+                        .extend(missing);
+                }
+
+                let provider_id = selection.provider_id();
+                if health_gate_targets.insert(provider_id) {
+                    actions.push(PlanAction::HealthGate {
+                        provider_id,
+                        timeout_seconds: default_health_gate_timeout(),
+                    });
+                }
+                actions.push(PlanAction::ApplyDriverPatch {
+                    patch: DriverPatchSpec {
+                        connector_extension_id: connector.extension_id.clone(),
+                        target_provider_id: provider_id,
+                        target_capability: target.capability.clone(),
+                        target_slot_id: target.slot.clone(),
+                        patch,
+                    },
+                });
+            }
+        }
+
+        let planned_instances: HashMap<String, PlannedInstance> = HashMap::new();
+        for (instance_id, missing) in &missing_secrets_by_instance {
+            if missing.is_empty() {
+                continue;
+            }
+            let (extension_id, instance_name) =
+                resolve_instance_info(*instance_id, &instance_map, &planned_instances)
+                    .unwrap_or_else(|| ("unknown".to_string(), "instance".to_string()));
+            let mut missing: Vec<_> = missing.iter().cloned().collect();
+            missing.sort();
+            plan.conflicts.push(conflict_missing_required_secrets(
+                &extension_id,
+                *instance_id,
+                &instance_name,
+                &missing,
+            ));
+        }
+
+        plan.actions = actions;
+        Ok(plan)
     }
 
     pub async fn plan_blueprint_with_decisions(
@@ -356,7 +536,13 @@ impl Planner {
 
         let mut used_instance_names = group_instance_names(&instances);
         let module_catalog = build_module_catalog(&extensions, allow_community)?;
-        let connector_catalog = build_connector_catalog(&extensions, allow_community)?;
+        let connector_allowlist = if manifest.connectors.is_empty() {
+            None
+        } else {
+            Some(manifest.connectors.as_slice())
+        };
+        let connector_catalog =
+            build_connector_catalog(&extensions, allow_community, connector_allowlist)?;
         let extension_map: HashMap<String, crate::db::models::Extension> = extensions
             .iter()
             .cloned()
@@ -475,21 +661,23 @@ impl Planner {
         let mut actions = Vec::new();
         let mut instance_entries: Vec<&PlannedInstance> = planned_instances.values().collect();
         instance_entries.sort_by(|a, b| a.instance.extension_id.cmp(&b.instance.extension_id));
+        let mut missing_secrets_by_instance: HashMap<Uuid, HashSet<String>> = HashMap::new();
         for instance in &instance_entries {
             let required = required_secrets_from_runtime(&instance.runtime.runtime.env)?;
             if required.is_empty() {
                 continue;
             }
-            let missing =
+            let mut missing =
                 missing_required_secrets_for_instance(store, instance.instance.instance_id, &required)
                     .await?;
+            if is_qbittorrent_extension_id(&instance.instance.extension_id) {
+                missing = filter_qbittorrent_missing(missing);
+            }
             if !missing.is_empty() {
-                plan.conflicts.push(conflict_missing_required_secrets(
-                    &instance.instance.extension_id,
-                    instance.instance.instance_id,
-                    &instance.instance.instance_name,
-                    &missing,
-                ));
+                missing_secrets_by_instance
+                    .entry(instance.instance.instance_id)
+                    .or_default()
+                    .extend(missing);
             }
         }
         for runtime in upgrade_instances.values() {
@@ -497,16 +685,17 @@ impl Planner {
             if required.is_empty() {
                 continue;
             }
-            let missing =
+            let mut missing =
                 missing_required_secrets_for_instance(store, runtime.instance_id, &required)
                     .await?;
+            if is_qbittorrent_extension_id(&runtime.extension_id) {
+                missing = filter_qbittorrent_missing(missing);
+            }
             if !missing.is_empty() {
-                plan.conflicts.push(conflict_missing_required_secrets(
-                    &runtime.extension_id,
-                    runtime.instance_id,
-                    &runtime.instance_name,
-                    &missing,
-                ));
+                missing_secrets_by_instance
+                    .entry(runtime.instance_id)
+                    .or_default()
+                    .extend(missing);
             }
         }
         for instance in instance_entries {
@@ -564,6 +753,36 @@ impl Planner {
                         continue;
                     }
                 };
+                let driver_patch =
+                    match DriverPatch::from_manifest(&target.capability, patch.clone()) {
+                        Ok(patch) => patch,
+                        Err(err) => {
+                            plan.conflicts.push(conflict_driver_patch(
+                                target,
+                                &connector.extension_id,
+                                &err.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(err) = driver_patch.validate() {
+                    plan.conflicts.push(conflict_driver_patch(
+                        target,
+                        &connector.extension_id,
+                        &err.to_string(),
+                    ));
+                    continue;
+                }
+                let instance_id = selection.instance_id();
+                let mut missing =
+                    missing_indexer_secrets_for_patch(store, instance_id, &driver_patch).await?;
+                missing.extend(missing_downloader_secrets_for_patch(store, &driver_patch).await?);
+                if !missing.is_empty() {
+                    missing_secrets_by_instance
+                        .entry(instance_id)
+                        .or_default()
+                        .extend(missing);
+                }
 
                 let provider_id = selection.provider_id();
                 if health_gate_targets.insert(provider_id) {
@@ -590,6 +809,23 @@ impl Planner {
             {
                 actions.push(action);
             }
+        }
+
+        for (instance_id, missing) in &missing_secrets_by_instance {
+            if missing.is_empty() {
+                continue;
+            }
+            let (extension_id, instance_name) =
+                resolve_instance_info(*instance_id, &instance_map, &planned_instances)
+                    .unwrap_or_else(|| ("unknown".to_string(), "instance".to_string()));
+            let mut missing: Vec<_> = missing.iter().cloned().collect();
+            missing.sort();
+            plan.conflicts.push(conflict_missing_required_secrets(
+                &extension_id,
+                *instance_id,
+                &instance_name,
+                &missing,
+            ));
         }
 
         let mut pre_actions = resolve_slot_collisions(
@@ -651,6 +887,13 @@ impl ProviderSelection {
         }
     }
 
+    fn instance_id(&self) -> Uuid {
+        match self {
+            ProviderSelection::Existing(value) => value.provider.instance_id,
+            ProviderSelection::Planned(value) => value.instance_id,
+        }
+    }
+
     fn endpoint(&self) -> Result<ProviderEndpoint> {
         match self {
             ProviderSelection::Existing(value) => parse_endpoint(&value.provider.endpoint_json),
@@ -688,9 +931,21 @@ fn build_module_catalog(
 fn build_connector_catalog(
     extensions: &[crate::db::models::Extension],
     allow_community: bool,
+    allowlist: Option<&[String]>,
 ) -> Result<Vec<ConnectorCandidate>> {
     let mut connectors = Vec::new();
+    let allowlist = allowlist.map(|values| {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<HashSet<String>>()
+    });
     for extension in extensions {
+        if let Some(allowlist) = allowlist.as_ref() {
+            if !allowlist.contains(&extension.extension_id) {
+                continue;
+            }
+        }
         if !extension.enabled || extension.kind != ExtensionKind::Connector {
             continue;
         }
@@ -1227,6 +1482,122 @@ fn conflict_missing_required_secrets(
     })
 }
 
+async fn missing_indexer_secrets_for_patch(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    patch: &DriverPatch,
+) -> Result<Vec<String>> {
+    let indexers: Vec<_> = match patch {
+        DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterIndexers { indexers }) => {
+            indexers.iter().collect()
+        }
+        DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetIndexerRegistry { indexers }) => {
+            indexers.iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    let mut missing = HashSet::new();
+    for indexer in indexers {
+        let fields = indexer.credential_fields()?;
+        for field in fields {
+            let key = indexer.credential_secret_key(field);
+            let exists = store
+                .get_secret(crate::db::models::SecretScope::Instance, Some(instance_id), &key)
+                .await?
+                .is_some();
+            if !exists {
+                missing.insert(format!("instance:{}:{}", instance_id, key));
+            }
+        }
+    }
+    Ok(missing.into_iter().collect())
+}
+
+fn filter_qbittorrent_missing(missing: Vec<String>) -> Vec<String> {
+    missing
+        .into_iter()
+        .filter(|value| {
+            !value.ends_with(":qbittorrent_username")
+                && !value.ends_with(":qbittorrent_password")
+        })
+        .collect()
+}
+
+fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
+    extension_id
+        .to_ascii_lowercase()
+        .contains("qbittorrent")
+}
+
+async fn missing_downloader_secrets_for_patch(
+    _store: &ExtensionStore<'_>,
+    patch: &DriverPatch,
+) -> Result<Vec<String>> {
+    let downloaders: Vec<_> = match patch {
+        DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) => {
+            downloaders.iter().collect()
+        }
+        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders { downloaders }) => {
+            downloaders.iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    for downloader in downloaders {
+        if !is_qbittorrent_downloader(&downloader.r#type) {
+            continue;
+        }
+        if downloader_has_credentials(downloader) {
+            continue;
+        }
+        // qBittorrent credentials are auto-generated on first run.
+        continue;
+    }
+    Ok(Vec::new())
+}
+
+fn is_qbittorrent_downloader(implementation: &str) -> bool {
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("qbittorrent")
+}
+
+fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {
+    !downloader_setting_missing(&downloader.settings, "username")
+        && !downloader_setting_missing(&downloader.settings, "password")
+}
+
+fn downloader_setting_missing(
+    settings: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+) -> bool {
+    match settings.get(key) {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
+    }
+}
+
+fn resolve_instance_info(
+    instance_id: Uuid,
+    instance_map: &HashMap<Uuid, crate::db::models::ExtensionInstance>,
+    planned_instances: &HashMap<String, PlannedInstance>,
+) -> Option<(String, String)> {
+    if let Some(instance) = instance_map.get(&instance_id) {
+        return Some((instance.extension_id.clone(), instance.instance_name.clone()));
+    }
+    planned_instances
+        .values()
+        .find(|planned| planned.instance.instance_id == instance_id)
+        .map(|planned| {
+            (
+                planned.instance.extension_id.clone(),
+                planned.instance.instance_name.clone(),
+            )
+        })
+}
+
 fn decisions_map(decisions: Option<&PlanDecisions>) -> HashMap<String, SlotConflictResolution> {
     let mut map = HashMap::new();
     if let Some(decisions) = decisions {
@@ -1581,7 +1952,36 @@ mod tests {
                 {
                     "type": "driver_patch",
                     "target": { "capability": target_capability, "slot": "default" },
-                    "patch": { "op": "noop" }
+                    "patch": { "op": "set_tags", "tags": ["elixir"] }
+                }
+            ]
+        })
+    }
+
+    fn connector_manifest_with_downloaders(id: &str, target_capability: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "connector",
+            "name": id,
+            "targets": [
+                { "capability": target_capability, "slot": "default" }
+            ],
+            "actions": [
+                {
+                    "type": "driver_patch",
+                    "target": { "capability": target_capability, "slot": "default" },
+                    "patch": {
+                        "op": "set_downloaders",
+                        "downloaders": [
+                            {
+                                "name": "qBittorrent",
+                                "type": "qbittorrent",
+                                "url": "http://elx-qbittorrent:8080",
+                                "enabled": true
+                            }
+                        ]
+                    }
                 }
             ]
         })
@@ -1710,6 +2110,39 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: None,
+                endpoint_json: Some(endpoint),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok((instance_id, provider_id))
+    }
+
+    async fn insert_provider_with_impl(
+        store: &ExtensionStore<'_>,
+        extension_id: &str,
+        capability: &str,
+        implementation: &str,
+        endpoint: serde_json::Value,
+    ) -> Result<(Uuid, Uuid)> {
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let provider_id = Uuid::new_v4();
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: capability.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some(implementation.to_string()),
                 endpoint_json: Some(endpoint),
                 health_state: ProviderHealthState::Healthy,
             })
@@ -1988,6 +2421,97 @@ mod tests {
                     })
                     .unwrap_or(false)
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extensions_conflicts_on_missing_qbittorrent_secrets() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.sonarr",
+            ExtensionKind::Module,
+            module_manifest("ext.sonarr", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.qbittorrent",
+            ExtensionKind::Module,
+            module_manifest("ext.qbittorrent", "downloader.torrent"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.sonarr.qbittorrent",
+            ExtensionKind::Connector,
+            connector_manifest_with_downloaders("ext.sonarr.qbittorrent", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.qbittorrent",
+            ExtensionKind::Blueprint,
+            json!({
+                "id": "blueprint.qbittorrent",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "QBittorrent Blueprint",
+                "wants": [
+                    { "capability": "media.manager.tv", "slot": "default" },
+                    { "capability": "downloader.torrent", "slot": "default" }
+                ],
+                "connectors": ["ext.sonarr.qbittorrent"]
+            }),
+        )
+        .await?;
+
+        let qbittorrent_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-qbittorrent".to_string(),
+            8080,
+            None,
+            None,
+        )?;
+        let _ = insert_provider_with_impl(
+            &store,
+            "ext.qbittorrent",
+            "downloader.torrent",
+            "qbittorrent",
+            serde_json::to_value(qbittorrent_endpoint)?,
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.qbittorrent".to_string(), None)
+            .await?;
+
+        let mut saw_qbittorrent_missing = false;
+        for conflict in &plan.conflicts {
+            if conflict.get("code") != Some(&json!("missing_required_secrets")) {
+                continue;
+            }
+            let missing = conflict.get("missing").and_then(|value| value.as_array());
+            let Some(missing) = missing else { continue };
+            for entry in missing {
+                if let Some(value) = entry.as_str() {
+                    if value.ends_with(":qbittorrent_username")
+                        || value.ends_with(":qbittorrent_password")
+                    {
+                        saw_qbittorrent_missing = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !saw_qbittorrent_missing,
+            "qbittorrent credentials should be auto-generated"
+        );
 
         Ok(())
     }

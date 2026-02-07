@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
-use crate::drivers::patches::{IndexerRegistryPatch, IndexerSpec};
+use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
 
 #[derive(Debug, Default)]
 pub struct IndexerRegistryDriver;
@@ -27,9 +27,30 @@ impl CapabilityDriver for IndexerRegistryDriver {
         "indexer.registry"
     }
 
-    async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
+    async fn read_state(&self, ctx: DriverCtx) -> Result<StateSnapshot> {
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if implementation != "prowlarr" {
+            bail!(
+                "indexer.registry implementation '{}' is not supported",
+                implementation
+            );
+        }
+
+        let config = ProwlarrDriverConfig::from_ctx(&ctx)?;
+        let client = ProwlarrClient::from_config(config, ctx.canonical_url()?).await?;
+        let status = client.get_json::<Value>("system/status").await?;
+        let version = status
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let indexers = client.get_json::<Vec<Value>>("indexer").await?;
+        let summary = format!("Prowlarr v{} · {} indexers", version, indexers.len());
+
         Ok(StateSnapshot {
-            summary: Some("indexer.registry driver is not implemented".to_string()),
+            summary: Some(summary),
         })
     }
 
@@ -57,6 +78,9 @@ impl CapabilityDriver for IndexerRegistryDriver {
         match patch {
             IndexerRegistryPatch::RegisterIndexers { indexers } => {
                 client.upsert_indexers(&indexers).await?;
+            }
+            IndexerRegistryPatch::RegisterApps { apps } => {
+                client.upsert_apps(&apps).await?;
             }
         }
 
@@ -249,6 +273,56 @@ impl ProwlarrClient {
         Ok(())
     }
 
+    async fn upsert_apps(&self, apps: &[AppSpec]) -> Result<()> {
+        if apps.is_empty() {
+            return Ok(());
+        }
+        let schema = self.get_json::<Vec<Value>>("applications/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("applications").await?;
+
+        for app in apps {
+            let tags = if app.tags.is_empty() {
+                Vec::new()
+            } else {
+                self.ensure_tags(&app.tags).await?
+            };
+            let schema_item = find_schema(&schema, &app.implementation)?;
+            let existing_item = find_by_name(&existing, &app.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = app.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", app.name.clone())?;
+            if !tags.is_empty() {
+                set_array_i64(&mut target, "tags", &tags)?;
+            }
+            ensure_schema_fields(&mut target, &app.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("app fields missing"))?;
+            apply_app_fields(fields, app)?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
+
+            if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                let path = format!("applications/{id}");
+                self.put_json(&path, &target).await?;
+            } else {
+                remove_readonly_fields(&mut target);
+                self.post_json("applications", &target).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_tags(&self, tags: &[String]) -> Result<Vec<i64>> {
         if tags.is_empty() {
             return Ok(Vec::new());
@@ -427,6 +501,30 @@ fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<(
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
             warn!("indexer field '{}' not found in schema", key);
+        }
+    }
+    Ok(())
+}
+
+fn apply_app_fields(fields: &mut Vec<Value>, spec: &AppSpec) -> Result<()> {
+    let url_value = Value::String(spec.url.clone());
+    if !set_field_value_optional(fields, "baseUrl", url_value.clone())?
+        && !set_field_value_optional(fields, "url", url_value.clone())?
+    {
+        bail!("app requires baseUrl or url field");
+    }
+    if let Some(api_key) = spec.api_key.as_ref() {
+        set_field_value_optional(fields, "apiKey", Value::String(api_key.clone()))?;
+    }
+    if !spec.categories.is_empty() {
+        let categories = parse_int_list(&spec.categories)?;
+        if !set_field_value_optional(fields, "syncCategories", Value::Array(categories))? {
+            warn!("app syncCategories field not found");
+        }
+    }
+    for (key, value) in &spec.settings {
+        if !set_field_value_optional(fields, key, value.clone())? {
+            warn!("app field '{}' not found in schema", key);
         }
     }
     Ok(())

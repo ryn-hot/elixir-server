@@ -85,6 +85,7 @@ pub struct NewSecret {
 #[derive(Debug, Clone)]
 pub struct NewOrchestratorRun {
     pub run_id: Uuid,
+    pub source: String,
     pub status: OrchestratorRunStatus,
     pub phase: Option<String>,
     pub plan_json: Option<serde_json::Value>,
@@ -653,9 +654,10 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_run(&self, data: &NewOrchestratorRun) -> Result<()> {
         let plan_json = json_to_string(data.plan_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO orchestrator_runs (run_id, status, phase, plan_json, error) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO orchestrator_runs (run_id, source, status, phase, plan_json, error) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(data.run_id.to_string())
+        .bind(&data.source)
         .bind(data.status.as_str())
         .bind(data.phase.as_deref())
         .bind(plan_json)
@@ -752,17 +754,32 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn cancel_pending_runs_by_source(
+        &self,
+        source: &str,
+        error: Option<&str>,
+    ) -> Result<u64> {
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE orchestrator_runs SET status = 'canceled', phase = 'canceled', error = ?, finished_at = CURRENT_TIMESTAMP WHERE source = ? AND status = 'pending'",
+        )
+        .bind(error)
+        .bind(source)
+        .execute(self.pool)
+        .await?;
+        Ok(updated.rows_affected())
+    }
+
     pub async fn list_runs(&self, limit: Option<i64>) -> Result<Vec<OrchestratorRun>> {
         let rows = if let Some(limit) = limit {
             sqlx::query(
-                "SELECT run_id, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC LIMIT ?",
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC LIMIT ?",
             )
             .bind(limit)
             .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT run_id, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC",
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC",
             )
             .fetch_all(self.pool)
             .await?
@@ -774,12 +791,21 @@ impl<'a> ExtensionStore<'a> {
         Ok(items)
     }
 
+    pub async fn delete_run_history(&self) -> Result<u64> {
+        let deleted = sqlx::query::<sqlx::Any>(
+            "DELETE FROM orchestrator_runs WHERE status IN ('failed', 'completed', 'canceled')",
+        )
+        .execute(self.pool)
+        .await?;
+        Ok(deleted.rows_affected())
+    }
+
     pub async fn get_latest_run_by_phase(
         &self,
         phase: &str,
     ) -> Result<Option<OrchestratorRun>> {
         let row = sqlx::query(
-            "SELECT run_id, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE phase = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE phase = ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(phase)
         .fetch_optional(self.pool)
@@ -787,9 +813,33 @@ impl<'a> ExtensionStore<'a> {
         row.map(|row| map_run(&row)).transpose()
     }
 
+    pub async fn get_latest_run_by_source(
+        &self,
+        source: &str,
+        status: Option<OrchestratorRunStatus>,
+    ) -> Result<Option<OrchestratorRun>> {
+        let row = if let Some(status) = status {
+            sqlx::query(
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(source)
+            .bind(status.as_str())
+            .fetch_optional(self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(source)
+            .fetch_optional(self.pool)
+            .await?
+        };
+        row.map(|row| map_run(&row)).transpose()
+    }
+
     pub async fn get_run(&self, run_id: Uuid) -> Result<Option<OrchestratorRun>> {
         let row = sqlx::query(
-            "SELECT run_id, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE run_id = ? LIMIT 1",
+            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE run_id = ? LIMIT 1",
         )
         .bind(run_id.to_string())
         .fetch_optional(self.pool)
@@ -871,6 +921,51 @@ impl<'a> ExtensionStore<'a> {
             items.push(map_runtime_log(&row)?);
         }
         Ok(items)
+    }
+
+    pub async fn get_extension_setting(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "SELECT CAST(value_json AS TEXT) as value_json FROM extension_settings WHERE setting_key = ? LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(self.pool)
+        .await?;
+        match row {
+            Some(row) => parse_json_opt(
+                row_get_opt_string(&row, "value_json")?,
+                "extension_settings.value_json",
+            ),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn upsert_extension_setting(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let value_json = json_to_string(Some(value))?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_settings (setting_key, value_json) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(key)
+        .bind(value_json)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_auto_wire_enabled(&self) -> Result<bool> {
+        let value = self.get_extension_setting("auto_wire_enabled").await?;
+        Ok(value.and_then(|value| value.as_bool()).unwrap_or(true))
+    }
+
+    pub async fn set_auto_wire_enabled(&self, enabled: bool) -> Result<()> {
+        self.upsert_extension_setting("auto_wire_enabled", &serde_json::json!(enabled))
+            .await
     }
 }
 
@@ -1040,11 +1135,13 @@ fn map_secret(row: &AnyRow) -> Result<Secret> {
 
 fn map_run(row: &AnyRow) -> Result<OrchestratorRun> {
     let run_id_raw: String = row.try_get("run_id")?;
+    let source_raw: String = row.try_get("source")?;
     let status_raw: String = row.try_get("status")?;
     let created_at_raw: String = row.try_get("created_at")?;
 
     Ok(OrchestratorRun {
         run_id: parse_uuid(&run_id_raw, "orchestrator_runs.run_id")?,
+        source: source_raw,
         status: parse_enum(&status_raw, "orchestrator_runs.status")?,
         phase: row_get_opt_string(row, "phase")?,
         plan_json: parse_json_opt(

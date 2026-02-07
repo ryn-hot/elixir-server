@@ -117,6 +117,7 @@ impl<'a> Reconciler<'a> {
             .store
             .create_run(&crate::extensions::store::NewOrchestratorRun {
                 run_id,
+                source: "reconcile".to_string(),
                 status: crate::db::models::OrchestratorRunStatus::Running,
                 phase: Some("reconcile".to_string()),
                 plan_json: None,
@@ -187,6 +188,7 @@ impl<'a> Reconciler<'a> {
             &mut manifest_cache,
         )
         .await?;
+        self.reconcile_auto_wire().await?;
         self.reconcile_bindings(run_id, &mut step_index, &bindings, &instance_map)
             .await?;
 
@@ -332,6 +334,183 @@ impl<'a> Reconciler<'a> {
             if failed {
                 continue;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn reconcile_auto_wire(&self) -> Result<()> {
+        if !self.store.get_auto_wire_enabled().await? {
+            return Ok(());
+        }
+
+        let planner = Planner::new();
+        let mut plan = match planner.plan_auto_wire(&self.store).await {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!("reconcile: auto-wire planning failed: {err}");
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&["auto_wire_plan", "error"])
+                    .inc();
+                return Ok(());
+            }
+        };
+
+        if plan.actions.is_empty() && plan.conflicts.is_empty() {
+            let _ = self
+                .store
+                .cancel_pending_runs_by_source("auto_wire", Some("no auto-wire actions"))
+                .await;
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&["auto_wire_plan", "empty"])
+                .inc();
+            return Ok(());
+        }
+
+        let missing = match missing_required_secrets_for_plan(&self.store, &plan.actions).await {
+            Ok(missing) => missing,
+            Err(err) => {
+                warn!("reconcile: auto-wire required secrets lookup failed: {err}");
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&["auto_wire_required_secrets", "error"])
+                    .inc();
+                return Ok(());
+            }
+        };
+        let unresolved = has_unresolved_conflicts(&plan.conflicts);
+
+        let pending_run = self
+            .store
+            .get_latest_run_by_source(
+                "auto_wire",
+                Some(crate::db::models::OrchestratorRunStatus::Pending),
+            )
+            .await?;
+
+        if !missing.is_empty() || unresolved {
+            let run_id = pending_run
+                .as_ref()
+                .map(|run| run.run_id)
+                .unwrap_or(plan.plan_id);
+            plan.plan_id = run_id;
+            let plan_json = serde_json::to_value(&plan)
+                .context("serializing auto-wire plan")?;
+            if let Some(run) = pending_run {
+                self.store.update_run_plan(run.run_id, plan_json).await?;
+            } else {
+                self.store
+                    .create_run(&crate::extensions::store::NewOrchestratorRun {
+                        run_id,
+                        source: "auto_wire".to_string(),
+                        status: crate::db::models::OrchestratorRunStatus::Pending,
+                        phase: Some("auto_wire".to_string()),
+                        plan_json: Some(plan_json),
+                        error: None,
+                    })
+                    .await?;
+            }
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&["auto_wire_plan", "blocked"])
+                .inc();
+            return Ok(());
+        }
+
+        let run_id = if let Some(run) = pending_run {
+            plan.plan_id = run.run_id;
+            let plan_json = serde_json::to_value(&plan)
+                .context("serializing auto-wire plan")?;
+            self.store.update_run_plan(run.run_id, plan_json).await?;
+            self.store
+                .update_run_status(
+                    run.run_id,
+                    crate::db::models::OrchestratorRunStatus::Running,
+                    Some("auto_wire"),
+                    None,
+                )
+                .await?;
+            run.run_id
+        } else {
+            let run_id = plan.plan_id;
+            let plan_json = serde_json::to_value(&plan)
+                .context("serializing auto-wire plan")?;
+            self.store
+                .create_run(&crate::extensions::store::NewOrchestratorRun {
+                    run_id,
+                    source: "auto_wire".to_string(),
+                    status: crate::db::models::OrchestratorRunStatus::Running,
+                    phase: Some("auto_wire".to_string()),
+                    plan_json: Some(plan_json),
+                    error: None,
+                })
+                .await?;
+            run_id
+        };
+
+        let executor = Executor::new(
+            self.pool,
+            self.probe,
+            self.drivers,
+            self.runtime,
+            self.runtime_paths.clone(),
+            self.secrets,
+        );
+        let mut step_index = 0;
+        let mut failed = false;
+        for action in plan.actions {
+            let action_json = match serde_json::to_value(&action) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!("reconcile: auto-wire action serialization failed: {err}");
+                    failed = true;
+                    break;
+                }
+            };
+            let executor_action = match action.clone().try_into() {
+                Ok(action) => action,
+                Err(err) => {
+                    warn!("reconcile: auto-wire invalid action: {err}");
+                    failed = true;
+                    break;
+                }
+            };
+            let action_type = action.action_type().to_string();
+            let result = self
+                .run_step(run_id, &mut step_index, &action_type, action_json, || {
+                    executor.apply(executor_action)
+                })
+                .await;
+            if let Err(err) = result {
+                warn!("reconcile: auto-wire action {action_type} failed: {err}");
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&[action_type.as_str(), "error"])
+                    .inc();
+                failed = true;
+                break;
+            }
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&[action_type.as_str(), "ok"])
+                .inc();
+        }
+
+        if failed {
+            let _ = self
+                .store
+                .update_run_status(
+                    run_id,
+                    crate::db::models::OrchestratorRunStatus::Failed,
+                    Some("auto_wire"),
+                    Some("auto-wire apply failed"),
+                )
+                .await;
+        } else {
+            self.store
+                .update_run_status(
+                    run_id,
+                    crate::db::models::OrchestratorRunStatus::Completed,
+                    Some("auto_wire"),
+                    None,
+                )
+                .await?;
         }
 
         Ok(())
@@ -799,22 +978,25 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use crate::config::DatabaseConfig;
     use crate::db::Database;
     use crate::db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
-        ProviderHealthState, SlotCardinality,
+        ProviderHealthState, SecretScope, SlotCardinality,
     };
-    use crate::drivers::DriverRegistry;
+    use crate::drivers::{
+        ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, DriverRegistry, StateSnapshot,
+    };
     use crate::extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
-        NewProvider,
+        NewProvider, NewSecret,
     };
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::runtime::RuntimePaths;
+    use crate::orchestrator::planner::{Plan, PlanAction, Planner};
     use crate::secrets::SecretsManager;
 
     #[derive(Default)]
@@ -915,6 +1097,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubIndexerDriver;
+
+    #[async_trait]
+    impl CapabilityDriver for StubIndexerDriver {
+        fn capability(&self) -> &'static str {
+            "indexer.registry"
+        }
+
+        async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
+            Ok(StateSnapshot { summary: None })
+        }
+
+        async fn apply_patch(
+            &self,
+            _ctx: DriverCtx,
+            _patch: DriverPatch,
+        ) -> Result<ApplyResult> {
+            Ok(ApplyResult::applied())
+        }
+    }
+
     async fn setup_db() -> Result<Database> {
         let config = DatabaseConfig {
             url: "sqlite::memory:?cache=shared".to_string(),
@@ -924,6 +1128,148 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    struct AutoWireFixture {
+        instance_id: Uuid,
+        provider_id: Uuid,
+        secret_key: String,
+        connector_id: String,
+    }
+
+    async fn seed_auto_wire_indexer(store: &ExtensionStore<'_>) -> Result<AutoWireFixture> {
+        let module_id = "ext.indexer.registry";
+        let connector_id = "ext.indexer.connector";
+        let indexer_name = "Test Indexer";
+        let secret_key = "indexer.test-indexer.api_key".to_string();
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: module_id.to_string(),
+                name: "Indexer Registry".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": module_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "Indexer Registry",
+                    "provides": [
+                        {
+                            "capability": "indexer.registry",
+                            "slot": "default",
+                            "implementation": "stub"
+                        }
+                    ],
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/test:1",
+                        "service_name": "elx-indexer"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 9696
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: connector_id.to_string(),
+                name: "Indexer Connector".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Connector,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": connector_id,
+                    "version": "1.0.0",
+                    "kind": "connector",
+                    "name": "Indexer Connector",
+                    "targets": [
+                        {
+                            "capability": "indexer.registry",
+                            "slot": "default"
+                        }
+                    ],
+                    "actions": [
+                        {
+                            "type": "driver_patch",
+                            "target": {
+                                "capability": "indexer.registry",
+                                "slot": "default"
+                            },
+                            "patch": {
+                                "op": "register_indexers",
+                                "indexers": [
+                                    {
+                                        "name": indexer_name,
+                                        "implementation": "torznab",
+                                        "url": "https://example.invalid",
+                                        "auth": {
+                                            "requires_account": true,
+                                            "required_fields": ["api_key"]
+                                        },
+                                        "categories": [],
+                                        "tags": []
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: module_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-indexer".to_string(),
+            9696,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "indexer.registry".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("stub".to_string()),
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        Ok(AutoWireFixture {
+            instance_id,
+            provider_id,
+            secret_key,
+            connector_id: connector_id.to_string(),
+        })
     }
 
     #[tokio::test]
@@ -1403,6 +1749,202 @@ mod tests {
             instances.iter().all(|instance| instance.extension_id != "ext.new"),
             "keep_existing decisions should prevent installing ext.new"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_wire_blocks_on_missing_secrets() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let fixture = seed_auto_wire_indexer(&store).await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let run = store
+            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
+            .await?
+            .expect("pending auto-wire run");
+        let plan_json = run.plan_json.expect("auto-wire plan");
+        let plan: Plan = serde_json::from_value(plan_json)?;
+        let expected_missing = format!(
+            "instance:{}:{}",
+            fixture.instance_id, fixture.secret_key
+        );
+        let missing_conflict = plan.conflicts.iter().find(|conflict| {
+            conflict
+                .get("code")
+                .and_then(Value::as_str)
+                == Some("missing_required_secrets")
+        });
+        assert!(missing_conflict.is_some(), "expected missing secrets conflict");
+        let missing = missing_conflict
+            .and_then(|conflict| conflict.get("missing"))
+            .and_then(Value::as_array)
+            .expect("missing list");
+        assert!(
+            missing
+                .iter()
+                .any(|value| value.as_str() == Some(expected_missing.as_str())),
+            "missing list should include the indexer secret"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_wire_applies_when_clean() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let fixture = seed_auto_wire_indexer(&store).await?;
+
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let encrypted = secrets.encrypt("test-key")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(fixture.instance_id),
+                key: fixture.secret_key.clone(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let mut drivers = DriverRegistry::new();
+        drivers.register(StubIndexerDriver::default());
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let run = store
+            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Completed))
+            .await?
+            .expect("completed auto-wire run");
+        let steps = store.list_steps(run.run_id).await?;
+        assert!(
+            steps.iter().any(|step| step.action_type == "apply_driver_patch"),
+            "expected apply_driver_patch step"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_wire_clears_pending_when_no_actions() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let fixture = seed_auto_wire_indexer(&store).await?;
+
+        let pending_id = Uuid::new_v4();
+        let pending_plan = Plan {
+            plan_id: pending_id,
+            blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
+            params: None,
+            actions: vec![PlanAction::HealthGate {
+                provider_id: fixture.provider_id,
+                timeout_seconds: 5,
+            }],
+            conflicts: Vec::new(),
+        };
+        store
+            .create_run(&crate::extensions::store::NewOrchestratorRun {
+                run_id: pending_id,
+                source: "auto_wire".to_string(),
+                status: OrchestratorRunStatus::Pending,
+                phase: Some("auto_wire".to_string()),
+                plan_json: Some(serde_json::to_value(&pending_plan)?),
+                error: None,
+            })
+            .await?;
+
+        store
+            .set_extension_enabled(&fixture.connector_id, false)
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let canceled = store
+            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Canceled))
+            .await?
+            .expect("auto-wire pending run canceled");
+        assert_eq!(canceled.run_id, pending_id);
+
+        let pending = store
+            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
+            .await?;
+        assert!(pending.is_none(), "pending auto-wire run should be cleared");
 
         Ok(())
     }

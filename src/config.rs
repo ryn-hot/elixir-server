@@ -59,6 +59,8 @@ impl Settings {
             .set_default("library.sonarr.enabled", default_false())?
             .set_default("extensions.registries", Vec::<String>::new())?
             .set_default("extensions.storage_root", default_extensions_root())?
+            .set_default("extensions.bundled_dir", default_extensions_bundled_dir())?
+            .set_default("extensions.core_extensions", default_core_extensions())?
             .set_default("extensions.allow_unsigned", default_false())?
             .set_default("extensions.allow_directory_install", default_false())?
             .set_default(
@@ -311,6 +313,10 @@ pub struct ExtensionsConfig {
     pub registries: Vec<String>,
     #[serde(default = "default_extensions_root")]
     pub storage_root: String,
+    #[serde(default = "default_extensions_bundled_dir")]
+    pub bundled_dir: String,
+    #[serde(default = "default_core_extensions")]
+    pub core_extensions: Vec<String>,
     #[serde(default = "default_false")]
     pub allow_unsigned: bool,
     #[serde(default = "default_false")]
@@ -332,6 +338,8 @@ impl Default for ExtensionsConfig {
         Self {
             registries: Vec::new(),
             storage_root: default_extensions_root(),
+            bundled_dir: default_extensions_bundled_dir(),
+            core_extensions: default_core_extensions(),
             allow_unsigned: default_false(),
             allow_directory_install: default_false(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
@@ -511,6 +519,14 @@ fn default_artwork_cache_dir() -> String {
 
 fn default_extensions_root() -> String {
     "data/extensions".to_string()
+}
+
+fn default_extensions_bundled_dir() -> String {
+    "extensions/bundled".to_string()
+}
+
+fn default_core_extensions() -> Vec<String> {
+    vec!["elixir.modules.qbittorrent".to_string()]
 }
 
 fn default_reconcile_interval_seconds() -> u64 {

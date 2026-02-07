@@ -22,8 +22,11 @@ use crate::artwork::ArtworkService;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
+use crate::extensions::package::{read_manifest_from_dir, unpack_package};
+use crate::extensions::store::ExtensionStore;
 use crate::extensions::registry::start_registry_refresh_loop;
 use crate::http::router;
+use crate::http::handlers::extensions::InstallRequest;
 use crate::library::start_periodic_scan;
 use crate::library::LinkerService;
 use crate::metadata::MetadataService;
@@ -33,8 +36,13 @@ use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
+use axum::{Json, extract::State};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tokio::net::TcpListener;
+use tokio::fs;
+use uuid::Uuid;
 
 fn load_env() {
     if let Ok(cwd) = std::env::current_dir() {
@@ -104,6 +112,9 @@ async fn main() -> anyhow::Result<()> {
         artwork,
         secrets,
     );
+    if let Err(err) = bootstrap_core_extensions(&state).await {
+        tracing::warn!("core extension bootstrap failed: {err}");
+    }
     let app = router(state.clone());
 
     // Kick off background periodic scan.
@@ -180,6 +191,118 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Elixir server shutdown complete");
     Ok(())
+}
+
+async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
+    if state.settings.extensions.core_extensions.is_empty() {
+        return Ok(());
+    }
+    let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
+    if !bundled_dir.is_dir() {
+        tracing::warn!(
+            "bundled extensions dir '{}' does not exist",
+            bundled_dir.display()
+        );
+        return Ok(());
+    }
+    let tmp_root = PathBuf::from(&state.settings.extensions.storage_root).join("tmp");
+    fs::create_dir_all(&tmp_root).await?;
+
+    let package_map = index_bundled_packages(&bundled_dir, &tmp_root).await?;
+    if package_map.is_empty() {
+        tracing::warn!(
+            "no bundled extensions discovered under '{}'",
+            bundled_dir.display()
+        );
+    }
+
+    let store = ExtensionStore::new(&state.db_pool);
+    for extension_id in &state.settings.extensions.core_extensions {
+        if store.get_extension(extension_id).await?.is_some() {
+            continue;
+        }
+        let Some(path) = package_map.get(extension_id) else {
+            tracing::warn!(
+                "core extension '{}' package not found in '{}'",
+                extension_id,
+                bundled_dir.display()
+            );
+            continue;
+        };
+        let request = InstallRequest {
+            download_url: None,
+            package_path: Some(path.to_string_lossy().to_string()),
+        };
+        match crate::http::handlers::extensions::install_extension(
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        {
+            Ok(_) => tracing::info!("bootstrapped core extension '{}'", extension_id),
+            Err(err) => tracing::warn!(
+                "failed to bootstrap core extension '{}': {:?}",
+                extension_id,
+                err
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+async fn index_bundled_packages(
+    bundled_dir: &Path,
+    tmp_root: &Path,
+) -> anyhow::Result<HashMap<String, PathBuf>> {
+    let mut map = HashMap::new();
+    let mut entries = fs::read_dir(bundled_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() && !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_file() {
+            let is_elx = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("elx"))
+                .unwrap_or(false);
+            if !is_elx {
+                continue;
+            }
+        }
+
+        let staging_dir = if file_type.is_dir() {
+            None
+        } else {
+            Some(tmp_root.join(Uuid::new_v4().to_string()))
+        };
+        let unpacked = match &staging_dir {
+            Some(dir) => unpack_package(&path, dir).await?,
+            None => path.clone(),
+        };
+        let package_manifest = match read_manifest_from_dir(&unpacked).await {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to read bundled manifest from '{}': {err}",
+                    path.display()
+                );
+                if let Some(dir) = staging_dir {
+                    let _ = fs::remove_dir_all(dir).await;
+                }
+                continue;
+            }
+        };
+        map.insert(package_manifest.manifest.id.clone(), path.clone());
+        if let Some(dir) = staging_dir {
+            let _ = fs::remove_dir_all(dir).await;
+        }
+    }
+
+    Ok(map)
 }
 
 async fn shutdown_signal() {

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::drivers::{
-    CapabilityDriver, DownloaderTorrentDriver, IndexerRegistryDriver, MediaManagerTvDriver,
+    CapabilityDriver, DownloaderTorrentDriver, IndexerRegistryDriver, MediaManagerMoviesDriver,
+    MediaManagerTvDriver,
 };
 
 pub struct DriverRegistry {
@@ -19,6 +20,7 @@ impl DriverRegistry {
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(MediaManagerTvDriver::new());
+        registry.register(MediaManagerMoviesDriver::new());
         registry.register(IndexerRegistryDriver::new());
         registry.register(DownloaderTorrentDriver::new());
         registry

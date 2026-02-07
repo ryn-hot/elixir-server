@@ -120,6 +120,10 @@ struct QbittorrentClient {
     cookie: String,
 }
 
+const QBITTORRENT_BOOTSTRAP_USER: &str = "admin";
+const QBITTORRENT_BOOTSTRAP_PASS: &str = "adminadmin";
+const QBITTORRENT_AUTOGEN_PREFIX: &str = "elixir_";
+
 impl QbittorrentClient {
     async fn from_config(
         config: QbittorrentDriverConfig,
@@ -152,7 +156,7 @@ impl QbittorrentClient {
         } else {
             client.set_api_version("v2")?;
         }
-        client.login(&username, &password).await?;
+        client.login_with_bootstrap(&username, &password).await?;
         Ok(client)
     }
 
@@ -162,7 +166,27 @@ impl QbittorrentClient {
         Ok(())
     }
 
-    async fn login(&mut self, username: &str, password: &str) -> Result<()> {
+    async fn login_with_bootstrap(&mut self, username: &str, password: &str) -> Result<()> {
+        if self.try_login(username, password).await? {
+            return Ok(());
+        }
+        if !username.starts_with(QBITTORRENT_AUTOGEN_PREFIX) {
+            bail!("qbittorrent auth rejected for configured credentials");
+        }
+        if !self
+            .try_login(QBITTORRENT_BOOTSTRAP_USER, QBITTORRENT_BOOTSTRAP_PASS)
+            .await?
+        {
+            bail!("qbittorrent auth rejected for configured credentials and default bootstrap");
+        }
+        self.set_webui_credentials(username, password).await?;
+        if self.try_login(username, password).await? {
+            return Ok(());
+        }
+        bail!("qbittorrent auth rejected after bootstrap reset");
+    }
+
+    async fn try_login(&mut self, username: &str, password: &str) -> Result<bool> {
         let url = self
             .api_base
             .join("auth/login")
@@ -188,18 +212,14 @@ impl QbittorrentClient {
             .await
             .context("reading qbittorrent auth response")?;
         if !status.is_success() {
-            bail!(
-                "qbittorrent auth failed ({}): {}",
-                status,
-                body.trim()
-            );
+            return Ok(false);
         }
         if body.trim() != "Ok." {
-            bail!("qbittorrent auth rejected: {}", body.trim());
+            return Ok(false);
         }
         let cookie = cookie_header.ok_or_else(|| anyhow::anyhow!("qbittorrent auth cookie missing"))?;
         self.cookie = cookie;
-        Ok(())
+        Ok(true)
     }
 
     fn api_url(&self, path: &str) -> Result<Url> {
@@ -346,6 +366,16 @@ impl QbittorrentClient {
         if prefs.is_empty() {
             return Ok(());
         }
+        let payload = Value::Object(prefs);
+        let mut fields = HashMap::new();
+        fields.insert("json".to_string(), payload.to_string());
+        self.request_form("app/setPreferences", &fields).await
+    }
+
+    async fn set_webui_credentials(&self, username: &str, password: &str) -> Result<()> {
+        let mut prefs = serde_json::Map::new();
+        prefs.insert("web_ui_username".to_string(), Value::String(username.to_string()));
+        prefs.insert("web_ui_password".to_string(), Value::String(password.to_string()));
         let payload = Value::Object(prefs);
         let mut fields = HashMap::new();
         fields.insert("json".to_string(), payload.to_string());

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use rand::{Rng, distributions::Alphanumeric};
+use reqwest::Url;
 use serde::Deserialize;
 use sqlx::AnyPool;
 use tokio::fs;
@@ -13,6 +15,10 @@ use uuid::Uuid;
 
 use crate::db::models::{BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality};
 use crate::drivers::{ApplyStatus, DriverCtx, DriverPatch, DriverRegistry};
+use crate::drivers::{
+    DownloaderSpec, IndexerCredentialField, IndexerRegistryPatch, MediaManagerMoviesPatch,
+    MediaManagerTvPatch,
+};
 use crate::extensions::manifest::{ManifestNetworking, ManifestRuntime, ManifestRuntimeEnv};
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
@@ -259,6 +265,10 @@ impl<'a> Executor<'a> {
             bail!("runtime network must be 'elixir_net'");
         }
 
+        if is_qbittorrent_extension_id(&extension_id) {
+            ensure_qbittorrent_secrets(&self.store, self.secrets, instance_id, &runtime.env)
+                .await?;
+        }
         ensure_runtime_secrets_present(&self.store, instance_id, &runtime.env).await?;
 
         let name = container_name(instance_id);
@@ -500,7 +510,7 @@ impl<'a> Executor<'a> {
             )
         })?;
 
-        let patch =
+        let mut patch =
             DriverPatch::from_manifest(&provider.capability, patch).context("parsing driver patch")?;
         patch.validate().context("validating driver patch")?;
 
@@ -510,6 +520,13 @@ impl<'a> Executor<'a> {
         {
             let api_key = resolve_sonarr_api_key(&self.store, self.secrets, &instance).await?;
             secrets.insert("sonarr_api_key".to_string(), api_key);
+        }
+        if provider.capability == "media.manager.movies"
+            && provider.implementation.as_deref() == Some("radarr")
+        {
+            let api_key = resolve_radarr_api_key(&self.store, self.secrets, &instance).await?;
+            secrets.insert("radarr_api_key".to_string(), api_key.clone());
+            secrets.insert("api_key".to_string(), api_key);
         }
         if provider.capability == "indexer.registry"
             && provider.implementation.as_deref() == Some("prowlarr")
@@ -525,6 +542,11 @@ impl<'a> Executor<'a> {
             secrets.insert("qbittorrent_username".to_string(), username);
             secrets.insert("qbittorrent_password".to_string(), password);
         }
+
+        resolve_indexer_credentials(&self.store, self.secrets, provider.instance_id, &mut patch)
+            .await?;
+        resolve_indexer_apps(&self.store, self.secrets, &mut patch).await?;
+        resolve_downloader_credentials(&self.store, self.secrets, &mut patch).await?;
 
         let ctx = DriverCtx::new(
             provider.provider_id,
@@ -656,6 +678,30 @@ impl<'a> Executor<'a> {
             }
             bail!("sonarr config.xml not ready");
         }
+        if provider.capability == "media.manager.movies"
+            && provider.implementation.as_deref() == Some("radarr")
+        {
+            let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
+            if let Some(config_dir) = config.config_dir {
+                if let Some(key) = read_radarr_api_key_from_config(&config_dir).await? {
+                    upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key)
+                        .await?;
+                    self.probe
+                        .probe_dns(&endpoint.host)
+                        .await
+                        .and_then(|result| ensure_probe_ok(result, "dns"))?;
+                    self.probe
+                        .probe_tcp(&endpoint.host, endpoint.port)
+                        .await
+                        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                    self.store
+                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            bail!("radarr config.xml not ready");
+        }
         if provider.capability == "indexer.registry"
             && provider.implementation.as_deref() == Some("prowlarr")
         {
@@ -724,6 +770,34 @@ async fn resolve_sonarr_api_key(
     bail!("sonarr api key is not available yet");
 }
 
+async fn resolve_radarr_api_key(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<String> {
+    let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
+    if let Some(key) = config.api_key {
+        upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
+        return Ok(key);
+    }
+
+    if let Some(secret) = store
+        .get_secret(SecretScope::Instance, Some(instance.instance_id), "radarr_api_key")
+        .await?
+    {
+        return secrets.decrypt(&secret.value_encrypted);
+    }
+
+    if let Some(config_dir) = config.config_dir {
+        if let Some(key) = read_radarr_api_key_from_config(&config_dir).await? {
+            upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
+            return Ok(key);
+        }
+    }
+
+    bail!("radarr api key is not available yet");
+}
+
 async fn upsert_sonarr_secret(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -737,6 +811,25 @@ async fn upsert_sonarr_secret(
             scope: SecretScope::Instance,
             scope_id: Some(instance_id),
             key: "sonarr_api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await
+}
+
+async fn upsert_radarr_secret(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    api_key: &str,
+) -> Result<()> {
+    let encrypted = secrets.encrypt(api_key)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "radarr_api_key".to_string(),
             value_encrypted: encrypted,
             rotatable: false,
         })
@@ -802,10 +895,90 @@ async fn resolve_qbittorrent_credentials(
         return Ok((username, password));
     }
 
+    ensure_qbittorrent_credentials(store, secrets, instance.instance_id).await
+}
+
+async fn resolve_indexer_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    patch: &mut DriverPatch,
+) -> Result<()> {
+    let indexers = match patch {
+        DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterIndexers { indexers }) => {
+            indexers
+        }
+        DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetIndexerRegistry { indexers }) => {
+            indexers
+        }
+        _ => return Ok(()),
+    };
+
+    for indexer in indexers {
+        let fields = indexer.credential_fields()?;
+        for field in fields {
+            let key = indexer.credential_secret_key(field);
+            let secret = store
+                .get_secret(SecretScope::Instance, Some(instance_id), &key)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("missing required secret instance:{}:{}", instance_id, key)
+                })?;
+            let value = secrets.decrypt(&secret.value_encrypted)?;
+            match field {
+                IndexerCredentialField::ApiKey => {
+                    indexer.api_key = Some(value);
+                }
+                IndexerCredentialField::Username => {
+                    indexer
+                        .settings
+                        .insert("username".to_string(), serde_json::Value::String(value));
+                }
+                IndexerCredentialField::Password => {
+                    indexer
+                        .settings
+                        .insert("password".to_string(), serde_json::Value::String(value));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_qbittorrent_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    env: &[ManifestRuntimeEnv],
+) -> Result<()> {
+    let mut requires_qbittorrent = false;
+    for entry in env {
+        if let Some(from_secret) = entry.from_secret.as_ref() {
+            let trimmed = from_secret.trim();
+            if trimmed == "instance:qbittorrent_username"
+                || trimmed == "instance:qbittorrent_password"
+            {
+                requires_qbittorrent = true;
+                break;
+            }
+        }
+    }
+    if !requires_qbittorrent {
+        return Ok(());
+    }
+    let _ = ensure_qbittorrent_credentials(store, secrets, instance_id).await?;
+    Ok(())
+}
+
+async fn ensure_qbittorrent_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+) -> Result<(String, String)> {
     let username = store
         .get_secret(
             SecretScope::Instance,
-            Some(instance.instance_id),
+            Some(instance_id),
             "qbittorrent_username",
         )
         .await?
@@ -815,7 +988,7 @@ async fn resolve_qbittorrent_credentials(
     let password = store
         .get_secret(
             SecretScope::Instance,
-            Some(instance.instance_id),
+            Some(instance_id),
             "qbittorrent_password",
         )
         .await?
@@ -825,8 +998,314 @@ async fn resolve_qbittorrent_credentials(
 
     match (username, password) {
         (Some(username), Some(password)) => Ok((username, password)),
-        _ => bail!("qbittorrent credentials are not available yet"),
+        (None, None) => {
+            let (username, password) = generate_qbittorrent_credentials();
+            upsert_qbittorrent_secrets(store, secrets, instance_id, &username, &password)
+                .await?;
+            Ok((username, password))
+        }
+        _ => bail!("qbittorrent credentials are partially configured"),
     }
+}
+
+fn generate_qbittorrent_credentials() -> (String, String) {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let password: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(28)
+        .map(char::from)
+        .collect();
+    (format!("elixir_{suffix}"), password)
+}
+
+fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
+    extension_id
+        .to_ascii_lowercase()
+        .contains("qbittorrent")
+}
+
+async fn resolve_indexer_apps(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    patch: &mut DriverPatch,
+) -> Result<()> {
+    let apps = match patch {
+        DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps { apps }) => apps,
+        _ => return Ok(()),
+    };
+    for app in apps {
+        if app.api_key.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+            continue;
+        }
+        let host_hint = url_host(&app.url);
+        if is_sonarr_app(&app.implementation) {
+            let instance = resolve_sonarr_instance_for_app(store, host_hint.as_deref()).await?;
+            let api_key = resolve_sonarr_api_key(store, secrets, &instance).await?;
+            app.api_key = Some(api_key);
+        } else if is_radarr_app(&app.implementation) {
+            let instance = resolve_radarr_instance_for_app(store, host_hint.as_deref()).await?;
+            let api_key = resolve_radarr_api_key(store, secrets, &instance).await?;
+            app.api_key = Some(api_key);
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_downloader_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    patch: &mut DriverPatch,
+) -> Result<()> {
+    let downloaders = match patch {
+        DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) => {
+            downloaders
+        }
+        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders { downloaders }) => {
+            downloaders
+        }
+        _ => return Ok(()),
+    };
+
+    for downloader in downloaders {
+        if !is_qbittorrent_downloader(&downloader.r#type) {
+            continue;
+        }
+        if downloader_has_credentials(downloader) {
+            continue;
+        }
+        let host_hint = url_host(&downloader.url);
+        let instance =
+            resolve_qbittorrent_instance_for_downloader(store, host_hint.as_deref()).await?;
+        let (username, password) =
+            resolve_qbittorrent_credentials(store, secrets, &instance).await?;
+        if downloader_setting_missing(&downloader.settings, "username") {
+            downloader.settings.insert(
+                "username".to_string(),
+                serde_json::Value::String(username),
+            );
+        }
+        if downloader_setting_missing(&downloader.settings, "password") {
+            downloader.settings.insert(
+                "password".to_string(),
+                serde_json::Value::String(password),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_sonarr_app(implementation: &str) -> bool {
+    implementation.trim().to_ascii_lowercase().starts_with("sonarr")
+}
+
+fn is_radarr_app(implementation: &str) -> bool {
+    implementation.trim().to_ascii_lowercase().starts_with("radarr")
+}
+
+fn url_host(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+}
+
+fn is_qbittorrent_downloader(implementation: &str) -> bool {
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("qbittorrent")
+}
+
+fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {
+    !downloader_setting_missing(&downloader.settings, "username")
+        && !downloader_setting_missing(&downloader.settings, "password")
+}
+
+fn downloader_setting_missing(
+    settings: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> bool {
+    match settings.get(key) {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
+    }
+}
+
+async fn resolve_sonarr_instance_for_app(
+    store: &ExtensionStore<'_>,
+    host_hint: Option<&str>,
+) -> Result<crate::db::models::ExtensionInstance> {
+    let providers = store.list_provider_details().await?;
+    let mut candidates = Vec::new();
+    for detail in providers {
+        if detail.provider.capability != "media.manager.tv" {
+            continue;
+        }
+        if let Some(implementation) = detail.provider.implementation.as_deref() {
+            if !implementation.eq_ignore_ascii_case("sonarr") {
+                continue;
+            }
+        }
+        candidates.push(detail);
+    }
+
+    if candidates.is_empty() {
+        bail!("sonarr provider not found for prowlarr app registration");
+    }
+
+    let mut selected = None;
+    if let Some(host) = host_hint {
+        for detail in &candidates {
+            let endpoint_json = detail.provider.endpoint_json.as_ref();
+            let endpoint_json = match endpoint_json {
+                Some(value) => value,
+                None => continue,
+            };
+            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(_) => continue,
+            };
+            if endpoint.host == host {
+                selected = Some(detail.clone());
+                break;
+            }
+        }
+    }
+
+    let selected = if let Some(selected) = selected {
+        selected
+    } else if candidates.len() == 1 {
+        candidates.remove(0)
+    } else {
+        bail!("multiple sonarr providers found; specify the elx-sonarr host in the app url");
+    };
+
+    store
+        .get_instance(selected.provider.instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("sonarr instance {} not found", selected.provider.instance_id))
+}
+
+async fn resolve_radarr_instance_for_app(
+    store: &ExtensionStore<'_>,
+    host_hint: Option<&str>,
+) -> Result<crate::db::models::ExtensionInstance> {
+    let providers = store.list_provider_details().await?;
+    let mut candidates = Vec::new();
+    for detail in providers {
+        if detail.provider.capability != "media.manager.movies" {
+            continue;
+        }
+        if let Some(implementation) = detail.provider.implementation.as_deref() {
+            if !implementation.eq_ignore_ascii_case("radarr") {
+                continue;
+            }
+        }
+        candidates.push(detail);
+    }
+
+    if candidates.is_empty() {
+        bail!("radarr provider not found for prowlarr app registration");
+    }
+
+    let mut selected = None;
+    if let Some(host) = host_hint {
+        for detail in &candidates {
+            let endpoint_json = detail.provider.endpoint_json.as_ref();
+            let endpoint_json = match endpoint_json {
+                Some(value) => value,
+                None => continue,
+            };
+            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(_) => continue,
+            };
+            if endpoint.host == host {
+                selected = Some(detail.clone());
+                break;
+            }
+        }
+    }
+
+    let selected = if let Some(selected) = selected {
+        selected
+    } else if candidates.len() == 1 {
+        candidates.remove(0)
+    } else {
+        bail!("multiple radarr providers found; specify the elx-radarr host in the app url");
+    };
+
+    store
+        .get_instance(selected.provider.instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("radarr instance {} not found", selected.provider.instance_id))
+}
+
+async fn resolve_qbittorrent_instance_for_downloader(
+    store: &ExtensionStore<'_>,
+    host_hint: Option<&str>,
+) -> Result<crate::db::models::ExtensionInstance> {
+    let providers = store.list_provider_details().await?;
+    let mut candidates = Vec::new();
+    for detail in providers {
+        if detail.provider.capability != "downloader.torrent" {
+            continue;
+        }
+        if let Some(implementation) = detail.provider.implementation.as_deref() {
+            if !implementation.eq_ignore_ascii_case("qbittorrent") {
+                continue;
+            }
+        }
+        candidates.push(detail);
+    }
+
+    if candidates.is_empty() {
+        bail!("qbittorrent provider not found for downloader credentials");
+    }
+
+    let mut selected = None;
+    if let Some(host) = host_hint {
+        for detail in &candidates {
+            let endpoint_json = detail.provider.endpoint_json.as_ref();
+            let endpoint_json = match endpoint_json {
+                Some(value) => value,
+                None => continue,
+            };
+            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(_) => continue,
+            };
+            if endpoint.host == host {
+                selected = Some(detail.clone());
+                break;
+            }
+        }
+    }
+
+    let selected = if let Some(selected) = selected {
+        selected
+    } else if candidates.len() == 1 {
+        candidates.remove(0)
+    } else {
+        bail!(
+            "multiple qbittorrent providers found; specify the elx-qbittorrent host in the downloader url"
+        );
+    };
+
+    store
+        .get_instance(selected.provider.instance_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "qbittorrent instance {} not found",
+                selected.provider.instance_id
+            )
+        })
 }
 
 async fn upsert_qbittorrent_secrets(
@@ -876,6 +1355,20 @@ struct SonarrRuntimeConfig {
 }
 
 #[derive(Default, Deserialize)]
+struct RadarrInstanceConfig {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    runtime: Option<RadarrRuntimeConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct RadarrRuntimeConfig {
+    #[serde(default)]
+    config_dir: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
 struct ProwlarrInstanceConfig {
     #[serde(default)]
     api_key: Option<String>,
@@ -902,6 +1395,11 @@ struct ParsedSonarrConfig {
     config_dir: Option<String>,
 }
 
+struct ParsedRadarrConfig {
+    api_key: Option<String>,
+    config_dir: Option<String>,
+}
+
 struct ParsedProwlarrConfig {
     api_key: Option<String>,
     config_dir: Option<String>,
@@ -922,6 +1420,21 @@ fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<Par
     let config: SonarrInstanceConfig =
         serde_json::from_value(value.clone()).context("parsing sonarr instance config")?;
     Ok(ParsedSonarrConfig {
+        api_key: config.api_key,
+        config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
+    })
+}
+
+fn parse_radarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedRadarrConfig> {
+    let Some(value) = value else {
+        return Ok(ParsedRadarrConfig {
+            api_key: None,
+            config_dir: None,
+        });
+    };
+    let config: RadarrInstanceConfig =
+        serde_json::from_value(value.clone()).context("parsing radarr instance config")?;
+    Ok(ParsedRadarrConfig {
         api_key: config.api_key,
         config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
     })
@@ -962,6 +1475,10 @@ fn parse_qbittorrent_instance_config(
 }
 
 async fn read_sonarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
+    read_arr_api_key_from_config(config_dir).await
+}
+
+async fn read_radarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
     read_arr_api_key_from_config(config_dir).await
 }
 

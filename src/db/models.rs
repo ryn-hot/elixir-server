@@ -256,6 +256,7 @@ pub struct Secret {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct OrchestratorRun {
     pub run_id: Uuid,
+    pub source: String,
     pub status: OrchestratorRunStatus,
     pub phase: Option<String>,
     pub plan_json: Option<serde_json::Value>,

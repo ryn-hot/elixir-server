@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub enum DriverPatch {
     MediaManagerTv(MediaManagerTvPatch),
+    MediaManagerMovies(MediaManagerMoviesPatch),
     IndexerRegistry(IndexerRegistryPatch),
     DownloaderTorrent(DownloaderTorrentPatch),
 }
@@ -15,6 +16,7 @@ impl DriverPatch {
     pub fn capability(&self) -> &'static str {
         match self {
             DriverPatch::MediaManagerTv(_) => "media.manager.tv",
+            DriverPatch::MediaManagerMovies(_) => "media.manager.movies",
             DriverPatch::IndexerRegistry(_) => "indexer.registry",
             DriverPatch::DownloaderTorrent(_) => "downloader.torrent",
         }
@@ -23,6 +25,7 @@ impl DriverPatch {
     pub fn validate(&self) -> Result<()> {
         match self {
             DriverPatch::MediaManagerTv(patch) => patch.validate(),
+            DriverPatch::MediaManagerMovies(patch) => patch.validate(),
             DriverPatch::IndexerRegistry(patch) => patch.validate(),
             DriverPatch::DownloaderTorrent(patch) => patch.validate(),
         }
@@ -34,6 +37,11 @@ impl DriverPatch {
                 let patch: MediaManagerTvPatch =
                     serde_json::from_value(patch).context("parsing media.manager.tv patch")?;
                 Ok(DriverPatch::MediaManagerTv(patch))
+            }
+            "media.manager.movies" => {
+                let patch: MediaManagerMoviesPatch =
+                    serde_json::from_value(patch).context("parsing media.manager.movies patch")?;
+                Ok(DriverPatch::MediaManagerMovies(patch))
             }
             "indexer.registry" => {
                 let patch: IndexerRegistryPatch =
@@ -165,9 +173,52 @@ impl MediaManagerTvPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+pub enum MediaManagerMoviesPatch {
+    SetDownloaders {
+        downloaders: Vec<DownloaderSpec>,
+    },
+    SetRootFolders {
+        roots: Vec<RootFolderSpec>,
+    },
+    SetTags {
+        tags: Vec<String>,
+    },
+}
+
+impl MediaManagerMoviesPatch {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            MediaManagerMoviesPatch::SetDownloaders { downloaders } => {
+                ensure_non_empty_list(downloaders, "downloaders")?;
+                for downloader in downloaders {
+                    downloader.validate()?;
+                }
+                Ok(())
+            }
+            MediaManagerMoviesPatch::SetRootFolders { roots } => {
+                ensure_non_empty_list(roots, "roots")?;
+                for root in roots {
+                    root.validate()?;
+                }
+                Ok(())
+            }
+            MediaManagerMoviesPatch::SetTags { tags } => {
+                ensure_non_empty_list(tags, "tags")?;
+                validate_tags(tags, "tags")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum IndexerRegistryPatch {
     RegisterIndexers {
         indexers: Vec<IndexerSpec>,
+    },
+    RegisterApps {
+        apps: Vec<AppSpec>,
     },
 }
 
@@ -178,6 +229,13 @@ impl IndexerRegistryPatch {
                 ensure_non_empty_list(indexers, "indexers")?;
                 for indexer in indexers {
                     indexer.validate()?;
+                }
+                Ok(())
+            }
+            IndexerRegistryPatch::RegisterApps { apps } => {
+                ensure_non_empty_list(apps, "apps")?;
+                for app in apps {
+                    app.validate()?;
                 }
                 Ok(())
             }
@@ -239,6 +297,8 @@ pub struct IndexerSpec {
     pub implementation: String,
     pub url: String,
     #[serde(default)]
+    pub auth: IndexerAuthSpec,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub categories: Vec<String>,
@@ -250,15 +310,127 @@ pub struct IndexerSpec {
     pub settings: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSpec {
+    pub name: String,
+    pub implementation: String,
+    pub url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub settings: HashMap<String, serde_json::Value>,
+}
+
+impl AppSpec {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.name, "app.name")?;
+        ensure_non_empty(&self.implementation, "app.implementation")?;
+        validate_url(&self.url)?;
+        ensure_optional_non_empty(self.api_key.as_deref(), "app.api_key")?;
+        validate_tags(&self.categories, "app.categories")?;
+        validate_tags(&self.tags, "app.tags")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexerAuthSpec {
+    pub requires_account: Option<bool>,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexerCredentialField {
+    Username,
+    Password,
+    ApiKey,
+}
+
 impl IndexerSpec {
     fn validate(&self) -> Result<()> {
         ensure_non_empty(&self.name, "indexer.name")?;
         ensure_non_empty(&self.implementation, "indexer.implementation")?;
         validate_url(&self.url)?;
         ensure_optional_non_empty(self.api_key.as_deref(), "indexer.api_key")?;
+        self.validate_auth()?;
         validate_tags(&self.categories, "indexer.categories")?;
         validate_tags(&self.tags, "indexer.tags")?;
         Ok(())
+    }
+
+    pub fn credential_fields(&self) -> Result<Vec<IndexerCredentialField>> {
+        let requires_account = self
+            .auth
+            .requires_account
+            .ok_or_else(|| anyhow!("indexer.auth.requires_account is required"))?;
+        if !requires_account {
+            return Ok(Vec::new());
+        }
+        let mut fields = if self.auth.required_fields.is_empty() {
+            vec!["username", "password"]
+        } else {
+            self.auth.required_fields.iter().map(String::as_str).collect()
+        };
+        let mut out = Vec::new();
+        for field in &mut fields {
+            let parsed = IndexerCredentialField::from_str(field)?;
+            if !out.contains(&parsed) {
+                out.push(parsed);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn credential_secret_key(&self, field: IndexerCredentialField) -> String {
+        let slug = slugify(&self.name);
+        format!("indexer.{slug}.{}", field.as_key())
+    }
+
+    fn validate_auth(&self) -> Result<()> {
+        let requires_account = self
+            .auth
+            .requires_account
+            .ok_or_else(|| anyhow!("indexer.auth.requires_account is required"))?;
+        if !requires_account && !self.auth.required_fields.is_empty() {
+            bail!("indexer.auth.required_fields is only allowed when requires_account is true");
+        }
+        if requires_account {
+            let fields = if self.auth.required_fields.is_empty() {
+                vec!["username", "password"]
+            } else {
+                self.auth.required_fields.iter().map(String::as_str).collect()
+            };
+            for field in fields {
+                let _ = IndexerCredentialField::from_str(field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IndexerCredentialField {
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "username" => Ok(IndexerCredentialField::Username),
+            "password" => Ok(IndexerCredentialField::Password),
+            "api_key" | "apikey" => Ok(IndexerCredentialField::ApiKey),
+            _ => bail!("unsupported indexer auth field '{}'", value),
+        }
+    }
+
+    fn as_key(&self) -> &'static str {
+        match self {
+            IndexerCredentialField::Username => "username",
+            IndexerCredentialField::Password => "password",
+            IndexerCredentialField::ApiKey => "api_key",
+        }
     }
 }
 
@@ -515,6 +687,21 @@ fn validate_tags(values: &[String], field: &str) -> Result<()> {
     Ok(())
 }
 
+fn slugify(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +713,10 @@ mod tests {
                 name: "test".to_string(),
                 implementation: "torznab".to_string(),
                 url: "".to_string(),
+                auth: IndexerAuthSpec {
+                    requires_account: Some(false),
+                    required_fields: Vec::new(),
+                },
                 api_key: None,
                 categories: Vec::new(),
                 tags: Vec::new(),
@@ -552,6 +743,33 @@ mod tests {
     #[test]
     fn indexer_registry_patch_requires_indexers() {
         let patch = IndexerRegistryPatch::RegisterIndexers { indexers: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn indexer_registry_patch_requires_apps() {
+        let patch = IndexerRegistryPatch::RegisterApps { apps: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn indexer_requires_auth_tag() {
+        let patch = MediaManagerTvPatch::SetIndexerRegistry {
+            indexers: vec![IndexerSpec {
+                name: "test".to_string(),
+                implementation: "torznab".to_string(),
+                url: "https://example.invalid".to_string(),
+                auth: IndexerAuthSpec {
+                    requires_account: None,
+                    required_fields: Vec::new(),
+                },
+                api_key: None,
+                categories: Vec::new(),
+                tags: Vec::new(),
+                enabled: None,
+                settings: HashMap::new(),
+            }],
+        };
         assert!(patch.validate().is_err());
     }
 
