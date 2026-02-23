@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -18,6 +18,12 @@ pub async fn missing_required_secrets_for_plan(
     actions: &[PlanAction],
 ) -> Result<Vec<String>> {
     let mut missing = HashSet::new();
+    let mut planned_provider_instances: HashMap<Uuid, Uuid> = HashMap::new();
+    for action in actions {
+        if let PlanAction::CreateOrUpdateProvider { provider } = action {
+            planned_provider_instances.insert(provider.provider_id, provider.instance_id);
+        }
+    }
     for action in actions {
         match action {
             PlanAction::EnsureRuntimeRunning { runtime, .. } => {
@@ -34,20 +40,25 @@ pub async fn missing_required_secrets_for_plan(
                 missing.extend(missing_for_instance);
             }
             PlanAction::ApplyDriverPatch { patch } => {
-                let provider = store
-                    .get_provider(patch.target_provider_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("provider {} not found", patch.target_provider_id))?;
-                let driver_patch = DriverPatch::from_manifest(
-                    &patch.target_capability,
-                    patch.patch.clone(),
-                )?;
+                let instance_id = if let Some(instance_id) =
+                    planned_provider_instances.get(&patch.target_provider_id)
+                {
+                    *instance_id
+                } else {
+                    let provider = store
+                        .get_provider(patch.target_provider_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("provider {} not found", patch.target_provider_id)
+                        })?;
+                    provider.instance_id
+                };
+                let driver_patch =
+                    DriverPatch::from_manifest(&patch.target_capability, patch.patch.clone())?;
                 let mut missing_for_patch =
-                    missing_indexer_secrets_for_patch(store, provider.instance_id, &driver_patch)
-                        .await?;
-                missing_for_patch.extend(
-                    missing_downloader_secrets_for_patch(store, &driver_patch).await?,
-                );
+                    missing_indexer_secrets_for_patch(store, instance_id, &driver_patch).await?;
+                missing_for_patch
+                    .extend(missing_downloader_secrets_for_patch(store, &driver_patch).await?);
                 missing.extend(missing_for_patch);
             }
             _ => {}
@@ -102,7 +113,11 @@ async fn missing_indexer_secrets_for_patch(
         for field in fields {
             let key = indexer.credential_secret_key(field);
             let exists = store
-                .get_secret(crate::db::models::SecretScope::Instance, Some(instance_id), &key)
+                .get_secret(
+                    crate::db::models::SecretScope::Instance,
+                    Some(instance_id),
+                    &key,
+                )
                 .await?
                 .is_some();
             if !exists {
@@ -121,9 +136,9 @@ async fn missing_downloader_secrets_for_patch(
         DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) => {
             downloaders.iter().collect()
         }
-        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders { downloaders }) => {
-            downloaders.iter().collect()
-        }
+        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders {
+            downloaders,
+        }) => downloaders.iter().collect(),
         _ => Vec::new(),
     };
     for downloader in downloaders {
@@ -143,16 +158,13 @@ fn filter_qbittorrent_missing(missing: Vec<String>) -> Vec<String> {
     missing
         .into_iter()
         .filter(|value| {
-            !value.ends_with(":qbittorrent_username")
-                && !value.ends_with(":qbittorrent_password")
+            !value.ends_with(":qbittorrent_username") && !value.ends_with(":qbittorrent_password")
         })
         .collect()
 }
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
-    extension_id
-        .to_ascii_lowercase()
-        .contains("qbittorrent")
+    extension_id.to_ascii_lowercase().contains("qbittorrent")
 }
 
 fn is_qbittorrent_downloader(implementation: &str) -> bool {

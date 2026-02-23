@@ -208,6 +208,7 @@ pub struct Provider {
     pub slot_id: String,
     pub cardinality: SlotCardinality,
     pub implementation: Option<String>,
+    pub scope_json: Option<serde_json::Value>,
     pub endpoint_json: Option<serde_json::Value>,
     pub health_state: ProviderHealthState,
     pub last_healthcheck_at: Option<DateTime<Utc>>,

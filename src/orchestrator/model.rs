@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -11,7 +11,10 @@ pub struct CapabilitySlot {
 impl CapabilitySlot {
     pub fn new(capability: String, slot_id: Option<String>) -> Result<Self> {
         let slot_id = slot_id.unwrap_or_else(default_slot);
-        let value = Self { capability, slot_id };
+        let value = Self {
+            capability,
+            slot_id,
+        };
         value.validate()?;
         Ok(value)
     }

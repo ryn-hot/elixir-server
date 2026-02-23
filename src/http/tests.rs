@@ -10,13 +10,12 @@ use argon2::{
     password_hash::{PasswordHasher, SaltString},
 };
 use axum::{
-    Json,
+    Json, Router,
     body::{self, Body},
     extract::State,
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer, SigningKey};
@@ -31,16 +30,16 @@ use uuid::Uuid;
 use zip::{ZipWriter, write::FileOptions};
 
 use crate::{
-    auth::AuthService,
     artwork::ArtworkService,
+    auth::AuthService,
     config::{
         AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, SecretsConfig,
         ServerConfig, Settings, TelemetryConfig,
     },
     db::Database,
     db::models::{
-        ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus, ProviderHealthState, SecretScope,
-        SlotCardinality,
+        ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus, ProviderHealthState,
+        SecretScope, SlotCardinality,
     },
     extensions::ExtensionManager,
     extensions::ExternalIds,
@@ -57,9 +56,11 @@ use crate::{
     library::normalize_override_key,
     library::run_full_scan,
     metadata::MetadataService,
-    orchestrator::planner::{Plan, Planner},
-    state::AppState,
+    orchestrator::model::ProviderEndpoint,
+    orchestrator::plan_validation::missing_required_secrets_for_plan,
+    orchestrator::planner::{DriverPatchSpec, Plan, PlanAction, Planner, ProviderSpec},
     secrets::SecretsManager,
+    state::AppState,
 };
 
 fn test_settings_with_db() -> Settings {
@@ -652,10 +653,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_body = body::to_bytes(list_resp.into_body(), 1_048_576).await?;
     let list_json: Value = serde_json::from_slice(&list_body)?;
-    let servers = list_json
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let servers = list_json.as_array().cloned().unwrap_or_default();
     assert!(!servers.is_empty());
     assert!(servers[0].get("wan_direct_endpoint").is_some());
 
@@ -709,9 +707,1336 @@ async fn discovery_requires_auth() -> Result<()> {
     assert_eq!(suggest_resp.status(), StatusCode::UNAUTHORIZED);
 
     let resp = app
+        .clone()
         .oneshot(Request::get("/api/v1/discovery/search?q=test").body(Body::empty())?)
         .await?;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let find_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/discovery/find?q=test&type=movie").body(Body::empty())?)
+        .await?;
+    assert_eq!(find_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let prefs_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/discovery/manager-preferences").body(Body::empty())?)
+        .await?;
+    assert_eq!(prefs_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let targets_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/find-media/targets?media_type=tv").body(Body::empty())?)
+        .await?;
+    assert_eq!(targets_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let find_search_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"mediaType":"tv","query":"test"}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(find_search_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let find_add_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "item": { "title": "Test Title" }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(find_add_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let find_prefs_resp = app
+        .oneshot(Request::get("/api/v1/find-media/preferences").body(Body::empty())?)
+        .await?;
+    assert_eq!(find_prefs_resp.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_manager_preferences_round_trip() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "discovery-preferences-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-prefs@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["series", "anime"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/sonarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.radarr".to_string(),
+            name: "Radarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.radarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Radarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.movies",
+                        "slot": "default",
+                        "implementation": "radarr",
+                        "scope": { "media_types": ["movie"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/radarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let sonarr_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: sonarr_instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "sonarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let sonarr_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: sonarr_provider_id,
+            instance_id: sonarr_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["series", "anime"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let radarr_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: radarr_instance_id,
+            extension_id: "elixir.modules.radarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "radarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let radarr_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: radarr_provider_id,
+            instance_id: radarr_instance_id,
+            capability: "media.manager.movies".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("radarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["movie"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let initial_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/discovery/manager-preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(initial_resp.status(), StatusCode::OK);
+    let initial_body = body::to_bytes(initial_resp.into_body(), 1_048_576).await?;
+    let initial_json: Value = serde_json::from_slice(&initial_body)?;
+    assert_eq!(
+        initial_json
+            .get("movieProviders")
+            .and_then(Value::as_array)
+            .map(|value| value.len()),
+        Some(1)
+    );
+    assert_eq!(
+        initial_json
+            .get("seriesProviders")
+            .and_then(Value::as_array)
+            .map(|value| value.len()),
+        Some(1)
+    );
+    assert_eq!(
+        initial_json
+            .get("animeProviders")
+            .and_then(Value::as_array)
+            .map(|value| value.len()),
+        Some(1)
+    );
+    assert_eq!(
+        initial_json
+            .get("preferences")
+            .and_then(|value| value.get("movieProviderId")),
+        Some(&Value::Null)
+    );
+
+    let update_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/discovery/manager-preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "movieProviderId": radarr_provider_id,
+                        "seriesProviderId": sonarr_provider_id,
+                        "animeProviderId": sonarr_provider_id
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(update_resp.status(), StatusCode::OK);
+    let update_body = body::to_bytes(update_resp.into_body(), 1_048_576).await?;
+    let update_json: Value = serde_json::from_slice(&update_body)?;
+    let radarr_provider_id_text = radarr_provider_id.to_string();
+    let sonarr_provider_id_text = sonarr_provider_id.to_string();
+    assert_eq!(
+        update_json
+            .get("preferences")
+            .and_then(|value| value.get("movieProviderId"))
+            .and_then(Value::as_str),
+        Some(radarr_provider_id_text.as_str())
+    );
+    assert_eq!(
+        update_json
+            .get("preferences")
+            .and_then(|value| value.get("seriesProviderId"))
+            .and_then(Value::as_str),
+        Some(sonarr_provider_id_text.as_str())
+    );
+    assert_eq!(
+        update_json
+            .get("preferences")
+            .and_then(|value| value.get("animeProviderId"))
+            .and_then(Value::as_str),
+        Some(sonarr_provider_id_text.as_str())
+    );
+
+    let persisted_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/discovery/manager-preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(persisted_resp.status(), StatusCode::OK);
+    let persisted_body = body::to_bytes(persisted_resp.into_body(), 1_048_576).await?;
+    let persisted_json: Value = serde_json::from_slice(&persisted_body)?;
+    assert_eq!(
+        persisted_json
+            .get("preferences")
+            .and_then(|value| value.get("movieProviderId"))
+            .and_then(Value::as_str),
+        Some(radarr_provider_id_text.as_str())
+    );
+
+    let new_prefs_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find-media/preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(new_prefs_resp.status(), StatusCode::OK);
+    let new_prefs_body = body::to_bytes(new_prefs_resp.into_body(), 1_048_576).await?;
+    let new_prefs_json: Value = serde_json::from_slice(&new_prefs_body)?;
+    assert_eq!(
+        new_prefs_json
+            .get("preferences")
+            .and_then(|value| value.get("moviesDefaultManagerProviderId"))
+            .and_then(Value::as_str),
+        Some(radarr_provider_id_text.as_str())
+    );
+    assert_eq!(
+        new_prefs_json
+            .get("preferences")
+            .and_then(|value| value.get("tvDefaultManagerProviderId"))
+            .and_then(Value::as_str),
+        Some(sonarr_provider_id_text.as_str())
+    );
+
+    let patch_resp = app
+        .oneshot(
+            Request::patch("/api/v1/find-media/preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "moviesDefaultManagerProviderId": Value::Null,
+                        "tvDefaultManagerProviderId": sonarr_provider_id,
+                        "animeDefaultManagerProviderId": sonarr_provider_id
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+    let patch_body = body::to_bytes(patch_resp.into_body(), 1_048_576).await?;
+    let patch_json: Value = serde_json::from_slice(&patch_body)?;
+    assert_eq!(
+        patch_json
+            .get("preferences")
+            .and_then(|value| value.get("moviesDefaultManagerProviderId")),
+        Some(&Value::Null)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "discovery-find-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["series", "anime"] }
+                    },
+                    {
+                        "capability": "media.search.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["series"] }
+                    },
+                    {
+                        "capability": "media.search.anime",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["anime"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/sonarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.radarr".to_string(),
+            name: "Radarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.radarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Radarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.movies",
+                        "slot": "default",
+                        "implementation": "radarr",
+                        "scope": { "media_types": ["movie"] }
+                    },
+                    {
+                        "capability": "media.search.movies",
+                        "slot": "default",
+                        "implementation": "radarr",
+                        "scope": { "media_types": ["movie"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/radarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let sonarr_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: sonarr_instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "sonarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+
+    let sonarr_manager_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: sonarr_manager_provider_id,
+            instance_id: sonarr_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["series", "anime"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: sonarr_instance_id,
+            capability: "media.search.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["series"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    let sonarr_anime_search_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: sonarr_anime_search_provider_id,
+            instance_id: sonarr_instance_id,
+            capability: "media.search.anime".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["anime"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let radarr_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: radarr_instance_id,
+            extension_id: "elixir.modules.radarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "radarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: radarr_instance_id,
+            capability: "media.manager.movies".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("radarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["movie"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: radarr_instance_id,
+            capability: "media.search.movies".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("radarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["movie"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/discovery/find?q=naruto&type=anime")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let sonarr_manager_provider_id_text = sonarr_manager_provider_id.to_string();
+    let sonarr_anime_search_provider_id_text = sonarr_anime_search_provider_id.to_string();
+
+    assert_eq!(
+        payload.get("mediaType").and_then(Value::as_str),
+        Some("anime")
+    );
+    let search_providers = payload
+        .get("searchProviders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(search_providers.len(), 2);
+    let manager_providers = payload
+        .get("managerProviders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(manager_providers.len(), 1);
+    assert_eq!(
+        payload
+            .get("defaultManagerProviderId")
+            .and_then(Value::as_str),
+        Some(sonarr_manager_provider_id_text.as_str())
+    );
+
+    let provider_ids: Vec<_> = search_providers
+        .iter()
+        .filter_map(|provider| provider.get("providerId").and_then(Value::as_str))
+        .collect();
+    assert!(provider_ids.contains(&sonarr_manager_provider_id_text.as_str()));
+    assert!(provider_ids.contains(&sonarr_anime_search_provider_id_text.as_str()));
+
+    let provider_errors = payload
+        .get("providerErrors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(provider_errors.len(), 2);
+    assert_eq!(
+        payload
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(0)
+    );
+
+    let targets_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find-media/targets?media_type=anime")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(targets_resp.status(), StatusCode::OK);
+    let targets_body = body::to_bytes(targets_resp.into_body(), 1_048_576).await?;
+    let targets_json: Value = serde_json::from_slice(&targets_body)?;
+    assert_eq!(
+        targets_json.get("mediaType").and_then(Value::as_str),
+        Some("anime")
+    );
+    assert_eq!(
+        targets_json
+            .get("searchProviders")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(2)
+    );
+    assert_eq!(
+        targets_json
+            .get("managerCandidates")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(1)
+    );
+
+    let search_resp = app
+        .oneshot(
+            Request::post("/api/v1/find-media/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "anime",
+                        "query": "naruto"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let search_body = body::to_bytes(search_resp.into_body(), 1_048_576).await?;
+    let search_json: Value = serde_json::from_slice(&search_body)?;
+    assert_eq!(
+        search_json.get("mediaType").and_then(Value::as_str),
+        Some("anime")
+    );
+    assert_eq!(
+        search_json
+            .get("providerErrors")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(2)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_add_returns_missing_manager_conflict() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-add-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-add@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "item": {
+                            "title": "Example Show",
+                            "externalIds": { "tvdbSeries": "12345" }
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("code").and_then(Value::as_str),
+        Some("missing_manager")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_add_returns_manager_selection_required_conflict() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-add-manager-selection-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-add-selection@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let manager_manifest = |id: &str| {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": id,
+            "provides": [
+                {
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "implementation": "sonarr",
+                    "scope": {
+                        "media_types": ["series"],
+                        "actions": ["add", "search", "monitor"]
+                    }
+                }
+            ],
+            "runtime": { "type": "container", "image": "example/sonarr:latest" }
+        })
+    };
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.manager_a".to_string(),
+            name: "Manager A".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manager_manifest("elixir.modules.manager_a"),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.manager_b".to_string(),
+            name: "Manager B".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manager_manifest("elixir.modules.manager_b"),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let manager_a_instance = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: manager_a_instance,
+            extension_id: "elixir.modules.manager_a".to_string(),
+            instance_name: "a".to_string(),
+            config_json: Some(json!({ "api_key": "a-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: manager_a_instance,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let manager_b_instance = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: manager_b_instance,
+            extension_id: "elixir.modules.manager_b".to_string(),
+            instance_name: "b".to_string(),
+            config_json: Some(json!({ "api_key": "b-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: manager_b_instance,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "item": { "title": "Example Show" }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("code").and_then(Value::as_str),
+        Some("manager_selection_required")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_add_returns_missing_required_secrets_conflict() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-add-missing-secrets-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-add-missing-secrets@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.requires_api".to_string(),
+            name: "Requires API".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.requires_api",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Requires API",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": {
+                            "media_types": ["series"],
+                            "actions": ["add"],
+                            "requires_account": true,
+                            "required_fields": ["api_key"]
+                        }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/sonarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.requires_api".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add"],
+                "requires_account": true,
+                "required_fields": ["api_key"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "item": { "title": "Example Show" }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("code").and_then(Value::as_str),
+        Some("missing_required_secrets")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_targets_manager_resolution_precedence() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-targets-precedence".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-targets@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let manager_manifest = |id: &str| {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": id,
+            "provides": [
+                {
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "implementation": "sonarr",
+                    "scope": {
+                        "media_types": ["series"],
+                        "actions": ["add", "search", "monitor"]
+                    }
+                }
+            ],
+            "runtime": { "type": "container", "image": "example/sonarr:latest" }
+        })
+    };
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.community".to_string(),
+            name: "Community".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: manager_manifest("elixir.modules.community"),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.verified".to_string(),
+            name: "Verified".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manager_manifest("elixir.modules.verified"),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let community_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: community_instance_id,
+            extension_id: "elixir.modules.community".to_string(),
+            instance_name: "community".to_string(),
+            config_json: Some(json!({ "api_key": "community-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let community_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: community_provider_id,
+            instance_id: community_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let verified_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: verified_instance_id,
+            extension_id: "elixir.modules.verified".to_string(),
+            instance_name: "verified".to_string(),
+            config_json: Some(json!({ "api_key": "verified-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let verified_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: verified_provider_id,
+            instance_id: verified_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let initial = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find-media/targets?media_type=tv")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body = body::to_bytes(initial.into_body(), 1_048_576).await?;
+    let initial_json: Value = serde_json::from_slice(&initial_body)?;
+    let verified_provider_id_text = verified_provider_id.to_string();
+    assert_eq!(
+        initial_json
+            .get("defaultManagerProviderId")
+            .and_then(Value::as_str),
+        Some(verified_provider_id_text.as_str())
+    );
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.blueprints.pref".to_string(),
+            name: "Blueprint Preference".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.blueprints.pref",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "pref",
+                "preferences": {
+                    "providers": {
+                        "media.manager.tv/default": {
+                            "prefer": ["elixir.modules.community"]
+                        }
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let desired_id = Uuid::new_v4();
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id,
+            blueprint_extension_id: "elixir.blueprints.pref".to_string(),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+            decisions_json: None,
+        })
+        .await?;
+    store.mark_desired_applied(desired_id, true).await?;
+
+    let blueprint = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find-media/targets?media_type=tv")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(blueprint.status(), StatusCode::OK);
+    let blueprint_body = body::to_bytes(blueprint.into_body(), 1_048_576).await?;
+    let blueprint_json: Value = serde_json::from_slice(&blueprint_body)?;
+    let community_provider_id_text = community_provider_id.to_string();
+    assert_eq!(
+        blueprint_json
+            .get("defaultManagerProviderId")
+            .and_then(Value::as_str),
+        Some(community_provider_id_text.as_str())
+    );
+
+    store
+        .upsert_extension_setting(
+            "manager_preference.series",
+            &json!(verified_provider_id.to_string()),
+        )
+        .await?;
+    let preferred = app
+        .oneshot(
+            Request::get("/api/v1/find-media/targets?media_type=tv")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(preferred.status(), StatusCode::OK);
+    let preferred_body = body::to_bytes(preferred.into_body(), 1_048_576).await?;
+    let preferred_json: Value = serde_json::from_slice(&preferred_body)?;
+    assert_eq!(
+        preferred_json
+            .get("defaultManagerProviderId")
+            .and_then(Value::as_str),
+        Some(verified_provider_id_text.as_str())
+    );
+
     Ok(())
 }
 
@@ -919,12 +2244,11 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     };
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
-    let media_file_id: String = sqlx::query_scalar(
-        "SELECT id FROM media_files WHERE path = ? LIMIT 1",
-    )
-    .bind(media_path.to_string_lossy().to_string())
-    .fetch_one(&state.db_pool)
-    .await?;
+    let media_file_id: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+            .bind(media_path.to_string_lossy().to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
 
     let review_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -947,29 +2271,23 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     });
     let response = app
         .oneshot(
-            Request::post(format!(
-                "/api/v1/library/review/queue/{review_id}/apply"
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(Body::from(apply_body.to_string()))?,
+            Request::post(format!("/api/v1/library/review/queue/{review_id}/apply"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(apply_body.to_string()))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let imdb_id: Option<String> = sqlx::query_scalar(
-        "SELECT external_imdb FROM movies LIMIT 1",
-    )
-    .fetch_one(&state.db_pool)
-    .await?;
+    let imdb_id: Option<String> = sqlx::query_scalar("SELECT external_imdb FROM movies LIMIT 1")
+        .fetch_one(&state.db_pool)
+        .await?;
     assert_eq!(imdb_id.as_deref(), Some("tt1234567"));
 
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM review_queue WHERE id = ? LIMIT 1",
-    )
-    .bind(&review_id)
-    .fetch_one(&state.db_pool)
-    .await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM review_queue WHERE id = ? LIMIT 1")
+        .bind(&review_id)
+        .fetch_one(&state.db_pool)
+        .await?;
     assert_eq!(status, "applied");
 
     let override_key: String = sqlx::query_scalar(
@@ -977,8 +2295,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     )
     .fetch_one(&state.db_pool)
     .await?;
-    let expected_key =
-        normalize_override_key("Review.Movie.2024").expect("normalized key");
+    let expected_key = normalize_override_key("Review.Movie.2024").expect("normalized key");
     assert_eq!(override_key, expected_key);
 
     Ok(())
@@ -1871,10 +3188,7 @@ async fn extensions_catalog_refresh_uses_cache() -> Result<()> {
 
     let refresh_resp = app
         .clone()
-        .oneshot(
-            Request::post("/api/v1/extensions/registries/refresh")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::post("/api/v1/extensions/registries/refresh").body(Body::empty())?)
         .await?;
     assert_eq!(refresh_resp.status(), StatusCode::OK);
     let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
@@ -1980,10 +3294,7 @@ async fn extensions_catalog_refresh_preserves_last_success_on_failure() -> Resul
 
     let refresh_resp = app
         .clone()
-        .oneshot(
-            Request::post("/api/v1/extensions/registries/refresh")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::post("/api/v1/extensions/registries/refresh").body(Body::empty())?)
         .await?;
     assert_eq!(refresh_resp.status(), StatusCode::OK);
     let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
@@ -2001,10 +3312,7 @@ async fn extensions_catalog_refresh_preserves_last_success_on_failure() -> Resul
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let refresh_resp = app
-        .oneshot(
-            Request::post("/api/v1/extensions/registries/refresh")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::post("/api/v1/extensions/registries/refresh").body(Body::empty())?)
         .await?;
     assert_eq!(refresh_resp.status(), StatusCode::OK);
     let refresh_body = body::to_bytes(refresh_resp.into_body(), 1_048_576).await?;
@@ -2275,7 +3583,10 @@ async fn extensions_secrets_crud_and_rotate() -> Result<()> {
 
     let delete_resp = app
         .clone()
-        .oneshot(Request::delete(format!("/api/v1/extensions/secrets/{secret_id}")).body(Body::empty())?)
+        .oneshot(
+            Request::delete(format!("/api/v1/extensions/secrets/{secret_id}"))
+                .body(Body::empty())?,
+        )
         .await?;
     assert_eq!(delete_resp.status(), StatusCode::OK);
 
@@ -2686,6 +3997,7 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
             slot_id: "default".to_string(),
             cardinality: SlotCardinality::One,
             implementation: Some("sonarr".to_string()),
+            scope_json: None,
             endpoint_json: None,
             health_state: ProviderHealthState::Healthy,
         })
@@ -2719,7 +4031,10 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
         .find(|item| item.desired_id == plan_uuid)
         .expect("desired blueprint");
     assert_eq!(desired_entry.blueprint_extension_id, "blueprint.conflict");
-    assert!(!desired_entry.applied, "expected desired blueprint to be pending");
+    assert!(
+        !desired_entry.applied,
+        "expected desired blueprint to be pending"
+    );
 
     let conflicts = plan_json
         .get("conflicts")
@@ -2778,9 +4093,9 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
         .cloned()
         .unwrap_or_default();
     assert!(
-        !resolved_conflicts.iter().any(|conflict| {
-            conflict.get("code") == Some(&json!("slot_conflict"))
-        }),
+        !resolved_conflicts
+            .iter()
+            .any(|conflict| { conflict.get("code") == Some(&json!("slot_conflict")) }),
         "expected slot conflict to be resolved"
     );
 
@@ -2805,6 +4120,201 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
         "expected keep_existing decision to persist"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_apply_blueprint_is_idempotent_for_pending_plan() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "ext.idempotent.module".to_string(),
+            name: "Idempotent Module".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "ext.idempotent.module",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Idempotent Module",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/test:1"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8989
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "blueprint.idempotent".to_string(),
+            name: "Idempotent Blueprint".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "blueprint.idempotent",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "Idempotent Blueprint",
+                "wants": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default"
+                    }
+                ],
+                "preferences": {
+                    "providers": {
+                        "media.manager.tv/default": {
+                            "prefer": ["ext.idempotent.module"]
+                        }
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let apply_body = json!({
+        "blueprint_id": "blueprint.idempotent"
+    })
+    .to_string();
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/blueprints/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(apply_body.clone()))?,
+        )
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json: Value =
+        serde_json::from_slice(&body::to_bytes(first.into_body(), 1_048_576).await?)?;
+    let first_plan_id = first_json
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .expect("first plan id");
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/blueprints/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(apply_body))?,
+        )
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_json: Value =
+        serde_json::from_slice(&body::to_bytes(second.into_body(), 1_048_576).await?)?;
+    let second_plan_id = second_json
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .expect("second plan id");
+    assert_eq!(first_plan_id, second_plan_id, "expected plan reuse");
+
+    let pending: Vec<_> = store
+        .list_desired_blueprints(Some(false))
+        .await?
+        .into_iter()
+        .filter(|item| item.blueprint_extension_id == "blueprint.idempotent")
+        .collect();
+    assert_eq!(pending.len(), 1, "expected single pending desired row");
+    assert_eq!(
+        pending[0].desired_id.to_string(),
+        first_plan_id,
+        "pending desired id should match reused plan id"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_plan_validation_allows_planned_provider_target() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let store = ExtensionStore::new(&database.pool);
+
+    let provider_id = Uuid::new_v4();
+    let instance_id = Uuid::new_v4();
+    let actions = vec![
+        PlanAction::CreateOrUpdateProvider {
+            provider: ProviderSpec {
+                provider_id,
+                instance_id,
+                capability: "indexer.registry".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("prowlarr".to_string()),
+                scope_json: None,
+                endpoint: ProviderEndpoint {
+                    scheme: "http".to_string(),
+                    host: "svc-prowlarr".to_string(),
+                    port: 9696,
+                    base_path: "/".to_string(),
+                    network: Some("elixir_net".to_string()),
+                },
+            },
+        },
+        PlanAction::ApplyDriverPatch {
+            patch: DriverPatchSpec {
+                connector_extension_id: "connector.test".to_string(),
+                target_provider_id: provider_id,
+                target_capability: "indexer.registry".to_string(),
+                target_slot_id: "default".to_string(),
+                patch: json!({
+                    "op": "register_indexers",
+                    "indexers": []
+                }),
+            },
+        },
+    ];
+
+    let missing = missing_required_secrets_for_plan(&store, &actions).await?;
+    assert!(
+        missing.is_empty(),
+        "planned provider target should validate without provider DB preexistence"
+    );
     Ok(())
 }
 
@@ -2894,9 +4404,7 @@ async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
     let applied_items: Vec<Value> = serde_json::from_slice(&applied_body)?;
     assert_eq!(applied_items.len(), 1);
     assert_eq!(
-        applied_items[0]
-            .get("desired_id")
-            .and_then(Value::as_str),
+        applied_items[0].get("desired_id").and_then(Value::as_str),
         Some(applied_id_str.as_str())
     );
 
@@ -2912,9 +4420,7 @@ async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
     let pending_items: Vec<Value> = serde_json::from_slice(&pending_body)?;
     assert_eq!(pending_items.len(), 1);
     assert_eq!(
-        pending_items[0]
-            .get("desired_id")
-            .and_then(Value::as_str),
+        pending_items[0].get("desired_id").and_then(Value::as_str),
         Some(pending_id_str.as_str())
     );
 
@@ -2928,28 +4434,296 @@ async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
     assert_eq!(delete_resp.status(), StatusCode::OK);
     let delete_body = body::to_bytes(delete_resp.into_body(), 1_048_576).await?;
     let delete_json: Value = serde_json::from_slice(&delete_body)?;
-    assert_eq!(
-        delete_json.get("deleted").and_then(Value::as_u64),
-        Some(1)
-    );
+    assert_eq!(delete_json.get("deleted").and_then(Value::as_u64), Some(1));
 
     let remaining_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/desired-blueprints")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/desired-blueprints").body(Body::empty())?)
         .await?;
     assert_eq!(remaining_resp.status(), StatusCode::OK);
     let remaining_body = body::to_bytes(remaining_resp.into_body(), 1_048_576).await?;
     let remaining_items: Vec<Value> = serde_json::from_slice(&remaining_body)?;
     assert_eq!(remaining_items.len(), 1);
     assert_eq!(
-        remaining_items[0]
-            .get("desired_id")
-            .and_then(Value::as_str),
+        remaining_items[0].get("desired_id").and_then(Value::as_str),
         Some(applied_id_str.as_str())
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_uninstall_blueprint_cascades_dependencies() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "lscr.io/linuxserver/sonarr:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.connectors.sonarr_defaults".to_string(),
+            name: "Sonarr Defaults".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Connector,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.connectors.sonarr_defaults",
+                "version": "1.0.0",
+                "kind": "connector",
+                "name": "Sonarr Defaults",
+                "targets": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default"
+                    }
+                ],
+                "actions": [
+                    {
+                        "type": "driver_patch",
+                        "target": {
+                            "capability": "media.manager.tv",
+                            "slot": "default"
+                        },
+                        "patch": {
+                            "op": "set_tags",
+                            "params": {
+                                "tags": ["elixir"]
+                            }
+                        }
+                    }
+                ]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.blueprints.arr_stack".to_string(),
+            name: "Arr Stack".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.blueprints.arr_stack",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "Arr Stack",
+                "wants": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default"
+                    }
+                ],
+                "connectors": ["elixir.connectors.sonarr_defaults"],
+                "preferences": {
+                    "providers": {
+                        "media.manager.tv/default": {
+                            "prefer": ["elixir.modules.sonarr"]
+                        }
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id: Uuid::new_v4(),
+            blueprint_extension_id: "elixir.blueprints.arr_stack".to_string(),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+            decisions_json: None,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/elixir.blueprints.arr_stack/uninstall")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let deleted = payload
+        .get("deletedExtensions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        deleted
+            .iter()
+            .any(|item| item.as_str() == Some("elixir.blueprints.arr_stack"))
+    );
+    assert!(
+        deleted
+            .iter()
+            .any(|item| item.as_str() == Some("elixir.connectors.sonarr_defaults"))
+    );
+    assert!(
+        deleted
+            .iter()
+            .any(|item| item.as_str() == Some("elixir.modules.sonarr"))
+    );
+
+    assert!(
+        store
+            .get_extension("elixir.blueprints.arr_stack")
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .get_extension("elixir.connectors.sonarr_defaults")
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .get_extension("elixir.modules.sonarr")
+            .await?
+            .is_none()
+    );
+
+    let desired = store.list_desired_blueprints(None).await?;
+    assert!(
+        desired.is_empty(),
+        "expected desired blueprints to be removed with blueprint uninstall"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_clear_runs_deletes_pending_entries() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: Uuid::new_v4(),
+            source: "manual".to_string(),
+            status: OrchestratorRunStatus::Pending,
+            phase: Some("plan".to_string()),
+            plan_json: None,
+            error: None,
+        })
+        .await?;
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: Uuid::new_v4(),
+            source: "manual".to_string(),
+            status: OrchestratorRunStatus::Completed,
+            phase: Some("completed".to_string()),
+            plan_json: None,
+            error: None,
+        })
+        .await?;
+    let stale_running_id = Uuid::new_v4();
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id: stale_running_id,
+            source: "reconcile".to_string(),
+            status: OrchestratorRunStatus::Running,
+            phase: Some("reconcile".to_string()),
+            plan_json: None,
+            error: None,
+        })
+        .await?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE orchestrator_runs SET created_at = '2000-01-01 00:00:00' WHERE run_id = ?",
+    )
+    .bind(stale_running_id.to_string())
+    .execute(&db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::delete("/api/v1/extensions/runs").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload.get("deleted").and_then(Value::as_u64), Some(3));
+
+    let remaining = store.list_runs(None).await?;
+    assert!(remaining.is_empty(), "expected all clearable runs removed");
 
     Ok(())
 }
@@ -2977,10 +4751,7 @@ async fn extensions_reconcile_now_and_latest() -> Result<()> {
 
     let latest_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/reconcile/latest")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/reconcile/latest").body(Body::empty())?)
         .await?;
     assert_eq!(latest_resp.status(), StatusCode::OK);
     let latest_body = body::to_bytes(latest_resp.into_body(), 1_048_576).await?;
@@ -2992,10 +4763,7 @@ async fn extensions_reconcile_now_and_latest() -> Result<()> {
 
     let now_resp = app
         .clone()
-        .oneshot(
-            Request::post("/api/v1/extensions/reconcile/now")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::post("/api/v1/extensions/reconcile/now").body(Body::empty())?)
         .await?;
     assert_eq!(now_resp.status(), StatusCode::OK);
     let now_body = body::to_bytes(now_resp.into_body(), 1_048_576).await?;
@@ -3008,10 +4776,7 @@ async fn extensions_reconcile_now_and_latest() -> Result<()> {
 
     let latest_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/reconcile/latest")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/reconcile/latest").body(Body::empty())?)
         .await?;
     assert_eq!(latest_resp.status(), StatusCode::OK);
     let latest_body = body::to_bytes(latest_resp.into_body(), 1_048_576).await?;
@@ -3049,15 +4814,15 @@ async fn extensions_auto_wire_status_default() -> Result<()> {
 
     let status_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/auto-wire")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/auto-wire").body(Body::empty())?)
         .await?;
     assert_eq!(status_resp.status(), StatusCode::OK);
     let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
     let status_json: Value = serde_json::from_slice(&status_body)?;
-    assert_eq!(status_json.get("enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        status_json.get("enabled").and_then(Value::as_bool),
+        Some(true)
+    );
     assert_eq!(status_json.get("pendingPlanId"), Some(&Value::Null));
     assert_eq!(status_json.get("pendingReason"), Some(&Value::Null));
     assert_eq!(status_json.get("pendingConflicts"), Some(&Value::Null));
@@ -3116,15 +4881,15 @@ async fn extensions_auto_wire_status_and_plan_pending() -> Result<()> {
 
     let status_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/auto-wire")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/auto-wire").body(Body::empty())?)
         .await?;
     assert_eq!(status_resp.status(), StatusCode::OK);
     let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
     let status_json: Value = serde_json::from_slice(&status_body)?;
-    assert_eq!(status_json.get("enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        status_json.get("enabled").and_then(Value::as_bool),
+        Some(true)
+    );
     assert_eq!(
         status_json.get("pendingPlanId").and_then(Value::as_str),
         Some(plan_id.to_string().as_str())
@@ -3140,10 +4905,7 @@ async fn extensions_auto_wire_status_and_plan_pending() -> Result<()> {
 
     let plan_resp = app
         .clone()
-        .oneshot(
-            Request::get("/api/v1/extensions/auto-wire/plan")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/api/v1/extensions/auto-wire/plan").body(Body::empty())?)
         .await?;
     assert_eq!(plan_resp.status(), StatusCode::OK);
     let plan_body = body::to_bytes(plan_resp.into_body(), 1_048_576).await?;
@@ -3254,7 +5016,10 @@ async fn extensions_auto_wire_toggle_disables_and_triggers_reconcile() -> Result
         }
         sleep(Duration::from_millis(25)).await;
     }
-    assert!(reconcile_run.is_some(), "expected reconcile run after enable");
+    assert!(
+        reconcile_run.is_some(),
+        "expected reconcile run after enable"
+    );
 
     Ok(())
 }
@@ -3342,9 +5107,9 @@ async fn extensions_rollback_plan_previews_availability() -> Result<()> {
         .cloned()
         .unwrap_or_default();
     assert!(
-        conflicts.iter().any(|conflict| {
-            conflict.get("code") == Some(&json!("rollback_unavailable"))
-        }),
+        conflicts
+            .iter()
+            .any(|conflict| { conflict.get("code") == Some(&json!("rollback_unavailable")) }),
         "expected rollback_unavailable conflict"
     );
 
@@ -3400,13 +5165,9 @@ async fn extensions_rollback_plan_previews_availability() -> Result<()> {
 
 #[tokio::test]
 async fn extensions_delete_instance_cleans_secrets() -> Result<()> {
-    let (app, instance_id) = setup_extension_instance(
-        "elixir.test.instance_delete",
-        "Instance Delete",
-        None,
-        true,
-    )
-    .await?;
+    let (app, instance_id) =
+        setup_extension_instance("elixir.test.instance_delete", "Instance Delete", None, true)
+            .await?;
 
     let instance_secret = json!({
         "scope": "instance",

@@ -3,8 +3,8 @@ pub mod error;
 pub mod handlers;
 
 use axum::{
-    http::{header, Method},
     Router,
+    http::{Method, header},
     routing::{delete, get, patch, post},
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -96,8 +96,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/extensions/runs",
-            get(handlers::extensions::list_runs)
-                .delete(handlers::extensions::clear_runs),
+            get(handlers::extensions::list_runs).delete(handlers::extensions::clear_runs),
         )
         .route(
             "/api/v1/extensions/desired-blueprints",
@@ -111,10 +110,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/extensions/runs/:id",
             get(handlers::extensions::run_detail),
         )
-        .route(
-            "/api/v1/extensions/graph",
-            get(handlers::extensions::graph),
-        )
+        .route("/api/v1/extensions/graph", get(handlers::extensions::graph))
         .route(
             "/api/v1/extensions/providers/:id/health",
             get(handlers::extensions::provider_health),
@@ -234,8 +230,34 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/discovery/search", get(handlers::discovery::search))
         .route(
+            "/api/v1/discovery/find",
+            get(handlers::discovery::find_media),
+        )
+        .route(
             "/api/v1/discovery/suggest",
             get(handlers::discovery::suggest),
+        )
+        .route(
+            "/api/v1/discovery/manager-preferences",
+            get(handlers::discovery::manager_preferences)
+                .post(handlers::discovery::update_manager_preferences),
+        )
+        .route(
+            "/api/v1/find-media/targets",
+            get(handlers::discovery::find_media_targets),
+        )
+        .route(
+            "/api/v1/find-media/search",
+            post(handlers::discovery::find_media_search),
+        )
+        .route(
+            "/api/v1/find-media/add",
+            post(handlers::discovery::find_media_add),
+        )
+        .route(
+            "/api/v1/find-media/preferences",
+            get(handlers::discovery::find_media_preferences)
+                .patch(handlers::discovery::patch_find_media_preferences),
         )
         .route("/api/v1/profile/playback", get(handlers::profile::profile))
         .with_state(state)

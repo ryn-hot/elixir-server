@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,22 +16,22 @@ use uuid::Uuid;
 
 use crate::config::RunEnvironment;
 use crate::db::models::{
-    Binding, Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel, OperationStep,
-    OperationStepStatus, OrchestratorRun, OrchestratorRunStatus, Provider, ProviderHealthState,
-    RuntimeLog, Secret, SecretScope, DesiredBlueprint,
+    Binding, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel,
+    OperationStep, OperationStepStatus, OrchestratorRun, OrchestratorRunStatus, Provider,
+    ProviderHealthState, RuntimeLog, Secret, SecretScope,
 };
+use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
     unpack_package, verify_signature,
 };
 use crate::extensions::permissions::PermissionPolicy;
+use crate::extensions::registry::{
+    RegistryCacheStore, RegistryClient, RegistryEntry, RegistryFetchError, refresh_registry_cache,
+};
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, missing_required_secrets_for_instances,
     required_secrets_from_manifest,
-};
-use crate::extensions::registry::{
-    RegistryCacheStore, RegistryClient, RegistryEntry, RegistryFetchError,
-    refresh_registry_cache,
 };
 use crate::extensions::store::{
     ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance, NewOperationStep,
@@ -224,7 +225,7 @@ pub async fn apply_blueprint(
     let db_pool = state.db_pool.clone();
     let store = ExtensionStore::new(&db_pool);
     let planner = Planner::new();
-    let plan = planner
+    let mut plan = planner
         .plan_blueprint(&store, payload.blueprint_id, payload.params)
         .await
         .map_err(ApiError::from)?;
@@ -233,6 +234,51 @@ pub async fn apply_blueprint(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+
+    let pending = store
+        .list_desired_blueprints(Some(false))
+        .await
+        .map_err(ApiError::from)?;
+    let mut reusable_run_id = None;
+    for item in pending {
+        if item.blueprint_extension_id != blueprint.extension_id || item.params_json != plan.params
+        {
+            continue;
+        }
+        let run = store
+            .get_run(item.desired_id)
+            .await
+            .map_err(ApiError::from)?;
+        let is_pending_run = run
+            .as_ref()
+            .is_some_and(|entry| entry.status == OrchestratorRunStatus::Pending);
+        if reusable_run_id.is_none() && is_pending_run {
+            reusable_run_id = Some(item.desired_id);
+            continue;
+        }
+        let _ = store.mark_desired_applied(item.desired_id, true).await;
+        if is_pending_run {
+            let _ = store
+                .update_run_status(
+                    item.desired_id,
+                    OrchestratorRunStatus::Canceled,
+                    Some("canceled"),
+                    Some("superseded by newer blueprint plan"),
+                )
+                .await;
+        }
+    }
+    if let Some(run_id) = reusable_run_id {
+        plan.plan_id = run_id;
+        let plan_json =
+            serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
+        store
+            .update_run_plan(run_id, plan_json)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(Json(plan));
+    }
+
     store
         .create_desired_blueprint(&NewDesiredBlueprint {
             desired_id: plan.plan_id,
@@ -243,7 +289,8 @@ pub async fn apply_blueprint(
         })
         .await
         .map_err(ApiError::from)?;
-    let plan_json = serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
+    let plan_json =
+        serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
     store
         .create_run(&NewOrchestratorRun {
             run_id: plan.plan_id,
@@ -277,8 +324,7 @@ pub async fn confirm_plan(
     Path(plan_id): Path<String>,
     payload: Option<Json<ConfirmPlanRequest>>,
 ) -> ApiResult<Json<PlanRunResponse>> {
-    let run_id =
-        Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
+    let run_id = Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
     let db_pool = state.db_pool.clone();
     let store = ExtensionStore::new(&db_pool);
 
@@ -398,7 +444,12 @@ pub async fn confirm_plan(
     match executor.execute_steps(steps).await {
         Ok(()) => {
             store
-                .update_run_status(run_id, OrchestratorRunStatus::Completed, Some("completed"), None)
+                .update_run_status(
+                    run_id,
+                    OrchestratorRunStatus::Completed,
+                    Some("completed"),
+                    None,
+                )
                 .await
                 .map_err(ApiError::from)?;
             Ok(Json(PlanRunResponse {
@@ -424,8 +475,7 @@ pub async fn cancel_plan(
     State(state): State<AppState>,
     Path(plan_id): Path<String>,
 ) -> ApiResult<Json<PlanRunResponse>> {
-    let run_id =
-        Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
+    let run_id = Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
     let store = ExtensionStore::new(&state.db_pool);
     let run = store
         .get_run(run_id)
@@ -434,11 +484,18 @@ pub async fn cancel_plan(
         .ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     if run.status != OrchestratorRunStatus::Pending {
-        return Err(ApiError::conflict("plan cannot be canceled in current state"));
+        return Err(ApiError::conflict(
+            "plan cannot be canceled in current state",
+        ));
     }
 
     store
-        .update_run_status(run_id, OrchestratorRunStatus::Canceled, Some("canceled"), None)
+        .update_run_status(
+            run_id,
+            OrchestratorRunStatus::Canceled,
+            Some("canceled"),
+            None,
+        )
         .await
         .map_err(ApiError::from)?;
 
@@ -536,21 +593,22 @@ pub async fn install_extension(
 
     let is_dev = state.settings.environment == RunEnvironment::Development;
     let allow_unsigned = is_dev && state.settings.extensions.allow_unsigned;
-    let allow_directory_install =
-        is_dev && state.settings.extensions.allow_directory_install;
+    let allow_directory_install = is_dev && state.settings.extensions.allow_directory_install;
 
     let package_path = match (&payload.download_url, &payload.package_path) {
         (Some(_), Some(_)) => {
-            return Err(ApiError::bad_request("provide download_url or package_path, not both"))
+            return Err(ApiError::bad_request(
+                "provide download_url or package_path, not both",
+            ));
         }
-        (Some(url), None) => {
-            download_package(url, &storage_paths.packages_dir)
-                .await
-                .map_err(ApiError::from)?
-        }
+        (Some(url), None) => download_package(url, &storage_paths.packages_dir)
+            .await
+            .map_err(ApiError::from)?,
         (None, Some(path)) => PathBuf::from(path),
         (None, None) => {
-            return Err(ApiError::bad_request("download_url or package_path is required"))
+            return Err(ApiError::bad_request(
+                "download_url or package_path is required",
+            ));
         }
     };
 
@@ -584,13 +642,13 @@ pub async fn install_extension(
             .await
             .map_err(|err| ApiError::bad_request(err.to_string()))?
     } else {
-        return Err(ApiError::bad_request("package path is not a file or directory"));
+        return Err(ApiError::bad_request(
+            "package path is not a file or directory",
+        ));
     };
 
     let PackageManifest {
-        manifest,
-        raw_json,
-        ..
+        manifest, raw_json, ..
     } = read_manifest_from_dir(&staged)
         .await
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -770,7 +828,11 @@ pub async fn enable_extension(
     }
     let policy = PermissionPolicy::new();
     policy
-        .enforce(extension.trust_level, &manifest.permissions, &extension.extension_id)
+        .enforce(
+            extension.trust_level,
+            &manifest.permissions,
+            &extension.extension_id,
+        )
         .map_err(|err| ApiError::forbidden(err.to_string()))?;
     let required = required_secrets_from_manifest(&manifest)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -835,37 +897,79 @@ pub async fn uninstall_extension(
         .iter()
         .any(|id| id == &extension_id)
     {
-        return Err(ApiError::forbidden(
-            "core extensions cannot be uninstalled",
-        ));
+        return Err(ApiError::forbidden("core extensions cannot be uninstalled"));
     }
     let store = ExtensionStore::new(&state.db_pool);
     let existing = store
         .get_extension(&extension_id)
         .await
         .map_err(ApiError::from)?;
-    if existing.is_none() {
+    let Some(existing) = existing else {
         return Err(ApiError::not_found("extension not found"));
-    }
-    store
-        .delete_extension(&extension_id)
-        .await
-        .map_err(ApiError::from)?;
-
+    };
     let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
-    let _ = fs::remove_dir_all(storage_paths.unpacked_dir.join(&extension_id)).await;
-    if let Some(hash) = existing.and_then(|extension| extension.package_hash) {
-        if let Err(err) =
-            remove_downloaded_package(&storage_paths.packages_dir, &hash).await
+    let mut deleted_extensions = vec![extension_id.clone()];
+
+    let mut cascade_targets: Vec<Extension> = Vec::new();
+    if existing.kind == ExtensionKind::Blueprint {
+        if let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(existing.manifest_json.clone())
         {
+            let installed = store.list_extensions().await.map_err(ApiError::from)?;
+            let installed_index: HashMap<String, Extension> = installed
+                .iter()
+                .cloned()
+                .map(|item| (item.extension_id.clone(), item))
+                .collect();
+            let dependencies = blueprint_dependency_ids(&manifest, &extension_id);
+            for dependency_id in dependencies {
+                if state
+                    .settings
+                    .extensions
+                    .core_extensions
+                    .iter()
+                    .any(|core| core == &dependency_id)
+                {
+                    continue;
+                }
+                if dependency_referenced_by_other_blueprints(
+                    &installed,
+                    &extension_id,
+                    &dependency_id,
+                ) {
+                    continue;
+                }
+                if let Some(item) = installed_index.get(&dependency_id) {
+                    cascade_targets.push(item.clone());
+                }
+            }
+        } else {
             tracing::warn!(
-                "failed to remove package for {}: {err}",
+                "failed to parse blueprint manifest during uninstall cascade: {}",
                 extension_id
             );
         }
+        let _ = store
+            .delete_desired_blueprints_by_extension(&extension_id)
+            .await
+            .map_err(ApiError::from)?;
     }
 
-    Ok(Json(serde_json::json!({ "status": "deleted" })))
+    uninstall_extension_record(&store, &storage_paths, &existing)
+        .await
+        .map_err(ApiError::from)?;
+
+    for dependency in cascade_targets {
+        uninstall_extension_record(&store, &storage_paths, &dependency)
+            .await
+            .map_err(ApiError::from)?;
+        deleted_extensions.push(dependency.extension_id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "deleted",
+        "deletedExtensions": deleted_extensions
+    })))
 }
 
 pub async fn list_instances(
@@ -892,7 +996,9 @@ pub async fn create_instance(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("extension not found"))?;
     if extension.kind == ExtensionKind::Blueprint {
-        return Err(ApiError::bad_request("blueprint extensions cannot create instances"));
+        return Err(ApiError::bad_request(
+            "blueprint extensions cannot create instances",
+        ));
     }
 
     let instance_id = Uuid::new_v4();
@@ -960,10 +1066,9 @@ pub async fn update_instance(
             let required = required_secrets_from_manifest(&manifest)
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
             if !required.is_empty() {
-                let missing =
-                    missing_required_secrets_for_instance(&store, instance_id, &required)
-                        .await
-                        .map_err(ApiError::from)?;
+                let missing = missing_required_secrets_for_instance(&store, instance_id, &required)
+                    .await
+                    .map_err(ApiError::from)?;
                 if !missing.is_empty() {
                     return Err(ApiError::bad_request(format!(
                         "missing required secrets: {}",
@@ -1044,7 +1149,8 @@ pub async fn rollback_instance(
         }));
     }
 
-    let plan_json = serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
+    let plan_json =
+        serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
     store
         .create_run(&NewOrchestratorRun {
             run_id: plan.plan_id,
@@ -1064,7 +1170,10 @@ pub async fn graph(State(state): State<AppState>) -> ApiResult<Json<GraphRespons
     let store = ExtensionStore::new(&state.db_pool);
     let providers = store.list_providers(None).await.map_err(ApiError::from)?;
     let bindings = store.list_bindings().await.map_err(ApiError::from)?;
-    Ok(Json(GraphResponse { providers, bindings }))
+    Ok(Json(GraphResponse {
+        providers,
+        bindings,
+    }))
 }
 
 pub async fn provider_health(
@@ -1096,8 +1205,8 @@ pub async fn runtime_logs(
     Path(instance_id): Path<String>,
     Query(query): Query<RuntimeLogsQuery>,
 ) -> ApiResult<Json<RuntimeLogsResponse>> {
-    let instance_id = Uuid::parse_str(&instance_id)
-        .map_err(|_| ApiError::bad_request("invalid instance id"))?;
+    let instance_id =
+        Uuid::parse_str(&instance_id).map_err(|_| ApiError::bad_request("invalid instance id"))?;
     let store = ExtensionStore::new(&state.db_pool);
     let mut logs = store
         .list_runtime_logs(instance_id)
@@ -1123,7 +1232,9 @@ pub async fn list_secrets(
         None => None,
     };
     if scope.is_none() && query.scope_id.is_some() {
-        return Err(ApiError::bad_request("scope is required when scope_id is provided"));
+        return Err(ApiError::bad_request(
+            "scope is required when scope_id is provided",
+        ));
     }
     let scope_id = match (scope, query.scope_id.as_deref()) {
         (Some(scope), Some(raw)) => parse_scope_id(scope, Some(raw), false)?,
@@ -1300,9 +1411,7 @@ pub async fn delete_secret(
     Ok(Json(serde_json::json!({ "status": "deleted" })))
 }
 
-pub async fn reconcile_now(
-    State(state): State<AppState>,
-) -> ApiResult<Json<ReconcileRunResponse>> {
+pub async fn reconcile_now(State(state): State<AppState>) -> ApiResult<Json<ReconcileRunResponse>> {
     let config = ReconcileConfig::from_settings(&state.settings);
     state
         .orchestrator
@@ -1332,7 +1441,10 @@ pub async fn auto_wire_status(
     State(state): State<AppState>,
 ) -> ApiResult<Json<AutoWireStatusResponse>> {
     let store = ExtensionStore::new(&state.db_pool);
-    let enabled = store.get_auto_wire_enabled().await.map_err(ApiError::from)?;
+    let enabled = store
+        .get_auto_wire_enabled()
+        .await
+        .map_err(ApiError::from)?;
     let pending = store
         .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
         .await
@@ -1348,9 +1460,7 @@ pub async fn auto_wire_status(
                 pending_plan_id = Some(plan.plan_id);
                 pending_conflicts = Some(plan.conflicts.len());
                 let has_missing = plan.conflicts.iter().any(|conflict| {
-                    conflict
-                        .get("code")
-                        .and_then(|value| value.as_str())
+                    conflict.get("code").and_then(|value| value.as_str())
                         == Some("missing_required_secrets")
                 });
                 pending_reason = Some(if has_missing {
@@ -1401,9 +1511,7 @@ pub async fn update_auto_wire(
     auto_wire_status(State(state)).await
 }
 
-pub async fn auto_wire_plan(
-    State(state): State<AppState>,
-) -> ApiResult<Json<Plan>> {
+pub async fn auto_wire_plan(State(state): State<AppState>) -> ApiResult<Json<Plan>> {
     let store = ExtensionStore::new(&state.db_pool);
     let run = store
         .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
@@ -1427,10 +1535,16 @@ pub async fn list_runs(
     Ok(Json(runs))
 }
 
-pub async fn clear_runs(
-    State(state): State<AppState>,
-) -> ApiResult<Json<RunsClearResponse>> {
+pub async fn clear_runs(State(state): State<AppState>) -> ApiResult<Json<RunsClearResponse>> {
     let store = ExtensionStore::new(&state.db_pool);
+    let stale_before = chrono::Utc::now()
+        - chrono::Duration::seconds(state.settings.extensions.apply_lock_ttl_seconds.max(1) as i64);
+    let _ = store
+        .reap_stale_running_runs(
+            stale_before,
+            "run history cleared; stale running run reaped",
+        )
+        .await;
     let deleted = store.delete_run_history().await.map_err(ApiError::from)?;
     Ok(Json(RunsClearResponse { deleted }))
 }
@@ -1463,8 +1577,7 @@ pub async fn run_detail(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Json<RunDetailResponse>> {
-    let run_id =
-        Uuid::parse_str(&run_id).map_err(|_| ApiError::bad_request("invalid run id"))?;
+    let run_id = Uuid::parse_str(&run_id).map_err(|_| ApiError::bad_request("invalid run id"))?;
     let store = ExtensionStore::new(&state.db_pool);
     let run = store
         .get_run(run_id)
@@ -1544,10 +1657,7 @@ async fn remove_downloaded_package(
         let hash = match compute_sha256(&path).await {
             Ok(hash) => hash,
             Err(err) => {
-                tracing::warn!(
-                    "failed to hash extension package {}: {err}",
-                    path.display()
-                );
+                tracing::warn!("failed to hash extension package {}: {err}", path.display());
                 continue;
             }
         };
@@ -1557,6 +1667,82 @@ async fn remove_downloaded_package(
         }
     }
     Ok(())
+}
+
+async fn uninstall_extension_record(
+    store: &ExtensionStore<'_>,
+    storage_paths: &ExtensionStoragePaths,
+    extension: &Extension,
+) -> Result<(), anyhow::Error> {
+    store.delete_extension(&extension.extension_id).await?;
+    let _ = fs::remove_dir_all(storage_paths.unpacked_dir.join(&extension.extension_id)).await;
+    if let Some(hash) = extension.package_hash.as_deref() {
+        if let Err(err) = remove_downloaded_package(&storage_paths.packages_dir, hash).await {
+            tracing::warn!(
+                "failed to remove package for {}: {err}",
+                extension.extension_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn blueprint_dependency_ids(manifest: &ExtensionManifest, blueprint_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for connector in &manifest.connectors {
+        let trimmed = connector.trim();
+        if trimmed.is_empty() || trimmed == blueprint_id {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(preferences) = manifest.preferences.as_ref() {
+        for provider_preference in preferences.providers.values() {
+            for extension_id in &provider_preference.prefer {
+                let trimmed = extension_id.trim();
+                if trimmed.is_empty() || trimmed == blueprint_id {
+                    continue;
+                }
+                if seen.insert(trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn dependency_referenced_by_other_blueprints(
+    installed: &[Extension],
+    uninstalling_blueprint_id: &str,
+    dependency_id: &str,
+) -> bool {
+    for extension in installed {
+        if extension.kind != ExtensionKind::Blueprint {
+            continue;
+        }
+        if extension.extension_id == uninstalling_blueprint_id {
+            continue;
+        }
+        let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        else {
+            continue;
+        };
+        if blueprint_dependency_ids(&manifest, &extension.extension_id)
+            .iter()
+            .any(|item| item == dependency_id)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn map_unique_violation(err: anyhow::Error, message: &str) -> ApiError {

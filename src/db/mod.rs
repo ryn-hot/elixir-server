@@ -1,9 +1,10 @@
 pub mod models;
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use sqlx::{AnyPool, any::AnyPoolOptions, migrate::Migrator};
+use tokio::fs;
 
 use crate::config::DatabaseConfig;
 
@@ -47,6 +48,9 @@ pub struct Database {
 impl Database {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
         let driver = DatabaseDriver::from_url(&config.url)?;
+        if matches!(driver, DatabaseDriver::Sqlite) {
+            ensure_sqlite_parent_dir(&config.url).await?;
+        }
 
         // Enable default Any drivers (Postgres + SQLite). This is a no-op if already installed.
         sqlx::any::install_default_drivers();
@@ -75,6 +79,38 @@ impl Database {
             .run(&self.pool)
             .await
             .context("database migrations failed")
+    }
+}
+
+async fn ensure_sqlite_parent_dir(url: &str) -> Result<()> {
+    let Some(path) = sqlite_file_path(url) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating sqlite directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn sqlite_file_path(url: &str) -> Option<std::path::PathBuf> {
+    let lowered = url.to_ascii_lowercase();
+    if lowered.starts_with("sqlite::memory") || lowered.starts_with("sqlite://:memory:") {
+        return None;
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))?;
+    let path_part = rest.split('?').next().unwrap_or(rest).trim();
+    if path_part.is_empty() || path_part.starts_with(":memory:") {
+        return None;
+    }
+    let path = Path::new(path_part);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(std::path::PathBuf::from(path_part))
     }
 }
 

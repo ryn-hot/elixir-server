@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState, PortMapping, VolumeMount};
 use crate::runtime::RuntimeManager;
+use crate::runtime::model::{
+    ContainerHandle, ContainerSpec, ContainerState, PortMapping, VolumeMount,
+};
 
 const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"];
 
@@ -195,11 +197,7 @@ impl DockerRuntimeManager {
         })
     }
 
-    async fn ensure_container_attached(
-        &self,
-        spec: &ContainerSpec,
-        value: &Value,
-    ) -> Result<()> {
+    async fn ensure_container_attached(&self, spec: &ContainerSpec, value: &Value) -> Result<()> {
         if !Self::has_network(value, &spec.network) {
             bail!(
                 "container '{}' is not attached to network '{}'",
@@ -229,7 +227,11 @@ impl DockerRuntimeManager {
 #[async_trait::async_trait]
 impl RuntimeManager for DockerRuntimeManager {
     async fn ensure_network(&self, name: &str) -> Result<()> {
-        let inspect_args = vec!["network".to_string(), "inspect".to_string(), name.to_string()];
+        let inspect_args = vec![
+            "network".to_string(),
+            "inspect".to_string(),
+            name.to_string(),
+        ];
         if self.run_capture(&inspect_args).await.is_ok() {
             return Ok(());
         }

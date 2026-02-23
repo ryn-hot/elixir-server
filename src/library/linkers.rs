@@ -223,7 +223,10 @@ impl LinkerService {
                 raw,
             });
         }
-        let with_season = episodes.iter().filter(|ep| ep.season_number.is_some()).count();
+        let with_season = episodes
+            .iter()
+            .filter(|ep| ep.season_number.is_some())
+            .count();
         tracing::debug!(
             anilist_id = %payload.mappings.anilist_id.clone().unwrap_or_default(),
             episodes = episodes.len(),
@@ -456,23 +459,59 @@ struct AniZipResponse {
 
 #[derive(Debug, Deserialize)]
 struct AniZipMappings {
-    #[serde(rename = "animeplanet_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "animeplanet_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     animeplanet_id: Option<String>,
-    #[serde(rename = "kitsu_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "kitsu_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     kitsu_id: Option<String>,
-    #[serde(rename = "mal_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "mal_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     mal_id: Option<String>,
-    #[serde(rename = "anilist_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "anilist_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     anilist_id: Option<String>,
-    #[serde(rename = "anisearch_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "anisearch_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     anisearch_id: Option<String>,
-    #[serde(rename = "anidb_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "anidb_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     anidb_id: Option<String>,
-    #[serde(rename = "thetvdb_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "thetvdb_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     thetvdb_id: Option<String>,
-    #[serde(rename = "themoviedb_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "themoviedb_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     themoviedb_id: Option<String>,
-    #[serde(rename = "imdb_id", default, deserialize_with = "deserialize_opt_string")]
+    #[serde(
+        rename = "imdb_id",
+        default,
+        deserialize_with = "deserialize_opt_string"
+    )]
     imdb_id: Option<String>,
 }
 

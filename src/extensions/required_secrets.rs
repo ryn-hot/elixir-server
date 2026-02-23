@@ -27,9 +27,7 @@ pub fn required_secrets_from_manifest(
     required_secrets_from_runtime(&runtime.env)
 }
 
-pub fn required_secrets_from_runtime(
-    env: &[ManifestRuntimeEnv],
-) -> Result<Vec<RequiredSecretRef>> {
+pub fn required_secrets_from_runtime(env: &[ManifestRuntimeEnv]) -> Result<Vec<RequiredSecretRef>> {
     let mut required = Vec::new();
     for env in env {
         if let Some(from_secret) = env.from_secret.as_ref() {
@@ -71,13 +69,8 @@ pub async fn missing_required_secrets_for_instance(
                 let scope_id = required
                     .scope_id
                     .ok_or_else(|| anyhow!("provider scope_id is required"))?;
-                if !secret_exists(
-                    store,
-                    SecretScope::Provider,
-                    Some(scope_id),
-                    &required.key,
-                )
-                .await?
+                if !secret_exists(store, SecretScope::Provider, Some(scope_id), &required.key)
+                    .await?
                 {
                     missing.insert(format!("provider:{}:{}", scope_id, required.key));
                 }
@@ -124,13 +117,8 @@ pub async fn missing_required_secrets_for_instances(
                 let scope_id = required
                     .scope_id
                     .ok_or_else(|| anyhow!("provider scope_id is required"))?;
-                if !secret_exists(
-                    store,
-                    SecretScope::Provider,
-                    Some(scope_id),
-                    &required.key,
-                )
-                .await?
+                if !secret_exists(store, SecretScope::Provider, Some(scope_id), &required.key)
+                    .await?
                 {
                     missing.insert(format!("provider:{}:{}", scope_id, required.key));
                 }
@@ -179,9 +167,7 @@ fn parse_required_secret(raw: &str) -> Result<RequiredSecretRef> {
                 key: (*key).to_string(),
             })
         }
-        _ => bail!(
-            "from_secret must be global:<key>, instance:<key>, or provider:<uuid>:<key>"
-        ),
+        _ => bail!("from_secret must be global:<key>, instance:<key>, or provider:<uuid>:<key>"),
     }
 }
 

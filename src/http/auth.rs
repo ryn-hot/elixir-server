@@ -31,7 +31,10 @@ fn parse_user(parts: &Parts, auth: &AuthService) -> Result<CurrentUser, ApiError
         .verify_access_token(&token)
         .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
 
-    Ok(CurrentUser { user_id, session_id })
+    Ok(CurrentUser {
+        user_id,
+        session_id,
+    })
 }
 
 fn extract_token(parts: &Parts) -> Result<String, ApiError> {
@@ -49,9 +52,7 @@ fn extract_token(parts: &Parts) -> Result<String, ApiError> {
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get("authorization")?;
     let raw_str = raw.to_str().ok()?;
-    raw_str
-        .strip_prefix("Bearer ")
-        .map(|s| s.to_string())
+    raw_str.strip_prefix("Bearer ").map(|s| s.to_string())
 }
 
 fn token_from_query(query: Option<&str>) -> Option<String> {

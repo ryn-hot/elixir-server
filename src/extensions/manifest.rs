@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::{ExtensionKind, ExtensionTrustLevel, SlotCardinality};
@@ -63,6 +63,11 @@ impl ExtensionManifest {
             if let Some(implementation) = provide.implementation.as_ref() {
                 ensure_non_empty(implementation, "provides.implementation")?;
             }
+            if let Some(scope) = provide.scope.as_ref() {
+                scope.validate()?;
+                validate_scope_media_for_capability(&provide.capability, scope)?;
+            }
+            validate_scope_actions_for_capability(&provide.capability, provide.scope.as_ref())?;
         }
 
         for require in &self.requires {
@@ -165,6 +170,8 @@ pub struct ManifestProvide {
     #[serde(default)]
     pub implementation: Option<String>,
     #[serde(default)]
+    pub scope: Option<ManifestProviderScope>,
+    #[serde(default)]
     pub endpoint: Option<ManifestEndpoint>,
     #[serde(default)]
     pub healthcheck: Option<ManifestHealthcheck>,
@@ -217,6 +224,51 @@ pub struct ManifestHealthcheck {
     pub r#type: String,
     #[serde(default)]
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManifestProviderScope {
+    #[serde(default)]
+    pub media_types: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub requires_account: bool,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
+}
+
+impl ManifestProviderScope {
+    pub fn validate(&self) -> Result<()> {
+        for media_type in &self.media_types {
+            ensure_non_empty(media_type, "provides.scope.media_types")?;
+            if canonical_media_type(media_type).is_none() {
+                bail!(
+                    "unsupported provides.scope.media_types value '{}'; expected tv|movies|anime",
+                    media_type
+                );
+            }
+        }
+        for action in &self.actions {
+            ensure_non_empty(action, "provides.scope.actions")?;
+            if !matches!(
+                action.trim().to_ascii_lowercase().as_str(),
+                "search" | "add" | "monitor"
+            ) {
+                bail!(
+                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor",
+                    action
+                );
+            }
+        }
+        for field in &self.required_fields {
+            ensure_non_empty(field, "provides.scope.required_fields")?;
+        }
+        if !self.requires_account && !self.required_fields.is_empty() {
+            bail!("provides.scope.required_fields requires provides.scope.requires_account=true");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,10 +372,10 @@ pub struct ManifestParseResult {
 }
 
 pub fn parse_manifest_yaml(yaml: &str) -> Result<ManifestParseResult> {
-    let raw_yaml: serde_yaml::Value = serde_yaml::from_str(yaml)
-        .context("parsing manifest yaml")?;
-    let manifest: ExtensionManifest = serde_yaml::from_value(raw_yaml.clone())
-        .context("parsing manifest fields")?;
+    let raw_yaml: serde_yaml::Value =
+        serde_yaml::from_str(yaml).context("parsing manifest yaml")?;
+    let manifest: ExtensionManifest =
+        serde_yaml::from_value(raw_yaml.clone()).context("parsing manifest fields")?;
     manifest.validate()?;
     let raw_json = serde_json::to_value(raw_yaml).context("converting manifest to json")?;
     Ok(ManifestParseResult { manifest, raw_json })
@@ -336,6 +388,95 @@ fn default_slot() -> String {
 fn ensure_non_empty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("manifest {} is required", field);
+    }
+    Ok(())
+}
+
+fn canonical_media_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "movie" | "movies" => Some("movies"),
+        "series" | "tv" => Some("tv"),
+        "anime" => Some("anime"),
+        _ => None,
+    }
+}
+
+fn infer_scope_actions_for_capability(capability: &str) -> Vec<&'static str> {
+    match capability.trim().to_ascii_lowercase().as_str() {
+        "media.manager.movies" | "media.manager.tv" | "media.manager.anime" => {
+            vec!["add", "monitor"]
+        }
+        value if value.starts_with("media.search.") => vec!["search"],
+        _ => Vec::new(),
+    }
+}
+
+fn infer_scope_media_for_capability(capability: &str) -> Option<Vec<&'static str>> {
+    match capability.trim().to_ascii_lowercase().as_str() {
+        "media.manager.movies" | "media.search.movie" | "media.search.movies" => {
+            Some(vec!["movies"])
+        }
+        "media.manager.tv" => Some(vec!["tv", "anime"]),
+        "media.manager.anime" | "media.search.anime" => Some(vec!["anime"]),
+        "media.search.series" | "media.search.tv" => Some(vec!["tv"]),
+        _ => None,
+    }
+}
+
+fn validate_scope_actions_for_capability(
+    capability: &str,
+    scope: Option<&ManifestProviderScope>,
+) -> Result<()> {
+    let mut actions = scope
+        .map(|scope| scope.actions.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        actions = infer_scope_actions_for_capability(capability)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    let capability = capability.trim().to_ascii_lowercase();
+    if capability.starts_with("media.manager.") && !actions.iter().any(|value| value == "add") {
+        bail!(
+            "manager capability '{}' requires provides.scope.actions to include 'add'",
+            capability
+        );
+    }
+    if capability.starts_with("media.search.") && !actions.iter().any(|value| value == "search") {
+        bail!(
+            "search capability '{}' requires provides.scope.actions to include 'search'",
+            capability
+        );
+    }
+    Ok(())
+}
+
+fn validate_scope_media_for_capability(
+    capability: &str,
+    scope: &ManifestProviderScope,
+) -> Result<()> {
+    let Some(allowed) = infer_scope_media_for_capability(capability) else {
+        return Ok(());
+    };
+    if scope.media_types.is_empty() {
+        return Ok(());
+    }
+    for media_type in &scope.media_types {
+        let Some(canonical) = canonical_media_type(media_type) else {
+            continue;
+        };
+        if !allowed.contains(&canonical) {
+            bail!(
+                "scope media type '{}' is incompatible with capability '{}'",
+                media_type,
+                capability
+            );
+        }
     }
     Ok(())
 }

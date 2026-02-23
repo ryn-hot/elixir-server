@@ -23,7 +23,7 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.7", features = ["serde", "v4"] }
+uuid = { version = "1.7", features = ["serde", "v4", "v5"] }
 argon2 = "0.5"
 rand = "0.8"
 rand_core = "0.6"

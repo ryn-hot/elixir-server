@@ -6,15 +6,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use elixir_classifier::pipeline::{ClassifiedHint, ClassifierPipeline};
-use elixir_classifier::hint::{
-    ClassificationHint as ClassifierHint, FileInput as ClassifierFileInput,
-    LibraryType as ClassifierLibraryType,
-};
 use elixir_classifier::hint::anime_parser_adapter::AnimeParserAdapter;
 use elixir_classifier::hint::folder_context_parser::FolderContextParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::id_extractor_parser::IdExtractorParser;
+use elixir_classifier::hint::{
+    ClassificationHint as ClassifierHint, FileInput as ClassifierFileInput,
+    LibraryType as ClassifierLibraryType,
+};
 use elixir_classifier::identify::anilist::AniListIdentifier;
 use elixir_classifier::identify::cinemeta::CinemetaIdentifier;
 use elixir_classifier::identify::tvdb::TvdbIdentifier;
@@ -24,18 +23,19 @@ use elixir_classifier::identify::{
 };
 use elixir_classifier::link::anizip_linker::AniZipLinker;
 use elixir_classifier::link::tvdb_linker::TvdbLinker;
+use elixir_classifier::pipeline::{ClassifiedHint, ClassifierPipeline};
 use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
 use crate::{
     artwork::{
-        extract_anilist_artwork, extract_cinemeta_artwork, extract_tvdb_artworks,
-        extract_tvdb_series_artwork, ArtworkCandidate, ArtworkKind, ArtworkService,
+        ArtworkCandidate, ArtworkKind, ArtworkService, extract_anilist_artwork,
+        extract_cinemeta_artwork, extract_tvdb_artworks, extract_tvdb_series_artwork,
     },
     config::ClassifierConfig,
     db::models::MediaType,
-    extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
     extensions::{ExternalIds, make_identity_key},
+    extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
     media::ffprobe,
     metadata::{MetadataResult, MetadataService},
     state::AppState,
@@ -112,20 +112,17 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             mut prefer_anime,
             tvdb_seeds,
             mut season_anilist_seeds,
-        ) = classify_candidate_files(
-            pool,
-            &classifier,
-            &candidate,
-            &merged_ids,
-            force_reclassify,
-        )
-        .await?;
+        ) = classify_candidate_files(pool, &classifier, &candidate, &merged_ids, force_reclassify)
+            .await?;
         merged_ids = classified_ids;
 
         let mut anizip_mappings: HashMap<i32, AniZipMapping> = HashMap::new();
         let mut bridge_result = AnimeBridgeResult::default();
         if let Some(linker) = linkers {
-            if matches!(candidate.identity.r#type, MediaType::Series | MediaType::Anime) {
+            if matches!(
+                candidate.identity.r#type,
+                MediaType::Series | MediaType::Anime
+            ) {
                 if merged_ids.tvdb_series.is_none() {
                     if let Some(imdb) = merged_ids.imdb.as_ref() {
                         if let Ok(Some(tvdb_id)) = linker.link_tvdb_series_by_imdb(imdb).await {
@@ -166,18 +163,14 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
                             let mut season_years: HashMap<i32, i32> = HashMap::new();
-                            if let Ok(seasons) =
-                                linker.fetch_tvdb_series_seasons(&tvdb_id).await
-                            {
+                            if let Ok(seasons) = linker.fetch_tvdb_series_seasons(&tvdb_id).await {
                                 for season_meta in seasons {
                                     let Some(season_number) =
                                         extract_tvdb_season_number(&season_meta)
                                     else {
                                         continue;
                                     };
-                                    if let Some(year) =
-                                        extract_tvdb_season_year(&season_meta)
-                                    {
+                                    if let Some(year) = extract_tvdb_season_year(&season_meta) {
                                         season_years.insert(season_number, year);
                                     }
                                 }
@@ -220,20 +213,13 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 
         let mut expanded_chain: Vec<AniListSeasonChainEntry> = Vec::new();
         if !season_anilist_seeds.is_empty() {
-            if let Some((seed_season, seed)) = season_anilist_seeds
-                .iter()
-                .max_by(|a, b| {
-                    a.1.confidence
-                        .partial_cmp(&b.1.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                let expanded = expand_anilist_season_chain(
-                    &anilist_bridge,
-                    *seed_season,
-                    seed,
-                )
-                .await?;
+            if let Some((seed_season, seed)) = season_anilist_seeds.iter().max_by(|a, b| {
+                a.1.confidence
+                    .partial_cmp(&b.1.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                let expanded =
+                    expand_anilist_season_chain(&anilist_bridge, *seed_season, seed).await?;
                 if !expanded.is_empty() {
                     tracing::trace!(
                         seed_season = seed_season,
@@ -388,8 +374,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     }
                 }
 
-                if candidate.identity.r#type == MediaType::Anime
-                    && !season_anilist_seeds.is_empty()
+                if candidate.identity.r#type == MediaType::Anime && !season_anilist_seeds.is_empty()
                 {
                     for season_number in season_anilist_seeds.keys() {
                         if season_ids.contains_key(season_number) {
@@ -403,10 +388,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                 if candidate.identity.r#type == MediaType::Series {
                     if let (Some(linker), Some(tvdb_id)) = (
                         linkers,
-                        merged_ids
-                            .tvdb_series
-                            .as_ref()
-                            .or(merged_ids.tvdb.as_ref()),
+                        merged_ids.tvdb_series.as_ref().or(merged_ids.tvdb.as_ref()),
                     ) {
                         let should_refresh = !series_seasons_scaffolded_recent(
                             pool,
@@ -511,13 +493,8 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     merged_ids.clone()
                 };
                 if refreshed_series_ids != series_ids {
-                    apply_external_ids_to_series(
-                        pool,
-                        series_id,
-                        &refreshed_series_ids,
-                        "anizip",
-                    )
-                    .await?;
+                    apply_external_ids_to_series(pool, series_id, &refreshed_series_ids, "anizip")
+                        .await?;
                     series_ids = refreshed_series_ids;
                 }
 
@@ -534,13 +511,18 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                             "classifier",
                             Some(seed.confidence),
                         )
-                            .await?;
-                        persist_series_external_ids(pool, series_id, &ids, "anilist_chain")
-                            .await?;
+                        .await?;
+                        persist_series_external_ids(pool, series_id, &ids, "anilist_chain").await?;
                     }
                     if let Some(mapping) = anizip_mappings.get(season_number) {
-                        apply_external_ids_to_season(pool, *season_id, &mapping.ids, "anizip", None)
-                            .await?;
+                        apply_external_ids_to_season(
+                            pool,
+                            *season_id,
+                            &mapping.ids,
+                            "anizip",
+                            None,
+                        )
+                        .await?;
                     }
                 }
 
@@ -704,8 +686,10 @@ fn merge_candidates(
         });
 
         if entry.identity.external_ids != candidate.identity.external_ids {
-            entry.identity.external_ids =
-                merge_external_ids(&entry.identity.external_ids, Some(candidate.identity.external_ids.clone()));
+            entry.identity.external_ids = merge_external_ids(
+                &entry.identity.external_ids,
+                Some(candidate.identity.external_ids.clone()),
+            );
         }
 
         for file in candidate.files {
@@ -873,12 +857,11 @@ async fn load_existing_classification_for_path(
     let mut ids = ExternalIds::default();
 
     if let Some(movie_id) = movie_id {
-        if let Some(row) = sqlx::query(
-            "SELECT external_imdb, external_tmdb FROM movies WHERE id = ? LIMIT 1",
-        )
-        .bind(&movie_id)
-        .fetch_optional(pool)
-        .await?
+        if let Some(row) =
+            sqlx::query("SELECT external_imdb, external_tmdb FROM movies WHERE id = ? LIMIT 1")
+                .bind(&movie_id)
+                .fetch_optional(pool)
+                .await?
         {
             ids.imdb = row.try_get::<String, _>("external_imdb").ok();
             ids.tmdb = row.try_get::<String, _>("external_tmdb").ok();
@@ -898,20 +881,17 @@ async fn load_existing_classification_for_path(
         .await?
         {
             ids.imdb = series_row.try_get::<String, _>("external_imdb").ok();
-            ids.tvdb_series = series_row
-                .try_get::<String, _>("external_tvdb_series")
-                .ok();
+            ids.tvdb_series = series_row.try_get::<String, _>("external_tvdb_series").ok();
             if ids.anilist.is_none() {
                 ids.anilist = series_row.try_get::<String, _>("external_anilist").ok();
             }
         }
 
-        if let Some(season_row) = sqlx::query(
-            "SELECT external_anilist FROM seasons WHERE id = ? LIMIT 1",
-        )
-        .bind(&season_id)
-        .fetch_optional(pool)
-        .await?
+        if let Some(season_row) =
+            sqlx::query("SELECT external_anilist FROM seasons WHERE id = ? LIMIT 1")
+                .bind(&season_id)
+                .fetch_optional(pool)
+                .await?
         {
             if ids.anilist.is_none() {
                 ids.anilist = season_row.try_get::<String, _>("external_anilist").ok();
@@ -919,10 +899,8 @@ async fn load_existing_classification_for_path(
         }
     }
 
-    let prefer_anime = ids.anilist.is_some()
-        || ids.anidb.is_some()
-        || ids.mal.is_some()
-        || ids.kitsu.is_some();
+    let prefer_anime =
+        ids.anilist.is_some() || ids.anidb.is_some() || ids.mal.is_some() || ids.kitsu.is_some();
 
     Ok(Some(ExistingFileClassification {
         ids,
@@ -1102,10 +1080,7 @@ async fn classify_candidate_files(
                 let (hint_json, candidates_json) =
                     build_review_payloads(&hint, canonical.as_ref(), review_recommended)?;
                 if let Some(canonical) = canonical.as_ref() {
-                    let season_number = hint
-                        .season
-                        .or(file.season)
-                        .unwrap_or(1);
+                    let season_number = hint.season.or(file.season).unwrap_or(1);
                     if canonical.chosen_provider == "tvdb" {
                         let seed = TvdbBridgeSeed {
                             hint: hint.clone(),
@@ -1191,7 +1166,13 @@ async fn classify_candidate_files(
         ids = ?updated_ids,
         "classifier file batch complete"
     );
-    Ok((updated_ids, outcomes, prefer_anime, tvdb_seeds, anilist_seeds))
+    Ok((
+        updated_ids,
+        outcomes,
+        prefer_anime,
+        tvdb_seeds,
+        anilist_seeds,
+    ))
 }
 
 fn resolve_episode_numbers(
@@ -1228,9 +1209,7 @@ fn resolve_episode_numbers(
                 } else {
                     None
                 }
-                .or_else(|| {
-                    lookup_anizip_absolute_episode_from_maps(anizip_mappings, abs)
-                });
+                .or_else(|| lookup_anizip_absolute_episode_from_maps(anizip_mappings, abs));
                 if let Some((mapped_season, mapped_episode)) = mapped {
                     tracing::trace!(
                         path = %file.descriptor.path,
@@ -1278,9 +1257,7 @@ fn lookup_anizip_absolute_episode_from_maps(
     absolute_episode: i32,
 ) -> Option<(i32, i32)> {
     for mapping in mappings.values() {
-        if let Some(found) =
-            lookup_anizip_absolute_episode(Some(mapping), absolute_episode)
-        {
+        if let Some(found) = lookup_anizip_absolute_episode(Some(mapping), absolute_episode) {
             return Some(found);
         }
     }
@@ -1303,7 +1280,10 @@ fn build_review_payloads(
     let mut hint_value = serde_json::to_value(hint)?;
     if review_recommended {
         if let Some(obj) = hint_value.as_object_mut() {
-            obj.insert("reviewRecommended".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "reviewRecommended".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
     }
     let hint_json = Some(serde_json::to_string(&hint_value)?);
@@ -1460,9 +1440,7 @@ async fn expand_anilist_season_chain(
 }
 
 fn build_anilist_identifier(config: Option<&ClassifierConfig>) -> AniListIdentifier {
-    let timeout = config
-        .map(|cfg| cfg.request_timeout_seconds)
-        .unwrap_or(10);
+    let timeout = config.map(|cfg| cfg.request_timeout_seconds).unwrap_or(10);
     AniListIdentifier::new(ANILIST_ENDPOINT.to_string(), timeout)
 }
 
@@ -1596,7 +1574,10 @@ async fn apply_tvdb_anime_bridge(
                 }
             }
             let alias_canonical = scorer.score(&hint, &alias_scored);
-            let alias_confidence = alias_canonical.as_ref().map(|c| c.confidence).unwrap_or(0.0);
+            let alias_confidence = alias_canonical
+                .as_ref()
+                .map(|c| c.confidence)
+                .unwrap_or(0.0);
             let current_confidence = canonical.as_ref().map(|c| c.confidence).unwrap_or(0.0);
             if alias_confidence > current_confidence {
                 canonical = alias_canonical;
@@ -1765,10 +1746,7 @@ fn extract_tvdb_alias_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn extract_translation_from_array(
-    values: &[serde_json::Value],
-    lang: &str,
-) -> Option<String> {
+fn extract_translation_from_array(values: &[serde_json::Value], lang: &str) -> Option<String> {
     for entry in values {
         if let Some(obj) = entry.as_object() {
             let language = obj
@@ -1800,9 +1778,7 @@ fn looks_like_language_code(value: &str) -> bool {
     if !(len == 2 || len == 3) {
         return false;
     }
-    trimmed
-        .chars()
-        .all(|c| c.is_ascii_lowercase())
+    trimmed.chars().all(|c| c.is_ascii_lowercase())
 }
 
 fn extract_tvdb_genres(meta: &serde_json::Value) -> Vec<String> {
@@ -1866,7 +1842,12 @@ fn parse_year_str(value: &str) -> Option<i32> {
 }
 
 fn extract_tvdb_country(meta: &serde_json::Value) -> Option<String> {
-    let keys = ["country", "originalCountry", "original_country", "primaryCountry"];
+    let keys = [
+        "country",
+        "originalCountry",
+        "original_country",
+        "primaryCountry",
+    ];
     for key in keys {
         if let Some(value) = meta.get(key).and_then(serde_json::Value::as_str) {
             let trimmed = value.trim();
@@ -1925,8 +1906,14 @@ fn dedupe_titles(values: Vec<String>) -> Vec<String> {
 
 fn select_best_classification(
     results: Vec<ClassifiedHint>,
-) -> Option<(elixir_classifier::hint::ClassificationHint, Option<ClassifierCanonicalMatch>)> {
-    let mut best: Option<(elixir_classifier::hint::ClassificationHint, Option<ClassifierCanonicalMatch>)> = None;
+) -> Option<(
+    elixir_classifier::hint::ClassificationHint,
+    Option<ClassifierCanonicalMatch>,
+)> {
+    let mut best: Option<(
+        elixir_classifier::hint::ClassificationHint,
+        Option<ClassifierCanonicalMatch>,
+    )> = None;
     for item in results {
         match (&best, &item.canonical) {
             (None, _) => best = Some((item.hint, item.canonical)),
@@ -1964,11 +1951,7 @@ fn build_classifier_pipeline(classifier_config: Option<&ClassifierConfig>) -> Cl
         tvdb_api_key.clone(),
         config.request_timeout_seconds,
     );
-    let tvdb_linker = TvdbLinker::new(
-        tvdb_base_url,
-        tvdb_api_key,
-        config.request_timeout_seconds,
-    );
+    let tvdb_linker = TvdbLinker::new(tvdb_base_url, tvdb_api_key, config.request_timeout_seconds);
     ClassifierPipeline::new()
         .register_hint_parser(Arc::new(GeneralParser::default()))
         .register_hint_parser(Arc::new(IdExtractorParser::default()))
@@ -2020,14 +2003,8 @@ fn classifier_library_type(media_type: MediaType) -> ClassifierLibraryType {
 
 fn classifier_ids_from_server(ids: &ExternalIds, media_type: MediaType) -> ClassifierExternalIds {
     let (tvdb_series, tvdb_movie) = match media_type {
-        MediaType::Movie => (
-            None,
-            ids.tvdb_movie.clone().or_else(|| ids.tvdb.clone()),
-        ),
-        _ => (
-            ids.tvdb_series.clone().or_else(|| ids.tvdb.clone()),
-            None,
-        ),
+        MediaType::Movie => (None, ids.tvdb_movie.clone().or_else(|| ids.tvdb.clone())),
+        _ => (ids.tvdb_series.clone().or_else(|| ids.tvdb.clone()), None),
     };
     ClassifierExternalIds {
         imdb: ids.imdb.clone(),
@@ -2043,8 +2020,14 @@ fn classifier_ids_from_server(ids: &ExternalIds, media_type: MediaType) -> Class
 
 fn classifier_ids_to_server(ids: &ClassifierExternalIds, media_type: MediaType) -> ExternalIds {
     let (tvdb_series, tvdb_movie) = match media_type {
-        MediaType::Movie => (None, ids.tvdb_movie.clone().or_else(|| ids.tvdb_series.clone())),
-        _ => (ids.tvdb_series.clone().or_else(|| ids.tvdb_movie.clone()), None),
+        MediaType::Movie => (
+            None,
+            ids.tvdb_movie.clone().or_else(|| ids.tvdb_series.clone()),
+        ),
+        _ => (
+            ids.tvdb_series.clone().or_else(|| ids.tvdb_movie.clone()),
+            None,
+        ),
     };
     ExternalIds {
         imdb: ids.imdb.clone(),
@@ -2061,9 +2044,7 @@ fn classifier_ids_to_server(ids: &ClassifierExternalIds, media_type: MediaType) 
 
 fn has_strong_ids(media_type: MediaType, ids: &ExternalIds) -> bool {
     match media_type {
-        MediaType::Movie => {
-            ids.imdb.is_some() || ids.tmdb.is_some() || ids.tvdb_movie.is_some()
-        }
+        MediaType::Movie => ids.imdb.is_some() || ids.tmdb.is_some() || ids.tvdb_movie.is_some(),
         MediaType::Series => ids.imdb.is_some() || ids.tvdb_series.is_some(),
         MediaType::Anime => ids.anilist.is_some(),
     }
@@ -2148,12 +2129,7 @@ async fn persist_review_outcome(
     match outcome.status {
         ReviewQueueStatus::Applied => mark_review_applied(pool, media_file_id).await?,
         ReviewQueueStatus::Pending => {
-            upsert_review_queue_entry(
-                pool,
-                media_file_id,
-                outcome,
-            )
-            .await?;
+            upsert_review_queue_entry(pool, media_file_id, outcome).await?;
         }
     }
     Ok(())
@@ -2447,17 +2423,15 @@ async fn upsert_series(
         .await?
     } else {
         // Fallback: match by title, allowing for loose type/year matching
-        let rows = sqlx::query(
-            "SELECT id, year FROM series WHERE title = ?",
-        )
-        .bind(&identity.title)
-        .fetch_all(pool)
-        .await?;
+        let rows = sqlx::query("SELECT id, year FROM series WHERE title = ?")
+            .bind(&identity.title)
+            .fetch_all(pool)
+            .await?;
 
         let mut best_match: Option<String> = None;
         for row in rows {
             let db_year: Option<i32> = row.try_get::<i64, _>("year").ok().map(|v| v as i32);
-            
+
             let year_match = match (identity.year, db_year) {
                 (Some(y1), Some(y2)) => y1 == y2,
                 _ => true, // If either is missing, assume match
@@ -2516,12 +2490,10 @@ async fn upsert_season(pool: &AnyPool, series_id: Uuid, season_number: i32) -> R
     .await?
     {
         let id = Uuid::parse_str(&id_str)?;
-        sqlx::query::<sqlx::Any>(
-            "UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        )
-        .bind(id_str)
-        .execute(pool)
-        .await?;
+        sqlx::query::<sqlx::Any>("UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(id_str)
+            .execute(pool)
+            .await?;
         return Ok(id);
     }
 
@@ -2587,12 +2559,11 @@ async fn upsert_legacy_media_item(
     merged_ids: &ExternalIds,
     meta: Option<&MetadataResult>,
 ) -> Result<()> {
-    let existing = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM media_items WHERE id = ? LIMIT 1",
-    )
-    .bind(id.to_string())
-    .fetch_optional(pool)
-    .await?;
+    let existing =
+        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = ? LIMIT 1")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
 
     let external_ids_json = serde_json::to_string(merged_ids)?;
     if existing.is_some() {
@@ -3046,7 +3017,10 @@ fn read_tag(tags: &Option<HashMap<String, String>>, key: &str) -> Option<String>
 }
 
 fn is_sidecar_subtitle_ext(ext: &str) -> bool {
-    matches!(ext, "srt" | "ass" | "ssa" | "vtt" | "sub" | "idx" | "sup" | "smi")
+    matches!(
+        ext,
+        "srt" | "ass" | "ssa" | "vtt" | "sub" | "idx" | "sup" | "smi"
+    )
 }
 
 fn is_subtitle_dir_name(name: &str) -> bool {
@@ -3215,9 +3189,7 @@ fn strip_release_tokens(tokens: &[String]) -> Vec<String> {
     let mut idx = 0;
     while idx < tokens.len() {
         let lower = tokens[idx].to_ascii_lowercase();
-        let next_lower = tokens
-            .get(idx + 1)
-            .map(|v| v.to_ascii_lowercase());
+        let next_lower = tokens.get(idx + 1).map(|v| v.to_ascii_lowercase());
 
         if (lower == "web" && matches!(next_lower.as_deref(), Some("dl") | Some("rip")))
             || (lower == "blu" && matches!(next_lower.as_deref(), Some("ray")))
@@ -3296,7 +3268,10 @@ fn looks_like_resolution(token: &str) -> bool {
 }
 
 fn looks_like_codec(token: &str) -> bool {
-    matches!(token, "x264" | "x265" | "h264" | "h265" | "hevc" | "av1" | "vp9")
+    matches!(
+        token,
+        "x264" | "x265" | "h264" | "h265" | "hevc" | "av1" | "vp9"
+    )
 }
 
 fn looks_like_audio_tag(token: &str) -> bool {
@@ -3559,9 +3534,15 @@ pub(crate) fn normalize_override_key(raw: &str) -> Option<String> {
 pub(crate) fn derive_override_key(library_type: &str, media_path: &str) -> Option<String> {
     let path = Path::new(media_path);
     let raw = match library_type {
-        "movie" => path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
+        "movie" => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
         "series" | "anime" => select_series_root_name(path),
-        _ => path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
+        _ => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
     }?;
     normalize_override_key(&raw)
 }
@@ -3796,11 +3777,7 @@ pub(crate) async fn apply_external_ids_to_series(
         ids = ?ids,
         "apply external ids to series"
     );
-    let tvdb = ids
-        .tvdb_series
-        .as_ref()
-        .or(ids.tvdb.as_ref())
-        .cloned();
+    let tvdb = ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()).cloned();
     sqlx::query::<sqlx::Any>(
         "UPDATE series SET external_imdb = COALESCE(?, external_imdb), external_tvdb_series = COALESCE(?, external_tvdb_series), external_anilist = COALESCE(?, external_anilist), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
@@ -4068,24 +4045,11 @@ async fn ensure_tvdb_season_scaffold(
         )
         .await?;
         if let (Some(artwork_service), Some(url)) = (artwork, episode.image.as_deref()) {
-            sync_episode_artwork(
-                pool,
-                artwork_service,
-                episode_id,
-                url,
-                "tvdb",
-            )
-            .await?;
+            sync_episode_artwork(pool, artwork_service, episode_id, url, "tvdb").await?;
         }
         if let Some(tvdb_episode_id) = episode.tvdb_episode_id.as_ref() {
-            insert_episode_external_id(
-                pool,
-                episode_id,
-                "tvdb_episode",
-                tvdb_episode_id,
-                "tvdb",
-            )
-            .await?;
+            insert_episode_external_id(pool, episode_id, "tvdb_episode", tvdb_episode_id, "tvdb")
+                .await?;
         }
         processed += 1;
     }
@@ -4106,7 +4070,9 @@ async fn ensure_anizip_season_scaffold(
     ttl_seconds: u64,
     force_metadata: bool,
 ) -> Result<()> {
-    if season_scaffolded_recent(pool, season_id, Some("anizip"), ttl_seconds, force_metadata).await? {
+    if season_scaffolded_recent(pool, season_id, Some("anizip"), ttl_seconds, force_metadata)
+        .await?
+    {
         return Ok(());
     }
     if season_scaffolded(pool, season_id).await? {
@@ -4140,43 +4106,17 @@ async fn ensure_anizip_season_scaffold(
             &episode.raw,
         )
         .await?;
-        upsert_anime_episode_meta(
-            pool,
-            season_id,
-            ep_number,
-            episode,
-        )
-        .await?;
+        upsert_anime_episode_meta(pool, season_id, ep_number, episode).await?;
         if let (Some(artwork_service), Some(url)) = (artwork, episode.image.as_deref()) {
-            sync_episode_artwork(
-                pool,
-                artwork_service,
-                episode_id,
-                url,
-                "anizip",
-            )
-            .await?;
+            sync_episode_artwork(pool, artwork_service, episode_id, url, "anizip").await?;
         }
         if let Some(tvdb_id) = episode.tvdb_id.as_ref() {
-            insert_episode_external_id(
-                pool,
-                episode_id,
-                "tvdb_episode",
-                tvdb_id,
-                "anizip",
-            )
-            .await?;
+            insert_episode_external_id(pool, episode_id, "tvdb_episode", tvdb_id, "anizip").await?;
             insert_episode_provider_key(pool, episode_id, "tvdb", tvdb_id).await?;
         }
         if let Some(anidb_eid) = episode.anidb_eid.as_ref() {
-            insert_episode_external_id(
-                pool,
-                episode_id,
-                "anidb_episode",
-                anidb_eid,
-                "anizip",
-            )
-            .await?;
+            insert_episode_external_id(pool, episode_id, "anidb_episode", anidb_eid, "anizip")
+                .await?;
             insert_episode_provider_key(pool, episode_id, "anidb", anidb_eid).await?;
         }
         processed += 1;
@@ -4307,12 +4247,8 @@ async fn sync_movie_artwork(
     if refs.is_empty() {
         return Ok(());
     }
-    let stored = artwork
-        .upsert_refs(pool, "movie", movie_id, &refs)
-        .await?;
-    artwork
-        .cache_primary(pool, &stored, &["cinemeta"])
-        .await?;
+    let stored = artwork.upsert_refs(pool, "movie", movie_id, &refs).await?;
+    artwork.cache_primary(pool, &stored, &["cinemeta"]).await?;
     Ok(())
 }
 
@@ -4335,18 +4271,11 @@ async fn sync_series_artwork(
     }
 
     let mut season_refs: HashMap<i32, Vec<ArtworkCandidate>> = HashMap::new();
-    if let (Some(linker), Some(tvdb_id)) = (
-        linkers,
-        ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()),
-    ) {
-        let should_refresh = !series_seasons_scaffolded_recent(
-            pool,
-            series_id,
-            None,
-            ttl_seconds,
-            force_metadata,
-        )
-        .await?;
+    if let (Some(linker), Some(tvdb_id)) = (linkers, ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()))
+    {
+        let should_refresh =
+            !series_seasons_scaffolded_recent(pool, series_id, None, ttl_seconds, force_metadata)
+                .await?;
         if should_refresh {
             if let Ok(Some(series_meta)) = linker.fetch_tvdb_series(tvdb_id).await {
                 update_series_metadata_from_tvdb(pool, series_id, &series_meta).await?;
@@ -4368,7 +4297,10 @@ async fn sync_series_artwork(
                         metadata_json: None,
                     };
                     if let Some(season_number) = entry.season_number {
-                        season_refs.entry(season_number).or_default().push(candidate);
+                        season_refs
+                            .entry(season_number)
+                            .or_default()
+                            .push(candidate);
                     } else {
                         refs.push(candidate);
                     }
@@ -4466,10 +4398,8 @@ async fn update_series_metadata_from_tvdb(
     });
 
     let merged_json = if let Some(existing) = existing {
-        let mut merged =
-            serde_json::from_str::<serde_json::Value>(&existing).unwrap_or_else(|_| {
-                serde_json::json!({})
-            });
+        let mut merged = serde_json::from_str::<serde_json::Value>(&existing)
+            .unwrap_or_else(|_| serde_json::json!({}));
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_json) {
             if let Some(obj) = merged.as_object_mut() {
                 obj.insert("tvdb".to_string(), parsed);
@@ -4573,7 +4503,13 @@ fn extract_tvdb_season_year(value: &serde_json::Value) -> Option<i32> {
     if let Some(year) = value.get("year").and_then(serde_json::Value::as_str) {
         return parse_year_str(year);
     }
-    let date_keys = ["firstAired", "first_air_date", "startDate", "premiereDate", "airDate"];
+    let date_keys = [
+        "firstAired",
+        "first_air_date",
+        "startDate",
+        "premiereDate",
+        "airDate",
+    ];
     for key in date_keys {
         if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
             if let Some(year) = value.get(0..4).and_then(|s| s.parse::<i32>().ok()) {
@@ -4664,8 +4600,7 @@ async fn season_scaffolded_recent(
         if let Some(updated_at) = updated_at {
             if let Ok(parsed) = updated_at.parse::<chrono::NaiveDateTime>() {
                 timestamp = Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-                    parsed,
-                    Utc,
+                    parsed, Utc,
                 ));
             }
         }
@@ -4688,12 +4623,11 @@ async fn series_seasons_scaffolded_recent(
     if force || ttl_seconds == 0 {
         return Ok(false);
     }
-    let season_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM seasons WHERE series_id = ?",
-    )
-    .bind(series_id.to_string())
-    .fetch_all(pool)
-    .await?;
+    let season_ids: Vec<String> =
+        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM seasons WHERE series_id = ?")
+            .bind(series_id.to_string())
+            .fetch_all(pool)
+            .await?;
 
     if season_ids.is_empty() {
         return Ok(false);
@@ -4708,11 +4642,7 @@ async fn series_seasons_scaffolded_recent(
     Ok(true)
 }
 
-async fn mark_season_scaffolded(
-    pool: &AnyPool,
-    season_id: Uuid,
-    provider: &str,
-) -> Result<()> {
+async fn mark_season_scaffolded(pool: &AnyPool, season_id: Uuid, provider: &str) -> Result<()> {
     let existing = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
     )
@@ -4734,10 +4664,7 @@ async fn mark_season_scaffolded(
 
     if let Some(obj) = meta.as_object_mut() {
         obj.insert("scaffolded".to_string(), serde_json::json!(true));
-        obj.insert(
-            "scaffold_provider".to_string(),
-            serde_json::json!(provider),
-        );
+        obj.insert("scaffold_provider".to_string(), serde_json::json!(provider));
         obj.insert(
             "scaffolded_at".to_string(),
             serde_json::json!(Utc::now().to_rfc3339()),
@@ -4808,16 +4735,14 @@ mod tests {
         }];
         run_full_scan(&database.pool, candidates, false).await?;
 
-        let (movie_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM movies")
-                .fetch_one(&database.pool)
-                .await?;
+        let (movie_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movies")
+            .fetch_one(&database.pool)
+            .await?;
         assert_eq!(movie_count, 1);
 
-        let (link_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM movie_files")
-                .fetch_one(&database.pool)
-                .await?;
+        let (link_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movie_files")
+            .fetch_one(&database.pool)
+            .await?;
         assert_eq!(link_count, 1);
 
         let (count_ok,): (i64,) =
@@ -4869,10 +4794,9 @@ mod tests {
         }];
         run_full_scan(&database.pool, candidates, false).await?;
 
-        let (queue_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM review_queue")
-                .fetch_one(&database.pool)
-                .await?;
+        let (queue_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM review_queue")
+            .fetch_one(&database.pool)
+            .await?;
         assert_eq!(queue_count, 1);
 
         Ok(())
@@ -4889,8 +4813,7 @@ mod tests {
         database.run_migrations().await?;
 
         let media_path = "/media/override_movie_2024.mkv";
-        let normalized =
-            derive_override_key("movie", media_path).expect("override key");
+        let normalized = derive_override_key("movie", media_path).expect("override key");
 
         sqlx::query(
             "INSERT INTO classifier_overrides (id, library_type, normalized_key, imdb_id, anilist_id, tvdb_id) VALUES (?, ?, ?, ?, NULL, NULL)",
@@ -4924,11 +4847,9 @@ mod tests {
         }];
         run_full_scan(&database.pool, candidates, false).await?;
 
-        let imdb: Option<String> = sqlx::query_scalar(
-            "SELECT external_imdb FROM movies LIMIT 1",
-        )
-        .fetch_one(&database.pool)
-        .await?;
+        let imdb: Option<String> = sqlx::query_scalar("SELECT external_imdb FROM movies LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
         assert_eq!(imdb.as_deref(), Some("tt9999999"));
 
         let (pending_count,): (i64,) =

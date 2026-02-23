@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::time::sleep;
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -10,6 +11,7 @@ use crate::config::Settings;
 use crate::db::models::{BindingStatus, ExtensionKind, ProviderHealthState};
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
+use crate::metrics;
 use crate::orchestrator::executor::{Executor, ExecutorAction};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::model::ProviderEndpoint;
@@ -22,7 +24,6 @@ use crate::runtime::model::ContainerHandle;
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
-use crate::metrics;
 
 #[derive(Debug, Clone)]
 pub struct ReconcileConfig {
@@ -34,25 +35,11 @@ pub struct ReconcileConfig {
 
 impl ReconcileConfig {
     pub fn from_settings(settings: &Settings) -> Self {
-        let interval = Duration::from_secs(
-            settings
-                .extensions
-                .reconcile_interval_seconds
-                .max(1),
-        );
+        let interval = Duration::from_secs(settings.extensions.reconcile_interval_seconds.max(1));
         let retry_attempts = settings.extensions.reconcile_retry_attempts.max(1);
-        let retry_backoff = Duration::from_secs(
-            settings
-                .extensions
-                .reconcile_retry_backoff_seconds
-                .max(1),
-        );
-        let lock_ttl = Duration::from_secs(
-            settings
-                .extensions
-                .apply_lock_ttl_seconds
-                .max(1),
-        );
+        let retry_backoff =
+            Duration::from_secs(settings.extensions.reconcile_retry_backoff_seconds.max(1));
+        let lock_ttl = Duration::from_secs(settings.extensions.apply_lock_ttl_seconds.max(1));
         Self {
             interval,
             retry_attempts,
@@ -112,6 +99,50 @@ impl<'a> Reconciler<'a> {
             return Ok(());
         }
 
+        let stale_before =
+            chrono::Utc::now() - chrono::Duration::seconds(self.lock_ttl.as_secs().max(1) as i64);
+        let stale_reason = "reconcile run expired and was reaped";
+        if let Ok(reaped) = self
+            .store
+            .reap_stale_running_runs(stale_before, stale_reason)
+            .await
+        {
+            if reaped > 0 {
+                tracing::warn!("reconcile: reaped {} stale running run(s)", reaped);
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&["reap_stale_runs", "ok"])
+                    .inc();
+            }
+        } else {
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&["reap_stale_runs", "error"])
+                .inc();
+        }
+
+        let (stop_heartbeat_tx, stop_heartbeat_rx) = watch::channel(false);
+        let heartbeat_pool = self.pool.clone();
+        let heartbeat_owner_id = owner_id.clone();
+        let heartbeat_ttl = self.lock_ttl;
+        let heartbeat_task = tokio::spawn(async move {
+            let store = ExtensionStore::new(&heartbeat_pool);
+            let mut stop_rx = stop_heartbeat_rx;
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs((heartbeat_ttl.as_secs() / 2).max(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let _ = store.touch_lock(APPLY_LOCK_NAME, &heartbeat_owner_id).await;
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         let run_id = Uuid::new_v4();
         let result = if let Err(err) = self
             .store
@@ -157,6 +188,8 @@ impl<'a> Reconciler<'a> {
             }
         }
 
+        let _ = stop_heartbeat_tx.send(true);
+        let _ = heartbeat_task.await;
         let _ = self.store.release_lock(APPLY_LOCK_NAME, &owner_id).await;
         result
     }
@@ -170,8 +203,10 @@ impl<'a> Reconciler<'a> {
         let extensions = self.store.list_extensions().await?;
         let bindings = self.store.list_bindings().await?;
 
-        let instance_map: HashMap<Uuid, _> =
-            instances.into_iter().map(|inst| (inst.instance_id, inst)).collect();
+        let instance_map: HashMap<Uuid, _> = instances
+            .into_iter()
+            .map(|inst| (inst.instance_id, inst))
+            .collect();
         let extension_map: HashMap<_, _> = extensions
             .into_iter()
             .map(|extension| (extension.extension_id.clone(), extension))
@@ -195,11 +230,7 @@ impl<'a> Reconciler<'a> {
         Ok(())
     }
 
-    async fn reconcile_desired_state(
-        &self,
-        run_id: Uuid,
-        step_index: &mut i32,
-    ) -> Result<()> {
+    async fn reconcile_desired_state(&self, run_id: Uuid, step_index: &mut i32) -> Result<()> {
         let desired = self.store.list_desired_blueprints(Some(true)).await?;
         if desired.is_empty() {
             return Ok(());
@@ -393,8 +424,7 @@ impl<'a> Reconciler<'a> {
                 .map(|run| run.run_id)
                 .unwrap_or(plan.plan_id);
             plan.plan_id = run_id;
-            let plan_json = serde_json::to_value(&plan)
-                .context("serializing auto-wire plan")?;
+            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
             if let Some(run) = pending_run {
                 self.store.update_run_plan(run.run_id, plan_json).await?;
             } else {
@@ -417,8 +447,7 @@ impl<'a> Reconciler<'a> {
 
         let run_id = if let Some(run) = pending_run {
             plan.plan_id = run.run_id;
-            let plan_json = serde_json::to_value(&plan)
-                .context("serializing auto-wire plan")?;
+            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
             self.store.update_run_plan(run.run_id, plan_json).await?;
             self.store
                 .update_run_status(
@@ -431,8 +460,7 @@ impl<'a> Reconciler<'a> {
             run.run_id
         } else {
             let run_id = plan.plan_id;
-            let plan_json = serde_json::to_value(&plan)
-                .context("serializing auto-wire plan")?;
+            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
             self.store
                 .create_run(&crate::extensions::store::NewOrchestratorRun {
                     run_id,
@@ -576,7 +604,10 @@ impl<'a> Reconciler<'a> {
                     );
                     let _ = self
                         .store
-                        .update_provider_health(provider.provider_id, ProviderHealthState::Unhealthy)
+                        .update_provider_health(
+                            provider.provider_id,
+                            ProviderHealthState::Unhealthy,
+                        )
                         .await;
                     continue;
                 }
@@ -592,7 +623,10 @@ impl<'a> Reconciler<'a> {
                     );
                     let _ = self
                         .store
-                        .update_provider_health(provider.provider_id, ProviderHealthState::Unhealthy)
+                        .update_provider_health(
+                            provider.provider_id,
+                            ProviderHealthState::Unhealthy,
+                        )
                         .await;
                     continue;
                 }
@@ -645,8 +679,7 @@ impl<'a> Reconciler<'a> {
                             || self.restart_runtime(instance, extension, manifests),
                         )
                         .await;
-                    if let Err(err) = restart
-                    {
+                    if let Err(err) = restart {
                         warn!(
                             "reconcile: restart failed for instance {}: {}",
                             instance.instance_id, err
@@ -894,10 +927,7 @@ impl<'a> Reconciler<'a> {
                 )
                 .await;
             if let Err(err) = result {
-                warn!(
-                    "reconcile: binding {} failed: {}",
-                    binding.binding_id, err
-                );
+                warn!("reconcile: binding {} failed: {}", binding.binding_id, err);
                 metrics::RECONCILE_ACTIONS
                     .with_label_values(&["apply_binding", "error"])
                     .inc();
@@ -938,7 +968,15 @@ impl<'a> Reconciler<'a> {
             })
             .await?;
 
-        let result = f().await;
+        let step_timeout = Duration::from_secs(self.lock_ttl.as_secs().saturating_sub(1).max(1));
+        let result = match timeout(step_timeout, f()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "step '{}' timed out after {}s",
+                action_type,
+                step_timeout.as_secs()
+            )),
+        };
         match &result {
             Ok(()) => {
                 self.store
@@ -994,9 +1032,9 @@ mod tests {
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewProvider, NewSecret,
     };
-    use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
-    use crate::runtime::RuntimePaths;
     use crate::orchestrator::planner::{Plan, PlanAction, Planner};
+    use crate::runtime::RuntimePaths;
+    use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::secrets::SecretsManager;
 
     #[derive(Default)]
@@ -1110,11 +1148,7 @@ mod tests {
             Ok(StateSnapshot { summary: None })
         }
 
-        async fn apply_patch(
-            &self,
-            _ctx: DriverCtx,
-            _patch: DriverPatch,
-        ) -> Result<ApplyResult> {
+        async fn apply_patch(&self, _ctx: DriverCtx, _patch: DriverPatch) -> Result<ApplyResult> {
             Ok(ApplyResult::applied())
         }
     }
@@ -1259,6 +1293,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: Some("stub".to_string()),
+                scope_json: None,
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Unknown,
             })
@@ -1328,6 +1363,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: None,
+                scope_json: None,
                 endpoint_json: Some(serde_json::to_value(consumer_endpoint)?),
                 health_state: ProviderHealthState::Unknown,
             })
@@ -1340,6 +1376,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: None,
+                scope_json: None,
                 endpoint_json: Some(serde_json::to_value(provider_endpoint)?),
                 health_state: ProviderHealthState::Unknown,
             })
@@ -1363,7 +1400,11 @@ mod tests {
         let drivers = DriverRegistry::new();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
@@ -1398,6 +1439,90 @@ mod tests {
             .find(|item| item.binding_id == binding_id)
             .expect("binding");
         assert_eq!(binding.status, BindingStatus::Applied);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_reaps_stale_running_runs_before_new_run() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let stale_run_id = Uuid::new_v4();
+        store
+            .create_run(&crate::extensions::store::NewOrchestratorRun {
+                run_id: stale_run_id,
+                source: "reconcile".to_string(),
+                status: OrchestratorRunStatus::Running,
+                phase: Some("reconcile".to_string()),
+                plan_json: None,
+                error: None,
+            })
+            .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE orchestrator_runs SET created_at = datetime('now', '-10 minutes') WHERE run_id = ?",
+        )
+        .bind(stale_run_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let stale_step_id = Uuid::new_v4();
+        store
+            .create_step(&crate::extensions::store::NewOperationStep {
+                step_id: stale_step_id,
+                run_id: stale_run_id,
+                step_index: 0,
+                action_type: "health_check".to_string(),
+                action_json: Some(json!({ "provider_id": Uuid::new_v4() })),
+                status: crate::db::models::OperationStepStatus::Running,
+                error: None,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let stale_run = store.get_run(stale_run_id).await?.expect("stale run");
+        assert_eq!(stale_run.status, OrchestratorRunStatus::Failed);
+        assert_eq!(
+            stale_run.error.as_deref(),
+            Some("reconcile run expired and was reaped")
+        );
+
+        let stale_steps = store.list_steps(stale_run_id).await?;
+        assert_eq!(stale_steps.len(), 1);
+        assert_eq!(
+            stale_steps[0].status,
+            crate::db::models::OperationStepStatus::Failed
+        );
 
         Ok(())
     }
@@ -1498,7 +1623,11 @@ mod tests {
         let drivers = DriverRegistry::new();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
@@ -1522,7 +1651,9 @@ mod tests {
 
         let instances = store.list_instances(None).await?;
         assert!(
-            instances.iter().any(|instance| instance.extension_id == "ext.module"),
+            instances
+                .iter()
+                .any(|instance| instance.extension_id == "ext.module"),
             "expected instance to be created"
         );
 
@@ -1691,6 +1822,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: Some("sonarr".to_string()),
+                scope_json: None,
                 endpoint_json: Some(serde_json::to_value(existing_endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
@@ -1722,7 +1854,11 @@ mod tests {
         let drivers = DriverRegistry::new();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
@@ -1746,7 +1882,9 @@ mod tests {
 
         let instances = store.list_instances(None).await?;
         assert!(
-            instances.iter().all(|instance| instance.extension_id != "ext.new"),
+            instances
+                .iter()
+                .all(|instance| instance.extension_id != "ext.new"),
             "keep_existing decisions should prevent installing ext.new"
         );
 
@@ -1764,7 +1902,11 @@ mod tests {
         let drivers = DriverRegistry::new();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
@@ -1792,17 +1934,14 @@ mod tests {
             .expect("pending auto-wire run");
         let plan_json = run.plan_json.expect("auto-wire plan");
         let plan: Plan = serde_json::from_value(plan_json)?;
-        let expected_missing = format!(
-            "instance:{}:{}",
-            fixture.instance_id, fixture.secret_key
-        );
+        let expected_missing = format!("instance:{}:{}", fixture.instance_id, fixture.secret_key);
         let missing_conflict = plan.conflicts.iter().find(|conflict| {
-            conflict
-                .get("code")
-                .and_then(Value::as_str)
-                == Some("missing_required_secrets")
+            conflict.get("code").and_then(Value::as_str) == Some("missing_required_secrets")
         });
-        assert!(missing_conflict.is_some(), "expected missing secrets conflict");
+        assert!(
+            missing_conflict.is_some(),
+            "expected missing secrets conflict"
+        );
         let missing = missing_conflict
             .and_then(|conflict| conflict.get("missing"))
             .and_then(Value::as_array)
@@ -1842,7 +1981,11 @@ mod tests {
         drivers.register(StubIndexerDriver::default());
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let config = ReconcileConfig {
@@ -1869,7 +2012,9 @@ mod tests {
             .expect("completed auto-wire run");
         let steps = store.list_steps(run.run_id).await?;
         assert!(
-            steps.iter().any(|step| step.action_type == "apply_driver_patch"),
+            steps
+                .iter()
+                .any(|step| step.action_type == "apply_driver_patch"),
             "expected apply_driver_patch step"
         );
 
@@ -1913,7 +2058,11 @@ mod tests {
         let drivers = DriverRegistry::new();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);

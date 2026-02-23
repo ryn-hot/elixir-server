@@ -174,20 +174,22 @@ impl MediaManagerTvPatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MediaManagerMoviesPatch {
-    SetDownloaders {
-        downloaders: Vec<DownloaderSpec>,
-    },
-    SetRootFolders {
-        roots: Vec<RootFolderSpec>,
-    },
-    SetTags {
-        tags: Vec<String>,
-    },
+    SetIndexerRegistry { indexers: Vec<IndexerSpec> },
+    SetDownloaders { downloaders: Vec<DownloaderSpec> },
+    SetRootFolders { roots: Vec<RootFolderSpec> },
+    SetTags { tags: Vec<String> },
 }
 
 impl MediaManagerMoviesPatch {
     pub fn validate(&self) -> Result<()> {
         match self {
+            MediaManagerMoviesPatch::SetIndexerRegistry { indexers } => {
+                ensure_non_empty_list(indexers, "indexers")?;
+                for indexer in indexers {
+                    indexer.validate()?;
+                }
+                Ok(())
+            }
             MediaManagerMoviesPatch::SetDownloaders { downloaders } => {
                 ensure_non_empty_list(downloaders, "downloaders")?;
                 for downloader in downloaders {
@@ -214,12 +216,9 @@ impl MediaManagerMoviesPatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IndexerRegistryPatch {
-    RegisterIndexers {
-        indexers: Vec<IndexerSpec>,
-    },
-    RegisterApps {
-        apps: Vec<AppSpec>,
-    },
+    RegisterIndexers { indexers: Vec<IndexerSpec> },
+    RegisterApp { app: AppSpec },
+    RegisterApps { apps: Vec<AppSpec> },
 }
 
 impl IndexerRegistryPatch {
@@ -232,6 +231,7 @@ impl IndexerRegistryPatch {
                 }
                 Ok(())
             }
+            IndexerRegistryPatch::RegisterApp { app } => app.validate(),
             IndexerRegistryPatch::RegisterApps { apps } => {
                 ensure_non_empty_list(apps, "apps")?;
                 for app in apps {
@@ -280,10 +280,7 @@ impl DownloaderTorrentPatch {
                 {
                     bail!("preferences must include at least one value");
                 }
-                ensure_optional_non_empty(
-                    default_save_path.as_deref(),
-                    "default_save_path",
-                )?;
+                ensure_optional_non_empty(default_save_path.as_deref(), "default_save_path")?;
                 ensure_optional_non_empty(incomplete_path.as_deref(), "incomplete_path")?;
                 Ok(())
             }
@@ -376,7 +373,11 @@ impl IndexerSpec {
         let mut fields = if self.auth.required_fields.is_empty() {
             vec!["username", "password"]
         } else {
-            self.auth.required_fields.iter().map(String::as_str).collect()
+            self.auth
+                .required_fields
+                .iter()
+                .map(String::as_str)
+                .collect()
         };
         let mut out = Vec::new();
         for field in &mut fields {
@@ -405,7 +406,11 @@ impl IndexerSpec {
             let fields = if self.auth.required_fields.is_empty() {
                 vec!["username", "password"]
             } else {
-                self.auth.required_fields.iter().map(String::as_str).collect()
+                self.auth
+                    .required_fields
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
             };
             for field in fields {
                 let _ = IndexerCredentialField::from_str(field)?;
@@ -550,9 +555,7 @@ impl SeriesTypeDefaultsSpec {
         ensure_non_empty(&self.series_type, "series_type")?;
         let normalized = self.series_type.trim().to_ascii_lowercase();
         if normalized != "standard" && normalized != "anime" && normalized != "daily" {
-            bail!(
-                "series_type must be one of 'standard', 'anime', or 'daily'"
-            );
+            bail!("series_type must be one of 'standard', 'anime', or 'daily'");
         }
         ensure_optional_non_empty(self.quality_profile.as_deref(), "quality_profile")?;
         ensure_optional_non_empty(self.language_profile.as_deref(), "language_profile")?;
@@ -742,13 +745,53 @@ mod tests {
 
     #[test]
     fn indexer_registry_patch_requires_indexers() {
-        let patch = IndexerRegistryPatch::RegisterIndexers { indexers: Vec::new() };
+        let patch = IndexerRegistryPatch::RegisterIndexers {
+            indexers: Vec::new(),
+        };
         assert!(patch.validate().is_err());
     }
 
     #[test]
     fn indexer_registry_patch_requires_apps() {
         let patch = IndexerRegistryPatch::RegisterApps { apps: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn indexer_registry_patch_register_app_requires_url() {
+        let patch = IndexerRegistryPatch::RegisterApp {
+            app: AppSpec {
+                name: "sonarr".to_string(),
+                implementation: "sonarr".to_string(),
+                url: "".to_string(),
+                api_key: None,
+                categories: Vec::new(),
+                tags: Vec::new(),
+                enabled: None,
+                settings: HashMap::new(),
+            },
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn media_manager_movies_patch_requires_valid_indexer_registry() {
+        let patch = MediaManagerMoviesPatch::SetIndexerRegistry {
+            indexers: vec![IndexerSpec {
+                name: "bad".to_string(),
+                implementation: "torznab".to_string(),
+                url: "http://localhost:9696".to_string(),
+                auth: IndexerAuthSpec {
+                    requires_account: Some(false),
+                    required_fields: Vec::new(),
+                },
+                api_key: None,
+                categories: Vec::new(),
+                tags: Vec::new(),
+                enabled: None,
+                settings: HashMap::new(),
+            }],
+        };
         assert!(patch.validate().is_err());
     }
 
@@ -775,7 +818,9 @@ mod tests {
 
     #[test]
     fn downloader_torrent_patch_requires_categories() {
-        let patch = DownloaderTorrentPatch::SetCategories { categories: Vec::new() };
+        let patch = DownloaderTorrentPatch::SetCategories {
+            categories: Vec::new(),
+        };
         assert!(patch.validate().is_err());
     }
 

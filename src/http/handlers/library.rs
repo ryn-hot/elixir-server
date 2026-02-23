@@ -9,8 +9,8 @@ use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::{
-    extensions::ExternalIds, http::error::ApiResult, library::run_full_scan_with_metadata_and_linkers,
-    state::AppState,
+    extensions::ExternalIds, http::error::ApiResult,
+    library::run_full_scan_with_metadata_and_linkers, state::AppState,
 };
 
 #[derive(Serialize)]
@@ -300,13 +300,11 @@ pub async fn list_seasons(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<SeasonResponse>>> {
     let preferred_languages = parse_language_header(&headers);
-    let exists: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM series WHERE id = ? LIMIT 1",
-    )
-    .bind(&series_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM series WHERE id = ? LIMIT 1")
+        .bind(&series_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
     if exists.is_none() {
         return Err(crate::http::error::ApiError::not_found("series not found"));
@@ -320,10 +318,7 @@ pub async fn list_seasons(
     .await
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-    let season_ids: Vec<String> = rows
-        .iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect();
+    let season_ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
 
     let posters = load_primary_artwork(
         &state.db_pool,
@@ -361,11 +356,7 @@ pub async fn list_seasons(
                     .try_get::<i64, _>("episode_count")
                     .ok()
                     .unwrap_or_default() as i32,
-                has_files: row
-                    .try_get::<i64, _>("file_count")
-                    .ok()
-                    .unwrap_or_default()
-                    > 0,
+                has_files: row.try_get::<i64, _>("file_count").ok().unwrap_or_default() > 0,
                 poster_url,
                 banner_url,
             }
@@ -381,13 +372,11 @@ pub async fn list_episodes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<EpisodeResponse>>> {
     let preferred_languages = parse_language_header(&headers);
-    let exists: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM seasons WHERE id = ? LIMIT 1",
-    )
-    .bind(&season_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM seasons WHERE id = ? LIMIT 1")
+        .bind(&season_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
     if exists.is_none() {
         return Err(crate::http::error::ApiError::not_found("season not found"));
@@ -401,10 +390,7 @@ pub async fn list_episodes(
     .await
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-    let episode_ids: Vec<String> = rows
-        .iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect();
+    let episode_ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
     let thumbnails = load_primary_artwork(
         &state.db_pool,
         "episode",
@@ -426,7 +412,11 @@ pub async fn list_episodes(
             let description = extract_episode_description(metadata_json.as_ref());
             let anime_title: Option<String> = row.try_get("anime_title").ok();
             let raw_title: Option<String> = row.try_get("title").ok();
-            let title = match raw_title.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let title = match raw_title
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 Some(_) => raw_title,
                 None => anime_title,
             };
@@ -554,8 +544,9 @@ pub async fn detail(
     .await
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-    let (item_type, title, year, runtime_seconds, metadata_json, external_ids) =
-        if let Some(row) = movie {
+    let (item_type, title, year, runtime_seconds, metadata_json, external_ids) = if let Some(row) =
+        movie
+    {
         let external_ids = ExternalIds {
             imdb: row.try_get::<String, _>("external_imdb").ok(),
             tmdb: row.try_get::<String, _>("external_tmdb").ok(),
@@ -585,7 +576,8 @@ pub async fn detail(
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-        let series = series.ok_or_else(|| crate::http::error::ApiError::not_found("item not found"))?;
+        let series =
+            series.ok_or_else(|| crate::http::error::ApiError::not_found("item not found"))?;
         let external_tvdb: Option<String> = series.try_get("external_tvdb_series").ok();
         let external_ids = ExternalIds {
             imdb: series.try_get::<String, _>("external_imdb").ok(),
@@ -622,10 +614,7 @@ pub async fn detail(
             .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?
     };
 
-    let file_ids: Vec<String> = files
-        .iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect();
+    let file_ids: Vec<String> = files.iter().map(|row| row.get::<String, _>("id")).collect();
 
     let mut tracks_by_file = load_media_tracks(&state.db_pool, &file_ids).await?;
     let mut subtitles_by_file = load_external_subtitles(&state.db_pool, &file_ids).await?;
@@ -656,7 +645,11 @@ pub async fn detail(
         .collect();
 
     let (description, genres) = extract_metadata_fields(metadata_json.as_ref());
-    let owner_type = if item_type == "movie" { "movie" } else { "series" };
+    let owner_type = if item_type == "movie" {
+        "movie"
+    } else {
+        "series"
+    };
     let provider_priority: &[&str] = if item_type == "anime" {
         &["anilist", "tvdb", "cinemeta"]
     } else if item_type == "movie" {
@@ -865,16 +858,19 @@ async fn load_primary_artwork(
     let mut grouped: HashMap<String, Vec<ArtworkRow>> = HashMap::new();
     for row in rows {
         let owner_id = row.get::<String, _>("owner_id");
-        grouped.entry(owner_id.clone()).or_default().push(ArtworkRow {
-            owner_id,
-            id: row.get::<String, _>("id"),
-            url: row.get::<String, _>("url"),
-            language: row.try_get::<String, _>("language").ok(),
-            provider: row.try_get::<String, _>("provider").ok(),
-            score: row.try_get::<f64, _>("score").ok().map(|v| v as f32),
-            width: row.try_get::<i64, _>("width").ok().map(|v| v as i32),
-            height: row.try_get::<i64, _>("height").ok().map(|v| v as i32),
-        });
+        grouped
+            .entry(owner_id.clone())
+            .or_default()
+            .push(ArtworkRow {
+                owner_id,
+                id: row.get::<String, _>("id"),
+                url: row.get::<String, _>("url"),
+                language: row.try_get::<String, _>("language").ok(),
+                provider: row.try_get::<String, _>("provider").ok(),
+                score: row.try_get::<f64, _>("score").ok().map(|v| v as f32),
+                width: row.try_get::<i64, _>("width").ok().map(|v| v as i32),
+                height: row.try_get::<i64, _>("height").ok().map(|v| v as i32),
+            });
     }
 
     for (owner_id, candidates) in grouped {

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,15 +18,30 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn from_roots(storage_root: &str, media_root: &str) -> Self {
-        let storage_path = Path::new(storage_root);
-        let data_root_path = storage_path.parent().unwrap_or(storage_path);
+        let storage_path = absolutize_path(storage_root);
+        let data_root_path = storage_path.parent().unwrap_or(&storage_path).to_path_buf();
         let data_root = data_root_path.to_string_lossy().to_string();
-        let downloads_root = data_root_path.join("downloads").to_string_lossy().to_string();
+        let downloads_root = data_root_path
+            .join("downloads")
+            .to_string_lossy()
+            .to_string();
+        let media_root = absolutize_path(media_root).to_string_lossy().to_string();
         Self {
             data_root,
             downloads_root,
-            media_root: media_root.to_string(),
+            media_root,
         }
+    }
+}
+
+fn absolutize_path(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
     }
 }
 

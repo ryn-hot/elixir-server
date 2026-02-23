@@ -34,12 +34,12 @@ use crate::{
     playback::{HLS_SEGMENT_SECONDS, SubtitleInfo, TranscodeParams},
     state::AppState,
 };
+use tokio::time::sleep;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
     process::Command,
 };
-use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 use tracing::info;
 
@@ -960,7 +960,8 @@ pub async fn master_playlist(
     if !handle.subtitles.is_empty() {
         let renditions = build_subtitle_renditions(&handle.subtitles, &handle.temp_dir).await;
         if !renditions.is_empty() {
-            let ready = wait_for_subtitle_segments(&handle.temp_dir, renditions.len(), 20, 150).await;
+            let ready =
+                wait_for_subtitle_segments(&handle.temp_dir, renditions.len(), 20, 150).await;
             if !ready {
                 tracing::warn!(
                     session = %session_id,
@@ -1096,7 +1097,10 @@ pub async fn serve_segment(
         SEGMENT_SERVED.with_label_values(&["ok"]).inc();
         return Ok((
             StatusCode::OK,
-            [(CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"))],
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/vtt; charset=utf-8"),
+            )],
             adjusted.into_bytes(),
         ));
     }
@@ -1270,10 +1274,7 @@ async fn build_subtitle_renditions(
     subtitles: &[SubtitleInfo],
     temp_dir: &Path,
 ) -> Vec<SubtitleRendition> {
-    let default_index = subtitles
-        .iter()
-        .position(|s| s.is_default)
-        .unwrap_or(0);
+    let default_index = subtitles.iter().position(|s| s.is_default).unwrap_or(0);
     let mut renditions = Vec::new();
 
     for (idx, sub) in subtitles.iter().enumerate() {
@@ -1362,7 +1363,10 @@ fn subtitle_display_name(info: &SubtitleInfo, index: usize) -> String {
 }
 
 fn escape_attribute(value: &str) -> String {
-    value.replace('"', "'").replace('\n', " ").replace('\r', " ")
+    value
+        .replace('"', "'")
+        .replace('\n', " ")
+        .replace('\r', " ")
 }
 
 fn inject_subtitle_media(
@@ -1473,7 +1477,10 @@ async fn resolve_subtitle_delay(state: &AppState, session_id: Uuid) -> Option<f6
         if let Some(segment) = find_first_segment(&temp_dir).await {
             if let Some(start_time) = probe_segment_start_time(&segment.path).await {
                 let offset = start_time - (segment.index as f64 * HLS_SEGMENT_SECONDS);
-                state.transcodes.set_subtitle_delay(session_id, offset).await;
+                state
+                    .transcodes
+                    .set_subtitle_delay(session_id, offset)
+                    .await;
                 info!(
                     session = %session_id,
                     segment = %segment.name,

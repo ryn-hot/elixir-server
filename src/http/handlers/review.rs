@@ -14,8 +14,8 @@ use crate::{
         error::{ApiError, ApiResult},
     },
     library::{
-        apply_external_ids_to_movie, apply_external_ids_to_season,
-        apply_external_ids_to_series, derive_override_key, normalize_override_key,
+        apply_external_ids_to_movie, apply_external_ids_to_season, apply_external_ids_to_series,
+        derive_override_key, normalize_override_key,
     },
     state::AppState,
 };
@@ -246,16 +246,16 @@ pub async fn apply_review(
     let library_type = normalize_library_type(&library_type)
         .ok_or_else(|| ApiError::bad_request("invalid library_type"))?;
     if !external_ids.has_any() {
-        return Err(ApiError::bad_request("external_ids must include at least one id"));
+        return Err(ApiError::bad_request(
+            "external_ids must include at least one id",
+        ));
     }
 
-    let row = sqlx::query(
-        "SELECT media_file_id FROM review_queue WHERE id = ? LIMIT 1",
-    )
-    .bind(&id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let row = sqlx::query("SELECT media_file_id FROM review_queue WHERE id = ? LIMIT 1")
+        .bind(&id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let row = row.ok_or_else(|| ApiError::not_found("review entry not found"))?;
     let media_file_id: String = row.get("media_file_id");
     let media_path: String = sqlx::query_scalar::<sqlx::Any, String>(
@@ -317,13 +317,7 @@ pub async fn apply_review(
     .ok_or_else(|| ApiError::bad_request("unable to derive normalized_key"))?;
 
     let override_ids = OverrideIds::from_external_ids(&external_ids);
-    upsert_override(
-        &state.db_pool,
-        library_type,
-        &normalized_key,
-        &override_ids,
-    )
-    .await?;
+    upsert_override(&state.db_pool, library_type, &normalized_key, &override_ids).await?;
 
     sqlx::query::<sqlx::Any>(
         "UPDATE review_queue SET status = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -352,16 +346,12 @@ pub async fn set_override(
         tvdb_id: body.tvdb_id.map(|v| v.as_string()),
     };
     if override_ids.is_empty() {
-        return Err(ApiError::bad_request("override must include at least one id"));
+        return Err(ApiError::bad_request(
+            "override must include at least one id",
+        ));
     }
 
-    upsert_override(
-        &state.db_pool,
-        library_type,
-        &normalized_key,
-        &override_ids,
-    )
-    .await?;
+    upsert_override(&state.db_pool, library_type, &normalized_key, &override_ids).await?;
 
     Ok(Json("ok"))
 }
@@ -379,11 +369,7 @@ impl OverrideIds {
     }
 
     fn from_external_ids(ids: &ExternalIds) -> Self {
-        let tvdb = ids
-            .tvdb_series
-            .as_ref()
-            .or(ids.tvdb.as_ref())
-            .cloned();
+        let tvdb = ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()).cloned();
         Self {
             imdb_id: ids.imdb.clone(),
             anilist_id: ids.anilist.clone(),
@@ -453,7 +439,9 @@ async fn load_current_match(
 }
 
 enum ReviewTarget {
-    Movie { id: Uuid },
+    Movie {
+        id: Uuid,
+    },
     Series {
         id: Uuid,
         season_id: Uuid,
@@ -473,8 +461,8 @@ async fn resolve_review_target(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     {
-        let movie_uuid = Uuid::parse_str(&movie_id)
-            .map_err(|_| ApiError::bad_request("invalid movie_id"))?;
+        let movie_uuid =
+            Uuid::parse_str(&movie_id).map_err(|_| ApiError::bad_request("invalid movie_id"))?;
         return Ok(ReviewTarget::Movie { id: movie_uuid });
     }
 
@@ -499,7 +487,9 @@ async fn resolve_review_target(
         });
     }
 
-    Err(ApiError::not_found("media file is not linked to a library item"))
+    Err(ApiError::not_found(
+        "media file is not linked to a library item",
+    ))
 }
 
 fn normalize_library_type(input: &str) -> Option<&'static str> {

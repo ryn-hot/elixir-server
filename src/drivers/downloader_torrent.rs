@@ -7,8 +7,8 @@ use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 use crate::drivers::patches::{DownloadCategorySpec, DownloaderTorrentPatch};
+use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
 #[derive(Debug, Default)]
 pub struct DownloaderTorrentDriver;
@@ -125,10 +125,7 @@ const QBITTORRENT_BOOTSTRAP_PASS: &str = "adminadmin";
 const QBITTORRENT_AUTOGEN_PREFIX: &str = "elixir_";
 
 impl QbittorrentClient {
-    async fn from_config(
-        config: QbittorrentDriverConfig,
-        endpoint_url: String,
-    ) -> Result<Self> {
+    async fn from_config(config: QbittorrentDriverConfig, endpoint_url: String) -> Result<Self> {
         let username = config
             .username
             .ok_or_else(|| anyhow::anyhow!("qbittorrent username is required"))?;
@@ -217,7 +214,8 @@ impl QbittorrentClient {
         if body.trim() != "Ok." {
             return Ok(false);
         }
-        let cookie = cookie_header.ok_or_else(|| anyhow::anyhow!("qbittorrent auth cookie missing"))?;
+        let cookie =
+            cookie_header.ok_or_else(|| anyhow::anyhow!("qbittorrent auth cookie missing"))?;
         self.cookie = cookie;
         Ok(true)
     }
@@ -260,20 +258,22 @@ impl QbittorrentClient {
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 bail!("qbittorrent auth rejected ({status}): {detail}");
             }
-            bail!("qbittorrent {} {path} failed ({status}): {detail}", method.as_str());
+            bail!(
+                "qbittorrent {} {path} failed ({status}): {detail}",
+                method.as_str()
+            );
         }
         if bytes.is_empty() {
-            bail!("qbittorrent {} {path} returned empty response", method.as_str());
+            bail!(
+                "qbittorrent {} {path} returned empty response",
+                method.as_str()
+            );
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {} {path} response", method.as_str()))
     }
 
-    async fn request_form(
-        &self,
-        path: &str,
-        fields: &HashMap<String, String>,
-    ) -> Result<()> {
+    async fn request_form(&self, path: &str, fields: &HashMap<String, String>) -> Result<()> {
         let request = self.authed_request(Method::POST, path)?;
         let resp = request
             .form(fields)
@@ -334,8 +334,7 @@ impl QbittorrentClient {
         if let Some(save_path) = save_path {
             fields.insert("savePath".to_string(), save_path.to_string());
         }
-        self.request_form("torrents/createCategory", &fields)
-            .await
+        self.request_form("torrents/createCategory", &fields).await
     }
 
     async fn edit_category(&self, name: &str, save_path: Option<&str>) -> Result<()> {
@@ -374,8 +373,14 @@ impl QbittorrentClient {
 
     async fn set_webui_credentials(&self, username: &str, password: &str) -> Result<()> {
         let mut prefs = serde_json::Map::new();
-        prefs.insert("web_ui_username".to_string(), Value::String(username.to_string()));
-        prefs.insert("web_ui_password".to_string(), Value::String(password.to_string()));
+        prefs.insert(
+            "web_ui_username".to_string(),
+            Value::String(username.to_string()),
+        );
+        prefs.insert(
+            "web_ui_password".to_string(),
+            Value::String(password.to_string()),
+        );
         let payload = Value::Object(prefs);
         let mut fields = HashMap::new();
         fields.insert("json".to_string(), payload.to_string());

@@ -4,13 +4,13 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
+use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
 #[derive(Debug, Default)]
 pub struct IndexerRegistryDriver;
@@ -78,6 +78,9 @@ impl CapabilityDriver for IndexerRegistryDriver {
         match patch {
             IndexerRegistryPatch::RegisterIndexers { indexers } => {
                 client.upsert_indexers(&indexers).await?;
+            }
+            IndexerRegistryPatch::RegisterApp { app } => {
+                client.upsert_apps(&[app]).await?;
             }
             IndexerRegistryPatch::RegisterApps { apps } => {
                 client.upsert_apps(&apps).await?;
@@ -208,10 +211,16 @@ impl ProwlarrClient {
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 bail!("prowlarr api key rejected ({status}): {detail}");
             }
-            bail!("prowlarr {} {path} failed ({status}): {detail}", method.as_str());
+            bail!(
+                "prowlarr {} {path} failed ({status}): {detail}",
+                method.as_str()
+            );
         }
         if bytes.is_empty() {
-            bail!("prowlarr {} {path} returned empty response", method.as_str());
+            bail!(
+                "prowlarr {} {path} returned empty response",
+                method.as_str()
+            );
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {} {path} response", method.as_str()))
@@ -222,7 +231,8 @@ impl ProwlarrClient {
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
-        self.request_json_value(Method::POST, path, Some(body)).await
+        self.request_json_value(Method::POST, path, Some(body))
+            .await
     }
 
     async fn put_json(&self, path: &str, body: &Value) -> Result<Value> {
@@ -287,7 +297,7 @@ impl ProwlarrClient {
                 self.ensure_tags(&app.tags).await?
             };
             let schema_item = find_schema(&schema, &app.implementation)?;
-            let existing_item = find_by_name(&existing, &app.name);
+            let existing_item = find_app_by_identity(&existing, app);
             let mut target = match existing_item.clone() {
                 Some(existing) => existing,
                 None => schema_item,
@@ -348,9 +358,7 @@ impl ProwlarrClient {
                 tag_ids.push(*id);
                 continue;
             }
-            let created = self
-                .post_json("tag", &json!({ "label": tag }))
-                .await?;
+            let created = self.post_json("tag", &json!({ "label": tag })).await?;
             if let Some(id) = created.get("id").and_then(Value::as_i64) {
                 by_name.insert(normalized, id);
                 tag_ids.push(id);
@@ -438,6 +446,89 @@ fn find_by_name(items: &[Value], name: &str) -> Option<Value> {
             None
         }
     })
+}
+
+fn find_app_by_identity(items: &[Value], app: &AppSpec) -> Option<Value> {
+    let target_name = normalize_name(&app.name);
+    let target_impl = normalize_name(&app.implementation);
+    let target_url = normalize_url(&app.url);
+
+    items.iter().find_map(|item| {
+        let name = item.get("name").and_then(Value::as_str)?;
+        if normalize_name(name) != target_name {
+            return None;
+        }
+
+        let implementation = item
+            .get("implementation")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("implementationName").and_then(Value::as_str))
+            .or_else(|| item.get("configContract").and_then(Value::as_str))
+            .map(normalize_name)
+            .unwrap_or_default();
+        if implementation != target_impl && !implementation.contains(&target_impl) {
+            return None;
+        }
+
+        let Some(existing_url) = app_url_from_item(item) else {
+            return None;
+        };
+        if normalize_url(&existing_url) != target_url {
+            return None;
+        }
+
+        Some(item.clone())
+    })
+}
+
+fn app_url_from_item(item: &Value) -> Option<String> {
+    let fields = item.get("fields")?.as_array()?;
+    for key in ["baseUrl", "url", "serverUrl", "prowlarrUrl"] {
+        let value = field_string_value(fields, key)?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn field_string_value(fields: &[Value], key: &str) -> Option<String> {
+    for field in fields {
+        let name = field.get("name").and_then(Value::as_str)?;
+        if !name.eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = field.get("value")?;
+        if let Some(text) = value.as_str() {
+            return Some(text.to_string());
+        }
+        if value.is_number() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Ok(url) = Url::parse(trimmed) {
+        let mut normalized = format!(
+            "{}://{}",
+            url.scheme().to_ascii_lowercase(),
+            url.host_str().unwrap_or("").to_ascii_lowercase()
+        );
+        if let Some(port) = url.port_or_known_default() {
+            normalized.push(':');
+            normalized.push_str(&port.to_string());
+        }
+        let path = url.path().trim_end_matches('/');
+        if !path.is_empty() {
+            normalized.push_str(path);
+        }
+        return normalized;
+    }
+    trimmed.to_ascii_lowercase()
 }
 
 fn find_schema(items: &[Value], implementation: &str) -> Result<Value> {
@@ -565,7 +656,10 @@ fn set_string(target: &mut Value, field: &str, value: String) -> Result<()> {
 
 fn set_array_i64(target: &mut Value, field: &str, values: &[i64]) -> Result<()> {
     if let Some(obj) = target.as_object_mut() {
-        let array = values.iter().map(|value| Value::Number((*value).into())).collect();
+        let array = values
+            .iter()
+            .map(|value| Value::Number((*value).into()))
+            .collect();
         obj.insert(field.to_string(), Value::Array(array));
         return Ok(());
     }
@@ -619,4 +713,63 @@ fn extract_error_message(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn register_app_identity_matches_name_type_and_url() {
+        let app = AppSpec {
+            name: "Sonarr".to_string(),
+            implementation: "Sonarr".to_string(),
+            url: "http://sonarr:8989".to_string(),
+            api_key: Some("abc".to_string()),
+            categories: vec![],
+            tags: vec![],
+            enabled: Some(true),
+            settings: HashMap::new(),
+        };
+        let existing = vec![json!({
+            "id": 5,
+            "name": "sonarr",
+            "implementation": "sonarr",
+            "fields": [
+                { "name": "baseUrl", "value": "http://sonarr:8989/" }
+            ]
+        })];
+
+        let matched = find_app_by_identity(&existing, &app);
+        assert!(matched.is_some(), "app identity should match");
+    }
+
+    #[test]
+    fn register_app_identity_rejects_url_mismatch() {
+        let app = AppSpec {
+            name: "Radarr".to_string(),
+            implementation: "Radarr".to_string(),
+            url: "http://radarr:7878".to_string(),
+            api_key: Some("abc".to_string()),
+            categories: vec![],
+            tags: vec![],
+            enabled: Some(true),
+            settings: HashMap::new(),
+        };
+        let existing = vec![json!({
+            "id": 8,
+            "name": "radarr",
+            "implementation": "radarr",
+            "fields": [
+                { "name": "baseUrl", "value": "http://radarr:8888/" }
+            ]
+        })];
+
+        let matched = find_app_by_identity(&existing, &app);
+        assert!(
+            matched.is_none(),
+            "app identity should require matching URL"
+        );
+    }
 }

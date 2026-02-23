@@ -2,17 +2,19 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use reqwest::Url;
 use reqwest::{
     Client, Method, StatusCode,
-    header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT},
+    header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT},
 };
-use reqwest::Url;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::drivers::patches::{DownloaderSpec, MediaManagerMoviesPatch, RootFolderSpec};
+use crate::drivers::patches::{
+    DownloaderSpec, IndexerSpec, MediaManagerMoviesPatch, RootFolderSpec,
+};
 use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
 pub struct MediaManagerMoviesDriver;
@@ -44,6 +46,9 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
         let client = RadarrClient::from_config(config, endpoint_url).await?;
 
         match patch {
+            MediaManagerMoviesPatch::SetIndexerRegistry { indexers } => {
+                client.upsert_indexers(&indexers).await?;
+            }
             MediaManagerMoviesPatch::SetDownloaders { downloaders } => {
                 client.upsert_downloaders(&downloaders).await?;
             }
@@ -179,11 +184,8 @@ impl RadarrClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let value = self
-            .request_json_value(Method::GET, path, None)
-            .await?;
-        serde_json::from_value(value)
-            .with_context(|| format!("parsing GET {path} response"))
+        let value = self.request_json_value(Method::GET, path, None).await?;
+        serde_json::from_value(value).with_context(|| format!("parsing GET {path} response"))
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
@@ -192,8 +194,7 @@ impl RadarrClient {
     }
 
     async fn put_json(&self, path: &str, body: &Value) -> Result<Value> {
-        self.request_json_value(Method::PUT, path, Some(body))
-            .await
+        self.request_json_value(Method::PUT, path, Some(body)).await
     }
 
     async fn request_json_value(
@@ -221,7 +222,10 @@ impl RadarrClient {
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 bail!("radarr api key rejected ({status}): {detail}");
             }
-            bail!("radarr {} {path} failed ({status}): {detail}", method.as_str());
+            bail!(
+                "radarr {} {path} failed ({status}): {detail}",
+                method.as_str()
+            );
         }
         if bytes.is_empty() {
             bail!("radarr {} {path} returned empty response", method.as_str());
@@ -242,6 +246,50 @@ impl RadarrClient {
             }
             let body = json!({ "path": root.path });
             self.post_json("rootfolder", &body).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_indexers(&self, indexers: &[IndexerSpec]) -> Result<()> {
+        if indexers.is_empty() {
+            return Ok(());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexer").await?;
+
+        for indexer in indexers {
+            let tags = self.ensure_tags(&indexer.tags).await?;
+            let schema_item = find_schema(&schema, &indexer.implementation)?;
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = indexer.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", indexer.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &indexer.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+            apply_indexer_fields(fields, indexer)?;
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
+
+            if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                let path = format!("indexer/{id}");
+                self.put_json(&path, &target).await?;
+            } else {
+                remove_readonly_fields(&mut target);
+                self.post_json("indexer", &target).await?;
+            }
         }
         Ok(())
     }
@@ -315,9 +363,7 @@ impl RadarrClient {
                 tag_ids.push(*id);
                 continue;
             }
-            let created = self
-                .post_json("tag", &json!({ "label": tag }))
-                .await?;
+            let created = self.post_json("tag", &json!({ "label": tag })).await?;
             if let Some(id) = created.get("id").and_then(Value::as_i64) {
                 by_name.insert(normalized, id);
                 tag_ids.push(id);
@@ -358,9 +404,7 @@ fn build_api_base(root: &Url, version: &str) -> Result<Url> {
 
 fn build_api_url(root: &Url, version: &str, path: &str) -> Result<Url> {
     let api_base = build_api_base(root, version)?;
-    api_base
-        .join(path)
-        .context("building radarr api url")
+    api_base.join(path).context("building radarr api url")
 }
 
 fn describe_error_body(body: &[u8]) -> String {
@@ -466,6 +510,18 @@ fn set_array_i64(target: &mut Value, field: &str, values: &[i64]) -> Result<()> 
     bail!("payload must be an object");
 }
 
+fn parse_int_list(values: &[String]) -> Result<Vec<Value>> {
+    let mut parsed = Vec::new();
+    for value in values {
+        let num = value
+            .trim()
+            .parse::<i64>()
+            .with_context(|| format!("invalid category '{}'", value))?;
+        parsed.push(Value::Number(num.into()));
+    }
+    Ok(parsed)
+}
+
 fn remove_readonly_fields(target: &mut Value) {
     if let Some(map) = target.as_object_mut() {
         map.remove("id");
@@ -494,6 +550,30 @@ fn apply_downloader_fields(fields: &mut Vec<Value>, spec: &DownloaderSpec) -> Re
     Ok(())
 }
 
+fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<()> {
+    let url_value = Value::String(spec.url.clone());
+    if !set_field_value_optional(fields, "baseUrl", url_value.clone())?
+        && !set_field_value_optional(fields, "url", url_value.clone())?
+    {
+        bail!("indexer requires baseUrl or url field");
+    }
+    if let Some(api_key) = spec.api_key.as_ref() {
+        set_field_value_optional(fields, "apiKey", Value::String(api_key.clone()))?;
+    }
+    if !spec.categories.is_empty() {
+        let categories = parse_int_list(&spec.categories)?;
+        if !set_field_value_optional(fields, "categories", Value::Array(categories))? {
+            warn!("indexer categories field not found");
+        }
+    }
+    for (key, value) in &spec.settings {
+        if !set_field_value_optional(fields, key, value.clone())? {
+            warn!("indexer field '{}' not found in schema", key);
+        }
+    }
+    Ok(())
+}
+
 fn apply_url_fields(fields: &mut Vec<Value>, url: &str) -> Result<()> {
     let parsed = Url::parse(url).context("parsing downloader url")?;
     let url_value = Value::String(url.to_string());
@@ -514,11 +594,7 @@ fn apply_url_fields(fields: &mut Vec<Value>, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_field_value_optional(
-    fields: &mut [Value],
-    name: &str,
-    value: Value,
-) -> Result<bool> {
+fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> Result<bool> {
     for field in fields.iter_mut() {
         let field_name = field.get("name").and_then(Value::as_str);
         if field_name == Some(name) {
@@ -529,4 +605,101 @@ fn set_field_value_optional(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn value_for_field<'a>(fields: &'a [Value], name: &str) -> Option<&'a Value> {
+        for field in fields {
+            if field.get("name").and_then(Value::as_str) == Some(name) {
+                return field.get("value");
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn apply_downloader_fields_sets_base_url_category_and_api_key() -> Result<()> {
+        let mut fields = vec![
+            json!({"name": "baseUrl", "value": ""}),
+            json!({"name": "apiKey", "value": ""}),
+            json!({"name": "category", "value": ""}),
+            json!({"name": "priority", "value": 0}),
+        ];
+        let mut settings = HashMap::new();
+        settings.insert("priority".to_string(), json!(42));
+        let spec = DownloaderSpec {
+            name: "qBittorrent".to_string(),
+            r#type: "qbittorrent".to_string(),
+            url: "http://elx-qbittorrent:8080".to_string(),
+            api_key: Some("secret-key".to_string()),
+            category: Some("movies".to_string()),
+            tags: Vec::new(),
+            enabled: Some(true),
+            settings,
+        };
+
+        apply_downloader_fields(&mut fields, &spec)?;
+
+        assert_eq!(
+            value_for_field(&fields, "baseUrl").cloned(),
+            Some(json!("http://elx-qbittorrent:8080"))
+        );
+        assert_eq!(
+            value_for_field(&fields, "apiKey").cloned(),
+            Some(json!("secret-key"))
+        );
+        assert_eq!(
+            value_for_field(&fields, "category").cloned(),
+            Some(json!("movies"))
+        );
+        assert_eq!(
+            value_for_field(&fields, "priority").cloned(),
+            Some(json!(42))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_downloader_fields_sets_host_port_and_ssl_when_url_fields_missing() -> Result<()> {
+        let mut fields = vec![
+            json!({"name": "host", "value": ""}),
+            json!({"name": "port", "value": 0}),
+            json!({"name": "useSsl", "value": false}),
+            json!({"name": "tvCategory", "value": ""}),
+        ];
+        let spec = DownloaderSpec {
+            name: "qBittorrent".to_string(),
+            r#type: "qbittorrent".to_string(),
+            url: "https://elx-qbittorrent:9443".to_string(),
+            api_key: None,
+            category: Some("movies".to_string()),
+            tags: Vec::new(),
+            enabled: Some(true),
+            settings: HashMap::new(),
+        };
+
+        apply_downloader_fields(&mut fields, &spec)?;
+
+        assert_eq!(
+            value_for_field(&fields, "host").cloned(),
+            Some(json!("elx-qbittorrent"))
+        );
+        assert_eq!(value_for_field(&fields, "port").cloned(), Some(json!(9443)));
+        assert_eq!(
+            value_for_field(&fields, "useSsl").cloned(),
+            Some(json!(true))
+        );
+        assert_eq!(
+            value_for_field(&fields, "tvCategory").cloned(),
+            Some(json!("movies"))
+        );
+
+        Ok(())
+    }
 }

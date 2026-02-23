@@ -1,5 +1,5 @@
-pub mod auth;
 pub mod artwork;
+pub mod auth;
 pub mod control;
 pub mod discovery;
 pub mod extensions;

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    auth::AuthService,
     artwork::ArtworkService,
+    auth::AuthService,
     config::Settings,
     db::{Database, DatabaseDriver},
     extensions::ExtensionManager,

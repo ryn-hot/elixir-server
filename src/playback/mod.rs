@@ -296,11 +296,7 @@ async fn spawn_ffmpeg(
             .arg(input);
     }
 
-    command
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0");
+    command.arg("-map").arg("0:v:0").arg("-map").arg("0:a:0");
 
     command
         .arg("-c:v")
@@ -528,8 +524,8 @@ async fn cleanup_stale_sessions(state: &crate::state::AppState, ttl_seconds: u64
     let rows = sqlx::query(
         "SELECT id, COALESCE(CAST(updated_at AS TEXT), '') AS updated_at FROM playback_sessions",
     )
-        .fetch_all(&state.db_pool)
-        .await?;
+    .fetch_all(&state.db_pool)
+    .await?;
 
     let now = chrono::Utc::now();
     let mut expired_ids = Vec::new();

@@ -4,9 +4,9 @@ use sqlx::AnyPool;
 use crate::drivers::DriverRegistry;
 use crate::orchestrator::executor::{Executor, ExecutorAction};
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
+use crate::runtime::RuntimePaths;
 use crate::runtime::docker::DockerRuntimeManager;
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
-use crate::runtime::RuntimePaths;
 use crate::secrets::SecretsManager;
 
 #[derive(Clone)]
@@ -38,7 +38,8 @@ impl OrchestratorService {
     pub async fn apply_actions(&self, actions: Vec<ExecutorAction>) -> Result<()> {
         let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
         let runtime = DockerRuntimeManager::new(None);
-        self.apply_actions_with_probe(actions, &probe, &runtime).await
+        self.apply_actions_with_probe(actions, &probe, &runtime)
+            .await
     }
 
     pub fn start_reconcile_loop(self: std::sync::Arc<Self>, config: ReconcileConfig) {
@@ -60,7 +61,8 @@ impl OrchestratorService {
     pub async fn reconcile_once(&self, config: &ReconcileConfig) -> Result<()> {
         let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
         let runtime = DockerRuntimeManager::new(None);
-        self.reconcile_once_with_probe(config, &probe, &runtime).await
+        self.reconcile_once_with_probe(config, &probe, &runtime)
+            .await
     }
 
     pub(crate) async fn reconcile_once_with_probe(
@@ -147,10 +149,7 @@ mod tests {
         }
 
         async fn probe_tcp(&self, host: &str, port: u16) -> Result<ProbeResult> {
-            self.calls
-                .lock()
-                .await
-                .push(format!("tcp:{host}:{port}"));
+            self.calls.lock().await.push(format!("tcp:{host}:{port}"));
             Ok(ProbeResult {
                 ok: true,
                 latency_ms: Some(1),
@@ -218,6 +217,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: None,
+                scope_json: None,
                 endpoint_json: None,
                 health_state: ProviderHealthState::Healthy,
             })
@@ -230,6 +230,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: None,
+                scope_json: None,
                 endpoint_json: None,
                 health_state: ProviderHealthState::Healthy,
             })

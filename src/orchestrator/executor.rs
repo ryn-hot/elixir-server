@@ -13,7 +13,9 @@ use tokio::fs;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::db::models::{BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality};
+use crate::db::models::{
+    BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality,
+};
 use crate::drivers::{ApplyStatus, DriverCtx, DriverPatch, DriverRegistry};
 use crate::drivers::{
     DownloaderSpec, IndexerCredentialField, IndexerRegistryPatch, MediaManagerMoviesPatch,
@@ -67,6 +69,7 @@ pub enum ExecutorAction {
         slot_id: String,
         cardinality: SlotCardinality,
         implementation: Option<String>,
+        scope_json: Option<serde_json::Value>,
         endpoint: ProviderEndpoint,
     },
     ApplyDriverPatch {
@@ -163,6 +166,7 @@ impl<'a> Executor<'a> {
                 slot_id,
                 cardinality,
                 implementation,
+                scope_json,
                 endpoint,
             } => {
                 self.create_or_update_provider(
@@ -172,6 +176,7 @@ impl<'a> Executor<'a> {
                     slot_id,
                     cardinality,
                     implementation,
+                    scope_json,
                     endpoint,
                 )
                 .await
@@ -180,9 +185,10 @@ impl<'a> Executor<'a> {
                 connector_extension_id,
                 target_provider_id,
                 patch,
-            } => self
-                .apply_driver_patch(connector_extension_id, target_provider_id, patch)
-                .await,
+            } => {
+                self.apply_driver_patch(connector_extension_id, target_provider_id, patch)
+                    .await
+            }
             ExecutorAction::ApplyBinding {
                 binding,
                 consumer_endpoint,
@@ -282,7 +288,10 @@ impl<'a> Executor<'a> {
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), instance_id.to_string());
         labels.insert("elixir.extension_id".to_string(), extension_id.clone());
-        labels.insert("elixir.extension_version".to_string(), desired_version.clone());
+        labels.insert(
+            "elixir.extension_version".to_string(),
+            desired_version.clone(),
+        );
         labels.insert("elixir.managed".to_string(), "true".to_string());
 
         let env = resolve_runtime_env(&self.store, self.secrets, instance_id, runtime.env).await?;
@@ -378,11 +387,7 @@ impl<'a> Executor<'a> {
                 rollback_version.as_deref()
             };
             self.store
-                .update_instance_runtime_version(
-                    instance_id,
-                    &desired_version,
-                    next_rollback,
-                )
+                .update_instance_runtime_version(instance_id, &desired_version, next_rollback)
                 .await?;
             return Ok(());
         }
@@ -445,9 +450,11 @@ impl<'a> Executor<'a> {
         slot_id: String,
         cardinality: SlotCardinality,
         implementation: Option<String>,
+        scope_json: Option<serde_json::Value>,
         endpoint: ProviderEndpoint,
     ) -> Result<()> {
-        let endpoint_json = serde_json::to_value(endpoint).context("serializing provider endpoint")?;
+        let endpoint_json =
+            serde_json::to_value(endpoint).context("serializing provider endpoint")?;
         self.store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -456,6 +463,7 @@ impl<'a> Executor<'a> {
                 slot_id,
                 cardinality,
                 implementation,
+                scope_json,
                 endpoint_json: Some(endpoint_json),
                 health_state: ProviderHealthState::Unknown,
             })
@@ -510,8 +518,8 @@ impl<'a> Executor<'a> {
             )
         })?;
 
-        let mut patch =
-            DriverPatch::from_manifest(&provider.capability, patch).context("parsing driver patch")?;
+        let mut patch = DriverPatch::from_manifest(&provider.capability, patch)
+            .context("parsing driver patch")?;
         patch.validate().context("validating driver patch")?;
 
         let mut secrets = HashMap::new();
@@ -615,10 +623,7 @@ impl<'a> Executor<'a> {
                     if Instant::now() >= deadline {
                         let _ = self
                             .store
-                            .update_provider_health(
-                                provider_id,
-                                ProviderHealthState::Unhealthy,
-                            )
+                            .update_provider_health(provider_id, ProviderHealthState::Unhealthy)
                             .await;
                         return Err(err);
                     }
@@ -754,7 +759,11 @@ async fn resolve_sonarr_api_key(
     }
 
     if let Some(secret) = store
-        .get_secret(SecretScope::Instance, Some(instance.instance_id), "sonarr_api_key")
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance.instance_id),
+            "sonarr_api_key",
+        )
         .await?
     {
         return secrets.decrypt(&secret.value_encrypted);
@@ -782,7 +791,11 @@ async fn resolve_radarr_api_key(
     }
 
     if let Some(secret) = store
-        .get_secret(SecretScope::Instance, Some(instance.instance_id), "radarr_api_key")
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance.instance_id),
+            "radarr_api_key",
+        )
         .await?
     {
         return secrets.decrypt(&secret.value_encrypted);
@@ -848,7 +861,11 @@ async fn resolve_prowlarr_api_key(
     }
 
     if let Some(secret) = store
-        .get_secret(SecretScope::Instance, Some(instance.instance_id), "prowlarr_api_key")
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance.instance_id),
+            "prowlarr_api_key",
+        )
         .await?
     {
         return secrets.decrypt(&secret.value_encrypted);
@@ -1000,8 +1017,7 @@ async fn ensure_qbittorrent_credentials(
         (Some(username), Some(password)) => Ok((username, password)),
         (None, None) => {
             let (username, password) = generate_qbittorrent_credentials();
-            upsert_qbittorrent_secrets(store, secrets, instance_id, &username, &password)
-                .await?;
+            upsert_qbittorrent_secrets(store, secrets, instance_id, &username, &password).await?;
             Ok((username, password))
         }
         _ => bail!("qbittorrent credentials are partially configured"),
@@ -1023,9 +1039,7 @@ fn generate_qbittorrent_credentials() -> (String, String) {
 }
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
-    extension_id
-        .to_ascii_lowercase()
-        .contains("qbittorrent")
+    extension_id.to_ascii_lowercase().contains("qbittorrent")
 }
 
 async fn resolve_indexer_apps(
@@ -1038,7 +1052,11 @@ async fn resolve_indexer_apps(
         _ => return Ok(()),
     };
     for app in apps {
-        if app.api_key.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+        if app
+            .api_key
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             continue;
         }
         let host_hint = url_host(&app.url);
@@ -1064,9 +1082,9 @@ async fn resolve_downloader_credentials(
         DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) => {
             downloaders
         }
-        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders { downloaders }) => {
-            downloaders
-        }
+        DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::SetDownloaders {
+            downloaders,
+        }) => downloaders,
         _ => return Ok(()),
     };
 
@@ -1083,27 +1101,31 @@ async fn resolve_downloader_credentials(
         let (username, password) =
             resolve_qbittorrent_credentials(store, secrets, &instance).await?;
         if downloader_setting_missing(&downloader.settings, "username") {
-            downloader.settings.insert(
-                "username".to_string(),
-                serde_json::Value::String(username),
-            );
+            downloader
+                .settings
+                .insert("username".to_string(), serde_json::Value::String(username));
         }
         if downloader_setting_missing(&downloader.settings, "password") {
-            downloader.settings.insert(
-                "password".to_string(),
-                serde_json::Value::String(password),
-            );
+            downloader
+                .settings
+                .insert("password".to_string(), serde_json::Value::String(password));
         }
     }
     Ok(())
 }
 
 fn is_sonarr_app(implementation: &str) -> bool {
-    implementation.trim().to_ascii_lowercase().starts_with("sonarr")
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("sonarr")
 }
 
 fn is_radarr_app(implementation: &str) -> bool {
-    implementation.trim().to_ascii_lowercase().starts_with("radarr")
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("radarr")
 }
 
 fn url_host(url: &str) -> Option<String> {
@@ -1124,10 +1146,7 @@ fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {
         && !downloader_setting_missing(&downloader.settings, "password")
 }
 
-fn downloader_setting_missing(
-    settings: &HashMap<String, serde_json::Value>,
-    key: &str,
-) -> bool {
+fn downloader_setting_missing(settings: &HashMap<String, serde_json::Value>, key: &str) -> bool {
     match settings.get(key) {
         None => true,
         Some(serde_json::Value::Null) => true,
@@ -1188,7 +1207,12 @@ async fn resolve_sonarr_instance_for_app(
     store
         .get_instance(selected.provider.instance_id)
         .await?
-        .ok_or_else(|| anyhow!("sonarr instance {} not found", selected.provider.instance_id))
+        .ok_or_else(|| {
+            anyhow!(
+                "sonarr instance {} not found",
+                selected.provider.instance_id
+            )
+        })
 }
 
 async fn resolve_radarr_instance_for_app(
@@ -1243,7 +1267,12 @@ async fn resolve_radarr_instance_for_app(
     store
         .get_instance(selected.provider.instance_id)
         .await?
-        .ok_or_else(|| anyhow!("radarr instance {} not found", selected.provider.instance_id))
+        .ok_or_else(|| {
+            anyhow!(
+                "radarr instance {} not found",
+                selected.provider.instance_id
+            )
+        })
 }
 
 async fn resolve_qbittorrent_instance_for_downloader(
@@ -1552,8 +1581,8 @@ async fn persist_runtime_config(
         .get_instance(instance_id)
         .await?
         .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
-    let updated =
-        merge_runtime_config(instance.config_json, config_dir, volumes).context("runtime config")?;
+    let updated = merge_runtime_config(instance.config_json, config_dir, volumes)
+        .context("runtime config")?;
     if let Some(updated) = updated {
         store
             .update_instance_config(instance_id, Some(&updated))
@@ -1586,7 +1615,10 @@ fn merge_runtime_config(
 
     if let Some(config_dir) = config_dir {
         if !runtime.contains_key("config_dir") {
-            runtime.insert("config_dir".to_string(), serde_json::Value::String(config_dir));
+            runtime.insert(
+                "config_dir".to_string(),
+                serde_json::Value::String(config_dir),
+            );
             changed = true;
         }
     }
@@ -1602,7 +1634,10 @@ fn merge_runtime_config(
                 })
             })
             .collect::<Vec<_>>();
-        runtime.insert("volumes".to_string(), serde_json::Value::Array(volume_values));
+        runtime.insert(
+            "volumes".to_string(),
+            serde_json::Value::Array(volume_values),
+        );
         changed = true;
     }
 
@@ -1689,9 +1724,7 @@ fn parse_secret_reference(raw: &str, instance_id: Uuid) -> Result<SecretReferenc
                 key: (*key).to_string(),
             })
         }
-        _ => bail!(
-            "from_secret must be instance:<key>, global:<key>, or provider:<uuid>:<key>"
-        ),
+        _ => bail!("from_secret must be instance:<key>, global:<key>, or provider:<uuid>:<key>"),
     }
 }
 
@@ -1761,6 +1794,16 @@ fn resolve_placeholders(raw: &str, paths: &RuntimePaths) -> Result<String> {
     if resolved.contains('{') {
         bail!("unknown placeholder in path '{}'", raw);
     }
+    // Docker rejects host paths like `data/foo` as local volume names.
+    // Normalize unresolved relative host paths to absolute host directories.
+    if !resolved.contains("://") {
+        let path = Path::new(&resolved);
+        if !path.is_absolute() && (resolved.contains('/') || resolved.starts_with('.')) {
+            if let Ok(cwd) = std::env::current_dir() {
+                resolved = cwd.join(path).to_string_lossy().to_string();
+            }
+        }
+    }
     Ok(resolved)
 }
 
@@ -1780,8 +1823,12 @@ mod tests {
 
     use crate::config::DatabaseConfig;
     use crate::db::Database;
-    use crate::db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality};
-    use crate::extensions::store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider};
+    use crate::db::models::{
+        ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
+    };
+    use crate::extensions::store::{
+        ExtensionStore, NewExtension, NewExtensionInstance, NewProvider,
+    };
     use crate::orchestrator::naming::container_name;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::secrets::SecretsManager;
@@ -1982,7 +2029,10 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<String> {
-            self.calls.lock().expect("upgrade runtime calls lock").clone()
+            self.calls
+                .lock()
+                .expect("upgrade runtime calls lock")
+                .clone()
         }
     }
 
@@ -2120,7 +2170,10 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<String> {
-            self.calls.lock().expect("rollback runtime calls lock").clone()
+            self.calls
+                .lock()
+                .expect("rollback runtime calls lock")
+                .clone()
         }
     }
 
@@ -2349,6 +2402,7 @@ mod tests {
                 slot_id: "default".to_string(),
                 cardinality: SlotCardinality::One,
                 implementation: Some("sonarr".to_string()),
+                scope_json: None,
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Unknown,
             })
@@ -2358,7 +2412,12 @@ mod tests {
         let drivers = DriverRegistry::new();
         let runtime = StubRuntime;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
@@ -2374,10 +2433,7 @@ mod tests {
 
         executor.health_gate(provider_id, 5).await?;
 
-        let provider = store
-            .get_provider(provider_id)
-            .await?
-            .expect("provider");
+        let provider = store.get_provider(provider_id).await?.expect("provider");
         assert_eq!(provider.health_state, ProviderHealthState::Healthy);
 
         let secret = store
@@ -2429,7 +2485,12 @@ mod tests {
         let runtime = CaptureRuntime::default();
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
@@ -2511,7 +2572,12 @@ mod tests {
         let runtime = StubRuntime;
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
@@ -2551,10 +2617,7 @@ mod tests {
             .await
             .unwrap_err();
         let root = err.root_cause().to_string();
-        assert!(
-            root.contains("not encrypted"),
-            "unexpected error: {root}"
-        );
+        assert!(root.contains("not encrypted"), "unexpected error: {root}");
         Ok(())
     }
 
@@ -2581,7 +2644,12 @@ mod tests {
         let runtime = StubRuntime;
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
@@ -2660,7 +2728,12 @@ mod tests {
         let runtime = UpgradeRuntime::new(container_name(instance_id));
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
 
@@ -2687,10 +2760,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("create failed"));
 
-        let instance = store
-            .get_instance(instance_id)
-            .await?
-            .expect("instance");
+        let instance = store.get_instance(instance_id).await?.expect("instance");
         assert_eq!(instance.runtime_version.as_deref(), Some("0.9.0"));
         assert!(instance.rollback_version.is_none());
 
@@ -2747,7 +2817,12 @@ mod tests {
         let runtime = UpgradeRuntime::new_with_failure(container_name(instance_id), false);
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
@@ -2771,10 +2846,7 @@ mod tests {
             )
             .await?;
 
-        let instance = store
-            .get_instance(instance_id)
-            .await?
-            .expect("instance");
+        let instance = store.get_instance(instance_id).await?.expect("instance");
         assert_eq!(instance.runtime_version.as_deref(), Some("1.0.0"));
         assert_eq!(instance.rollback_version.as_deref(), Some("0.9.0"));
 
@@ -2818,7 +2890,12 @@ mod tests {
         let runtime = RollbackRuntime::new(container_name(instance_id));
         let temp_dir = TempDir::new()?;
         let runtime_paths = RuntimePaths::from_roots(
-            temp_dir.path().join("data").join("extensions").to_string_lossy().as_ref(),
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
         let secrets = SecretsManager::from_key_bytes([4u8; 32], true);
@@ -2835,10 +2912,7 @@ mod tests {
             .apply(ExecutorAction::RollbackRuntime { instance_id })
             .await?;
 
-        let instance = store
-            .get_instance(instance_id)
-            .await?
-            .expect("instance");
+        let instance = store.get_instance(instance_id).await?.expect("instance");
         assert_eq!(instance.runtime_version.as_deref(), Some("1.0.0"));
         assert!(instance.rollback_version.is_none());
 
@@ -2853,6 +2927,23 @@ mod tests {
             format!("start:{base_name}"),
         ];
         assert_eq!(runtime.calls(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_volume_mount_makes_relative_placeholder_absolute() -> Result<()> {
+        let paths = RuntimePaths {
+            data_root: "data".to_string(),
+            downloads_root: "data/downloads".to_string(),
+            media_root: "media".to_string(),
+        };
+        let mount = resolve_volume_mount("{data}/bazarr:/config", &paths)?;
+        assert!(
+            Path::new(&mount.host_path).is_absolute(),
+            "expected absolute host path, got {}",
+            mount.host_path
+        );
+        assert!(mount.host_path.ends_with("/data/bazarr"));
         Ok(())
     }
 }

@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
 pub struct ProbeConfig {
@@ -11,17 +16,18 @@ pub struct ProbeConfig {
     pub network: String,
     pub image: String,
     pub probe_binary_path: PathBuf,
+    pub allow_utility_fallback: bool,
 }
 
 impl ProbeConfig {
     pub fn with_storage_root(storage_root: &str) -> Self {
+        let storage_root = absolutize_path(storage_root);
         Self {
             docker_bin: "docker".to_string(),
             network: "elixir_net".to_string(),
             image: "alpine:3.19".to_string(),
-            probe_binary_path: PathBuf::from(storage_root)
-                .join("probe")
-                .join("elixir-probe"),
+            probe_binary_path: storage_root.join("probe").join("elixir-probe"),
+            allow_utility_fallback: true,
         }
     }
 }
@@ -52,11 +58,15 @@ pub trait ProbeRunner: Send + Sync {
 
 pub struct NetworkProbe {
     config: ProbeConfig,
+    binary_disabled: AtomicBool,
 }
 
 impl NetworkProbe {
     pub fn new(config: ProbeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            binary_disabled: AtomicBool::new(false),
+        }
     }
 
     pub async fn probe_dns(&self, name: &str) -> Result<ProbeResult> {
@@ -76,8 +86,17 @@ impl NetworkProbe {
     }
 
     async fn run_probe(&self, args: &[&str]) -> Result<ProbeResult> {
+        if !self.binary_disabled.load(Ordering::Relaxed) && self.probe_binary_exists() {
+            return self.run_binary_probe(args).await;
+        }
+        if self.config.allow_utility_fallback {
+            return self.run_utility_probe(args).await;
+        }
         self.ensure_probe_binary()?;
+        unreachable!("ensure_probe_binary always returns an error when binary is missing")
+    }
 
+    async fn run_binary_probe(&self, args: &[&str]) -> Result<ProbeResult> {
         let mut cmd = Command::new(&self.config.docker_bin);
         cmd.arg("run")
             .arg("--rm")
@@ -96,16 +115,31 @@ impl NetworkProbe {
             cmd.arg(arg);
         }
 
-        let output = cmd.output().await.context("running probe container")?;
+        let output = timeout(Duration::from_secs(20), cmd.output())
+            .await
+            .context("probe command timed out")?
+            .context("running probe container")?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr_trimmed = stderr.trim();
+
+        if !output.status.success()
+            && self.config.allow_utility_fallback
+            && should_fallback_from_binary_error(stderr_trimmed)
+        {
+            self.binary_disabled.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                "probe binary failed compatibility checks; switching to utility fallback: {}",
+                stderr_trimmed
+            );
+            return self.run_utility_probe(args).await;
+        }
 
         if stdout.trim().is_empty() {
             bail!("probe returned no output: {}", stderr.trim());
         }
 
-        let parsed: ProbeResult = serde_json::from_str(&stdout)
-            .context("parsing probe output")?;
+        let parsed: ProbeResult = serde_json::from_str(&stdout).context("parsing probe output")?;
 
         if !output.status.success() && parsed.ok {
             bail!("probe exited with error: {}", stderr.trim());
@@ -114,8 +148,81 @@ impl NetworkProbe {
         Ok(parsed)
     }
 
+    async fn run_utility_probe(&self, args: &[&str]) -> Result<ProbeResult> {
+        let (entrypoint, utility_args): (&str, Vec<String>) = match args {
+            ["dns", name] => ("nslookup", vec![(*name).to_string()]),
+            ["tcp", host, port] => (
+                "nc",
+                vec![
+                    "-z".to_string(),
+                    "-w".to_string(),
+                    "3".to_string(),
+                    (*host).to_string(),
+                    (*port).to_string(),
+                ],
+            ),
+            ["http", url] => (
+                "wget",
+                vec![
+                    "-q".to_string(),
+                    "-T".to_string(),
+                    "5".to_string(),
+                    "-O".to_string(),
+                    "/dev/null".to_string(),
+                    (*url).to_string(),
+                ],
+            ),
+            _ => bail!("invalid probe invocation arguments: {:?}", args),
+        };
+
+        let mut cmd = Command::new(&self.config.docker_bin);
+        cmd.arg("run")
+            .arg("--rm")
+            .arg("--network")
+            .arg(&self.config.network)
+            .arg("--entrypoint")
+            .arg(entrypoint)
+            .arg(&self.config.image)
+            .args(&utility_args);
+
+        let output = cmd.output();
+        let output = timeout(Duration::from_secs(20), output)
+            .await
+            .context("utility probe command timed out")?
+            .with_context(|| format!("running fallback probe utility '{entrypoint}'"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if output.status.success() {
+            return Ok(ProbeResult {
+                ok: true,
+                latency_ms: None,
+                details: Some(serde_json::json!({
+                    "mode": "utility_fallback",
+                    "entrypoint": entrypoint
+                })),
+            });
+        }
+
+        Ok(ProbeResult {
+            ok: false,
+            latency_ms: None,
+            details: Some(serde_json::json!({
+                "mode": "utility_fallback",
+                "entrypoint": entrypoint,
+                "stdout": stdout.trim(),
+                "stderr": stderr.trim(),
+                "exit_code": output.status.code()
+            })),
+        })
+    }
+
+    fn probe_binary_exists(&self) -> bool {
+        Path::new(&self.config.probe_binary_path).is_file()
+    }
+
     fn ensure_probe_binary(&self) -> Result<()> {
-        if Path::new(&self.config.probe_binary_path).is_file() {
+        if self.probe_binary_exists() {
             return Ok(());
         }
         bail!(
@@ -150,6 +257,54 @@ fn ensure_ok(result: ProbeResult, stage: &str) -> Result<()> {
     bail!("probe {stage} failed: {details}");
 }
 
+fn should_fallback_from_binary_error(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("exec format error")
+        || lowered.contains("cannot execute binary file")
+        || lowered.contains("no such file or directory")
+        || lowered.contains("invalid mount config for type")
+        || lowered.contains("mount path must be absolute")
+        || lowered.contains("includes invalid characters for a local volume name")
+}
+
+fn absolutize_path(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_fallback_from_binary_error;
+
+    #[test]
+    fn detects_exec_format_error_for_binary_fallback() {
+        assert!(should_fallback_from_binary_error(
+            "exec /probe: exec format error"
+        ));
+        assert!(should_fallback_from_binary_error(
+            "cannot execute binary file"
+        ));
+        assert!(should_fallback_from_binary_error(
+            "no such file or directory"
+        ));
+        assert!(should_fallback_from_binary_error(
+            "invalid mount config for type \"bind\": bind source path does not exist"
+        ));
+        assert!(should_fallback_from_binary_error(
+            "create data/extensions/probe/elixir-probe: \"data/extensions/probe/elixir-probe\" includes invalid characters for a local volume name"
+        ));
+        assert!(!should_fallback_from_binary_error(
+            "http probe failed with status 401"
+        ));
+    }
+}
+
 #[cfg(all(test, feature = "docker-probe-tests"))]
 mod docker_tests {
     use super::*;
@@ -164,9 +319,9 @@ mod docker_tests {
     use anyhow::{Context, Result, bail};
     use uuid::Uuid;
 
+    use crate::runtime::RuntimeManager;
     use crate::runtime::docker::DockerRuntimeManager;
     use crate::runtime::model::ContainerSpec;
-    use crate::runtime::RuntimeManager;
 
     struct ContainerCleanup {
         name: String,
@@ -264,18 +419,21 @@ mod docker_tests {
     fn build_probe_binary(workspace_root: &Path, storage_root: &Path) -> Result<PathBuf> {
         let status = Command::new("cargo")
             .current_dir(workspace_root)
-            .args(["build", "-p", "elixir_probe"])
+            .args(["build", "-p", "elixir-probe"])
             .status()
             .context("building elixir_probe")?;
         if !status.success() {
-            bail!("cargo build elixir_probe failed with status {:?}", status.code());
+            bail!(
+                "cargo build elixir_probe failed with status {:?}",
+                status.code()
+            );
         }
 
         let exe_suffix = std::env::consts::EXE_SUFFIX;
         let built_path = workspace_root
             .join("target")
             .join("debug")
-            .join(format!("elixir_probe{exe_suffix}"));
+            .join(format!("elixir-probe{exe_suffix}"));
         if !built_path.is_file() {
             bail!("probe binary not found at {}", built_path.display());
         }

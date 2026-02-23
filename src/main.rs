@@ -1,38 +1,38 @@
-mod auth;
 mod artwork;
+mod auth;
 mod config;
 mod db;
 mod drivers;
 mod extensions;
-mod orchestrator;
 mod http;
 mod library;
 mod media;
 mod metadata;
 mod metrics;
 mod network;
+mod orchestrator;
 mod playback;
 mod runtime;
 mod secrets;
 mod state;
 mod telemetry;
 
-use crate::auth::AuthService;
 use crate::artwork::ArtworkService;
+use crate::auth::AuthService;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::extensions::package::{read_manifest_from_dir, unpack_package};
-use crate::extensions::store::ExtensionStore;
 use crate::extensions::registry::start_registry_refresh_loop;
-use crate::http::router;
+use crate::extensions::store::ExtensionStore;
 use crate::http::handlers::extensions::InstallRequest;
-use crate::library::start_periodic_scan;
+use crate::http::router;
 use crate::library::LinkerService;
+use crate::library::start_periodic_scan;
 use crate::metadata::MetadataService;
 use crate::network::{start_mdns, wan::start_wan_tasks};
-use crate::playback::start_session_cleanup;
 use crate::orchestrator::reconcile::ReconcileConfig;
+use crate::playback::start_session_cleanup;
 use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
@@ -40,8 +40,8 @@ use axum::{Json, extract::State};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use tokio::net::TcpListener;
 use tokio::fs;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 fn load_env() {
@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
     let settings = Settings::load().context("failed to load configuration")?;
     telemetry::init_tracing(&settings.telemetry).context("failed to initialize tracing")?;
     metrics::init_metrics();
+    ensure_runtime_directories(&settings)
+        .await
+        .context("failed to prepare runtime directories")?;
+    log_resolved_paths(&settings);
 
     let database = Database::connect(&settings.database)
         .await
@@ -75,8 +79,13 @@ async fn main() -> anyhow::Result<()> {
 
     let auth_service =
         AuthService::new(settings.auth.clone()).context("failed to initialize auth service")?;
+    let extension_sources_dir = PathBuf::from(&settings.extensions.bundled_dir)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(&settings.extensions.bundled_dir));
+    let extension_sources_dir = extension_sources_dir.to_string_lossy().to_string();
     let extensions = ExtensionManager::load_from_dir(
-        "extensions",
+        &extension_sources_dir,
         &settings.library.local_root,
         settings.library.hash_dedupe_enabled,
     )
@@ -94,8 +103,8 @@ async fn main() -> anyhow::Result<()> {
         settings.metadata.request_timeout_seconds,
     )
     .context("failed to initialize artwork cache")?;
-    let secrets = SecretsManager::from_settings(&settings)
-        .context("failed to initialize secrets manager")?;
+    let secrets =
+        SecretsManager::from_settings(&settings).context("failed to initialize secrets manager")?;
 
     let addr = settings
         .server
@@ -191,6 +200,53 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Elixir server shutdown complete");
     Ok(())
+}
+
+async fn ensure_runtime_directories(settings: &Settings) -> anyhow::Result<()> {
+    if let Some(sqlite_path) = sqlite_file_path(&settings.database.url) {
+        if let Some(parent) = sqlite_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+    }
+
+    fs::create_dir_all(&settings.library.local_root).await?;
+    fs::create_dir_all(&settings.library.artwork_cache_dir).await?;
+    fs::create_dir_all(&settings.extensions.storage_root).await?;
+    fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("packages")).await?;
+    fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("unpacked")).await?;
+    fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("registry-cache"))
+        .await?;
+    fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("tmp")).await?;
+    fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("probe")).await?;
+    fs::create_dir_all(&settings.extensions.bundled_dir).await?;
+    Ok(())
+}
+
+fn log_resolved_paths(settings: &Settings) {
+    tracing::info!(
+        "paths: db='{}' media='{}' artwork='{}' extensions_root='{}' bundled='{}'",
+        settings.database.url,
+        settings.library.local_root,
+        settings.library.artwork_cache_dir,
+        settings.extensions.storage_root,
+        settings.extensions.bundled_dir
+    );
+}
+
+fn sqlite_file_path(url: &str) -> Option<PathBuf> {
+    let rest = if let Some(value) = url.strip_prefix("sqlite://") {
+        value
+    } else if let Some(value) = url.strip_prefix("sqlite:") {
+        value
+    } else {
+        return None;
+    };
+
+    let path = rest.split('?').next().unwrap_or_default();
+    if path.is_empty() || path.starts_with(":memory:") {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {

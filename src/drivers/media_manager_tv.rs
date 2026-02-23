@@ -4,16 +4,16 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 use crate::drivers::patches::{
     CustomFormatSpec, DownloaderSpec, IndexerSpec, LanguageProfileSpec, MediaManagerTvPatch,
     QualityProfileSpec, ReleaseProfileSpec, RootFolderSpec, SeriesTypeDefaultsSpec, WebhookSpec,
 };
+use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
 #[derive(Debug, Default)]
 pub struct MediaManagerTvDriver;
@@ -91,9 +91,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
             } => {
                 client.upsert_custom_formats(&formats).await?;
                 client.upsert_release_profiles(&release_profiles).await?;
-                client
-                    .apply_custom_format_scores(&formats)
-                    .await?;
+                client.apply_custom_format_scores(&formats).await?;
             }
             MediaManagerTvPatch::SetAuxServiceEndpoint { url } => {
                 bail!("aux service endpoint is not supported for Sonarr ({})", url);
@@ -232,11 +230,8 @@ impl SonarrClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let value = self
-            .request_json_value(Method::GET, path, None)
-            .await?;
-        serde_json::from_value(value)
-            .with_context(|| format!("parsing GET {path} response"))
+        let value = self.request_json_value(Method::GET, path, None).await?;
+        serde_json::from_value(value).with_context(|| format!("parsing GET {path} response"))
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
@@ -245,8 +240,7 @@ impl SonarrClient {
     }
 
     async fn put_json(&self, path: &str, body: &Value) -> Result<Value> {
-        self.request_json_value(Method::PUT, path, Some(body))
-            .await
+        self.request_json_value(Method::PUT, path, Some(body)).await
     }
 
     async fn request_json_value(
@@ -274,7 +268,10 @@ impl SonarrClient {
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 bail!("sonarr api key rejected ({status}): {detail}");
             }
-            bail!("sonarr {} {path} failed ({status}): {detail}", method.as_str());
+            bail!(
+                "sonarr {} {path} failed ({status}): {detail}",
+                method.as_str()
+            );
         }
         if bytes.is_empty() {
             bail!("sonarr {} {path} returned empty response", method.as_str());
@@ -416,7 +413,10 @@ impl SonarrClient {
             if let Some(cutoff_id) = cutoff_id {
                 set_i64(&mut target, "cutoff", cutoff_id)?;
             } else if profile.cutoff.is_some() {
-                bail!("quality cutoff '{}' not found", profile.cutoff.as_deref().unwrap_or(""));
+                bail!(
+                    "quality cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
             }
 
             if let Some(existing_item) = existing_item {
@@ -463,7 +463,10 @@ impl SonarrClient {
             if let Some(cutoff_id) = cutoff_id {
                 set_i64(&mut target, "cutoff", cutoff_id)?;
             } else if profile.cutoff.is_some() {
-                bail!("language cutoff '{}' not found", profile.cutoff.as_deref().unwrap_or(""));
+                bail!(
+                    "language cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
             }
 
             if let Some(existing_item) = existing_item {
@@ -574,9 +577,7 @@ impl SonarrClient {
                 tag_ids.push(*id);
                 continue;
             }
-            let created = self
-                .post_json("tag", &json!({ "label": tag }))
-                .await?;
+            let created = self.post_json("tag", &json!({ "label": tag })).await?;
             if let Some(id) = created.get("id").and_then(Value::as_i64) {
                 by_name.insert(normalized, id);
                 tag_ids.push(id);
@@ -700,17 +701,9 @@ impl SonarrClient {
                 None => json!({}),
             };
             set_string(&mut target, "name", profile.name.clone())?;
-            set_string(
-                &mut target,
-                "required",
-                join_lines(&profile.required),
-            )?;
+            set_string(&mut target, "required", join_lines(&profile.required))?;
             set_string(&mut target, "ignored", join_lines(&profile.ignored))?;
-            set_string(
-                &mut target,
-                "preferred",
-                join_lines(&profile.preferred),
-            )?;
+            set_string(&mut target, "preferred", join_lines(&profile.preferred))?;
 
             if let Some(existing_item) = existing_item {
                 if target == existing_item {
@@ -818,11 +811,7 @@ fn normalize_version(version: &str) -> Result<&'static str> {
     }
 }
 
-fn ensure_sonarr_v3(
-    product_major: Option<u32>,
-    api_version: &str,
-    feature: &str,
-) -> Result<()> {
+fn ensure_sonarr_v3(product_major: Option<u32>, api_version: &str, feature: &str) -> Result<()> {
     if let Some(major) = product_major {
         if major >= 4 {
             bail!("sonarr {feature} require Sonarr v3, detected v{major}");
@@ -856,9 +845,7 @@ fn build_api_base(root: &Url, version: &str) -> Result<Url> {
 
 fn build_api_url(root: &Url, version: &str, path: &str) -> Result<Url> {
     let api_base = build_api_base(root, version)?;
-    api_base
-        .join(path)
-        .context("building sonarr api url")
+    api_base.join(path).context("building sonarr api url")
 }
 
 fn normalize_name(value: &str) -> String {
@@ -1012,11 +999,7 @@ fn apply_url_fields(fields: &mut Vec<Value>, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_field_value_optional(
-    fields: &mut [Value],
-    name: &str,
-    value: Value,
-) -> Result<bool> {
+fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> Result<bool> {
     for field in fields.iter_mut() {
         let field_name = field.get("name").and_then(Value::as_str);
         if field_name == Some(name) {
@@ -1067,7 +1050,10 @@ fn set_i64(target: &mut Value, field: &str, value: i64) -> Result<()> {
 
 fn set_array_i64(target: &mut Value, field: &str, values: &[i64]) -> Result<()> {
     if let Some(obj) = target.as_object_mut() {
-        let array = values.iter().map(|value| Value::Number((*value).into())).collect();
+        let array = values
+            .iter()
+            .map(|value| Value::Number((*value).into()))
+            .collect();
         obj.insert(field.to_string(), Value::Array(array));
         return Ok(());
     }
@@ -1143,14 +1129,18 @@ fn apply_language_items(
     let cutoff_name = cutoff;
     let mut cutoff_id = None;
     for entry in languages {
-        let name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("language").and_then(|lang| lang.get("name")).and_then(Value::as_str));
-        let id = entry
-            .get("id")
-            .and_then(Value::as_i64)
-            .or_else(|| entry.get("language").and_then(|lang| lang.get("id")).and_then(Value::as_i64));
+        let name = entry.get("name").and_then(Value::as_str).or_else(|| {
+            entry
+                .get("language")
+                .and_then(|lang| lang.get("name"))
+                .and_then(Value::as_str)
+        });
+        let id = entry.get("id").and_then(Value::as_i64).or_else(|| {
+            entry
+                .get("language")
+                .and_then(|lang| lang.get("id"))
+                .and_then(Value::as_i64)
+        });
         if let Some(name) = name {
             let normalized = normalize_name(name);
             let is_allowed = allowed.contains(&normalized);
@@ -1610,7 +1600,10 @@ mod docker_tests {
             .await
             .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("require Sonarr v3"), "unexpected error: {message}");
+        assert!(
+            message.contains("require Sonarr v3"),
+            "unexpected error: {message}"
+        );
         assert!(
             message.contains(&format!("v{major}")),
             "unexpected version in error: {message}"
@@ -1627,7 +1620,10 @@ mod docker_tests {
             .await
             .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("require Sonarr v3"), "unexpected error: {message}");
+        assert!(
+            message.contains("require Sonarr v3"),
+            "unexpected error: {message}"
+        );
         assert!(
             message.contains(&format!("v{major}")),
             "unexpected version in error: {message}"

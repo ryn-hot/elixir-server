@@ -6,7 +6,10 @@ use axum::{
 use image::GenericImageView;
 use serde::Deserialize;
 use sqlx::Row;
-use std::{path::{Path as StdPath, PathBuf}, time::SystemTime};
+use std::{
+    path::{Path as StdPath, PathBuf},
+    time::SystemTime,
+};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -138,7 +141,8 @@ async fn ensure_resized_variant(
     tokio::fs::create_dir_all(&variant_dir)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let variant_path = variant_dir.join(format!("{}_{}x{}.{}", artwork_id, target_w, target_h, ext));
+    let variant_path =
+        variant_dir.join(format!("{}_{}x{}.{}", artwork_id, target_w, target_h, ext));
 
     if tokio::fs::metadata(&variant_path).await.is_ok() {
         return Ok(variant_path);
@@ -269,11 +273,7 @@ fn image_format_from_extension(ext: &str) -> Option<image::ImageFormat> {
 }
 
 fn content_type_for_path(path: &str) -> Option<&'static str> {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "png" => Some("image/png"),

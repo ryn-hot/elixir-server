@@ -79,8 +79,8 @@ impl RegistryCacheStore {
         if contents.trim().is_empty() {
             return Ok(None);
         }
-        let cache = serde_json::from_str::<RegistryCache>(&contents)
-            .context("parsing registry cache")?;
+        let cache =
+            serde_json::from_str::<RegistryCache>(&contents).context("parsing registry cache")?;
         Ok(Some(cache))
     }
 
@@ -88,8 +88,7 @@ impl RegistryCacheStore {
         fs::create_dir_all(&self.cache_dir)
             .await
             .with_context(|| format!("creating {}", self.cache_dir.display()))?;
-        let payload =
-            serde_json::to_vec_pretty(cache).context("serializing registry cache")?;
+        let payload = serde_json::to_vec_pretty(cache).context("serializing registry cache")?;
         let tmp_path = self.cache_file.with_extension("tmp");
         fs::write(&tmp_path, &payload)
             .await
@@ -130,10 +129,7 @@ impl RegistryClient {
     }
 }
 
-pub async fn fetch_registries(
-    urls: &[String],
-    timeout: Duration,
-) -> Result<Vec<RegistryIndex>> {
+pub async fn fetch_registries(urls: &[String], timeout: Duration) -> Result<Vec<RegistryIndex>> {
     let client = RegistryClient::new(timeout)?;
     let mut results = Vec::new();
     for url in urls {
@@ -227,8 +223,8 @@ pub async fn start_registry_refresh_loop(
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = refresh_registry_cache(&registries, Duration::from_secs(10), &cache_store)
-            .await
+        if let Err(err) =
+            refresh_registry_cache(&registries, Duration::from_secs(10), &cache_store).await
         {
             warn!("registry refresh failed: {err}");
         }

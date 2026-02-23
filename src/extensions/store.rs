@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use sqlx::{AnyPool, QueryBuilder, Row, TypeInfo, Value, ValueRef, any::AnyRow};
 use std::time::Duration;
-use sqlx::{any::AnyRow, AnyPool, QueryBuilder, Row, TypeInfo, Value, ValueRef};
 use uuid::Uuid;
 
 use crate::db::models::{
     Binding, BindingStatus, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind,
-    ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun, OrchestratorRunStatus,
-    Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope, SlotCardinality,
+    ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
+    OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
+    SlotCardinality,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct NewProvider {
     pub slot_id: String,
     pub cardinality: SlotCardinality,
     pub implementation: Option<String>,
+    pub scope_json: Option<serde_json::Value>,
     pub endpoint_json: Option<serde_json::Value>,
     pub health_state: ProviderHealthState,
 }
@@ -120,8 +122,8 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn upsert_extension(&self, data: &NewExtension) -> Result<()> {
-        let manifest_json = serde_json::to_string(&data.manifest_json)
-            .context("serializing manifest json")?;
+        let manifest_json =
+            serde_json::to_string(&data.manifest_json).context("serializing manifest json")?;
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extensions (extension_id, name, version, kind, publisher_name, signing_key_id, trust_level, manifest_json, package_hash, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(extension_id) DO UPDATE SET name = excluded.name, version = excluded.version, kind = excluded.kind, publisher_name = excluded.publisher_name, signing_key_id = excluded.signing_key_id, trust_level = excluded.trust_level, manifest_json = excluded.manifest_json, package_hash = excluded.package_hash, enabled = excluded.enabled",
         )
@@ -195,7 +197,10 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
-    pub async fn list_instances(&self, extension_id: Option<&str>) -> Result<Vec<ExtensionInstance>> {
+    pub async fn list_instances(
+        &self,
+        extension_id: Option<&str>,
+    ) -> Result<Vec<ExtensionInstance>> {
         let rows = if let Some(extension_id) = extension_id {
             sqlx::query(
             "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(enabled AS INTEGER) as enabled FROM extension_instances WHERE extension_id = ? ORDER BY created_at DESC",
@@ -297,13 +302,11 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         match scope_id {
             Some(scope_id) => {
-                sqlx::query::<sqlx::Any>(
-                    "DELETE FROM secrets WHERE scope = ? AND scope_id = ?",
-                )
-                .bind(scope.as_str())
-                .bind(scope_id.to_string())
-                .execute(self.pool)
-                .await?;
+                sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE scope = ? AND scope_id = ?")
+                    .bind(scope.as_str())
+                    .bind(scope_id.to_string())
+                    .execute(self.pool)
+                    .await?;
             }
             None => {
                 sqlx::query::<sqlx::Any>(
@@ -318,9 +321,10 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn upsert_provider(&self, data: &NewProvider) -> Result<()> {
+        let scope_json = json_to_string(data.scope_json.as_ref())?;
         let endpoint_json = json_to_string(data.endpoint_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO providers (provider_id, instance_id, capability, slot_id, cardinality, implementation, endpoint_json, health_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(instance_id, capability, slot_id) DO UPDATE SET cardinality = excluded.cardinality, implementation = excluded.implementation, endpoint_json = excluded.endpoint_json, health_state = excluded.health_state, updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO providers (provider_id, instance_id, capability, slot_id, cardinality, implementation, scope_json, endpoint_json, health_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(instance_id, capability, slot_id) DO UPDATE SET cardinality = excluded.cardinality, implementation = excluded.implementation, scope_json = excluded.scope_json, endpoint_json = excluded.endpoint_json, health_state = excluded.health_state, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(data.provider_id.to_string())
         .bind(data.instance_id.to_string())
@@ -328,6 +332,7 @@ impl<'a> ExtensionStore<'a> {
         .bind(&data.slot_id)
         .bind(data.cardinality.as_str())
         .bind(data.implementation.as_deref())
+        .bind(scope_json)
         .bind(endpoint_json)
         .bind(data.health_state.as_str())
         .execute(self.pool)
@@ -338,14 +343,14 @@ impl<'a> ExtensionStore<'a> {
     pub async fn list_providers(&self, instance_id: Option<Uuid>) -> Result<Vec<Provider>> {
         let rows = if let Some(instance_id) = instance_id {
             sqlx::query(
-                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE instance_id = ? ORDER BY created_at DESC",
+                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE instance_id = ? ORDER BY created_at DESC",
             )
             .bind(instance_id.to_string())
             .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers ORDER BY created_at DESC",
+                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers ORDER BY created_at DESC",
             )
             .fetch_all(self.pool)
             .await?
@@ -359,7 +364,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_provider(&self, provider_id: Uuid) -> Result<Option<Provider>> {
         let row = sqlx::query(
-            "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE provider_id = ? LIMIT 1",
+            "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE provider_id = ? LIMIT 1",
         )
         .bind(provider_id.to_string())
         .fetch_optional(self.pool)
@@ -369,7 +374,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn list_provider_details(&self) -> Result<Vec<ProviderDetails>> {
         let rows = sqlx::query(
-            "SELECT p.provider_id, p.instance_id, p.capability, p.slot_id, p.cardinality, CAST(p.implementation AS TEXT) as implementation, CAST(p.endpoint_json AS TEXT) as endpoint_json, p.health_state, CAST(p.last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(p.created_at AS TEXT) as created_at, CAST(p.updated_at AS TEXT) as updated_at, i.extension_id as extension_id, e.trust_level as trust_level FROM providers p JOIN extension_instances i ON p.instance_id = i.instance_id JOIN extensions e ON i.extension_id = e.extension_id ORDER BY p.created_at DESC",
+            "SELECT p.provider_id, p.instance_id, p.capability, p.slot_id, p.cardinality, CAST(p.implementation AS TEXT) as implementation, CAST(p.scope_json AS TEXT) as scope_json, CAST(p.endpoint_json AS TEXT) as endpoint_json, p.health_state, CAST(p.last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(p.created_at AS TEXT) as created_at, CAST(p.updated_at AS TEXT) as updated_at, i.extension_id as extension_id, e.trust_level as trust_level FROM providers p JOIN extension_instances i ON p.instance_id = i.instance_id JOIN extensions e ON i.extension_id = e.extension_id ORDER BY p.created_at DESC",
         )
         .fetch_all(self.pool)
         .await?;
@@ -519,22 +524,30 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
-    pub async fn delete_desired_blueprints(
-        &self,
-        applied: Option<bool>,
-    ) -> Result<u64> {
+    pub async fn delete_desired_blueprints(&self, applied: Option<bool>) -> Result<u64> {
         let result = if let Some(applied) = applied {
-            sqlx::query::<sqlx::Any>(
-                "DELETE FROM desired_blueprints WHERE applied = ?",
-            )
-            .bind(applied)
-            .execute(self.pool)
-            .await?
+            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE applied = ?")
+                .bind(applied)
+                .execute(self.pool)
+                .await?
         } else {
             sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints")
                 .execute(self.pool)
                 .await?
         };
+        Ok(result.rows_affected())
+    }
+
+    pub async fn delete_desired_blueprints_by_extension(
+        &self,
+        blueprint_extension_id: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query::<sqlx::Any>(
+            "DELETE FROM desired_blueprints WHERE blueprint_extension_id = ?",
+        )
+        .bind(blueprint_extension_id)
+        .execute(self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -654,7 +667,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_run(&self, data: &NewOrchestratorRun) -> Result<()> {
         let plan_json = json_to_string(data.plan_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO orchestrator_runs (run_id, source, status, phase, plan_json, error) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orchestrator_runs (run_id, source, status, phase, plan_json, error, started_at) VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
         )
         .bind(data.run_id.to_string())
         .bind(&data.source)
@@ -662,6 +675,7 @@ impl<'a> ExtensionStore<'a> {
         .bind(data.phase.as_deref())
         .bind(plan_json)
         .bind(data.error.as_deref())
+        .bind(data.status.as_str())
         .execute(self.pool)
         .await?;
         Ok(())
@@ -691,8 +705,7 @@ impl<'a> ExtensionStore<'a> {
         }
 
         let ttl_seconds = ttl.as_secs().max(1);
-        let stale_before =
-            Utc::now() - chrono::Duration::seconds(ttl_seconds as i64);
+        let stale_before = Utc::now() - chrono::Duration::seconds(ttl_seconds as i64);
         let stale_str = stale_before.format("%Y-%m-%d %H:%M:%S").to_string();
         let updated = sqlx::query::<sqlx::Any>(
             "UPDATE orchestrator_locks SET owner_id = ?, locked_at = CURRENT_TIMESTAMP WHERE lock_name = ? AND locked_at < ?",
@@ -703,6 +716,17 @@ impl<'a> ExtensionStore<'a> {
         .execute(self.pool)
         .await?;
 
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn touch_lock(&self, lock_name: &str, owner_id: &str) -> Result<bool> {
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE orchestrator_locks SET locked_at = CURRENT_TIMESTAMP WHERE lock_name = ? AND owner_id = ?",
+        )
+        .bind(lock_name)
+        .bind(owner_id)
+        .execute(self.pool)
+        .await?;
         Ok(updated.rows_affected() > 0)
     }
 
@@ -738,19 +762,13 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
-    pub async fn update_run_plan(
-        &self,
-        run_id: Uuid,
-        plan_json: serde_json::Value,
-    ) -> Result<()> {
+    pub async fn update_run_plan(&self, run_id: Uuid, plan_json: serde_json::Value) -> Result<()> {
         let plan_json = json_to_string(Some(&plan_json))?;
-        sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_runs SET plan_json = ? WHERE run_id = ?",
-        )
-        .bind(plan_json)
-        .bind(run_id.to_string())
-        .execute(self.pool)
-        .await?;
+        sqlx::query::<sqlx::Any>("UPDATE orchestrator_runs SET plan_json = ? WHERE run_id = ?")
+            .bind(plan_json)
+            .bind(run_id.to_string())
+            .execute(self.pool)
+            .await?;
         Ok(())
     }
 
@@ -793,17 +811,14 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn delete_run_history(&self) -> Result<u64> {
         let deleted = sqlx::query::<sqlx::Any>(
-            "DELETE FROM orchestrator_runs WHERE status IN ('failed', 'completed', 'canceled')",
+            "DELETE FROM orchestrator_runs WHERE status IN ('pending', 'failed', 'completed', 'canceled')",
         )
         .execute(self.pool)
         .await?;
         Ok(deleted.rows_affected())
     }
 
-    pub async fn get_latest_run_by_phase(
-        &self,
-        phase: &str,
-    ) -> Result<Option<OrchestratorRun>> {
+    pub async fn get_latest_run_by_phase(&self, phase: &str) -> Result<Option<OrchestratorRun>> {
         let row = sqlx::query(
             "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE phase = ? ORDER BY created_at DESC LIMIT 1",
         )
@@ -847,10 +862,51 @@ impl<'a> ExtensionStore<'a> {
         row.map(|row| map_run(&row)).transpose()
     }
 
+    pub async fn reap_stale_running_runs(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+        reason: &str,
+    ) -> Result<u64> {
+        let stale_str = stale_before.format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query::<sqlx::Any>(
+            "UPDATE operation_steps
+             SET status = 'failed',
+                 error = COALESCE(error, ?),
+                 finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
+             WHERE status = 'running'
+               AND run_id IN (
+                   SELECT run_id
+                   FROM orchestrator_runs
+                   WHERE status = 'running'
+                     AND created_at < ?
+               )",
+        )
+        .bind(reason)
+        .bind(&stale_str)
+        .execute(self.pool)
+        .await?;
+
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE orchestrator_runs
+             SET status = 'failed',
+                 phase = COALESCE(phase, 'reconcile'),
+                 error = COALESCE(error, ?),
+                 finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
+             WHERE status = 'running'
+               AND created_at < ?",
+        )
+        .bind(reason)
+        .bind(&stale_str)
+        .execute(self.pool)
+        .await?;
+
+        Ok(updated.rows_affected())
+    }
+
     pub async fn create_step(&self, data: &NewOperationStep) -> Result<()> {
         let action_json = json_to_string(data.action_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO operation_steps (step_id, run_id, step_index, action_type, action_json, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO operation_steps (step_id, run_id, step_index, action_type, action_json, status, error, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
         )
         .bind(data.step_id.to_string())
         .bind(data.run_id.to_string())
@@ -859,6 +915,7 @@ impl<'a> ExtensionStore<'a> {
         .bind(action_json)
         .bind(data.status.as_str())
         .bind(data.error.as_deref())
+        .bind(data.status.as_str())
         .execute(self.pool)
         .await?;
         Ok(())
@@ -923,10 +980,7 @@ impl<'a> ExtensionStore<'a> {
         Ok(items)
     }
 
-    pub async fn get_extension_setting(
-        &self,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>> {
+    pub async fn get_extension_setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
         let row = sqlx::query(
             "SELECT CAST(value_json AS TEXT) as value_json FROM extension_settings WHERE setting_key = ? LIMIT 1",
         )
@@ -1038,6 +1092,10 @@ fn map_provider(row: &AnyRow) -> Result<Provider> {
         slot_id: row.try_get("slot_id")?,
         cardinality: parse_enum(&cardinality_raw, "providers.cardinality")?,
         implementation: row_get_opt_string(row, "implementation")?,
+        scope_json: parse_json_opt(
+            row_get_opt_string(row, "scope_json")?,
+            "providers.scope_json",
+        )?,
         endpoint_json: parse_json_opt(
             row_get_opt_string(row, "endpoint_json")?,
             "providers.endpoint_json",
@@ -1168,8 +1226,7 @@ fn map_step(row: &AnyRow) -> Result<OperationStep> {
     let created_at_raw: String = row.try_get("created_at")?;
 
     let step_index: i64 = row.try_get("step_index")?;
-    let step_index = i32::try_from(step_index)
-        .context("operation_steps.step_index overflow")?;
+    let step_index = i32::try_from(step_index).context("operation_steps.step_index overflow")?;
 
     Ok(OperationStep {
         step_id: parse_uuid(&step_id_raw, "operation_steps.step_id")?,
@@ -1217,9 +1274,9 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    value.parse::<T>().map_err(|err| {
-        anyhow::anyhow!("invalid {field} '{value}': {err}")
-    })
+    value
+        .parse::<T>()
+        .map_err(|err| anyhow::anyhow!("invalid {field} '{value}': {err}"))
 }
 
 fn parse_uuid(value: &str, field: &str) -> Result<Uuid> {
@@ -1254,10 +1311,7 @@ fn parse_json(value: &str, field: &str) -> Result<serde_json::Value> {
     serde_json::from_str(value).with_context(|| format!("invalid {field} json"))
 }
 
-fn parse_json_opt(
-    value: Option<String>,
-    field: &str,
-) -> Result<Option<serde_json::Value>> {
+fn parse_json_opt(value: Option<String>, field: &str) -> Result<Option<serde_json::Value>> {
     match value {
         Some(value) => Ok(Some(parse_json(&value, field)?)),
         None => Ok(None),

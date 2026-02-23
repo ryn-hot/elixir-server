@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
@@ -109,7 +109,10 @@ pub fn verify_signature(
     let hash_bytes = decode_hex(package_hash)
         .with_context(|| format!("decoding package hash {}", package_hash))?;
 
-    if verifying_key.verify(package_hash.as_bytes(), &signature).is_ok() {
+    if verifying_key
+        .verify(package_hash.as_bytes(), &signature)
+        .is_ok()
+    {
         return Ok(());
     }
     if verifying_key.verify(&hash_bytes, &signature).is_ok() {
@@ -165,12 +168,17 @@ fn unpack_zip(package_path: &Path, dest_dir: &Path) -> Result<()> {
         .with_context(|| format!("parsing zip archive {}", package_path.display()))?;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)
+        let mut entry = archive
+            .by_index(i)
             .with_context(|| format!("reading zip entry {i}"))?;
         if is_zip_symlink(&entry) {
-            bail!("zip entry {} is a symlink, which is not allowed", entry.name());
+            bail!(
+                "zip entry {} is a symlink, which is not allowed",
+                entry.name()
+            );
         }
-        let rel_path = entry.enclosed_name()
+        let rel_path = entry
+            .enclosed_name()
             .ok_or_else(|| anyhow::anyhow!("zip entry has invalid path {}", entry.name()))?;
         let out_path = dest_dir.join(rel_path);
 
@@ -280,8 +288,7 @@ fn parse_public_key(key_id: &str) -> Result<VerifyingKey> {
     if !scheme.eq_ignore_ascii_case("ed25519") {
         bail!("unsupported signing key type {}", scheme);
     }
-    let bytes = decode_text_bytes(encoded)
-        .with_context(|| "decoding public key")?;
+    let bytes = decode_text_bytes(encoded).with_context(|| "decoding public key")?;
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("public key must be 32 bytes"))?;
@@ -299,8 +306,7 @@ fn parse_signature(signature: &str) -> Result<Signature> {
         }
         None => trimmed,
     };
-    let bytes = decode_text_bytes(encoded)
-        .with_context(|| "decoding signature")?;
+    let bytes = decode_text_bytes(encoded).with_context(|| "decoding signature")?;
     let bytes: [u8; 64] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("signature must be 64 bytes"))?;

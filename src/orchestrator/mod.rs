@@ -1,11 +1,11 @@
 pub mod bindings;
 pub mod executor;
 pub mod lock;
-pub mod naming;
 pub mod model;
-pub mod planner;
-pub mod plan_validation;
+pub mod naming;
 pub mod plan_executor;
+pub mod plan_validation;
+pub mod planner;
 pub mod reconcile;
 pub mod service;
 

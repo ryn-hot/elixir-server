@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, str::FromStr};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result};
 use config::{Config, Environment as ConfigEnvironment, File};
@@ -32,9 +37,54 @@ pub struct Settings {
     pub telemetry: TelemetryConfig,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            environment: RunEnvironment::default(),
+            server: ServerConfig::default(),
+            network: NetworkConfig::default(),
+            database: DatabaseConfig::default(),
+            auth: AuthConfig::default(),
+            secrets: SecretsConfig::default(),
+            library: LibraryConfig::default(),
+            extensions: ExtensionsConfig::default(),
+            metadata: MetadataConfig::default(),
+            classifier: ClassifierConfig::default(),
+            playback: PlaybackConfig::default(),
+            telemetry: TelemetryConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigPaths {
+    base_dir: PathBuf,
+    default_file: PathBuf,
+    local_file: PathBuf,
+}
+
+impl ConfigPaths {
+    fn new(config_dir: PathBuf) -> Self {
+        let config_dir = absolutize_path(config_dir);
+        let base_dir = match config_dir.file_name().and_then(|name| name.to_str()) {
+            Some("config") => config_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| config_dir.clone()),
+            _ => config_dir.clone(),
+        };
+        Self {
+            base_dir,
+            default_file: config_dir.join("default.toml"),
+            local_file: config_dir.join("local.toml"),
+        }
+    }
+}
+
 impl Settings {
     pub fn load() -> Result<Self> {
         let env_override = std::env::var("ELIXIR_ENV").ok().map(|v| v.to_lowercase());
+        let config_paths = discover_config_paths();
 
         let mut builder = Config::builder()
             .set_default("environment", RunEnvironment::default().as_str())?
@@ -125,8 +175,8 @@ impl Settings {
                 default_lan_bitrate_bps(),
             )?
             .set_default("telemetry.log_directives", default_log_directives())?
-            .add_source(File::with_name("config/default").required(false))
-            .add_source(File::with_name("config/local").required(false))
+            .add_source(File::from(config_paths.default_file.clone()).required(false))
+            .add_source(File::from(config_paths.local_file.clone()).required(false))
             .add_source(ConfigEnvironment::with_prefix("ELIXIR").separator("__"));
 
         if let Some(env_value) = env_override {
@@ -135,13 +185,24 @@ impl Settings {
             builder = builder.set_override("environment", parsed.as_str())?;
         }
 
-        let settings: Settings = builder
+        let mut settings: Settings = builder
             .build()
             .context("unable to build configuration sources")?
             .try_deserialize()
             .context("configuration deserialization failed")?;
+        settings.normalize_paths(&config_paths.base_dir)?;
 
         Ok(settings)
+    }
+
+    fn normalize_paths(&mut self, base_dir: &Path) -> Result<()> {
+        self.database.url = normalize_database_url(&self.database.url, base_dir)
+            .context("normalizing database.url")?;
+        self.library.local_root = normalize_path(&self.library.local_root, base_dir);
+        self.library.artwork_cache_dir = normalize_path(&self.library.artwork_cache_dir, base_dir);
+        self.extensions.storage_root = normalize_path(&self.extensions.storage_root, base_dir);
+        self.extensions.bundled_dir = normalize_path(&self.extensions.bundled_dir, base_dir);
+        Ok(())
     }
 }
 
@@ -481,7 +542,7 @@ fn default_port() -> u16 {
 }
 
 fn default_database_url() -> String {
-    "sqlite://elixir.db".to_string()
+    "sqlite://data/elixir.db".to_string()
 }
 
 fn default_access_token_secret() -> String {
@@ -611,4 +672,200 @@ fn default_wan_bitrate_bps() -> Option<i64> {
 
 fn default_lan_bitrate_bps() -> Option<i64> {
     Some(20_000_000)
+}
+
+fn discover_config_paths() -> ConfigPaths {
+    if let Ok(dir) = std::env::var("ELIXIR_CONFIG_DIR") {
+        return ConfigPaths::new(expand_tilde_path(Path::new(dir.trim())));
+    }
+
+    if let Ok(file) = std::env::var("ELIXIR_CONFIG_FILE") {
+        let file_path = expand_tilde_path(Path::new(file.trim()));
+        let config_dir = file_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("config"));
+        return ConfigPaths::new(config_dir);
+    }
+
+    let mut candidate_dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidate_dirs.extend(candidate_config_dirs(&cwd));
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidate_dirs.extend(candidate_config_dirs(exe_dir));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    candidate_dirs.retain(|dir| seen.insert(dir.clone()));
+
+    if let Some(dir) = candidate_dirs
+        .iter()
+        .find(|dir| has_config_toml(dir))
+        .cloned()
+    {
+        return ConfigPaths::new(dir);
+    }
+
+    if let Some(dir) = candidate_dirs.iter().find(|dir| dir.is_dir()).cloned() {
+        return ConfigPaths::new(dir);
+    }
+
+    ConfigPaths::new(PathBuf::from("config"))
+}
+
+fn candidate_config_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for ancestor in start.ancestors() {
+        dirs.push(ancestor.join("config"));
+        dirs.push(ancestor.join("elixir-server").join("config"));
+    }
+    dirs
+}
+
+fn has_config_toml(dir: &Path) -> bool {
+    dir.join("default.toml").is_file() || dir.join("local.toml").is_file()
+}
+
+fn normalize_database_url(raw: &str, base_dir: &Path) -> Result<String> {
+    let lowered = raw.to_ascii_lowercase();
+    if !lowered.starts_with("sqlite:") {
+        return Ok(raw.to_string());
+    }
+    if lowered.starts_with("sqlite::memory") || lowered.starts_with("sqlite://:memory:") {
+        return Ok(raw.to_string());
+    }
+
+    if let Some(rest) = raw.strip_prefix("sqlite://") {
+        let (path_part, query_part) = split_query(rest);
+        if path_part.is_empty() || Path::new(path_part).is_absolute() {
+            return Ok(raw.to_string());
+        }
+        let absolute = normalize_path(path_part, base_dir);
+        if let Some(query) = query_part {
+            return Ok(format!("sqlite://{absolute}?{query}"));
+        }
+        return Ok(format!("sqlite://{absolute}"));
+    }
+
+    if let Some(rest) = raw.strip_prefix("sqlite:") {
+        let (path_part, query_part) = split_query(rest);
+        if path_part.is_empty()
+            || path_part.starts_with(":memory:")
+            || Path::new(path_part).is_absolute()
+        {
+            return Ok(raw.to_string());
+        }
+        let absolute = normalize_path(path_part, base_dir);
+        if let Some(query) = query_part {
+            return Ok(format!("sqlite:{absolute}?{query}"));
+        }
+        return Ok(format!("sqlite:{absolute}"));
+    }
+
+    Ok(raw.to_string())
+}
+
+fn split_query(input: &str) -> (&str, Option<&str>) {
+    match input.split_once('?') {
+        Some((path, query)) if !query.is_empty() => (path, Some(query)),
+        Some((path, _)) => (path, None),
+        None => (input, None),
+    }
+}
+
+fn normalize_path(raw: &str, base_dir: &Path) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    let expanded = expand_tilde_path(Path::new(raw));
+    if expanded.is_absolute() {
+        return expanded.to_string_lossy().to_string();
+    }
+    base_dir.join(expanded).to_string_lossy().to_string()
+}
+
+fn expand_tilde_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn absolutize_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn normalize_paths_resolves_relative_entries() -> Result<()> {
+        let base = tempdir()?;
+        let mut settings = Settings::default();
+        settings.database.url = "sqlite://data/elixir.db".to_string();
+        settings.library.local_root = "./media".to_string();
+        settings.library.artwork_cache_dir = "data/artwork".to_string();
+        settings.extensions.storage_root = "data/extensions".to_string();
+        settings.extensions.bundled_dir = "extensions/bundled".to_string();
+
+        settings.normalize_paths(base.path())?;
+
+        assert_eq!(
+            settings.database.url,
+            format!(
+                "sqlite://{}",
+                base.path().join("data/elixir.db").to_string_lossy()
+            )
+        );
+        assert_eq!(
+            PathBuf::from(&settings.library.local_root),
+            base.path().join("media")
+        );
+        assert_eq!(
+            PathBuf::from(&settings.library.artwork_cache_dir),
+            base.path().join("data/artwork")
+        );
+        assert_eq!(
+            PathBuf::from(&settings.extensions.storage_root),
+            base.path().join("data/extensions")
+        );
+        assert_eq!(
+            PathBuf::from(&settings.extensions.bundled_dir),
+            base.path().join("extensions/bundled")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_database_url_keeps_memory_url() -> Result<()> {
+        let base = tempdir()?;
+        let url = normalize_database_url("sqlite::memory:?cache=shared", base.path())?;
+        assert_eq!(url, "sqlite::memory:?cache=shared");
+        Ok(())
+    }
 }

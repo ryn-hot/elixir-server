@@ -450,10 +450,7 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
         Some(arr)
     } else if let Some(arr) = value.get("artworks").and_then(Value::as_array) {
         Some(arr)
-    } else if let Some(arr) = value
-        .get("data")
-        .and_then(Value::as_array)
-    {
+    } else if let Some(arr) = value.get("data").and_then(Value::as_array) {
         Some(arr)
     } else if let Some(arr) = value
         .get("data")

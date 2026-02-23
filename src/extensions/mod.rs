@@ -12,15 +12,15 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{config::SonarrConfig, db::models::MediaType, extensions::sonarr::load_sonarr_sources};
+use elixir_classifier::HintParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
-use elixir_classifier::HintParser;
 
 pub mod manifest;
 pub mod package;
 pub mod permissions;
-pub mod required_secrets;
 pub mod registry;
+pub mod required_secrets;
 pub mod store;
 
 mod sonarr;
@@ -124,7 +124,8 @@ impl ExtensionManager {
                 let entry = entry?;
                 let manifest_path = entry.path().join("manifest.json");
                 if manifest_path.exists() {
-                    let manifest = read_file_source_manifest(&manifest_path.to_string_lossy()).await?;
+                    let manifest =
+                        read_file_source_manifest(&manifest_path.to_string_lossy()).await?;
                     if manifest.capabilities.file_source {
                         // Placeholder: actual per-extension implementation should be loaded here.
                         // For now we register a no-op source to keep the manager aware of the manifest.
@@ -266,8 +267,8 @@ async fn build_candidate_from_path(path: &Path, hash_files: bool) -> Option<Medi
     } else {
         MediaType::Movie
     };
-    let cleaned_title = derive_clean_title(&file_name, media_type)
-        .unwrap_or_else(|| title.trim().to_string());
+    let cleaned_title =
+        derive_clean_title(&file_name, media_type).unwrap_or_else(|| title.trim().to_string());
 
     let identity = MediaIdentity {
         r#type: media_type,
@@ -416,9 +417,7 @@ fn parse_season_episode_words(value: &str) -> Option<(i32, i32)> {
     let after = &value[season_idx + "SEASON".len()..];
     let (season, season_end) = parse_number_after(after)?;
     let rest = &after[season_end..];
-    let ep_idx = rest
-        .find("EPISODE")
-        .or_else(|| rest.find("EP"))?;
+    let ep_idx = rest.find("EPISODE").or_else(|| rest.find("EP"))?;
     let ep_label_len = if rest[ep_idx..].starts_with("EPISODE") {
         "EPISODE".len()
     } else {
@@ -492,10 +491,7 @@ fn parse_number_after(value: &str) -> Option<(i32, usize)> {
 }
 
 fn is_separator(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'.' | b'_' | b'-' | b' ' | b'(' | b')' | b'[' | b']'
-    )
+    matches!(byte, b'.' | b'_' | b'-' | b' ' | b'(' | b')' | b'[' | b']')
 }
 
 async fn compute_hash(path: &str) -> Option<String> {
@@ -530,7 +526,8 @@ mod tests {
 
     #[test]
     fn parse_season_episode_detects_patterns() {
-        let (season, episode) = parse_season_episode("Solo.Leveling.S02E02.I.Suppose.You.Arent.Aware");
+        let (season, episode) =
+            parse_season_episode("Solo.Leveling.S02E02.I.Suppose.You.Arent.Aware");
         assert_eq!(season, Some(2));
         assert_eq!(episode, Some(2));
 

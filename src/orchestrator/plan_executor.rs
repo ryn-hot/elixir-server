@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::db::models::OperationStepStatus;
 use crate::extensions::store::ExtensionStore;
-use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::executor::ExecutorAction;
+use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::state::AppState;
 
 #[derive(Clone)]
@@ -34,13 +34,7 @@ impl PlanExecutor {
     pub async fn execute_steps(&self, steps: Vec<PlannedStep>) -> Result<()> {
         let store = ExtensionStore::new(&self.state.db_pool);
         let owner_id = Uuid::new_v4().to_string();
-        let ttl = Duration::from_secs(
-            self.state
-                .settings
-                .extensions
-                .apply_lock_ttl_seconds
-                .max(1),
-        );
+        let ttl = Duration::from_secs(self.state.settings.extensions.apply_lock_ttl_seconds.max(1));
 
         let mut acquired = false;
         for _ in 0..10 {
