@@ -74,16 +74,17 @@ impl CapabilityDriver for IndexerRegistryDriver {
 
         let config = ProwlarrDriverConfig::from_ctx(&ctx)?;
         let client = ProwlarrClient::from_config(config, ctx.canonical_url()?).await?;
+        let provider_endpoint_url = ctx.endpoint.canonical_url()?;
 
         match patch {
             IndexerRegistryPatch::RegisterIndexers { indexers } => {
                 client.upsert_indexers(&indexers).await?;
             }
             IndexerRegistryPatch::RegisterApp { app } => {
-                client.upsert_apps(&[app]).await?;
+                client.upsert_apps(&[app], &provider_endpoint_url).await?;
             }
             IndexerRegistryPatch::RegisterApps { apps } => {
-                client.upsert_apps(&apps).await?;
+                client.upsert_apps(&apps, &provider_endpoint_url).await?;
             }
         }
 
@@ -245,10 +246,18 @@ impl ProwlarrClient {
         }
         let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
         let existing = self.get_json::<Vec<Value>>("indexer").await?;
+        let mut skipped = 0usize;
 
         for indexer in indexers {
             let tags = self.ensure_tags(&indexer.tags).await?;
-            let schema_item = find_schema(&schema, &indexer.implementation)?;
+            let Some(schema_item) = find_schema_optional(&schema, &indexer.implementation) else {
+                skipped += 1;
+                warn!(
+                    "prowlarr indexer implementation '{}' is unavailable; skipping indexer '{}'",
+                    indexer.implementation, indexer.name
+                );
+                continue;
+            };
             let existing_item = find_by_name(&existing, &indexer.name);
             let mut target = match existing_item.clone() {
                 Some(existing) => existing,
@@ -280,10 +289,15 @@ impl ProwlarrClient {
                 self.post_json("indexer", &target).await?;
             }
         }
+        if skipped > 0 {
+            warn!(
+                "prowlarr skipped {skipped} indexer(s) because implementations were unavailable in schema"
+            );
+        }
         Ok(())
     }
 
-    async fn upsert_apps(&self, apps: &[AppSpec]) -> Result<()> {
+    async fn upsert_apps(&self, apps: &[AppSpec], prowlarr_url: &str) -> Result<()> {
         if apps.is_empty() {
             return Ok(());
         }
@@ -314,7 +328,7 @@ impl ProwlarrClient {
                 .get_mut("fields")
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| anyhow::anyhow!("app fields missing"))?;
-            apply_app_fields(fields, app)?;
+            apply_app_fields(fields, app, prowlarr_url)?;
 
             if let Some(existing_item) = existing_item {
                 if target == existing_item {
@@ -532,8 +546,13 @@ fn normalize_url(value: &str) -> String {
 }
 
 fn find_schema(items: &[Value], implementation: &str) -> Result<Value> {
+    find_schema_optional(items, implementation)
+        .ok_or_else(|| anyhow::anyhow!("implementation '{}' not found", implementation))
+}
+
+fn find_schema_optional(items: &[Value], implementation: &str) -> Option<Value> {
     let needle = normalize_name(implementation);
-    let schema = items.iter().find_map(|value| {
+    items.iter().find_map(|value| {
         let implementation_value = value
             .get("implementation")
             .and_then(Value::as_str)
@@ -543,8 +562,7 @@ fn find_schema(items: &[Value], implementation: &str) -> Result<Value> {
         } else {
             None
         }
-    });
-    schema.ok_or_else(|| anyhow::anyhow!("implementation '{}' not found", implementation))
+    })
 }
 
 fn ensure_schema_fields(target: &mut Value, implementation: &str) -> Result<()> {
@@ -597,7 +615,14 @@ fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<(
     Ok(())
 }
 
-fn apply_app_fields(fields: &mut Vec<Value>, spec: &AppSpec) -> Result<()> {
+fn apply_app_fields(fields: &mut Vec<Value>, spec: &AppSpec, prowlarr_url: &str) -> Result<()> {
+    let prowlarr_url = normalize_root_url(prowlarr_url)?.to_string();
+    set_field_value_optional(
+        fields,
+        "prowlarrUrl",
+        Value::String(prowlarr_url.to_string()),
+    )?;
+
     let url_value = Value::String(spec.url.clone());
     if !set_field_value_optional(fields, "baseUrl", url_value.clone())?
         && !set_field_value_optional(fields, "url", url_value.clone())?
@@ -771,5 +796,59 @@ mod tests {
             matched.is_none(),
             "app identity should require matching URL"
         );
+    }
+
+    #[test]
+    fn find_schema_optional_returns_none_when_implementation_missing() {
+        let schema = vec![json!({
+            "implementation": "Newznab"
+        })];
+
+        let found = find_schema_optional(&schema, "Nyaa");
+        assert!(
+            found.is_none(),
+            "missing implementation should be skipped by optional lookup"
+        );
+    }
+
+    #[test]
+    fn find_schema_returns_error_when_implementation_missing() {
+        let schema = vec![json!({
+            "implementation": "Newznab"
+        })];
+
+        let err = find_schema(&schema, "Nyaa").expect_err("expected missing implementation error");
+        let message = err.to_string();
+        assert!(
+            message.contains("implementation 'Nyaa' not found"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn apply_app_fields_sets_prowlarr_url_when_supported() {
+        let app = AppSpec {
+            name: "Radarr".to_string(),
+            implementation: "Radarr".to_string(),
+            url: "http://elx-radarr:7878".to_string(),
+            api_key: Some("abc".to_string()),
+            categories: vec!["2000".to_string()],
+            tags: vec![],
+            enabled: Some(true),
+            settings: HashMap::new(),
+        };
+        let mut fields = vec![
+            json!({"name": "prowlarrUrl", "value": ""}),
+            json!({"name": "baseUrl", "value": ""}),
+            json!({"name": "apiKey", "value": ""}),
+            json!({"name": "syncCategories", "value": []}),
+        ];
+
+        apply_app_fields(&mut fields, &app, "http://svc-prowlarr:9696/").unwrap();
+
+        let prowlarr_url = field_string_value(&fields, "prowlarrUrl").unwrap();
+        assert_eq!(prowlarr_url, "http://svc-prowlarr:9696/");
+        let base_url = field_string_value(&fields, "baseUrl").unwrap();
+        assert_eq!(base_url, "http://elx-radarr:7878");
     }
 }

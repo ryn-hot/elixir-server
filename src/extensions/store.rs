@@ -741,6 +741,14 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn force_release_lock(&self, lock_name: &str) -> Result<u64> {
+        let result = sqlx::query::<sqlx::Any>("DELETE FROM orchestrator_locks WHERE lock_name = ?")
+            .bind(lock_name)
+            .execute(self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn update_run_status(
         &self,
         run_id: Uuid,

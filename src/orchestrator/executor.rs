@@ -10,6 +10,8 @@ use reqwest::Url;
 use serde::Deserialize;
 use sqlx::AnyPool;
 use tokio::fs;
+use tokio::net::lookup_host;
+use tokio::process::Command;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -556,11 +558,14 @@ impl<'a> Executor<'a> {
         resolve_indexer_apps(&self.store, self.secrets, &mut patch).await?;
         resolve_downloader_credentials(&self.store, self.secrets, &mut patch).await?;
 
+        let transport_base_url =
+            resolve_driver_transport_base_url(provider.instance_id, &endpoint).await?;
         let ctx = DriverCtx::new(
             provider.provider_id,
             provider.instance_id,
             provider.capability.clone(),
             endpoint,
+            transport_base_url,
             provider.implementation.clone(),
             instance.config_json.clone(),
             secrets,
@@ -1553,6 +1558,113 @@ fn parse_arr_api_key(xml: &str) -> Result<Option<String>> {
         buf.clear();
     }
     Ok(None)
+}
+
+async fn resolve_driver_transport_base_url(
+    instance_id: Uuid,
+    endpoint: &ProviderEndpoint,
+) -> Result<Option<String>> {
+    let canonical = endpoint.canonical_url()?;
+    if endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+        return Ok(Some(canonical));
+    }
+
+    match lookup_docker_published_port(instance_id, endpoint.port).await {
+        Ok(Some(host_port)) => {
+            let base = format!("{}://127.0.0.1:{host_port}", endpoint.scheme);
+            return Ok(Some(format!("{base}{}", endpoint.base_path)));
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "driver transport fallback unavailable for instance {} endpoint {}:{}",
+                instance_id,
+                endpoint.host,
+                endpoint.port
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                "driver transport fallback failed for instance {} endpoint {}:{}: {}",
+                instance_id,
+                endpoint.host,
+                endpoint.port,
+                err
+            );
+        }
+    }
+
+    Ok(Some(canonical))
+}
+
+async fn endpoint_host_resolves(host: &str, port: u16) -> bool {
+    lookup_host((host, port))
+        .await
+        .map(|mut addrs| addrs.next().is_some())
+        .unwrap_or(false)
+}
+
+async fn lookup_docker_published_port(
+    instance_id: Uuid,
+    container_port: u16,
+) -> Result<Option<u16>> {
+    let ps_args = vec![
+        "ps".to_string(),
+        "-a".to_string(),
+        "--filter".to_string(),
+        format!("label=elixir.instance_id={instance_id}"),
+        "--format".to_string(),
+        "{{.Names}}".to_string(),
+    ];
+    let containers = run_docker_stdout(&ps_args).await?;
+    let container_name = containers
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string);
+    let Some(container_name) = container_name else {
+        return Ok(None);
+    };
+
+    let inspect_args = vec![
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{json .NetworkSettings.Ports}}".to_string(),
+        container_name,
+    ];
+    let ports_json = run_docker_stdout(&inspect_args).await?;
+    let ports: serde_json::Value =
+        serde_json::from_str(ports_json.trim()).context("parsing docker ports inspect output")?;
+    let key = format!("{container_port}/tcp");
+    let bindings = ports.get(&key).and_then(serde_json::Value::as_array);
+    let Some(binding) = bindings.and_then(|values| values.first()) else {
+        return Ok(None);
+    };
+    let host_port = binding
+        .get("HostPort")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .ok();
+    Ok(host_port.filter(|port| *port > 0))
+}
+
+async fn run_docker_stdout(args: &[String]) -> Result<String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running docker {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "docker {} failed (status {:?}): {}",
+            args.join(" "),
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn ensure_probe_ok(result: crate::runtime::probe::ProbeResult, stage: &str) -> Result<()> {

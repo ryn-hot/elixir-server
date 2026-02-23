@@ -133,6 +133,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Start extensions reconcile loop.
     let reconcile_config = ReconcileConfig::from_settings(&settings);
+    if let Err(err) = state
+        .orchestrator
+        .recover_orphaned_state_after_restart(&reconcile_config)
+        .await
+    {
+        tracing::warn!("orchestrator startup recovery failed: {err}");
+    }
     state
         .orchestrator
         .clone()

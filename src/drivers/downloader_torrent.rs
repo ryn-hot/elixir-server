@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, COOKIE, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
+use reqwest::header::{ACCEPT, COOKIE, HOST, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::fs;
+use tokio::process::Command;
+use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::drivers::patches::{DownloadCategorySpec, DownloaderTorrentPatch};
 use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
@@ -50,11 +55,28 @@ impl CapabilityDriver for DownloaderTorrentDriver {
         patch.validate()?;
 
         let config = QbittorrentDriverConfig::from_ctx(&ctx)?;
-        let client = QbittorrentClient::from_config(config, ctx.canonical_url()?).await?;
+        let endpoint_url = ctx.endpoint.canonical_url()?;
+        let transport_url = ctx.canonical_url()?;
+        let transport_override = if transport_url != endpoint_url {
+            Some(transport_url)
+        } else {
+            None
+        };
+        let client = match QbittorrentClient::from_config(
+            config,
+            endpoint_url,
+            transport_override,
+            ctx.instance_id,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
 
-        match patch {
+        let patch_result = match patch {
             DownloaderTorrentPatch::SetCategories { categories } => {
-                client.upsert_categories(&categories).await?;
+                client.upsert_categories(&categories).await
             }
             DownloaderTorrentPatch::SetPreferences {
                 default_save_path,
@@ -63,8 +85,11 @@ impl CapabilityDriver for DownloaderTorrentDriver {
             } => {
                 client
                     .set_preferences(default_save_path, incomplete_path, use_incomplete)
-                    .await?;
+                    .await
             }
+        };
+        if let Err(err) = patch_result {
+            return Err(err);
         }
 
         Ok(ApplyResult::applied())
@@ -115,9 +140,11 @@ impl QbittorrentDriverConfig {
 
 struct QbittorrentClient {
     client: Client,
-    root: Url,
+    endpoint_root: Url,
+    transport_root: Url,
     api_base: Url,
     cookie: String,
+    host_header: Option<String>,
 }
 
 const QBITTORRENT_BOOTSTRAP_USER: &str = "admin";
@@ -125,27 +152,38 @@ const QBITTORRENT_BOOTSTRAP_PASS: &str = "adminadmin";
 const QBITTORRENT_AUTOGEN_PREFIX: &str = "elixir_";
 
 impl QbittorrentClient {
-    async fn from_config(config: QbittorrentDriverConfig, endpoint_url: String) -> Result<Self> {
+    async fn from_config(
+        config: QbittorrentDriverConfig,
+        endpoint_url: String,
+        transport_url: Option<String>,
+        instance_id: Uuid,
+    ) -> Result<Self> {
         let username = config
             .username
             .ok_or_else(|| anyhow::anyhow!("qbittorrent username is required"))?;
         let password = config
             .password
             .ok_or_else(|| anyhow::anyhow!("qbittorrent password is required"))?;
-        let root = resolve_base_url(config.base_url.as_deref(), &endpoint_url)?;
+        let endpoint_root = resolve_base_url(config.base_url.as_deref(), &endpoint_url)?;
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        let client = Client::builder()
+        let builder = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .default_headers(headers)
+            .default_headers(headers);
+        let transport_root = transport_root(&endpoint_root, transport_url.as_deref())?;
+        let host_header = host_header_for_transport(&endpoint_root, &transport_root);
+
+        let client = builder
             .build()
             .context("building qbittorrent http client")?;
         let mut client = Self {
             client,
-            root,
+            endpoint_root,
+            transport_root,
             api_base: Url::parse("http://127.0.0.1/").expect("fallback url"),
             cookie: String::new(),
+            host_header,
         };
 
         if let Some(version) = config.api_version.as_deref() {
@@ -153,28 +191,68 @@ impl QbittorrentClient {
         } else {
             client.set_api_version("v2")?;
         }
-        client.login_with_bootstrap(&username, &password).await?;
+        client
+            .login_with_bootstrap(instance_id, &username, &password)
+            .await?;
         Ok(client)
     }
 
     fn set_api_version(&mut self, version: &str) -> Result<()> {
         let version = normalize_version(version)?;
-        self.api_base = build_api_base(&self.root, version)?;
+        self.api_base = build_api_base(&self.transport_root, version)?;
         Ok(())
     }
 
-    async fn login_with_bootstrap(&mut self, username: &str, password: &str) -> Result<()> {
+    async fn login_with_bootstrap(
+        &mut self,
+        instance_id: Uuid,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        self.refresh_transport_port(instance_id).await?;
         if self.try_login(username, password).await? {
             return Ok(());
         }
         if !username.starts_with(QBITTORRENT_AUTOGEN_PREFIX) {
             bail!("qbittorrent auth rejected for configured credentials");
         }
-        if !self
-            .try_login(QBITTORRENT_BOOTSTRAP_USER, QBITTORRENT_BOOTSTRAP_PASS)
-            .await?
-        {
-            bail!("qbittorrent auth rejected for configured credentials and default bootstrap");
+        reset_qbittorrent_webui_auth(instance_id).await?;
+
+        // qBittorrent needs a short warm-up after restart before auth/login is ready.
+        let mut bootstrapped = false;
+        let mut tried_default = false;
+        let mut last_temp_attempt: Option<String> = None;
+        for _ in 0..20 {
+            self.refresh_transport_port(instance_id).await?;
+
+            if let Some(temp_password) = lookup_qbittorrent_temporary_password(instance_id).await? {
+                if last_temp_attempt.as_deref() != Some(temp_password.as_str()) {
+                    last_temp_attempt = Some(temp_password.clone());
+                    if self
+                        .try_login(QBITTORRENT_BOOTSTRAP_USER, &temp_password)
+                        .await?
+                    {
+                        bootstrapped = true;
+                        break;
+                    }
+                }
+            }
+
+            if !tried_default {
+                tried_default = true;
+                if self
+                    .try_login(QBITTORRENT_BOOTSTRAP_USER, QBITTORRENT_BOOTSTRAP_PASS)
+                    .await?
+                {
+                    bootstrapped = true;
+                    break;
+                }
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+        if !bootstrapped {
+            bail!("qbittorrent auth rejected for configured credentials and bootstrap credentials");
         }
         self.set_webui_credentials(username, password).await?;
         if self.try_login(username, password).await? {
@@ -183,18 +261,49 @@ impl QbittorrentClient {
         bail!("qbittorrent auth rejected after bootstrap reset");
     }
 
+    async fn refresh_transport_port(&mut self, instance_id: Uuid) -> Result<()> {
+        if self.host_header.is_none() {
+            return Ok(());
+        }
+        let container_port = self.endpoint_root.port_or_known_default().unwrap_or(80);
+        let Some(container_name) = find_container_name_for_instance(instance_id).await? else {
+            return Ok(());
+        };
+        let Some(host_port) = lookup_container_host_port(&container_name, container_port).await?
+        else {
+            return Ok(());
+        };
+        let current_port = self
+            .transport_root
+            .port_or_known_default()
+            .unwrap_or(container_port);
+        if current_port == host_port {
+            return Ok(());
+        }
+        self.transport_root
+            .set_port(Some(host_port))
+            .map_err(|_| anyhow::anyhow!("invalid qbittorrent transport host port"))?;
+        self.set_api_version("v2")?;
+        Ok(())
+    }
+
     async fn try_login(&mut self, username: &str, password: &str) -> Result<bool> {
         let url = self
             .api_base
             .join("auth/login")
             .context("building qbittorrent login url")?;
-        let resp = self
+        let resp = match self
             .client
             .post(url)
+            .with_optional_host_header(self.host_header.as_deref())?
             .form(&[("username", username), ("password", password)])
             .send()
             .await
-            .context("qbittorrent auth/login request")?;
+        {
+            Ok(resp) => resp,
+            // During bootstrap/recovery qBittorrent can briefly refuse/close connections.
+            Err(_) => return Ok(false),
+        };
         let status = resp.status();
         let cookie_header = resp
             .headers()
@@ -231,6 +340,7 @@ impl QbittorrentClient {
         Ok(self
             .client
             .request(method, url)
+            .with_optional_host_header(self.host_header.as_deref())?
             .header(COOKIE, self.cookie.clone()))
     }
 
@@ -388,6 +498,231 @@ impl QbittorrentClient {
     }
 }
 
+trait HostHeaderExt {
+    fn with_optional_host_header(self, host_header: Option<&str>) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+impl HostHeaderExt for reqwest::RequestBuilder {
+    fn with_optional_host_header(self, host_header: Option<&str>) -> Result<Self> {
+        if let Some(value) = host_header {
+            let header = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid Host header value '{value}'"))?;
+            Ok(self.header(HOST, header))
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+async fn lookup_qbittorrent_temporary_password(instance_id: Uuid) -> Result<Option<String>> {
+    let Some(container_name) = find_container_name_for_instance(instance_id).await? else {
+        return Ok(None);
+    };
+
+    let logs_output = run_docker_command(&["logs", "--tail", "500", &container_name]).await?;
+    if let Some(password) = extract_qbittorrent_temporary_password(&logs_output.combined()) {
+        return Ok(Some(password));
+    }
+    lookup_qbittorrent_temporary_password_from_mount(&container_name).await
+}
+
+#[derive(Debug)]
+struct DockerCommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl DockerCommandOutput {
+    fn combined(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            return self.stdout.clone();
+        }
+        if self.stdout.trim().is_empty() {
+            return self.stderr.clone();
+        }
+        format!("{}\n{}", self.stdout, self.stderr)
+    }
+}
+
+async fn run_docker_command(args: &[&str]) -> Result<DockerCommandOutput> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running docker {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "docker {} failed with status {:?}",
+            args.join(" "),
+            output.status.code()
+        );
+    }
+    Ok(DockerCommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn extract_qbittorrent_temporary_password(logs: &str) -> Option<String> {
+    let marker = "temporary password is provided for this session:";
+    for line in logs.lines().rev() {
+        let normalized = line.to_ascii_lowercase();
+        let Some(index) = normalized.find(marker) else {
+            continue;
+        };
+        let value = line[index + marker.len()..].trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+async fn reset_qbittorrent_webui_auth(instance_id: Uuid) -> Result<()> {
+    let container_name = find_container_name_for_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("qbittorrent container not found for instance"))?;
+
+    // Stop first so qBittorrent does not overwrite config on shutdown after we patch it.
+    let _ = run_docker_command(&["stop", &container_name]).await;
+
+    let config_root = match find_container_config_root(&container_name).await? {
+        Some(path) => path,
+        None => {
+            let _ = run_docker_command(&["start", &container_name]).await;
+            bail!("qbittorrent /config mount not found for recovery");
+        }
+    };
+    let config_path = config_root.join("qBittorrent").join("qBittorrent.conf");
+    let content = match fs::read_to_string(&config_path).await {
+        Ok(content) => content,
+        Err(err) => {
+            let _ = run_docker_command(&["start", &container_name]).await;
+            return Err(err).with_context(|| format!("reading {}", config_path.display()));
+        }
+    };
+    let (rewritten, changed) = strip_qbittorrent_webui_auth_fields(&content);
+    if changed {
+        if let Err(err) = fs::write(&config_path, rewritten).await {
+            let _ = run_docker_command(&["start", &container_name]).await;
+            return Err(err).with_context(|| format!("writing {}", config_path.display()));
+        }
+    }
+
+    run_docker_command(&["start", &container_name]).await?;
+    Ok(())
+}
+
+async fn lookup_qbittorrent_temporary_password_from_mount(
+    container_name: &str,
+) -> Result<Option<String>> {
+    let Some(config_root) = find_container_config_root(container_name).await? else {
+        return Ok(None);
+    };
+    let candidates = [
+        config_root
+            .join("qBittorrent")
+            .join("logs")
+            .join("qbittorrent.log"),
+        config_root
+            .join("qBittorrent")
+            .join("logs")
+            .join("qBittorrent.log"),
+    ];
+    for path in candidates {
+        let content = match fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        if let Some(password) = extract_qbittorrent_temporary_password(&content) {
+            return Ok(Some(password));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_container_config_root(container_name: &str) -> Result<Option<std::path::PathBuf>> {
+    let inspect_output = run_docker_command(&[
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{if eq .Destination \"/config\"}}{{.Source}}{{end}}{{end}}",
+        container_name,
+    ])
+    .await?;
+    let config_root = inspect_output.stdout.trim();
+    if config_root.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(std::path::PathBuf::from(config_root)))
+}
+
+async fn find_container_name_for_instance(instance_id: Uuid) -> Result<Option<String>> {
+    let ps_output = run_docker_command(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label=elixir.instance_id={instance_id}"),
+        "--format",
+        "{{.Names}}",
+    ])
+    .await?;
+    let container = ps_output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string);
+    Ok(container)
+}
+
+async fn lookup_container_host_port(
+    container_name: &str,
+    container_port: u16,
+) -> Result<Option<u16>> {
+    let port_output =
+        run_docker_command(&["port", container_name, &format!("{container_port}/tcp")]).await?;
+    let value = port_output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let host_port = value
+        .rsplit(':')
+        .next()
+        .and_then(|raw| raw.trim().parse::<u16>().ok());
+    Ok(host_port)
+}
+
+fn strip_qbittorrent_webui_auth_fields(content: &str) -> (String, bool) {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let should_remove = trimmed.starts_with("WebUI\\Username=")
+            || trimmed.starts_with("WebUI\\Password_PBKDF2=")
+            || trimmed.starts_with("WebUI\\Password_ha1=")
+            || trimmed.starts_with("WebUI\\Password=")
+            || trimmed.starts_with("WebUI\\MaxAuthenticationFailCount=")
+            || trimmed.starts_with("WebUI\\BanDuration=");
+        if should_remove {
+            continue;
+        }
+        lines.push(line);
+    }
+    lines.push("WebUI\\MaxAuthenticationFailCount=0");
+    lines.push("WebUI\\BanDuration=0");
+    let mut rewritten = lines.join("\n");
+    if content.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    (rewritten, true)
+}
+
 fn normalize_root_url(base_url: &str) -> Result<Url> {
     let mut url = Url::parse(base_url).context("parsing qbittorrent base_url")?;
     let mut path = url.path().trim_end_matches('/').to_string();
@@ -409,6 +744,35 @@ fn resolve_base_url(config_base_url: Option<&str>, endpoint_url: &str) -> Result
         return Ok(base);
     }
     Ok(endpoint)
+}
+
+fn transport_root(endpoint: &Url, transport_override: Option<&str>) -> Result<Url> {
+    let Some(transport_override) = transport_override else {
+        return Ok(endpoint.clone());
+    };
+    let transport = normalize_root_url(transport_override)?;
+    let mut merged = endpoint.clone();
+    merged
+        .set_scheme(transport.scheme())
+        .map_err(|_| anyhow::anyhow!("invalid transport scheme '{}'", transport.scheme()))?;
+    merged
+        .set_host(transport.host_str())
+        .map_err(|_| anyhow::anyhow!("invalid transport host"))?;
+    merged
+        .set_port(transport.port())
+        .map_err(|_| anyhow::anyhow!("invalid transport port"))?;
+    Ok(merged)
+}
+
+fn host_header_for_transport(endpoint: &Url, transport: &Url) -> Option<String> {
+    let endpoint_host = endpoint.host_str()?;
+    let endpoint_port = endpoint.port_or_known_default().unwrap_or(80);
+    let transport_host = transport.host_str()?;
+    let transport_port = transport.port_or_known_default().unwrap_or(80);
+    if endpoint_host.eq_ignore_ascii_case(transport_host) && endpoint_port == transport_port {
+        return None;
+    }
+    Some(format!("{endpoint_host}:{endpoint_port}"))
 }
 
 fn ensure_same_origin(candidate: &Url, endpoint: &Url) -> Result<()> {
@@ -485,4 +849,83 @@ fn extract_error_message(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn is_qbittorrent_auth_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("qbittorrent auth rejected")
+            || message.contains("auth/login")
+            || message.contains("bootstrap credentials")
+            || message.contains("after bootstrap reset")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_latest_temporary_password_from_logs() {
+        let logs = r#"
+The WebUI administrator password was not set. A temporary password is provided for this session: oldPass123
+some other line
+The WebUI administrator password was not set. A temporary password is provided for this session: NewPass456
+"#;
+        let password = extract_qbittorrent_temporary_password(logs);
+        assert_eq!(password.as_deref(), Some("NewPass456"));
+    }
+
+    #[test]
+    fn detects_qbittorrent_auth_errors_from_error_chain() {
+        let err = anyhow::anyhow!("qbittorrent auth rejected for configured credentials");
+        assert!(is_qbittorrent_auth_error(&err));
+
+        let nested = Err::<(), _>(anyhow::anyhow!("wrapper"))
+            .context("auth/login failed")
+            .unwrap_err();
+        assert!(is_qbittorrent_auth_error(&nested));
+
+        let other = anyhow::anyhow!("network timeout");
+        assert!(!is_qbittorrent_auth_error(&other));
+    }
+
+    #[test]
+    fn strips_webui_auth_fields_from_qbittorrent_conf() {
+        let input = "\
+[Preferences]
+WebUI\\Address=*
+WebUI\\Username=elixir_old
+WebUI\\Password_PBKDF2=@ByteArray(foo:bar)
+WebUI\\ServerDomains=*
+";
+        let (output, changed) = strip_qbittorrent_webui_auth_fields(input);
+        assert!(changed);
+        assert!(!output.contains("WebUI\\Username="));
+        assert!(!output.contains("WebUI\\Password_PBKDF2="));
+        assert!(output.contains("WebUI\\Address=*"));
+        assert!(output.contains("WebUI\\ServerDomains=*"));
+        assert!(output.contains("WebUI\\MaxAuthenticationFailCount=0"));
+        assert!(output.contains("WebUI\\BanDuration=0"));
+    }
+
+    #[test]
+    fn host_header_is_set_when_transport_differs() -> Result<()> {
+        let endpoint = Url::parse("http://svc-elixir-modules-qbittorrent-default:8080/")?;
+        let transport = Url::parse("http://127.0.0.1:33042/")?;
+        let header = host_header_for_transport(&endpoint, &transport);
+        assert_eq!(
+            header.as_deref(),
+            Some("svc-elixir-modules-qbittorrent-default:8080")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transport_root_swaps_host_and_port_keeps_path() -> Result<()> {
+        let endpoint = Url::parse("http://svc-elixir-modules-qbittorrent-default:8080/base/")?;
+        let merged = transport_root(&endpoint, Some("http://127.0.0.1:33042"))?;
+        assert_eq!(merged.as_str(), "http://127.0.0.1:33042/base/");
+        Ok(())
+    }
 }

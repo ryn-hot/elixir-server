@@ -11,6 +11,7 @@ pub struct DriverCtx {
     pub instance_id: Uuid,
     pub capability: String,
     pub endpoint: ProviderEndpoint,
+    pub transport_base_url: Option<String>,
     pub implementation: Option<String>,
     pub instance_config: Option<serde_json::Value>,
     pub secrets: HashMap<String, String>,
@@ -22,6 +23,7 @@ impl DriverCtx {
         instance_id: Uuid,
         capability: String,
         endpoint: ProviderEndpoint,
+        transport_base_url: Option<String>,
         implementation: Option<String>,
         instance_config: Option<serde_json::Value>,
         secrets: HashMap<String, String>,
@@ -31,6 +33,7 @@ impl DriverCtx {
             instance_id,
             capability,
             endpoint,
+            transport_base_url,
             implementation,
             instance_config,
             secrets,
@@ -38,6 +41,9 @@ impl DriverCtx {
     }
 
     pub fn canonical_url(&self) -> Result<String> {
+        if let Some(url) = self.transport_base_url.as_ref() {
+            return Ok(url.clone());
+        }
         self.endpoint.canonical_url()
     }
 

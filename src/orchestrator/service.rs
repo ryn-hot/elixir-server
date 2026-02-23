@@ -1,8 +1,11 @@
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::AnyPool;
 
 use crate::drivers::DriverRegistry;
+use crate::extensions::store::ExtensionStore;
 use crate::orchestrator::executor::{Executor, ExecutorAction};
+use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
 use crate::runtime::RuntimePaths;
 use crate::runtime::docker::DockerRuntimeManager;
@@ -12,10 +15,11 @@ use crate::secrets::SecretsManager;
 #[derive(Clone)]
 pub struct OrchestratorService {
     pool: AnyPool,
-    storage_root: String,
     runtime_paths: RuntimePaths,
     drivers: std::sync::Arc<DriverRegistry>,
     secrets: std::sync::Arc<SecretsManager>,
+    probe: std::sync::Arc<NetworkProbe>,
+    runtime: std::sync::Arc<DockerRuntimeManager>,
 }
 
 impl OrchestratorService {
@@ -26,19 +30,22 @@ impl OrchestratorService {
         secrets: std::sync::Arc<SecretsManager>,
     ) -> Self {
         let runtime_paths = RuntimePaths::from_roots(&storage_root, &media_root);
+        let probe = std::sync::Arc::new(NetworkProbe::new(ProbeConfig::with_storage_root(
+            &storage_root,
+        )));
+        let runtime = std::sync::Arc::new(DockerRuntimeManager::new(None));
         Self {
             pool,
-            storage_root,
             runtime_paths,
             drivers: std::sync::Arc::new(DriverRegistry::with_defaults()),
             secrets,
+            probe,
+            runtime,
         }
     }
 
     pub async fn apply_actions(&self, actions: Vec<ExecutorAction>) -> Result<()> {
-        let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
-        let runtime = DockerRuntimeManager::new(None);
-        self.apply_actions_with_probe(actions, &probe, &runtime)
+        self.apply_actions_with_probe(actions, self.probe.as_ref(), self.runtime.as_ref())
             .await
     }
 
@@ -47,21 +54,47 @@ impl OrchestratorService {
             return;
         }
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(config.interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Run once on startup, then always wait a full interval after each run.
+            // This avoids an endless "catch-up" loop when reconcile duration exceeds interval.
             loop {
-                ticker.tick().await;
                 if let Err(err) = self.reconcile_once(&config).await {
                     tracing::warn!("reconcile loop error: {}", err);
                 }
+                tokio::time::sleep(config.interval).await;
             }
         });
     }
 
+    pub async fn recover_orphaned_state_after_restart(
+        &self,
+        config: &ReconcileConfig,
+    ) -> Result<()> {
+        let store = ExtensionStore::new(&self.pool);
+        let cleared = store.force_release_lock(APPLY_LOCK_NAME).await?;
+        if cleared > 0 {
+            tracing::warn!(
+                "orchestrator: cleared {} stale apply lock(s) on startup",
+                cleared
+            );
+        }
+
+        // On process restart there should be no active in-flight run in this process;
+        // mark leftover running runs as failed immediately so UI/API never linger at "running".
+        let stale_before = Utc::now() + chrono::Duration::seconds(config.lock_ttl.as_secs() as i64);
+        let reaped = store
+            .reap_stale_running_runs(stale_before, "server restarted")
+            .await?;
+        if reaped > 0 {
+            tracing::warn!(
+                "orchestrator: marked {} orphaned running run(s) as failed on startup",
+                reaped
+            );
+        }
+        Ok(())
+    }
+
     pub async fn reconcile_once(&self, config: &ReconcileConfig) -> Result<()> {
-        let probe = NetworkProbe::new(ProbeConfig::with_storage_root(&self.storage_root));
-        let runtime = DockerRuntimeManager::new(None);
-        self.reconcile_once_with_probe(config, &probe, &runtime)
+        self.reconcile_once_with_probe(config, self.probe.as_ref(), self.runtime.as_ref())
             .await
     }
 
@@ -111,16 +144,19 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
     use crate::config::DatabaseConfig;
     use crate::db::Database;
     use crate::db::models::{
-        BindingStatus, ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
+        BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
+        ProviderHealthState, SlotCardinality,
     };
     use crate::extensions::store::{
-        ExtensionStore, NewBinding, NewExtension, NewExtensionInstance, NewProvider,
+        ExtensionStore, NewBinding, NewExtension, NewExtensionInstance, NewOrchestratorRun,
+        NewProvider,
     };
     use crate::orchestrator::model::ProviderEndpoint;
     use crate::runtime::probe::{ProbeResult, ProbeRunner};
@@ -295,6 +331,70 @@ mod tests {
                 "http:http://svc-consumer:7878/health".to_string(),
             ]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_state_clears_lock_and_running_runs() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let run_id = Uuid::new_v4();
+        store
+            .create_run(&NewOrchestratorRun {
+                run_id,
+                source: "reconcile".to_string(),
+                status: OrchestratorRunStatus::Running,
+                phase: Some("reconcile".to_string()),
+                plan_json: None,
+                error: None,
+            })
+            .await?;
+
+        let original_owner = Uuid::new_v4().to_string();
+        let acquired = store
+            .acquire_lock(APPLY_LOCK_NAME, &original_owner, Duration::from_secs(60))
+            .await?;
+        assert!(acquired, "expected initial apply lock acquisition");
+
+        let service = OrchestratorService::new(
+            database.pool.clone(),
+            "/tmp/extensions".to_string(),
+            "/tmp/media".to_string(),
+            Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
+        );
+        let reconcile_config = ReconcileConfig {
+            interval: Duration::from_secs(60),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        service
+            .recover_orphaned_state_after_restart(&reconcile_config)
+            .await?;
+
+        let run = store
+            .get_run(run_id)
+            .await?
+            .expect("orchestrator run should still exist");
+        assert_eq!(run.status, OrchestratorRunStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("server restarted"));
+
+        let lock_rows = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM orchestrator_locks WHERE lock_name = ?",
+        )
+        .bind(APPLY_LOCK_NAME)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(lock_rows, 0, "stale apply lock should be cleared");
 
         Ok(())
     }
