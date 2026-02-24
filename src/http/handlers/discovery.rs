@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result as AnyResult, bail};
 use axum::{
@@ -11,6 +11,8 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use tokio::net::lookup_host;
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
@@ -830,31 +832,22 @@ fn collect_search_providers(
     providers: &[ProviderContext],
     media_type: MediaType,
 ) -> Vec<ProviderContext> {
-    let mut out: Vec<_> = providers
+    let mut candidates: Vec<_> = providers
         .iter()
         .filter(|provider| provider.media_types.contains(&media_type))
         .filter(|provider| provider.detail.provider.health_state != ProviderHealthState::Unhealthy)
         .filter(|provider| {
-            let capability = provider.detail.provider.capability.as_str();
-            if capability.starts_with("media.search.") {
-                return true;
-            }
-            // Compatibility: managers can also back search in v1.
-            capability.starts_with("media.manager.")
+            provider
+                .detail
+                .provider
+                .capability
+                .starts_with("media.search.")
         })
         .filter(|provider| provider_supports_action(provider, "search"))
-        .filter(
-            |provider| match provider.detail.provider.implementation.as_deref() {
-                Some(value) => {
-                    let value = value.trim().to_ascii_lowercase();
-                    value == "sonarr" || value == "radarr"
-                }
-                None => false,
-            },
-        )
         .cloned()
         .collect();
-    out.sort_by(|left, right| {
+
+    candidates.sort_by(|left, right| {
         let by_extension = left.detail.extension_id.cmp(&right.detail.extension_id);
         if by_extension == std::cmp::Ordering::Equal {
             left.detail
@@ -865,6 +858,18 @@ fn collect_search_providers(
             by_extension
         }
     });
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for provider in candidates {
+        let key = (
+            provider.detail.provider.instance_id,
+            provider.detail.provider.implementation.clone(),
+        );
+        if seen.insert(key) {
+            out.push(provider);
+        }
+    }
     out
 }
 
@@ -1049,7 +1054,7 @@ async fn execute_find_media_search(
     )
     .await
     .map_err(ApiError::from)?;
-    let (manager_contexts, manager_errors) = filter_manager_providers(
+    let (manager_contexts, _manager_errors) = filter_manager_providers(
         state,
         &store,
         collect_manager_providers(&providers, media_type),
@@ -1064,10 +1069,6 @@ async fn execute_find_media_search(
             message: error.message,
         })
         .collect();
-    provider_errors.extend(manager_errors.into_iter().map(|error| ProviderSearchError {
-        provider_id: error.provider.detail.provider.provider_id,
-        message: error.message,
-    }));
 
     let search_providers: Vec<ProviderSummary> =
         search_contexts.iter().map(provider_summary).collect();
@@ -1084,6 +1085,7 @@ async fn execute_find_media_search(
         blueprint_preferred,
         &manager_contexts,
     );
+    let has_requested_provider_filter = !requested_provider_ids.is_empty();
 
     let filtered_search_contexts = if requested_provider_ids.is_empty() {
         search_contexts
@@ -1134,6 +1136,36 @@ async fn execute_find_media_search(
                     provider_id: provider.detail.provider.provider_id,
                     message: err.to_string(),
                 });
+            }
+        }
+    }
+
+    // Keep Find Media usable when manager-backed search providers are unavailable.
+    if merged.is_empty() && !has_requested_provider_filter {
+        const METADATA_SOURCE_LABEL: &str = "Elixir Metadata";
+        if let Ok(results) = state
+            .metadata
+            .discovery_search(&query, Some(media_type))
+            .await
+        {
+            for result in results {
+                let key = discovery_result_key(&result);
+                let entry = merged.entry(key).or_insert_with(|| FindMediaResult {
+                    title: result.title.clone(),
+                    r#type: result.r#type,
+                    year: result.year,
+                    external_ids: result.external_ids.clone(),
+                    description: result.description.clone(),
+                    source_provider_ids: Vec::new(),
+                    source_labels: Vec::new(),
+                });
+                if !entry
+                    .source_labels
+                    .iter()
+                    .any(|label| label == METADATA_SOURCE_LABEL)
+                {
+                    entry.source_labels.push(METADATA_SOURCE_LABEL.to_string());
+                }
             }
         }
     }
@@ -1252,8 +1284,14 @@ fn discovery_result_key(result: &DiscoveryResult) -> String {
         if let Some(value) = ids.tmdb.as_deref() {
             return format!("tmdb:{}", value.trim().to_ascii_lowercase());
         }
+        if let Some(value) = ids.tvdb_movie.as_deref() {
+            return format!("tvdb_movie:{}", value.trim().to_ascii_lowercase());
+        }
         if let Some(value) = ids.tvdb_series.as_deref() {
             return format!("tvdb_series:{}", value.trim().to_ascii_lowercase());
+        }
+        if let Some(value) = ids.tvdb.as_deref() {
+            return format!("tvdb:{}", value.trim().to_ascii_lowercase());
         }
         if let Some(value) = ids.anilist.as_deref() {
             return format!("anilist:{}", value.trim().to_ascii_lowercase());
@@ -1575,7 +1613,9 @@ async fn add_with_manager_provider(
         .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
     let endpoint: ProviderEndpoint =
         serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let base_url = endpoint.canonical_url()?;
+    let base_url =
+        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
+            .await?;
     let implementation = provider
         .detail
         .provider
@@ -1753,7 +1793,13 @@ async fn add_with_radarr(
 
 fn lookup_term_for_item(item: &FindMediaAddItem) -> String {
     if let Some(ids) = item.external_ids.as_ref() {
+        if let Some(value) = ids.tvdb_movie.as_deref() {
+            return value.trim().to_string();
+        }
         if let Some(value) = ids.tvdb_series.as_deref() {
+            return value.trim().to_string();
+        }
+        if let Some(value) = ids.tvdb.as_deref() {
             return value.trim().to_string();
         }
         if let Some(value) = ids.tmdb.as_deref() {
@@ -1793,6 +1839,31 @@ fn lookup_item_matches(value: &Value, item: &FindMediaAddItem, media_type: Media
     };
 
     if let Some(tvdb) = external_ids.tvdb_series.as_deref() {
+        if value
+            .get("tvdbId")
+            .and_then(as_id_string)
+            .map(|id| id == tvdb.trim())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    if media_type == MediaType::Movie {
+        if let Some(tvdb) = external_ids
+            .tvdb_movie
+            .as_deref()
+            .or(external_ids.tvdb.as_deref())
+        {
+            if value
+                .get("tvdbId")
+                .and_then(as_id_string)
+                .map(|id| id == tvdb.trim())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    } else if let Some(tvdb) = external_ids.tvdb.as_deref() {
         if value
             .get("tvdbId")
             .and_then(as_id_string)
@@ -1890,7 +1961,9 @@ async fn search_with_provider(
         .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
     let endpoint: ProviderEndpoint =
         serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let base_url = endpoint.canonical_url()?;
+    let base_url =
+        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
+            .await?;
 
     let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
 
@@ -2168,6 +2241,102 @@ async fn request_arr_write(
     }
 
     bail!("manager endpoint is not available")
+}
+
+async fn resolve_provider_transport_base_url(
+    instance_id: Uuid,
+    endpoint: &ProviderEndpoint,
+) -> AnyResult<String> {
+    let canonical = endpoint.canonical_url()?;
+    if endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+        return Ok(canonical);
+    }
+
+    if let Some(host_port) = lookup_docker_published_port(instance_id, endpoint.port).await? {
+        let base_path = if endpoint.base_path.trim().is_empty() {
+            "/"
+        } else {
+            endpoint.base_path.as_str()
+        };
+        return Ok(format!(
+            "{}://127.0.0.1:{}{}",
+            endpoint.scheme, host_port, base_path
+        ));
+    }
+
+    bail!(
+        "provider endpoint {}:{} is not reachable from server host and has no published host port",
+        endpoint.host,
+        endpoint.port
+    );
+}
+
+async fn endpoint_host_resolves(host: &str, port: u16) -> bool {
+    lookup_host((host, port))
+        .await
+        .map(|mut values| values.next().is_some())
+        .unwrap_or(false)
+}
+
+async fn lookup_docker_published_port(
+    instance_id: Uuid,
+    container_port: u16,
+) -> AnyResult<Option<u16>> {
+    let container_names = run_docker_stdout(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label=elixir.instance_id={instance_id}"),
+        "--format",
+        "{{.Names}}",
+    ])
+    .await?;
+    let Some(container_name) = container_names
+        .lines()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let ports_json = run_docker_stdout(&[
+        "inspect",
+        "--format",
+        "{{json .NetworkSettings.Ports}}",
+        container_name,
+    ])
+    .await?;
+    let ports: Value =
+        serde_json::from_str(ports_json.trim()).context("parsing docker ports inspect output")?;
+    let key = format!("{container_port}/tcp");
+    let binding = ports
+        .get(&key)
+        .and_then(Value::as_array)
+        .and_then(|values| values.first());
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    let host_port = binding
+        .get("HostPort")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .ok();
+    Ok(host_port)
+}
+
+async fn run_docker_stdout(args: &[&str]) -> AnyResult<String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("executing docker {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("docker {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(String::from_utf8(output.stdout).context("docker output was not utf-8")?)
 }
 
 fn build_arr_client(api_key: &str) -> AnyResult<Client> {

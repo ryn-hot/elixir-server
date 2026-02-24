@@ -10,7 +10,7 @@ use reqwest::{
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::debug;
 
 use crate::drivers::patches::{
     DownloaderSpec, IndexerSpec, MediaManagerMoviesPatch, RootFolderSpec,
@@ -536,15 +536,23 @@ fn apply_downloader_fields(fields: &mut Vec<Value>, spec: &DownloaderSpec) -> Re
         set_field_value_optional(fields, "apiKey", Value::String(api_key.clone()))?;
     }
     if let Some(category) = spec.category.as_ref() {
-        if !set_field_value_optional(fields, "category", Value::String(category.clone()))?
-            && !set_field_value_optional(fields, "tvCategory", Value::String(category.clone()))?
-        {
-            warn!("download client category field not found");
+        let category_value = Value::String(category.clone());
+        let has_category = set_field_value_optional(fields, "category", category_value.clone())?
+            || set_field_value_optional(fields, "movieCategory", category_value.clone())?
+            || set_field_value_optional(fields, "tvCategory", category_value)?;
+        if !has_category {
+            debug!(
+                "download client category is unsupported by schema for type '{}'; skipping",
+                spec.r#type
+            );
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("download client field '{}' not found in schema", key);
+            debug!(
+                "download client field '{}' not present in schema; skipping",
+                key
+            );
         }
     }
     Ok(())
@@ -563,12 +571,12 @@ fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<(
     if !spec.categories.is_empty() {
         let categories = parse_int_list(&spec.categories)?;
         if !set_field_value_optional(fields, "categories", Value::Array(categories))? {
-            warn!("indexer categories field not found");
+            debug!("indexer categories field not present in schema; skipping categories");
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("indexer field '{}' not found in schema", key);
+            debug!("indexer field '{}' not present in schema; skipping", key);
         }
     }
     Ok(())
@@ -697,6 +705,33 @@ mod tests {
         );
         assert_eq!(
             value_for_field(&fields, "tvCategory").cloned(),
+            Some(json!("movies"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_downloader_fields_sets_movie_category_when_present() -> Result<()> {
+        let mut fields = vec![
+            json!({"name": "baseUrl", "value": ""}),
+            json!({"name": "movieCategory", "value": ""}),
+        ];
+        let spec = DownloaderSpec {
+            name: "qBittorrent".to_string(),
+            r#type: "qbittorrent".to_string(),
+            url: "http://elx-qbittorrent:8080".to_string(),
+            api_key: None,
+            category: Some("movies".to_string()),
+            tags: Vec::new(),
+            enabled: Some(true),
+            settings: HashMap::new(),
+        };
+
+        apply_downloader_fields(&mut fields, &spec)?;
+
+        assert_eq!(
+            value_for_field(&fields, "movieCategory").cloned(),
             Some(json!("movies"))
         );
 

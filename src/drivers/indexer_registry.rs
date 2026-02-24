@@ -7,7 +7,7 @@ use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::debug;
 
 use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
 use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
@@ -246,16 +246,12 @@ impl ProwlarrClient {
         }
         let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
         let existing = self.get_json::<Vec<Value>>("indexer").await?;
-        let mut skipped = 0usize;
+        let mut skipped: Vec<(String, String)> = Vec::new();
 
         for indexer in indexers {
             let tags = self.ensure_tags(&indexer.tags).await?;
             let Some(schema_item) = find_schema_optional(&schema, &indexer.implementation) else {
-                skipped += 1;
-                warn!(
-                    "prowlarr indexer implementation '{}' is unavailable; skipping indexer '{}'",
-                    indexer.implementation, indexer.name
-                );
+                skipped.push((indexer.name.clone(), indexer.implementation.clone()));
                 continue;
             };
             let existing_item = find_by_name(&existing, &indexer.name);
@@ -289,9 +285,11 @@ impl ProwlarrClient {
                 self.post_json("indexer", &target).await?;
             }
         }
-        if skipped > 0 {
-            warn!(
-                "prowlarr skipped {skipped} indexer(s) because implementations were unavailable in schema"
+        if !skipped.is_empty() {
+            debug!(
+                skipped = skipped.len(),
+                skipped_indexers = ?skipped,
+                "prowlarr skipped indexers that are unavailable in current schema"
             );
         }
         Ok(())
@@ -552,17 +550,41 @@ fn find_schema(items: &[Value], implementation: &str) -> Result<Value> {
 
 fn find_schema_optional(items: &[Value], implementation: &str) -> Option<Value> {
     let needle = normalize_name(implementation);
-    items.iter().find_map(|value| {
-        let implementation_value = value
+    let exact = items.iter().find_map(|value| {
+        let matches = value
             .get("implementation")
             .and_then(Value::as_str)
-            .or_else(|| value.get("implementationName").and_then(Value::as_str))?;
-        if normalize_name(implementation_value) == needle {
-            Some(value.clone())
-        } else {
-            None
-        }
-    })
+            .into_iter()
+            .chain(value.get("implementationName").and_then(Value::as_str))
+            .chain(value.get("name").and_then(Value::as_str))
+            .any(|candidate| normalize_name(candidate) == needle);
+        if matches { Some(value.clone()) } else { None }
+    });
+    if exact.is_some() {
+        return exact;
+    }
+
+    // Fallback for minor naming drift between manifests and live schema
+    // (for example short-name vs implementationName) while remaining deterministic.
+    let fuzzy: Vec<Value> = items
+        .iter()
+        .filter_map(|value| {
+            let matches = value
+                .get("implementation")
+                .and_then(Value::as_str)
+                .into_iter()
+                .chain(value.get("implementationName").and_then(Value::as_str))
+                .chain(value.get("name").and_then(Value::as_str))
+                .map(normalize_name)
+                .any(|candidate| candidate.starts_with(&needle) || needle.starts_with(&candidate));
+            if matches { Some(value.clone()) } else { None }
+        })
+        .collect();
+
+    if fuzzy.len() == 1 {
+        return fuzzy.into_iter().next();
+    }
+    None
 }
 
 fn ensure_schema_fields(target: &mut Value, implementation: &str) -> Result<()> {
@@ -604,12 +626,12 @@ fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<(
     if !spec.categories.is_empty() {
         let categories = parse_int_list(&spec.categories)?;
         if !set_field_value_optional(fields, "categories", Value::Array(categories))? {
-            warn!("indexer categories field not found");
+            debug!("indexer categories field not present in schema; skipping categories");
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("indexer field '{}' not found in schema", key);
+            debug!("indexer field '{}' not present in schema; skipping", key);
         }
     }
     Ok(())
@@ -635,12 +657,12 @@ fn apply_app_fields(fields: &mut Vec<Value>, spec: &AppSpec, prowlarr_url: &str)
     if !spec.categories.is_empty() {
         let categories = parse_int_list(&spec.categories)?;
         if !set_field_value_optional(fields, "syncCategories", Value::Array(categories))? {
-            warn!("app syncCategories field not found");
+            debug!("app syncCategories field not present in schema; skipping categories");
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("app field '{}' not found in schema", key);
+            debug!("app field '{}' not present in schema; skipping", key);
         }
     }
     Ok(())
@@ -808,6 +830,24 @@ mod tests {
         assert!(
             found.is_none(),
             "missing implementation should be skipped by optional lookup"
+        );
+    }
+
+    #[test]
+    fn find_schema_optional_matches_single_fuzzy_candidate() {
+        let schema = vec![
+            json!({"implementation": "NyaaSi"}),
+            json!({"implementation": "Newznab"}),
+        ];
+
+        let found = find_schema_optional(&schema, "Nyaa");
+        assert!(found.is_some(), "expected fuzzy implementation match");
+        assert_eq!(
+            found
+                .as_ref()
+                .and_then(|value| value.get("implementation"))
+                .and_then(Value::as_str),
+            Some("NyaaSi")
         );
     }
 

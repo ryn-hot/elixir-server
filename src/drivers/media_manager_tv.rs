@@ -7,7 +7,7 @@ use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::debug;
 
 use crate::drivers::patches::{
     CustomFormatSpec, DownloaderSpec, IndexerSpec, LanguageProfileSpec, MediaManagerTvPatch,
@@ -948,12 +948,12 @@ fn apply_indexer_fields(fields: &mut Vec<Value>, spec: &IndexerSpec) -> Result<(
     if !spec.categories.is_empty() {
         let categories = parse_int_list(&spec.categories)?;
         if !set_field_value_optional(fields, "categories", Value::Array(categories))? {
-            warn!("indexer categories field not found");
+            debug!("indexer categories field not present in schema; skipping categories");
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("indexer field '{}' not found in schema", key);
+            debug!("indexer field '{}' not present in schema; skipping", key);
         }
     }
     Ok(())
@@ -968,12 +968,18 @@ fn apply_downloader_fields(fields: &mut Vec<Value>, spec: &DownloaderSpec) -> Re
         if !set_field_value_optional(fields, "category", Value::String(category.clone()))?
             && !set_field_value_optional(fields, "tvCategory", Value::String(category.clone()))?
         {
-            warn!("download client category field not found");
+            debug!(
+                "download client category is unsupported by schema for type '{}'; skipping",
+                spec.r#type
+            );
         }
     }
     for (key, value) in &spec.settings {
         if !set_field_value_optional(fields, key, value.clone())? {
-            warn!("download client field '{}' not found in schema", key);
+            debug!(
+                "download client field '{}' not present in schema; skipping",
+                key
+            );
         }
     }
     Ok(())

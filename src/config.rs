@@ -133,6 +133,9 @@ impl Settings {
                 "extensions.apply_lock_ttl_seconds",
                 default_apply_lock_ttl_seconds(),
             )?
+            .set_default("metadata.enable_tvdb", true)?
+            .set_default("metadata.tvdb_base_url", default_tvdb_base_url())?
+            .set_default("metadata.cinemeta_base_url", default_cinemeta_base_url())?
             .set_default("metadata.enable_cinemeta", true)?
             .set_default("metadata.enable_anilist", true)?
             .set_default("metadata.enable_aniapi", true)?
@@ -202,6 +205,19 @@ impl Settings {
         self.library.artwork_cache_dir = normalize_path(&self.library.artwork_cache_dir, base_dir);
         self.extensions.storage_root = normalize_path(&self.extensions.storage_root, base_dir);
         self.extensions.bundled_dir = normalize_path(&self.extensions.bundled_dir, base_dir);
+        if self.metadata.tvdb_base_url.trim().is_empty() {
+            self.metadata.tvdb_base_url = self.classifier.tvdb_base_url.clone();
+        }
+        if self
+            .metadata
+            .tvdb_api_key
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            self.metadata.tvdb_api_key = self.classifier.tvdb_api_key.clone();
+        }
         Ok(())
     }
 }
@@ -415,6 +431,14 @@ impl Default for ExtensionsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetadataConfig {
     #[serde(default = "default_true")]
+    pub enable_tvdb: bool,
+    #[serde(default = "default_tvdb_base_url")]
+    pub tvdb_base_url: String,
+    #[serde(default)]
+    pub tvdb_api_key: Option<String>,
+    #[serde(default = "default_cinemeta_base_url")]
+    pub cinemeta_base_url: String,
+    #[serde(default = "default_true")]
     pub enable_cinemeta: bool,
     #[serde(default = "default_true")]
     pub enable_anilist: bool,
@@ -431,6 +455,10 @@ pub struct MetadataConfig {
 impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
+            enable_tvdb: default_true(),
+            tvdb_base_url: default_tvdb_base_url(),
+            tvdb_api_key: None,
+            cinemeta_base_url: default_cinemeta_base_url(),
             enable_cinemeta: default_true(),
             enable_anilist: default_true(),
             enable_aniapi: default_true(),
@@ -632,6 +660,10 @@ fn default_classifier_timeout_seconds() -> u64 {
 
 fn default_tvdb_base_url() -> String {
     "https://api4.thetvdb.com/v4".to_string()
+}
+
+fn default_cinemeta_base_url() -> String {
+    "https://v3-cinemeta.strem.io".to_string()
 }
 
 fn default_anizip_base_url() -> String {

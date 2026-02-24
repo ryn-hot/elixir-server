@@ -247,7 +247,19 @@ pub fn router(state: AppState) -> Router {
             get(handlers::discovery::find_media_targets),
         )
         .route(
+            "/api/v1/find/targets",
+            get(handlers::discovery::find_media_targets),
+        )
+        .route(
+            "/api/v1/find/managers",
+            get(handlers::discovery::find_media_targets),
+        )
+        .route(
             "/api/v1/find-media/search",
+            post(handlers::discovery::find_media_search),
+        )
+        .route(
+            "/api/v1/find/search",
             post(handlers::discovery::find_media_search),
         )
         .route(
@@ -255,7 +267,16 @@ pub fn router(state: AppState) -> Router {
             post(handlers::discovery::find_media_add),
         )
         .route(
+            "/api/v1/find/add",
+            post(handlers::discovery::find_media_add),
+        )
+        .route(
             "/api/v1/find-media/preferences",
+            get(handlers::discovery::find_media_preferences)
+                .patch(handlers::discovery::patch_find_media_preferences),
+        )
+        .route(
+            "/api/v1/find/preferences",
             get(handlers::discovery::find_media_preferences)
                 .patch(handlers::discovery::patch_find_media_preferences),
         )

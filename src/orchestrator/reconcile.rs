@@ -418,6 +418,26 @@ impl<'a> Reconciler<'a> {
             )
             .await?;
 
+        if pending_run.is_none() && missing.is_empty() && !unresolved {
+            if let Some(previous) = self
+                .store
+                .get_latest_run_by_source(
+                    "auto_wire",
+                    Some(crate::db::models::OrchestratorRunStatus::Completed),
+                )
+                .await?
+            {
+                if let Some(previous_plan_json) = previous.plan_json {
+                    if auto_wire_plan_equivalent(&previous_plan_json, &plan) {
+                        metrics::RECONCILE_ACTIONS
+                            .with_label_values(&["auto_wire_plan", "unchanged"])
+                            .inc();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         if !missing.is_empty() || unresolved {
             let run_id = pending_run
                 .as_ref()
@@ -1009,6 +1029,23 @@ fn parse_endpoint(value: &Option<serde_json::Value>) -> Result<ProviderEndpoint>
         serde_json::from_value(value).context("parsing provider endpoint")?;
     endpoint.validate()?;
     Ok(endpoint)
+}
+
+fn auto_wire_plan_equivalent(previous_plan_json: &serde_json::Value, current_plan: &Plan) -> bool {
+    let previous_plan = match serde_json::from_value::<Plan>(previous_plan_json.clone()) {
+        Ok(plan) => plan,
+        Err(_) => return false,
+    };
+
+    let previous_signature = serde_json::json!({
+        "actions": previous_plan.actions,
+        "conflicts": previous_plan.conflicts,
+    });
+    let current_signature = serde_json::json!({
+        "actions": &current_plan.actions,
+        "conflicts": &current_plan.conflicts,
+    });
+    previous_signature == current_signature
 }
 
 #[cfg(test)]
@@ -2016,6 +2053,82 @@ mod tests {
                 .iter()
                 .any(|step| step.action_type == "apply_driver_patch"),
             "expected apply_driver_patch step"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_wire_skips_when_plan_unchanged() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let fixture = seed_auto_wire_indexer(&store).await?;
+
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let encrypted = secrets.encrypt("test-key")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(fixture.instance_id),
+                key: fixture.secret_key.clone(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let mut drivers = DriverRegistry::new();
+        drivers.register(StubIndexerDriver::default());
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            &config,
+        );
+        reconciler.run_once().await?;
+        let first_completed = store
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.source == "auto_wire" && run.status == OrchestratorRunStatus::Completed
+            })
+            .count();
+        assert_eq!(first_completed, 1);
+
+        reconciler.run_once().await?;
+        let second_completed = store
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.source == "auto_wire" && run.status == OrchestratorRunStatus::Completed
+            })
+            .count();
+        assert_eq!(
+            second_completed, 1,
+            "unchanged auto-wire plan should not create another completed run"
         );
 
         Ok(())

@@ -759,9 +759,49 @@ async fn discovery_requires_auth() -> Result<()> {
     assert_eq!(find_add_resp.status(), StatusCode::UNAUTHORIZED);
 
     let find_prefs_resp = app
+        .clone()
         .oneshot(Request::get("/api/v1/find-media/preferences").body(Body::empty())?)
         .await?;
     assert_eq!(find_prefs_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let alias_targets_resp = app
+        .clone()
+        .oneshot(Request::get("/api/v1/find/targets?media_type=tv").body(Body::empty())?)
+        .await?;
+    assert_eq!(alias_targets_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let alias_search_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"mediaType":"tv","query":"test"}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(alias_search_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let alias_add_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find/add")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "item": { "title": "Test Title" }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(alias_add_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let alias_prefs_resp = app
+        .oneshot(Request::get("/api/v1/find/preferences").body(Body::empty())?)
+        .await?;
+    assert_eq!(alias_prefs_resp.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
 
@@ -1305,7 +1345,10 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/discovery/find?q=naruto&type=anime")
+            Request::get(format!(
+                "/api/v1/discovery/find?q=naruto&type=anime&provider_id={}",
+                sonarr_anime_search_provider_id
+            ))
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())?,
         )
@@ -1325,7 +1368,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert_eq!(search_providers.len(), 2);
+    assert_eq!(search_providers.len(), 1);
     let manager_providers = payload
         .get("managerProviders")
         .and_then(Value::as_array)
@@ -1343,7 +1386,6 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         .iter()
         .filter_map(|provider| provider.get("providerId").and_then(Value::as_str))
         .collect();
-    assert!(provider_ids.contains(&sonarr_manager_provider_id_text.as_str()));
     assert!(provider_ids.contains(&sonarr_anime_search_provider_id_text.as_str()));
 
     let provider_errors = payload
@@ -1351,7 +1393,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert_eq!(provider_errors.len(), 2);
+    assert_eq!(provider_errors.len(), 1);
     assert_eq!(
         payload
             .get("results")
@@ -1380,7 +1422,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .get("searchProviders")
             .and_then(Value::as_array)
             .map(|items| items.len()),
-        Some(2)
+        Some(1)
     );
     assert_eq!(
         targets_json
@@ -1390,7 +1432,27 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         Some(1)
     );
 
+    let managers_alias_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find/managers?media_type=anime")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(managers_alias_resp.status(), StatusCode::OK);
+    let managers_alias_body = body::to_bytes(managers_alias_resp.into_body(), 1_048_576).await?;
+    let managers_alias_json: Value = serde_json::from_slice(&managers_alias_body)?;
+    assert_eq!(
+        managers_alias_json
+            .get("managerCandidates")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(1)
+    );
+
     let search_resp = app
+        .clone()
         .oneshot(
             Request::post("/api/v1/find-media/search")
                 .header("authorization", format!("Bearer {token}"))
@@ -1416,7 +1478,98 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .get("providerErrors")
             .and_then(Value::as_array)
             .map(|items| items.len()),
-        Some(2)
+        Some(1)
+    );
+
+    let search_alias_resp = app
+        .oneshot(
+            Request::post("/api/v1/find/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "anime",
+                        "query": "naruto"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(search_alias_resp.status(), StatusCode::OK);
+    let search_alias_body = body::to_bytes(search_alias_resp.into_body(), 1_048_576).await?;
+    let search_alias_json: Value = serde_json::from_slice(&search_alias_body)?;
+    assert_eq!(
+        search_alias_json
+            .get("providerErrors")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(1)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_search_without_providers_returns_ok() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-no-providers-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-no-providers@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "movies",
+                        "query": "matrix"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("mediaType").and_then(Value::as_str),
+        Some("movies")
+    );
+    assert!(payload.get("results").and_then(Value::as_array).is_some());
+    assert_eq!(
+        payload
+            .get("providerErrors")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(0)
     );
 
     Ok(())

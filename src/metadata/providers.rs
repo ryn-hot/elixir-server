@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::{
     db::models::MediaType,
     extensions::{ExternalIds, MediaIdentity},
-    metadata::provider_types::MetadataResult,
+    metadata::provider_types::{DiscoveryResult, MetadataResult},
 };
 
 pub mod cinemeta {
@@ -32,18 +32,20 @@ pub mod cinemeta {
     pub async fn fetch(
         client: &Client,
         identity: &MediaIdentity,
+        base_url: &str,
     ) -> Result<Option<MetadataResult>> {
         let media_kind = match identity.r#type {
             MediaType::Movie => "movie",
             MediaType::Series | MediaType::Anime => "series",
         };
+        let base_url = normalize_base_url(base_url);
+        if base_url.is_empty() {
+            return Ok(None);
+        }
 
         // Try by imdb id if present.
         if let Some(imdb) = identity.external_ids.imdb.as_ref() {
-            let url = format!(
-                "https://v3-cinemeta.strem.io/meta/{}/{}.json",
-                media_kind, imdb
-            );
+            let url = format!("{}/meta/{}/{}.json", base_url, media_kind, imdb);
             if let Ok(res) = client.get(&url).send().await {
                 if res.status().is_success() {
                     if let Ok(body) = res.json::<CineMetaResponse>().await {
@@ -68,10 +70,7 @@ pub mod cinemeta {
 
         // Fallback to search by title.
         let query = urlencoding::encode(&identity.title);
-        let url = format!(
-            "https://v3-cinemeta.strem.io/meta/{}/search={}.json",
-            media_kind, query
-        );
+        let url = format!("{}/meta/{}/search={}.json", base_url, media_kind, query);
         let res = client.get(&url).send().await?;
         if !res.status().is_success() {
             return Ok(None);
@@ -103,22 +102,250 @@ pub mod cinemeta {
         client: &Client,
         query: &str,
         media_kind: &str,
+        base_url: &str,
     ) -> Result<Vec<CineMetaItem>> {
         #[derive(Debug, Deserialize)]
         struct SearchResp {
             metas: Option<Vec<CineMetaItem>>,
         }
+        let base_url = normalize_base_url(base_url);
+        if base_url.is_empty() {
+            return Ok(Vec::new());
+        }
         let encoded = urlencoding::encode(query);
-        let url = format!(
-            "https://v3-cinemeta.strem.io/meta/{}/search={}.json",
-            media_kind, encoded
-        );
+        let url = format!("{}/meta/{}/search={}.json", base_url, media_kind, encoded);
         let res = client.get(&url).send().await?;
         if !res.status().is_success() {
             return Ok(Vec::new());
         }
         let body: SearchResp = res.json().await?;
         Ok(body.metas.unwrap_or_default())
+    }
+
+    fn normalize_base_url(base_url: &str) -> String {
+        base_url.trim().trim_end_matches('/').to_string()
+    }
+}
+
+pub mod tvdb {
+    use super::*;
+    use serde_json::Value;
+
+    pub fn map_search_results(
+        items: &[Value],
+        fallback_query: &str,
+        media_type: MediaType,
+    ) -> Vec<DiscoveryResult> {
+        let mut results = Vec::new();
+        for item in items {
+            if !tvdb_result_matches_media_type(item, media_type) {
+                continue;
+            }
+            let Some(tvdb_id) = extract_tvdb_id(item) else {
+                continue;
+            };
+
+            let title = select_title(item, fallback_query);
+            let year = extract_year(item);
+            let description = item
+                .get("overview")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+            let imdb = extract_remote_id(item, &["imdb"], true);
+            let tmdb = extract_remote_id(item, &["tmdb", "themoviedb"], false);
+
+            let (tvdb_series, tvdb_movie) = match media_type {
+                MediaType::Movie => (None, Some(tvdb_id.clone())),
+                MediaType::Series | MediaType::Anime => (Some(tvdb_id.clone()), None),
+            };
+
+            results.push(DiscoveryResult {
+                title,
+                r#type: media_type,
+                year,
+                external_ids: Some(ExternalIds {
+                    imdb,
+                    tmdb,
+                    tvdb: Some(tvdb_id),
+                    tvdb_series,
+                    tvdb_movie,
+                    ..Default::default()
+                }),
+                description,
+            });
+        }
+        results
+    }
+
+    fn tvdb_result_matches_media_type(value: &Value, media_type: MediaType) -> bool {
+        let expected = match media_type {
+            MediaType::Movie => "movie",
+            MediaType::Series | MediaType::Anime => "series",
+        };
+        let actual = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase());
+        if let Some(actual) = actual {
+            if expected == "movie" {
+                return actual.contains("movie");
+            }
+            if actual.contains("series") || actual.contains("show") || actual.contains("tv") {
+                return true;
+            }
+            return false;
+        }
+        if expected == "movie" {
+            return value
+                .get("isMovie")
+                .and_then(Value::as_i64)
+                .map(|flag| flag == 1)
+                .unwrap_or(true);
+        }
+        true
+    }
+
+    fn extract_tvdb_id(value: &Value) -> Option<String> {
+        value
+            .get("tvdb_id")
+            .or_else(|| value.get("tvdbId"))
+            .or_else(|| value.get("id"))
+            .and_then(as_string)
+    }
+
+    fn select_title(value: &Value, fallback_query: &str) -> String {
+        let title = value
+            .get("name")
+            .or_else(|| value.get("title"))
+            .or_else(|| value.get("name_translated"))
+            .or_else(|| value.get("seriesName"))
+            .or_else(|| value.get("movieName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_query);
+        title.to_string()
+    }
+
+    fn extract_year(value: &Value) -> Option<i32> {
+        if let Some(year) = value.get("year").and_then(Value::as_i64) {
+            return Some(year as i32);
+        }
+        if let Some(year) = value.get("year").and_then(Value::as_str) {
+            return parse_year_text(year);
+        }
+        if let Some(first_air_time) = value.get("first_air_time").and_then(Value::as_str) {
+            return parse_year_text(first_air_time);
+        }
+        if let Some(first_aired) = value.get("firstAired").and_then(Value::as_str) {
+            return parse_year_text(first_aired);
+        }
+        None
+    }
+
+    fn parse_year_text(value: &str) -> Option<i32> {
+        let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() < 4 {
+            return None;
+        }
+        digits.get(0..4)?.parse::<i32>().ok()
+    }
+
+    fn extract_remote_id(
+        value: &Value,
+        sources: &[&str],
+        allow_prefix_match: bool,
+    ) -> Option<String> {
+        let array = value
+            .get("remote_ids")
+            .or_else(|| value.get("remoteIds"))
+            .and_then(Value::as_array)?;
+        for item in array {
+            let source = item
+                .get("sourceName")
+                .or_else(|| item.get("source_name"))
+                .or_else(|| item.get("source"))
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let id = item.get("id").and_then(as_string)?;
+            let lower_id = id.to_ascii_lowercase();
+            if allow_prefix_match && lower_id.starts_with("tt") {
+                return Some(id);
+            }
+            if sources.iter().any(|expected| source.contains(expected)) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn as_string(value: &Value) -> Option<String> {
+        if let Some(text) = value.as_str() {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+        if let Some(number) = value.as_i64() {
+            return Some(number.to_string());
+        }
+        if let Some(number) = value.as_u64() {
+            return Some(number.to_string());
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn maps_tvdb_movie_search_result() {
+            let items = vec![json!({
+                "id": "550",
+                "type": "movie",
+                "name": "Fight Club",
+                "overview": "Desc",
+                "year": "1999",
+                "remote_ids": [
+                    { "sourceName": "IMDB", "id": "tt0137523" },
+                    { "sourceName": "TheMovieDB.com", "id": "550" }
+                ]
+            })];
+            let mapped = map_search_results(&items, "fight club", MediaType::Movie);
+            assert_eq!(mapped.len(), 1);
+            let result = &mapped[0];
+            assert_eq!(result.title, "Fight Club");
+            assert_eq!(result.year, Some(1999));
+            let ids = result.external_ids.as_ref().expect("external ids");
+            assert_eq!(ids.imdb.as_deref(), Some("tt0137523"));
+            assert_eq!(ids.tmdb.as_deref(), Some("550"));
+            assert_eq!(ids.tvdb_movie.as_deref(), Some("550"));
+        }
+
+        #[test]
+        fn ignores_non_series_results_for_series_search() {
+            let items = vec![
+                json!({
+                    "id": "123",
+                    "type": "movie",
+                    "name": "Movie Result"
+                }),
+                json!({
+                    "id": "456",
+                    "type": "series",
+                    "name": "Series Result"
+                }),
+            ];
+            let mapped = map_search_results(&items, "query", MediaType::Series);
+            assert_eq!(mapped.len(), 1);
+            assert_eq!(mapped[0].title, "Series Result");
+            let ids = mapped[0].external_ids.as_ref().expect("external ids");
+            assert_eq!(ids.tvdb_series.as_deref(), Some("456"));
+        }
     }
 }
 
