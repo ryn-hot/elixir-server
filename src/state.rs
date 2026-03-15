@@ -10,6 +10,7 @@ use crate::{
     metadata::MetadataService,
     orchestrator::OrchestratorService,
     playback::TranscodeManager,
+    runtime::docker::DockerStartupConfig,
     secrets::SecretsManager,
 };
 use sqlx::AnyPool;
@@ -47,7 +48,23 @@ impl AppState {
         let orchestrator = OrchestratorService::new(
             db_pool.clone(),
             settings.extensions.storage_root.clone(),
+            settings.extensions.bundled_dir.clone(),
             settings.library.local_root.clone(),
+            settings.network.vpn.wireguard_gateway_image.clone(),
+            if settings.network.vpn.enabled && settings.network.vpn.auto_wrap_qbittorrent {
+                Some(settings.network.vpn.wireguard_config_secret.clone())
+            } else {
+                None
+            },
+            DockerStartupConfig {
+                auto_start_runtime: settings.extensions.docker.auto_start_runtime,
+                startup_timeout: std::time::Duration::from_secs(
+                    settings.extensions.docker.startup_timeout_seconds,
+                ),
+                startup_poll_interval: std::time::Duration::from_millis(
+                    settings.extensions.docker.startup_poll_interval_millis,
+                ),
+            },
             secrets.clone(),
         );
         Self {

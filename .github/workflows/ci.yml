@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -34,3 +35,35 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --all-targets
+
+  probe-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build bundled probe assets
+        run: |
+          chmod +x scripts/build_probe_release.sh
+          scripts/build_probe_release.sh
+
+      - name: Verify bundled probe binaries
+        run: |
+          file extensions/probe/linux/x86_64/elixir-probe
+          file extensions/probe/linux/aarch64/elixir-probe
+
+      - name: Verify bundled probe artifacts are committed
+        run: |
+          if [ -n "$(git status --short -- extensions/probe)" ]; then
+            git status --short -- extensions/probe
+            echo "Bundled probe artifacts are out of date. Run scripts/build_probe_release.sh and commit extensions/probe/."
+            exit 1
+          fi
+
+      - name: Upload bundled probe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: elixir-probe-linux
+          path: |
+            extensions/probe/linux/x86_64/elixir-probe
+            extensions/probe/linux/aarch64/elixir-probe

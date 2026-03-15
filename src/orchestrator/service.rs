@@ -8,14 +8,20 @@ use crate::orchestrator::executor::{Executor, ExecutorAction};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
 use crate::runtime::RuntimePaths;
-use crate::runtime::docker::DockerRuntimeManager;
+use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
 use crate::secrets::SecretsManager;
+
+const STARTUP_STALE_INSTANCE_GRACE_MINUTES: i64 = 30;
+const KNOWN_STALE_BAZARR_EXTENSION_ID: &str = "elixir.modules.bazarr";
 
 #[derive(Clone)]
 pub struct OrchestratorService {
     pool: AnyPool,
     runtime_paths: RuntimePaths,
+    wireguard_gateway_image: String,
+    default_wireguard_config_secret: Option<String>,
+    docker_startup: DockerStartupConfig,
     drivers: std::sync::Arc<DriverRegistry>,
     secrets: std::sync::Arc<SecretsManager>,
     probe: std::sync::Arc<NetworkProbe>,
@@ -26,17 +32,24 @@ impl OrchestratorService {
     pub fn new(
         pool: AnyPool,
         storage_root: String,
+        bundled_dir: String,
         media_root: String,
+        wireguard_gateway_image: String,
+        default_wireguard_config_secret: Option<String>,
+        docker_startup: DockerStartupConfig,
         secrets: std::sync::Arc<SecretsManager>,
     ) -> Self {
         let runtime_paths = RuntimePaths::from_roots(&storage_root, &media_root);
-        let probe = std::sync::Arc::new(NetworkProbe::new(ProbeConfig::with_storage_root(
-            &storage_root,
-        )));
+        let probe = std::sync::Arc::new(NetworkProbe::new(
+            ProbeConfig::with_storage_and_bundled_dirs(&storage_root, &bundled_dir),
+        ));
         let runtime = std::sync::Arc::new(DockerRuntimeManager::new(None));
         Self {
             pool,
             runtime_paths,
+            wireguard_gateway_image,
+            default_wireguard_config_secret,
+            docker_startup,
             drivers: std::sync::Arc::new(DriverRegistry::with_defaults()),
             secrets,
             probe,
@@ -45,8 +58,18 @@ impl OrchestratorService {
     }
 
     pub async fn apply_actions(&self, actions: Vec<ExecutorAction>) -> Result<()> {
+        self.runtime
+            .ensure_daemon_available(&self.docker_startup)
+            .await?;
         self.apply_actions_with_probe(actions, self.probe.as_ref(), self.runtime.as_ref())
             .await
+    }
+
+    pub async fn prepare_probe_binary(&self) -> Result<()> {
+        self.runtime
+            .ensure_daemon_available(&self.docker_startup)
+            .await?;
+        self.probe.prepare_binary().await
     }
 
     pub fn start_reconcile_loop(self: std::sync::Arc<Self>, config: ReconcileConfig) {
@@ -54,6 +77,13 @@ impl OrchestratorService {
             return;
         }
         tokio::spawn(async move {
+            if !config.startup_settle.is_zero() {
+                tracing::info!(
+                    "orchestrator: waiting {:?} before first reconcile after startup",
+                    config.startup_settle
+                );
+                tokio::time::sleep(config.startup_settle).await;
+            }
             // Run once on startup, then always wait a full interval after each run.
             // This avoids an endless "catch-up" loop when reconcile duration exceeds interval.
             loop {
@@ -90,10 +120,26 @@ impl OrchestratorService {
                 reaped
             );
         }
+
+        let stale_before =
+            Utc::now() - chrono::Duration::minutes(STARTUP_STALE_INSTANCE_GRACE_MINUTES);
+        let pruned = store
+            .prune_stale_suffix_instances(KNOWN_STALE_BAZARR_EXTENSION_ID, "default", stale_before)
+            .await?;
+        if pruned > 0 {
+            tracing::warn!(
+                "orchestrator: pruned {} stale startup instance(s) for {}",
+                pruned,
+                KNOWN_STALE_BAZARR_EXTENSION_ID
+            );
+        }
         Ok(())
     }
 
     pub async fn reconcile_once(&self, config: &ReconcileConfig) -> Result<()> {
+        self.runtime
+            .ensure_daemon_available(&self.docker_startup)
+            .await?;
         self.reconcile_once_with_probe(config, self.probe.as_ref(), self.runtime.as_ref())
             .await
     }
@@ -111,6 +157,8 @@ impl OrchestratorService {
             &self.drivers,
             self.runtime_paths.clone(),
             self.secrets.as_ref(),
+            self.wireguard_gateway_image.clone(),
+            self.default_wireguard_config_secret.clone(),
             config,
         );
         reconciler.run_once().await
@@ -129,7 +177,9 @@ impl OrchestratorService {
             runtime,
             self.runtime_paths.clone(),
             self.secrets.as_ref(),
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
         for action in actions {
             executor.apply(action).await?;
         }
@@ -152,11 +202,11 @@ mod tests {
     use crate::db::Database;
     use crate::db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
-        ProviderHealthState, SlotCardinality,
+        ProviderHealthState, SecretScope, SlotCardinality,
     };
     use crate::extensions::store::{
         ExtensionStore, NewBinding, NewExtension, NewExtensionInstance, NewOrchestratorRun,
-        NewProvider,
+        NewProvider, NewSecret,
     };
     use crate::orchestrator::model::ProviderEndpoint;
     use crate::runtime::probe::{ProbeResult, ProbeRunner};
@@ -301,7 +351,15 @@ mod tests {
         let service = OrchestratorService::new(
             database.pool.clone(),
             "data/extensions".to_string(),
+            "extensions/bundled".to_string(),
             "data/library".to_string(),
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: Duration::from_secs(1),
+                startup_poll_interval: Duration::from_millis(100),
+            },
             Arc::new(secrets),
         );
         let probe = MockProbe::default();
@@ -367,13 +425,22 @@ mod tests {
         let service = OrchestratorService::new(
             database.pool.clone(),
             "/tmp/extensions".to_string(),
+            "/tmp/extensions/bundled".to_string(),
             "/tmp/media".to_string(),
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: Duration::from_secs(1),
+                startup_poll_interval: Duration::from_millis(100),
+            },
             Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
         );
         let reconcile_config = ReconcileConfig {
             interval: Duration::from_secs(60),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -395,6 +462,149 @@ mod tests {
         .fetch_one(&database.pool)
         .await?;
         assert_eq!(lock_rows, 0, "stale apply lock should be cleared");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_state_prunes_stale_bazarr_suffix_instances() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
+                name: "Bazarr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: json!({}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let default_instance = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id: default_instance,
+                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({"runtime": {"config_dir": "/tmp/bazarr"}})),
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(default_instance, "1.0.0", None)
+            .await?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: Uuid::new_v4(),
+                instance_id: default_instance,
+                capability: "subtitles.manager".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("bazarr".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let stale_instance = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id: stale_instance,
+                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
+                instance_name: "default-2".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_instances
+             SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
+             WHERE instance_id = ?",
+        )
+        .bind(stale_instance.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let keep_instance = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id: keep_instance,
+                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
+                instance_name: "default-3".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(keep_instance),
+                key: "api_key".to_string(),
+                value_encrypted: "encrypted".to_string(),
+                rotatable: false,
+            })
+            .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_instances
+             SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
+             WHERE instance_id = ?",
+        )
+        .bind(keep_instance.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let service = OrchestratorService::new(
+            database.pool.clone(),
+            "/tmp/extensions".to_string(),
+            "/tmp/extensions/bundled".to_string(),
+            "/tmp/media".to_string(),
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: Duration::from_secs(1),
+                startup_poll_interval: Duration::from_millis(100),
+            },
+            Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
+        );
+        let reconcile_config = ReconcileConfig {
+            interval: Duration::from_secs(60),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+        };
+
+        service
+            .recover_orphaned_state_after_restart(&reconcile_config)
+            .await?;
+
+        assert!(
+            store.get_instance(stale_instance).await?.is_none(),
+            "stale bazarr suffix instance should be pruned"
+        );
+        assert!(
+            store.get_instance(keep_instance).await?.is_some(),
+            "instances with attached secrets should be preserved"
+        );
+        assert!(
+            store.get_instance(default_instance).await?.is_some(),
+            "primary provider-backed instance should be preserved"
+        );
 
         Ok(())
     }
