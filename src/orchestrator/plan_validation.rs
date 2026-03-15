@@ -27,7 +27,7 @@ pub async fn missing_required_secrets_for_plan(
     for action in actions {
         match action {
             PlanAction::EnsureRuntimeRunning { runtime, .. } => {
-                let required = required_secrets_from_runtime(&runtime.runtime.env)?;
+                let required = required_secrets_from_runtime(&runtime.runtime)?;
                 if required.is_empty() {
                     continue;
                 }

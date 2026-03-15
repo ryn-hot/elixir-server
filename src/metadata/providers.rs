@@ -125,6 +125,32 @@ pub mod cinemeta {
     fn normalize_base_url(base_url: &str) -> String {
         base_url.trim().trim_end_matches('/').to_string()
     }
+
+    pub fn extract_poster_url(rest: &serde_json::Value) -> Option<String> {
+        rest.get("poster")
+            .or_else(|| rest.get("posterUrl"))
+            .or_else(|| rest.get("image"))
+            .or_else(|| rest.get("thumbnail"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    }
+
+    pub fn extract_popularity_score(rest: &serde_json::Value) -> Option<f64> {
+        value_to_score(rest.get("popularity"))
+            .or_else(|| value_to_score(rest.get("imdbRating")))
+            .or_else(|| value_to_score(rest.get("rank")))
+            .or_else(|| value_to_score(rest.get("votes")))
+    }
+
+    fn value_to_score(value: Option<&serde_json::Value>) -> Option<f64> {
+        let value = value?;
+        if let Some(number) = value.as_f64() {
+            return Some(number);
+        }
+        value.as_str()?.trim().parse::<f64>().ok()
+    }
 }
 
 pub mod tvdb {
@@ -172,6 +198,8 @@ pub mod tvdb {
                     ..Default::default()
                 }),
                 description,
+                poster_url: extract_poster_url(item),
+                popularity_score: extract_popularity_score(item),
             });
         }
         results
@@ -243,6 +271,21 @@ pub mod tvdb {
         None
     }
 
+    fn extract_poster_url(value: &Value) -> Option<String> {
+        value
+            .get("image_url")
+            .or_else(|| value.get("image"))
+            .or_else(|| value.get("poster"))
+            .or_else(|| value.get("thumbnail"))
+            .and_then(as_string)
+    }
+
+    fn extract_popularity_score(value: &Value) -> Option<f64> {
+        value_to_score(value.get("score"))
+            .or_else(|| value_to_score(value.get("popularity")))
+            .or_else(|| value_to_score(value.get("siteRating")))
+    }
+
     fn parse_year_text(value: &str) -> Option<i32> {
         let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.len() < 4 {
@@ -295,6 +338,14 @@ pub mod tvdb {
             return Some(number.to_string());
         }
         None
+    }
+
+    fn value_to_score(value: Option<&Value>) -> Option<f64> {
+        let value = value?;
+        if let Some(number) = value.as_f64() {
+            return Some(number);
+        }
+        value.as_str()?.trim().parse::<f64>().ok()
     }
 
     #[cfg(test)]
@@ -365,6 +416,7 @@ pub mod anilist {
         pub startDate: Option<serde_json::Value>,
         pub coverImage: Option<serde_json::Value>,
         pub bannerImage: Option<String>,
+        pub popularity: Option<i32>,
     }
 
     pub async fn fetch(
@@ -407,6 +459,8 @@ pub mod anilist {
                   description
                   genres
                   startDate { year }
+                  coverImage { extraLarge large medium }
+                  popularity
                 }
               }
             }
@@ -558,6 +612,20 @@ pub mod anilist {
             description: media.description.clone(),
             genres: media.genres.clone(),
         })
+    }
+
+    pub fn extract_cover_image_url(media: &MediaItem) -> Option<String> {
+        let Some(value) = media.coverImage.as_ref() else {
+            return None;
+        };
+        value
+            .get("extraLarge")
+            .or_else(|| value.get("large"))
+            .or_else(|| value.get("medium"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| url.to_string())
     }
 }
 

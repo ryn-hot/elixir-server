@@ -10,6 +10,7 @@ use crate::db::models::{
     OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
     SlotCardinality,
 };
+use crate::extensions::ExternalIds;
 
 #[derive(Debug, Clone)]
 pub struct NewExtension {
@@ -72,6 +73,37 @@ pub struct NewDesiredBlueprint {
     pub blueprint_version: String,
     pub params_json: Option<serde_json::Value>,
     pub decisions_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManagedIngestIntent {
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedIngestIntent {
+    pub intent_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub source: String,
+    pub active: bool,
+    pub last_matched_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +325,50 @@ impl<'a> ExtensionStore<'a> {
             .execute(self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn prune_stale_suffix_instances(
+        &self,
+        extension_id: &str,
+        primary_instance_name: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<u64> {
+        let stale_str = stale_before.format("%Y-%m-%d %H:%M:%S").to_string();
+        let result = sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_instances
+             WHERE extension_id = ?
+               AND instance_name LIKE ?
+               AND updated_at < ?
+               AND COALESCE(NULLIF(TRIM(CAST(config_json AS TEXT)), 'null'), '') = ''
+               AND runtime_version IS NULL
+               AND rollback_version IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM providers
+                   WHERE providers.instance_id = extension_instances.instance_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM secrets
+                   WHERE secrets.scope = 'instance'
+                     AND secrets.scope_id = extension_instances.instance_id
+               )
+               AND EXISTS (
+                   SELECT 1
+                   FROM extension_instances AS primary_instance
+                   JOIN providers AS primary_provider
+                     ON primary_provider.instance_id = primary_instance.instance_id
+                   WHERE primary_instance.extension_id = extension_instances.extension_id
+                     AND primary_instance.instance_name = ?
+               )",
+        )
+        .bind(extension_id)
+        .bind(format!("{primary_instance_name}-%"))
+        .bind(stale_str)
+        .bind(primary_instance_name)
+        .execute(self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn delete_secrets_by_scope(
@@ -549,6 +625,204 @@ impl<'a> ExtensionStore<'a> {
         .execute(self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    pub async fn upsert_managed_ingest_intent(
+        &self,
+        data: &NewManagedIngestIntent,
+    ) -> Result<Uuid> {
+        let external_ids_json = match data.external_ids.as_ref() {
+            Some(ids) => {
+                Some(serde_json::to_value(ids).context("serializing managed ingest external ids")?)
+            }
+            None => None,
+        };
+        let external_ids_json = json_to_string(external_ids_json.as_ref())?;
+
+        if let Some(manager_item_id) = data.manager_item_id.as_deref() {
+            sqlx::query::<sqlx::Any>(
+                "INSERT INTO managed_ingest_intents (
+                    intent_id, media_type, title, normalized_title, year, external_ids_json,
+                    manager_provider_id, manager_item_id, manager_label, source, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 ON CONFLICT(manager_provider_id, manager_item_id) DO UPDATE SET
+                    media_type = excluded.media_type,
+                    title = excluded.title,
+                    normalized_title = excluded.normalized_title,
+                    year = excluded.year,
+                    external_ids_json = COALESCE(excluded.external_ids_json, managed_ingest_intents.external_ids_json),
+                    manager_label = excluded.manager_label,
+                    source = excluded.source,
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(data.media_type.as_str())
+            .bind(&data.title)
+            .bind(&data.normalized_title)
+            .bind(data.year)
+            .bind(external_ids_json.as_deref())
+            .bind(data.manager_provider_id.to_string())
+            .bind(manager_item_id)
+            .bind(data.manager_label.as_deref())
+            .bind(&data.source)
+            .execute(self.pool)
+            .await?;
+
+            let intent_id_raw: String = sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT intent_id FROM managed_ingest_intents
+                 WHERE manager_provider_id = ? AND manager_item_id = ?
+                 LIMIT 1",
+            )
+            .bind(data.manager_provider_id.to_string())
+            .bind(manager_item_id)
+            .fetch_one(self.pool)
+            .await?;
+            return parse_uuid(&intent_id_raw, "managed_ingest_intents.intent_id");
+        }
+
+        let existing_intent_id = if let Some(year) = data.year {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT intent_id FROM managed_ingest_intents
+                 WHERE manager_provider_id = ?
+                   AND manager_item_id IS NULL
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year = ?
+                 LIMIT 1",
+            )
+            .bind(data.manager_provider_id.to_string())
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .bind(year)
+            .fetch_optional(self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT intent_id FROM managed_ingest_intents
+                 WHERE manager_provider_id = ?
+                   AND manager_item_id IS NULL
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year IS NULL
+                 LIMIT 1",
+            )
+            .bind(data.manager_provider_id.to_string())
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .fetch_optional(self.pool)
+            .await?
+        };
+
+        if let Some(existing_intent_id) = existing_intent_id {
+            if external_ids_json.is_some() {
+                sqlx::query::<sqlx::Any>(
+                    "UPDATE managed_ingest_intents
+                     SET title = ?,
+                         normalized_title = ?,
+                         year = ?,
+                         external_ids_json = ?,
+                         manager_label = ?,
+                         source = ?,
+                         active = 1,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE intent_id = ?",
+                )
+                .bind(&data.title)
+                .bind(&data.normalized_title)
+                .bind(data.year)
+                .bind(external_ids_json.as_deref())
+                .bind(data.manager_label.as_deref())
+                .bind(&data.source)
+                .bind(&existing_intent_id)
+                .execute(self.pool)
+                .await?;
+            } else {
+                sqlx::query::<sqlx::Any>(
+                    "UPDATE managed_ingest_intents
+                     SET title = ?,
+                         normalized_title = ?,
+                         year = ?,
+                         manager_label = ?,
+                         source = ?,
+                         active = 1,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE intent_id = ?",
+                )
+                .bind(&data.title)
+                .bind(&data.normalized_title)
+                .bind(data.year)
+                .bind(data.manager_label.as_deref())
+                .bind(&data.source)
+                .bind(&existing_intent_id)
+                .execute(self.pool)
+                .await?;
+            }
+            return parse_uuid(&existing_intent_id, "managed_ingest_intents.intent_id");
+        }
+
+        let intent_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_ingest_intents (
+                intent_id, media_type, title, normalized_title, year, external_ids_json,
+                manager_provider_id, manager_item_id, manager_label, source, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)",
+        )
+        .bind(intent_id.to_string())
+        .bind(data.media_type.as_str())
+        .bind(&data.title)
+        .bind(&data.normalized_title)
+        .bind(data.year)
+        .bind(external_ids_json.as_deref())
+        .bind(data.manager_provider_id.to_string())
+        .bind(data.manager_label.as_deref())
+        .bind(&data.source)
+        .execute(self.pool)
+        .await?;
+        Ok(intent_id)
+    }
+
+    pub async fn list_active_managed_ingest_intents(&self) -> Result<Vec<ManagedIngestIntent>> {
+        let rows = sqlx::query(
+            "SELECT
+                intent_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) as external_ids_json,
+                manager_provider_id,
+                CAST(manager_item_id AS TEXT) as manager_item_id,
+                CAST(manager_label AS TEXT) as manager_label,
+                source,
+                CAST(active AS INTEGER) as active,
+                CAST(last_matched_at AS TEXT) as last_matched_at,
+                CAST(created_at AS TEXT) as created_at,
+                CAST(updated_at AS TEXT) as updated_at
+             FROM managed_ingest_intents
+             WHERE active = 1
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_managed_ingest_intent(&row)?);
+        }
+        Ok(items)
+    }
+
+    pub async fn mark_managed_ingest_intent_matched(&self, intent_id: Uuid) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_ingest_intents
+             SET last_matched_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE intent_id = ?",
+        )
+        .bind(intent_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn upsert_secret(&self, data: &NewSecret) -> Result<()> {
@@ -1196,6 +1470,60 @@ fn map_secret(row: &AnyRow) -> Result<Secret> {
         value_encrypted: row.try_get("value_encrypted")?,
         created_at: parse_datetime(&created_at_raw, "secrets.created_at")?,
         rotatable: row_get_bool(row, "rotatable")?,
+    })
+}
+
+fn map_managed_ingest_intent(row: &AnyRow) -> Result<ManagedIngestIntent> {
+    let intent_id_raw: String = row.try_get("intent_id")?;
+    let media_type_raw: String = row.try_get("media_type")?;
+    let manager_provider_id_raw: String = row.try_get("manager_provider_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    let external_ids = parse_json_opt(
+        row_get_opt_string(row, "external_ids_json")?,
+        "managed_ingest_intents.external_ids_json",
+    )?
+    .map(serde_json::from_value::<ExternalIds>)
+    .transpose()
+    .context("parsing managed ingest external ids")?;
+
+    let year: Option<i64> = row.try_get("year")?;
+    let year = year.map(|value| value as i32);
+
+    let media_type = match media_type_raw.trim().to_ascii_lowercase().as_str() {
+        "movie" => crate::db::models::MediaType::Movie,
+        "series" => crate::db::models::MediaType::Series,
+        "anime" => crate::db::models::MediaType::Anime,
+        _ => {
+            anyhow::bail!(
+                "invalid enum value '{}' for field managed_ingest_intents.media_type",
+                media_type_raw
+            );
+        }
+    };
+
+    Ok(ManagedIngestIntent {
+        intent_id: parse_uuid(&intent_id_raw, "managed_ingest_intents.intent_id")?,
+        media_type,
+        title: row.try_get("title")?,
+        normalized_title: row.try_get("normalized_title")?,
+        year,
+        external_ids,
+        manager_provider_id: parse_uuid(
+            &manager_provider_id_raw,
+            "managed_ingest_intents.manager_provider_id",
+        )?,
+        manager_item_id: row_get_opt_string(row, "manager_item_id")?,
+        manager_label: row_get_opt_string(row, "manager_label")?,
+        source: row.try_get("source")?,
+        active: row_get_bool(row, "active")?,
+        last_matched_at: parse_datetime_opt(
+            row_get_opt_string(row, "last_matched_at")?,
+            "managed_ingest_intents.last_matched_at",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "managed_ingest_intents.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "managed_ingest_intents.updated_at")?,
     })
 }
 

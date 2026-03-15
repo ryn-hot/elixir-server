@@ -33,6 +33,7 @@ use crate::metadata::MetadataService;
 use crate::network::{start_mdns, wan::start_wan_tasks};
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::playback::start_session_cleanup;
+use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
 use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
@@ -68,6 +69,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to prepare runtime directories")?;
     log_resolved_paths(&settings);
+    ensure_docker_runtime_available(&settings)
+        .await
+        .context("docker runtime is unavailable")?;
 
     let database = Database::connect(&settings.database)
         .await
@@ -123,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
     );
     if let Err(err) = bootstrap_core_extensions(&state).await {
         tracing::warn!("core extension bootstrap failed: {err}");
+    }
+    if let Err(err) = state.orchestrator.prepare_probe_binary().await {
+        tracing::warn!("probe binary preparation failed: {err}");
     }
     let app = router(state.clone());
 
@@ -226,6 +233,22 @@ async fn ensure_runtime_directories(settings: &Settings) -> anyhow::Result<()> {
     fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("tmp")).await?;
     fs::create_dir_all(PathBuf::from(&settings.extensions.storage_root).join("probe")).await?;
     fs::create_dir_all(&settings.extensions.bundled_dir).await?;
+    Ok(())
+}
+
+async fn ensure_docker_runtime_available(settings: &Settings) -> anyhow::Result<()> {
+    let runtime = DockerRuntimeManager::new(None);
+    let startup = DockerStartupConfig {
+        auto_start_runtime: settings.extensions.docker.auto_start_runtime,
+        startup_timeout: std::time::Duration::from_secs(
+            settings.extensions.docker.startup_timeout_seconds,
+        ),
+        startup_poll_interval: std::time::Duration::from_millis(
+            settings.extensions.docker.startup_poll_interval_millis,
+        ),
+    };
+    let status = runtime.ensure_daemon_available(&startup).await?;
+    tracing::info!("docker daemon ready ({status:?})");
     Ok(())
 }
 

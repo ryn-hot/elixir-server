@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use uuid::Uuid;
 
 use crate::db::models::{ExtensionKind, SecretScope};
-use crate::extensions::manifest::{ExtensionManifest, ManifestRuntimeEnv};
+use crate::extensions::manifest::{ExtensionManifest, ManifestRuntime};
 use crate::extensions::store::ExtensionStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,13 +24,22 @@ pub fn required_secrets_from_manifest(
         Some(runtime) => runtime,
         None => return Ok(Vec::new()),
     };
-    required_secrets_from_runtime(&runtime.env)
+    required_secrets_from_runtime(runtime)
 }
 
-pub fn required_secrets_from_runtime(env: &[ManifestRuntimeEnv]) -> Result<Vec<RequiredSecretRef>> {
+pub fn required_secrets_from_runtime(runtime: &ManifestRuntime) -> Result<Vec<RequiredSecretRef>> {
     let mut required = Vec::new();
-    for env in env {
+    for env in &runtime.env {
         if let Some(from_secret) = env.from_secret.as_ref() {
+            required.push(parse_required_secret(from_secret)?);
+        }
+    }
+    if let Some(egress) = runtime.egress.as_ref() {
+        if egress.mode_is_wireguard() && egress.strict {
+            let from_secret = egress
+                .wireguard_config_secret
+                .as_deref()
+                .ok_or_else(|| anyhow!("wireguard egress requires wireguard_config_secret"))?;
             required.push(parse_required_secret(from_secret)?);
         }
     }
@@ -184,4 +193,67 @@ fn sorted_missing(missing: HashSet<String>) -> Vec<String> {
     let mut missing: Vec<_> = missing.into_iter().collect();
     missing.sort();
     missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::extensions::manifest::{
+        ManifestRuntime, ManifestRuntimeEgress, ManifestRuntimeEnv, ManifestRuntimePort,
+    };
+
+    #[test]
+    fn strict_wireguard_egress_requires_secret() {
+        let runtime = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/test:1".to_string()),
+            network: None,
+            service_name: None,
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: vec![ManifestRuntimeEnv {
+                name: "API_KEY".to_string(),
+                value: None,
+                from_secret: Some("instance:api_key".to_string()),
+            }],
+            egress: Some(ManifestRuntimeEgress {
+                mode: "wireguard".to_string(),
+                strict: true,
+                wireguard_config_secret: Some("instance:wg_config".to_string()),
+                wireguard_gateway_image: None,
+            }),
+        };
+        let required = required_secrets_from_runtime(&runtime).expect("required secrets");
+        let keys: Vec<_> = required.into_iter().map(|item| item.key).collect();
+        assert!(keys.iter().any(|key| key == "api_key"));
+        assert!(keys.iter().any(|key| key == "wg_config"));
+    }
+
+    #[test]
+    fn non_strict_wireguard_egress_does_not_require_secret() {
+        let runtime = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/test:1".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: Some(ManifestRuntimeEgress {
+                mode: "wireguard".to_string(),
+                strict: false,
+                wireguard_config_secret: Some("instance:wg_config".to_string()),
+                wireguard_gateway_image: None,
+            }),
+        };
+        let required = required_secrets_from_runtime(&runtime).expect("required secrets");
+        assert!(
+            required.is_empty(),
+            "strict=false should not block runtime when wireguard config is missing"
+        );
+    }
 }

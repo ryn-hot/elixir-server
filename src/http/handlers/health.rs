@@ -15,6 +15,7 @@ pub struct HealthResponse {
     database: DatabaseHealth,
     mdns: MdnsHealth,
     wan: WanHealth,
+    vpn: VpnHealth,
 }
 
 #[derive(Serialize)]
@@ -37,11 +38,20 @@ pub struct WanHealth {
     wan_direct_endpoint: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct VpnHealth {
+    status: &'static str,
+    host_vpn_detected: bool,
+    host_vpn_interfaces: Vec<String>,
+    warning: Option<String>,
+}
+
 pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<HealthResponse>> {
     let environment = app_state.settings.environment.as_str();
     let database = check_database(&app_state).await;
     let mdns_status = check_mdns(&app_state);
     let wan_status = check_wan(&app_state).await;
+    let vpn_status = check_vpn(&app_state);
 
     Ok(Json(HealthResponse {
         status: "ok",
@@ -50,6 +60,7 @@ pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<He
         database,
         mdns: mdns_status,
         wan: wan_status,
+        vpn: vpn_status,
     }))
 }
 
@@ -114,6 +125,24 @@ fn check_mdns(state: &AppState) -> MdnsHealth {
     MdnsHealth {
         status: if active { "ok" } else { "error" },
         name: Some(state.settings.network.mdns_name.clone()),
+    }
+}
+
+fn check_vpn(state: &AppState) -> VpnHealth {
+    if !state.settings.network.vpn.detect_host_vpn {
+        return VpnHealth {
+            status: "disabled",
+            host_vpn_detected: false,
+            host_vpn_interfaces: Vec::new(),
+            warning: None,
+        };
+    }
+    let status = crate::network::vpn::detect_host_vpn();
+    VpnHealth {
+        status: if status.detected { "warning" } else { "ok" },
+        host_vpn_detected: status.detected,
+        host_vpn_interfaces: status.interfaces,
+        warning: status.warning,
     }
 }
 

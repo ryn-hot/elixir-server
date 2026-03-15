@@ -131,6 +131,9 @@ impl ExtensionManifest {
                     }
                 }
             }
+            if let Some(egress) = runtime.egress.as_ref() {
+                egress.validate()?;
+            }
         }
 
         for action in &self.actions {
@@ -287,6 +290,52 @@ pub struct ManifestRuntime {
     pub volumes: Vec<String>,
     #[serde(default)]
     pub env: Vec<ManifestRuntimeEnv>,
+    #[serde(default)]
+    pub egress: Option<ManifestRuntimeEgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestRuntimeEgress {
+    #[serde(default = "default_runtime_egress_mode")]
+    pub mode: String,
+    #[serde(default = "default_true")]
+    pub strict: bool,
+    #[serde(default)]
+    pub wireguard_config_secret: Option<String>,
+    #[serde(default)]
+    pub wireguard_gateway_image: Option<String>,
+}
+
+impl ManifestRuntimeEgress {
+    pub fn validate(&self) -> Result<()> {
+        let mode = self.mode.trim().to_ascii_lowercase();
+        match mode.as_str() {
+            "direct" => {}
+            "wireguard" => {
+                let secret = self
+                    .wireguard_config_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if secret.is_empty() {
+                    bail!("runtime.egress.wireguard_config_secret is required for wireguard mode");
+                }
+                validate_secret_reference(secret, "runtime.egress.wireguard_config_secret")?;
+                if let Some(image) = self.wireguard_gateway_image.as_deref() {
+                    ensure_non_empty(image, "runtime.egress.wireguard_gateway_image")?;
+                }
+            }
+            _ => bail!(
+                "unsupported runtime.egress.mode '{}'; expected direct|wireguard",
+                self.mode
+            ),
+        }
+        Ok(())
+    }
+
+    pub fn mode_is_wireguard(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case("wireguard")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,11 +434,44 @@ fn default_slot() -> String {
     "default".to_string()
 }
 
+fn default_runtime_egress_mode() -> String {
+    "direct".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn ensure_non_empty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("manifest {} is required", field);
     }
     Ok(())
+}
+
+fn validate_secret_reference(value: &str, field: &str) -> Result<()> {
+    let parts: Vec<&str> = value.split(':').collect();
+    match parts.as_slice() {
+        ["instance", key] | ["global", key] => {
+            if key.trim().is_empty() {
+                bail!("{} key must not be empty", field);
+            }
+            Ok(())
+        }
+        ["provider", provider_id, key] => {
+            if provider_id.trim().is_empty() {
+                bail!("{} provider id must not be empty", field);
+            }
+            if key.trim().is_empty() {
+                bail!("{} provider key must not be empty", field);
+            }
+            Ok(())
+        }
+        _ => bail!(
+            "{} must be instance:<key>, global:<key>, or provider:<uuid>:<key>",
+            field
+        ),
+    }
 }
 
 fn canonical_media_type(value: &str) -> Option<&'static str> {
@@ -479,4 +561,63 @@ fn validate_scope_media_for_capability(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_accepts_wireguard_runtime_egress() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Module
+provides:
+  - capability: downloader.torrent
+    slot: default
+    implementation: qbittorrent
+runtime:
+  type: container
+  image: example/test:1
+  egress:
+    mode: wireguard
+    strict: true
+    wireguard_config_secret: instance:wg_config
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        let egress = parsed
+            .manifest
+            .runtime
+            .expect("runtime")
+            .egress
+            .expect("egress");
+        assert!(egress.mode_is_wireguard());
+        assert_eq!(
+            egress.wireguard_config_secret.as_deref(),
+            Some("instance:wg_config")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_wireguard_egress_without_secret() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Module
+provides:
+  - capability: downloader.torrent
+    slot: default
+    implementation: qbittorrent
+runtime:
+  type: container
+  image: example/test:1
+  egress:
+    mode: wireguard
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("wireguard_config_secret"));
+    }
 }

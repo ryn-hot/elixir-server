@@ -144,6 +144,8 @@ impl MetadataService {
                                     ..Default::default()
                                 }),
                                 description: media.description.clone(),
+                                poster_url: providers::anilist::extract_cover_image_url(&media),
+                                popularity_score: media.popularity.map(f64::from),
                             }
                         })
                         .collect();
@@ -196,6 +198,10 @@ impl MetadataService {
                                     ..Default::default()
                                 }),
                                 description: meta.description.clone(),
+                                poster_url: providers::cinemeta::extract_poster_url(&meta.rest),
+                                popularity_score: providers::cinemeta::extract_popularity_score(
+                                    &meta.rest,
+                                ),
                             }
                         })
                         .collect();

@@ -93,6 +93,17 @@ impl Settings {
             .set_default("network.mdns_enabled", true)?
             .set_default("network.mdns_name", default_mdns_name())?
             .set_default("network.wan_enabled", true)?
+            .set_default("network.vpn.enabled", false)?
+            .set_default("network.vpn.detect_host_vpn", true)?
+            .set_default(
+                "network.vpn.wireguard_gateway_image",
+                default_wireguard_gateway_image(),
+            )?
+            .set_default(
+                "network.vpn.wireguard_config_secret",
+                default_wireguard_config_secret(),
+            )?
+            .set_default("network.vpn.auto_wrap_qbittorrent", true)?
             .set_default("database.url", default_database_url())?
             .set_default(
                 "auth.access_token_ttl_minutes",
@@ -114,6 +125,18 @@ impl Settings {
             .set_default("extensions.allow_unsigned", default_false())?
             .set_default("extensions.allow_directory_install", default_false())?
             .set_default(
+                "extensions.docker.auto_start_runtime",
+                default_extensions_docker_auto_start_runtime(),
+            )?
+            .set_default(
+                "extensions.docker.startup_timeout_seconds",
+                default_extensions_docker_startup_timeout_seconds(),
+            )?
+            .set_default(
+                "extensions.docker.startup_poll_interval_millis",
+                default_extensions_docker_startup_poll_interval_millis(),
+            )?
+            .set_default(
                 "extensions.reconcile_interval_seconds",
                 default_reconcile_interval_seconds(),
             )?
@@ -128,6 +151,10 @@ impl Settings {
             .set_default(
                 "extensions.reconcile_retry_backoff_seconds",
                 default_reconcile_retry_backoff_seconds(),
+            )?
+            .set_default(
+                "extensions.reconcile_startup_settle_seconds",
+                default_reconcile_startup_settle_seconds(),
             )?
             .set_default(
                 "extensions.apply_lock_ttl_seconds",
@@ -289,6 +316,8 @@ pub struct NetworkConfig {
     pub mdns_name: String,
     #[serde(default = "default_true")]
     pub wan_enabled: bool,
+    #[serde(default)]
+    pub vpn: VpnConfig,
 }
 
 impl Default for NetworkConfig {
@@ -297,6 +326,33 @@ impl Default for NetworkConfig {
             mdns_enabled: default_true(),
             mdns_name: default_mdns_name(),
             wan_enabled: default_true(),
+            vpn: VpnConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VpnConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub detect_host_vpn: bool,
+    #[serde(default = "default_wireguard_config_secret")]
+    pub wireguard_config_secret: String,
+    #[serde(default = "default_true")]
+    pub auto_wrap_qbittorrent: bool,
+    #[serde(default = "default_wireguard_gateway_image")]
+    pub wireguard_gateway_image: String,
+}
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            detect_host_vpn: default_true(),
+            wireguard_config_secret: default_wireguard_config_secret(),
+            auto_wrap_qbittorrent: default_true(),
+            wireguard_gateway_image: default_wireguard_gateway_image(),
         }
     }
 }
@@ -398,6 +454,8 @@ pub struct ExtensionsConfig {
     pub allow_unsigned: bool,
     #[serde(default = "default_false")]
     pub allow_directory_install: bool,
+    #[serde(default)]
+    pub docker: ExtensionsDockerConfig,
     #[serde(default = "default_reconcile_interval_seconds")]
     pub reconcile_interval_seconds: u64,
     #[serde(default = "default_registry_refresh_interval_seconds")]
@@ -406,6 +464,8 @@ pub struct ExtensionsConfig {
     pub reconcile_retry_attempts: u32,
     #[serde(default = "default_reconcile_retry_backoff_seconds")]
     pub reconcile_retry_backoff_seconds: u64,
+    #[serde(default = "default_reconcile_startup_settle_seconds")]
+    pub reconcile_startup_settle_seconds: u64,
     #[serde(default = "default_apply_lock_ttl_seconds")]
     pub apply_lock_ttl_seconds: u64,
 }
@@ -419,11 +479,36 @@ impl Default for ExtensionsConfig {
             core_extensions: default_core_extensions(),
             allow_unsigned: default_false(),
             allow_directory_install: default_false(),
+            docker: ExtensionsDockerConfig::default(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             registry_refresh_interval_seconds: default_registry_refresh_interval_seconds(),
             reconcile_retry_attempts: default_reconcile_retry_attempts(),
             reconcile_retry_backoff_seconds: default_reconcile_retry_backoff_seconds(),
+            reconcile_startup_settle_seconds: default_reconcile_startup_settle_seconds(),
             apply_lock_ttl_seconds: default_apply_lock_ttl_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtensionsDockerConfig {
+    #[serde(
+        default = "default_extensions_docker_auto_start_runtime",
+        alias = "auto_start_desktop"
+    )]
+    pub auto_start_runtime: bool,
+    #[serde(default = "default_extensions_docker_startup_timeout_seconds")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_extensions_docker_startup_poll_interval_millis")]
+    pub startup_poll_interval_millis: u64,
+}
+
+impl Default for ExtensionsDockerConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_runtime: default_extensions_docker_auto_start_runtime(),
+            startup_timeout_seconds: default_extensions_docker_startup_timeout_seconds(),
+            startup_poll_interval_millis: default_extensions_docker_startup_poll_interval_millis(),
         }
     }
 }
@@ -634,8 +719,24 @@ fn default_reconcile_retry_backoff_seconds() -> u64 {
     5
 }
 
+fn default_reconcile_startup_settle_seconds() -> u64 {
+    15
+}
+
 fn default_apply_lock_ttl_seconds() -> u64 {
     300
+}
+
+fn default_extensions_docker_auto_start_runtime() -> bool {
+    true
+}
+
+fn default_extensions_docker_startup_timeout_seconds() -> u64 {
+    90
+}
+
+fn default_extensions_docker_startup_poll_interval_millis() -> u64 {
+    1_000
 }
 
 fn default_true() -> bool {
@@ -680,6 +781,14 @@ fn default_cleanup_interval_seconds() -> u64 {
 
 fn default_mdns_name() -> String {
     "Elixir Server".to_string()
+}
+
+fn default_wireguard_gateway_image() -> String {
+    "qmcgaw/gluetun:v3.39.0".to_string()
+}
+
+fn default_wireguard_config_secret() -> String {
+    "global:wireguard_config".to_string()
 }
 
 fn default_max_resolution() -> String {

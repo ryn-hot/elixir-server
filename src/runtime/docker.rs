@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::time::{Instant, sleep};
 
 use crate::runtime::RuntimeManager;
 use crate::runtime::model::{
@@ -14,6 +19,19 @@ const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"]
 
 pub struct DockerRuntimeManager {
     docker_bin: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerStartupConfig {
+    pub auto_start_runtime: bool,
+    pub startup_timeout: Duration,
+    pub startup_poll_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerDaemonStatus {
+    Ready,
+    StartedByElixir,
 }
 
 impl DockerRuntimeManager {
@@ -46,6 +64,114 @@ impl DockerRuntimeManager {
 
     async fn run_stdout(&self, args: &[String]) -> Result<String> {
         Ok(self.run_capture(args).await?.stdout)
+    }
+
+    pub async fn server_version(&self) -> Result<String> {
+        let args = vec![
+            "version".to_string(),
+            "--format".to_string(),
+            "{{.Server.Version}}".to_string(),
+        ];
+        let stdout = self.run_stdout(&args).await?;
+        let version = stdout.trim();
+        if version.is_empty() {
+            bail!("docker daemon returned an empty server version");
+        }
+        Ok(version.to_string())
+    }
+
+    pub async fn ensure_daemon_available(
+        &self,
+        config: &DockerStartupConfig,
+    ) -> Result<DockerDaemonStatus> {
+        match self.server_version().await {
+            Ok(_) => return Ok(DockerDaemonStatus::Ready),
+            Err(err) if !is_docker_daemon_unavailable(&err) => return Err(err),
+            Err(initial_err) => {
+                let mut started_by_elixir = false;
+                let mut last_err = initial_err;
+
+                if config.auto_start_runtime {
+                    match self.start_docker_runtime().await {
+                        Ok(()) => {
+                            started_by_elixir = true;
+                            tracing::info!("docker daemon unavailable; launched Docker runtime");
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "docker daemon unavailable and runtime auto-start failed: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+
+                let deadline = Instant::now() + config.startup_timeout;
+                while Instant::now() < deadline {
+                    sleep(config.startup_poll_interval).await;
+                    match self.server_version().await {
+                        Ok(_) => {
+                            return Ok(if started_by_elixir {
+                                DockerDaemonStatus::StartedByElixir
+                            } else {
+                                DockerDaemonStatus::Ready
+                            });
+                        }
+                        Err(err) if is_docker_daemon_unavailable(&err) => {
+                            last_err = err;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                bail!(
+                    "docker daemon unavailable after waiting {:?}: {}",
+                    config.startup_timeout,
+                    last_err
+                );
+            }
+        }
+    }
+
+    async fn start_docker_runtime(&self) -> Result<()> {
+        let attempts = docker_start_attempts();
+        if attempts.is_empty() {
+            bail!("no docker auto-start strategy is available for this platform");
+        }
+
+        let mut errors = Vec::new();
+        for attempt in attempts {
+            match self.run_start_attempt(&attempt).await {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(format!("{}: {}", attempt.label, err)),
+            }
+        }
+
+        bail!("docker auto-start failed: {}", errors.join(" | "))
+    }
+
+    async fn run_start_attempt(&self, attempt: &DockerStartAttempt) -> Result<()> {
+        let output = Command::new(&attempt.program)
+            .args(&attempt.args)
+            .output()
+            .await
+            .with_context(|| format!("running {}", attempt.label))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            bail!(
+                "{} failed (status {:?}): {}",
+                attempt.label,
+                output.status.code(),
+                detail
+            );
+        }
+        Ok(())
     }
 
     async fn find_container_id(&self, name: &str) -> Result<Option<String>> {
@@ -144,13 +270,21 @@ impl DockerRuntimeManager {
             "-d".to_string(),
             "--name".to_string(),
             spec.name.clone(),
-            "--network".to_string(),
-            spec.network.clone(),
         ];
 
-        for alias in &spec.aliases {
-            args.push("--network-alias".to_string());
-            args.push(alias.clone());
+        if let Some(network_mode) = spec.network_mode.as_ref() {
+            args.push("--network".to_string());
+            args.push(network_mode.clone());
+        } else {
+            args.push("--network".to_string());
+            args.push(spec.network.clone());
+        }
+
+        if spec.network_mode.is_none() {
+            for alias in &spec.aliases {
+                args.push("--network-alias".to_string());
+                args.push(alias.clone());
+            }
         }
 
         for (key, value) in &spec.labels {
@@ -166,6 +300,21 @@ impl DockerRuntimeManager {
         for env in &spec.env {
             args.push("-e".to_string());
             args.push(format!("{}={}", env.name, env.value));
+        }
+
+        for capability in &spec.cap_add {
+            args.push("--cap-add".to_string());
+            args.push(capability.clone());
+        }
+
+        for device in &spec.devices {
+            args.push("--device".to_string());
+            args.push(device.clone());
+        }
+
+        for (key, value) in &spec.sysctls {
+            args.push("--sysctl".to_string());
+            args.push(format!("{key}={value}"));
         }
 
         for volume in &spec.volumes {
@@ -198,6 +347,22 @@ impl DockerRuntimeManager {
     }
 
     async fn ensure_container_attached(&self, spec: &ContainerSpec, value: &Value) -> Result<()> {
+        if let Some(network_mode) = spec.network_mode.as_ref() {
+            let current = value
+                .pointer("/HostConfig/NetworkMode")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if current != network_mode {
+                bail!(
+                    "container '{}' has network mode '{}' but expected '{}'; recreate to fix",
+                    spec.name,
+                    current,
+                    network_mode
+                );
+            }
+            return Ok(());
+        }
+
         if !Self::has_network(value, &spec.network) {
             bail!(
                 "container '{}' is not attached to network '{}'",
@@ -255,14 +420,16 @@ impl RuntimeManager for DockerRuntimeManager {
         if spec.name.trim().is_empty() {
             bail!("container name is required");
         }
-        if spec.network.trim().is_empty() {
+        if spec.network_mode.is_none() && spec.network.trim().is_empty() {
             bail!("container network is required");
         }
         if spec.image.trim().is_empty() {
             bail!("container image is required");
         }
 
-        self.ensure_network(&spec.network).await?;
+        if spec.network_mode.is_none() {
+            self.ensure_network(&spec.network).await?;
+        }
 
         if let Some(_) = self.find_container_id(&spec.name).await? {
             let inspect = self.inspect_container(&spec.name).await?;
@@ -351,6 +518,130 @@ struct CommandOutput {
     stderr: String,
 }
 
+#[derive(Debug, Clone)]
+struct DockerStartAttempt {
+    program: String,
+    args: Vec<String>,
+    label: String,
+}
+
+impl DockerStartAttempt {
+    fn new(program: impl Into<String>, args: Vec<String>, label: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            label: label.into(),
+        }
+    }
+}
+
+fn is_docker_daemon_unavailable(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("cannot connect to the docker daemon")
+        || message.contains("is the docker daemon running")
+        || message.contains("error during connect")
+        || message.contains("docker daemon unavailable")
+        || (message.contains("dial unix")
+            && (message.contains("docker.sock") || message.contains("docker.raw.sock"))
+            && (message.contains("connection refused")
+                || message.contains("connect: no such file or directory")
+                || message.contains("no such file or directory")))
+}
+
+fn docker_start_attempts() -> Vec<DockerStartAttempt> {
+    #[cfg(target_os = "macos")]
+    {
+        return vec![DockerStartAttempt::new(
+            "open",
+            vec!["-a".to_string(), "Docker".to_string()],
+            "open -a Docker",
+        )];
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut attempts = Vec::new();
+        for base in windows_program_files_roots() {
+            let desktop_path = base
+                .join("Docker")
+                .join("Docker")
+                .join("Docker Desktop.exe");
+            attempts.push(DockerStartAttempt::new(
+                "cmd",
+                vec![
+                    "/C".to_string(),
+                    "start".to_string(),
+                    "".to_string(),
+                    desktop_path.to_string_lossy().to_string(),
+                ],
+                format!("cmd /C start {}", desktop_path.display()),
+            ));
+        }
+        attempts.push(DockerStartAttempt::new(
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                "".to_string(),
+                "Docker Desktop".to_string(),
+            ],
+            "cmd /C start Docker Desktop",
+        ));
+        return attempts;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return vec![
+            DockerStartAttempt::new(
+                "systemctl",
+                vec![
+                    "--user".to_string(),
+                    "start".to_string(),
+                    "docker-desktop".to_string(),
+                ],
+                "systemctl --user start docker-desktop",
+            ),
+            DockerStartAttempt::new(
+                "systemctl",
+                vec![
+                    "--user".to_string(),
+                    "start".to_string(),
+                    "docker".to_string(),
+                ],
+                "systemctl --user start docker",
+            ),
+            DockerStartAttempt::new(
+                "systemctl",
+                vec!["start".to_string(), "docker".to_string()],
+                "systemctl start docker",
+            ),
+            DockerStartAttempt::new(
+                "service",
+                vec!["docker".to_string(), "start".to_string()],
+                "service docker start",
+            ),
+        ];
+    }
+
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_program_files_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(value) = std::env::var_os(key) {
+            let path = PathBuf::from(value);
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
 fn format_volume(volume: &VolumeMount) -> String {
     if volume.read_only {
         format!("{}:{}:ro", volume.host_path, volume.container_path)
@@ -400,5 +691,32 @@ mod tests {
         labels.insert("elixir.instance_id".to_string(), "id".to_string());
         labels.insert("elixir.extension_id".to_string(), "ext".to_string());
         assert!(DockerRuntimeManager::ensure_required_labels(&labels).is_ok());
+    }
+
+    #[test]
+    fn docker_daemon_unavailable_errors_are_detected() {
+        let err = anyhow::anyhow!(
+            "docker version --format {{.Server.Version}} failed: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        );
+        assert!(is_docker_daemon_unavailable(&err));
+    }
+
+    #[test]
+    fn docker_desktop_transitional_socket_errors_are_detected() {
+        let refused = anyhow::anyhow!(
+            "docker version --format {{.Server.Version}} failed (status Some(1)): Error response from daemon: dial unix docker.raw.sock: connect: connection refused"
+        );
+        assert!(is_docker_daemon_unavailable(&refused));
+
+        let missing = anyhow::anyhow!(
+            "docker info failed (status Some(1)): Error response from daemon: dial unix docker.raw.sock: connect: no such file or directory"
+        );
+        assert!(is_docker_daemon_unavailable(&missing));
+    }
+
+    #[test]
+    fn unrelated_docker_errors_are_not_classified_as_daemon_unavailable() {
+        let err = anyhow::anyhow!("docker inspect foo failed: No such container: foo");
+        assert!(!is_docker_daemon_unavailable(&err));
     }
 }

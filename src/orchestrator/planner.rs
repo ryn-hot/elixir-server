@@ -675,7 +675,7 @@ impl Planner {
         instance_entries.sort_by(|a, b| a.instance.extension_id.cmp(&b.instance.extension_id));
         let mut missing_secrets_by_instance: HashMap<Uuid, HashSet<String>> = HashMap::new();
         for instance in &instance_entries {
-            let required = required_secrets_from_runtime(&instance.runtime.runtime.env)?;
+            let required = required_secrets_from_runtime(&instance.runtime.runtime)?;
             if required.is_empty() {
                 continue;
             }
@@ -696,7 +696,7 @@ impl Planner {
             }
         }
         for runtime in upgrade_instances.values() {
-            let required = required_secrets_from_runtime(&runtime.runtime.env)?;
+            let required = required_secrets_from_runtime(&runtime.runtime)?;
             if required.is_empty() {
                 continue;
             }

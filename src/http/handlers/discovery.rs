@@ -17,7 +17,11 @@ use uuid::Uuid;
 
 use crate::{
     db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
-    extensions::{ExternalIds, manifest::ExtensionManifest, store::ExtensionStore},
+    extensions::{
+        ExternalIds,
+        manifest::ExtensionManifest,
+        store::{ExtensionStore, NewManagedIngestIntent},
+    },
     http::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
@@ -167,6 +171,8 @@ pub struct FindMediaResult {
     pub year: Option<i32>,
     pub external_ids: Option<ExternalIds>,
     pub description: Option<String>,
+    pub poster_url: Option<String>,
+    pub popularity_score: Option<f64>,
     pub source_provider_ids: Vec<Uuid>,
     pub source_labels: Vec<String>,
 }
@@ -497,6 +503,17 @@ pub async fn find_media_add(
     .await
     .map_err(ApiError::from)?;
 
+    persist_managed_ingest_intent(
+        &store,
+        media_type,
+        &item,
+        manager.detail.provider.provider_id,
+        &provider_label(&manager),
+        manager_item_id.as_deref(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
     let response = FindMediaAddResponse {
         operation_id: Uuid::new_v4(),
         manager_provider_id: manager.detail.provider.provider_id,
@@ -507,6 +524,43 @@ pub async fn find_media_add(
     };
 
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+async fn persist_managed_ingest_intent(
+    store: &ExtensionStore<'_>,
+    media_type: MediaType,
+    item: &FindMediaAddItem,
+    manager_provider_id: Uuid,
+    manager_label: &str,
+    manager_item_id: Option<&str>,
+) -> AnyResult<()> {
+    let title = item
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("item.title is required for managed ingest intent"))?;
+
+    let normalized_title = normalize_name(title);
+    if normalized_title.is_empty() {
+        bail!("item.title is required for managed ingest intent");
+    }
+
+    store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type,
+            title: title.to_string(),
+            normalized_title,
+            year: item.year,
+            external_ids: item.external_ids.clone(),
+            manager_provider_id,
+            manager_item_id: manager_item_id.map(str::to_string),
+            manager_label: Some(manager_label.to_string()),
+            source: "find_media_add".to_string(),
+        })
+        .await?;
+
+    Ok(())
 }
 
 pub async fn find_media_preferences(
@@ -1088,7 +1142,13 @@ async fn execute_find_media_search(
     let has_requested_provider_filter = !requested_provider_ids.is_empty();
 
     let filtered_search_contexts = if requested_provider_ids.is_empty() {
-        search_contexts
+        if media_type == MediaType::Anime {
+            // Anime discovery defaults to metadata providers (AniList path).
+            // Provider-backed search is still available when explicitly requested.
+            Vec::new()
+        } else {
+            search_contexts
+        }
     } else {
         let mut out = Vec::new();
         for provider_id in requested_provider_ids {
@@ -1120,9 +1180,28 @@ async fn execute_find_media_search(
                         year: result.year,
                         external_ids: result.external_ids.clone(),
                         description: result.description.clone(),
+                        poster_url: result.poster_url.clone(),
+                        popularity_score: result.popularity_score,
                         source_provider_ids: Vec::new(),
                         source_labels: Vec::new(),
                     });
+                    if entry
+                        .description
+                        .as_ref()
+                        .map(|text| text.trim().is_empty())
+                        .unwrap_or(true)
+                    {
+                        entry.description = result.description.clone();
+                    }
+                    if entry.poster_url.is_none() {
+                        entry.poster_url = result.poster_url.clone();
+                    }
+                    if entry.popularity_score.is_none()
+                        || result.popularity_score.unwrap_or_default()
+                            > entry.popularity_score.unwrap_or_default()
+                    {
+                        entry.popularity_score = result.popularity_score;
+                    }
                     if !entry.source_provider_ids.contains(&provider_id) {
                         entry.source_provider_ids.push(provider_id);
                     }
@@ -1156,9 +1235,28 @@ async fn execute_find_media_search(
                     year: result.year,
                     external_ids: result.external_ids.clone(),
                     description: result.description.clone(),
+                    poster_url: result.poster_url.clone(),
+                    popularity_score: result.popularity_score,
                     source_provider_ids: Vec::new(),
                     source_labels: Vec::new(),
                 });
+                if entry
+                    .description
+                    .as_ref()
+                    .map(|text| text.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    entry.description = result.description.clone();
+                }
+                if entry.poster_url.is_none() {
+                    entry.poster_url = result.poster_url.clone();
+                }
+                if entry.popularity_score.is_none()
+                    || result.popularity_score.unwrap_or_default()
+                        > entry.popularity_score.unwrap_or_default()
+                {
+                    entry.popularity_score = result.popularity_score;
+                }
                 if !entry
                     .source_labels
                     .iter()
@@ -1171,14 +1269,7 @@ async fn execute_find_media_search(
     }
 
     let mut results: Vec<_> = merged.into_values().collect();
-    results.sort_by(|left, right| {
-        let by_year = right.year.cmp(&left.year);
-        if by_year == std::cmp::Ordering::Equal {
-            left.title.cmp(&right.title)
-        } else {
-            by_year
-        }
-    });
+    sort_find_media_results(query.as_str(), &mut results);
 
     Ok(FindMediaResponse {
         query,
@@ -1938,6 +2029,135 @@ fn normalize_name(value: &str) -> String {
         .replace([' ', '-', '_', ':'], "")
 }
 
+fn sort_find_media_results(query: &str, results: &mut [FindMediaResult]) {
+    let query_tokens = tokenize_for_search(query);
+    let query_compact = compact_for_search(query);
+    let query_year = extract_year_from_query(query);
+
+    results.sort_by(|left, right| {
+        let left_score = find_media_rank(left, &query_tokens, &query_compact, query_year);
+        let right_score = find_media_rank(right, &query_tokens, &query_compact, query_year);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.year.cmp(&left.year))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+}
+
+fn find_media_rank(
+    item: &FindMediaResult,
+    query_tokens: &[String],
+    query_compact: &str,
+    query_year: Option<i32>,
+) -> f64 {
+    let title = item.title.trim().to_ascii_lowercase();
+    let title_tokens = tokenize_for_search(&title);
+    let title_compact = compact_for_search(&title);
+
+    let mut score = 0.0;
+    if !query_compact.is_empty() {
+        if title_compact == query_compact {
+            score += 1200.0;
+        } else if title_compact.starts_with(query_compact) {
+            score += 900.0;
+        } else if title_compact.contains(query_compact) {
+            score += 650.0;
+        }
+    }
+
+    if !query_tokens.is_empty() {
+        let overlap = query_tokens
+            .iter()
+            .filter(|token| title_tokens.iter().any(|candidate| candidate == *token))
+            .count();
+        let overlap_ratio = overlap as f64 / query_tokens.len() as f64;
+        score += overlap_ratio * 420.0;
+        if overlap == query_tokens.len() && !query_tokens.is_empty() {
+            score += 180.0;
+        }
+    }
+
+    if let (Some(query_year), Some(result_year)) = (query_year, item.year) {
+        if query_year == result_year {
+            score += 120.0;
+        }
+    }
+
+    if let Some(popularity) = item.popularity_score.filter(|value| *value > 0.0) {
+        score += (popularity.ln_1p() * 45.0).min(220.0);
+    }
+
+    score
+}
+
+fn tokenize_for_search(value: &str) -> Vec<String> {
+    value
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn compact_for_search(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+}
+
+fn extract_year_from_query(value: &str) -> Option<i32> {
+    for token in value.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        if token.len() == 4
+            && token.chars().all(|ch| ch.is_ascii_digit())
+            && let Ok(year) = token.parse::<i32>()
+            && (1888..=2100).contains(&year)
+        {
+            return Some(year);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod ranking_tests {
+    use super::*;
+
+    #[test]
+    fn ranks_exact_title_above_loose_match() {
+        let mut results = vec![
+            FindMediaResult {
+                title: "The Good, the Bad and the Ugly".to_string(),
+                r#type: MediaType::Movie,
+                year: Some(1966),
+                external_ids: None,
+                description: None,
+                poster_url: None,
+                popularity_score: Some(9.1),
+                source_provider_ids: Vec::new(),
+                source_labels: Vec::new(),
+            },
+            FindMediaResult {
+                title: "Good Cars: The Ugly Truth".to_string(),
+                r#type: MediaType::Movie,
+                year: Some(2022),
+                external_ids: None,
+                description: None,
+                poster_url: None,
+                popularity_score: Some(1.0),
+                source_provider_ids: Vec::new(),
+                source_labels: Vec::new(),
+            },
+        ];
+
+        sort_find_media_results("The Good The Bad And The Ugly", &mut results);
+        assert_eq!(results[0].title, "The Good, the Bad and the Ugly");
+    }
+}
+
 async fn search_with_provider(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -2065,6 +2285,8 @@ async fn search_sonarr(
             .get("overview")
             .and_then(Value::as_str)
             .map(|value| value.to_string());
+        let poster_url = extract_arr_poster_url(base_url, &item);
+        let popularity_score = extract_arr_popularity_score(&item);
 
         out.push(DiscoveryResult {
             title: title.to_string(),
@@ -2081,6 +2303,8 @@ async fn search_sonarr(
                 ..Default::default()
             }),
             description,
+            poster_url,
+            popularity_score,
         });
     }
     Ok(out)
@@ -2119,6 +2343,8 @@ async fn search_radarr(
             .get("overview")
             .and_then(Value::as_str)
             .map(|value| value.to_string());
+        let poster_url = extract_arr_poster_url(base_url, &item);
+        let popularity_score = extract_arr_popularity_score(&item);
 
         out.push(DiscoveryResult {
             title: title.to_string(),
@@ -2130,6 +2356,8 @@ async fn search_radarr(
                 ..Default::default()
             }),
             description,
+            poster_url,
+            popularity_score,
         });
     }
     Ok(out)
@@ -2388,4 +2616,49 @@ fn parse_year_from_text(value: Option<&str>) -> Option<i32> {
     let value = value?;
     let year = value.get(0..4)?;
     year.parse::<i32>().ok()
+}
+
+fn extract_arr_poster_url(base_url: &str, value: &Value) -> Option<String> {
+    let images = value.get("images").and_then(Value::as_array)?;
+    let url = images
+        .iter()
+        .find(|image| {
+            image
+                .get("coverType")
+                .and_then(Value::as_str)
+                .map(|cover| {
+                    let cover = cover.trim().to_ascii_lowercase();
+                    cover == "poster" || cover == "cover"
+                })
+                .unwrap_or(false)
+        })
+        .or_else(|| images.first())?
+        .get("url")
+        .and_then(Value::as_str)?
+        .trim();
+    if url.is_empty() {
+        return None;
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(url.to_string());
+    }
+    let root = Url::parse(base_url).ok()?;
+    let joined = root.join(url.trim_start_matches('/')).ok()?;
+    Some(joined.to_string())
+}
+
+fn extract_arr_popularity_score(value: &Value) -> Option<f64> {
+    value
+        .get("ratings")
+        .and_then(|ratings| ratings.get("value"))
+        .and_then(value_as_f64)
+        .or_else(|| value.get("popularity").and_then(value_as_f64))
+        .or_else(|| value.get("voteCount").and_then(value_as_f64))
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    value.as_str()?.trim().parse::<f64>().ok()
 }

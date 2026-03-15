@@ -1349,8 +1349,8 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
                 "/api/v1/discovery/find?q=naruto&type=anime&provider_id={}",
                 sonarr_anime_search_provider_id
             ))
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())?,
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1478,7 +1478,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .get("providerErrors")
             .and_then(Value::as_array)
             .map(|items| items.len()),
-        Some(1)
+        Some(0)
     );
 
     let search_alias_resp = app
@@ -1503,7 +1503,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .get("providerErrors")
             .and_then(Value::as_array)
             .map(|items| items.len()),
-        Some(1)
+        Some(0)
     );
 
     Ok(())

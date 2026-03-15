@@ -58,3 +58,4 @@ elixir_classifier = { path = "../crates/elixir_classifier" }
 default = []
 docker-probe-tests = []
 docker-sonarr-tests = []
+docker-wireguard-tests = []

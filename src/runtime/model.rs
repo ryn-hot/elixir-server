@@ -8,6 +8,8 @@ pub struct ContainerSpec {
     pub image: String,
     pub network: String,
     #[serde(default)]
+    pub network_mode: Option<String>,
+    #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
     pub env: Vec<EnvVar>,
@@ -19,6 +21,12 @@ pub struct ContainerSpec {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+    #[serde(default)]
+    pub devices: Vec<String>,
+    #[serde(default)]
+    pub sysctls: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

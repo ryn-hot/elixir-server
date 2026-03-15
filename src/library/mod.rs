@@ -34,6 +34,7 @@ use crate::{
     },
     config::ClassifierConfig,
     db::models::MediaType,
+    extensions::store::{ExtensionStore, ManagedIngestIntent},
     extensions::{ExternalIds, make_identity_key},
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
     media::ffprobe,
@@ -99,6 +100,9 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 ) -> Result<()> {
     let (merged, mut seen_paths): (Vec<AggregatedCandidate>, HashSet<String>) =
         merge_candidates(candidates, hash_dedupe);
+    let extension_store = ExtensionStore::new(pool);
+    let managed_ingest_intents = extension_store.list_active_managed_ingest_intents().await?;
+    let mut matched_managed_intent_ids: HashSet<Uuid> = HashSet::new();
     let classifier = build_classifier_pipeline(classifier_config);
     let anilist_bridge = build_anilist_identifier(classifier_config);
     let anilist_scorer = DefaultScorer::default();
@@ -106,6 +110,16 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 
     for mut candidate in merged {
         let mut merged_ids = candidate.identity.external_ids.clone();
+        if let Some(intent) =
+            match_managed_ingest_intent(&candidate.identity, &merged_ids, &managed_ingest_intents)
+        {
+            if let Some(intent_ids) = intent.external_ids.clone() {
+                merged_ids = merge_external_ids(&merged_ids, Some(intent_ids));
+            }
+            candidate.identity.r#type =
+                merge_media_type_with_intent(candidate.identity.r#type, intent.media_type);
+            matched_managed_intent_ids.insert(intent.intent_id);
+        }
         let (
             classified_ids,
             mut review_outcomes,
@@ -631,6 +645,12 @@ pub async fn run_full_scan_with_metadata_and_linkers(
         }
     }
 
+    for intent_id in matched_managed_intent_ids {
+        extension_store
+            .mark_managed_ingest_intent_matched(intent_id)
+            .await?;
+    }
+
     // Mark missing
     let existing_paths: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT path FROM media_files WHERE scan_state = 'ok'",
@@ -735,6 +755,144 @@ fn merge_external_ids(base: &ExternalIds, incoming: Option<ExternalIds>) -> Exte
     } else {
         base.clone()
     }
+}
+
+fn merge_media_type_with_intent(current: MediaType, intent: MediaType) -> MediaType {
+    match intent {
+        MediaType::Anime => MediaType::Anime,
+        MediaType::Series => {
+            if current == MediaType::Anime {
+                MediaType::Anime
+            } else {
+                MediaType::Series
+            }
+        }
+        MediaType::Movie => MediaType::Movie,
+    }
+}
+
+fn match_managed_ingest_intent<'a>(
+    identity: &MediaIdentity,
+    merged_ids: &ExternalIds,
+    intents: &'a [ManagedIngestIntent],
+) -> Option<&'a ManagedIngestIntent> {
+    let normalized_title = normalize_managed_intent_title(&identity.title);
+    let mut best: Option<(&ManagedIngestIntent, i32)> = None;
+
+    for intent in intents {
+        if !managed_intent_media_type_compatible(identity.r#type, intent.media_type) {
+            continue;
+        }
+
+        let id_score = intent
+            .external_ids
+            .as_ref()
+            .map(|ids| managed_intent_id_overlap_score(merged_ids, ids))
+            .unwrap_or(0);
+        let title_match =
+            !normalized_title.is_empty() && normalized_title == intent.normalized_title;
+        let year_score = match (intent.year, identity.year) {
+            (Some(intent_year), Some(identity_year)) if intent_year == identity_year => 20,
+            (Some(_), Some(_)) => {
+                if id_score == 0 {
+                    continue;
+                }
+                0
+            }
+            (None, _) | (_, None) => 5,
+        };
+
+        if id_score == 0 && !title_match {
+            continue;
+        }
+
+        let mut score = id_score * 100;
+        if title_match {
+            score += 30;
+        }
+        score += year_score;
+        if intent.external_ids.is_some() {
+            score += 1;
+        }
+
+        match best {
+            Some((_, best_score)) if score <= best_score => {}
+            _ => best = Some((intent, score)),
+        }
+    }
+
+    best.map(|(intent, _)| intent)
+}
+
+fn managed_intent_media_type_compatible(candidate: MediaType, intent: MediaType) -> bool {
+    candidate == intent
+        || (candidate == MediaType::Series && intent == MediaType::Anime)
+        || (candidate == MediaType::Anime && intent == MediaType::Series)
+}
+
+fn managed_intent_id_overlap_score(left: &ExternalIds, right: &ExternalIds) -> i32 {
+    let mut score = 0;
+    if managed_intent_id_match(left.imdb.as_deref(), right.imdb.as_deref(), true) {
+        score += 10;
+    }
+    if managed_intent_id_match(left.tmdb.as_deref(), right.tmdb.as_deref(), false) {
+        score += 8;
+    }
+    if managed_intent_id_match(
+        left.tvdb_series.as_deref(),
+        right.tvdb_series.as_deref(),
+        false,
+    ) {
+        score += 8;
+    }
+    if managed_intent_id_match(
+        left.tvdb_movie.as_deref(),
+        right.tvdb_movie.as_deref(),
+        false,
+    ) {
+        score += 8;
+    }
+    if managed_intent_id_match(left.tvdb.as_deref(), right.tvdb.as_deref(), false) {
+        score += 6;
+    }
+    if managed_intent_id_match(left.anilist.as_deref(), right.anilist.as_deref(), false) {
+        score += 10;
+    }
+    if managed_intent_id_match(left.anidb.as_deref(), right.anidb.as_deref(), false) {
+        score += 6;
+    }
+    if managed_intent_id_match(left.mal.as_deref(), right.mal.as_deref(), false) {
+        score += 6;
+    }
+    if managed_intent_id_match(left.kitsu.as_deref(), right.kitsu.as_deref(), false) {
+        score += 4;
+    }
+    score
+}
+
+fn managed_intent_id_match(
+    left: Option<&str>,
+    right: Option<&str>,
+    case_insensitive: bool,
+) -> bool {
+    let Some(left) = left.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(right) = right.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if case_insensitive {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn normalize_managed_intent_title(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_', ':'], "")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4851,6 +5009,163 @@ mod tests {
             .fetch_one(&database.pool)
             .await?;
         assert_eq!(imdb.as_deref(), Some("tt9999999"));
+
+        let (pending_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM review_queue WHERE status = 'pending'")
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(pending_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_ingest_intent_supplies_ids_and_marks_match() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+
+        let title = "Managed Movie";
+        let normalized_title = normalize_managed_intent_title(title);
+        let external_ids_json = serde_json::json!({
+            "imdb": "tt0096256"
+        });
+
+        sqlx::query(
+            "INSERT INTO managed_ingest_intents (
+                intent_id, media_type, title, normalized_title, year, external_ids_json,
+                manager_provider_id, manager_item_id, manager_label, source, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind("movie")
+        .bind(title)
+        .bind(normalized_title)
+        .bind(1988)
+        .bind(serde_json::to_string(&external_ids_json)?)
+        .bind(Uuid::new_v4().to_string())
+        .bind("movie-123")
+        .bind("default(radarr)")
+        .bind("find_media_add")
+        .execute(&database.pool)
+        .await?;
+
+        let candidates = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds::default(),
+                title: title.to_string(),
+                year: Some(1988),
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: "/media/managed_movie.mkv".to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, candidates, false).await?;
+
+        let imdb: Option<String> = sqlx::query_scalar("SELECT external_imdb FROM movies LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(imdb.as_deref(), Some("tt0096256"));
+
+        let (pending_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM review_queue WHERE status = 'pending'")
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(pending_count, 0);
+
+        let matched: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(last_matched_at AS TEXT) FROM managed_ingest_intents LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(
+            matched
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_anime_intent_promotes_series_to_anime() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+
+        let title = "Solo Leveling";
+        let normalized_title = normalize_managed_intent_title(title);
+        let external_ids_json = serde_json::json!({
+            "anilist": "151807"
+        });
+
+        sqlx::query(
+            "INSERT INTO managed_ingest_intents (
+                intent_id, media_type, title, normalized_title, year, external_ids_json,
+                manager_provider_id, manager_item_id, manager_label, source, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind("anime")
+        .bind(title)
+        .bind(normalized_title)
+        .bind(2024)
+        .bind(serde_json::to_string(&external_ids_json)?)
+        .bind(Uuid::new_v4().to_string())
+        .bind("anime-151807")
+        .bind("default(sonarr)")
+        .bind("find_media_add")
+        .execute(&database.pool)
+        .await?;
+
+        let candidates = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Series,
+                external_ids: ExtIds::default(),
+                title: title.to_string(),
+                year: Some(2024),
+                season: Some(1),
+                episode: Some(1),
+            },
+            files: vec![FD {
+                path: "/media/Solo.Leveling.S01E01.mkv".to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, candidates, false).await?;
+
+        let row = sqlx::query("SELECT library_type, external_anilist FROM series LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        let library_type: String = row.try_get("library_type")?;
+        let anilist: Option<String> = row.try_get("external_anilist")?;
+        assert_eq!(library_type, "anime");
+        assert_eq!(anilist.as_deref(), Some("151807"));
 
         let (pending_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM review_queue WHERE status = 'pending'")

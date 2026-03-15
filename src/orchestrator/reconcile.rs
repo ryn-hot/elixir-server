@@ -30,6 +30,7 @@ pub struct ReconcileConfig {
     pub interval: Duration,
     pub retry_attempts: u32,
     pub retry_backoff: Duration,
+    pub startup_settle: Duration,
     pub lock_ttl: Duration,
 }
 
@@ -39,11 +40,18 @@ impl ReconcileConfig {
         let retry_attempts = settings.extensions.reconcile_retry_attempts.max(1);
         let retry_backoff =
             Duration::from_secs(settings.extensions.reconcile_retry_backoff_seconds.max(1));
+        let startup_settle = Duration::from_secs(
+            settings
+                .extensions
+                .reconcile_startup_settle_seconds
+                .min(300),
+        );
         let lock_ttl = Duration::from_secs(settings.extensions.apply_lock_ttl_seconds.max(1));
         Self {
             interval,
             retry_attempts,
             retry_backoff,
+            startup_settle,
             lock_ttl,
         }
     }
@@ -57,6 +65,8 @@ pub struct Reconciler<'a> {
     runtime_paths: RuntimePaths,
     drivers: &'a crate::drivers::DriverRegistry,
     secrets: &'a SecretsManager,
+    wireguard_gateway_image: String,
+    default_wireguard_config_secret: Option<String>,
     retry_attempts: u32,
     retry_backoff: Duration,
     lock_ttl: Duration,
@@ -70,6 +80,8 @@ impl<'a> Reconciler<'a> {
         drivers: &'a crate::drivers::DriverRegistry,
         runtime_paths: RuntimePaths,
         secrets: &'a SecretsManager,
+        wireguard_gateway_image: String,
+        default_wireguard_config_secret: Option<String>,
         config: &ReconcileConfig,
     ) -> Self {
         Self {
@@ -80,6 +92,8 @@ impl<'a> Reconciler<'a> {
             runtime_paths,
             drivers,
             secrets,
+            wireguard_gateway_image,
+            default_wireguard_config_secret,
             retry_attempts: config.retry_attempts.max(1),
             retry_backoff: config.retry_backoff,
             lock_ttl: config.lock_ttl,
@@ -244,7 +258,9 @@ impl<'a> Reconciler<'a> {
             self.runtime,
             self.runtime_paths.clone(),
             self.secrets,
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
 
         for item in desired {
             let decisions = self
@@ -501,7 +517,9 @@ impl<'a> Reconciler<'a> {
             self.runtime,
             self.runtime_paths.clone(),
             self.secrets,
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
         let mut step_index = 0;
         let mut failed = false;
         for action in plan.actions {
@@ -610,7 +628,9 @@ impl<'a> Reconciler<'a> {
             self.runtime,
             self.runtime_paths.clone(),
             self.secrets,
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
 
         for detail in providers {
             let provider = &detail.provider;
@@ -816,7 +836,9 @@ impl<'a> Reconciler<'a> {
             self.runtime,
             self.runtime_paths.clone(),
             self.secrets,
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
 
         executor
             .apply(ExecutorAction::EnsureRuntimeRunning {
@@ -850,7 +872,9 @@ impl<'a> Reconciler<'a> {
             self.runtime,
             self.runtime_paths.clone(),
             self.secrets,
-        );
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
 
         for binding in bindings {
             let consumer = match provider_map.get(&binding.consumer_provider_id) {
@@ -1449,6 +1473,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -1459,6 +1484,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -1533,6 +1560,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -1543,6 +1571,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -1672,6 +1702,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -1682,6 +1713,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -1903,6 +1936,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -1913,6 +1947,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -1951,6 +1987,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -1961,6 +1998,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -2029,6 +2068,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -2039,6 +2079,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -2094,6 +2136,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -2104,6 +2147,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -2183,6 +2228,7 @@ mod tests {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
         };
 
@@ -2193,6 +2239,8 @@ mod tests {
             &drivers,
             runtime_paths,
             &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
             &config,
         );
         reconciler.run_once().await?;
@@ -2209,5 +2257,15 @@ mod tests {
         assert!(pending.is_none(), "pending auto-wire run should be cleared");
 
         Ok(())
+    }
+
+    #[test]
+    fn reconcile_config_uses_startup_settle_from_settings() {
+        let mut settings = Settings::default();
+        settings.extensions.reconcile_startup_settle_seconds = 23;
+
+        let config = ReconcileConfig::from_settings(&settings);
+
+        assert_eq!(config.startup_settle, Duration::from_secs(23));
     }
 }

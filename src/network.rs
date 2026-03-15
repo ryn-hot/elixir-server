@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod vpn;
 pub mod wan;
 
 use anyhow::Result;

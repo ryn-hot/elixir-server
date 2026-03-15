@@ -8,6 +8,7 @@ pub struct SettingsResponse {
     environment: String,
     server: ServerSettings,
     network: NetworkSettings,
+    vpn: VpnSettings,
     database: DatabaseSettings,
     telemetry: TelemetrySettings,
 }
@@ -27,6 +28,18 @@ pub struct NetworkSettings {
     default_lan_max_bitrate_bps: Option<i64>,
     default_wan_max_bitrate_bps: Option<i64>,
     wan_status: String,
+}
+
+#[derive(Serialize)]
+pub struct VpnSettings {
+    enabled: bool,
+    detect_host_vpn: bool,
+    auto_wrap_qbittorrent: bool,
+    wireguard_config_secret: String,
+    wireguard_gateway_image: String,
+    host_vpn_detected: bool,
+    host_vpn_interfaces: Vec<String>,
+    warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +72,7 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             default_wan_max_bitrate_bps: settings.playback.default_wan_max_bitrate_bps,
             wan_status: wan_status(&app_state).await,
         },
+        vpn: vpn_settings(&app_state),
         database: DatabaseSettings {
             driver: app_state.db_driver.as_str(),
             max_connections: settings.database.max_connections,
@@ -68,6 +82,29 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             log_directives: settings.telemetry.log_directives.clone(),
         },
     }))
+}
+
+fn vpn_settings(state: &AppState) -> VpnSettings {
+    let detect_host_vpn = state.settings.network.vpn.detect_host_vpn;
+    let status = if detect_host_vpn {
+        crate::network::vpn::detect_host_vpn()
+    } else {
+        crate::network::vpn::HostVpnStatus {
+            detected: false,
+            interfaces: Vec::new(),
+            warning: None,
+        }
+    };
+    VpnSettings {
+        enabled: state.settings.network.vpn.enabled,
+        detect_host_vpn,
+        auto_wrap_qbittorrent: state.settings.network.vpn.auto_wrap_qbittorrent,
+        wireguard_config_secret: state.settings.network.vpn.wireguard_config_secret.clone(),
+        wireguard_gateway_image: state.settings.network.vpn.wireguard_gateway_image.clone(),
+        host_vpn_detected: status.detected,
+        host_vpn_interfaces: status.interfaces,
+        warning: status.warning,
+    }
 }
 
 async fn latest_wan_endpoint(state: &AppState) -> Option<String> {

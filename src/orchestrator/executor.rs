@@ -23,7 +23,9 @@ use crate::drivers::{
     DownloaderSpec, IndexerCredentialField, IndexerRegistryPatch, MediaManagerMoviesPatch,
     MediaManagerTvPatch,
 };
-use crate::extensions::manifest::{ManifestNetworking, ManifestRuntime, ManifestRuntimeEnv};
+use crate::extensions::manifest::{
+    ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress, ManifestRuntimeEnv,
+};
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
@@ -94,6 +96,8 @@ pub struct Executor<'a> {
     runtime: &'a dyn RuntimeManager,
     runtime_paths: RuntimePaths,
     secrets: &'a SecretsManager,
+    wireguard_gateway_image: String,
+    default_wireguard_config_secret: Option<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -112,7 +116,23 @@ impl<'a> Executor<'a> {
             runtime,
             runtime_paths,
             secrets,
+            wireguard_gateway_image: "qmcgaw/gluetun:v3.39.0".to_string(),
+            default_wireguard_config_secret: None,
         }
+    }
+
+    pub fn with_wireguard_gateway_image(mut self, image: impl Into<String>) -> Self {
+        let image = image.into();
+        if !image.trim().is_empty() {
+            self.wireguard_gateway_image = image;
+        }
+        self
+    }
+
+    pub fn with_default_wireguard_config_secret(mut self, secret: Option<String>) -> Self {
+        self.default_wireguard_config_secret =
+            secret.and_then(|value| (!value.trim().is_empty()).then_some(value));
+        self
     }
 
     pub async fn apply(&self, action: ExecutorAction) -> Result<()> {
@@ -277,7 +297,7 @@ impl<'a> Executor<'a> {
             ensure_qbittorrent_secrets(&self.store, self.secrets, instance_id, &runtime.env)
                 .await?;
         }
-        ensure_runtime_secrets_present(&self.store, instance_id, &runtime.env).await?;
+        ensure_runtime_secrets_present(&self.store, instance_id, &runtime).await?;
 
         let name = container_name(instance_id);
         let mut alias_list = aliases;
@@ -315,19 +335,71 @@ impl<'a> Executor<'a> {
             })
             .collect();
 
-        let spec = ContainerSpec {
+        let mut spec = ContainerSpec {
             name: name.clone(),
             image,
             network,
+            network_mode: None,
             aliases: alias_list,
             env,
             volumes,
             ports,
-            labels,
+            labels: labels.clone(),
             command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
         };
 
-        self.runtime.ensure_network(&spec.network).await?;
+        let resolved_egress = runtime.egress.clone().or_else(|| {
+            if is_qbittorrent_extension_id(&extension_id) {
+                self.default_wireguard_config_secret
+                    .as_ref()
+                    .map(|secret| ManifestRuntimeEgress {
+                        mode: "wireguard".to_string(),
+                        strict: true,
+                        wireguard_config_secret: Some(secret.clone()),
+                        wireguard_gateway_image: None,
+                    })
+            } else {
+                None
+            }
+        });
+
+        if let Some(egress) = resolved_egress {
+            if egress.mode_is_wireguard() {
+                match self
+                    .ensure_wireguard_gateway(
+                        instance_id,
+                        &extension_id,
+                        &name,
+                        &spec,
+                        &egress,
+                        &labels,
+                    )
+                    .await
+                {
+                    Ok(gateway_name) => {
+                        spec.network_mode = Some(format!("container:{gateway_name}"));
+                        spec.aliases.clear();
+                        spec.ports.clear();
+                    }
+                    Err(err) if !egress.strict => {
+                        tracing::warn!(
+                            "wireguard gateway setup failed for extension {} instance {} (strict=false), falling back to direct egress: {}",
+                            extension_id,
+                            instance_id,
+                            err
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        if spec.network_mode.is_none() {
+            self.runtime.ensure_network(&spec.network).await?;
+        }
 
         let needs_upgrade = current_version.as_deref() != Some(desired_version.as_str());
         if needs_upgrade {
@@ -406,6 +478,142 @@ impl<'a> Executor<'a> {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn ensure_wireguard_gateway(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        container_name: &str,
+        app_spec: &ContainerSpec,
+        egress: &ManifestRuntimeEgress,
+        base_labels: &HashMap<String, String>,
+    ) -> Result<String> {
+        let config_secret = egress
+            .wireguard_config_secret
+            .as_deref()
+            .ok_or_else(|| anyhow!("wireguard egress requires wireguard_config_secret"))?;
+        let config_value =
+            resolve_secret_value(&self.store, self.secrets, instance_id, config_secret)
+                .await
+                .with_context(|| {
+                    format!(
+                        "resolving wireguard config secret '{}' for instance {}",
+                        config_secret, instance_id
+                    )
+                })?;
+        if config_value.trim().is_empty() {
+            bail!(
+                "wireguard config secret '{}' resolved to empty value",
+                config_secret
+            );
+        }
+
+        let gateway_name = format!("{container_name}-vpn");
+        let config_path = self
+            .write_wireguard_config(instance_id, &config_value)
+            .await
+            .context("writing wireguard config")?;
+
+        let mut labels = base_labels.clone();
+        labels.insert(
+            "elixir.network_role".to_string(),
+            "wireguard_gateway".to_string(),
+        );
+
+        let mut sysctls = HashMap::new();
+        sysctls.insert(
+            "net.ipv4.conf.all.src_valid_mark".to_string(),
+            "1".to_string(),
+        );
+
+        let gateway_image = egress
+            .wireguard_gateway_image
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(self.wireguard_gateway_image.as_str())
+            .to_string();
+
+        let input_ports = app_spec
+            .ports
+            .iter()
+            .map(|port| port.container_port.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut gateway_env = vec![
+            EnvVar {
+                name: "VPN_SERVICE_PROVIDER".to_string(),
+                value: "custom".to_string(),
+            },
+            EnvVar {
+                name: "VPN_TYPE".to_string(),
+                value: "wireguard".to_string(),
+            },
+            EnvVar {
+                name: "WIREGUARD_CONF_FILE".to_string(),
+                value: "wg0.conf".to_string(),
+            },
+            EnvVar {
+                name: "FIREWALL_OUTBOUND_SUBNETS".to_string(),
+                value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".to_string(),
+            },
+        ];
+        if !input_ports.is_empty() {
+            gateway_env.push(EnvVar {
+                name: "FIREWALL_INPUT_PORTS".to_string(),
+                value: input_ports,
+            });
+        }
+
+        let gateway_spec = ContainerSpec {
+            name: gateway_name.clone(),
+            image: gateway_image,
+            network: app_spec.network.clone(),
+            network_mode: None,
+            aliases: app_spec.aliases.clone(),
+            env: gateway_env,
+            volumes: vec![VolumeMount {
+                host_path: config_path,
+                container_path: "/gluetun/wireguard/wg0.conf".to_string(),
+                read_only: true,
+            }],
+            ports: app_spec.ports.clone(),
+            labels,
+            command: Vec::new(),
+            cap_add: vec!["NET_ADMIN".to_string()],
+            devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
+            sysctls,
+        };
+
+        self.runtime.ensure_network(&gateway_spec.network).await?;
+        self.runtime
+            .ensure_container(&gateway_spec)
+            .await
+            .with_context(|| {
+                format!(
+                    "ensuring wireguard gateway container '{}' for extension '{}'",
+                    gateway_name, extension_id
+                )
+            })?;
+        Ok(gateway_name)
+    }
+
+    async fn write_wireguard_config(&self, instance_id: Uuid, config: &str) -> Result<String> {
+        let root = Path::new(&self.runtime_paths.data_root)
+            .join("extensions")
+            .join("wireguard")
+            .join(instance_id.to_string());
+        fs::create_dir_all(&root).await?;
+        let path = root.join("wg0.conf");
+        fs::write(&path, config).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&path, permissions).await?;
+        }
+        Ok(path.to_string_lossy().to_string())
     }
 
     async fn rollback_runtime(&self, instance_id: Uuid) -> Result<()> {
@@ -1777,9 +1985,9 @@ fn ensure_provider_healthy(provider: &Provider) -> Result<()> {
 async fn ensure_runtime_secrets_present(
     store: &ExtensionStore<'_>,
     instance_id: Uuid,
-    env: &[ManifestRuntimeEnv],
+    runtime: &ManifestRuntime,
 ) -> Result<()> {
-    let required = required_secrets_from_runtime(env)?;
+    let required = required_secrets_from_runtime(runtime)?;
     if required.is_empty() {
         return Ok(());
     }
@@ -1789,6 +1997,22 @@ async fn ensure_runtime_secrets_present(
     } else {
         bail!("missing required secrets: {}", missing.join(", "));
     }
+}
+
+async fn resolve_secret_value(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    from_secret: &str,
+) -> Result<String> {
+    let reference = parse_secret_reference(from_secret, instance_id)?;
+    let secret = store
+        .get_secret(reference.scope, reference.scope_id, &reference.key)
+        .await?
+        .ok_or_else(|| anyhow!("secret '{}' not found", reference.key))?;
+    secrets
+        .decrypt(&secret.value_encrypted)
+        .with_context(|| format!("decrypting secret '{}'", reference.key))
 }
 
 struct SecretReference {
@@ -1852,20 +2076,9 @@ async fn resolve_runtime_env(
         let value = match (env.value, env.from_secret) {
             (Some(value), None) => value,
             (None, Some(from_secret)) => {
-                let reference = parse_secret_reference(&from_secret, instance_id)?;
-                let secret = store
-                    .get_secret(reference.scope, reference.scope_id, &reference.key)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "secret '{}' not found for runtime.env '{}'",
-                            reference.key,
-                            name
-                        )
-                    })?;
-                secrets
-                    .decrypt(&secret.value_encrypted)
-                    .with_context(|| format!("decrypting secret for runtime.env '{name}'"))?
+                resolve_secret_value(store, secrets, instance_id, &from_secret)
+                    .await
+                    .with_context(|| format!("resolving runtime.env '{name}'"))?
             }
             (Some(_), Some(_)) => bail!(
                 "runtime.env '{}' must not define both value and from_secret",
@@ -1938,6 +2151,7 @@ mod tests {
     use crate::db::models::{
         ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
     };
+    use crate::extensions::manifest::ManifestRuntimePort;
     use crate::extensions::store::{
         ExtensionStore, NewExtension, NewExtensionInstance, NewProvider,
     };
@@ -2050,23 +2264,43 @@ mod tests {
 
     #[derive(Default)]
     struct CaptureRuntime {
-        spec: Mutex<Option<ContainerSpec>>,
+        specs: Mutex<Vec<ContainerSpec>>,
+        networks: Mutex<Vec<String>>,
     }
 
     impl CaptureRuntime {
         fn last_spec(&self) -> Option<ContainerSpec> {
-            self.spec.lock().expect("capture runtime lock").clone()
+            self.specs
+                .lock()
+                .expect("capture runtime lock")
+                .last()
+                .cloned()
+        }
+
+        fn specs(&self) -> Vec<ContainerSpec> {
+            self.specs.lock().expect("capture runtime lock").clone()
+        }
+
+        fn networks(&self) -> Vec<String> {
+            self.networks.lock().expect("capture runtime lock").clone()
         }
     }
 
     #[async_trait]
     impl RuntimeManager for CaptureRuntime {
-        async fn ensure_network(&self, _name: &str) -> Result<()> {
+        async fn ensure_network(&self, name: &str) -> Result<()> {
+            self.networks
+                .lock()
+                .expect("capture runtime lock")
+                .push(name.to_string());
             Ok(())
         }
 
         async fn ensure_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
-            *self.spec.lock().expect("capture runtime lock") = Some(spec.clone());
+            self.specs
+                .lock()
+                .expect("capture runtime lock")
+                .push(spec.clone());
             Ok(ContainerHandle {
                 id: "capture".to_string(),
                 name: spec.name.clone(),
@@ -2627,6 +2861,7 @@ mod tests {
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
             }],
+            egress: None,
         };
 
         executor
@@ -2715,6 +2950,7 @@ mod tests {
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
             }],
+            egress: None,
         };
 
         let err = executor
@@ -2787,6 +3023,7 @@ mod tests {
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
             }],
+            egress: None,
         };
 
         let err = executor
@@ -2801,6 +3038,391 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("missing required secrets"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wireguard_egress_creates_gateway_and_container_namespace_pair() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "ext.wg", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.wg".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([4u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: "wg_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_wireguard_gateway_image("example/wireguard-gateway:1");
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/downloader:latest".to_string()),
+            network: None,
+            service_name: Some("elx-downloader".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: Some(ManifestRuntimeEgress {
+                mode: "wireguard".to_string(),
+                strict: true,
+                wireguard_config_secret: Some("instance:wg_config".to_string()),
+                wireguard_gateway_image: None,
+            }),
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.wg".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-test".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 2, "expected gateway + app container specs");
+        let gateway = &specs[0];
+        let app = &specs[1];
+        assert_eq!(gateway.image, "example/wireguard-gateway:1");
+        assert!(gateway.aliases.iter().any(|alias| alias == "svc-test"));
+        assert!(
+            gateway
+                .aliases
+                .iter()
+                .any(|alias| alias == "elx-downloader"),
+            "service alias should be attached to gateway container"
+        );
+        assert_eq!(gateway.cap_add, vec!["NET_ADMIN".to_string()]);
+        assert!(
+            gateway
+                .devices
+                .iter()
+                .any(|d| d == "/dev/net/tun:/dev/net/tun")
+        );
+        assert_eq!(gateway.network_mode, None);
+        assert_eq!(gateway.ports.len(), 1);
+
+        let gateway_name = gateway.name.clone();
+        assert_eq!(
+            app.network_mode.as_deref(),
+            Some(format!("container:{gateway_name}").as_str())
+        );
+        assert!(app.aliases.is_empty(), "app aliases belong on gateway");
+        assert!(app.ports.is_empty(), "app ports belong on gateway");
+
+        let wg_path = gateway
+            .volumes
+            .first()
+            .expect("gateway config mount")
+            .host_path
+            .clone();
+        assert!(
+            Path::new(&wg_path).exists(),
+            "wireguard config file should exist"
+        );
+        let content = fs::read_to_string(&wg_path).await?;
+        assert!(content.contains("PrivateKey = test"));
+
+        let networks = runtime.networks();
+        assert_eq!(networks, vec!["elixir_net".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wireguard_egress_strict_false_falls_back_to_direct_when_secret_missing() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "ext.wg", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.wg".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/downloader:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: Some(ManifestRuntimeEgress {
+                mode: "wireguard".to_string(),
+                strict: false,
+                wireguard_config_secret: Some("instance:wg_config".to_string()),
+                wireguard_gateway_image: None,
+            }),
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.wg".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-test".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(
+            specs.len(),
+            1,
+            "strict=false should fall back to direct runtime"
+        );
+        assert_eq!(specs[0].network_mode, None);
+        assert!(!specs[0].aliases.is_empty());
+        assert_eq!(specs[0].ports.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wireguard_egress_strict_true_fails_when_secret_missing() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "ext.wg", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.wg".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/downloader:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: Some(ManifestRuntimeEgress {
+                mode: "wireguard".to_string(),
+                strict: true,
+                wireguard_config_secret: Some("instance:wg_config".to_string()),
+                wireguard_gateway_image: None,
+            }),
+        };
+
+        let err = executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.wg".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-test".to_string()],
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("missing required secrets") || message.contains("secret"),
+            "unexpected error: {message}"
+        );
+        assert!(runtime.specs().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qbittorrent_uses_default_wireguard_secret_when_runtime_egress_not_declared()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([9u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(
+            specs.len(),
+            2,
+            "expected default wireguard wrapping for qbittorrent"
+        );
+        assert!(specs[1].network_mode.is_some());
         Ok(())
     }
 
@@ -2833,6 +3455,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             env: Vec::new(),
+            egress: None,
         };
 
         let probe = StubProbe::default();
@@ -2922,6 +3545,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             env: Vec::new(),
+            egress: None,
         };
 
         let probe = StubProbe::default();
@@ -3040,6 +3664,313 @@ mod tests {
         ];
         assert_eq!(runtime.calls(), expected);
         Ok(())
+    }
+
+    #[cfg(feature = "docker-wireguard-tests")]
+    mod docker_wireguard_tests {
+        use super::*;
+
+        use std::collections::HashMap;
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        use anyhow::{Context, bail};
+
+        use crate::runtime::RuntimeManager;
+        use crate::runtime::docker::DockerRuntimeManager;
+
+        struct ContainerCleanup {
+            names: Vec<String>,
+        }
+
+        impl ContainerCleanup {
+            fn new(names: Vec<String>) -> Self {
+                Self { names }
+            }
+        }
+
+        impl Drop for ContainerCleanup {
+            fn drop(&mut self) {
+                for name in &self.names {
+                    let _ = Command::new("docker")
+                        .arg("rm")
+                        .arg("-f")
+                        .arg(name)
+                        .status();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn wireguard_egress_docker_namespace_routing() -> Result<()> {
+            ensure_docker_available()?;
+            if !Path::new("/dev/net/tun").exists() {
+                eprintln!("skipping docker wireguard test: /dev/net/tun is not available");
+                return Ok(());
+            }
+
+            let database = setup_db().await?;
+            let store = ExtensionStore::new(&database.pool);
+            insert_extension(&store, "ext.wg", json!({})).await?;
+
+            let instance_id = Uuid::new_v4();
+            store
+                .create_instance(&NewExtensionInstance {
+                    instance_id,
+                    extension_id: "ext.wg".to_string(),
+                    instance_name: "default".to_string(),
+                    config_json: None,
+                    enabled: true,
+                })
+                .await?;
+
+            let wireguard_config = r#"[Interface]
+PrivateKey = yAnzdtF2rM8Nl1N8MPm+2MvmFo0xSg6u40qCMgfHdC0=
+Address = 10.64.0.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = fNBdb9h9NP7VDaRao7IhiHBpjz2uVH54camzato3tr0=
+AllowedIPs = 0.0.0.0/0,::/0
+Endpoint = 127.0.0.1:51820
+PersistentKeepalive = 25
+"#;
+
+            let secrets = SecretsManager::from_key_bytes([11u8; 32], true);
+            let encrypted = secrets.encrypt(wireguard_config)?;
+            store
+                .upsert_secret(&NewSecret {
+                    secret_id: Uuid::new_v4(),
+                    scope: SecretScope::Instance,
+                    scope_id: Some(instance_id),
+                    key: "wg_config".to_string(),
+                    value_encrypted: encrypted,
+                    rotatable: false,
+                })
+                .await?;
+
+            let runtime = DockerRuntimeManager::new(None);
+            runtime.ensure_network("elixir_net").await?;
+
+            let suffix = short_id();
+            let target_name = format!("elixir-wg-target-{suffix}");
+            let target_alias = format!("svc-wg-target-{suffix}");
+            let app_name = container_name(instance_id);
+            let gateway_name = format!("{app_name}-vpn");
+            let _cleanup = ContainerCleanup::new(vec![
+                app_name.clone(),
+                gateway_name.clone(),
+                target_name.clone(),
+            ]);
+
+            let mut target_labels = HashMap::new();
+            target_labels.insert("elixir.managed".to_string(), "true".to_string());
+            target_labels.insert("elixir.instance_id".to_string(), Uuid::new_v4().to_string());
+            target_labels.insert("elixir.extension_id".to_string(), "elixir.test".to_string());
+            let target_spec = ContainerSpec {
+                name: target_name.clone(),
+                image: "hashicorp/http-echo:0.2.3".to_string(),
+                network: "elixir_net".to_string(),
+                network_mode: None,
+                aliases: vec![target_alias.clone()],
+                env: Vec::new(),
+                volumes: Vec::new(),
+                ports: Vec::new(),
+                labels: target_labels,
+                command: vec![
+                    "-listen".to_string(),
+                    ":8080".to_string(),
+                    "-text".to_string(),
+                    "ok".to_string(),
+                ],
+                cap_add: Vec::new(),
+                devices: Vec::new(),
+                sysctls: HashMap::new(),
+            };
+            runtime.ensure_container(&target_spec).await?;
+
+            let probe = StubProbe::default();
+            let drivers = DriverRegistry::new();
+            let temp_dir = TempDir::new()?;
+            let runtime_paths = RuntimePaths::from_roots(
+                temp_dir
+                    .path()
+                    .join("data")
+                    .join("extensions")
+                    .to_string_lossy()
+                    .as_ref(),
+                temp_dir.path().to_string_lossy().as_ref(),
+            );
+            let executor = Executor::new(
+                &database.pool,
+                &probe,
+                &drivers,
+                &runtime,
+                runtime_paths,
+                &secrets,
+            )
+            .with_wireguard_gateway_image("qmcgaw/gluetun:v3.39.0");
+
+            let runtime_spec = ManifestRuntime {
+                r#type: "container".to_string(),
+                image: Some("nginx:1.27-alpine".to_string()),
+                network: None,
+                service_name: Some(format!("elx-wg-app-{suffix}")),
+                ports: vec![],
+                volumes: Vec::new(),
+                env: Vec::new(),
+                egress: Some(ManifestRuntimeEgress {
+                    mode: "wireguard".to_string(),
+                    strict: true,
+                    wireguard_config_secret: Some("instance:wg_config".to_string()),
+                    wireguard_gateway_image: None,
+                }),
+            };
+
+            executor
+                .ensure_runtime_running(
+                    instance_id,
+                    "ext.wg".to_string(),
+                    "default".to_string(),
+                    runtime_spec,
+                    None,
+                    vec![format!("svc-wg-app-{suffix}")],
+                )
+                .await?;
+
+            wait_until_running(&runtime, &gateway_name).await?;
+            wait_until_running(&runtime, &app_name).await?;
+
+            let app_mode = inspect_network_mode(&app_name)?;
+            let gateway = runtime
+                .get_container_handle(&gateway_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("gateway container missing"))?;
+            let app_expected_by_name = format!("container:{gateway_name}");
+            let app_expected_by_id = format!("container:{}", gateway.id);
+            assert!(
+                app_mode == app_expected_by_name || app_mode == app_expected_by_id,
+                "unexpected app network mode '{}'; expected '{}' or '{}'",
+                app_mode,
+                app_expected_by_name,
+                app_expected_by_id
+            );
+
+            let body = wait_for_gateway_http_probe(&gateway_name, &target_alias)?;
+            assert!(
+                body.contains("ok"),
+                "unexpected response body from target via gateway namespace: {body}"
+            );
+
+            Ok(())
+        }
+
+        async fn wait_until_running(runtime: &DockerRuntimeManager, name: &str) -> Result<()> {
+            let mut last = None;
+            for _ in 0..30 {
+                if let Some(handle) = runtime.get_container_handle(name).await? {
+                    let state = runtime.inspect(&handle).await?;
+                    if state.running {
+                        return Ok(());
+                    }
+                    last = Some(format!(
+                        "container exists but not running (status={})",
+                        state.status
+                    ));
+                } else {
+                    last = Some("container not found yet".to_string());
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            bail!(
+                "container '{}' did not become running: {}",
+                name,
+                last.unwrap_or_else(|| "unknown state".to_string())
+            );
+        }
+
+        fn wait_for_gateway_http_probe(gateway_name: &str, target_alias: &str) -> Result<String> {
+            let mut last_err = None;
+            for _ in 0..20 {
+                match gateway_http_probe(gateway_name, target_alias) {
+                    Ok(body) => return Ok(body),
+                    Err(err) => {
+                        last_err = Some(err);
+                        thread::sleep(Duration::from_millis(750));
+                    }
+                }
+            }
+            if let Some(err) = last_err {
+                let gateway_logs = docker_logs(gateway_name).unwrap_or_else(|_| String::new());
+                bail!(
+                    "failed to reach target '{}' from gateway namespace: {}\n{}",
+                    target_alias,
+                    err,
+                    gateway_logs
+                );
+            }
+            bail!("gateway probe failed without an error");
+        }
+
+        fn gateway_http_probe(gateway_name: &str, target_alias: &str) -> Result<String> {
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--network",
+                    &format!("container:{gateway_name}"),
+                    "curlimages/curl:8.10.1",
+                    "-fsS",
+                    &format!("http://{target_alias}:8080/"),
+                ])
+                .output()
+                .context("running gateway namespace http probe")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                bail!("gateway probe command failed: {stderr}");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn inspect_network_mode(name: &str) -> Result<String> {
+            let output = Command::new("docker")
+                .args(["inspect", "--format", "{{.HostConfig.NetworkMode}}", name])
+                .output()
+                .with_context(|| format!("inspecting container '{}'", name))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                bail!("docker inspect failed for '{}': {}", name, stderr);
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn docker_logs(name: &str) -> Result<String> {
+            let output = Command::new("docker")
+                .args(["logs", name])
+                .output()
+                .with_context(|| format!("reading logs for container '{}'", name))?;
+            Ok(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+
+        fn ensure_docker_available() -> Result<()> {
+            let output = Command::new("docker")
+                .arg("version")
+                .arg("--format")
+                .arg("{{.Server.Version}}")
+                .output()
+                .context("checking docker availability")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("docker is not available: {}", stderr.trim());
+            }
+            Ok(())
+        }
+
+        fn short_id() -> String {
+            let raw = Uuid::new_v4().simple().to_string();
+            raw.chars().take(8).collect()
+        }
     }
 
     #[test]

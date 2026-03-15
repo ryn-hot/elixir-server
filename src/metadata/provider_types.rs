@@ -18,4 +18,6 @@ pub struct DiscoveryResult {
     pub year: Option<i32>,
     pub external_ids: Option<ExternalIds>,
     pub description: Option<String>,
+    pub poster_url: Option<String>,
+    pub popularity_score: Option<f64>,
 }
