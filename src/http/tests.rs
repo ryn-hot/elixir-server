@@ -346,6 +346,245 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
 }
 
 #[tokio::test]
+async fn downloader_profile_reports_default_profile_and_telemetry() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            name: "qBittorrent".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "managed_defaults": {
+                    "qbittorrent_performance_profile_version": "v1"
+                }
+            })),
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "downloader.torrent".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("qbittorrent".to_string()),
+            scope_json: None,
+            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
+                "http".to_string(),
+                "elx-qbittorrent".to_string(),
+                8080,
+                None,
+                Some("elixir_net".to_string()),
+            )?)?),
+            health_state: ProviderHealthState::Unknown,
+        })
+        .await?;
+    store
+        .upsert_extension_setting(
+            &format!("extensions.downloaders.telemetry.{provider_id}"),
+            &json!({
+                "lastSuccessfulSampleAt": "2026-04-07T12:00:00Z",
+                "lastErrorAt": "2026-04-07T12:05:00Z"
+            }),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/downloaders/profile").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("profile").and_then(Value::as_str),
+        Some("balanced")
+    );
+    assert_eq!(
+        json.get("defaultProfile").and_then(Value::as_str),
+        Some("balanced")
+    );
+    assert_eq!(json.get("source").and_then(Value::as_str), Some("config"));
+    assert_eq!(
+        json.get("pendingUpdateCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    let downloaders = json
+        .get("downloaders")
+        .and_then(Value::as_array)
+        .expect("downloaders");
+    assert_eq!(downloaders.len(), 1);
+    assert_eq!(
+        downloaders[0].get("name").and_then(Value::as_str),
+        Some("qBittorrent")
+    );
+    assert_eq!(
+        downloaders[0].get("appliedProfile").and_then(Value::as_str),
+        Some("balanced")
+    );
+    assert_eq!(
+        downloaders[0].get("syncState").and_then(Value::as_str),
+        Some("up_to_date")
+    );
+    assert!(
+        downloaders[0]
+            .get("telemetryError")
+            .map(Value::is_null)
+            .unwrap_or(true)
+    );
+    assert_eq!(
+        downloaders[0]
+            .get("lastSuccessfulSampleAt")
+            .and_then(Value::as_str),
+        Some("2026-04-07T12:00:00Z")
+    );
+    assert_eq!(
+        downloaders[0].get("lastErrorAt").and_then(Value::as_str),
+        Some("2026-04-07T12:05:00Z")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn downloader_profile_update_persists_override_and_marks_pending_updates() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            name: "qBittorrent".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "managed_defaults": {
+                    "qbittorrent_performance_profile_version": "balanced-v1"
+                }
+            })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id,
+            capability: "downloader.torrent".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("qbittorrent".to_string()),
+            scope_json: None,
+            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
+                "http".to_string(),
+                "elx-qbittorrent".to_string(),
+                8080,
+                None,
+                Some("elixir_net".to_string()),
+            )?)?),
+            health_state: ProviderHealthState::Unknown,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::patch("/api/v1/extensions/downloaders/profile")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "profile": "aggressive" }).to_string()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("profile").and_then(Value::as_str),
+        Some("aggressive")
+    );
+    assert_eq!(json.get("source").and_then(Value::as_str), Some("override"));
+    assert!(json.get("updatedAt").is_some());
+    assert_eq!(
+        json.get("pendingUpdateCount").and_then(Value::as_u64),
+        Some(1)
+    );
+    let stored = store
+        .get_extension_setting("downloader_profile")
+        .await?
+        .expect("stored override");
+    assert_eq!(stored.as_str(), Some("aggressive"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn login_returns_access_token() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "test-secret-key".to_string();
@@ -3572,6 +3811,157 @@ async fn extensions_rejects_bad_signature() -> Result<()> {
     assert_eq!(install_resp.status(), StatusCode::BAD_REQUEST);
 
     let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_allows_unsigned_bundled_directory_install_in_production() -> Result<()> {
+    let temp = tempdir()?;
+    let bundled_dir = temp.path().join("bundled");
+    let package_dir = bundled_dir.join("nzbget-module");
+    std::fs::create_dir_all(&package_dir)?;
+    let manifest = r#"id: elixir.modules.nzbget
+version: 1.0.0
+kind: module
+name: "NZBGet"
+provides:
+  - capability: downloader.nzb
+    slot: default
+    implementation: "nzbget"
+runtime:
+  type: container
+  image: "example/nzbget:1"
+  env:
+    - name: "NZBGET_USER"
+      from_secret: "instance:nzbget_username"
+    - name: "NZBGET_PASS"
+      from_secret: "instance:nzbget_password"
+"#;
+    std::fs::write(package_dir.join("manifest.yaml"), manifest)?;
+
+    let mut settings = test_settings_with_db();
+    settings.environment = RunEnvironment::Production;
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_dir.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let status = install_resp.status();
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "install failed body: {payload}");
+    assert_eq!(
+        payload.get("extension_id").and_then(Value::as_str),
+        Some("elixir.modules.nzbget")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_allows_unsigned_bundled_elx_install_in_production() -> Result<()> {
+    let temp = tempdir()?;
+    let bundled_dir = temp.path().join("bundled");
+    std::fs::create_dir_all(&bundled_dir)?;
+    let package_path = bundled_dir.join("qbittorrent-module.elx");
+    let manifest = r#"id: elixir.modules.qbittorrent
+version: 1.0.0
+kind: module
+name: "qBittorrent"
+provides:
+  - capability: downloader.torrent
+    slot: default
+    implementation: "qbittorrent"
+runtime:
+  type: container
+  image: "example/qbittorrent:1"
+  env:
+    - name: "QBITTORRENT_USERNAME"
+      from_secret: "instance:qbittorrent_username"
+    - name: "QBITTORRENT_PASSWORD"
+      from_secret: "instance:qbittorrent_password"
+"#;
+    let file = File::create(&package_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::<()>::default();
+    zip.start_file("manifest.yaml", options)?;
+    zip.write_all(manifest.as_bytes())?;
+    zip.finish()?;
+
+    let mut settings = test_settings_with_db();
+    settings.environment = RunEnvironment::Production;
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_path.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let status = install_resp.status();
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "install failed body: {payload}");
+    assert_eq!(
+        payload.get("extension_id").and_then(Value::as_str),
+        Some("elixir.modules.qbittorrent")
+    );
+
     Ok(())
 }
 

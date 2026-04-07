@@ -51,7 +51,10 @@ impl AppState {
             settings.extensions.bundled_dir.clone(),
             settings.library.local_root.clone(),
             settings.network.vpn.wireguard_gateway_image.clone(),
-            if settings.network.vpn.enabled && settings.network.vpn.auto_wrap_qbittorrent {
+            if settings.network.vpn.enabled
+                && (settings.network.vpn.auto_wrap_qbittorrent
+                    || settings.network.vpn.auto_wrap_nzbget)
+            {
                 Some(settings.network.vpn.wireguard_config_secret.clone())
             } else {
                 None
@@ -65,6 +68,7 @@ impl AppState {
                     settings.extensions.docker.startup_poll_interval_millis,
                 ),
             },
+            settings.extensions.downloader_profile,
             secrets.clone(),
         );
         Self {

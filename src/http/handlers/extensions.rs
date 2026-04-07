@@ -11,10 +11,11 @@ use base64::{Engine as _, engine::general_purpose};
 use rand::{RngCore, rngs::OsRng};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::config::RunEnvironment;
+use crate::config::{DownloaderPerformanceProfile, RunEnvironment};
 use crate::db::models::{
     Binding, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel,
     OperationStep, OperationStepStatus, OrchestratorRun, OrchestratorRunStatus, Provider,
@@ -133,6 +134,60 @@ pub struct AutoWireStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AutoWireUpdateRequest {
     pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloaderProfileResponse {
+    pub profile: DownloaderPerformanceProfile,
+    pub default_profile: DownloaderPerformanceProfile,
+    pub source: String,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_update_count: usize,
+    pub profiles: Vec<DownloaderProfileOption>,
+    pub downloaders: Vec<DownloaderTelemetryItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloaderProfileOption {
+    pub id: DownloaderPerformanceProfile,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloaderTelemetryItem {
+    pub name: String,
+    pub extension_id: String,
+    pub instance_id: Uuid,
+    pub instance_name: String,
+    pub capability: String,
+    pub implementation: Option<String>,
+    pub health_state: ProviderHealthState,
+    pub last_healthcheck_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub applied_profile: Option<DownloaderPerformanceProfile>,
+    pub sync_state: String,
+    pub state_summary: Option<String>,
+    pub status: Option<String>,
+    pub download_rate_bps: Option<u64>,
+    pub upload_rate_bps: Option<u64>,
+    pub active_items: Option<u64>,
+    pub queued_items: Option<u64>,
+    pub error_items: Option<u64>,
+    pub post_process_items: Option<u64>,
+    pub downloaded_bytes: Option<u64>,
+    pub uploaded_bytes: Option<u64>,
+    pub last_successful_sample_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub telemetry_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloaderProfileRequest {
+    pub profile: DownloaderPerformanceProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,15 +671,18 @@ pub async fn install_extension(
         return Err(ApiError::bad_request("package path does not exist"));
     }
 
+    let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
+    let is_bundled_source = path_within(&package_path, &bundled_dir);
+
     let staging_dir = storage_paths.tmp_dir.join(Uuid::new_v4().to_string());
     let mut package_hash = None;
     let staged = if package_path.is_dir() {
-        if !allow_directory_install {
+        if !allow_directory_install && !is_bundled_source {
             return Err(ApiError::bad_request(
                 "directory installs are only allowed in development with extensions.allow_directory_install=true",
             ));
         }
-        if !allow_unsigned {
+        if !allow_unsigned && !is_bundled_source {
             return Err(ApiError::bad_request(
                 "unsigned installs are disabled; enable extensions.allow_unsigned for development",
             ));
@@ -713,7 +771,7 @@ pub async fn install_extension(
         if has_material {
             verify_signature(hash, signature, publisher_key_id)
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        } else if !allow_unsigned {
+        } else if !allow_unsigned && !is_bundled_source {
             return Err(ApiError::bad_request("package signature is required"));
         }
     }
@@ -1526,6 +1584,291 @@ pub async fn auto_wire_plan(State(state): State<AppState>) -> ApiResult<Json<Pla
     Ok(Json(plan))
 }
 
+const DOWNLOADER_PROFILE_SETTING_KEY: &str = "downloader_profile";
+
+pub async fn downloader_profile(
+    State(state): State<AppState>,
+) -> ApiResult<Json<DownloaderProfileResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let response = build_downloader_profile_response(
+        &state,
+        &store,
+        state.settings.extensions.downloader_profile,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+pub async fn update_downloader_profile(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateDownloaderProfileRequest>,
+) -> ApiResult<Json<DownloaderProfileResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    if payload.profile == state.settings.extensions.downloader_profile {
+        store
+            .delete_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
+            .await
+            .map_err(ApiError::from)?;
+    } else {
+        store
+            .upsert_extension_setting(
+                DOWNLOADER_PROFILE_SETTING_KEY,
+                &serde_json::json!(payload.profile),
+            )
+            .await
+            .map_err(ApiError::from)?;
+    }
+    let response = build_downloader_profile_response(
+        &state,
+        &store,
+        state.settings.extensions.downloader_profile,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn build_downloader_profile_response(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    default_profile: DownloaderPerformanceProfile,
+) -> anyhow::Result<DownloaderProfileResponse> {
+    let override_record = store
+        .get_extension_setting_record(DOWNLOADER_PROFILE_SETTING_KEY)
+        .await?;
+    let effective_profile = DownloaderPerformanceProfile::from_setting_value(
+        override_record.as_ref().map(|record| &record.value_json),
+        default_profile,
+    );
+    let instances = store.list_instances(None).await?;
+    let providers = store.list_provider_details().await?;
+    let instance_map: HashMap<Uuid, ExtensionInstance> = instances
+        .into_iter()
+        .map(|instance| (instance.instance_id, instance))
+        .collect();
+
+    let mut downloaders = Vec::new();
+    for detail in providers {
+        if detail.provider.capability != "downloader.torrent"
+            && detail.provider.capability != "downloader.nzb"
+        {
+            continue;
+        }
+        let Some(instance) = instance_map.get(&detail.provider.instance_id) else {
+            continue;
+        };
+        let applied_profile = applied_profile_for_provider(
+            instance.config_json.as_ref(),
+            &detail.provider.capability,
+            detail.provider.implementation.as_deref(),
+        );
+        let sync_state = if applied_profile == Some(effective_profile) {
+            "up_to_date"
+        } else if applied_profile.is_some() {
+            "pending_update"
+        } else {
+            "pending_bootstrap"
+        };
+        let mut state_summary = None;
+        let mut status = None;
+        let mut download_rate_bps = None;
+        let mut upload_rate_bps = None;
+        let mut active_items = None;
+        let mut queued_items = None;
+        let mut error_items = None;
+        let mut post_process_items = None;
+        let mut downloaded_bytes = None;
+        let mut uploaded_bytes = None;
+        let mut telemetry_status =
+            load_downloader_telemetry_status(store, detail.provider.provider_id).await?;
+        let mut telemetry_error = None;
+
+        if should_fetch_live_downloader_state(detail.provider.health_state) {
+            match state
+                .orchestrator
+                .read_provider_state(&detail.provider, instance)
+                .await
+            {
+                Ok(snapshot) => {
+                    state_summary = snapshot.summary;
+                    if let Some(activity) = snapshot.activity {
+                        status = activity.status;
+                        download_rate_bps = activity.download_rate_bps;
+                        upload_rate_bps = activity.upload_rate_bps;
+                        active_items = activity.active_items;
+                        queued_items = activity.queued_items;
+                        error_items = activity.error_items;
+                        post_process_items = activity.post_process_items;
+                        downloaded_bytes = activity.downloaded_bytes;
+                        uploaded_bytes = activity.uploaded_bytes;
+                    }
+                    telemetry_status =
+                        record_downloader_telemetry_success(store, detail.provider.provider_id)
+                            .await?;
+                }
+                Err(err) => {
+                    telemetry_status =
+                        record_downloader_telemetry_error(store, detail.provider.provider_id)
+                            .await?;
+                    telemetry_error = Some(err.to_string());
+                }
+            }
+        }
+        downloaders.push(DownloaderTelemetryItem {
+            name: downloader_display_name(
+                &detail.provider.capability,
+                detail.provider.implementation.as_deref(),
+            ),
+            extension_id: detail.extension_id,
+            instance_id: instance.instance_id,
+            instance_name: instance.instance_name.clone(),
+            capability: detail.provider.capability.clone(),
+            implementation: detail.provider.implementation.clone(),
+            health_state: detail.provider.health_state,
+            last_healthcheck_at: detail.provider.last_healthcheck_at,
+            applied_profile,
+            sync_state: sync_state.to_string(),
+            state_summary,
+            status,
+            download_rate_bps,
+            upload_rate_bps,
+            active_items,
+            queued_items,
+            error_items,
+            post_process_items,
+            downloaded_bytes,
+            uploaded_bytes,
+            last_successful_sample_at: telemetry_status.last_successful_sample_at,
+            last_error_at: telemetry_status.last_error_at,
+            telemetry_error,
+        });
+    }
+    downloaders.sort_by(|left, right| left.name.cmp(&right.name));
+    let pending_update_count = downloaders
+        .iter()
+        .filter(|item| item.sync_state != "up_to_date")
+        .count();
+
+    Ok(DownloaderProfileResponse {
+        profile: effective_profile,
+        default_profile,
+        source: if override_record.is_some() {
+            "override".to_string()
+        } else {
+            "config".to_string()
+        },
+        updated_at: override_record.map(|record| record.updated_at),
+        pending_update_count,
+        profiles: vec![
+            DownloaderProfileOption {
+                id: DownloaderPerformanceProfile::Balanced,
+                label: "Balanced",
+                description: "Current default tuning. Strong throughput without pushing CPU, disk, or network limits as hard.",
+            },
+            DownloaderProfileOption {
+                id: DownloaderPerformanceProfile::Aggressive,
+                label: "Aggressive",
+                description: "Higher concurrency and cache sizes for faster downloading on stronger hardware and networks.",
+            },
+        ],
+        downloaders,
+    })
+}
+
+const DOWNLOADER_TELEMETRY_SETTING_PREFIX: &str = "extensions.downloaders.telemetry.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DownloaderTelemetryStatus {
+    #[serde(default)]
+    last_successful_sample_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    last_error_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn downloader_telemetry_setting_key(provider_id: Uuid) -> String {
+    format!("{DOWNLOADER_TELEMETRY_SETTING_PREFIX}{provider_id}")
+}
+
+async fn load_downloader_telemetry_status(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+) -> anyhow::Result<DownloaderTelemetryStatus> {
+    let key = downloader_telemetry_setting_key(provider_id);
+    match store.get_extension_setting(&key).await? {
+        Some(value) => Ok(serde_json::from_value(value)?),
+        None => Ok(DownloaderTelemetryStatus::default()),
+    }
+}
+
+async fn save_downloader_telemetry_status(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+    status: &DownloaderTelemetryStatus,
+) -> anyhow::Result<()> {
+    let key = downloader_telemetry_setting_key(provider_id);
+    store.upsert_extension_setting(&key, &json!(status)).await?;
+    Ok(())
+}
+
+async fn record_downloader_telemetry_success(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+) -> anyhow::Result<DownloaderTelemetryStatus> {
+    let mut status = load_downloader_telemetry_status(store, provider_id).await?;
+    status.last_successful_sample_at = Some(chrono::Utc::now());
+    save_downloader_telemetry_status(store, provider_id, &status).await?;
+    Ok(status)
+}
+
+async fn record_downloader_telemetry_error(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+) -> anyhow::Result<DownloaderTelemetryStatus> {
+    let mut status = load_downloader_telemetry_status(store, provider_id).await?;
+    status.last_error_at = Some(chrono::Utc::now());
+    save_downloader_telemetry_status(store, provider_id, &status).await?;
+    Ok(status)
+}
+
+fn applied_profile_for_provider(
+    config_json: Option<&serde_json::Value>,
+    capability: &str,
+    implementation: Option<&str>,
+) -> Option<DownloaderPerformanceProfile> {
+    let key = match (capability, implementation.unwrap_or_default()) {
+        ("downloader.torrent", "qbittorrent") => "qbittorrent_performance_profile_version",
+        ("downloader.nzb", "nzbget") => "nzbget_performance_profile_version",
+        _ => return None,
+    };
+    let version = config_json
+        .and_then(|value| value.get("managed_defaults"))
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_str())?;
+    match version {
+        "v1" | "balanced-v1" => Some(DownloaderPerformanceProfile::Balanced),
+        "aggressive-v1" => Some(DownloaderPerformanceProfile::Aggressive),
+        _ => None,
+    }
+}
+
+fn downloader_display_name(capability: &str, implementation: Option<&str>) -> String {
+    match (capability, implementation.unwrap_or_default()) {
+        ("downloader.torrent", "qbittorrent") => "qBittorrent".to_string(),
+        ("downloader.nzb", "nzbget") => "NZBGet".to_string(),
+        (_, implementation) if !implementation.is_empty() => implementation.to_string(),
+        _ => capability.to_string(),
+    }
+}
+
+fn should_fetch_live_downloader_state(health_state: ProviderHealthState) -> bool {
+    matches!(
+        health_state,
+        ProviderHealthState::Healthy | ProviderHealthState::Degraded
+    )
+}
+
 pub async fn list_runs(
     State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
@@ -1831,6 +2174,15 @@ fn parse_scope_and_id(
     let scope = parse_secret_scope(scope)?;
     let scope_id = parse_scope_id(scope, scope_id, require_id)?;
     Ok((scope, scope_id))
+}
+
+fn path_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let path = std::fs::canonicalize(path).ok();
+    let root = std::fs::canonicalize(root).ok();
+    match (path, root) {
+        (Some(path), Some(root)) => path.starts_with(root),
+        _ => false,
+    }
 }
 
 async fn copy_dir_recursive(

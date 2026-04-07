@@ -52,9 +52,23 @@ impl DriverCtx {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ActivitySnapshot {
+    pub status: Option<String>,
+    pub download_rate_bps: Option<u64>,
+    pub upload_rate_bps: Option<u64>,
+    pub active_items: Option<u64>,
+    pub queued_items: Option<u64>,
+    pub error_items: Option<u64>,
+    pub post_process_items: Option<u64>,
+    pub downloaded_bytes: Option<u64>,
+    pub uploaded_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StateSnapshot {
     pub summary: Option<String>,
+    pub activity: Option<ActivitySnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

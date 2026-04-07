@@ -685,9 +685,7 @@ impl Planner {
                 &required,
             )
             .await?;
-            if is_qbittorrent_extension_id(&instance.instance.extension_id) {
-                missing = filter_qbittorrent_missing(missing);
-            }
+            missing = filter_auto_managed_runtime_missing(&instance.instance.extension_id, missing);
             if !missing.is_empty() {
                 missing_secrets_by_instance
                     .entry(instance.instance.instance_id)
@@ -703,9 +701,7 @@ impl Planner {
             let mut missing =
                 missing_required_secrets_for_instance(store, runtime.instance_id, &required)
                     .await?;
-            if is_qbittorrent_extension_id(&runtime.extension_id) {
-                missing = filter_qbittorrent_missing(missing);
-            }
+            missing = filter_auto_managed_runtime_missing(&runtime.extension_id, missing);
             if !missing.is_empty() {
                 missing_secrets_by_instance
                     .entry(runtime.instance_id)
@@ -1676,17 +1672,22 @@ async fn missing_indexer_secrets_for_patch(
     Ok(missing.into_iter().collect())
 }
 
-fn filter_qbittorrent_missing(missing: Vec<String>) -> Vec<String> {
+fn filter_auto_managed_runtime_missing(extension_id: &str, missing: Vec<String>) -> Vec<String> {
+    if is_qbittorrent_extension_id(extension_id) {
+        return filter_secret_suffixes(missing, &["qbittorrent_username", "qbittorrent_password"]);
+    }
+    if is_nzbget_extension_id(extension_id) {
+        return filter_secret_suffixes(missing, &["nzbget_username", "nzbget_password"]);
+    }
     missing
-        .into_iter()
-        .filter(|value| {
-            !value.ends_with(":qbittorrent_username") && !value.ends_with(":qbittorrent_password")
-        })
-        .collect()
 }
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
     extension_id.to_ascii_lowercase().contains("qbittorrent")
+}
+
+fn is_nzbget_extension_id(extension_id: &str) -> bool {
+    extension_id.to_ascii_lowercase().contains("nzbget")
 }
 
 async fn missing_downloader_secrets_for_patch(
@@ -1703,16 +1704,20 @@ async fn missing_downloader_secrets_for_patch(
         _ => Vec::new(),
     };
     for downloader in downloaders {
-        if !is_qbittorrent_downloader(&downloader.r#type) {
+        if !is_auto_managed_downloader(&downloader.r#type) {
             continue;
         }
         if downloader_has_credentials(downloader) {
             continue;
         }
-        // qBittorrent credentials are auto-generated on first run.
+        // Built-in downloader credentials are auto-generated on first run.
         continue;
     }
     Ok(Vec::new())
+}
+
+fn is_auto_managed_downloader(implementation: &str) -> bool {
+    is_qbittorrent_downloader(implementation) || is_nzbget_downloader(implementation)
 }
 
 fn is_qbittorrent_downloader(implementation: &str) -> bool {
@@ -1720,6 +1725,24 @@ fn is_qbittorrent_downloader(implementation: &str) -> bool {
         .trim()
         .to_ascii_lowercase()
         .starts_with("qbittorrent")
+}
+
+fn is_nzbget_downloader(implementation: &str) -> bool {
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("nzbget")
+}
+
+fn filter_secret_suffixes(missing: Vec<String>, suffixes: &[&str]) -> Vec<String> {
+    missing
+        .into_iter()
+        .filter(|value| {
+            !suffixes
+                .iter()
+                .any(|suffix| value.ends_with(&format!(":{suffix}")))
+        })
+        .collect()
 }
 
 fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {
@@ -2110,6 +2133,46 @@ mod tests {
         })
     }
 
+    fn module_manifest_with_downloader_runtime_secrets(
+        id: &str,
+        capability: &str,
+        implementation: &str,
+        username_secret: &str,
+        password_secret: &str,
+    ) -> serde_json::Value {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": id,
+            "provides": [
+                {
+                    "capability": capability,
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": implementation
+                }
+            ],
+            "runtime": {
+                "type": "container",
+                "image": "example/module:1.0.0",
+                "env": [
+                    {
+                        "name": "DOWNLOADER_USERNAME",
+                        "from_secret": format!("instance:{username_secret}")
+                    },
+                    {
+                        "name": "DOWNLOADER_PASSWORD",
+                        "from_secret": format!("instance:{password_secret}")
+                    }
+                ]
+            },
+            "networking": {
+                "service_port": { "scheme": "http", "container_port": 8080 }
+            }
+        })
+    }
+
     fn connector_manifest(id: &str, target_capability: &str) -> serde_json::Value {
         json!({
             "id": id,
@@ -2149,6 +2212,35 @@ mod tests {
                                 "name": "qBittorrent",
                                 "type": "qbittorrent",
                                 "url": "http://elx-qbittorrent:8080",
+                                "enabled": true
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+    }
+
+    fn connector_manifest_with_nzbget(id: &str, target_capability: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "version": "1.0.0",
+            "kind": "connector",
+            "name": id,
+            "targets": [
+                { "capability": target_capability, "slot": "default" }
+            ],
+            "actions": [
+                {
+                    "type": "driver_patch",
+                    "target": { "capability": target_capability, "slot": "default" },
+                    "patch": {
+                        "op": "set_downloaders",
+                        "downloaders": [
+                            {
+                                "name": "NZBGet",
+                                "type": "nzbget",
+                                "url": "http://elx-nzbget:6789",
                                 "enabled": true
                             }
                         ]
@@ -2680,6 +2772,150 @@ mod tests {
         assert!(
             !saw_qbittorrent_missing,
             "qbittorrent credentials should be auto-generated"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_omits_auto_managed_nzbget_runtime_secrets() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.nzbget",
+            ExtensionKind::Module,
+            module_manifest_with_downloader_runtime_secrets(
+                "ext.nzbget",
+                "downloader.nzb",
+                "nzbget",
+                "nzbget_username",
+                "nzbget_password",
+            ),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.nzbget.runtime",
+            ExtensionKind::Blueprint,
+            blueprint_single_want("blueprint.nzbget.runtime", "downloader.nzb"),
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.nzbget.runtime".to_string(), None)
+            .await?;
+
+        let mut saw_nzbget_missing = false;
+        for conflict in &plan.conflicts {
+            if conflict.get("code") != Some(&json!("missing_required_secrets")) {
+                continue;
+            }
+            let missing = conflict.get("missing").and_then(|value| value.as_array());
+            let Some(missing) = missing else { continue };
+            for entry in missing {
+                if let Some(value) = entry.as_str() {
+                    if value.ends_with(":nzbget_username") || value.ends_with(":nzbget_password") {
+                        saw_nzbget_missing = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !saw_nzbget_missing,
+            "nzbget credentials should be auto-generated"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extensions_conflicts_on_missing_nzbget_secrets() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.sonarr",
+            ExtensionKind::Module,
+            module_manifest("ext.sonarr", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.nzbget",
+            ExtensionKind::Module,
+            module_manifest("ext.nzbget", "downloader.nzb"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.sonarr.nzbget",
+            ExtensionKind::Connector,
+            connector_manifest_with_nzbget("ext.sonarr.nzbget", "media.manager.tv"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "blueprint.nzbget",
+            ExtensionKind::Blueprint,
+            json!({
+                "id": "blueprint.nzbget",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "NZBGet Blueprint",
+                "wants": [
+                    { "capability": "media.manager.tv", "slot": "default" },
+                    { "capability": "downloader.nzb", "slot": "default" }
+                ],
+                "connectors": ["ext.sonarr.nzbget"]
+            }),
+        )
+        .await?;
+
+        let nzbget_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            None,
+        )?;
+        let _ = insert_provider_with_impl(
+            &store,
+            "ext.nzbget",
+            "downloader.nzb",
+            "nzbget",
+            serde_json::to_value(nzbget_endpoint)?,
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.nzbget".to_string(), None)
+            .await?;
+
+        let mut saw_nzbget_missing = false;
+        for conflict in &plan.conflicts {
+            if conflict.get("code") != Some(&json!("missing_required_secrets")) {
+                continue;
+            }
+            let missing = conflict.get("missing").and_then(|value| value.as_array());
+            let Some(missing) = missing else { continue };
+            for entry in missing {
+                if let Some(value) = entry.as_str() {
+                    if value.ends_with(":nzbget_username") || value.ends_with(":nzbget_password") {
+                        saw_nzbget_missing = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !saw_nzbget_missing,
+            "nzbget credentials should be auto-generated"
         );
 
         Ok(())

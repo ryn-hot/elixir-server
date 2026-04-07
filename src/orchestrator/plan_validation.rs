@@ -34,9 +34,10 @@ pub async fn missing_required_secrets_for_plan(
                 let mut missing_for_instance =
                     missing_required_secrets_for_instance(store, runtime.instance_id, &required)
                         .await?;
-                if is_qbittorrent_extension_id(&runtime.extension_id) {
-                    missing_for_instance = filter_qbittorrent_missing(missing_for_instance);
-                }
+                missing_for_instance = filter_auto_managed_runtime_missing(
+                    &runtime.extension_id,
+                    missing_for_instance,
+                );
                 missing.extend(missing_for_instance);
             }
             PlanAction::ApplyDriverPatch { patch } => {
@@ -142,29 +143,38 @@ async fn missing_downloader_secrets_for_patch(
         _ => Vec::new(),
     };
     for downloader in downloaders {
-        if !is_qbittorrent_downloader(&downloader.r#type) {
+        if !is_auto_managed_downloader(&downloader.r#type) {
             continue;
         }
         if downloader_has_credentials(downloader) {
             continue;
         }
-        // qBittorrent credentials are auto-generated on first run.
+        // Built-in downloader credentials are auto-generated on first run.
         continue;
     }
     Ok(Vec::new())
 }
 
-fn filter_qbittorrent_missing(missing: Vec<String>) -> Vec<String> {
+fn filter_auto_managed_runtime_missing(extension_id: &str, missing: Vec<String>) -> Vec<String> {
+    if is_qbittorrent_extension_id(extension_id) {
+        return filter_secret_suffixes(missing, &["qbittorrent_username", "qbittorrent_password"]);
+    }
+    if is_nzbget_extension_id(extension_id) {
+        return filter_secret_suffixes(missing, &["nzbget_username", "nzbget_password"]);
+    }
     missing
-        .into_iter()
-        .filter(|value| {
-            !value.ends_with(":qbittorrent_username") && !value.ends_with(":qbittorrent_password")
-        })
-        .collect()
 }
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
     extension_id.to_ascii_lowercase().contains("qbittorrent")
+}
+
+fn is_nzbget_extension_id(extension_id: &str) -> bool {
+    extension_id.to_ascii_lowercase().contains("nzbget")
+}
+
+fn is_auto_managed_downloader(implementation: &str) -> bool {
+    is_qbittorrent_downloader(implementation) || is_nzbget_downloader(implementation)
 }
 
 fn is_qbittorrent_downloader(implementation: &str) -> bool {
@@ -172,6 +182,24 @@ fn is_qbittorrent_downloader(implementation: &str) -> bool {
         .trim()
         .to_ascii_lowercase()
         .starts_with("qbittorrent")
+}
+
+fn is_nzbget_downloader(implementation: &str) -> bool {
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("nzbget")
+}
+
+fn filter_secret_suffixes(missing: Vec<String>, suffixes: &[&str]) -> Vec<String> {
+    missing
+        .into_iter()
+        .filter(|value| {
+            !suffixes
+                .iter()
+                .any(|suffix| value.ends_with(&format!(":{suffix}")))
+        })
+        .collect()
 }
 
 fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {

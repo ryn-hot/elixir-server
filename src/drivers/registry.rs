@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::drivers::{
-    CapabilityDriver, DownloaderTorrentDriver, IndexerRegistryDriver, MediaManagerMoviesDriver,
-    MediaManagerTvDriver,
+    CapabilityDriver, DownloaderNzbDriver, DownloaderTorrentDriver, IndexerRegistryDriver,
+    MediaManagerMoviesDriver, MediaManagerTvDriver,
 };
 
 pub struct DriverRegistry {
@@ -23,6 +23,7 @@ impl DriverRegistry {
         registry.register(MediaManagerMoviesDriver::new());
         registry.register(IndexerRegistryDriver::new());
         registry.register(DownloaderTorrentDriver::new());
+        registry.register(DownloaderNzbDriver::new());
         registry
     }
 

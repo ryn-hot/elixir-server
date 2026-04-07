@@ -15,13 +15,14 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{
     BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality,
 };
 use crate::drivers::{ApplyStatus, DriverCtx, DriverPatch, DriverRegistry};
 use crate::drivers::{
-    DownloaderSpec, IndexerCredentialField, IndexerRegistryPatch, MediaManagerMoviesPatch,
-    MediaManagerTvPatch,
+    DownloaderNzbPatch, DownloaderSpec, DownloaderTorrentPatch, IndexerCredentialField,
+    IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
 };
 use crate::extensions::manifest::{
     ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress, ManifestRuntimeEnv,
@@ -98,6 +99,7 @@ pub struct Executor<'a> {
     secrets: &'a SecretsManager,
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
+    default_downloader_profile: DownloaderPerformanceProfile,
 }
 
 impl<'a> Executor<'a> {
@@ -118,6 +120,7 @@ impl<'a> Executor<'a> {
             secrets,
             wireguard_gateway_image: "qmcgaw/gluetun:v3.39.0".to_string(),
             default_wireguard_config_secret: None,
+            default_downloader_profile: DownloaderPerformanceProfile::Balanced,
         }
     }
 
@@ -132,6 +135,14 @@ impl<'a> Executor<'a> {
     pub fn with_default_wireguard_config_secret(mut self, secret: Option<String>) -> Self {
         self.default_wireguard_config_secret =
             secret.and_then(|value| (!value.trim().is_empty()).then_some(value));
+        self
+    }
+
+    pub fn with_default_downloader_profile(
+        mut self,
+        profile: DownloaderPerformanceProfile,
+    ) -> Self {
+        self.default_downloader_profile = profile;
         self
     }
 
@@ -297,6 +308,9 @@ impl<'a> Executor<'a> {
             ensure_qbittorrent_secrets(&self.store, self.secrets, instance_id, &runtime.env)
                 .await?;
         }
+        if is_nzbget_extension_id(&extension_id) {
+            ensure_nzbget_secrets(&self.store, self.secrets, instance_id, &runtime.env).await?;
+        }
         ensure_runtime_secrets_present(&self.store, instance_id, &runtime).await?;
 
         let name = container_name(instance_id);
@@ -352,7 +366,7 @@ impl<'a> Executor<'a> {
         };
 
         let resolved_egress = runtime.egress.clone().or_else(|| {
-            if is_qbittorrent_extension_id(&extension_id) {
+            if is_default_wireguard_downloader_extension_id(&extension_id) {
                 self.default_wireguard_config_secret
                     .as_ref()
                     .map(|secret| ManifestRuntimeEgress {
@@ -703,6 +717,8 @@ impl<'a> Executor<'a> {
 
         let endpoint_json = provider
             .endpoint_json
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("provider {} has no endpoint", provider.provider_id))?;
         let endpoint: ProviderEndpoint =
             serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
@@ -732,52 +748,13 @@ impl<'a> Executor<'a> {
             .context("parsing driver patch")?;
         patch.validate().context("validating driver patch")?;
 
-        let mut secrets = HashMap::new();
-        if provider.capability == "media.manager.tv"
-            && provider.implementation.as_deref() == Some("sonarr")
-        {
-            let api_key = resolve_sonarr_api_key(&self.store, self.secrets, &instance).await?;
-            secrets.insert("sonarr_api_key".to_string(), api_key);
-        }
-        if provider.capability == "media.manager.movies"
-            && provider.implementation.as_deref() == Some("radarr")
-        {
-            let api_key = resolve_radarr_api_key(&self.store, self.secrets, &instance).await?;
-            secrets.insert("radarr_api_key".to_string(), api_key.clone());
-            secrets.insert("api_key".to_string(), api_key);
-        }
-        if provider.capability == "indexer.registry"
-            && provider.implementation.as_deref() == Some("prowlarr")
-        {
-            let api_key = resolve_prowlarr_api_key(&self.store, self.secrets, &instance).await?;
-            secrets.insert("prowlarr_api_key".to_string(), api_key);
-        }
-        if provider.capability == "downloader.torrent"
-            && provider.implementation.as_deref() == Some("qbittorrent")
-        {
-            let (username, password) =
-                resolve_qbittorrent_credentials(&self.store, self.secrets, &instance).await?;
-            secrets.insert("qbittorrent_username".to_string(), username);
-            secrets.insert("qbittorrent_password".to_string(), password);
-        }
-
         resolve_indexer_credentials(&self.store, self.secrets, provider.instance_id, &mut patch)
             .await?;
         resolve_indexer_apps(&self.store, self.secrets, &mut patch).await?;
         resolve_downloader_credentials(&self.store, self.secrets, &mut patch).await?;
 
-        let transport_base_url =
-            resolve_driver_transport_base_url(provider.instance_id, &endpoint).await?;
-        let ctx = DriverCtx::new(
-            provider.provider_id,
-            provider.instance_id,
-            provider.capability.clone(),
-            endpoint,
-            transport_base_url,
-            provider.implementation.clone(),
-            instance.config_json.clone(),
-            secrets,
-        );
+        let ctx =
+            build_driver_ctx_for_provider(&self.store, self.secrets, &provider, &instance).await?;
         let result = driver.apply_patch(ctx, patch).await?;
         if result.status == ApplyStatus::Deferred {
             let detail = result
@@ -855,6 +832,8 @@ impl<'a> Executor<'a> {
 
         let endpoint_json = provider
             .endpoint_json
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("provider {} has no endpoint", provider.provider_id))?;
         let endpoint: ProviderEndpoint =
             serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
@@ -953,12 +932,152 @@ impl<'a> Executor<'a> {
             .probe_tcp(&endpoint.host, endpoint.port)
             .await
             .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+        self.apply_builtin_downloader_profile_if_needed(&provider, &instance, &endpoint)
+            .await?;
         self.store
             .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
             .await?;
         Ok(())
     }
+
+    async fn apply_builtin_downloader_profile_if_needed(
+        &self,
+        provider: &Provider,
+        instance: &crate::db::models::ExtensionInstance,
+        endpoint: &ProviderEndpoint,
+    ) -> Result<()> {
+        let Some(implementation) = provider.implementation.as_deref() else {
+            return Ok(());
+        };
+        let selected_profile = self.selected_downloader_profile().await?;
+
+        match (provider.capability.as_str(), implementation) {
+            ("downloader.torrent", "qbittorrent") => {
+                let config = parse_qbittorrent_instance_config(instance.config_json.as_ref())?;
+                let desired_version = qbittorrent_performance_profile_version(selected_profile);
+                if qbittorrent_profile_version_matches(
+                    config.performance_profile_version.as_deref(),
+                    selected_profile,
+                ) {
+                    return Ok(());
+                }
+                let (username, password) =
+                    resolve_qbittorrent_credentials(&self.store, self.secrets, instance).await?;
+                let mut secrets = HashMap::new();
+                secrets.insert("qbittorrent_username".to_string(), username);
+                secrets.insert("qbittorrent_password".to_string(), password);
+
+                let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
+                    anyhow!(
+                        "no driver registered for capability '{}'",
+                        provider.capability
+                    )
+                })?;
+                let transport_base_url =
+                    resolve_driver_transport_base_url(provider.instance_id, endpoint).await?;
+                let ctx = DriverCtx::new(
+                    provider.provider_id,
+                    provider.instance_id,
+                    provider.capability.clone(),
+                    endpoint.clone(),
+                    transport_base_url,
+                    provider.implementation.clone(),
+                    instance.config_json.clone(),
+                    secrets,
+                );
+                let result = driver
+                    .apply_patch(ctx, qbittorrent_performance_profile_patch(selected_profile))
+                    .await?;
+                if result.status == ApplyStatus::Deferred {
+                    bail!(
+                        "qbittorrent performance profile deferred: {}",
+                        result
+                            .message
+                            .unwrap_or_else(|| "driver deferred".to_string())
+                    );
+                }
+                persist_managed_defaults_profile_version(
+                    &self.store,
+                    instance.instance_id,
+                    instance.config_json.clone(),
+                    "qbittorrent_performance_profile_version",
+                    desired_version,
+                )
+                .await?;
+            }
+            ("downloader.nzb", "nzbget") => {
+                let config = parse_nzbget_instance_config(instance.config_json.as_ref())?;
+                let desired_version = nzbget_performance_profile_version(selected_profile);
+                if nzbget_profile_version_matches(
+                    config.performance_profile_version.as_deref(),
+                    selected_profile,
+                ) {
+                    return Ok(());
+                }
+                let (username, password) =
+                    resolve_nzbget_credentials(&self.store, self.secrets, instance).await?;
+                let mut secrets = HashMap::new();
+                secrets.insert("nzbget_username".to_string(), username);
+                secrets.insert("nzbget_password".to_string(), password);
+
+                let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
+                    anyhow!(
+                        "no driver registered for capability '{}'",
+                        provider.capability
+                    )
+                })?;
+                let transport_base_url =
+                    resolve_driver_transport_base_url(provider.instance_id, endpoint).await?;
+                let ctx = DriverCtx::new(
+                    provider.provider_id,
+                    provider.instance_id,
+                    provider.capability.clone(),
+                    endpoint.clone(),
+                    transport_base_url,
+                    provider.implementation.clone(),
+                    instance.config_json.clone(),
+                    secrets,
+                );
+                let result = driver
+                    .apply_patch(ctx, nzbget_performance_profile_patch(selected_profile))
+                    .await?;
+                if result.status == ApplyStatus::Deferred {
+                    bail!(
+                        "nzbget performance profile deferred: {}",
+                        result
+                            .message
+                            .unwrap_or_else(|| "driver deferred".to_string())
+                    );
+                }
+                persist_managed_defaults_profile_version(
+                    &self.store,
+                    instance.instance_id,
+                    instance.config_json.clone(),
+                    "nzbget_performance_profile_version",
+                    desired_version,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn selected_downloader_profile(&self) -> Result<DownloaderPerformanceProfile> {
+        let override_value = self
+            .store
+            .get_extension_setting("downloader_profile")
+            .await?;
+        Ok(DownloaderPerformanceProfile::from_setting_value(
+            override_value.as_ref(),
+            self.default_downloader_profile,
+        ))
+    }
 }
+
+const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v1";
+const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v1";
 
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
@@ -990,6 +1109,72 @@ async fn resolve_sonarr_api_key(
     }
 
     bail!("sonarr api key is not available yet");
+}
+
+pub(crate) async fn build_driver_ctx_for_provider(
+    store: &ExtensionStore<'_>,
+    secrets_manager: &SecretsManager,
+    provider: &Provider,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<DriverCtx> {
+    let endpoint_json = provider
+        .endpoint_json
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("provider {} has no endpoint", provider.provider_id))?;
+    let endpoint: ProviderEndpoint =
+        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+    endpoint.validate()?;
+
+    let mut secrets = HashMap::new();
+    if provider.capability == "media.manager.tv"
+        && provider.implementation.as_deref() == Some("sonarr")
+    {
+        let api_key = resolve_sonarr_api_key(store, secrets_manager, instance).await?;
+        secrets.insert("sonarr_api_key".to_string(), api_key);
+    }
+    if provider.capability == "media.manager.movies"
+        && provider.implementation.as_deref() == Some("radarr")
+    {
+        let api_key = resolve_radarr_api_key(store, secrets_manager, instance).await?;
+        secrets.insert("radarr_api_key".to_string(), api_key.clone());
+        secrets.insert("api_key".to_string(), api_key);
+    }
+    if provider.capability == "indexer.registry"
+        && provider.implementation.as_deref() == Some("prowlarr")
+    {
+        let api_key = resolve_prowlarr_api_key(store, secrets_manager, instance).await?;
+        secrets.insert("prowlarr_api_key".to_string(), api_key);
+    }
+    if provider.capability == "downloader.torrent"
+        && provider.implementation.as_deref() == Some("qbittorrent")
+    {
+        let (username, password) =
+            resolve_qbittorrent_credentials(store, secrets_manager, instance).await?;
+        secrets.insert("qbittorrent_username".to_string(), username);
+        secrets.insert("qbittorrent_password".to_string(), password);
+    }
+    if provider.capability == "downloader.nzb"
+        && provider.implementation.as_deref() == Some("nzbget")
+    {
+        let (username, password) =
+            resolve_nzbget_credentials(store, secrets_manager, instance).await?;
+        secrets.insert("nzbget_username".to_string(), username);
+        secrets.insert("nzbget_password".to_string(), password);
+    }
+
+    let transport_base_url =
+        resolve_driver_transport_base_url(provider.instance_id, &endpoint).await?;
+    Ok(DriverCtx::new(
+        provider.provider_id,
+        provider.instance_id,
+        provider.capability.clone(),
+        endpoint,
+        transport_base_url,
+        provider.implementation.clone(),
+        instance.config_json.clone(),
+        secrets,
+    ))
 }
 
 async fn resolve_radarr_api_key(
@@ -1128,6 +1313,20 @@ async fn resolve_qbittorrent_credentials(
     ensure_qbittorrent_credentials(store, secrets, instance.instance_id).await
 }
 
+async fn resolve_nzbget_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<(String, String)> {
+    let config = parse_nzbget_instance_config(instance.config_json.as_ref())?;
+    if let (Some(username), Some(password)) = (config.username, config.password) {
+        upsert_nzbget_secrets(store, secrets, instance.instance_id, &username, &password).await?;
+        return Ok((username, password));
+    }
+
+    ensure_nzbget_credentials(store, secrets, instance.instance_id).await
+}
+
 async fn resolve_indexer_credentials(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -1200,6 +1399,29 @@ async fn ensure_qbittorrent_secrets(
     Ok(())
 }
 
+async fn ensure_nzbget_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    env: &[ManifestRuntimeEnv],
+) -> Result<()> {
+    let mut requires_nzbget = false;
+    for entry in env {
+        if let Some(from_secret) = entry.from_secret.as_ref() {
+            let trimmed = from_secret.trim();
+            if trimmed == "instance:nzbget_username" || trimmed == "instance:nzbget_password" {
+                requires_nzbget = true;
+                break;
+            }
+        }
+    }
+    if !requires_nzbget {
+        return Ok(());
+    }
+    let _ = ensure_nzbget_credentials(store, secrets, instance_id).await?;
+    Ok(())
+}
+
 async fn ensure_qbittorrent_credentials(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -1237,7 +1459,50 @@ async fn ensure_qbittorrent_credentials(
     }
 }
 
+async fn ensure_nzbget_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+) -> Result<(String, String)> {
+    let username = store
+        .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_username")
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+    let password = store
+        .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_password")
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok((username, password)),
+        (None, None) => {
+            let (username, password) = generate_nzbget_credentials();
+            upsert_nzbget_secrets(store, secrets, instance_id, &username, &password).await?;
+            Ok((username, password))
+        }
+        _ => bail!("nzbget credentials are partially configured"),
+    }
+}
+
 fn generate_qbittorrent_credentials() -> (String, String) {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let password: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(28)
+        .map(char::from)
+        .collect();
+    (format!("elixir_{suffix}"), password)
+}
+
+fn generate_nzbget_credentials() -> (String, String) {
     let suffix: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(6)
@@ -1253,6 +1518,14 @@ fn generate_qbittorrent_credentials() -> (String, String) {
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
     extension_id.to_ascii_lowercase().contains("qbittorrent")
+}
+
+fn is_nzbget_extension_id(extension_id: &str) -> bool {
+    extension_id.to_ascii_lowercase().contains("nzbget")
+}
+
+fn is_default_wireguard_downloader_extension_id(extension_id: &str) -> bool {
+    is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
 }
 
 async fn resolve_indexer_apps(
@@ -1302,26 +1575,25 @@ async fn resolve_downloader_credentials(
     };
 
     for downloader in downloaders {
-        if !is_qbittorrent_downloader(&downloader.r#type) {
-            continue;
-        }
         if downloader_has_credentials(downloader) {
             continue;
         }
         let host_hint = url_host(&downloader.url);
-        let instance =
-            resolve_qbittorrent_instance_for_downloader(store, host_hint.as_deref()).await?;
-        let (username, password) =
-            resolve_qbittorrent_credentials(store, secrets, &instance).await?;
-        if downloader_setting_missing(&downloader.settings, "username") {
-            downloader
-                .settings
-                .insert("username".to_string(), serde_json::Value::String(username));
+        if is_qbittorrent_downloader(&downloader.r#type) {
+            let instance =
+                resolve_qbittorrent_instance_for_downloader(store, host_hint.as_deref()).await?;
+            let (username, password) =
+                resolve_qbittorrent_credentials(store, secrets, &instance).await?;
+            apply_downloader_credentials(downloader, username, password);
+            continue;
         }
-        if downloader_setting_missing(&downloader.settings, "password") {
-            downloader
-                .settings
-                .insert("password".to_string(), serde_json::Value::String(password));
+        if is_nzbget_downloader(&downloader.r#type) {
+            let instance =
+                resolve_nzbget_instance_for_downloader(store, host_hint.as_deref()).await?;
+            let (username, password) =
+                resolve_nzbget_credentials(store, secrets, &instance).await?;
+            apply_downloader_credentials(downloader, username, password);
+            continue;
         }
     }
     Ok(())
@@ -1352,6 +1624,30 @@ fn is_qbittorrent_downloader(implementation: &str) -> bool {
         .trim()
         .to_ascii_lowercase()
         .starts_with("qbittorrent")
+}
+
+fn is_nzbget_downloader(implementation: &str) -> bool {
+    implementation
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("nzbget")
+}
+
+fn apply_downloader_credentials(
+    downloader: &mut DownloaderSpec,
+    username: String,
+    password: String,
+) {
+    if downloader_setting_missing(&downloader.settings, "username") {
+        downloader
+            .settings
+            .insert("username".to_string(), serde_json::Value::String(username));
+    }
+    if downloader_setting_missing(&downloader.settings, "password") {
+        downloader
+            .settings
+            .insert("password".to_string(), serde_json::Value::String(password));
+    }
 }
 
 fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {
@@ -1550,6 +1846,66 @@ async fn resolve_qbittorrent_instance_for_downloader(
         })
 }
 
+async fn resolve_nzbget_instance_for_downloader(
+    store: &ExtensionStore<'_>,
+    host_hint: Option<&str>,
+) -> Result<crate::db::models::ExtensionInstance> {
+    let providers = store.list_provider_details().await?;
+    let mut candidates = Vec::new();
+    for detail in providers {
+        if detail.provider.capability != "downloader.nzb" {
+            continue;
+        }
+        if let Some(implementation) = detail.provider.implementation.as_deref() {
+            if !implementation.eq_ignore_ascii_case("nzbget") {
+                continue;
+            }
+        }
+        candidates.push(detail);
+    }
+
+    if candidates.is_empty() {
+        bail!("nzbget provider not found for downloader credentials");
+    }
+
+    let mut selected = None;
+    if let Some(host) = host_hint {
+        for detail in &candidates {
+            let endpoint_json = detail.provider.endpoint_json.as_ref();
+            let endpoint_json = match endpoint_json {
+                Some(value) => value,
+                None => continue,
+            };
+            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(_) => continue,
+            };
+            if endpoint.host == host {
+                selected = Some(detail.clone());
+                break;
+            }
+        }
+    }
+
+    let selected = if let Some(selected) = selected {
+        selected
+    } else if candidates.len() == 1 {
+        candidates.remove(0)
+    } else {
+        bail!("multiple nzbget providers found; specify the elx-nzbget host in the downloader url");
+    };
+
+    store
+        .get_instance(selected.provider.instance_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "nzbget instance {} not found",
+                selected.provider.instance_id
+            )
+        })
+}
+
 async fn upsert_qbittorrent_secrets(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -1575,6 +1931,38 @@ async fn upsert_qbittorrent_secrets(
             scope: SecretScope::Instance,
             scope_id: Some(instance_id),
             key: "qbittorrent_password".to_string(),
+            value_encrypted: encrypted_password,
+            rotatable: false,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn upsert_nzbget_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let encrypted_username = secrets.encrypt(username)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget_username".to_string(),
+            value_encrypted: encrypted_username,
+            rotatable: false,
+        })
+        .await?;
+    let encrypted_password = secrets.encrypt(password)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget_password".to_string(),
             value_encrypted: encrypted_password,
             rotatable: false,
         })
@@ -1630,6 +2018,26 @@ struct QbittorrentInstanceConfig {
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    managed_defaults: Option<ManagedDefaultsConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct NzbgetInstanceConfig {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    managed_defaults: Option<ManagedDefaultsConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct ManagedDefaultsConfig {
+    #[serde(default)]
+    qbittorrent_performance_profile_version: Option<String>,
+    #[serde(default)]
+    nzbget_performance_profile_version: Option<String>,
 }
 
 struct ParsedSonarrConfig {
@@ -1650,6 +2058,13 @@ struct ParsedProwlarrConfig {
 struct ParsedQbittorrentConfig {
     username: Option<String>,
     password: Option<String>,
+    performance_profile_version: Option<String>,
+}
+
+struct ParsedNzbgetConfig {
+    username: Option<String>,
+    password: Option<String>,
+    performance_profile_version: Option<String>,
 }
 
 fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedSonarrConfig> {
@@ -1706,6 +2121,7 @@ fn parse_qbittorrent_instance_config(
         return Ok(ParsedQbittorrentConfig {
             username: None,
             password: None,
+            performance_profile_version: None,
         });
     };
     let config: QbittorrentInstanceConfig =
@@ -1713,6 +2129,28 @@ fn parse_qbittorrent_instance_config(
     Ok(ParsedQbittorrentConfig {
         username: config.username,
         password: config.password,
+        performance_profile_version: config
+            .managed_defaults
+            .and_then(|defaults| defaults.qbittorrent_performance_profile_version),
+    })
+}
+
+fn parse_nzbget_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedNzbgetConfig> {
+    let Some(value) = value else {
+        return Ok(ParsedNzbgetConfig {
+            username: None,
+            password: None,
+            performance_profile_version: None,
+        });
+    };
+    let config: NzbgetInstanceConfig =
+        serde_json::from_value(value.clone()).context("parsing nzbget instance config")?;
+    Ok(ParsedNzbgetConfig {
+        username: config.username,
+        password: config.password,
+        performance_profile_version: config
+            .managed_defaults
+            .and_then(|defaults| defaults.nzbget_performance_profile_version),
     })
 }
 
@@ -1911,6 +2349,20 @@ async fn persist_runtime_config(
     Ok(())
 }
 
+async fn persist_managed_defaults_profile_version(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    existing: Option<serde_json::Value>,
+    key: &str,
+    version: &str,
+) -> Result<()> {
+    let updated = merge_managed_defaults_profile(existing, key, version)?;
+    store
+        .update_instance_config(instance_id, Some(&updated))
+        .await?;
+    Ok(())
+}
+
 fn merge_runtime_config(
     existing: Option<serde_json::Value>,
     config_dir: Option<String>,
@@ -1965,6 +2417,150 @@ fn merge_runtime_config(
         Ok(Some(serde_json::Value::Object(root)))
     } else {
         Ok(None)
+    }
+}
+
+fn merge_managed_defaults_profile(
+    existing: Option<serde_json::Value>,
+    key: &str,
+    version: &str,
+) -> Result<serde_json::Value> {
+    let mut root = match existing {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => bail!("instance config is not an object"),
+        None => serde_json::Map::new(),
+    };
+
+    let defaults_entry = root
+        .entry("managed_defaults".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let defaults = defaults_entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("managed_defaults config is not an object"))?;
+    defaults.insert(
+        key.to_string(),
+        serde_json::Value::String(version.to_string()),
+    );
+    Ok(serde_json::Value::Object(root))
+}
+
+fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
+    let (
+        max_connections,
+        max_connections_per_torrent,
+        max_upload_slots,
+        max_upload_slots_per_torrent,
+        disk_cache_mb,
+        disk_cache_ttl_seconds,
+        max_active_downloads,
+        max_active_torrents,
+        max_active_uploads,
+    ) = match profile {
+        DownloaderPerformanceProfile::Balanced => (500, 100, 20, 8, 512, 60, 50, 100, 20),
+        DownloaderPerformanceProfile::Aggressive => (800, 150, 30, 10, 768, 120, 80, 160, 30),
+    };
+    DriverPatch::DownloaderTorrent(DownloaderTorrentPatch::SetPreferences {
+        default_save_path: Some("/downloads".to_string()),
+        incomplete_path: Some("/downloads/.incomplete".to_string()),
+        use_incomplete: Some(true),
+        max_connections: Some(max_connections),
+        max_connections_per_torrent: Some(max_connections_per_torrent),
+        max_upload_slots: Some(max_upload_slots),
+        max_upload_slots_per_torrent: Some(max_upload_slots_per_torrent),
+        disk_cache_mb: Some(disk_cache_mb),
+        disk_cache_ttl_seconds: Some(disk_cache_ttl_seconds),
+        queueing_enabled: Some(false),
+        max_active_downloads: Some(max_active_downloads),
+        max_active_torrents: Some(max_active_torrents),
+        max_active_uploads: Some(max_active_uploads),
+        random_port: Some(false),
+        listen_port: Some(51413),
+        upnp: Some(false),
+        preallocate_all: Some(false),
+    })
+}
+
+fn nzbget_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
+    let (server_connections, article_retries, article_cache_mb, write_buffer_kb, par_threads) =
+        match profile {
+            DownloaderPerformanceProfile::Balanced => {
+                (20, 3, 200, 1024, recommended_nzbget_par_threads(false))
+            }
+            DownloaderPerformanceProfile::Aggressive => {
+                (32, 4, 384, 2048, recommended_nzbget_par_threads(true))
+            }
+        };
+    DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
+        default_save_path: Some("/downloads".to_string()),
+        incomplete_path: Some("/downloads/.incomplete".to_string()),
+        use_incomplete: Some(true),
+        server_connections: Some(server_connections),
+        article_retries: Some(article_retries),
+        article_timeout_seconds: Some(60),
+        article_cache_mb: Some(article_cache_mb),
+        direct_write: Some(true),
+        write_buffer_kb: Some(write_buffer_kb),
+        continue_partial: Some(true),
+        par_check: Some("auto".to_string()),
+        par_scan: Some("auto".to_string()),
+        par_quick: Some(true),
+        par_repair: Some(true),
+        par_rename: Some(true),
+        par_pause_queue: Some(true),
+        par_threads: Some(par_threads),
+        unpack: Some(true),
+        unpack_pause_queue: Some(true),
+        download_rate_kib: Some(0),
+    })
+}
+
+fn recommended_nzbget_par_threads(aggressive: bool) -> u64 {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(if aggressive { 4 } else { 2 })
+        .clamp(
+            if aggressive { 3 } else { 2 },
+            if aggressive { 6 } else { 4 },
+        ) as u64
+}
+
+fn qbittorrent_performance_profile_version(profile: DownloaderPerformanceProfile) -> &'static str {
+    match profile {
+        DownloaderPerformanceProfile::Balanced => BALANCED_PERFORMANCE_PROFILE_VERSION,
+        DownloaderPerformanceProfile::Aggressive => AGGRESSIVE_PERFORMANCE_PROFILE_VERSION,
+    }
+}
+
+fn nzbget_performance_profile_version(profile: DownloaderPerformanceProfile) -> &'static str {
+    match profile {
+        DownloaderPerformanceProfile::Balanced => BALANCED_PERFORMANCE_PROFILE_VERSION,
+        DownloaderPerformanceProfile::Aggressive => AGGRESSIVE_PERFORMANCE_PROFILE_VERSION,
+    }
+}
+
+fn qbittorrent_profile_version_matches(
+    current: Option<&str>,
+    selected: DownloaderPerformanceProfile,
+) -> bool {
+    matches_profile_version(current, selected)
+}
+
+fn nzbget_profile_version_matches(
+    current: Option<&str>,
+    selected: DownloaderPerformanceProfile,
+) -> bool {
+    matches_profile_version(current, selected)
+}
+
+fn matches_profile_version(current: Option<&str>, selected: DownloaderPerformanceProfile) -> bool {
+    match selected {
+        DownloaderPerformanceProfile::Balanced => matches!(
+            current,
+            Some("v1") | Some(BALANCED_PERFORMANCE_PROFILE_VERSION)
+        ),
+        DownloaderPerformanceProfile::Aggressive => {
+            matches!(current, Some(AGGRESSIVE_PERFORMANCE_PROFILE_VERSION))
+        }
     }
 }
 
@@ -2140,7 +2736,7 @@ pub fn new_binding_id() -> Uuid {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -2158,6 +2754,46 @@ mod tests {
     use crate::orchestrator::naming::container_name;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::secrets::SecretsManager;
+
+    struct RecordingDriver {
+        capability: &'static str,
+        calls: Arc<Mutex<Vec<crate::drivers::DriverPatch>>>,
+    }
+
+    impl RecordingDriver {
+        fn new(
+            capability: &'static str,
+            calls: Arc<Mutex<Vec<crate::drivers::DriverPatch>>>,
+        ) -> Self {
+            Self { capability, calls }
+        }
+    }
+
+    #[async_trait]
+    impl crate::drivers::CapabilityDriver for RecordingDriver {
+        fn capability(&self) -> &'static str {
+            self.capability
+        }
+
+        async fn read_state(&self, _ctx: DriverCtx) -> Result<crate::drivers::StateSnapshot> {
+            Ok(crate::drivers::StateSnapshot {
+                summary: None,
+                activity: None,
+            })
+        }
+
+        async fn apply_patch(
+            &self,
+            _ctx: DriverCtx,
+            patch: crate::drivers::DriverPatch,
+        ) -> Result<crate::drivers::ApplyResult> {
+            self.calls
+                .lock()
+                .expect("recording driver lock")
+                .push(patch);
+            Ok(crate::drivers::ApplyResult::applied())
+        }
+    }
 
     #[derive(Default)]
     struct StubProbe {
@@ -3423,6 +4059,568 @@ mod tests {
             "expected default wireguard wrapping for qbittorrent"
         );
         assert!(specs[1].network_mode.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nzbget_credentials_are_auto_generated_for_runtime_env() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/nzbget:latest".to_string()),
+            network: None,
+            service_name: Some("elx-nzbget".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 6789,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: vec![
+                ManifestRuntimeEnv {
+                    name: "NZBGET_USER".to_string(),
+                    value: None,
+                    from_secret: Some("instance:nzbget_username".to_string()),
+                },
+                ManifestRuntimeEnv {
+                    name: "NZBGET_PASS".to_string(),
+                    value: None,
+                    from_secret: Some("instance:nzbget_password".to_string()),
+                },
+            ],
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.nzbget".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-nzb".to_string()],
+            )
+            .await?;
+
+        let spec = runtime.last_spec().expect("captured nzbget spec");
+        let env_map: std::collections::HashMap<_, _> = spec
+            .env
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.value.clone()))
+            .collect();
+        let username_secret = store
+            .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_username")
+            .await?
+            .expect("nzbget username secret");
+        let password_secret = store
+            .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_password")
+            .await?
+            .expect("nzbget password secret");
+        let username = secrets.decrypt(&username_secret.value_encrypted)?;
+        let password = secrets.decrypt(&password_secret.value_encrypted)?;
+        assert_eq!(env_map.get("NZBGET_USER"), Some(&username));
+        assert_eq!(env_map.get("NZBGET_PASS"), Some(&password));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nzbget_uses_default_wireguard_secret_when_runtime_egress_not_declared() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/nzbget:latest".to_string()),
+            network: None,
+            service_name: Some("elx-nzbget".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 6789,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.nzbget".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-nzb".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(
+            specs.len(),
+            2,
+            "expected default wireguard wrapping for nzbget"
+        );
+        assert!(specs[1].network_mode.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_downloader_credentials_injects_nzbget_settings() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: Uuid::new_v4(),
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
+        let mut patch = DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders {
+            downloaders: vec![DownloaderSpec {
+                name: "NZBGet".to_string(),
+                r#type: "nzbget".to_string(),
+                url: "http://elx-nzbget:6789".to_string(),
+                api_key: None,
+                category: Some("movies".to_string()),
+                tags: Vec::new(),
+                enabled: Some(true),
+                settings: HashMap::new(),
+            }],
+        });
+
+        resolve_downloader_credentials(&store, &secrets, &mut patch).await?;
+
+        let DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) =
+            patch
+        else {
+            panic!("expected media manager tv patch");
+        };
+        let downloader = downloaders.first().expect("nzbget downloader");
+        let username = downloader
+            .settings
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .expect("username setting");
+        let password = downloader
+            .settings
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .expect("password setting");
+        assert!(!username.trim().is_empty());
+        assert!(!password.trim().is_empty());
+
+        let username_secret = store
+            .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_username")
+            .await?
+            .expect("nzbget username secret");
+        let password_secret = store
+            .get_secret(SecretScope::Instance, Some(instance_id), "nzbget_password")
+            .await?
+            .expect("nzbget password secret");
+        assert_eq!(username, secrets.decrypt(&username_secret.value_encrypted)?);
+        assert_eq!(password, secrets.decrypt(&password_secret.value_encrypted)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_gate_applies_qbittorrent_performance_profile_once() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(RecordingDriver::new("downloader.torrent", calls.clone()));
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor.health_gate_once(provider_id).await?;
+        executor.health_gate_once(provider_id).await?;
+
+        let calls = calls.lock().expect("recording driver lock");
+        assert_eq!(calls.len(), 1, "profile should only apply once");
+        let crate::drivers::DriverPatch::DownloaderTorrent(
+            DownloaderTorrentPatch::SetPreferences {
+                max_connections,
+                disk_cache_mb,
+                queueing_enabled,
+                listen_port,
+                preallocate_all,
+                ..
+            },
+        ) = &calls[0]
+        else {
+            panic!("expected qbittorrent preferences patch");
+        };
+        assert_eq!(*max_connections, Some(500));
+        assert_eq!(*disk_cache_mb, Some(512));
+        assert_eq!(*queueing_enabled, Some(false));
+        assert_eq!(*listen_port, Some(51413));
+        assert_eq!(*preallocate_all, Some(false));
+        drop(calls);
+
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let parsed = parse_qbittorrent_instance_config(instance.config_json.as_ref())?;
+        assert_eq!(
+            parsed.performance_profile_version.as_deref(),
+            Some(BALANCED_PERFORMANCE_PROFILE_VERSION)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_gate_uses_aggressive_qbittorrent_profile_when_selected() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+        store
+            .upsert_extension_setting("downloader_profile", &json!("aggressive"))
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(RecordingDriver::new("downloader.torrent", calls.clone()));
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor.health_gate_once(provider_id).await?;
+
+        let calls = calls.lock().expect("recording driver lock");
+        assert_eq!(calls.len(), 1, "profile should apply once");
+        let crate::drivers::DriverPatch::DownloaderTorrent(
+            DownloaderTorrentPatch::SetPreferences {
+                max_connections,
+                disk_cache_mb,
+                max_active_downloads,
+                ..
+            },
+        ) = &calls[0]
+        else {
+            panic!("expected qbittorrent preferences patch");
+        };
+        assert_eq!(*max_connections, Some(800));
+        assert_eq!(*disk_cache_mb, Some(768));
+        assert_eq!(*max_active_downloads, Some(80));
+        drop(calls);
+
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let parsed = parse_qbittorrent_instance_config(instance.config_json.as_ref())?;
+        assert_eq!(
+            parsed.performance_profile_version.as_deref(),
+            Some(AGGRESSIVE_PERFORMANCE_PROFILE_VERSION)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_gate_applies_nzbget_performance_profile_once() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-nzb".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(RecordingDriver::new("downloader.nzb", calls.clone()));
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor.health_gate_once(provider_id).await?;
+        executor.health_gate_once(provider_id).await?;
+
+        let calls = calls.lock().expect("recording driver lock");
+        assert_eq!(calls.len(), 1, "profile should only apply once");
+        let crate::drivers::DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
+            server_connections,
+            write_buffer_kb,
+            direct_write,
+            par_check,
+            unpack_pause_queue,
+            ..
+        }) = &calls[0]
+        else {
+            panic!("expected nzbget preferences patch");
+        };
+        assert_eq!(*server_connections, Some(20));
+        assert_eq!(*write_buffer_kb, Some(1024));
+        assert_eq!(*direct_write, Some(true));
+        assert_eq!(par_check.as_deref(), Some("auto"));
+        assert_eq!(*unpack_pause_queue, Some(true));
+        drop(calls);
+
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let parsed = parse_nzbget_instance_config(instance.config_json.as_ref())?;
+        assert_eq!(
+            parsed.performance_profile_version.as_deref(),
+            Some(BALANCED_PERFORMANCE_PROFILE_VERSION)
+        );
         Ok(())
     }
 

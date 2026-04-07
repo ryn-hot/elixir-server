@@ -33,6 +33,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
         Ok(StateSnapshot {
             summary: Some("media.manager.tv driver is not implemented".to_string()),
+            activity: None,
         })
     }
 

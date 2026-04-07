@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use config::{Config, Environment as ConfigEnvironment, File};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
@@ -104,6 +104,7 @@ impl Settings {
                 default_wireguard_config_secret(),
             )?
             .set_default("network.vpn.auto_wrap_qbittorrent", true)?
+            .set_default("network.vpn.auto_wrap_nzbget", true)?
             .set_default("database.url", default_database_url())?
             .set_default(
                 "auth.access_token_ttl_minutes",
@@ -122,6 +123,10 @@ impl Settings {
             .set_default("extensions.storage_root", default_extensions_root())?
             .set_default("extensions.bundled_dir", default_extensions_bundled_dir())?
             .set_default("extensions.core_extensions", default_core_extensions())?
+            .set_default(
+                "extensions.downloader_profile",
+                default_downloader_profile().as_str(),
+            )?
             .set_default("extensions.allow_unsigned", default_false())?
             .set_default("extensions.allow_directory_install", default_false())?
             .set_default(
@@ -341,6 +346,8 @@ pub struct VpnConfig {
     pub wireguard_config_secret: String,
     #[serde(default = "default_true")]
     pub auto_wrap_qbittorrent: bool,
+    #[serde(default = "default_true")]
+    pub auto_wrap_nzbget: bool,
     #[serde(default = "default_wireguard_gateway_image")]
     pub wireguard_gateway_image: String,
 }
@@ -352,6 +359,7 @@ impl Default for VpnConfig {
             detect_host_vpn: default_true(),
             wireguard_config_secret: default_wireguard_config_secret(),
             auto_wrap_qbittorrent: default_true(),
+            auto_wrap_nzbget: default_true(),
             wireguard_gateway_image: default_wireguard_gateway_image(),
         }
     }
@@ -450,6 +458,8 @@ pub struct ExtensionsConfig {
     pub bundled_dir: String,
     #[serde(default = "default_core_extensions")]
     pub core_extensions: Vec<String>,
+    #[serde(default = "default_downloader_profile")]
+    pub downloader_profile: DownloaderPerformanceProfile,
     #[serde(default = "default_false")]
     pub allow_unsigned: bool,
     #[serde(default = "default_false")]
@@ -477,6 +487,7 @@ impl Default for ExtensionsConfig {
             storage_root: default_extensions_root(),
             bundled_dir: default_extensions_bundled_dir(),
             core_extensions: default_core_extensions(),
+            downloader_profile: default_downloader_profile(),
             allow_unsigned: default_false(),
             allow_directory_install: default_false(),
             docker: ExtensionsDockerConfig::default(),
@@ -487,6 +498,34 @@ impl Default for ExtensionsConfig {
             reconcile_startup_settle_seconds: default_reconcile_startup_settle_seconds(),
             apply_lock_ttl_seconds: default_apply_lock_ttl_seconds(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloaderPerformanceProfile {
+    Balanced,
+    Aggressive,
+}
+
+impl DownloaderPerformanceProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DownloaderPerformanceProfile::Balanced => "balanced",
+            DownloaderPerformanceProfile::Aggressive => "aggressive",
+        }
+    }
+
+    pub fn from_setting_value(value: Option<&serde_json::Value>, default: Self) -> Self {
+        value
+            .and_then(|entry| serde_json::from_value(entry.clone()).ok())
+            .unwrap_or(default)
+    }
+}
+
+impl Default for DownloaderPerformanceProfile {
+    fn default() -> Self {
+        default_downloader_profile()
     }
 }
 
@@ -700,7 +739,14 @@ fn default_extensions_bundled_dir() -> String {
 }
 
 fn default_core_extensions() -> Vec<String> {
-    vec!["elixir.modules.qbittorrent".to_string()]
+    vec![
+        "elixir.modules.qbittorrent".to_string(),
+        "elixir.modules.nzbget".to_string(),
+    ]
+}
+
+fn default_downloader_profile() -> DownloaderPerformanceProfile {
+    DownloaderPerformanceProfile::Balanced
 }
 
 fn default_reconcile_interval_seconds() -> u64 {

@@ -10,6 +10,7 @@ pub enum DriverPatch {
     MediaManagerMovies(MediaManagerMoviesPatch),
     IndexerRegistry(IndexerRegistryPatch),
     DownloaderTorrent(DownloaderTorrentPatch),
+    DownloaderNzb(DownloaderNzbPatch),
 }
 
 impl DriverPatch {
@@ -19,6 +20,7 @@ impl DriverPatch {
             DriverPatch::MediaManagerMovies(_) => "media.manager.movies",
             DriverPatch::IndexerRegistry(_) => "indexer.registry",
             DriverPatch::DownloaderTorrent(_) => "downloader.torrent",
+            DriverPatch::DownloaderNzb(_) => "downloader.nzb",
         }
     }
 
@@ -28,6 +30,7 @@ impl DriverPatch {
             DriverPatch::MediaManagerMovies(patch) => patch.validate(),
             DriverPatch::IndexerRegistry(patch) => patch.validate(),
             DriverPatch::DownloaderTorrent(patch) => patch.validate(),
+            DriverPatch::DownloaderNzb(patch) => patch.validate(),
         }
     }
 
@@ -52,6 +55,11 @@ impl DriverPatch {
                 let patch: DownloaderTorrentPatch =
                     serde_json::from_value(patch).context("parsing downloader.torrent patch")?;
                 Ok(DriverPatch::DownloaderTorrent(patch))
+            }
+            "downloader.nzb" => {
+                let patch: DownloaderNzbPatch =
+                    serde_json::from_value(patch).context("parsing downloader.nzb patch")?;
+                Ok(DriverPatch::DownloaderNzb(patch))
             }
             _ => bail!("no driver patch type registered for capability '{capability}'"),
         }
@@ -256,6 +264,34 @@ pub enum DownloaderTorrentPatch {
         incomplete_path: Option<String>,
         #[serde(default)]
         use_incomplete: Option<bool>,
+        #[serde(default)]
+        max_connections: Option<u64>,
+        #[serde(default)]
+        max_connections_per_torrent: Option<u64>,
+        #[serde(default)]
+        max_upload_slots: Option<u64>,
+        #[serde(default)]
+        max_upload_slots_per_torrent: Option<u64>,
+        #[serde(default)]
+        disk_cache_mb: Option<u64>,
+        #[serde(default)]
+        disk_cache_ttl_seconds: Option<u64>,
+        #[serde(default)]
+        queueing_enabled: Option<bool>,
+        #[serde(default)]
+        max_active_downloads: Option<u64>,
+        #[serde(default)]
+        max_active_torrents: Option<u64>,
+        #[serde(default)]
+        max_active_uploads: Option<u64>,
+        #[serde(default)]
+        random_port: Option<bool>,
+        #[serde(default)]
+        listen_port: Option<u16>,
+        #[serde(default)]
+        upnp: Option<bool>,
+        #[serde(default)]
+        preallocate_all: Option<bool>,
     },
 }
 
@@ -273,15 +309,158 @@ impl DownloaderTorrentPatch {
                 default_save_path,
                 incomplete_path,
                 use_incomplete,
+                max_connections,
+                max_connections_per_torrent,
+                max_upload_slots,
+                max_upload_slots_per_torrent,
+                disk_cache_mb,
+                disk_cache_ttl_seconds,
+                queueing_enabled,
+                max_active_downloads,
+                max_active_torrents,
+                max_active_uploads,
+                random_port,
+                listen_port,
+                upnp,
+                preallocate_all,
             } => {
                 if default_save_path.is_none()
                     && incomplete_path.is_none()
                     && use_incomplete.is_none()
+                    && max_connections.is_none()
+                    && max_connections_per_torrent.is_none()
+                    && max_upload_slots.is_none()
+                    && max_upload_slots_per_torrent.is_none()
+                    && disk_cache_mb.is_none()
+                    && disk_cache_ttl_seconds.is_none()
+                    && queueing_enabled.is_none()
+                    && max_active_downloads.is_none()
+                    && max_active_torrents.is_none()
+                    && max_active_uploads.is_none()
+                    && random_port.is_none()
+                    && listen_port.is_none()
+                    && upnp.is_none()
+                    && preallocate_all.is_none()
                 {
                     bail!("preferences must include at least one value");
                 }
                 ensure_optional_non_empty(default_save_path.as_deref(), "default_save_path")?;
                 ensure_optional_non_empty(incomplete_path.as_deref(), "incomplete_path")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DownloaderNzbPatch {
+    SetCategories {
+        categories: Vec<DownloadCategorySpec>,
+    },
+    SetPreferences {
+        #[serde(default)]
+        default_save_path: Option<String>,
+        #[serde(default)]
+        incomplete_path: Option<String>,
+        #[serde(default)]
+        use_incomplete: Option<bool>,
+        #[serde(default)]
+        server_connections: Option<u64>,
+        #[serde(default)]
+        article_retries: Option<u64>,
+        #[serde(default)]
+        article_timeout_seconds: Option<u64>,
+        #[serde(default)]
+        article_cache_mb: Option<u64>,
+        #[serde(default)]
+        direct_write: Option<bool>,
+        #[serde(default)]
+        write_buffer_kb: Option<u64>,
+        #[serde(default)]
+        continue_partial: Option<bool>,
+        #[serde(default)]
+        par_check: Option<String>,
+        #[serde(default)]
+        par_scan: Option<String>,
+        #[serde(default)]
+        par_quick: Option<bool>,
+        #[serde(default)]
+        par_repair: Option<bool>,
+        #[serde(default)]
+        par_rename: Option<bool>,
+        #[serde(default)]
+        par_pause_queue: Option<bool>,
+        #[serde(default)]
+        par_threads: Option<u64>,
+        #[serde(default)]
+        unpack: Option<bool>,
+        #[serde(default)]
+        unpack_pause_queue: Option<bool>,
+        #[serde(default)]
+        download_rate_kib: Option<u64>,
+    },
+}
+
+impl DownloaderNzbPatch {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            DownloaderNzbPatch::SetCategories { categories } => {
+                ensure_non_empty_list(categories, "categories")?;
+                for category in categories {
+                    category.validate()?;
+                }
+                Ok(())
+            }
+            DownloaderNzbPatch::SetPreferences {
+                default_save_path,
+                incomplete_path,
+                use_incomplete,
+                server_connections,
+                article_retries,
+                article_timeout_seconds,
+                article_cache_mb,
+                direct_write,
+                write_buffer_kb,
+                continue_partial,
+                par_check,
+                par_scan,
+                par_quick,
+                par_repair,
+                par_rename,
+                par_pause_queue,
+                par_threads,
+                unpack,
+                unpack_pause_queue,
+                download_rate_kib,
+            } => {
+                if default_save_path.is_none()
+                    && incomplete_path.is_none()
+                    && use_incomplete.is_none()
+                    && server_connections.is_none()
+                    && article_retries.is_none()
+                    && article_timeout_seconds.is_none()
+                    && article_cache_mb.is_none()
+                    && direct_write.is_none()
+                    && write_buffer_kb.is_none()
+                    && continue_partial.is_none()
+                    && par_check.is_none()
+                    && par_scan.is_none()
+                    && par_quick.is_none()
+                    && par_repair.is_none()
+                    && par_rename.is_none()
+                    && par_pause_queue.is_none()
+                    && par_threads.is_none()
+                    && unpack.is_none()
+                    && unpack_pause_queue.is_none()
+                    && download_rate_kib.is_none()
+                {
+                    bail!("preferences must include at least one value");
+                }
+                ensure_optional_non_empty(default_save_path.as_deref(), "default_save_path")?;
+                ensure_optional_non_empty(incomplete_path.as_deref(), "incomplete_path")?;
+                ensure_optional_non_empty(par_check.as_deref(), "par_check")?;
+                ensure_optional_non_empty(par_scan.as_deref(), "par_scan")?;
                 Ok(())
             }
         }
@@ -830,7 +1009,107 @@ mod tests {
             default_save_path: None,
             incomplete_path: None,
             use_incomplete: None,
+            max_connections: None,
+            max_connections_per_torrent: None,
+            max_upload_slots: None,
+            max_upload_slots_per_torrent: None,
+            disk_cache_mb: None,
+            disk_cache_ttl_seconds: None,
+            queueing_enabled: None,
+            max_active_downloads: None,
+            max_active_torrents: None,
+            max_active_uploads: None,
+            random_port: None,
+            listen_port: None,
+            upnp: None,
+            preallocate_all: None,
         };
         assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn downloader_nzb_patch_requires_categories() {
+        let patch = DownloaderNzbPatch::SetCategories {
+            categories: Vec::new(),
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn downloader_nzb_patch_requires_preferences() {
+        let patch = DownloaderNzbPatch::SetPreferences {
+            default_save_path: None,
+            incomplete_path: None,
+            use_incomplete: None,
+            server_connections: None,
+            article_retries: None,
+            article_timeout_seconds: None,
+            article_cache_mb: None,
+            direct_write: None,
+            write_buffer_kb: None,
+            continue_partial: None,
+            par_check: None,
+            par_scan: None,
+            par_quick: None,
+            par_repair: None,
+            par_rename: None,
+            par_pause_queue: None,
+            par_threads: None,
+            unpack: None,
+            unpack_pause_queue: None,
+            download_rate_kib: None,
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn downloader_torrent_patch_accepts_performance_profile() {
+        let patch = DownloaderTorrentPatch::SetPreferences {
+            default_save_path: None,
+            incomplete_path: None,
+            use_incomplete: None,
+            max_connections: Some(500),
+            max_connections_per_torrent: Some(100),
+            max_upload_slots: Some(20),
+            max_upload_slots_per_torrent: Some(8),
+            disk_cache_mb: Some(512),
+            disk_cache_ttl_seconds: Some(60),
+            queueing_enabled: Some(false),
+            max_active_downloads: Some(50),
+            max_active_torrents: Some(100),
+            max_active_uploads: Some(20),
+            random_port: Some(false),
+            listen_port: Some(51413),
+            upnp: Some(false),
+            preallocate_all: Some(false),
+        };
+        assert!(patch.validate().is_ok());
+    }
+
+    #[test]
+    fn downloader_nzb_patch_accepts_performance_profile() {
+        let patch = DownloaderNzbPatch::SetPreferences {
+            default_save_path: None,
+            incomplete_path: None,
+            use_incomplete: None,
+            server_connections: Some(20),
+            article_retries: Some(3),
+            article_timeout_seconds: Some(60),
+            article_cache_mb: Some(200),
+            direct_write: Some(true),
+            write_buffer_kb: Some(1024),
+            continue_partial: Some(true),
+            par_check: Some("auto".to_string()),
+            par_scan: Some("auto".to_string()),
+            par_quick: Some(true),
+            par_repair: Some(true),
+            par_rename: Some(true),
+            par_pause_queue: Some(true),
+            par_threads: Some(4),
+            unpack: Some(true),
+            unpack_pause_queue: Some(true),
+            download_rate_kib: Some(0),
+        };
+        assert!(patch.validate().is_ok());
     }
 }

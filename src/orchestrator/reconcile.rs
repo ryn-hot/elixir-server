@@ -7,7 +7,7 @@ use tokio::time::{sleep, timeout};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::config::Settings;
+use crate::config::{DownloaderPerformanceProfile, Settings};
 use crate::db::models::{BindingStatus, ExtensionKind, ProviderHealthState};
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
@@ -67,6 +67,7 @@ pub struct Reconciler<'a> {
     secrets: &'a SecretsManager,
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
+    default_downloader_profile: DownloaderPerformanceProfile,
     retry_attempts: u32,
     retry_backoff: Duration,
     lock_ttl: Duration,
@@ -82,6 +83,7 @@ impl<'a> Reconciler<'a> {
         secrets: &'a SecretsManager,
         wireguard_gateway_image: String,
         default_wireguard_config_secret: Option<String>,
+        default_downloader_profile: DownloaderPerformanceProfile,
         config: &ReconcileConfig,
     ) -> Self {
         Self {
@@ -94,6 +96,7 @@ impl<'a> Reconciler<'a> {
             secrets,
             wireguard_gateway_image,
             default_wireguard_config_secret,
+            default_downloader_profile,
             retry_attempts: config.retry_attempts.max(1),
             retry_backoff: config.retry_backoff,
             lock_ttl: config.lock_ttl,
@@ -260,7 +263,8 @@ impl<'a> Reconciler<'a> {
             self.secrets,
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
 
         for item in desired {
             let decisions = self
@@ -519,7 +523,8 @@ impl<'a> Reconciler<'a> {
             self.secrets,
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
         let mut step_index = 0;
         let mut failed = false;
         for action in plan.actions {
@@ -630,7 +635,8 @@ impl<'a> Reconciler<'a> {
             self.secrets,
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
 
         for detail in providers {
             let provider = &detail.provider;
@@ -838,7 +844,8 @@ impl<'a> Reconciler<'a> {
             self.secrets,
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
 
         executor
             .apply(ExecutorAction::EnsureRuntimeRunning {
@@ -874,7 +881,8 @@ impl<'a> Reconciler<'a> {
             self.secrets,
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
 
         for binding in bindings {
             let consumer = match provider_map.get(&binding.consumer_provider_id) {
@@ -1206,7 +1214,10 @@ mod tests {
         }
 
         async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
-            Ok(StateSnapshot { summary: None })
+            Ok(StateSnapshot {
+                summary: None,
+                activity: None,
+            })
         }
 
         async fn apply_patch(&self, _ctx: DriverCtx, _patch: DriverPatch) -> Result<ApplyResult> {
@@ -1486,6 +1497,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -1573,6 +1585,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -1715,6 +1728,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -1949,6 +1963,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -2000,6 +2015,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -2081,6 +2097,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -2149,6 +2166,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;
@@ -2241,6 +2259,7 @@ mod tests {
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
+            DownloaderPerformanceProfile::Balanced,
             &config,
         );
         reconciler.run_once().await?;

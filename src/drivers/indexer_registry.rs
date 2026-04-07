@@ -51,6 +51,7 @@ impl CapabilityDriver for IndexerRegistryDriver {
 
         Ok(StateSnapshot {
             summary: Some(summary),
+            activity: None,
         })
     }
 

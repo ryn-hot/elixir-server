@@ -56,6 +56,13 @@ pub struct ProviderDetails {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExtensionSettingRecord {
+    pub setting_key: String,
+    pub value_json: serde_json::Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewBinding {
     pub binding_id: Uuid,
     pub consumer_provider_id: Uuid,
@@ -1263,19 +1270,24 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn get_extension_setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .get_extension_setting_record(key)
+            .await?
+            .map(|record| record.value_json))
+    }
+
+    pub async fn get_extension_setting_record(
+        &self,
+        key: &str,
+    ) -> Result<Option<ExtensionSettingRecord>> {
         let row = sqlx::query(
-            "SELECT CAST(value_json AS TEXT) as value_json FROM extension_settings WHERE setting_key = ? LIMIT 1",
+            "SELECT setting_key, CAST(value_json AS TEXT) as value_json, CAST(updated_at AS TEXT) as updated_at FROM extension_settings WHERE setting_key = ? LIMIT 1",
         )
         .bind(key)
         .fetch_optional(self.pool)
         .await?;
-        match row {
-            Some(row) => parse_json_opt(
-                row_get_opt_string(&row, "value_json")?,
-                "extension_settings.value_json",
-            ),
-            None => Ok(None),
-        }
+        row.map(|row| map_extension_setting_record(&row))
+            .transpose()
     }
 
     pub async fn upsert_extension_setting(
@@ -1291,6 +1303,14 @@ impl<'a> ExtensionStore<'a> {
         .bind(value_json)
         .execute(self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn delete_extension_setting(&self, key: &str) -> Result<()> {
+        sqlx::query::<sqlx::Any>("DELETE FROM extension_settings WHERE setting_key = ?")
+            .bind(key)
+            .execute(self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1335,6 +1355,21 @@ fn map_extension(row: &AnyRow) -> Result<Extension> {
         package_hash: row_get_opt_string(row, "package_hash")?,
         installed_at: parse_datetime(&installed_at_raw, "extensions.installed_at")?,
         enabled: row_get_bool(row, "enabled")?,
+    })
+}
+
+fn map_extension_setting_record(row: &AnyRow) -> Result<ExtensionSettingRecord> {
+    let setting_key: String = row.try_get("setting_key")?;
+    let value_json = parse_json_opt(
+        row_get_opt_string(row, "value_json")?,
+        "extension_settings.value_json",
+    )?
+    .ok_or_else(|| anyhow::anyhow!("extension_settings.value_json was null"))?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSettingRecord {
+        setting_key,
+        value_json,
+        updated_at: parse_datetime(&updated_at_raw, "extension_settings.updated_at")?,
     })
 }
 

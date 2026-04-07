@@ -95,6 +95,11 @@ pub fn router(state: AppState) -> Router {
             get(handlers::extensions::auto_wire_plan),
         )
         .route(
+            "/api/v1/extensions/downloaders/profile",
+            get(handlers::extensions::downloader_profile)
+                .patch(handlers::extensions::update_downloader_profile),
+        )
+        .route(
             "/api/v1/extensions/runs",
             get(handlers::extensions::list_runs).delete(handlers::extensions::clear_runs),
         )

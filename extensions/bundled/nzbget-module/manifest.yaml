@@ -1,0 +1,41 @@
+id: elixir.modules.nzbget
+version: 1.0.0
+kind: module
+name: "NZBGet"
+description: "Usenet downloader module backed by NZBGet."
+publisher:
+  name: "Elixir"
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: downloader.nzb
+    slot: default
+    cardinality: one
+    implementation: nzbget
+requires: []
+conflicts:
+  - capability: downloader.nzb
+    slot: default
+    policy: prompt_replace
+runtime:
+  type: container
+  image: "lscr.io/linuxserver/nzbget:latest"
+  network: "elixir_net"
+  service_name: "elx-nzbget"
+  ports:
+    - container: 6789
+      host: 0
+  volumes:
+    - "{data}/nzbget:/config"
+    - "{downloads}:/downloads"
+  env:
+    - name: "NZBGET_USER"
+      from_secret: "instance:nzbget_username"
+    - name: "NZBGET_PASS"
+      from_secret: "instance:nzbget_password"
+networking:
+  service_port:
+    scheme: http
+    container_port: 6789

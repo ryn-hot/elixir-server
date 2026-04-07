@@ -2,9 +2,11 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::AnyPool;
 
+use crate::config::DownloaderPerformanceProfile;
+use crate::db::models::{ExtensionInstance, Provider};
 use crate::drivers::DriverRegistry;
 use crate::extensions::store::ExtensionStore;
-use crate::orchestrator::executor::{Executor, ExecutorAction};
+use crate::orchestrator::executor::{Executor, ExecutorAction, build_driver_ctx_for_provider};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
 use crate::runtime::RuntimePaths;
@@ -22,6 +24,7 @@ pub struct OrchestratorService {
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
     docker_startup: DockerStartupConfig,
+    default_downloader_profile: DownloaderPerformanceProfile,
     drivers: std::sync::Arc<DriverRegistry>,
     secrets: std::sync::Arc<SecretsManager>,
     probe: std::sync::Arc<NetworkProbe>,
@@ -37,6 +40,7 @@ impl OrchestratorService {
         wireguard_gateway_image: String,
         default_wireguard_config_secret: Option<String>,
         docker_startup: DockerStartupConfig,
+        default_downloader_profile: DownloaderPerformanceProfile,
         secrets: std::sync::Arc<SecretsManager>,
     ) -> Self {
         let runtime_paths = RuntimePaths::from_roots(&storage_root, &media_root);
@@ -50,6 +54,7 @@ impl OrchestratorService {
             wireguard_gateway_image,
             default_wireguard_config_secret,
             docker_startup,
+            default_downloader_profile,
             drivers: std::sync::Arc::new(DriverRegistry::with_defaults()),
             secrets,
             probe,
@@ -70,6 +75,21 @@ impl OrchestratorService {
             .ensure_daemon_available(&self.docker_startup)
             .await?;
         self.probe.prepare_binary().await
+    }
+
+    pub async fn read_provider_state(
+        &self,
+        provider: &Provider,
+        instance: &ExtensionInstance,
+    ) -> Result<crate::drivers::StateSnapshot> {
+        let driver = self
+            .drivers
+            .get(&provider.capability)
+            .ok_or_else(|| anyhow::anyhow!("no driver registered for {}", provider.capability))?;
+        let store = ExtensionStore::new(&self.pool);
+        let ctx = build_driver_ctx_for_provider(&store, self.secrets.as_ref(), provider, instance)
+            .await?;
+        driver.read_state(ctx).await
     }
 
     pub fn start_reconcile_loop(self: std::sync::Arc<Self>, config: ReconcileConfig) {
@@ -159,6 +179,7 @@ impl OrchestratorService {
             self.secrets.as_ref(),
             self.wireguard_gateway_image.clone(),
             self.default_wireguard_config_secret.clone(),
+            self.default_downloader_profile,
             config,
         );
         reconciler.run_once().await
@@ -179,7 +200,8 @@ impl OrchestratorService {
             self.secrets.as_ref(),
         )
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone());
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
         for action in actions {
             executor.apply(action).await?;
         }
@@ -360,6 +382,7 @@ mod tests {
                 startup_timeout: Duration::from_secs(1),
                 startup_poll_interval: Duration::from_millis(100),
             },
+            DownloaderPerformanceProfile::Balanced,
             Arc::new(secrets),
         );
         let probe = MockProbe::default();
@@ -434,6 +457,7 @@ mod tests {
                 startup_timeout: Duration::from_secs(1),
                 startup_poll_interval: Duration::from_millis(100),
             },
+            DownloaderPerformanceProfile::Balanced,
             Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
         );
         let reconcile_config = ReconcileConfig {
@@ -579,6 +603,7 @@ mod tests {
                 startup_timeout: Duration::from_secs(1),
                 startup_poll_interval: Duration::from_millis(100),
             },
+            DownloaderPerformanceProfile::Balanced,
             Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
         );
         let reconcile_config = ReconcileConfig {

@@ -32,7 +32,10 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
-        Ok(StateSnapshot { summary: None })
+        Ok(StateSnapshot {
+            summary: None,
+            activity: None,
+        })
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
