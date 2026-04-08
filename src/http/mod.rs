@@ -22,6 +22,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::extensions::catalog),
         )
         .route(
+            "/api/v1/extensions/status-summary",
+            get(handlers::extensions::status_summary),
+        )
+        .route(
             "/api/v1/extensions/registries/refresh",
             post(handlers::extensions::refresh_catalog),
         )

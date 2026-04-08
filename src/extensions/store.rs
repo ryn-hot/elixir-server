@@ -555,6 +555,28 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn upsert_desired_blueprint(&self, data: &NewDesiredBlueprint) -> Result<()> {
+        let params_json = json_to_string(data.params_json.as_ref())?;
+        let decisions_json = json_to_string(data.decisions_json.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, decisions_json, applied)
+             VALUES (?, ?, ?, ?, ?, 0)
+             ON CONFLICT(desired_id) DO UPDATE SET
+                blueprint_extension_id = excluded.blueprint_extension_id,
+                blueprint_version = excluded.blueprint_version,
+                params_json = excluded.params_json,
+                decisions_json = excluded.decisions_json",
+        )
+        .bind(data.desired_id.to_string())
+        .bind(&data.blueprint_extension_id)
+        .bind(&data.blueprint_version)
+        .bind(params_json)
+        .bind(decisions_json)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_desired_blueprints(
         &self,
         applied: Option<bool>,
@@ -618,6 +640,15 @@ impl<'a> ExtensionStore<'a> {
                 .execute(self.pool)
                 .await?
         };
+        Ok(result.rows_affected())
+    }
+
+    pub async fn delete_desired_blueprint(&self, desired_id: Uuid) -> Result<u64> {
+        let result =
+            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE desired_id = ?")
+                .bind(desired_id.to_string())
+                .execute(self.pool)
+                .await?;
         Ok(result.rows_affected())
     }
 
@@ -1139,6 +1170,28 @@ impl<'a> ExtensionStore<'a> {
             .await?
         };
         row.map(|row| map_run(&row)).transpose()
+    }
+
+    pub async fn list_runs_by_source_status(
+        &self,
+        source: &str,
+        status: OrchestratorRunStatus,
+    ) -> Result<Vec<OrchestratorRun>> {
+        let rows = sqlx::query(
+            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at
+             FROM orchestrator_runs
+             WHERE source = ? AND status = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(source)
+        .bind(status.as_str())
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_run(&row)?);
+        }
+        Ok(items)
     }
 
     pub async fn get_run(&self, run_id: Uuid) -> Result<Option<OrchestratorRun>> {

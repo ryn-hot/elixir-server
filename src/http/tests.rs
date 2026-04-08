@@ -38,8 +38,8 @@ use crate::{
     },
     db::Database,
     db::models::{
-        ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus, ProviderHealthState,
-        SecretScope, SlotCardinality,
+        BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
+        ProviderHealthState, SecretScope, SlotCardinality,
     },
     extensions::ExtensionManager,
     extensions::ExternalIds,
@@ -48,7 +48,7 @@ use crate::{
     extensions::MediaIdentity,
     extensions::package::compute_sha256,
     extensions::store::{
-        ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
+        ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
@@ -580,6 +580,327 @@ async fn downloader_profile_update_persists_override_and_marks_pending_updates()
         .await?
         .expect("stored override");
     assert_eq!(stored.as_str(), Some("aggressive"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_surfaces_setup_and_connection_issues() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.secretful".to_string(),
+            name: "Secretful".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.secretful",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Secretful",
+                "provides": [{
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "implementation": "sonarr"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/secretful:latest",
+                    "env": [{
+                        "name": "API_KEY",
+                        "from_secret": "instance:api_key"
+                    }]
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let secretful_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: secretful_instance_id,
+            extension_id: "elixir.modules.secretful".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: secretful_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-secretful",
+                "port": 8989,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.healthy".to_string(),
+            name: "Healthy".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.healthy",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Healthy",
+                "provides": [{
+                    "capability": "media.manager.movies",
+                    "slot": "default",
+                    "implementation": "radarr"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/healthy:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let healthy_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: healthy_instance_id,
+            extension_id: "elixir.modules.healthy".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let healthy_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: healthy_provider_id,
+            instance_id: healthy_instance_id,
+            capability: "media.manager.movies".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("radarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-healthy",
+                "port": 7878,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.broken".to_string(),
+            name: "Broken".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.broken",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Broken",
+                "provides": [{
+                    "capability": "subtitles.manager",
+                    "slot": "default",
+                    "implementation": "bazarr"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/broken:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let broken_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: broken_instance_id,
+            extension_id: "elixir.modules.broken".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let broken_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: broken_provider_id,
+            instance_id: broken_instance_id,
+            capability: "subtitles.manager".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("bazarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-broken",
+                "port": 6767,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_binding(&NewBinding {
+            binding_id: Uuid::new_v4(),
+            consumer_provider_id: broken_provider_id,
+            requires_capability: "media.manager.movies".to_string(),
+            requires_slot_id: "default".to_string(),
+            target_provider_id: healthy_provider_id,
+            binding_params_json: None,
+            status: BindingStatus::Failed,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.connectors.waiting".to_string(),
+            name: "Waiting Connector".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Connector,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.connectors.waiting",
+                "version": "1.0.0",
+                "kind": "connector",
+                "name": "Waiting Connector",
+                "targets": [{
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }],
+                "actions": [{
+                    "type": "driver_patch",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "patch": {
+                        "op": "noop"
+                    }
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        json.get("needsAttentionCount").and_then(Value::as_u64),
+        Some(3)
+    );
+
+    let items = json
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let item_by_id = |extension_id: &str| -> &Value {
+        items
+            .iter()
+            .find(|item| {
+                item.get("extensionId")
+                    .and_then(Value::as_str)
+                    .map(|value| value == extension_id)
+                    .unwrap_or(false)
+            })
+            .expect("summary item")
+    };
+
+    let secretful = item_by_id("elixir.modules.secretful");
+    assert_eq!(
+        secretful.get("severity").and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        secretful.get("statusCode").and_then(Value::as_str),
+        Some("missing_required_secrets")
+    );
+
+    let broken = item_by_id("elixir.modules.broken");
+    assert_eq!(
+        broken.get("severity").and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        broken.get("statusCode").and_then(Value::as_str),
+        Some("connection_issue")
+    );
+
+    let waiting = item_by_id("elixir.connectors.waiting");
+    assert_eq!(
+        waiting.get("severity").and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        waiting.get("statusCode").and_then(Value::as_str),
+        Some("waiting_for_app")
+    );
+
+    let healthy = item_by_id("elixir.modules.healthy");
+    assert_eq!(
+        healthy.get("severity").and_then(Value::as_str),
+        Some("ready")
+    );
+    assert_eq!(
+        healthy.get("statusCode").and_then(Value::as_str),
+        Some("ready")
+    );
 
     Ok(())
 }
@@ -4568,15 +4889,13 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
         .and_then(Value::as_str)
         .expect("plan_id");
     let plan_uuid = Uuid::parse_str(plan_id)?;
-    let desired = store.list_desired_blueprints(None).await?;
-    let desired_entry = desired
-        .iter()
-        .find(|item| item.desired_id == plan_uuid)
-        .expect("desired blueprint");
-    assert_eq!(desired_entry.blueprint_extension_id, "blueprint.conflict");
     assert!(
-        !desired_entry.applied,
-        "expected desired blueprint to be pending"
+        store
+            .list_desired_blueprints(None)
+            .await?
+            .into_iter()
+            .all(|item| item.desired_id != plan_uuid),
+        "preview should not persist durable desired state"
     );
 
     let conflicts = plan_json
@@ -4801,11 +5120,23 @@ async fn extensions_apply_blueprint_is_idempotent_for_pending_plan() -> Result<(
         .into_iter()
         .filter(|item| item.blueprint_extension_id == "blueprint.idempotent")
         .collect();
-    assert_eq!(pending.len(), 1, "expected single pending desired row");
+    assert!(
+        pending.is_empty(),
+        "preview should not create pending desired blueprint rows"
+    );
+
+    let pending_runs = store
+        .list_runs_by_source_status("blueprint", OrchestratorRunStatus::Pending)
+        .await?;
     assert_eq!(
-        pending[0].desired_id.to_string(),
+        pending_runs.len(),
+        1,
+        "expected a single reusable pending blueprint run"
+    );
+    assert_eq!(
+        pending_runs[0].run_id.to_string(),
         first_plan_id,
-        "pending desired id should match reused plan id"
+        "pending preview run id should match reused plan id"
     );
 
     Ok(())

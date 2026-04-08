@@ -141,6 +141,27 @@ impl OrchestratorService {
             );
         }
 
+        let canceled_blueprint_previews = store
+            .cancel_pending_runs_by_source(
+                "blueprint",
+                Some("server restarted before plan confirmation"),
+            )
+            .await?;
+        if canceled_blueprint_previews > 0 {
+            tracing::warn!(
+                "orchestrator: canceled {} stale blueprint preview run(s) on startup",
+                canceled_blueprint_previews
+            );
+        }
+
+        let deleted_pending_desired = store.delete_desired_blueprints(Some(false)).await?;
+        if deleted_pending_desired > 0 {
+            tracing::warn!(
+                "orchestrator: deleted {} stale pending desired blueprint row(s) on startup",
+                deleted_pending_desired
+            );
+        }
+
         let stale_before =
             Utc::now() - chrono::Duration::minutes(STARTUP_STALE_INSTANCE_GRACE_MINUTES);
         let pruned = store
@@ -439,6 +460,32 @@ mod tests {
             })
             .await?;
 
+        let preview_run_id = Uuid::new_v4();
+        store
+            .create_run(&NewOrchestratorRun {
+                run_id: preview_run_id,
+                source: "blueprint".to_string(),
+                status: OrchestratorRunStatus::Pending,
+                phase: Some("planned".to_string()),
+                plan_json: Some(json!({
+                    "plan_id": preview_run_id,
+                    "blueprint_id": "elixir.blueprints.arr_stack",
+                    "actions": [],
+                    "conflicts": []
+                })),
+                error: None,
+            })
+            .await?;
+        store
+            .create_desired_blueprint(&crate::extensions::store::NewDesiredBlueprint {
+                desired_id: preview_run_id,
+                blueprint_extension_id: "elixir.blueprints.arr_stack".to_string(),
+                blueprint_version: "1.0.0".to_string(),
+                params_json: None,
+                decisions_json: None,
+            })
+            .await?;
+
         let original_owner = Uuid::new_v4().to_string();
         let acquired = store
             .acquire_lock(APPLY_LOCK_NAME, &original_owner, Duration::from_secs(60))
@@ -478,6 +525,25 @@ mod tests {
             .expect("orchestrator run should still exist");
         assert_eq!(run.status, OrchestratorRunStatus::Failed);
         assert_eq!(run.error.as_deref(), Some("server restarted"));
+
+        let preview_run = store
+            .get_run(preview_run_id)
+            .await?
+            .expect("preview run should still exist");
+        assert_eq!(preview_run.status, OrchestratorRunStatus::Canceled);
+        assert_eq!(
+            preview_run.error.as_deref(),
+            Some("server restarted before plan confirmation")
+        );
+
+        assert!(
+            store
+                .list_desired_blueprints(Some(false))
+                .await?
+                .into_iter()
+                .all(|row| row.desired_id != preview_run_id),
+            "stale pending desired blueprints should be removed on startup"
+        );
 
         let lock_rows = sqlx::query_scalar::<sqlx::Any, i64>(
             "SELECT COUNT(*) FROM orchestrator_locks WHERE lock_name = ?",

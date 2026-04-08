@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 use crate::config::{DownloaderPerformanceProfile, RunEnvironment};
 use crate::db::models::{
-    Binding, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel,
-    OperationStep, OperationStepStatus, OrchestratorRun, OrchestratorRunStatus, Provider,
-    ProviderHealthState, RuntimeLog, Secret, SecretScope,
+    Binding, BindingStatus, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind,
+    ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
+    OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
 };
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::package::{
@@ -216,6 +216,30 @@ pub struct RunsClearResponse {
     pub deleted: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatusSummaryResponse {
+    pub needs_attention_count: usize,
+    pub items: Vec<ExtensionStatusSummaryItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatusSummaryItem {
+    pub extension_id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: ExtensionKind,
+    pub trust_level: ExtensionTrustLevel,
+    pub enabled: bool,
+    pub severity: String,
+    pub status_code: String,
+    pub label: String,
+    pub description: String,
+    pub primary_action: String,
+    pub primary_action_label: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretsQuery {
@@ -290,38 +314,52 @@ pub async fn apply_blueprint(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
 
-    let pending = store
-        .list_desired_blueprints(Some(false))
+    let pending_runs = store
+        .list_runs_by_source_status("blueprint", OrchestratorRunStatus::Pending)
         .await
         .map_err(ApiError::from)?;
     let mut reusable_run_id = None;
-    for item in pending {
-        if item.blueprint_extension_id != blueprint.extension_id || item.params_json != plan.params
-        {
-            continue;
-        }
-        let run = store
-            .get_run(item.desired_id)
-            .await
-            .map_err(ApiError::from)?;
-        let is_pending_run = run
-            .as_ref()
-            .is_some_and(|entry| entry.status == OrchestratorRunStatus::Pending);
-        if reusable_run_id.is_none() && is_pending_run {
-            reusable_run_id = Some(item.desired_id);
-            continue;
-        }
-        let _ = store.mark_desired_applied(item.desired_id, true).await;
-        if is_pending_run {
+    for run in pending_runs {
+        let Some(plan_json) = run.plan_json.as_ref() else {
             let _ = store
                 .update_run_status(
-                    item.desired_id,
+                    run.run_id,
                     OrchestratorRunStatus::Canceled,
                     Some("canceled"),
-                    Some("superseded by newer blueprint plan"),
+                    Some("invalid blueprint preview payload"),
                 )
                 .await;
+            continue;
+        };
+        let Ok(existing_plan) = serde_json::from_value::<Plan>(plan_json.clone()) else {
+            let _ = store
+                .update_run_status(
+                    run.run_id,
+                    OrchestratorRunStatus::Canceled,
+                    Some("canceled"),
+                    Some("invalid blueprint preview payload"),
+                )
+                .await;
+            continue;
+        };
+
+        if existing_plan.blueprint_id == blueprint.extension_id
+            && existing_plan.params == plan.params
+        {
+            if reusable_run_id.is_none() {
+                reusable_run_id = Some(run.run_id);
+                continue;
+            }
         }
+
+        let _ = store
+            .update_run_status(
+                run.run_id,
+                OrchestratorRunStatus::Canceled,
+                Some("canceled"),
+                Some("superseded by newer blueprint preview"),
+            )
+            .await;
     }
     if let Some(run_id) = reusable_run_id {
         plan.plan_id = run_id;
@@ -334,16 +372,6 @@ pub async fn apply_blueprint(
         return Ok(Json(plan));
     }
 
-    store
-        .create_desired_blueprint(&NewDesiredBlueprint {
-            desired_id: plan.plan_id,
-            blueprint_extension_id: blueprint.extension_id.clone(),
-            blueprint_version: blueprint.version.clone(),
-            params_json: plan.params.clone(),
-            decisions_json: None,
-        })
-        .await
-        .map_err(ApiError::from)?;
     let plan_json =
         serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.to_string()))?;
     store
@@ -452,14 +480,28 @@ pub async fn confirm_plan(
         .map(|value| serde_json::to_value(value))
         .transpose()
         .map_err(|err| ApiError::internal(err.to_string()))?;
-    store
-        .update_desired_decisions(run_id, decisions_json)
-        .await
-        .map_err(ApiError::from)?;
-    store
-        .mark_desired_applied(run_id, true)
-        .await
-        .map_err(ApiError::from)?;
+
+    if run.source == "blueprint" {
+        let blueprint = store
+            .get_extension(&plan.blueprint_id)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+        store
+            .upsert_desired_blueprint(&NewDesiredBlueprint {
+                desired_id: run_id,
+                blueprint_extension_id: blueprint.extension_id,
+                blueprint_version: blueprint.version,
+                params_json: plan.params.clone(),
+                decisions_json: decisions_json.clone(),
+            })
+            .await
+            .map_err(ApiError::from)?;
+        store
+            .mark_desired_applied(run_id, true)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     let mut steps = Vec::with_capacity(plan.actions.len());
     for (index, action) in plan.actions.iter().enumerate() {
@@ -553,6 +595,10 @@ pub async fn cancel_plan(
         )
         .await
         .map_err(ApiError::from)?;
+
+    if run.source == "blueprint" {
+        let _ = store.delete_desired_blueprint(run_id).await;
+    }
 
     Ok(Json(PlanRunResponse {
         run_id,
@@ -1584,6 +1630,16 @@ pub async fn auto_wire_plan(State(state): State<AppState>) -> ApiResult<Json<Pla
     Ok(Json(plan))
 }
 
+pub async fn status_summary(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ExtensionStatusSummaryResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let response = build_extension_status_summary(&store)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
 const DOWNLOADER_PROFILE_SETTING_KEY: &str = "downloader_profile";
 
 pub async fn downloader_profile(
@@ -1774,6 +1830,428 @@ async fn build_downloader_profile_response(
         ],
         downloaders,
     })
+}
+
+async fn build_extension_status_summary(
+    store: &ExtensionStore<'_>,
+) -> anyhow::Result<ExtensionStatusSummaryResponse> {
+    let extensions = store.list_extensions().await?;
+    let instances = store.list_instances(None).await?;
+    let providers = store.list_providers(None).await?;
+    let bindings = store.list_bindings().await?;
+    let desired_blueprints = store.list_desired_blueprints(None).await?;
+
+    let mut instances_by_extension: HashMap<String, Vec<ExtensionInstance>> = HashMap::new();
+    for instance in instances {
+        instances_by_extension
+            .entry(instance.extension_id.clone())
+            .or_default()
+            .push(instance);
+    }
+
+    let mut providers_by_instance: HashMap<Uuid, Vec<Provider>> = HashMap::new();
+    let mut available_targets = HashSet::new();
+    for provider in providers {
+        available_targets.insert((provider.capability.clone(), provider.slot_id.clone()));
+        providers_by_instance
+            .entry(provider.instance_id)
+            .or_default()
+            .push(provider);
+    }
+
+    let mut failed_bindings_by_consumer: HashMap<Uuid, usize> = HashMap::new();
+    for binding in bindings {
+        if binding.status == BindingStatus::Failed {
+            *failed_bindings_by_consumer
+                .entry(binding.consumer_provider_id)
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut pending_blueprints = HashSet::new();
+    for blueprint in desired_blueprints {
+        if !blueprint.applied {
+            pending_blueprints.insert(blueprint.blueprint_extension_id);
+        }
+    }
+
+    let mut items = Vec::with_capacity(extensions.len());
+    for extension in extensions {
+        let manifest =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone()).ok();
+        let instances = instances_by_extension
+            .get(&extension.extension_id)
+            .cloned()
+            .unwrap_or_default();
+        let item = match extension.kind {
+            ExtensionKind::Blueprint => {
+                summarize_blueprint_extension(&extension, &pending_blueprints)
+            }
+            ExtensionKind::Connector => {
+                summarize_connector_extension(&extension, manifest.as_ref(), &available_targets)
+            }
+            ExtensionKind::Module => {
+                summarize_module_extension(
+                    store,
+                    &extension,
+                    manifest.as_ref(),
+                    &instances,
+                    &providers_by_instance,
+                    &failed_bindings_by_consumer,
+                )
+                .await?
+            }
+        };
+        items.push(item);
+    }
+
+    items.sort_by(|left, right| {
+        extension_status_sort_order(&left.severity)
+            .cmp(&extension_status_sort_order(&right.severity))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+
+    let needs_attention_count = items
+        .iter()
+        .filter(|item| item.severity == "attention")
+        .count();
+
+    Ok(ExtensionStatusSummaryResponse {
+        needs_attention_count,
+        items,
+    })
+}
+
+fn summarize_blueprint_extension(
+    extension: &Extension,
+    pending_blueprints: &HashSet<String>,
+) -> ExtensionStatusSummaryItem {
+    if !extension.enabled {
+        return disabled_extension_status(
+            extension,
+            "disabled",
+            "Disabled",
+            "This stack is installed but turned off.",
+            "enable",
+            "Enable",
+        );
+    }
+    if pending_blueprints.contains(&extension.extension_id) {
+        return attention_extension_status(
+            extension,
+            "pending_blueprint_setup",
+            "Needs setup",
+            "This stack is waiting for final setup before it is ready to use.",
+            "finish_setup",
+            "Finish setup",
+        );
+    }
+    ready_extension_status(
+        extension,
+        "ready",
+        "Ready",
+        "This stack is installed and ready to use.",
+        "open",
+        "Open",
+    )
+}
+
+fn summarize_connector_extension(
+    extension: &Extension,
+    manifest: Option<&ExtensionManifest>,
+    available_targets: &HashSet<(String, String)>,
+) -> ExtensionStatusSummaryItem {
+    if !extension.enabled {
+        return disabled_extension_status(
+            extension,
+            "disabled",
+            "Disabled",
+            "This connector is installed but turned off.",
+            "enable",
+            "Enable",
+        );
+    }
+
+    let has_target = manifest
+        .map(|manifest| {
+            manifest.targets.iter().any(|target| {
+                available_targets.contains(&(target.capability.clone(), target.slot.clone()))
+            })
+        })
+        .unwrap_or(true);
+
+    if !has_target {
+        return attention_extension_status(
+            extension,
+            "waiting_for_app",
+            "Needs setup",
+            "Install a compatible app to use this connector.",
+            "finish_setup",
+            "Finish setup",
+        );
+    }
+
+    ready_extension_status(
+        extension,
+        "ready",
+        "Ready",
+        "This connector is installed and ready for compatible apps.",
+        "open",
+        "Open",
+    )
+}
+
+async fn summarize_module_extension(
+    store: &ExtensionStore<'_>,
+    extension: &Extension,
+    manifest: Option<&ExtensionManifest>,
+    instances: &[ExtensionInstance],
+    providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
+    failed_bindings_by_consumer: &HashMap<Uuid, usize>,
+) -> anyhow::Result<ExtensionStatusSummaryItem> {
+    if !extension.enabled {
+        return Ok(disabled_extension_status(
+            extension,
+            "disabled",
+            "Disabled",
+            "This extension is installed but turned off.",
+            "enable",
+            "Enable",
+        ));
+    }
+
+    if instances.is_empty() {
+        return Ok(attention_extension_status(
+            extension,
+            "missing_instance",
+            "Needs setup",
+            "Create an instance to start using this extension.",
+            "finish_setup",
+            "Finish setup",
+        ));
+    }
+
+    let required_secret_keys = manifest
+        .and_then(|manifest| required_secrets_from_manifest(manifest).ok())
+        .unwrap_or_default();
+
+    let mut enabled_instance_count = 0usize;
+    let mut provider_count = 0usize;
+    let mut missing_secret_count = 0usize;
+    let mut unhealthy_provider_count = 0usize;
+    let mut degraded_provider_count = 0usize;
+    let mut failed_binding_count = 0usize;
+
+    for instance in instances {
+        if !instance.enabled {
+            continue;
+        }
+        enabled_instance_count += 1;
+
+        if !required_secret_keys.is_empty() {
+            missing_secret_count += missing_required_secrets_for_instance(
+                store,
+                instance.instance_id,
+                &required_secret_keys,
+            )
+            .await?
+            .len();
+        }
+
+        if let Some(providers) = providers_by_instance.get(&instance.instance_id) {
+            provider_count += providers.len();
+            for provider in providers {
+                match provider.health_state {
+                    ProviderHealthState::Unhealthy => unhealthy_provider_count += 1,
+                    ProviderHealthState::Degraded => degraded_provider_count += 1,
+                    ProviderHealthState::Unknown | ProviderHealthState::Healthy => {}
+                }
+                failed_binding_count += failed_bindings_by_consumer
+                    .get(&provider.provider_id)
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    if missing_secret_count > 0 {
+        let noun = if missing_secret_count == 1 {
+            "secret is"
+        } else {
+            "secrets are"
+        };
+        return Ok(attention_extension_status(
+            extension,
+            "missing_required_secrets",
+            "Needs setup",
+            &format!(
+                "Finish setup to add the {} required {noun} still missing.",
+                missing_secret_count
+            ),
+            "finish_setup",
+            "Finish setup",
+        ));
+    }
+
+    if enabled_instance_count == 0 {
+        return Ok(disabled_extension_status(
+            extension,
+            "instances_disabled",
+            "Disabled",
+            "All instances for this extension are turned off.",
+            "finish_setup",
+            "Open",
+        ));
+    }
+
+    if provider_count == 0 {
+        return Ok(attention_extension_status(
+            extension,
+            "provider_not_ready",
+            "Needs setup",
+            "This extension is still finishing setup.",
+            "finish_setup",
+            "Finish setup",
+        ));
+    }
+
+    if unhealthy_provider_count > 0 || failed_binding_count > 0 {
+        let description = if unhealthy_provider_count > 0 && failed_binding_count > 0 {
+            "This extension has connection problems and is not working normally."
+        } else if unhealthy_provider_count > 0 {
+            "This extension is not responding normally right now."
+        } else {
+            "This extension has a broken connection that needs repair."
+        };
+        return Ok(attention_extension_status(
+            extension,
+            "connection_issue",
+            "Connection issue",
+            description,
+            "fix",
+            "Fix",
+        ));
+    }
+
+    if degraded_provider_count > 0 {
+        return Ok(attention_extension_status(
+            extension,
+            "degraded_runtime",
+            "Needs attention",
+            "This extension is working, but it needs attention.",
+            "fix",
+            "Fix",
+        ));
+    }
+
+    let description = format!(
+        "{} instance{} configured and working normally.",
+        enabled_instance_count,
+        if enabled_instance_count == 1 { "" } else { "s" }
+    );
+    Ok(ready_extension_status(
+        extension,
+        "ready",
+        "Ready",
+        &description,
+        "open",
+        "Open",
+    ))
+}
+
+fn extension_status_sort_order(severity: &str) -> usize {
+    match severity {
+        "attention" => 0,
+        "ready" => 1,
+        "disabled" => 2,
+        _ => 3,
+    }
+}
+
+fn attention_extension_status(
+    extension: &Extension,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    extension_status_item(
+        extension,
+        "attention",
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
+}
+
+fn ready_extension_status(
+    extension: &Extension,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    extension_status_item(
+        extension,
+        "ready",
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
+}
+
+fn disabled_extension_status(
+    extension: &Extension,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    extension_status_item(
+        extension,
+        "disabled",
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
+}
+
+fn extension_status_item(
+    extension: &Extension,
+    severity: &str,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    ExtensionStatusSummaryItem {
+        extension_id: extension.extension_id.clone(),
+        name: extension.name.clone(),
+        version: extension.version.clone(),
+        kind: extension.kind.clone(),
+        trust_level: extension.trust_level.clone(),
+        enabled: extension.enabled,
+        severity: severity.to_string(),
+        status_code: status_code.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        primary_action: primary_action.to_string(),
+        primary_action_label: primary_action_label.to_string(),
+    }
 }
 
 const DOWNLOADER_TELEMETRY_SETTING_PREFIX: &str = "extensions.downloaders.telemetry.";
