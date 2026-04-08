@@ -403,6 +403,22 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn prune_orphaned_instance_secrets(&self) -> Result<u64> {
+        let result = sqlx::query::<sqlx::Any>(
+            "DELETE FROM secrets
+             WHERE scope = 'instance'
+               AND scope_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM extension_instances
+                   WHERE extension_instances.instance_id = secrets.scope_id
+               )",
+        )
+        .execute(self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn upsert_provider(&self, data: &NewProvider) -> Result<()> {
         let scope_json = json_to_string(data.scope_json.as_ref())?;
         let endpoint_json = json_to_string(data.endpoint_json.as_ref())?;

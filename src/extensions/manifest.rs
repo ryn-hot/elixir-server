@@ -34,6 +34,8 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub connectors: Vec<String>,
     #[serde(default)]
+    pub optional_addons: Vec<ManifestOptionalAddon>,
+    #[serde(default)]
     pub wants: Vec<ManifestCapabilityRef>,
     #[serde(default)]
     pub preferences: Option<ManifestPreferences>,
@@ -150,6 +152,10 @@ impl ExtensionManifest {
 
         for connector in &self.connectors {
             ensure_non_empty(connector, "connectors")?;
+        }
+
+        for addon in &self.optional_addons {
+            addon.validate()?;
         }
 
         Ok(())
@@ -359,6 +365,60 @@ pub struct ManifestCapabilityRef {
     pub capability: String,
     #[serde(default = "default_slot")]
     pub slot: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestOptionalAddon {
+    pub extension_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
+    #[serde(default)]
+    pub secret_key_prefix: Option<String>,
+    #[serde(default)]
+    pub target: Option<ManifestCapabilityRef>,
+}
+
+impl ManifestOptionalAddon {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.extension_id, "optional_addons.extension_id")?;
+        if let Some(title) = self.title.as_deref() {
+            ensure_non_empty(title, "optional_addons.title")?;
+        }
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "optional_addons.description")?;
+        }
+        for field in &self.required_fields {
+            ensure_non_empty(field, "optional_addons.required_fields")?;
+        }
+        if !self.required_fields.is_empty() {
+            let Some(prefix) = self.secret_key_prefix.as_deref() else {
+                bail!(
+                    "optional_addons.secret_key_prefix is required when optional_addons.required_fields is set"
+                );
+            };
+            ensure_non_empty(prefix, "optional_addons.secret_key_prefix")?;
+            let Some(target) = self.target.as_ref() else {
+                bail!(
+                    "optional_addons.target is required when optional_addons.required_fields is set"
+                );
+            };
+            ensure_non_empty(&target.capability, "optional_addons.target.capability")?;
+            ensure_non_empty(&target.slot, "optional_addons.target.slot")?;
+        } else {
+            if let Some(prefix) = self.secret_key_prefix.as_deref() {
+                ensure_non_empty(prefix, "optional_addons.secret_key_prefix")?;
+            }
+            if let Some(target) = self.target.as_ref() {
+                ensure_non_empty(&target.capability, "optional_addons.target.capability")?;
+                ensure_non_empty(&target.slot, "optional_addons.target.slot")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

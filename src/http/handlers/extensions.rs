@@ -238,6 +238,27 @@ pub struct ExtensionStatusSummaryItem {
     pub description: String,
     pub primary_action: String,
     pub primary_action_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_addons: Vec<ExtensionOptionalAddonSummaryItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionOptionalAddonSummaryItem {
+    pub extension_id: String,
+    pub title: String,
+    pub description: String,
+    pub severity: String,
+    pub status_code: String,
+    pub label: String,
+    pub action: String,
+    pub action_label: String,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
+    #[serde(default)]
+    pub secret_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_scope_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1059,11 +1080,18 @@ pub async fn uninstall_extension(
             .map_err(ApiError::from)?;
     }
 
+    remove_extension_instances(&state, &store, &existing.extension_id)
+        .await
+        .map_err(ApiError::from)?;
+
     uninstall_extension_record(&store, &storage_paths, &existing)
         .await
         .map_err(ApiError::from)?;
 
     for dependency in cascade_targets {
+        remove_extension_instances(&state, &store, &dependency.extension_id)
+            .await
+            .map_err(ApiError::from)?;
         uninstall_extension_record(&store, &storage_paths, &dependency)
             .await
             .map_err(ApiError::from)?;
@@ -1210,12 +1238,7 @@ pub async fn delete_instance(
         return Err(ApiError::not_found("instance not found"));
     }
 
-    store
-        .delete_secrets_by_scope(SecretScope::Instance, Some(instance_id))
-        .await
-        .map_err(ApiError::from)?;
-    store
-        .delete_instance(instance_id)
+    remove_instance_record(&state, &store, instance_id)
         .await
         .map_err(ApiError::from)?;
 
@@ -1850,9 +1873,14 @@ async fn build_extension_status_summary(
     }
 
     let mut providers_by_instance: HashMap<Uuid, Vec<Provider>> = HashMap::new();
+    let mut provider_instances_by_target: HashMap<(String, String), Vec<Uuid>> = HashMap::new();
     let mut available_targets = HashSet::new();
     for provider in providers {
         available_targets.insert((provider.capability.clone(), provider.slot_id.clone()));
+        provider_instances_by_target
+            .entry((provider.capability.clone(), provider.slot_id.clone()))
+            .or_default()
+            .push(provider.instance_id);
         providers_by_instance
             .entry(provider.instance_id)
             .or_default()
@@ -1875,10 +1903,19 @@ async fn build_extension_status_summary(
         }
     }
 
+    let extensions_by_id: HashMap<String, Extension> = extensions
+        .iter()
+        .cloned()
+        .map(|extension| (extension.extension_id.clone(), extension))
+        .collect();
+    let mut manifests_by_id: HashMap<String, ExtensionManifest> = HashMap::new();
     let mut items = Vec::with_capacity(extensions.len());
     for extension in extensions {
         let manifest =
             serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone()).ok();
+        if let Some(manifest) = manifest.as_ref() {
+            manifests_by_id.insert(extension.extension_id.clone(), manifest.clone());
+        }
         let instances = instances_by_extension
             .get(&extension.extension_id)
             .cloned()
@@ -1903,6 +1940,34 @@ async fn build_extension_status_summary(
             }
         };
         items.push(item);
+    }
+
+    let item_summary_by_id: HashMap<String, ExtensionStatusSummaryItem> = items
+        .iter()
+        .cloned()
+        .map(|item| (item.extension_id.clone(), item))
+        .collect();
+    for item in &mut items {
+        let Some(extension) = extensions_by_id.get(&item.extension_id) else {
+            continue;
+        };
+        if extension.kind != ExtensionKind::Blueprint {
+            continue;
+        }
+        let Some(manifest) = manifests_by_id.get(&item.extension_id) else {
+            continue;
+        };
+        if manifest.optional_addons.is_empty() {
+            continue;
+        }
+        item.optional_addons = summarize_blueprint_optional_addons(
+            store,
+            manifest,
+            &extensions_by_id,
+            &item_summary_by_id,
+            &provider_instances_by_target,
+        )
+        .await?;
     }
 
     items.sort_by(|left, right| {
@@ -1958,6 +2023,150 @@ fn summarize_blueprint_extension(
         "open",
         "Open",
     )
+}
+
+async fn summarize_blueprint_optional_addons(
+    store: &ExtensionStore<'_>,
+    manifest: &ExtensionManifest,
+    extensions_by_id: &HashMap<String, Extension>,
+    item_summary_by_id: &HashMap<String, ExtensionStatusSummaryItem>,
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+) -> anyhow::Result<Vec<ExtensionOptionalAddonSummaryItem>> {
+    let mut items = Vec::new();
+    for addon in &manifest.optional_addons {
+        let installed_extension = extensions_by_id.get(&addon.extension_id);
+        let target_instance_id = addon
+            .target
+            .as_ref()
+            .and_then(|target| resolve_addon_target_instance(provider_instances_by_target, target));
+        let secret_keys: Vec<String> = addon
+            .required_fields
+            .iter()
+            .map(|field| addon_secret_key(addon, field))
+            .collect();
+
+        let mut missing_secret_keys = Vec::new();
+        if let Some(instance_id) = target_instance_id {
+            for key in &secret_keys {
+                let exists = store
+                    .get_secret(SecretScope::Instance, Some(instance_id), key)
+                    .await?
+                    .is_some();
+                if !exists {
+                    missing_secret_keys.push(key.clone());
+                }
+            }
+        } else {
+            missing_secret_keys = secret_keys.clone();
+        }
+
+        let mut item = if let Some(summary) = item_summary_by_id.get(&addon.extension_id) {
+            let installed_enabled = installed_extension
+                .map(|value| value.enabled)
+                .unwrap_or(false);
+            ExtensionOptionalAddonSummaryItem {
+                extension_id: addon.extension_id.clone(),
+                title: addon.title.clone().unwrap_or_else(|| summary.name.clone()),
+                description: if summary.description.trim().is_empty() {
+                    addon
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "Optional add-on".to_string())
+                } else {
+                    summary.description.clone()
+                },
+                severity: summary.severity.clone(),
+                status_code: summary.status_code.clone(),
+                label: if installed_enabled && summary.severity == "ready" {
+                    "Active".to_string()
+                } else if !installed_enabled {
+                    "Not active".to_string()
+                } else {
+                    summary.label.clone()
+                },
+                action: if installed_enabled {
+                    "open".to_string()
+                } else {
+                    "activate".to_string()
+                },
+                action_label: if installed_enabled {
+                    "Open".to_string()
+                } else {
+                    "Activate".to_string()
+                },
+                required_fields: addon.required_fields.clone(),
+                secret_keys: secret_keys.clone(),
+                secret_scope_instance_id: target_instance_id,
+            }
+        } else {
+            ExtensionOptionalAddonSummaryItem {
+                extension_id: addon.extension_id.clone(),
+                title: addon
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| addon.extension_id.clone()),
+                description: addon
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "Available when you want to add it.".to_string()),
+                severity: "available".to_string(),
+                status_code: "available".to_string(),
+                label: "Available".to_string(),
+                action: "activate".to_string(),
+                action_label: "Activate".to_string(),
+                required_fields: addon.required_fields.clone(),
+                secret_keys: secret_keys.clone(),
+                secret_scope_instance_id: target_instance_id,
+            }
+        };
+
+        if !item.required_fields.is_empty()
+            && item.action == "activate"
+            && !missing_secret_keys.is_empty()
+            && target_instance_id.is_some()
+        {
+            item.description = addon.description.clone().unwrap_or_else(|| {
+                "You can add your account details when you activate this source.".to_string()
+            });
+        }
+
+        items.push(item);
+    }
+
+    items.sort_by(|left, right| {
+        left.title
+            .to_ascii_lowercase()
+            .cmp(&right.title.to_ascii_lowercase())
+    });
+    Ok(items)
+}
+
+fn resolve_addon_target_instance(
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+    target: &crate::extensions::manifest::ManifestCapabilityRef,
+) -> Option<Uuid> {
+    let instance_ids =
+        provider_instances_by_target.get(&(target.capability.clone(), target.slot.clone()))?;
+    let mut unique = instance_ids.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() == 1 {
+        unique.first().copied()
+    } else {
+        None
+    }
+}
+
+fn addon_secret_key(
+    addon: &crate::extensions::manifest::ManifestOptionalAddon,
+    field: &str,
+) -> String {
+    match addon.secret_key_prefix.as_deref() {
+        Some(prefix) if !prefix.trim().is_empty() => {
+            format!("{}.{}", prefix.trim(), field.trim())
+        }
+        _ => field.trim().to_string(),
+    }
 }
 
 fn summarize_connector_extension(
@@ -2251,6 +2460,7 @@ fn extension_status_item(
         description: description.to_string(),
         primary_action: primary_action.to_string(),
         primary_action_label: primary_action_label.to_string(),
+        optional_addons: Vec::new(),
     }
 }
 
@@ -2505,6 +2715,37 @@ async fn uninstall_extension_record(
             );
         }
     }
+    Ok(())
+}
+
+async fn remove_extension_instances(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> Result<(), anyhow::Error> {
+    let instances = store.list_instances(Some(extension_id)).await?;
+    for instance in instances {
+        remove_instance_record(state, store, instance.instance_id).await?;
+    }
+    Ok(())
+}
+
+async fn remove_instance_record(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> Result<(), anyhow::Error> {
+    state
+        .orchestrator
+        .remove_instance_runtime(instance_id)
+        .await?;
+    for provider in store.list_providers(Some(instance_id)).await? {
+        store.delete_provider(provider.provider_id).await?;
+    }
+    store
+        .delete_secrets_by_scope(SecretScope::Instance, Some(instance_id))
+        .await?;
+    store.delete_instance(instance_id).await?;
     Ok(())
 }
 

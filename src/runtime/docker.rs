@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
@@ -262,6 +262,119 @@ impl DockerRuntimeManager {
             .is_some()
     }
 
+    fn extract_labels(value: &Value) -> HashMap<String, String> {
+        value
+            .pointer("/Config/Labels")
+            .and_then(Value::as_object)
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn aliases_conflict(spec: &ContainerSpec, value: &Value) -> bool {
+        if spec.network_mode.is_some() || spec.aliases.is_empty() {
+            return false;
+        }
+        if !Self::has_network(value, &spec.network) {
+            return false;
+        }
+        let aliases = Self::extract_aliases(value, &spec.network);
+        spec.aliases.iter().any(|alias| aliases.contains(alias))
+    }
+
+    async fn list_managed_container_names(&self) -> Result<Vec<String>> {
+        let args = vec![
+            "ps".to_string(),
+            "-a".to_string(),
+            "--filter".to_string(),
+            "label=elixir.managed=true".to_string(),
+            "--format".to_string(),
+            "{{.Names}}".to_string(),
+        ];
+        let stdout = self.run_stdout(&args).await?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    async fn remove_conflicting_managed_containers(&self, spec: &ContainerSpec) -> Result<usize> {
+        if spec.network_mode.is_some() || spec.aliases.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(expected_instance_id) = spec.labels.get("elixir.instance_id") else {
+            return Ok(0);
+        };
+
+        let mut removed = 0usize;
+        for name in self.list_managed_container_names().await? {
+            if name == spec.name {
+                continue;
+            }
+
+            let inspect = self.inspect_container(&name).await?;
+            if !Self::aliases_conflict(spec, &inspect) {
+                continue;
+            }
+
+            let labels = Self::extract_labels(&inspect);
+            if labels.get("elixir.instance_id") == Some(expected_instance_id) {
+                continue;
+            }
+
+            tracing::warn!(
+                "docker runtime: removing stale/conflicting managed container '{}' before ensuring '{}'",
+                name,
+                spec.name
+            );
+            self.remove_container(&ContainerHandle {
+                id: name.clone(),
+                name,
+            })
+            .await?;
+            removed += 1;
+        }
+
+        Ok(removed)
+    }
+
+    pub async fn prune_orphaned_managed_containers(
+        &self,
+        active_instance_ids: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for name in self.list_managed_container_names().await? {
+            let inspect = self.inspect_container(&name).await?;
+            let labels = Self::extract_labels(&inspect);
+            let instance_id = labels.get("elixir.instance_id");
+            if instance_id.is_some_and(|value| active_instance_ids.contains(value)) {
+                continue;
+            }
+
+            tracing::warn!(
+                "docker runtime: removing orphaned managed container '{}' with missing/stale instance id {:?}",
+                name,
+                instance_id
+            );
+            self.remove_container(&ContainerHandle {
+                id: name.clone(),
+                name: name.clone(),
+            })
+            .await?;
+            removed.push(name);
+        }
+        Ok(removed)
+    }
+
     async fn create_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
         Self::ensure_required_labels(&spec.labels)?;
 
@@ -430,6 +543,8 @@ impl RuntimeManager for DockerRuntimeManager {
         if spec.network_mode.is_none() {
             self.ensure_network(&spec.network).await?;
         }
+
+        self.remove_conflicting_managed_containers(spec).await?;
 
         if let Some(_) = self.find_container_id(&spec.name).await? {
             let inspect = self.inspect_container(&spec.name).await?;
@@ -664,6 +779,7 @@ fn format_port(port: &PortMapping) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn port_mapping_formats() {
@@ -718,5 +834,66 @@ mod tests {
     fn unrelated_docker_errors_are_not_classified_as_daemon_unavailable() {
         let err = anyhow::anyhow!("docker inspect foo failed: No such container: foo");
         assert!(!is_docker_daemon_unavailable(&err));
+    }
+
+    #[test]
+    fn alias_conflicts_are_detected_on_same_network() {
+        let spec = ContainerSpec {
+            name: "elx-new".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: vec![
+                "svc-elixir-modules-prowlarr-default".to_string(),
+                "elx-prowlarr".to_string(),
+            ],
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        };
+        let inspect = json!({
+            "NetworkSettings": {
+                "Networks": {
+                    "elixir_net": {
+                        "Aliases": ["svc-elixir-modules-prowlarr-default", "deadbeef"]
+                    }
+                }
+            }
+        });
+        assert!(DockerRuntimeManager::aliases_conflict(&spec, &inspect));
+    }
+
+    #[test]
+    fn alias_conflicts_ignore_other_networks() {
+        let spec = ContainerSpec {
+            name: "elx-new".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: vec!["svc-elixir-modules-prowlarr-default".to_string()],
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        };
+        let inspect = json!({
+            "NetworkSettings": {
+                "Networks": {
+                    "other_net": {
+                        "Aliases": ["svc-elixir-modules-prowlarr-default"]
+                    }
+                }
+            }
+        });
+        assert!(!DockerRuntimeManager::aliases_conflict(&spec, &inspect));
     }
 }

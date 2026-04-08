@@ -906,6 +906,176 @@ async fn extension_status_summary_surfaces_setup_and_connection_issues() -> Resu
 }
 
 #[tokio::test]
+async fn extension_status_summary_includes_optional_addons_for_blueprints() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            name: "Prowlarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.prowlarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Prowlarr",
+                "provides": [{
+                    "capability": "indexer.registry",
+                    "slot": "default",
+                    "implementation": "prowlarr"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/prowlarr:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let prowlarr_instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: prowlarr_instance_id,
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: prowlarr_instance_id,
+            capability: "indexer.registry".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("prowlarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-prowlarr",
+                "port": 9696,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.blueprints.arr_stack".to_string(),
+            name: "Arr Stack".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.blueprints.arr_stack",
+                "version": "1.0.0",
+                "kind": "blueprint",
+                "name": "Arr Stack",
+                "wants": [{
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }],
+                "optional_addons": [{
+                    "extension_id": "elixir.connectors.prowlarr_nzbgeek",
+                    "title": "NZBGeek",
+                    "description": "Add your NZBGeek account to Prowlarr.",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "required_fields": ["api_key"],
+                    "secret_key_prefix": "indexer.nzbgeek"
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("status items");
+    let arr_stack = items
+        .iter()
+        .find(|item| {
+            item.get("extensionId").and_then(Value::as_str) == Some("elixir.blueprints.arr_stack")
+        })
+        .expect("arr stack summary");
+    let addons = arr_stack
+        .get("optionalAddons")
+        .and_then(Value::as_array)
+        .expect("optional addons");
+    assert_eq!(addons.len(), 1);
+    let addon = &addons[0];
+    assert_eq!(
+        addon.get("extensionId").and_then(Value::as_str),
+        Some("elixir.connectors.prowlarr_nzbgeek")
+    );
+    assert_eq!(addon.get("title").and_then(Value::as_str), Some("NZBGeek"));
+    assert_eq!(
+        addon.get("action").and_then(Value::as_str),
+        Some("activate")
+    );
+    assert_eq!(
+        addon
+            .get("requiredFields")
+            .and_then(Value::as_array)
+            .map(|fields| { fields.iter().filter_map(Value::as_str).collect::<Vec<_>>() }),
+        Some(vec!["api_key"])
+    );
+    assert_eq!(
+        addon
+            .get("secretKeys")
+            .and_then(Value::as_array)
+            .map(|fields| { fields.iter().filter_map(Value::as_str).collect::<Vec<_>>() }),
+        Some(vec!["indexer.nzbgeek.api_key"])
+    );
+    let expected_instance_id = prowlarr_instance_id.to_string();
+    assert_eq!(
+        addon.get("secretScopeInstanceId").and_then(Value::as_str),
+        Some(expected_instance_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn login_returns_access_token() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "test-secret-key".to_string();

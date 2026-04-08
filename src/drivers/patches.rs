@@ -360,9 +360,21 @@ pub enum DownloaderNzbPatch {
     },
     SetPreferences {
         #[serde(default)]
+        main_dir: Option<String>,
+        #[serde(default)]
         default_save_path: Option<String>,
         #[serde(default)]
         incomplete_path: Option<String>,
+        #[serde(default)]
+        nzb_dir: Option<String>,
+        #[serde(default)]
+        queue_dir: Option<String>,
+        #[serde(default)]
+        temp_dir: Option<String>,
+        #[serde(default)]
+        script_dir: Option<String>,
+        #[serde(default)]
+        log_file: Option<String>,
         #[serde(default)]
         use_incomplete: Option<bool>,
         #[serde(default)]
@@ -413,8 +425,14 @@ impl DownloaderNzbPatch {
                 Ok(())
             }
             DownloaderNzbPatch::SetPreferences {
+                main_dir,
                 default_save_path,
                 incomplete_path,
+                nzb_dir,
+                queue_dir,
+                temp_dir,
+                script_dir,
+                log_file,
                 use_incomplete,
                 server_connections,
                 article_retries,
@@ -434,8 +452,14 @@ impl DownloaderNzbPatch {
                 unpack_pause_queue,
                 download_rate_kib,
             } => {
-                if default_save_path.is_none()
+                if main_dir.is_none()
+                    && default_save_path.is_none()
                     && incomplete_path.is_none()
+                    && nzb_dir.is_none()
+                    && queue_dir.is_none()
+                    && temp_dir.is_none()
+                    && script_dir.is_none()
+                    && log_file.is_none()
                     && use_incomplete.is_none()
                     && server_connections.is_none()
                     && article_retries.is_none()
@@ -457,8 +481,14 @@ impl DownloaderNzbPatch {
                 {
                     bail!("preferences must include at least one value");
                 }
+                ensure_optional_non_empty(main_dir.as_deref(), "main_dir")?;
                 ensure_optional_non_empty(default_save_path.as_deref(), "default_save_path")?;
                 ensure_optional_non_empty(incomplete_path.as_deref(), "incomplete_path")?;
+                ensure_optional_non_empty(nzb_dir.as_deref(), "nzb_dir")?;
+                ensure_optional_non_empty(queue_dir.as_deref(), "queue_dir")?;
+                ensure_optional_non_empty(temp_dir.as_deref(), "temp_dir")?;
+                ensure_optional_non_empty(script_dir.as_deref(), "script_dir")?;
+                ensure_optional_non_empty(log_file.as_deref(), "log_file")?;
                 ensure_optional_non_empty(par_check.as_deref(), "par_check")?;
                 ensure_optional_non_empty(par_scan.as_deref(), "par_scan")?;
                 Ok(())
@@ -1038,8 +1068,14 @@ mod tests {
     #[test]
     fn downloader_nzb_patch_requires_preferences() {
         let patch = DownloaderNzbPatch::SetPreferences {
+            main_dir: None,
             default_save_path: None,
             incomplete_path: None,
+            nzb_dir: None,
+            queue_dir: None,
+            temp_dir: None,
+            script_dir: None,
+            log_file: None,
             use_incomplete: None,
             server_connections: None,
             article_retries: None,
@@ -1089,8 +1125,14 @@ mod tests {
     #[test]
     fn downloader_nzb_patch_accepts_performance_profile() {
         let patch = DownloaderNzbPatch::SetPreferences {
+            main_dir: Some("/downloads".to_string()),
             default_save_path: None,
             incomplete_path: None,
+            nzb_dir: Some("/downloads/.nzb".to_string()),
+            queue_dir: Some("/downloads/.queue".to_string()),
+            temp_dir: Some("/downloads/.tmp".to_string()),
+            script_dir: Some("/config/scripts".to_string()),
+            log_file: Some("/config/nzbget.log".to_string()),
             use_incomplete: None,
             server_connections: Some(20),
             article_retries: Some(3),

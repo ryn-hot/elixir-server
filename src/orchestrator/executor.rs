@@ -270,7 +270,7 @@ impl<'a> Executor<'a> {
         &self,
         instance_id: Uuid,
         extension_id: String,
-        _instance_name: String,
+        instance_name: String,
         runtime: ManifestRuntime,
         _networking: Option<ManifestNetworking>,
         aliases: Vec<String>,
@@ -323,6 +323,7 @@ impl<'a> Executor<'a> {
 
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), instance_id.to_string());
+        labels.insert("elixir.instance_name".to_string(), instance_name);
         labels.insert("elixir.extension_id".to_string(), extension_id.clone());
         labels.insert(
             "elixir.extension_version".to_string(),
@@ -338,6 +339,9 @@ impl<'a> Executor<'a> {
             .map(|volume| resolve_volume_mount(volume, &self.runtime_paths))
             .collect::<Result<Vec<_>>>()?;
         let runtime_volumes = volumes.clone();
+        if is_nzbget_extension_id(&extension_id) {
+            prepare_nzbget_runtime_dirs(&runtime_volumes).await?;
+        }
 
         let ports = runtime
             .ports
@@ -666,6 +670,18 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    async fn restart_instance_runtime(&self, instance_id: Uuid) -> Result<()> {
+        let name = container_name(instance_id);
+        let handle = self
+            .runtime
+            .get_container_handle(&name)
+            .await?
+            .ok_or_else(|| anyhow!("runtime container '{}' not found", name))?;
+        self.runtime.stop_container(&handle).await?;
+        self.runtime.start_container(&handle).await?;
+        Ok(())
+    }
+
     async fn create_or_update_provider(
         &self,
         provider_id: Uuid,
@@ -755,6 +771,8 @@ impl<'a> Executor<'a> {
 
         let ctx =
             build_driver_ctx_for_provider(&self.store, self.secrets, &provider, &instance).await?;
+        let restart_nzbget_runtime =
+            should_restart_nzbget_after_patch(&provider, instance.config_json.as_ref(), &patch);
         let result = driver.apply_patch(ctx, patch).await?;
         if result.status == ApplyStatus::Deferred {
             let detail = result
@@ -765,6 +783,10 @@ impl<'a> Executor<'a> {
                 connector_extension_id,
                 detail
             );
+        }
+        if restart_nzbget_runtime {
+            self.restart_instance_runtime(provider.instance_id).await?;
+            self.health_gate(provider.provider_id, 30).await?;
         }
         Ok(())
     }
@@ -867,6 +889,8 @@ impl<'a> Executor<'a> {
                         .probe_tcp(&endpoint.host, endpoint.port)
                         .await
                         .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                    self.ensure_provider_driver_ready(&provider, &instance)
+                        .await?;
                     self.store
                         .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
                         .await?;
@@ -891,6 +915,8 @@ impl<'a> Executor<'a> {
                         .probe_tcp(&endpoint.host, endpoint.port)
                         .await
                         .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                    self.ensure_provider_driver_ready(&provider, &instance)
+                        .await?;
                     self.store
                         .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
                         .await?;
@@ -915,6 +941,8 @@ impl<'a> Executor<'a> {
                         .probe_tcp(&endpoint.host, endpoint.port)
                         .await
                         .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                    self.ensure_provider_driver_ready(&provider, &instance)
+                        .await?;
                     self.store
                         .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
                         .await?;
@@ -932,11 +960,27 @@ impl<'a> Executor<'a> {
             .probe_tcp(&endpoint.host, endpoint.port)
             .await
             .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+        self.ensure_provider_driver_ready(&provider, &instance)
+            .await?;
         self.apply_builtin_downloader_profile_if_needed(&provider, &instance, &endpoint)
             .await?;
         self.store
             .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
             .await?;
+        Ok(())
+    }
+
+    async fn ensure_provider_driver_ready(
+        &self,
+        provider: &Provider,
+        instance: &crate::db::models::ExtensionInstance,
+    ) -> Result<()> {
+        let Some(driver) = self.drivers.get(&provider.capability) else {
+            return Ok(());
+        };
+        let ctx =
+            build_driver_ctx_for_provider(&self.store, self.secrets, provider, instance).await?;
+        driver.read_state(ctx).await?;
         Ok(())
     }
 
@@ -1049,6 +1093,7 @@ impl<'a> Executor<'a> {
                             .unwrap_or_else(|| "driver deferred".to_string())
                     );
                 }
+                let restart_required = nzbget_has_managed_config(instance.config_json.as_ref());
                 persist_managed_defaults_profile_version(
                     &self.store,
                     instance.instance_id,
@@ -1057,6 +1102,10 @@ impl<'a> Executor<'a> {
                     desired_version,
                 )
                 .await?;
+                if restart_required {
+                    self.restart_instance_runtime(instance.instance_id).await?;
+                    bail!("nzbget runtime restarted to apply managed config");
+                }
             }
             _ => {}
         }
@@ -1078,6 +1127,8 @@ impl<'a> Executor<'a> {
 
 const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v1";
 const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v1";
+const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v3";
+const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v3";
 
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
@@ -2349,6 +2400,54 @@ async fn persist_runtime_config(
     Ok(())
 }
 
+async fn prepare_nzbget_runtime_dirs(volumes: &[VolumeMount]) -> Result<()> {
+    let downloads_root = volumes
+        .iter()
+        .find(|volume| volume.container_path == "/downloads")
+        .map(|volume| volume.host_path.clone());
+    let config_root = volumes
+        .iter()
+        .find(|volume| volume.container_path == "/config")
+        .map(|volume| volume.host_path.clone());
+
+    if let Some(downloads_root) = downloads_root {
+        for relative in [
+            "",
+            ".incomplete",
+            ".nzb",
+            ".queue",
+            ".tmp",
+            "movies",
+            "tv",
+            "anime",
+        ] {
+            let path = if relative.is_empty() {
+                Path::new(&downloads_root).to_path_buf()
+            } else {
+                Path::new(&downloads_root).join(relative)
+            };
+            fs::create_dir_all(&path)
+                .await
+                .with_context(|| format!("creating nzbget runtime directory {}", path.display()))?;
+        }
+    }
+
+    if let Some(config_root) = config_root {
+        for relative in ["", "scripts"] {
+            let path = if relative.is_empty() {
+                Path::new(&config_root).to_path_buf()
+            } else {
+                Path::new(&config_root).join(relative)
+            };
+            fs::create_dir_all(&path)
+                .await
+                .with_context(|| format!("creating nzbget config directory {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn persist_managed_defaults_profile_version(
     store: &ExtensionStore<'_>,
     instance_id: Uuid,
@@ -2444,6 +2543,33 @@ fn merge_managed_defaults_profile(
     Ok(serde_json::Value::Object(root))
 }
 
+fn should_restart_nzbget_after_patch(
+    provider: &Provider,
+    instance_config: Option<&serde_json::Value>,
+    patch: &DriverPatch,
+) -> bool {
+    if provider.capability != "downloader.nzb"
+        || provider.implementation.as_deref() != Some("nzbget")
+        || !nzbget_has_managed_config(instance_config)
+    {
+        return false;
+    }
+
+    matches!(
+        patch,
+        DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetCategories { .. })
+            | DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences { .. })
+    )
+}
+
+fn nzbget_has_managed_config(instance_config: Option<&serde_json::Value>) -> bool {
+    instance_config
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.get("config_dir"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
     let (
         max_connections,
@@ -2491,8 +2617,14 @@ fn nzbget_performance_profile_patch(profile: DownloaderPerformanceProfile) -> Dr
             }
         };
     DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
+        main_dir: Some("/config".to_string()),
         default_save_path: Some("/downloads".to_string()),
         incomplete_path: Some("/downloads/.incomplete".to_string()),
+        nzb_dir: Some("/config/nzb".to_string()),
+        queue_dir: Some("/config/queue".to_string()),
+        temp_dir: Some("/config/tmp".to_string()),
+        script_dir: Some("/config/scripts".to_string()),
+        log_file: Some("/config/nzbget.log".to_string()),
         use_incomplete: Some(true),
         server_connections: Some(server_connections),
         article_retries: Some(article_retries),
@@ -2533,8 +2665,8 @@ fn qbittorrent_performance_profile_version(profile: DownloaderPerformanceProfile
 
 fn nzbget_performance_profile_version(profile: DownloaderPerformanceProfile) -> &'static str {
     match profile {
-        DownloaderPerformanceProfile::Balanced => BALANCED_PERFORMANCE_PROFILE_VERSION,
-        DownloaderPerformanceProfile::Aggressive => AGGRESSIVE_PERFORMANCE_PROFILE_VERSION,
+        DownloaderPerformanceProfile::Balanced => NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION,
+        DownloaderPerformanceProfile::Aggressive => NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION,
     }
 }
 
@@ -2549,7 +2681,14 @@ fn nzbget_profile_version_matches(
     current: Option<&str>,
     selected: DownloaderPerformanceProfile,
 ) -> bool {
-    matches_profile_version(current, selected)
+    match selected {
+        DownloaderPerformanceProfile::Balanced => {
+            matches!(current, Some(NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION))
+        }
+        DownloaderPerformanceProfile::Aggressive => {
+            matches!(current, Some(NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION))
+        }
+    }
 }
 
 fn matches_profile_version(current: Option<&str>, selected: DownloaderPerformanceProfile) -> bool {
@@ -4598,28 +4737,32 @@ mod tests {
         let calls = calls.lock().expect("recording driver lock");
         assert_eq!(calls.len(), 1, "profile should only apply once");
         let crate::drivers::DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
+            main_dir,
             server_connections,
             write_buffer_kb,
             direct_write,
             par_check,
             unpack_pause_queue,
+            script_dir,
             ..
         }) = &calls[0]
         else {
             panic!("expected nzbget preferences patch");
         };
+        assert_eq!(main_dir.as_deref(), Some("/config"));
         assert_eq!(*server_connections, Some(20));
         assert_eq!(*write_buffer_kb, Some(1024));
         assert_eq!(*direct_write, Some(true));
         assert_eq!(par_check.as_deref(), Some("auto"));
         assert_eq!(*unpack_pause_queue, Some(true));
+        assert_eq!(script_dir.as_deref(), Some("/config/scripts"));
         drop(calls);
 
         let instance = store.get_instance(instance_id).await?.expect("instance");
         let parsed = parse_nzbget_instance_config(instance.config_json.as_ref())?;
         assert_eq!(
             parsed.performance_profile_version.as_deref(),
-            Some(BALANCED_PERFORMANCE_PROFILE_VERSION)
+            Some(NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION)
         );
         Ok(())
     }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::AnyPool;
+use std::collections::HashSet;
 
 use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{ExtensionInstance, Provider};
@@ -8,8 +9,9 @@ use crate::drivers::DriverRegistry;
 use crate::extensions::store::ExtensionStore;
 use crate::orchestrator::executor::{Executor, ExecutorAction, build_driver_ctx_for_provider};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
+use crate::orchestrator::naming::container_name;
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
-use crate::runtime::RuntimePaths;
+use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
 use crate::secrets::SecretsManager;
@@ -75,6 +77,32 @@ impl OrchestratorService {
             .ensure_daemon_available(&self.docker_startup)
             .await?;
         self.probe.prepare_binary().await
+    }
+
+    pub async fn remove_instance_runtime(&self, instance_id: uuid::Uuid) -> Result<()> {
+        self.runtime
+            .ensure_daemon_available(&self.docker_startup)
+            .await?;
+
+        let base_name = container_name(instance_id);
+        for name in [
+            base_name.clone(),
+            format!("{base_name}-rollback"),
+            format!("{base_name}-vpn"),
+            format!("{base_name}-vpn-rollback"),
+        ] {
+            if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+                let _ = self.runtime.stop_container(&handle).await;
+                self.runtime.remove_container(&handle).await?;
+            }
+        }
+
+        let wireguard_dir = std::path::Path::new(&self.runtime_paths.data_root)
+            .join("extensions")
+            .join("wireguard")
+            .join(instance_id.to_string());
+        let _ = std::fs::remove_dir_all(wireguard_dir);
+        Ok(())
     }
 
     pub async fn read_provider_state(
@@ -172,6 +200,32 @@ impl OrchestratorService {
                 "orchestrator: pruned {} stale startup instance(s) for {}",
                 pruned,
                 KNOWN_STALE_BAZARR_EXTENSION_ID
+            );
+        }
+
+        let active_instance_ids: HashSet<String> = store
+            .list_instances(None)
+            .await?
+            .into_iter()
+            .map(|instance| instance.instance_id.to_string())
+            .collect();
+        let removed_containers = self
+            .runtime
+            .prune_orphaned_managed_containers(&active_instance_ids)
+            .await?;
+        if !removed_containers.is_empty() {
+            tracing::warn!(
+                "orchestrator: removed {} orphaned managed container(s) on startup: {:?}",
+                removed_containers.len(),
+                removed_containers
+            );
+        }
+
+        let pruned_secrets = store.prune_orphaned_instance_secrets().await?;
+        if pruned_secrets > 0 {
+            tracing::warn!(
+                "orchestrator: pruned {} orphaned instance secret(s) on startup",
+                pruned_secrets
             );
         }
         Ok(())
