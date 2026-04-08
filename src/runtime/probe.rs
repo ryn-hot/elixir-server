@@ -473,13 +473,45 @@ impl ProbeRunner for NetworkProbe {
 }
 
 fn ensure_ok(result: ProbeResult, stage: &str) -> Result<()> {
-    if result.ok {
+    if result.ok || (stage == "http" && http_probe_reached_service(&result)) {
         return Ok(());
     }
     let details = result
         .details
         .unwrap_or_else(|| serde_json::json!({ "stage": stage }));
     bail!("probe {stage} failed: {details}");
+}
+
+fn http_probe_reached_service(result: &ProbeResult) -> bool {
+    let Some(details) = result.details.as_ref() else {
+        return false;
+    };
+
+    extract_http_status(details).is_some()
+}
+
+fn extract_http_status(details: &serde_json::Value) -> Option<u16> {
+    match details {
+        serde_json::Value::String(value) => extract_http_status_from_text(value),
+        serde_json::Value::Object(map) => map.values().find_map(extract_http_status),
+        serde_json::Value::Array(values) => values.iter().find_map(extract_http_status),
+        _ => None,
+    }
+}
+
+fn extract_http_status_from_text(value: &str) -> Option<u16> {
+    for marker in ["http status ", "HTTP/1.1 ", "HTTP/1.0 ", "HTTP/2 "] {
+        if let Some(index) = value.find(marker) {
+            let status = &value[index + marker.len()..];
+            let digits: String = status.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.len() == 3 {
+                if let Ok(code) = digits.parse::<u16>() {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn should_fallback_from_binary_error(stderr: &str) -> bool {
@@ -595,9 +627,10 @@ fn read_probe_magic(path: &Path) -> Result<ProbeBinaryMagic> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NetworkProbe, ProbeBinaryMagic, ProbeConfig, bundled_probe_binary_path,
-        linux_musl_target_for_arch, read_probe_magic, should_fallback_from_binary_error,
+        NetworkProbe, ProbeBinaryMagic, ProbeConfig, ProbeResult, bundled_probe_binary_path,
+        ensure_ok, linux_musl_target_for_arch, read_probe_magic, should_fallback_from_binary_error,
     };
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -622,6 +655,46 @@ mod tests {
         assert!(!should_fallback_from_binary_error(
             "http probe failed with status 401"
         ));
+    }
+
+    #[test]
+    fn accepts_http_auth_response_as_reachable() {
+        let result = ProbeResult {
+            ok: false,
+            latency_ms: None,
+            details: Some(json!({
+                "error": "http status 401"
+            })),
+        };
+        ensure_ok(result, "http").expect("401 should count as reachable");
+    }
+
+    #[test]
+    fn accepts_http_utility_fallback_status_as_reachable() {
+        let result = ProbeResult {
+            ok: false,
+            latency_ms: None,
+            details: Some(json!({
+                "mode": "utility_fallback",
+                "entrypoint": "wget",
+                "stderr": "wget: server returned error: HTTP/1.1 401 Unauthorized",
+                "exit_code": 1
+            })),
+        };
+        ensure_ok(result, "http").expect("utility fallback 401 should count as reachable");
+    }
+
+    #[test]
+    fn still_rejects_non_http_probe_failures() {
+        let result = ProbeResult {
+            ok: false,
+            latency_ms: None,
+            details: Some(json!({
+                "error": "tcp connect failed"
+            })),
+        };
+        let err = ensure_ok(result, "http").expect_err("non-http failures must still fail");
+        assert!(err.to_string().contains("probe http failed"));
     }
 
     #[test]
