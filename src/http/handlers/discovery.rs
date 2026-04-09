@@ -7,12 +7,14 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
 use tokio::process::Command;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +36,22 @@ use crate::{
 const MANAGER_PREF_MOVIE: &str = "manager_preference.movie";
 const MANAGER_PREF_SERIES: &str = "manager_preference.series";
 const MANAGER_PREF_ANIME: &str = "manager_preference.anime";
+const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.instance.";
+
+#[derive(Debug, Clone)]
+struct ManagerControlDefaults {
+    monitor_on_add: bool,
+    search_on_add: bool,
+}
+
+impl Default for ManagerControlDefaults {
+    fn default() -> Self {
+        Self {
+            monitor_on_add: true,
+            search_on_add: true,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DiscoveryQuery {
@@ -59,6 +77,12 @@ pub struct FindQuery {
 #[derive(Debug, Deserialize)]
 pub struct FindMediaTargetsQuery {
     pub media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FindMediaAcquisitionQuery {
+    #[serde(default = "default_acquisition_limit")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,11 +237,126 @@ pub struct FindMediaSearchResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FindMediaAddResponse {
     pub operation_id: Uuid,
+    pub intent_id: Uuid,
     pub manager_provider_id: Uuid,
     pub manager_label: String,
     pub media_type: String,
     pub title: String,
     pub manager_item_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindMediaAcquisitionResponse {
+    pub updated_at: DateTime<Utc>,
+    pub active_count: usize,
+    pub downloading_count: usize,
+    pub needs_attention_count: usize,
+    pub recent_completed_count: usize,
+    pub total_download_rate_bps: Option<u64>,
+    pub total_upload_rate_bps: Option<u64>,
+    pub items: Vec<FindMediaAcquisitionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindMediaAcquisitionItem {
+    pub intent_id: Uuid,
+    pub title: String,
+    pub media_type: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_label: String,
+    pub manager_item_id: Option<String>,
+    pub source: String,
+    pub stage: String,
+    pub stage_label: String,
+    pub description: String,
+    pub progress_percent: Option<f64>,
+    pub eta_seconds: Option<i64>,
+    pub downloader_label: Option<String>,
+    pub protocol: Option<String>,
+    pub last_matched_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquisitionStage {
+    Requested,
+    Searching,
+    Queued,
+    Downloading,
+    PostProcessing,
+    Importing,
+    Ready,
+    NeedsAttention,
+    Failed,
+}
+
+impl AcquisitionStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Searching => "searching",
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::PostProcessing => "post_processing",
+            Self::Importing => "importing",
+            Self::Ready => "ready",
+            Self::NeedsAttention => "needs_attention",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "Requested",
+            Self::Searching => "Searching",
+            Self::Queued => "Queued",
+            Self::Downloading => "Downloading",
+            Self::PostProcessing => "Post-processing",
+            Self::Importing => "Importing",
+            Self::Ready => "Ready",
+            Self::NeedsAttention => "Needs attention",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn sort_priority(self) -> i32 {
+        match self {
+            Self::NeedsAttention => 0,
+            Self::Failed => 1,
+            Self::Downloading => 2,
+            Self::PostProcessing => 3,
+            Self::Importing => 4,
+            Self::Queued => 5,
+            Self::Searching => 6,
+            Self::Requested => 7,
+            Self::Ready => 8,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Ready | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AcquisitionItemState {
+    stage: AcquisitionStage,
+    description: String,
+    progress_percent: Option<f64>,
+    eta_seconds: Option<i64>,
+    downloader_label: Option<String>,
+    protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AcquisitionDownloaderTotals {
+    total_download_rate_bps: Option<u64>,
+    total_upload_rate_bps: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,6 +421,10 @@ where
 
 fn default_limit() -> usize {
     5
+}
+
+fn default_acquisition_limit() -> usize {
+    12
 }
 
 pub async fn search(
@@ -367,7 +510,7 @@ pub async fn find_media_targets(
     let providers = load_provider_contexts(&store)
         .await
         .map_err(ApiError::from)?;
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -423,8 +566,23 @@ pub async fn find_media_search(
         .to_string();
     let provider_ids = parse_provider_ids(&payload.provider_ids)?;
 
+    info!(
+        media_type = media_type_api_name(media_type),
+        query = %query,
+        provider_filter_count = provider_ids.len(),
+        "find media search requested"
+    );
+
     let response =
         execute_find_media_search(&state, query.clone(), media_type, provider_ids).await?;
+
+    info!(
+        media_type = media_type_api_name(media_type),
+        query = %query,
+        result_count = response.results.len(),
+        provider_error_count = response.provider_errors.len(),
+        "find media search completed"
+    );
 
     Ok(Json(FindMediaSearchResponse {
         query,
@@ -432,6 +590,19 @@ pub async fn find_media_search(
         results: response.results,
         provider_errors: response.provider_errors,
     }))
+}
+
+pub async fn find_media_acquisition(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Query(params): Query<FindMediaAcquisitionQuery>,
+) -> ApiResult<Json<FindMediaAcquisitionResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let limit = params.limit.clamp(1, 50);
+    let response = build_find_media_acquisition_response(&state, &store, limit)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
 }
 
 pub async fn find_media_add(
@@ -468,11 +639,19 @@ pub async fn find_media_add(
         .to_string();
     let explicit_manager = parse_provider_id(payload.manager_provider_id.as_deref())?;
 
+    info!(
+        media_type = media_type_api_name(media_type),
+        title = %title,
+        year = item.year,
+        explicit_manager = ?explicit_manager,
+        "find media add requested"
+    );
+
     let store = ExtensionStore::new(&state.db_pool);
     let providers = load_provider_contexts(&store)
         .await
         .map_err(ApiError::from)?;
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
     let manager_contexts = collect_manager_providers(&providers, media_type);
@@ -492,6 +671,14 @@ pub async fn find_media_add(
         ManagerSelection::Conflict(conflict) => return Ok(conflict.into_response()),
     };
 
+    info!(
+        media_type = media_type_api_name(media_type),
+        title = %title,
+        manager_provider_id = %manager.detail.provider.provider_id,
+        manager_label = %provider_label(&manager),
+        "find media add resolved manager"
+    );
+
     let manager_item_id = add_with_manager_provider(
         &state,
         &store,
@@ -503,7 +690,7 @@ pub async fn find_media_add(
     .await
     .map_err(ApiError::from)?;
 
-    persist_managed_ingest_intent(
+    let intent_id = persist_managed_ingest_intent(
         &store,
         media_type,
         &item,
@@ -516,12 +703,22 @@ pub async fn find_media_add(
 
     let response = FindMediaAddResponse {
         operation_id: Uuid::new_v4(),
+        intent_id,
         manager_provider_id: manager.detail.provider.provider_id,
         manager_label: provider_label(&manager),
         media_type: media_type_api_name(media_type).to_string(),
         title,
         manager_item_id,
     };
+
+    info!(
+        media_type = %response.media_type,
+        title = %response.title,
+        manager_provider_id = %response.manager_provider_id,
+        manager_label = %response.manager_label,
+        manager_item_id = ?response.manager_item_id,
+        "find media add completed"
+    );
 
     Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -533,7 +730,7 @@ async fn persist_managed_ingest_intent(
     manager_provider_id: Uuid,
     manager_label: &str,
     manager_item_id: Option<&str>,
-) -> AnyResult<()> {
+) -> AnyResult<Uuid> {
     let title = item
         .title
         .as_deref()
@@ -546,7 +743,7 @@ async fn persist_managed_ingest_intent(
         bail!("item.title is required for managed ingest intent");
     }
 
-    store
+    let intent_id = store
         .upsert_managed_ingest_intent(&NewManagedIngestIntent {
             media_type,
             title: title.to_string(),
@@ -560,7 +757,592 @@ async fn persist_managed_ingest_intent(
         })
         .await?;
 
-    Ok(())
+    debug!(
+        media_type = ?media_type,
+        title = %title,
+        manager_provider_id = %manager_provider_id,
+        manager_label = %manager_label,
+        manager_item_id = ?manager_item_id,
+        "managed ingest intent persisted"
+    );
+
+    Ok(intent_id)
+}
+
+const ACQUISITION_RECENT_WINDOW_HOURS: i64 = 6;
+
+async fn build_find_media_acquisition_response(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    limit: usize,
+) -> AnyResult<FindMediaAcquisitionResponse> {
+    let provider_contexts = load_provider_contexts(store).await?;
+    let provider_map: HashMap<Uuid, ProviderContext> = provider_contexts
+        .into_iter()
+        .map(|provider| (provider.detail.provider.provider_id, provider))
+        .collect();
+    let downloader_totals = load_acquisition_downloader_totals(state, store).await?;
+    let recent_cutoff = Utc::now() - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS);
+
+    let mut items = Vec::new();
+    for intent in store.list_active_managed_ingest_intents().await? {
+        let item = build_find_media_acquisition_item(state, store, &provider_map, &intent).await?;
+        if item.stage == AcquisitionStage::Ready.as_str() {
+            let reference = item.last_matched_at.unwrap_or(item.updated_at);
+            if reference < recent_cutoff {
+                continue;
+            }
+        }
+        items.push(item);
+    }
+
+    items.sort_by(|left, right| {
+        let left_stage = acquisition_stage_from_str(&left.stage);
+        let right_stage = acquisition_stage_from_str(&right.stage);
+        left_stage
+            .sort_priority()
+            .cmp(&right_stage.sort_priority())
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+
+    let mut active_count = 0usize;
+    let mut downloading_count = 0usize;
+    let mut needs_attention_count = 0usize;
+    let mut recent_completed_count = 0usize;
+    for item in &items {
+        let stage = acquisition_stage_from_str(&item.stage);
+        if stage.is_active() {
+            active_count += 1;
+        }
+        if stage == AcquisitionStage::Downloading {
+            downloading_count += 1;
+        }
+        if matches!(stage, AcquisitionStage::NeedsAttention | AcquisitionStage::Failed) {
+            needs_attention_count += 1;
+        }
+        if stage == AcquisitionStage::Ready {
+            recent_completed_count += 1;
+        }
+    }
+
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+
+    Ok(FindMediaAcquisitionResponse {
+        updated_at: Utc::now(),
+        active_count,
+        downloading_count,
+        needs_attention_count,
+        recent_completed_count,
+        total_download_rate_bps: downloader_totals.total_download_rate_bps,
+        total_upload_rate_bps: downloader_totals.total_upload_rate_bps,
+        items,
+    })
+}
+
+async fn build_find_media_acquisition_item(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+) -> AnyResult<FindMediaAcquisitionItem> {
+    let manager_label = provider_map
+        .get(&intent.manager_provider_id)
+        .map(provider_label)
+        .or_else(|| intent.manager_label.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Manager".to_string());
+    let state_view =
+        resolve_acquisition_item_state(state, store, provider_map.get(&intent.manager_provider_id), intent)
+            .await?;
+
+    Ok(FindMediaAcquisitionItem {
+        intent_id: intent.intent_id,
+        title: intent.title.clone(),
+        media_type: media_type_api_name(intent.media_type).to_string(),
+        year: intent.year,
+        external_ids: intent.external_ids.clone(),
+        manager_provider_id: intent.manager_provider_id,
+        manager_label,
+        manager_item_id: intent.manager_item_id.clone(),
+        source: intent.source.clone(),
+        stage: state_view.stage.as_str().to_string(),
+        stage_label: state_view.stage.label().to_string(),
+        description: state_view.description,
+        progress_percent: state_view.progress_percent,
+        eta_seconds: state_view.eta_seconds,
+        downloader_label: state_view.downloader_label,
+        protocol: state_view.protocol,
+        last_matched_at: intent.last_matched_at,
+        created_at: intent.created_at,
+        updated_at: intent.updated_at,
+    })
+}
+
+async fn resolve_acquisition_item_state(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: Option<&ProviderContext>,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+) -> AnyResult<AcquisitionItemState> {
+    if intent.last_matched_at.is_some() {
+        return Ok(AcquisitionItemState {
+            stage: AcquisitionStage::Ready,
+            description: "Imported and matched in the library.".to_string(),
+            progress_percent: Some(100.0),
+            eta_seconds: None,
+            downloader_label: None,
+            protocol: None,
+        });
+    }
+
+    let Some(provider) = provider else {
+        return Ok(acquisition_attention(
+            "Selected manager is no longer available.",
+        ));
+    };
+
+    if provider.detail.provider.health_state == ProviderHealthState::Unhealthy {
+        return Ok(acquisition_attention("Selected manager is currently unavailable."));
+    }
+
+    let implementation = provider
+        .detail
+        .provider
+        .implementation
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(implementation.as_str(), "sonarr" | "radarr") {
+        return Ok(AcquisitionItemState {
+            stage: AcquisitionStage::Requested,
+            description: "Waiting for manager status.".to_string(),
+            progress_percent: None,
+            eta_seconds: None,
+            downloader_label: None,
+            protocol: None,
+        });
+    }
+
+    let Some(manager_item_id) = intent.manager_item_id.as_deref() else {
+        return Ok(AcquisitionItemState {
+            stage: AcquisitionStage::Requested,
+            description: "Request accepted. Waiting for manager confirmation.".to_string(),
+            progress_percent: None,
+            eta_seconds: None,
+            downloader_label: None,
+            protocol: None,
+        });
+    };
+
+    let endpoint_json = provider
+        .detail
+        .provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint =
+        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+    let base_url =
+        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
+            .await?;
+    let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
+
+    let item_value = match request_arr_json_with_query(
+        &base_url,
+        &api_key,
+        &manager_item_paths(&implementation, manager_item_id),
+        &[],
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(acquisition_attention(format!(
+                "Manager status could not be loaded: {}",
+                err
+            )));
+        }
+    };
+
+    let queue_value = request_arr_json_with_query(
+        &base_url,
+        &api_key,
+        &manager_queue_paths(&implementation),
+        &[("page", "1".to_string()), ("pageSize", "250".to_string())],
+    )
+    .await
+    .ok();
+
+    Ok(derive_arr_acquisition_state(
+        &implementation,
+        manager_item_id,
+        &item_value,
+        queue_value.as_ref(),
+    ))
+}
+
+async fn load_acquisition_downloader_totals(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+) -> AnyResult<AcquisitionDownloaderTotals> {
+    let providers = store.list_provider_details().await?;
+    let instances = store.list_instances(None).await?;
+    let instance_map: HashMap<Uuid, crate::db::models::ExtensionInstance> = instances
+        .into_iter()
+        .map(|instance| (instance.instance_id, instance))
+        .collect();
+
+    let mut total_download_rate = 0u64;
+    let mut total_upload_rate = 0u64;
+    let mut has_download_rate = false;
+    let mut has_upload_rate = false;
+
+    for detail in providers {
+        if detail.provider.capability != "downloader.torrent"
+            && detail.provider.capability != "downloader.nzb"
+        {
+            continue;
+        }
+        if detail.provider.health_state == ProviderHealthState::Unhealthy {
+            continue;
+        }
+        let Some(instance) = instance_map.get(&detail.provider.instance_id) else {
+            continue;
+        };
+        let Ok(snapshot) = state
+            .orchestrator
+            .read_provider_state(&detail.provider, instance)
+            .await
+        else {
+            continue;
+        };
+        let Some(activity) = snapshot.activity else {
+            continue;
+        };
+        if let Some(rate) = activity.download_rate_bps {
+            total_download_rate = total_download_rate.saturating_add(rate);
+            has_download_rate = true;
+        }
+        if let Some(rate) = activity.upload_rate_bps {
+            total_upload_rate = total_upload_rate.saturating_add(rate);
+            has_upload_rate = true;
+        }
+    }
+
+    Ok(AcquisitionDownloaderTotals {
+        total_download_rate_bps: has_download_rate.then_some(total_download_rate),
+        total_upload_rate_bps: has_upload_rate.then_some(total_upload_rate),
+    })
+}
+
+fn acquisition_attention(message: impl Into<String>) -> AcquisitionItemState {
+    AcquisitionItemState {
+        stage: AcquisitionStage::NeedsAttention,
+        description: message.into(),
+        progress_percent: None,
+        eta_seconds: None,
+        downloader_label: None,
+        protocol: None,
+    }
+}
+
+fn acquisition_stage_from_str(value: &str) -> AcquisitionStage {
+    match value {
+        "requested" => AcquisitionStage::Requested,
+        "searching" => AcquisitionStage::Searching,
+        "queued" => AcquisitionStage::Queued,
+        "downloading" => AcquisitionStage::Downloading,
+        "post_processing" => AcquisitionStage::PostProcessing,
+        "importing" => AcquisitionStage::Importing,
+        "ready" => AcquisitionStage::Ready,
+        "needs_attention" => AcquisitionStage::NeedsAttention,
+        "failed" => AcquisitionStage::Failed,
+        _ => AcquisitionStage::Requested,
+    }
+}
+
+fn manager_item_paths(implementation: &str, manager_item_id: &str) -> [String; 2] {
+    match implementation {
+        "sonarr" => [
+            format!("api/v3/series/{manager_item_id}"),
+            format!("api/v4/series/{manager_item_id}"),
+        ],
+        "radarr" => [
+            format!("api/v3/movie/{manager_item_id}"),
+            format!("api/v4/movie/{manager_item_id}"),
+        ],
+        _ => [String::new(), String::new()],
+    }
+}
+
+fn manager_queue_paths(implementation: &str) -> [&str; 2] {
+    match implementation {
+        "sonarr" => ["api/v3/queue", "api/v4/queue"],
+        "radarr" => ["api/v3/queue", "api/v4/queue"],
+        _ => ["", ""],
+    }
+}
+
+fn derive_arr_acquisition_state(
+    implementation: &str,
+    manager_item_id: &str,
+    item_value: &Value,
+    queue_value: Option<&Value>,
+) -> AcquisitionItemState {
+    let queue_entries: Vec<Value> = queue_value
+        .map(extract_arr_queue_records)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| queue_entry_matches_manager_item(entry, implementation, manager_item_id))
+        .collect();
+
+    let has_file = match implementation {
+        "sonarr" => sonarr_item_has_files(item_value),
+        "radarr" => radarr_item_has_file(item_value),
+        _ => false,
+    };
+
+    if let Some(message) = queue_entries
+        .iter()
+        .find_map(|entry| queue_entry_error_message(entry))
+    {
+        return acquisition_attention(message);
+    }
+
+    if has_file {
+        return AcquisitionItemState {
+            stage: AcquisitionStage::Importing,
+            description: "Manager has imported files. Waiting for library scan.".to_string(),
+            progress_percent: Some(100.0),
+            eta_seconds: None,
+            downloader_label: queue_entries
+                .first()
+                .and_then(queue_entry_downloader_label),
+            protocol: queue_entries.first().and_then(queue_entry_protocol),
+        };
+    }
+
+    if let Some(entry) = queue_entries.first() {
+        let progress_percent = queue_entry_progress_percent(entry);
+        let eta_seconds = queue_entry_eta_seconds(entry);
+        let downloader_label = queue_entry_downloader_label(entry);
+        let protocol = queue_entry_protocol(entry);
+        let tracked_state = queue_entry_state(entry);
+        let stage = if tracked_state.contains("import") {
+            AcquisitionStage::Importing
+        } else if tracked_state.contains("post")
+            || tracked_state.contains("extract")
+            || tracked_state.contains("verif")
+            || progress_percent
+                .map(|value| value >= 99.5)
+                .unwrap_or(false)
+        {
+            AcquisitionStage::PostProcessing
+        } else if tracked_state.contains("download")
+            || progress_percent.map(|value| value > 0.0).unwrap_or(false)
+        {
+            AcquisitionStage::Downloading
+        } else {
+            AcquisitionStage::Queued
+        };
+
+        let description = match stage {
+            AcquisitionStage::Downloading => {
+                if let Some(label) = downloader_label.as_deref() {
+                    format!("Downloading via {label}.")
+                } else {
+                    "Download in progress.".to_string()
+                }
+            }
+            AcquisitionStage::PostProcessing => {
+                "Download finished. Waiting for post-processing.".to_string()
+            }
+            AcquisitionStage::Importing => {
+                "Manager is importing the completed download.".to_string()
+            }
+            _ => {
+                if let Some(label) = downloader_label.as_deref() {
+                    format!("Queued with {label}.")
+                } else {
+                    "Waiting in the download queue.".to_string()
+                }
+            }
+        };
+
+        return AcquisitionItemState {
+            stage,
+            description,
+            progress_percent,
+            eta_seconds,
+            downloader_label,
+            protocol,
+        };
+    }
+
+    AcquisitionItemState {
+        stage: AcquisitionStage::Searching,
+        description: "Manager accepted the item and is searching for releases.".to_string(),
+        progress_percent: None,
+        eta_seconds: None,
+        downloader_label: None,
+        protocol: None,
+    }
+}
+
+fn extract_arr_queue_records(value: &Value) -> Vec<Value> {
+    if let Some(items) = value.as_array() {
+        return items.clone();
+    }
+    value
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn queue_entry_matches_manager_item(entry: &Value, implementation: &str, manager_item_id: &str) -> bool {
+    let direct_id = match implementation {
+        "sonarr" => entry
+            .get("seriesId")
+            .or_else(|| entry.get("series").and_then(|value| value.get("id"))),
+        "radarr" => entry
+            .get("movieId")
+            .or_else(|| entry.get("movie").and_then(|value| value.get("id"))),
+        _ => None,
+    };
+    as_id_string(direct_id.unwrap_or(&Value::Null))
+        .map(|value| value == manager_item_id)
+        .unwrap_or(false)
+}
+
+fn sonarr_item_has_files(value: &Value) -> bool {
+    value
+        .get("statistics")
+        .and_then(|statistics| statistics.get("episodeFileCount"))
+        .and_then(Value::as_i64)
+        .map(|count| count > 0)
+        .unwrap_or(false)
+        || value
+            .get("statistics")
+            .and_then(|statistics| statistics.get("sizeOnDisk"))
+            .and_then(Value::as_u64)
+            .map(|size| size > 0)
+            .unwrap_or(false)
+}
+
+fn radarr_item_has_file(value: &Value) -> bool {
+    value.get("hasFile").and_then(Value::as_bool).unwrap_or(false)
+        || value
+            .get("movieFileId")
+            .and_then(Value::as_i64)
+            .map(|id| id > 0)
+            .unwrap_or(false)
+        || value
+            .get("sizeOnDisk")
+            .and_then(Value::as_u64)
+            .map(|size| size > 0)
+            .unwrap_or(false)
+}
+
+fn queue_entry_state(entry: &Value) -> String {
+    let mut parts = Vec::new();
+    for key in ["trackedDownloadState", "trackedDownloadStatus", "status"] {
+        if let Some(value) = entry.get(key).and_then(Value::as_str) {
+            let value = value.trim().to_ascii_lowercase();
+            if !value.is_empty() {
+                parts.push(value);
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn queue_entry_error_message(entry: &Value) -> Option<String> {
+    if let Some(value) = entry.get("errorMessage").and_then(Value::as_str) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    let tracked_status = entry
+        .get("trackedDownloadStatus")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if tracked_status.contains("warning") || tracked_status.contains("error") {
+        return Some("Downloader reported a problem for this item.".to_string());
+    }
+    None
+}
+
+fn queue_entry_progress_percent(entry: &Value) -> Option<f64> {
+    let size = entry.get("size").and_then(value_as_f64)?;
+    if size <= 0.0 {
+        return None;
+    }
+    let size_left = entry
+        .get("sizeleft")
+        .or_else(|| entry.get("sizeLeft"))
+        .and_then(value_as_f64)
+        .unwrap_or(size);
+    let progress = ((size - size_left).max(0.0) / size) * 100.0;
+    Some(progress.clamp(0.0, 100.0))
+}
+
+fn queue_entry_eta_seconds(entry: &Value) -> Option<i64> {
+    if let Some(value) = entry
+        .get("estimatedCompletionTime")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+            let eta = parsed.with_timezone(&Utc) - Utc::now();
+            return Some(eta.num_seconds().max(0));
+        }
+    }
+    if let Some(value) = entry
+        .get("timeleft")
+        .or_else(|| entry.get("timeLeft"))
+        .and_then(Value::as_str)
+    {
+        return parse_arr_duration_seconds(value);
+    }
+    None
+}
+
+fn queue_entry_downloader_label(entry: &Value) -> Option<String> {
+    entry.get("downloadClient")
+        .or_else(|| entry.get("downloadClientName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn queue_entry_protocol(entry: &Value) -> Option<String> {
+    entry.get("protocol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_arr_duration_seconds(value: &str) -> Option<i64> {
+    let mut parts = value
+        .trim()
+        .split(':')
+        .filter_map(|item| item.trim().parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    while parts.len() < 3 {
+        parts.insert(0, 0);
+    }
+    Some(parts[0] * 3600 + parts[1] * 60 + parts[2])
 }
 
 pub async fn find_media_preferences(
@@ -571,7 +1353,7 @@ pub async fn find_media_preferences(
     let providers = load_provider_contexts(&store)
         .await
         .map_err(ApiError::from)?;
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -625,7 +1407,7 @@ pub async fn patch_find_media_preferences(
             .map_err(ApiError::from)?;
     }
 
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -658,7 +1440,7 @@ pub async fn manager_preferences(
     let providers = load_provider_contexts(&store)
         .await
         .map_err(ApiError::from)?;
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -1097,7 +1879,7 @@ async fn execute_find_media_search(
     let providers = load_provider_contexts(&store)
         .await
         .map_err(ApiError::from)?;
-    let preferences = load_manager_preferences(&store)
+    let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -1439,11 +2221,22 @@ async fn load_provider_contexts(store: &ExtensionStore<'_>) -> AnyResult<Vec<Pro
     Ok(providers)
 }
 
-async fn load_manager_preferences(store: &ExtensionStore<'_>) -> AnyResult<ManagerPreferenceState> {
+async fn load_manager_preferences(
+    store: &ExtensionStore<'_>,
+    providers: &[ProviderContext],
+) -> AnyResult<ManagerPreferenceState> {
+    let movie_provider_id =
+        sanitize_manager_preference(store, MANAGER_PREF_MOVIE, MediaType::Movie, providers).await?;
+    let series_provider_id =
+        sanitize_manager_preference(store, MANAGER_PREF_SERIES, MediaType::Series, providers)
+            .await?;
+    let anime_provider_id =
+        sanitize_manager_preference(store, MANAGER_PREF_ANIME, MediaType::Anime, providers).await?;
+
     Ok(ManagerPreferenceState {
-        movie_provider_id: load_manager_preference(store, MANAGER_PREF_MOVIE).await?,
-        series_provider_id: load_manager_preference(store, MANAGER_PREF_SERIES).await?,
-        anime_provider_id: load_manager_preference(store, MANAGER_PREF_ANIME).await?,
+        movie_provider_id,
+        series_provider_id,
+        anime_provider_id,
     })
 }
 
@@ -1462,6 +2255,34 @@ async fn load_manager_preference(store: &ExtensionStore<'_>, key: &str) -> AnyRe
     let provider_id =
         Uuid::parse_str(value).with_context(|| format!("invalid manager preference '{key}'"))?;
     Ok(Some(provider_id))
+}
+
+async fn sanitize_manager_preference(
+    store: &ExtensionStore<'_>,
+    key: &str,
+    media_type: MediaType,
+    providers: &[ProviderContext],
+) -> AnyResult<Option<Uuid>> {
+    let provider_id = load_manager_preference(store, key).await?;
+    let Some(provider_id) = provider_id else {
+        return Ok(None);
+    };
+
+    let is_valid = collect_manager_providers(providers, media_type)
+        .iter()
+        .any(|provider| provider.detail.provider.provider_id == provider_id);
+    if is_valid {
+        return Ok(Some(provider_id));
+    }
+
+    store.delete_extension_setting(key).await?;
+    info!(
+        setting_key = key,
+        media_type = media_type_api_name(media_type),
+        stale_provider_id = %provider_id,
+        "cleared stale manager preference"
+    );
+    Ok(None)
 }
 
 async fn save_manager_preference(
@@ -1688,6 +2509,43 @@ async fn provider_field_is_available(
     Ok(false)
 }
 
+fn control_defaults_setting_key(instance_id: Uuid) -> String {
+    format!("{CONTROL_DEFAULTS_SETTING_PREFIX}{instance_id}")
+}
+
+async fn load_manager_control_defaults(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> AnyResult<ManagerControlDefaults> {
+    let value = store
+        .get_extension_setting(&control_defaults_setting_key(instance_id))
+        .await?;
+    let mut defaults = ManagerControlDefaults::default();
+    if let Some(object) = value.as_ref().and_then(Value::as_object) {
+        if let Some(value) = object.get("monitorOnAdd").and_then(Value::as_bool) {
+            defaults.monitor_on_add = value;
+        }
+        if let Some(value) = object.get("searchOnAdd").and_then(Value::as_bool) {
+            defaults.search_on_add = value;
+        }
+    }
+    Ok(defaults)
+}
+
+async fn resolve_find_media_add_options(
+    store: &ExtensionStore<'_>,
+    provider: &ProviderContext,
+    options: &FindMediaAddOptions,
+) -> AnyResult<FindMediaAddOptions> {
+    let defaults = load_manager_control_defaults(store, provider.detail.provider.instance_id).await?;
+    Ok(FindMediaAddOptions {
+        monitor: Some(options.monitor.unwrap_or(defaults.monitor_on_add)),
+        search: Some(options.search.unwrap_or(defaults.search_on_add)),
+        root_folder_path: options.root_folder_path.clone(),
+        quality_profile_id: options.quality_profile_id,
+    })
+}
+
 async fn add_with_manager_provider(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -1716,9 +2574,19 @@ async fn add_with_manager_provider(
         .unwrap_or_default();
     let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
 
+    debug!(
+        manager_provider_id = %provider.detail.provider.provider_id,
+        implementation = %implementation,
+        capability = %provider.detail.provider.capability,
+        base_url = %base_url,
+        "dispatching find media add to manager provider"
+    );
+
+    let effective_options = resolve_find_media_add_options(store, provider, options).await?;
+
     match implementation.as_str() {
-        "sonarr" => add_with_sonarr(&base_url, &api_key, media_type, item, options).await,
-        "radarr" => add_with_radarr(&base_url, &api_key, item, options).await,
+        "sonarr" => add_with_sonarr(&base_url, &api_key, media_type, item, &effective_options).await,
+        "radarr" => add_with_radarr(&base_url, &api_key, item, &effective_options).await,
         _ => bail!(
             "manager implementation '{}' does not support add",
             implementation
@@ -1734,6 +2602,12 @@ async fn add_with_sonarr(
     options: &FindMediaAddOptions,
 ) -> AnyResult<Option<String>> {
     let lookup_term = lookup_term_for_item(item);
+    debug!(
+        lookup_term = %lookup_term,
+        media_type = ?media_type,
+        title = ?item.title,
+        "adding media through sonarr"
+    );
     let items = request_arr_lookup(
         base_url,
         api_key,
@@ -1799,10 +2673,16 @@ async fn add_with_sonarr(
         Some(&selected),
     )
     .await?;
-    Ok(created
+    let created_id = created
         .get("id")
         .and_then(Value::as_i64)
-        .map(|value| value.to_string()))
+        .map(|value| value.to_string());
+    debug!(
+        lookup_term = %lookup_term,
+        created_id = ?created_id,
+        "sonarr add completed"
+    );
+    Ok(created_id)
 }
 
 async fn add_with_radarr(
@@ -1812,6 +2692,11 @@ async fn add_with_radarr(
     options: &FindMediaAddOptions,
 ) -> AnyResult<Option<String>> {
     let lookup_term = lookup_term_for_item(item);
+    debug!(
+        lookup_term = %lookup_term,
+        title = ?item.title,
+        "adding media through radarr"
+    );
     let items = request_arr_lookup(
         base_url,
         api_key,
@@ -1876,10 +2761,16 @@ async fn add_with_radarr(
         Some(&selected),
     )
     .await?;
-    Ok(created
+    let created_id = created
         .get("id")
         .and_then(Value::as_i64)
-        .map(|value| value.to_string()))
+        .map(|value| value.to_string());
+    debug!(
+        lookup_term = %lookup_term,
+        created_id = ?created_id,
+        "radarr add completed"
+    );
+    Ok(created_id)
 }
 
 fn lookup_term_for_item(item: &FindMediaAddItem) -> String {
@@ -2398,6 +3289,49 @@ async fn request_arr_lookup(
     bail!("lookup endpoint is not available");
 }
 
+async fn request_arr_json_with_query<P: AsRef<str>>(
+    base_url: &str,
+    api_key: &str,
+    paths: &[P],
+    query_pairs: &[(&str, String)],
+) -> AnyResult<Value> {
+    let client = build_arr_client(api_key)?;
+
+    for path in paths {
+        let path = path.as_ref();
+        if path.trim().is_empty() {
+            continue;
+        }
+        let mut url = build_arr_lookup_url(base_url, path)?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query_pairs {
+                pairs.append_pair(key, value);
+            }
+        }
+
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("calling {path}"))?;
+        if resp.status() == ReqwestStatusCode::NOT_FOUND {
+            continue;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            bail!("{path} failed ({status}): {}", detail.trim());
+        }
+        return resp
+            .json::<Value>()
+            .await
+            .with_context(|| format!("parsing {path}"));
+    }
+
+    bail!("manager endpoint is not available");
+}
+
 async fn request_arr_first_id(base_url: &str, api_key: &str, paths: &[&str]) -> AnyResult<i64> {
     let value = request_arr_write(base_url, api_key, ReqwestMethod::GET, paths, None).await?;
     let items = value
@@ -2661,4 +3595,76 @@ fn value_as_f64(value: &Value) -> Option<f64> {
         return Some(number);
     }
     value.as_str()?.trim().parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_arr_duration_seconds_handles_hms() {
+        assert_eq!(parse_arr_duration_seconds("01:02:03"), Some(3723));
+        assert_eq!(parse_arr_duration_seconds("12:34"), Some(754));
+        assert_eq!(parse_arr_duration_seconds(""), None);
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_downloading_from_queue_progress() {
+        let item = json!({
+            "hasFile": false,
+            "sizeOnDisk": 0
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "movieId": 42,
+                    "downloadClient": "default (nzbget)",
+                    "protocol": "usenet",
+                    "trackedDownloadState": "downloading",
+                    "size": 1000,
+                    "sizeleft": 250
+                }
+            ]
+        });
+
+        let state = derive_arr_acquisition_state("radarr", "42", &item, Some(&queue));
+        assert_eq!(state.stage, AcquisitionStage::Downloading);
+        assert_eq!(state.downloader_label.as_deref(), Some("default (nzbget)"));
+        assert_eq!(state.protocol.as_deref(), Some("usenet"));
+        assert_eq!(state.progress_percent.map(|value| value.round() as i32), Some(75));
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_importing_when_files_exist() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 3,
+                "sizeOnDisk": 12345
+            }
+        });
+
+        let state = derive_arr_acquisition_state("sonarr", "9", &item, None);
+        assert_eq!(state.stage, AcquisitionStage::Importing);
+        assert_eq!(
+            state.description,
+            "Manager has imported files. Waiting for library scan."
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_attention_for_queue_errors() {
+        let item = json!({
+            "hasFile": false
+        });
+        let queue = json!([
+            {
+                "movieId": 77,
+                "errorMessage": "Release was rejected"
+            }
+        ]);
+
+        let state = derive_arr_acquisition_state("radarr", "77", &item, Some(&queue));
+        assert_eq!(state.stage, AcquisitionStage::NeedsAttention);
+        assert_eq!(state.description, "Release was rejected");
+    }
 }

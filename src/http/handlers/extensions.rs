@@ -3,16 +3,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use base64::{Engine as _, engine::general_purpose};
 use rand::{RngCore, rngs::OsRng};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::net::lookup_host;
 use tokio::fs;
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::config::{DownloaderPerformanceProfile, RunEnvironment};
@@ -35,11 +40,12 @@ use crate::extensions::required_secrets::{
     required_secrets_from_manifest,
 };
 use crate::extensions::store::{
-    ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance, NewOperationStep,
-    NewOrchestratorRun, NewSecret,
+    ExtensionStore, ManagedIngestIntent, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
+    NewOperationStep, NewOrchestratorRun, NewSecret,
 };
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
+use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
@@ -259,6 +265,140 @@ pub struct ExtensionOptionalAddonSummaryItem {
     pub secret_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_scope_instance_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlSurface {
+    pub extension_id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: ExtensionKind,
+    pub trust_level: ExtensionTrustLevel,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<String>,
+    pub status: ExtensionControlStatus,
+    #[serde(default)]
+    pub sections: Vec<ExtensionControlSection>,
+    #[serde(default)]
+    pub actions: Vec<ExtensionControlAction>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlStatus {
+    pub health: String,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<ExtensionControlTelemetry>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlTelemetry {
+    #[serde(default)]
+    pub metrics: Vec<ExtensionControlMetric>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlMetric {
+    pub id: String,
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlSection {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub fields: Vec<ExtensionControlField>,
+    #[serde(default)]
+    pub entities: Vec<ExtensionControlEntity>,
+    #[serde(default)]
+    pub actions: Vec<ExtensionControlAction>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlEntity {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub details: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<ExtensionControlAction>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlField {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub field_type: String,
+    pub value: serde_json::Value,
+    pub required: bool,
+    pub readonly: bool,
+    pub secret: bool,
+    #[serde(default)]
+    pub options: Vec<ExtensionControlOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlOption {
+    pub value: serde_json::Value,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlAction {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateExtensionControlSettingsRequest {
+    #[serde(default)]
+    pub values: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunExtensionControlActionRequest {
+    #[serde(default)]
+    pub params: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlActionResponse {
+    pub success: bool,
+    pub message: String,
+    pub control_surface: ExtensionControlSurface,
 }
 
 #[derive(Debug, Deserialize)]
@@ -704,6 +844,127 @@ pub async fn get_extension(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("extension not found"))?;
     Ok(Json(extension))
+}
+
+pub async fn get_extension_control_surface(
+    State(state): State<AppState>,
+    Path(extension_id): Path<String>,
+) -> ApiResult<Json<ExtensionControlSurface>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let surface = build_extension_control_surface(&state, &store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(surface))
+}
+
+pub async fn update_extension_control_surface_settings(
+    State(state): State<AppState>,
+    Path(extension_id): Path<String>,
+    Json(payload): Json<UpdateExtensionControlSettingsRequest>,
+) -> ApiResult<Json<ExtensionControlSurface>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    if !payload.values.is_empty() {
+        let context = load_extension_control_context(&store, &extension_id)
+            .await
+            .map_err(ApiError::from)?;
+        let extension_key = context.extension.extension_id.to_ascii_lowercase();
+        if extension_key.contains("sonarr") || extension_key.contains("radarr") {
+            let Some(instance) = context.selected_instance.as_ref() else {
+                return Err(ApiError::conflict(
+                    "no active instance is available for this extension yet",
+                ));
+            };
+            save_manager_control_defaults(&store, instance.instance_id, &payload.values)
+                .await
+                .map_err(ApiError::from)?;
+        } else if extension_key.contains("qbittorrent") || extension_key.contains("nzbget") {
+            let Some(profile) = payload
+                .values
+                .get("downloaderProfile")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+            else {
+                return Err(ApiError::conflict(
+                    "downloaderProfile is required for downloader defaults",
+                ));
+            };
+            match profile.as_str() {
+                "balanced" => {
+                    if state.settings.extensions.downloader_profile
+                        == DownloaderPerformanceProfile::Balanced
+                    {
+                        store
+                            .delete_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
+                            .await
+                            .map_err(ApiError::from)?;
+                    } else {
+                        store
+                            .upsert_extension_setting(
+                                DOWNLOADER_PROFILE_SETTING_KEY,
+                                &serde_json::Value::String(profile),
+                            )
+                            .await
+                            .map_err(ApiError::from)?;
+                    }
+                }
+                "aggressive" => {
+                    if state.settings.extensions.downloader_profile
+                        == DownloaderPerformanceProfile::Aggressive
+                    {
+                        store
+                            .delete_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
+                            .await
+                            .map_err(ApiError::from)?;
+                    } else {
+                        store
+                            .upsert_extension_setting(
+                                DOWNLOADER_PROFILE_SETTING_KEY,
+                                &serde_json::Value::String(profile),
+                            )
+                            .await
+                            .map_err(ApiError::from)?;
+                    }
+                }
+                _ => {
+                    return Err(ApiError::conflict(
+                        "downloaderProfile must be balanced or aggressive",
+                    ))
+                }
+            }
+        } else {
+            return Err(ApiError::conflict(
+                "this extension does not expose editable settings yet",
+            ));
+        }
+    }
+    let surface = build_extension_control_surface(&state, &store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(surface))
+}
+
+pub async fn run_extension_control_action(
+    State(state): State<AppState>,
+    Path((extension_id, action_id)): Path<(String, String)>,
+    payload: Option<Json<RunExtensionControlActionRequest>>,
+) -> ApiResult<Json<ExtensionControlActionResponse>> {
+    let params = payload
+        .as_ref()
+        .map(|value| value.params.clone())
+        .unwrap_or_default();
+    let store = ExtensionStore::new(&state.db_pool);
+    let message =
+        execute_extension_control_action(&state, &store, &extension_id, &action_id, &params)
+            .await
+            .map_err(ApiError::from)?;
+    let surface = build_extension_control_surface(&state, &store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ExtensionControlActionResponse {
+        success: true,
+        message,
+        control_surface: surface,
+    }))
 }
 
 pub async fn install_extension(
@@ -2555,6 +2816,1326 @@ fn should_fetch_live_downloader_state(health_state: ProviderHealthState) -> bool
         health_state,
         ProviderHealthState::Healthy | ProviderHealthState::Degraded
     )
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionControlContext {
+    extension: Extension,
+    summary: ExtensionStatusSummaryItem,
+    instances: Vec<ExtensionInstance>,
+    selected_instance: Option<ExtensionInstance>,
+    providers: Vec<Provider>,
+    selected_provider: Option<Provider>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ExtensionControlLiveSnapshot {
+    version: Option<String>,
+    metrics: Vec<ExtensionControlMetric>,
+}
+
+async fn build_extension_control_surface(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> anyhow::Result<ExtensionControlSurface> {
+    let context = load_extension_control_context(store, extension_id).await?;
+    let live_snapshot = load_extension_control_live_snapshot(state, store, &context)
+        .await
+        .unwrap_or_default();
+
+    let mut details = Vec::new();
+    if !context.summary.description.trim().is_empty() {
+        details.push(context.summary.description.clone());
+    }
+    if context.selected_instance.is_none() && !context.instances.is_empty() {
+        details.push("Create or enable a default instance to manage this extension here.".to_string());
+    }
+    let status = ExtensionControlStatus {
+        health: control_health_for_summary(&context.summary),
+        summary: context.summary.label.clone(),
+        details,
+        telemetry: (!live_snapshot.metrics.is_empty()).then_some(ExtensionControlTelemetry {
+            metrics: live_snapshot.metrics.clone(),
+        }),
+    };
+
+    let implementation = context
+        .selected_provider
+        .as_ref()
+        .and_then(|provider| provider.implementation.clone());
+    let mut sections = Vec::new();
+    if let Some(section) = build_extension_control_settings_section(state, store, &context).await? {
+        sections.push(section);
+    }
+    if let Some(section) = build_extension_control_managed_items_section(store, &context).await? {
+        sections.push(section);
+    }
+    if let Some(section) = build_extension_control_service_section(&context, &live_snapshot) {
+        sections.push(section);
+    }
+    sections.push(build_extension_control_overview_section(&context));
+
+    Ok(ExtensionControlSurface {
+        extension_id: context.extension.extension_id.clone(),
+        name: context.extension.name.clone(),
+        version: context.extension.version.clone(),
+        kind: context.extension.kind.clone(),
+        trust_level: context.extension.trust_level.clone(),
+        enabled: context.extension.enabled,
+        instance_id: context.selected_instance.as_ref().map(|instance| instance.instance_id),
+        instance_name: context
+            .selected_instance
+            .as_ref()
+            .map(|instance| instance.instance_name.clone()),
+        implementation,
+        status,
+        sections,
+        actions: build_extension_control_actions(&context),
+    })
+}
+
+async fn load_extension_control_context(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> anyhow::Result<ExtensionControlContext> {
+    let extension = store
+        .get_extension(extension_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("extension not found"))?;
+    let summary = build_extension_status_summary(store)
+        .await?
+        .items
+        .into_iter()
+        .find(|item| item.extension_id == extension_id)
+        .ok_or_else(|| anyhow::anyhow!("extension status not found"))?;
+    let instances = store.list_instances(Some(extension_id)).await?;
+    let selected_instance = choose_extension_control_instance(&instances);
+    let providers = if let Some(instance) = selected_instance.as_ref() {
+        store.list_providers(Some(instance.instance_id)).await?
+    } else {
+        Vec::new()
+    };
+    let selected_provider = choose_extension_control_provider(extension_id, &providers);
+
+    Ok(ExtensionControlContext {
+        extension,
+        summary,
+        instances,
+        selected_instance,
+        providers,
+        selected_provider,
+    })
+}
+
+fn choose_extension_control_instance(
+    instances: &[ExtensionInstance],
+) -> Option<ExtensionInstance> {
+    let mut enabled: Vec<_> = instances.iter().filter(|instance| instance.enabled).cloned().collect();
+    enabled.sort_by(|left, right| {
+        let left_default = left.instance_name.eq_ignore_ascii_case("default");
+        let right_default = right.instance_name.eq_ignore_ascii_case("default");
+        right_default
+            .cmp(&left_default)
+            .then_with(|| left.instance_name.cmp(&right.instance_name))
+    });
+    if let Some(instance) = enabled.into_iter().next() {
+        return Some(instance);
+    }
+
+    let mut all = instances.to_vec();
+    all.sort_by(|left, right| left.instance_name.cmp(&right.instance_name));
+    all.into_iter().next()
+}
+
+fn choose_extension_control_provider(
+    extension_id: &str,
+    providers: &[Provider],
+) -> Option<Provider> {
+    let extension_id = extension_id.to_ascii_lowercase();
+    let preferred_capability = if extension_id.contains("sonarr") {
+        Some("media.manager.tv")
+    } else if extension_id.contains("radarr") {
+        Some("media.manager.movies")
+    } else if extension_id.contains("prowlarr") {
+        Some("indexer.registry")
+    } else if extension_id.contains("qbittorrent") {
+        Some("downloader.torrent")
+    } else if extension_id.contains("nzbget") {
+        Some("downloader.nzb")
+    } else {
+        None
+    };
+
+    if let Some(capability) = preferred_capability {
+        if let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.capability == capability)
+            .cloned()
+        {
+            return Some(provider);
+        }
+    }
+
+    let mut sorted = providers.to_vec();
+    sorted.sort_by(|left, right| left.capability.cmp(&right.capability));
+    sorted.into_iter().next()
+}
+
+fn control_health_for_summary(summary: &ExtensionStatusSummaryItem) -> String {
+    match summary.status_code.as_str() {
+        "connection_issue" => "error".to_string(),
+        _ if summary.severity == "attention" => "attention".to_string(),
+        _ if summary.severity == "disabled" => "disabled".to_string(),
+        _ => "healthy".to_string(),
+    }
+}
+
+fn build_extension_control_overview_section(
+    context: &ExtensionControlContext,
+) -> ExtensionControlSection {
+    let provider_count = context.providers.len().to_string();
+    let capability_list = if context.providers.is_empty() {
+        "Not available yet".to_string()
+    } else {
+        let mut values = context
+            .providers
+            .iter()
+            .map(|provider| provider.capability.clone())
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        values.join(", ")
+    };
+
+    let mut fields = vec![
+        control_text_field("version", "Version", "", context.extension.version.clone()),
+        control_text_field(
+            "trustLevel",
+            "Trust",
+            "",
+            context.extension.trust_level.as_str().to_string(),
+        ),
+        control_text_field(
+            "instanceCount",
+            "Instances",
+            "",
+            context.instances.len().to_string(),
+        ),
+        control_text_field("providerCount", "Providers", "", provider_count),
+        control_text_field("capabilities", "Capabilities", "", capability_list),
+    ];
+
+    if let Some(instance) = context.selected_instance.as_ref() {
+        fields.insert(
+            2,
+            control_text_field("instanceName", "Selected instance", "", instance.instance_name.clone()),
+        );
+    }
+
+    ExtensionControlSection {
+        id: "overview".to_string(),
+        title: "Overview".to_string(),
+        description: "High-level status for this extension.".to_string(),
+        fields,
+        entities: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+fn build_extension_control_service_section(
+    context: &ExtensionControlContext,
+    live_snapshot: &ExtensionControlLiveSnapshot,
+) -> Option<ExtensionControlSection> {
+    let provider = context.selected_provider.as_ref()?;
+    let mut fields = vec![
+        control_text_field(
+            "implementation",
+            "Implementation",
+            "",
+            provider
+                .implementation
+                .clone()
+                .unwrap_or_else(|| provider.capability.clone()),
+        ),
+        control_text_field(
+            "healthState",
+            "Health",
+            "",
+            provider.health_state.as_str().to_string(),
+        ),
+        control_text_field(
+            "lastHealthcheck",
+            "Last health check",
+            "",
+            provider
+                .last_healthcheck_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "Not yet checked".to_string()),
+        ),
+    ];
+
+    if let Some(version) = live_snapshot.version.as_ref() {
+        fields.insert(
+            0,
+            control_text_field("serviceVersion", "Service version", "", version.clone()),
+        );
+    }
+
+    for metric in &live_snapshot.metrics {
+        if metric.id == "version" {
+            continue;
+        }
+        fields.push(control_text_field(
+            &metric.id,
+            &metric.label,
+            "",
+            metric.value.clone(),
+        ));
+    }
+
+    Some(ExtensionControlSection {
+        id: "service".to_string(),
+        title: "Service".to_string(),
+        description: "Live status from the managed service when it is reachable.".to_string(),
+        fields,
+        entities: Vec::new(),
+        actions: Vec::new(),
+    })
+}
+
+const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.instance.";
+
+#[derive(Debug, Clone)]
+struct ManagerControlDefaults {
+    monitor_on_add: bool,
+    search_on_add: bool,
+}
+
+impl Default for ManagerControlDefaults {
+    fn default() -> Self {
+        Self {
+            monitor_on_add: true,
+            search_on_add: true,
+        }
+    }
+}
+
+fn control_defaults_setting_key(instance_id: Uuid) -> String {
+    format!("{CONTROL_DEFAULTS_SETTING_PREFIX}{instance_id}")
+}
+
+async fn build_extension_control_settings_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let extension_id = context.extension.extension_id.to_ascii_lowercase();
+
+    if extension_id.contains("sonarr") || extension_id.contains("radarr") {
+        let Some(instance) = context.selected_instance.as_ref() else {
+            return Ok(None);
+        };
+        let defaults = load_manager_control_defaults(store, instance.instance_id).await?;
+        return Ok(Some(ExtensionControlSection {
+            id: "defaults".to_string(),
+            title: "Add defaults".to_string(),
+            description:
+                "These defaults are used when you add media from Find Media into this manager."
+                    .to_string(),
+            fields: vec![
+                ExtensionControlField {
+                    id: "monitorOnAdd".to_string(),
+                    label: "Monitor on add".to_string(),
+                    description:
+                        "Keep new items monitored so future releases are tracked automatically."
+                            .to_string(),
+                    field_type: "toggle".to_string(),
+                    value: serde_json::Value::Bool(defaults.monitor_on_add),
+                    required: false,
+                    readonly: false,
+                    secret: false,
+                    options: Vec::new(),
+                    validation: None,
+                },
+                ExtensionControlField {
+                    id: "searchOnAdd".to_string(),
+                    label: "Search on add".to_string(),
+                    description:
+                        "Start a search immediately after the item is accepted by the manager."
+                            .to_string(),
+                    field_type: "toggle".to_string(),
+                    value: serde_json::Value::Bool(defaults.search_on_add),
+                    required: false,
+                    readonly: false,
+                    secret: false,
+                    options: Vec::new(),
+                    validation: None,
+                },
+            ],
+            entities: Vec::new(),
+            actions: Vec::new(),
+        }));
+    }
+
+    if extension_id.contains("qbittorrent") || extension_id.contains("nzbget") {
+        let override_value = store
+            .get_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
+            .await?;
+        let selected = DownloaderPerformanceProfile::from_setting_value(
+            override_value.as_ref(),
+            state.settings.extensions.downloader_profile,
+        );
+        return Ok(Some(ExtensionControlSection {
+            id: "defaults".to_string(),
+            title: "Downloader defaults".to_string(),
+            description:
+                "This shared profile tunes Elixir-managed downloaders for balanced or aggressive use."
+                    .to_string(),
+            fields: vec![ExtensionControlField {
+                id: "downloaderProfile".to_string(),
+                label: "Performance profile".to_string(),
+                description: "Balanced is safer by default. Aggressive prioritizes throughput."
+                    .to_string(),
+                field_type: "select".to_string(),
+                value: serde_json::Value::String(selected.as_str().to_string()),
+                required: true,
+                readonly: false,
+                secret: false,
+                options: vec![
+                    ExtensionControlOption {
+                        value: serde_json::Value::String("balanced".to_string()),
+                        label: "Balanced".to_string(),
+                    },
+                    ExtensionControlOption {
+                        value: serde_json::Value::String("aggressive".to_string()),
+                        label: "Aggressive".to_string(),
+                    },
+                ],
+                validation: None,
+            }],
+            entities: Vec::new(),
+            actions: Vec::new(),
+        }));
+    }
+
+    Ok(None)
+}
+
+async fn build_extension_control_managed_items_section(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return Ok(None);
+    };
+    let implementation = provider
+        .implementation
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if implementation != "sonarr" && implementation != "radarr" {
+        return Ok(None);
+    }
+
+    let mut intents = store.list_active_managed_ingest_intents().await?;
+    intents.retain(|intent| intent.manager_provider_id == provider.provider_id);
+    intents.truncate(8);
+
+    let entities = intents
+        .iter()
+        .map(|intent| build_extension_control_managed_item_entity(&implementation, intent))
+        .collect::<Vec<_>>();
+
+    Ok(Some(ExtensionControlSection {
+        id: "managedItems".to_string(),
+        title: "Managed items".to_string(),
+        description:
+            "Recent media accepted by this manager through Elixir. Use these actions to search, refresh, or remove a request."
+                .to_string(),
+        fields: Vec::new(),
+        entities,
+        actions: build_extension_control_manager_actions(&implementation),
+    }))
+}
+
+fn build_extension_control_managed_item_entity(
+    implementation: &str,
+    intent: &ManagedIngestIntent,
+) -> ExtensionControlEntity {
+    let title = match intent.year {
+        Some(year) => format!("{} ({year})", intent.title),
+        None => intent.title.clone(),
+    };
+    let subtitle = intent.manager_label.clone().or_else(|| {
+        Some(if implementation == "sonarr" {
+            "Tracked by Sonarr".to_string()
+        } else {
+            "Tracked by Radarr".to_string()
+        })
+    });
+    let mut details = vec![format!("Requested {}", intent.created_at.to_rfc3339())];
+    if let Some(item_id) = intent.manager_item_id.as_deref() {
+        details.push(format!("Manager item id {item_id}"));
+    }
+    if let Some(matched_at) = intent.last_matched_at {
+        details.push(format!("Matched in library {}", matched_at.to_rfc3339()));
+    }
+    let mut actions = Vec::new();
+    if intent.manager_item_id.is_some() {
+        actions.push(ExtensionControlAction {
+            id: "search_item".to_string(),
+            label: "Search".to_string(),
+            description: "Start a search for this title now.".to_string(),
+            kind: "secondary".to_string(),
+            params: Some(json!({ "intentId": intent.intent_id.to_string() })),
+            confirm_text: None,
+        });
+        actions.push(ExtensionControlAction {
+            id: "refresh_item".to_string(),
+            label: "Refresh".to_string(),
+            description: "Refresh this title from the manager.".to_string(),
+            kind: "secondary".to_string(),
+            params: Some(json!({ "intentId": intent.intent_id.to_string() })),
+            confirm_text: None,
+        });
+        actions.push(ExtensionControlAction {
+            id: "remove_item".to_string(),
+            label: "Remove".to_string(),
+            description: "Remove this title from the manager and stop tracking it in Elixir."
+                .to_string(),
+            kind: "danger".to_string(),
+            params: Some(json!({ "intentId": intent.intent_id.to_string() })),
+            confirm_text: Some(format!("Remove {} from this manager?", title)),
+        });
+    }
+
+    ExtensionControlEntity {
+        id: intent.intent_id.to_string(),
+        title,
+        subtitle,
+        details,
+        actions,
+    }
+}
+
+fn build_extension_control_manager_actions(
+    implementation: &str,
+) -> Vec<ExtensionControlAction> {
+    let search_label = if implementation == "sonarr" {
+        "Search missing"
+    } else {
+        "Search missing"
+    };
+    vec![
+        ExtensionControlAction {
+            id: "refresh_manager".to_string(),
+            label: "Refresh library".to_string(),
+            description: "Refresh the manager so Elixir sees the latest manager state."
+                .to_string(),
+            kind: "secondary".to_string(),
+            params: None,
+            confirm_text: None,
+        },
+        ExtensionControlAction {
+            id: "search_missing".to_string(),
+            label: search_label.to_string(),
+            description: "Start the manager's built-in search for monitored missing items."
+                .to_string(),
+            kind: "primary".to_string(),
+            params: None,
+            confirm_text: None,
+        },
+    ]
+}
+
+async fn load_manager_control_defaults(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<ManagerControlDefaults> {
+    let key = control_defaults_setting_key(instance_id);
+    let value = store.get_extension_setting(&key).await?;
+    let mut defaults = ManagerControlDefaults::default();
+    if let Some(object) = value.as_ref().and_then(serde_json::Value::as_object) {
+        if let Some(value) = object.get("monitorOnAdd").and_then(serde_json::Value::as_bool) {
+            defaults.monitor_on_add = value;
+        }
+        if let Some(value) = object.get("searchOnAdd").and_then(serde_json::Value::as_bool) {
+            defaults.search_on_add = value;
+        }
+    }
+    Ok(defaults)
+}
+
+async fn save_manager_control_defaults(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    values: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    let key = control_defaults_setting_key(instance_id);
+    let existing = store
+        .get_extension_setting(&key)
+        .await?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut object = existing;
+    let mut updated = false;
+
+    for (field_id, value) in values {
+        match field_id.as_str() {
+            "monitorOnAdd" => {
+                let bool_value = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("monitorOnAdd must be a boolean"))?;
+                object.insert(field_id.clone(), serde_json::Value::Bool(bool_value));
+                updated = true;
+            }
+            "searchOnAdd" => {
+                let bool_value = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("searchOnAdd must be a boolean"))?;
+                object.insert(field_id.clone(), serde_json::Value::Bool(bool_value));
+                updated = true;
+            }
+            other => anyhow::bail!("unsupported control setting '{other}'"),
+        }
+    }
+
+    if updated {
+        store
+            .upsert_extension_setting(&key, &serde_json::Value::Object(object))
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn build_extension_control_actions(
+    context: &ExtensionControlContext,
+) -> Vec<ExtensionControlAction> {
+    if context.selected_provider.is_none() {
+        return Vec::new();
+    }
+
+    let extension_id = context.extension.extension_id.to_ascii_lowercase();
+    if extension_id.contains("sonarr")
+        || extension_id.contains("radarr")
+        || extension_id.contains("prowlarr")
+    {
+        return vec![ExtensionControlAction {
+            id: "test_connection".to_string(),
+            label: "Test connection".to_string(),
+            description: "Check that Elixir can reach this service and read its status.".to_string(),
+            kind: "primary".to_string(),
+            params: None,
+            confirm_text: None,
+        }];
+    }
+
+    Vec::new()
+}
+
+fn control_text_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: String,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "text".to_string(),
+        value: serde_json::Value::String(value),
+        required: false,
+        readonly: true,
+        secret: false,
+        options: Vec::new(),
+        validation: None,
+    }
+}
+
+async fn execute_extension_control_action(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    action_id: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let context = load_extension_control_context(store, extension_id).await?;
+    let Some(provider) = context.selected_provider.as_ref() else {
+        anyhow::bail!("no active provider is available for this extension yet");
+    };
+    let Some(instance) = context.selected_instance.as_ref() else {
+        anyhow::bail!("no active instance is available for this extension yet");
+    };
+
+    match action_id {
+        "test_connection" => {
+            let snapshot = load_extension_control_live_snapshot(state, store, &context).await?;
+            let implementation = provider
+                .implementation
+                .as_deref()
+                .unwrap_or(extension_id)
+                .to_ascii_lowercase();
+            let label = if implementation == "sonarr" {
+                "Sonarr"
+            } else if implementation == "radarr" {
+                "Radarr"
+            } else if implementation == "prowlarr" {
+                "Prowlarr"
+            } else {
+                instance.instance_name.as_str()
+            };
+            let message = match snapshot.version {
+                Some(version) => format!("{label} is reachable. Version {version}."),
+                None => format!("{label} is reachable."),
+            };
+            Ok(message)
+        }
+        "search_missing" => {
+            let implementation = provider
+                .implementation
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let (base_url, api_key) =
+                resolve_extension_control_arr_connection(state, store, &context).await?;
+            execute_extension_control_manager_command(
+                &implementation,
+                &base_url,
+                &api_key,
+                action_id,
+                None,
+            )
+            .await
+        }
+        "refresh_manager" => {
+            let implementation = provider
+                .implementation
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let (base_url, api_key) =
+                resolve_extension_control_arr_connection(state, store, &context).await?;
+            execute_extension_control_manager_command(
+                &implementation,
+                &base_url,
+                &api_key,
+                action_id,
+                None,
+            )
+            .await
+        }
+        "search_item" | "refresh_item" | "remove_item" => {
+            let implementation = provider
+                .implementation
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if implementation != "sonarr" && implementation != "radarr" {
+                anyhow::bail!("item actions are not supported for this extension");
+            }
+            let intent = resolve_extension_control_intent(store, provider.provider_id, params).await?;
+            let manager_item_id = intent
+                .manager_item_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("manager item id is not available for this item"))?;
+            let manager_item_id = manager_item_id
+                .parse::<i64>()
+                .context("parsing manager item id")?;
+            let (base_url, api_key) =
+                resolve_extension_control_arr_connection(state, store, &context).await?;
+            let message = execute_extension_control_manager_command(
+                &implementation,
+                &base_url,
+                &api_key,
+                action_id,
+                Some(manager_item_id),
+            )
+            .await?;
+            if action_id == "remove_item" {
+                store
+                    .deactivate_managed_ingest_intent(intent.intent_id)
+                    .await?;
+            }
+            Ok(message)
+        }
+        _ => anyhow::bail!("unsupported control action '{action_id}'"),
+    }
+}
+
+async fn load_extension_control_live_snapshot(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    let provider = match context.selected_provider.as_ref() {
+        Some(value) => value,
+        None => return Ok(ExtensionControlLiveSnapshot::default()),
+    };
+    let instance = match context.selected_instance.as_ref() {
+        Some(value) => value,
+        None => return Ok(ExtensionControlLiveSnapshot::default()),
+    };
+    let implementation = provider
+        .implementation
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url = resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+
+    match implementation.as_str() {
+        "sonarr" => load_sonarr_control_snapshot(state, store, instance, &base_url).await,
+        "radarr" => load_radarr_control_snapshot(state, store, instance, &base_url).await,
+        "prowlarr" => load_prowlarr_control_snapshot(state, store, instance, &base_url).await,
+        _ => Ok(ExtensionControlLiveSnapshot::default()),
+    }
+}
+
+async fn resolve_extension_control_arr_connection(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<(String, String)> {
+    let provider = context
+        .selected_provider
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active provider is available for this extension yet"))?;
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+    let implementation = provider
+        .implementation
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let candidate_keys = match implementation.as_str() {
+        "sonarr" => vec!["sonarr_api_key", "api_key"],
+        "radarr" => vec!["radarr_api_key", "api_key"],
+        "prowlarr" => vec!["prowlarr_api_key", "api_key"],
+        _ => vec!["api_key"],
+    };
+    let api_key = resolve_control_api_key(state, store, instance, &candidate_keys).await?;
+    Ok((base_url, api_key))
+}
+
+async fn resolve_extension_control_intent(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<ManagedIngestIntent> {
+    let intent_id = params
+        .get("intentId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("intentId is required"))?;
+    let intent_id = Uuid::parse_str(intent_id).context("parsing intentId")?;
+    let intents = store.list_active_managed_ingest_intents().await?;
+    intents
+        .into_iter()
+        .find(|intent| intent.intent_id == intent_id && intent.manager_provider_id == provider_id)
+        .ok_or_else(|| anyhow::anyhow!("managed item is no longer available"))
+}
+
+async fn execute_extension_control_manager_command(
+    implementation: &str,
+    base_url: &str,
+    api_key: &str,
+    action_id: &str,
+    item_id: Option<i64>,
+) -> anyhow::Result<String> {
+    match (implementation, action_id) {
+        ("sonarr", "search_missing") => {
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "MissingEpisodeSearch" })),
+            )
+            .await?;
+            Ok("Sonarr started a missing episode search.".to_string())
+        }
+        ("sonarr", "refresh_manager") => {
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "RefreshSeries" })),
+            )
+            .await?;
+            Ok("Sonarr refresh started.".to_string())
+        }
+        ("sonarr", "search_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "SeriesSearch", "seriesId": item_id })),
+            )
+            .await?;
+            Ok("Sonarr started a search for this series.".to_string())
+        }
+        ("sonarr", "refresh_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "RefreshSeries", "seriesId": item_id })),
+            )
+            .await?;
+            Ok("Sonarr refresh started for this series.".to_string())
+        }
+        ("sonarr", "remove_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::DELETE,
+                &[&format!("api/v3/series/{item_id}?deleteFiles=false"), &format!("api/v4/series/{item_id}?deleteFiles=false")],
+                None,
+            )
+            .await?;
+            Ok("Sonarr removed this series.".to_string())
+        }
+        ("radarr", "search_missing") => {
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "MissingMoviesSearch" })),
+            )
+            .await?;
+            Ok("Radarr started a missing movie search.".to_string())
+        }
+        ("radarr", "refresh_manager") => {
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "RefreshMovie" })),
+            )
+            .await?;
+            Ok("Radarr refresh started.".to_string())
+        }
+        ("radarr", "search_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "MoviesSearch", "movieIds": [item_id] })),
+            )
+            .await?;
+            Ok("Radarr started a search for this movie.".to_string())
+        }
+        ("radarr", "refresh_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::POST,
+                &["api/v3/command", "api/v4/command"],
+                Some(&json!({ "name": "RefreshMovie", "movieId": item_id })),
+            )
+            .await?;
+            Ok("Radarr refresh started for this movie.".to_string())
+        }
+        ("radarr", "remove_item") => {
+            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
+            request_control_write(
+                base_url,
+                api_key,
+                ReqwestMethod::DELETE,
+                &[&format!("api/v3/movie/{item_id}?deleteFiles=false"), &format!("api/v4/movie/{item_id}?deleteFiles=false")],
+                None,
+            )
+            .await?;
+            Ok("Radarr removed this movie.".to_string())
+        }
+        _ => anyhow::bail!("unsupported control action '{action_id}' for {implementation}"),
+    }
+}
+
+async fn load_sonarr_control_snapshot(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    base_url: &str,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    let api_key = resolve_control_api_key(state, store, instance, &["sonarr_api_key", "api_key"]).await?;
+    let status = request_control_json(base_url, &api_key, &["api/v3/system/status", "api/v4/system/status"]).await?;
+    let series = request_control_json(base_url, &api_key, &["api/v3/series", "api/v4/series"]).await?;
+    let downloaders = request_control_json(
+        base_url,
+        &api_key,
+        &["api/v3/downloadclient", "api/v4/downloadclient"],
+    )
+    .await?;
+
+    Ok(ExtensionControlLiveSnapshot {
+        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        metrics: vec![
+            ExtensionControlMetric {
+                id: "version".to_string(),
+                label: "Service version".to_string(),
+                value: status
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            },
+            ExtensionControlMetric {
+                id: "seriesCount".to_string(),
+                label: "Series".to_string(),
+                value: series.as_array().map(|value| value.len()).unwrap_or(0).to_string(),
+            },
+            ExtensionControlMetric {
+                id: "downloadClientCount".to_string(),
+                label: "Download clients".to_string(),
+                value: downloaders
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            },
+        ],
+    })
+}
+
+async fn load_radarr_control_snapshot(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    base_url: &str,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    let api_key = resolve_control_api_key(state, store, instance, &["radarr_api_key", "api_key"]).await?;
+    let status = request_control_json(base_url, &api_key, &["api/v3/system/status", "api/v4/system/status"]).await?;
+    let movies = request_control_json(base_url, &api_key, &["api/v3/movie", "api/v4/movie"]).await?;
+    let downloaders = request_control_json(
+        base_url,
+        &api_key,
+        &["api/v3/downloadclient", "api/v4/downloadclient"],
+    )
+    .await?;
+
+    Ok(ExtensionControlLiveSnapshot {
+        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        metrics: vec![
+            ExtensionControlMetric {
+                id: "version".to_string(),
+                label: "Service version".to_string(),
+                value: status
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            },
+            ExtensionControlMetric {
+                id: "movieCount".to_string(),
+                label: "Movies".to_string(),
+                value: movies.as_array().map(|value| value.len()).unwrap_or(0).to_string(),
+            },
+            ExtensionControlMetric {
+                id: "downloadClientCount".to_string(),
+                label: "Download clients".to_string(),
+                value: downloaders
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            },
+        ],
+    })
+}
+
+async fn load_prowlarr_control_snapshot(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    base_url: &str,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    let api_key = resolve_control_api_key(state, store, instance, &["prowlarr_api_key", "api_key"]).await?;
+    let status = request_control_json(base_url, &api_key, &["api/v1/system/status"]).await?;
+    let indexers = request_control_json(base_url, &api_key, &["api/v1/indexer"]).await?;
+    let applications = request_control_json(base_url, &api_key, &["api/v1/applications"]).await?;
+
+    Ok(ExtensionControlLiveSnapshot {
+        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        metrics: vec![
+            ExtensionControlMetric {
+                id: "version".to_string(),
+                label: "Service version".to_string(),
+                value: status
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            },
+            ExtensionControlMetric {
+                id: "indexerCount".to_string(),
+                label: "Indexers".to_string(),
+                value: indexers
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            },
+            ExtensionControlMetric {
+                id: "appCount".to_string(),
+                label: "Connected apps".to_string(),
+                value: applications
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            },
+        ],
+    })
+}
+
+async fn resolve_control_api_key(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    candidate_keys: &[&str],
+) -> anyhow::Result<String> {
+    if let Some(value) = instance
+        .config_json
+        .as_ref()
+        .and_then(|value| value.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+
+    for key in candidate_keys {
+        if let Some(secret) = store
+            .get_secret(SecretScope::Instance, Some(instance.instance_id), key)
+            .await?
+        {
+            let value = state.secrets.decrypt(&secret.value_encrypted)?;
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+
+    anyhow::bail!("service api key is not available yet");
+}
+
+async fn request_control_json(
+    base_url: &str,
+    api_key: &str,
+    paths: &[&str],
+) -> anyhow::Result<serde_json::Value> {
+    let client = build_extension_control_arr_client(api_key)?;
+
+    for path in paths {
+        let url = build_extension_control_url(base_url, path)?;
+        let resp = client
+            .request(ReqwestMethod::GET, url)
+            .send()
+            .await
+            .map_err(anyhow::Error::from)?;
+        if resp.status() == ReqwestStatusCode::NOT_FOUND {
+            continue;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{path} failed ({status}): {}", detail.trim());
+        }
+        return resp.json::<serde_json::Value>().await.map_err(anyhow::Error::from);
+    }
+
+    anyhow::bail!("service endpoint is not available")
+}
+
+async fn request_control_write(
+    base_url: &str,
+    api_key: &str,
+    method: ReqwestMethod,
+    paths: &[&str],
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let client = build_extension_control_arr_client(api_key)?;
+
+    for path in paths {
+        let url = build_extension_control_url(base_url, path)?;
+        let mut request = client.request(method.clone(), url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(anyhow::Error::from)?;
+        if resp.status() == ReqwestStatusCode::NOT_FOUND {
+            continue;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{} failed ({status}): {}", path, detail.trim());
+        }
+        let bytes = resp.bytes().await.map_err(anyhow::Error::from)?;
+        if bytes.is_empty() {
+            return Ok(json!({}));
+        }
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|_| json!({}));
+        return Ok(value);
+    }
+
+    anyhow::bail!("service endpoint is not available")
+}
+
+async fn resolve_control_provider_transport_base_url(
+    instance_id: Uuid,
+    endpoint: &ProviderEndpoint,
+) -> anyhow::Result<String> {
+    let canonical = endpoint.canonical_url()?;
+    if control_endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+        return Ok(canonical);
+    }
+
+    if let Some(host_port) = lookup_control_docker_published_port(instance_id, endpoint.port).await?
+    {
+        let base_path = if endpoint.base_path.trim().is_empty() {
+            "/"
+        } else {
+            endpoint.base_path.as_str()
+        };
+        return Ok(format!(
+            "{}://127.0.0.1:{}{}",
+            endpoint.scheme, host_port, base_path
+        ));
+    }
+
+    anyhow::bail!(
+        "provider endpoint {}:{} is not reachable from the server host",
+        endpoint.host,
+        endpoint.port
+    )
+}
+
+async fn control_endpoint_host_resolves(host: &str, port: u16) -> bool {
+    lookup_host((host, port))
+        .await
+        .map(|mut values| values.next().is_some())
+        .unwrap_or(false)
+}
+
+async fn lookup_control_docker_published_port(
+    instance_id: Uuid,
+    container_port: u16,
+) -> anyhow::Result<Option<u16>> {
+    let container_names = run_control_docker_stdout(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label=elixir.instance_id={instance_id}"),
+        "--format",
+        "{{.Names}}",
+    ])
+    .await?;
+    let Some(container_name) = container_names
+        .lines()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let ports_json = run_control_docker_stdout(&[
+        "inspect",
+        "--format",
+        "{{json .NetworkSettings.Ports}}",
+        container_name,
+    ])
+    .await?;
+    let ports: serde_json::Value = serde_json::from_str(ports_json.trim())?;
+    let key = format!("{container_port}/tcp");
+    let binding = ports
+        .get(&key)
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.first());
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    Ok(binding
+        .get("HostPort")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .ok())
+}
+
+async fn run_control_docker_stdout(args: &[&str]) -> anyhow::Result<String> {
+    let output = Command::new("docker").args(args).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("docker {} failed: {}", args.join(" "), stderr.trim());
+    }
+    String::from_utf8(output.stdout).map_err(anyhow::Error::from)
+}
+
+fn build_extension_control_arr_client(api_key: &str) -> anyhow::Result<Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Api-Key",
+        HeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .default_headers(headers)
+        .build()
+        .map_err(anyhow::Error::from)
+}
+
+fn build_extension_control_url(base_url: &str, path: &str) -> anyhow::Result<Url> {
+    let mut root = Url::parse(base_url)?;
+    let (path_only, query) = match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    };
+    let trimmed = root.path().trim_end_matches('/');
+    let next_path = if trimmed.is_empty() || trimmed == "/" {
+        format!("/{}", path_only.trim_start_matches('/'))
+    } else {
+        format!("{}/{}", trimmed, path_only.trim_start_matches('/'))
+    };
+    root.set_path(&next_path);
+    root.set_query(query);
+    Ok(root)
 }
 
 pub async fn list_runs(

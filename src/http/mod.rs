@@ -26,6 +26,15 @@ pub fn router(state: AppState) -> Router {
             get(handlers::extensions::status_summary),
         )
         .route(
+            "/api/v1/extensions/:id/control-surface",
+            get(handlers::extensions::get_extension_control_surface)
+                .put(handlers::extensions::update_extension_control_surface_settings),
+        )
+        .route(
+            "/api/v1/extensions/:id/control-surface/actions/:action_id",
+            post(handlers::extensions::run_extension_control_action),
+        )
+        .route(
             "/api/v1/extensions/registries/refresh",
             post(handlers::extensions::refresh_catalog),
         )
@@ -278,6 +287,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/find/add",
             post(handlers::discovery::find_media_add),
+        )
+        .route(
+            "/api/v1/find-media/acquisition",
+            get(handlers::discovery::find_media_acquisition),
+        )
+        .route(
+            "/api/v1/find/acquisition",
+            get(handlers::discovery::find_media_acquisition),
         )
         .route(
             "/api/v1/find-media/preferences",

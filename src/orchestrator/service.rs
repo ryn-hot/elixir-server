@@ -11,9 +11,9 @@ use crate::orchestrator::executor::{Executor, ExecutorAction, build_driver_ctx_f
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::naming::container_name;
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
-use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
+use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
 
 const STARTUP_STALE_INSTANCE_GRACE_MINUTES: i64 = 30;

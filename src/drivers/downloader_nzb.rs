@@ -79,8 +79,7 @@ impl CapabilityDriver for DownloaderNzbDriver {
                 if let Some(path) = managed_config_path.as_deref() {
                     upsert_categories_in_file(path, &categories).await?;
                 } else {
-                    let client =
-                        NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
+                    let client = NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
                     client.upsert_categories(&categories).await?;
                 }
             }
@@ -144,8 +143,7 @@ impl CapabilityDriver for DownloaderNzbDriver {
                     )
                     .await?;
                 } else {
-                    let client =
-                        NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
+                    let client = NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
                     client
                         .set_preferences(
                             main_dir,

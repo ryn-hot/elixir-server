@@ -879,6 +879,19 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn deactivate_managed_ingest_intent(&self, intent_id: Uuid) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_ingest_intents
+             SET active = 0,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE intent_id = ?",
+        )
+        .bind(intent_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn upsert_secret(&self, data: &NewSecret) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO secrets (secret_id, scope, scope_id, key, value_encrypted, rotatable) VALUES (?, ?, ?, ?, ?, ?) \n             ON CONFLICT(scope, scope_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, rotatable = excluded.rotatable",

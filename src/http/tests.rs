@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argon2::{
     Argon2,
     password_hash::{PasswordHasher, SaltString},
@@ -12,10 +12,10 @@ use argon2::{
 use axum::{
     Json, Router,
     body::{self, Body},
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{Request, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer, SigningKey};
@@ -38,7 +38,7 @@ use crate::{
     },
     db::Database,
     db::models::{
-        BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
+        BindingStatus, ExtensionKind, ExtensionTrustLevel, MediaType, OrchestratorRunStatus,
         ProviderHealthState, SecretScope, SlotCardinality,
     },
     extensions::ExtensionManager,
@@ -49,7 +49,7 @@ use crate::{
     extensions::package::compute_sha256,
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
-        NewOrchestratorRun, NewProvider, NewSecret,
+        NewManagedIngestIntent, NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
@@ -283,6 +283,130 @@ async fn registry_handler(State(state): State<Arc<RegistryState>>) -> Json<Value
 
 async fn package_handler(State(state): State<Arc<RegistryState>>) -> impl IntoResponse {
     (StatusCode::OK, state.package_bytes.clone())
+}
+
+fn discover_test_host_ip() -> Result<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    let host = socket.local_addr()?.ip().to_string();
+    if host == "0.0.0.0"
+        || matches!(host.as_str(), "127.0.0.1" | "::1")
+    {
+        anyhow::bail!("failed to discover a non-localhost test host ip");
+    }
+    Ok(host)
+}
+
+async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+
+    let app = Router::new()
+        .route(
+            "/api/v3/system/status",
+            get(|| async { Json(json!({ "version": "4.0.0.778" })) }),
+        )
+        .route(
+            "/api/v3/series",
+            get(|| async { Json(json!([{ "id": 1 }, { "id": 2 }])) }),
+        )
+        .route(
+            "/api/v3/downloadclient",
+            get(|| async { Json(json!([{ "id": 11 }])) }),
+        );
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let ready_url = format!("http://{}:{}/api/v3/system/status", host, addr.port());
+    for _ in 0..20 {
+        if let Ok(response) = reqwest::get(&ready_url).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    Ok((host, addr, shutdown_tx))
+}
+
+#[derive(Clone, Default)]
+struct MockArrControlState {
+    commands: Arc<Mutex<Vec<Value>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
+}
+
+async fn start_mock_sonarr_control_server(
+) -> Result<(String, SocketAddr, MockArrControlState, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+    let state = MockArrControlState::default();
+
+    async fn system_status() -> Json<Value> {
+        Json(json!({ "version": "4.0.0.778" }))
+    }
+
+    async fn series_list() -> Json<Value> {
+        Json(json!([{ "id": 42 }, { "id": 99 }]))
+    }
+
+    async fn download_clients() -> Json<Value> {
+        Json(json!([{ "id": 11 }]))
+    }
+
+    async fn command_handler(
+        State(state): State<MockArrControlState>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        state.commands.lock().unwrap().push(payload.clone());
+        Json(json!({ "id": 500, "state": "started" }))
+    }
+
+    async fn delete_series_handler(
+        State(state): State<MockArrControlState>,
+        AxumPath(series_id): AxumPath<String>,
+    ) -> impl IntoResponse {
+        state.deletes.lock().unwrap().push(series_id);
+        StatusCode::OK
+    }
+
+    let app = Router::new()
+        .route("/api/v3/system/status", get(system_status))
+        .route("/api/v3/series", get(series_list))
+        .route("/api/v3/downloadclient", get(download_clients))
+        .route("/api/v3/command", post(command_handler))
+        .route("/api/v3/series/:id", delete(delete_series_handler))
+        .with_state(state.clone());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let ready_url = format!("http://{}:{}/api/v3/system/status", host, addr.port());
+    for _ in 0..20 {
+        if let Ok(response) = reqwest::get(&ready_url).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    Ok((host, addr, state, shutdown_tx))
 }
 
 #[tokio::test]
@@ -2234,6 +2358,317 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .and_then(Value::as_array)
             .map(|items| items.len()),
         Some(0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_preferences_clear_stale_manager_provider_ids() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-stale-pref-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-stale-pref@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["series", "anime"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/sonarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "sonarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["series", "anime"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let stale_id = Uuid::new_v4();
+    store
+        .upsert_extension_setting("manager_preference.series", &json!(stale_id.to_string()))
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find-media/preferences")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload
+            .get("preferences")
+            .and_then(|value| value.get("tvDefaultManagerProviderId")),
+        Some(&Value::Null)
+    );
+
+    assert_eq!(
+        store
+            .get_extension_setting("manager_preference.series")
+            .await?,
+        None
+    );
+
+    let targets_response = app
+        .oneshot(
+            Request::get("/api/v1/find-media/targets?media_type=series")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(targets_response.status(), StatusCode::OK);
+    let targets_body = body::to_bytes(targets_response.into_body(), 1_048_576).await?;
+    let targets_payload: Value = serde_json::from_slice(&targets_body)?;
+    assert_eq!(
+        targets_payload
+            .get("preferredManagerProviderId")
+            .and_then(Value::as_str),
+        None
+    );
+    assert_eq!(
+        targets_payload
+            .get("defaultManagerProviderId")
+            .and_then(Value::as_str),
+        Some(provider_id.to_string().as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_acquisition_lists_active_intents() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-acquisition-secret".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-acquisition@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr",
+                        "scope": { "media_types": ["series", "anime"] }
+                    }
+                ],
+                "runtime": { "type": "container", "image": "example/sonarr:latest" }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "sonarr-api-key" })),
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({ "media_types": ["series", "anime"] })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 7878,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let intent_id = store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: MediaType::Series,
+            title: "Noble House".to_string(),
+            normalized_title: "noble house".to_string(),
+            year: Some(1988),
+            external_ids: Some(ExternalIds {
+                tvdb: Some("74493".to_string()),
+                ..ExternalIds::default()
+            }),
+            manager_provider_id: provider_id,
+            manager_item_id: None,
+            manager_label: Some("default (sonarr)".to_string()),
+            source: "find_media".to_string(),
+        })
+        .await?;
+
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/find/acquisition?limit=5")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        payload.get("activeCount").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload.get("downloadingCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        payload.get("needsAttentionCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        payload
+            .get("recentCompletedCount")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .context("acquisition items missing")?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("intentId").and_then(Value::as_str),
+        Some(intent_id.to_string().as_str())
+    );
+    assert_eq!(items[0].get("title").and_then(Value::as_str), Some("Noble House"));
+    assert_eq!(items[0].get("mediaType").and_then(Value::as_str), Some("tv"));
+    assert_eq!(items[0].get("stage").and_then(Value::as_str), Some("requested"));
+    assert_eq!(
+        items[0].get("stageLabel").and_then(Value::as_str),
+        Some("Requested")
     );
 
     Ok(())
@@ -5308,6 +5743,761 @@ async fn extensions_apply_blueprint_is_idempotent_for_pending_plan() -> Result<(
         first_plan_id,
         "pending preview run id should match reused plan id"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "lscr.io/linuxserver/sonarr:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "api_key": "test-sonarr-key"
+            })),
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        payload.get("extensionId").and_then(Value::as_str),
+        Some("elixir.modules.sonarr")
+    );
+    assert_eq!(payload.get("name").and_then(Value::as_str), Some("Sonarr"));
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Ready")
+    );
+    assert_eq!(
+        payload
+            .pointer("/actions/0/id")
+            .and_then(Value::as_str),
+        Some("test_connection")
+    );
+
+    let metrics = payload
+        .pointer("/status/telemetry/metrics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        metrics
+            .iter()
+            .any(|metric| metric.get("id").and_then(Value::as_str) == Some("seriesCount")
+                && metric.get("value").and_then(Value::as_str) == Some("2")),
+        "expected series count metric in control surface: {}",
+        payload
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|metric| metric.get("id").and_then(Value::as_str) == Some("downloadClientCount")
+                && metric.get("value").and_then(Value::as_str) == Some("1")),
+        "expected download client count metric in control surface: {}",
+        payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_test_connection_returns_success() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [
+                    {
+                        "capability": "media.manager.tv",
+                        "slot": "default",
+                        "implementation": "sonarr"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "lscr.io/linuxserver/sonarr:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "api_key": "test-sonarr-key"
+            })),
+            enabled: true,
+        })
+        .await?;
+
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/test_connection",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected control action response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload.get("success").and_then(Value::as_bool), Some(true));
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("Sonarr is reachable. Version 4.0.0.778."),
+        "expected connection success message in control action response"
+    );
+    assert_eq!(
+        payload
+            .pointer("/controlSurface/actions/0/id")
+            .and_then(Value::as_str),
+        Some("test_connection")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, _server_state, shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: MediaType::Series,
+            title: "Noble House".to_string(),
+            normalized_title: "noble house".to_string(),
+            year: Some(1988),
+            external_ids: None,
+            manager_provider_id: provider_id,
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            source: "find_media".to_string(),
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let defaults_fields = payload
+        .pointer("/sections/2/fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        defaults_fields
+            .iter()
+            .any(|field| field.get("id").and_then(Value::as_str) == Some("monitorOnAdd")
+                && field.get("value").and_then(Value::as_bool) == Some(true)),
+        "expected monitorOnAdd field in defaults section: {}",
+        payload
+    );
+    assert!(
+        defaults_fields
+            .iter()
+            .any(|field| field.get("id").and_then(Value::as_str) == Some("searchOnAdd")
+                && field.get("value").and_then(Value::as_bool) == Some(true)),
+        "expected searchOnAdd field in defaults section: {}",
+        payload
+    );
+
+    let entities = payload
+        .pointer("/sections/3/entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        entities.iter().any(|entity| entity.get("title").and_then(Value::as_str)
+            == Some("Noble House (1988)")),
+        "expected Noble House managed item in control surface: {}",
+        payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_remove_item_deactivates_intent() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    let intent_id = store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: MediaType::Series,
+            title: "Noble House".to_string(),
+            normalized_title: "noble house".to_string(),
+            year: Some(1988),
+            external_ids: None,
+            manager_provider_id: provider_id,
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            source: "find_media".to_string(),
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/remove_item",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "params": {
+                    "intentId": intent_id.to_string()
+                }
+            }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        store.list_active_managed_ingest_intents().await?.len(),
+        0,
+        "remove action should deactivate the managed ingest intent"
+    );
+    assert_eq!(
+        server_state.deletes.lock().unwrap().as_slice(),
+        &["42".to_string()],
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_search_and_refresh_item_issue_sonarr_commands() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    let intent_id = store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: MediaType::Series,
+            title: "Noble House".to_string(),
+            normalized_title: "noble house".to_string(),
+            year: Some(1988),
+            external_ids: None,
+            manager_provider_id: provider_id,
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            source: "find_media".to_string(),
+        })
+        .await?;
+
+    for action_id in ["search_item", "refresh_item"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/{action_id}"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "params": {
+                        "intentId": intent_id.to_string()
+                    }
+                }))?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let _ = shutdown_tx.send(());
+
+    let commands = server_state.commands.lock().unwrap().clone();
+    assert!(
+        commands.iter().any(|payload| {
+            payload.get("name").and_then(Value::as_str) == Some("SeriesSearch")
+                && payload.get("seriesId").and_then(Value::as_i64) == Some(42)
+        }),
+        "expected SeriesSearch command: {:?}",
+        commands
+    );
+    assert!(
+        commands.iter().any(|payload| {
+            payload.get("name").and_then(Value::as_str) == Some("RefreshSeries")
+                && payload.get("seriesId").and_then(Value::as_i64) == Some(42)
+        }),
+        "expected RefreshSeries command: {:?}",
+        commands
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "svc-sonarr",
+                "port": 8989,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "values": {
+                        "monitorOnAdd": false,
+                        "searchOnAdd": false
+                    }
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let fields = payload
+        .pointer("/sections/2/fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("monitorOnAdd")
+                && field.get("value").and_then(Value::as_bool) == Some(false)
+        }),
+        "expected updated monitorOnAdd field: {}",
+        payload
+    );
+    assert!(
+        fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("searchOnAdd")
+                && field.get("value").and_then(Value::as_bool) == Some(false)
+        }),
+        "expected updated searchOnAdd field: {}",
+        payload
+    );
+    let stored = store
+        .get_extension_setting(&format!("extensions.control_defaults.instance.{instance_id}"))
+        .await?
+        .unwrap_or(Value::Null);
+    assert_eq!(stored.get("monitorOnAdd").and_then(Value::as_bool), Some(false));
+    assert_eq!(stored.get("searchOnAdd").and_then(Value::as_bool), Some(false));
 
     Ok(())
 }
