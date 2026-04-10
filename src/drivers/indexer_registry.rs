@@ -8,7 +8,6 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::debug;
-
 use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
 use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
@@ -247,24 +246,28 @@ impl ProwlarrClient {
         }
         let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
         let existing = self.get_json::<Vec<Value>>("indexer").await?;
-        let mut skipped: Vec<(String, String)> = Vec::new();
+        let default_app_profile_id = self.resolve_default_app_profile_id().await?;
+        let mut unsupported: Vec<(String, String)> = Vec::new();
+        let mut realized = 0usize;
 
         for indexer in indexers {
-            let tags = self.ensure_tags(&indexer.tags).await?;
-            let Some(schema_item) = find_schema_optional(&schema, &indexer.implementation) else {
-                skipped.push((indexer.name.clone(), indexer.implementation.clone()));
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let schema_item = find_schema_optional(&schema, &indexer.implementation);
+            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone()) else {
+                unsupported.push((indexer.name.clone(), indexer.implementation.clone()));
                 continue;
             };
-            let existing_item = find_by_name(&existing, &indexer.name);
+            let tags = self.ensure_tags(&indexer.tags).await?;
             let mut target = match existing_item.clone() {
                 Some(existing) => existing,
-                None => schema_item,
+                None => schema_or_existing,
             };
             let enabled = indexer.enabled.unwrap_or(true);
             set_enabled(&mut target, enabled)?;
             set_string(&mut target, "name", indexer.name.clone())?;
             set_array_i64(&mut target, "tags", &tags)?;
             ensure_schema_fields(&mut target, &indexer.implementation)?;
+            apply_indexer_defaults(&mut target, default_app_profile_id)?;
 
             let fields = target
                 .get_mut("fields")
@@ -274,6 +277,7 @@ impl ProwlarrClient {
 
             if let Some(existing_item) = existing_item {
                 if target == existing_item {
+                    realized += 1;
                     continue;
                 }
             }
@@ -285,13 +289,20 @@ impl ProwlarrClient {
                 remove_readonly_fields(&mut target);
                 self.post_json("indexer", &target).await?;
             }
+            realized += 1;
         }
-        if !skipped.is_empty() {
-            debug!(
-                skipped = skipped.len(),
-                skipped_indexers = ?skipped,
-                "prowlarr skipped indexers that are unavailable in current schema"
+        if !unsupported.is_empty() {
+            bail!(
+                "prowlarr schema does not support requested indexers: {}",
+                unsupported
+                    .iter()
+                    .map(|(name, implementation)| format!("{name} ({implementation})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
+        }
+        if realized == 0 {
+            bail!("prowlarr did not apply any requested indexers");
         }
         Ok(())
     }
@@ -380,6 +391,30 @@ impl ProwlarrClient {
             }
         }
         Ok(tag_ids)
+    }
+
+    async fn resolve_default_app_profile_id(&self) -> Result<Option<i64>> {
+        let profiles = self.get_json::<Vec<Value>>("appProfile").await?;
+        if profiles.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(id) = profiles.iter().find_map(|profile| {
+            let name = profile.get("name").and_then(Value::as_str)?;
+            let id = profile.get("id").and_then(Value::as_i64)?;
+            if name.trim().eq_ignore_ascii_case("standard") && id > 0 {
+                Some(id)
+            } else {
+                None
+            }
+        }) {
+            return Ok(Some(id));
+        }
+
+        Ok(profiles
+            .iter()
+            .filter_map(|profile| profile.get("id").and_then(Value::as_i64))
+            .find(|id| *id > 0))
     }
 }
 
@@ -606,6 +641,29 @@ fn ensure_schema_fields(target: &mut Value, implementation: &str) -> Result<()> 
     Ok(())
 }
 
+fn apply_indexer_defaults(target: &mut Value, default_app_profile_id: Option<i64>) -> Result<()> {
+    let Some(map) = target.as_object_mut() else {
+        bail!("expected object for indexer defaults");
+    };
+
+    if map.contains_key("appProfileId") {
+        let current = map.get("appProfileId").and_then(Value::as_i64).unwrap_or(0);
+        if current <= 0 {
+            let app_profile_id = default_app_profile_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prowlarr requires an app profile for this indexer, but none are available"
+                )
+            })?;
+            map.insert(
+                "appProfileId".to_string(),
+                Value::Number(app_profile_id.into()),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn remove_readonly_fields(target: &mut Value) {
     if let Some(map) = target.as_object_mut() {
         map.remove("id");
@@ -766,7 +824,11 @@ fn extract_error_message(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::{get, post}};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     #[test]
     fn register_app_identity_matches_name_type_and_url() {
@@ -891,5 +953,166 @@ mod tests {
         assert_eq!(prowlarr_url, "http://svc-prowlarr:9696/");
         let base_url = field_string_value(&fields, "baseUrl").unwrap();
         assert_eq!(base_url, "http://elx-radarr:7878");
+    }
+
+    #[test]
+    fn find_schema_optional_returns_none_for_removed_public_indexers() {
+        let schema = vec![
+            json!({"implementation": "Anidex"}),
+            json!({"implementation": "TorrentsCSV"}),
+        ];
+
+        assert!(find_schema_optional(&schema, "Nyaa").is_none());
+        assert!(find_schema_optional(&schema, "EZTV").is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_indexers_fails_when_requested_implementation_is_missing_from_schema() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        let app = Router::new()
+            .route(
+                "/api/v1/indexer/schema",
+                get(|| async { Json(json!([{ "implementation": "Anidex", "fields": [] }])) }),
+            )
+            .route("/api/v1/indexer", get(|| async { Json(json!([])) }))
+            .route("/api/v1/indexer", post(|| async { Json(json!({ "id": 1 })) }));
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        let err = client
+            .upsert_indexers(&[IndexerSpec {
+                name: "Nyaa".to_string(),
+                implementation: "Nyaa".to_string(),
+                url: "https://nyaa.si/".to_string(),
+                auth: crate::drivers::patches::IndexerAuthSpec {
+                    requires_account: Some(false),
+                    required_fields: Vec::new(),
+                },
+                api_key: None,
+                categories: Vec::new(),
+                tags: Vec::new(),
+                enabled: Some(true),
+                settings: HashMap::new(),
+            }])
+            .await
+            .expect_err("unsupported schema implementation should fail");
+
+        let _ = shutdown_tx.send(());
+
+        assert!(
+            err.to_string()
+                .contains("prowlarr schema does not support requested indexers"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_indexers_assigns_default_app_profile_id_when_required() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(None::<Value>));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/indexer/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "AnimeTosho",
+                        "implementation": "Torznab",
+                        "appProfileId": 0,
+                        "fields": [
+                            { "name": "baseUrl", "value": "" },
+                            { "name": "apiPath", "value": "/api" }
+                        ]
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/appProfile",
+                get(|| async { Json(json!([{ "name": "Standard", "id": 1 }])) }),
+            )
+            .route("/api/v1/tag", get(|| async { Json(json!([])) }))
+            .route("/api/v1/tag", post(|| async { Json(json!({ "id": 77 })) }))
+            .route("/api/v1/indexer", get(|| async { Json(json!([])) }))
+            .route(
+                "/api/v1/indexer",
+                post({
+                    let captured = Arc::clone(&captured);
+                    move |Json(body): Json<Value>| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            *captured.lock().expect("capture payload") = Some(body);
+                            Json(json!({ "id": 1 }))
+                        }
+                    }
+                }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        client
+            .upsert_indexers(&[IndexerSpec {
+                name: "AnimeTosho".to_string(),
+                implementation: "Torznab".to_string(),
+                url: "https://feed.animetosho.org".to_string(),
+                auth: crate::drivers::patches::IndexerAuthSpec {
+                    requires_account: Some(false),
+                    required_fields: Vec::new(),
+                },
+                api_key: None,
+                categories: Vec::new(),
+                tags: vec!["public".to_string()],
+                enabled: Some(true),
+                settings: HashMap::new(),
+            }])
+            .await
+            .expect("indexer creation should succeed");
+
+        let _ = shutdown_tx.send(());
+
+        let body = captured
+            .lock()
+            .expect("captured payload")
+            .clone()
+            .expect("indexer create payload");
+        assert_eq!(body.get("appProfileId").and_then(Value::as_i64), Some(1));
     }
 }

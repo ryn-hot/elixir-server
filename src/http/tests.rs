@@ -94,6 +94,18 @@ fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
     )
 }
 
+fn control_surface_section<'a>(payload: &'a Value, section_id: &str) -> &'a Value {
+    payload
+        .get("sections")
+        .and_then(Value::as_array)
+        .and_then(|sections| {
+            sections.iter().find(|section| {
+                section.get("id").and_then(Value::as_str) == Some(section_id)
+            })
+        })
+        .unwrap_or_else(|| panic!("missing control-surface section '{section_id}': {payload}"))
+}
+
 async fn setup_extension_instance(
     extension_id: &str,
     name: &str,
@@ -326,6 +338,112 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
     });
 
     let ready_url = format!("http://{}:{}/api/v3/system/status", host, addr.port());
+    for _ in 0..20 {
+        if let Ok(response) = reqwest::get(&ready_url).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    Ok((host, addr, shutdown_tx))
+}
+
+async fn start_mock_prowlarr_indexer_server(
+    indexer_names: Vec<&'static str>,
+) -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+    let names = Arc::new(indexer_names.into_iter().map(str::to_string).collect::<Vec<_>>());
+
+    let app = Router::new()
+        .route(
+            "/api/v1/indexer",
+            get({
+                let names = Arc::clone(&names);
+                move || {
+                    let names = Arc::clone(&names);
+                    async move {
+                        Json(Value::Array(
+                            names.iter()
+                                .map(|name| json!({ "name": name }))
+                                .collect(),
+                        ))
+                    }
+                }
+            }),
+        );
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let ready_url = format!("http://{}:{}/api/v1/indexer", host, addr.port());
+    for _ in 0..20 {
+        if let Ok(response) = reqwest::get(&ready_url).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    Ok((host, addr, shutdown_tx))
+}
+
+async fn start_mock_prowlarr_control_server(
+    indexers: Vec<Value>,
+    applications: Vec<Value>,
+) -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+    let indexers = Arc::new(indexers);
+    let applications = Arc::new(applications);
+
+    let app = Router::new()
+        .route(
+            "/api/v1/system/status",
+            get(|| async { Json(json!({ "version": "1.17.2.4511" })) }),
+        )
+        .route(
+            "/api/v1/indexer",
+            get({
+                let indexers = Arc::clone(&indexers);
+                move || {
+                    let indexers = Arc::clone(&indexers);
+                    async move { Json(Value::Array(indexers.as_ref().clone())) }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/applications",
+            get({
+                let applications = Arc::clone(&applications);
+                move || {
+                    let applications = Arc::clone(&applications);
+                    async move { Json(Value::Array(applications.as_ref().clone())) }
+                }
+            }),
+        );
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let ready_url = format!("http://{}:{}/api/v1/system/status", host, addr.port());
     for _ in 0..20 {
         if let Ok(response) = reqwest::get(&ready_url).await {
             if response.status().is_success() {
@@ -1196,6 +1314,187 @@ async fn extension_status_summary_includes_optional_addons_for_blueprints() -> R
         Some(expected_instance_id.as_str())
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_marks_public_indexer_connector_attention_when_downstream_missing()
+-> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, shutdown_tx) = start_mock_prowlarr_indexer_server(vec![]).await?;
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            name: "Prowlarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.prowlarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Prowlarr",
+                "provides": [{
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id,
+            capability: "indexer.registry".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("prowlarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
+                "http".to_string(),
+                host,
+                addr.port(),
+                Some("/".to_string()),
+                None,
+            )?)?),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "api_key".to_string(),
+            value_encrypted: secrets.encrypt("test-api-key")?,
+            rotatable: false,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.connectors.prowlarr_public_indexers".to_string(),
+            name: "Prowlarr Public Indexers".to_string(),
+            version: "1.0.2".to_string(),
+            kind: ExtensionKind::Connector,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.connectors.prowlarr_public_indexers",
+                "version": "1.0.2",
+                "kind": "connector",
+                "name": "Prowlarr Public Indexers",
+                "targets": [{
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }],
+                "actions": [{
+                    "type": "driver_patch",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "patch": {
+                        "op": "register_indexers",
+                        "indexers": [
+                            {
+                                "name": "AnimeTosho",
+                                "implementation": "Torznab",
+                                "url": "https://feed.animetosho.org",
+                                "auth": { "requires_account": false },
+                                "tags": ["public"],
+                                "enabled": true
+                            },
+                            {
+                                "name": "SubsPlease",
+                                "implementation": "SubsPlease",
+                                "url": "https://subsplease.org/",
+                                "auth": { "requires_account": false },
+                                "tags": ["public"],
+                                "enabled": true
+                            }
+                        ]
+                    }
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let items = json
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let connector = items
+        .iter()
+        .find(|item| {
+            item.get("extensionId")
+                .and_then(Value::as_str)
+                == Some("elixir.connectors.prowlarr_public_indexers")
+        })
+        .expect("public indexer connector summary");
+
+    assert_eq!(
+        connector.get("severity").and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        connector.get("statusCode").and_then(Value::as_str),
+        Some("downstream_incomplete")
+    );
+    assert!(
+        connector
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("AnimeTosho"),
+        "expected missing downstream description: {connector}"
+    );
+
+    let _ = shutdown_tx.send(());
     Ok(())
 }
 
@@ -6113,8 +6412,8 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
 
-    let defaults_fields = payload
-        .pointer("/sections/2/fields")
+    let defaults_fields = control_surface_section(&payload, "defaults")
+        .get("fields")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -6135,8 +6434,8 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
         payload
     );
 
-    let entities = payload
-        .pointer("/sections/3/entities")
+    let entities = control_surface_section(&payload, "managedItems")
+        .get("entities")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -6471,8 +6770,8 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
 
-    let fields = payload
-        .pointer("/sections/2/fields")
+    let fields = control_surface_section(&payload, "defaults")
+        .get("fields")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -6498,6 +6797,267 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
         .unwrap_or(Value::Null);
     assert_eq!(stored.get("monitorOnAdd").and_then(Value::as_bool), Some(false));
     assert_eq!(stored.get("searchOnAdd").and_then(Value::as_bool), Some(false));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (prowlarr_host, prowlarr_addr, shutdown_tx) = start_mock_prowlarr_control_server(
+        vec![
+            json!({
+                "name": "AnimeTosho",
+                "implementation": "Torznab",
+                "enable": true,
+                "appProfileId": 1
+            }),
+            json!({
+                "name": "Private Tracker",
+                "implementation": "Torznab",
+                "enable": true,
+                "appProfileId": 1
+            }),
+        ],
+        vec![json!({ "name": "Sonarr" }), json!({ "name": "Radarr" })],
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            name: "Prowlarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.prowlarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Prowlarr",
+                "provides": [{
+                    "capability": "indexer.registry",
+                    "slot": "default",
+                    "implementation": "prowlarr"
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.prowlarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-prowlarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "indexer.registry".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("prowlarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": prowlarr_host,
+                "port": prowlarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.connectors.prowlarr_public_indexers".to_string(),
+            name: "Prowlarr Public Indexers".to_string(),
+            version: "1.0.2".to_string(),
+            kind: ExtensionKind::Connector,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.connectors.prowlarr_public_indexers",
+                "version": "1.0.2",
+                "kind": "connector",
+                "name": "Prowlarr Public Indexers",
+                "targets": [{
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }],
+                "actions": [{
+                    "type": "driver_patch",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "patch": {
+                        "op": "register_indexers",
+                        "indexers": [{
+                            "name": "AnimeTosho",
+                            "implementation": "Torznab",
+                            "url": "https://feed.animetosho.org",
+                            "enabled": true
+                        }]
+                    }
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.blueprints.arr_stack".to_string(),
+            name: "Arr Stack".to_string(),
+            version: "1.0.5".to_string(),
+            kind: ExtensionKind::Blueprint,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.blueprints.arr_stack",
+                "version": "1.0.5",
+                "kind": "blueprint",
+                "name": "Arr Stack",
+                "optional_addons": [{
+                    "extension_id": "elixir.connectors.prowlarr_nzbgeek",
+                    "title": "NZBGeek",
+                    "description": "Add NZBGeek to Prowlarr.",
+                    "required_fields": ["api_key"],
+                    "secret_key_prefix": "nzbgeek",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    }
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.prowlarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let managed_entities = control_surface_section(&payload, "managedIndexers")
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let anime_tosho = managed_entities
+        .iter()
+        .find(|entity| entity.get("title").and_then(Value::as_str) == Some("AnimeTosho"))
+        .expect("AnimeTosho managed indexer entity");
+    assert_eq!(
+        anime_tosho.get("subtitle").and_then(Value::as_str),
+        Some("Managed by Elixir via Prowlarr Public Indexers")
+    );
+    let private_tracker = managed_entities
+        .iter()
+        .find(|entity| entity.get("title").and_then(Value::as_str) == Some("Private Tracker"))
+        .expect("manual indexer entity");
+    assert_eq!(
+        private_tracker.get("subtitle").and_then(Value::as_str),
+        Some("Custom in Prowlarr")
+    );
+
+    let connector_entities = control_surface_section(&payload, "addConnector")
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let public_connector = connector_entities
+        .iter()
+        .find(|entity| {
+            entity.get("title").and_then(Value::as_str)
+                == Some("Prowlarr Public Indexers")
+        })
+        .expect("public connector entity");
+    assert_eq!(
+        public_connector.pointer("/actions/0/navigateExtensionId").and_then(Value::as_str),
+        Some("elixir.connectors.prowlarr_public_indexers")
+    );
+
+    let nzbgeek = connector_entities
+        .iter()
+        .find(|entity| entity.get("title").and_then(Value::as_str) == Some("NZBGeek"))
+        .expect("nzbgeek optional addon entity");
+    assert_eq!(
+        nzbgeek.pointer("/actions/0/id").and_then(Value::as_str),
+        Some("activate_connector")
+    );
+    assert_eq!(
+        nzbgeek.pointer("/actions/0/requiredFields/0").and_then(Value::as_str),
+        Some("api_key")
+    );
+    assert_eq!(
+        nzbgeek.pointer("/actions/0/secretKeys/0").and_then(Value::as_str),
+        Some("nzbgeek.api_key")
+    );
+
+    let manual_actions = control_surface_section(&payload, "manualSetup")
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        manual_actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("open_service_ui"))
+            .and_then(|action| action.get("label"))
+            .and_then(Value::as_str),
+        Some("Open Prowlarr UI")
+    );
+    assert!(
+        manual_actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("open_service_ui"))
+            .and_then(|action| action.get("openUrl"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains(&format!(":{}", prowlarr_addr.port())),
+        "expected manual section to expose Prowlarr URL: {}",
+        payload
+    );
 
     Ok(())
 }

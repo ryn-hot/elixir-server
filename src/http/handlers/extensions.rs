@@ -26,6 +26,7 @@ use crate::db::models::{
     ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
     OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
 };
+use crate::drivers::IndexerRegistryPatch;
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
@@ -377,6 +378,16 @@ pub struct ExtensionControlAction {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigate_extension_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_scope_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -864,7 +875,7 @@ pub async fn update_extension_control_surface_settings(
 ) -> ApiResult<Json<ExtensionControlSurface>> {
     let store = ExtensionStore::new(&state.db_pool);
     if !payload.values.is_empty() {
-        let context = load_extension_control_context(&store, &extension_id)
+        let context = load_extension_control_context(&state, &store, &extension_id)
             .await
             .map_err(ApiError::from)?;
         let extension_key = context.extension.extension_id.to_ascii_lowercase();
@@ -971,8 +982,18 @@ pub async fn install_extension(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
 ) -> ApiResult<Json<InstallResponse>> {
+    let response = install_extension_internal(&state, &payload)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn install_extension_internal(
+    state: &AppState,
+    payload: &InstallRequest,
+) -> anyhow::Result<InstallResponse> {
     let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
-    storage_paths.ensure_dirs().await.map_err(ApiError::from)?;
+    storage_paths.ensure_dirs().await?;
 
     let is_dev = state.settings.environment == RunEnvironment::Development;
     let allow_unsigned = is_dev && state.settings.extensions.allow_unsigned;
@@ -980,23 +1001,18 @@ pub async fn install_extension(
 
     let package_path = match (&payload.download_url, &payload.package_path) {
         (Some(_), Some(_)) => {
-            return Err(ApiError::bad_request(
-                "provide download_url or package_path, not both",
-            ));
+            anyhow::bail!("provide download_url or package_path, not both");
         }
         (Some(url), None) => download_package(url, &storage_paths.packages_dir)
-            .await
-            .map_err(ApiError::from)?,
+            .await?,
         (None, Some(path)) => PathBuf::from(path),
         (None, None) => {
-            return Err(ApiError::bad_request(
-                "download_url or package_path is required",
-            ));
+            anyhow::bail!("download_url or package_path is required");
         }
     };
 
     if !package_path.exists() {
-        return Err(ApiError::bad_request("package path does not exist"));
+        anyhow::bail!("package path does not exist");
     }
 
     let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
@@ -1006,38 +1022,35 @@ pub async fn install_extension(
     let mut package_hash = None;
     let staged = if package_path.is_dir() {
         if !allow_directory_install && !is_bundled_source {
-            return Err(ApiError::bad_request(
-                "directory installs are only allowed in development with extensions.allow_directory_install=true",
-            ));
+            anyhow::bail!(
+                "directory installs are only allowed in development with extensions.allow_directory_install=true"
+            );
         }
         if !allow_unsigned && !is_bundled_source {
-            return Err(ApiError::bad_request(
-                "unsigned installs are disabled; enable extensions.allow_unsigned for development",
-            ));
+            anyhow::bail!(
+                "unsigned installs are disabled; enable extensions.allow_unsigned for development"
+            );
         }
         copy_dir_recursive(&package_path, &staging_dir)
             .await
-            .map_err(|err| ApiError::internal(err.to_string()))?;
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         staging_dir.clone()
     } else if package_path.is_file() {
         let hash = compute_sha256(&package_path)
-            .await
-            .map_err(ApiError::from)?;
+            .await?;
         package_hash = Some(hash);
         unpack_package(&package_path, &staging_dir)
             .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?
     } else {
-        return Err(ApiError::bad_request(
-            "package path is not a file or directory",
-        ));
+        anyhow::bail!("package path is not a file or directory");
     };
 
     let PackageManifest {
         manifest, raw_json, ..
     } = read_manifest_from_dir(&staged)
         .await
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
 
     let registry_entry = if package_hash.is_some() {
         fetch_registry_entry(
@@ -1051,15 +1064,11 @@ pub async fn install_extension(
     };
     if let (Some(entry), Some(hash)) = (&registry_entry, package_hash.as_deref()) {
         if entry.id != manifest.id || entry.version != manifest.version {
-            return Err(ApiError::bad_request(
-                "manifest id/version does not match registry entry",
-            ));
+            anyhow::bail!("manifest id/version does not match registry entry");
         }
         if let Some(expected_hash) = entry.sha256.as_deref() {
             if !expected_hash.trim().eq_ignore_ascii_case(hash) {
-                return Err(ApiError::bad_request(
-                    "package hash does not match registry",
-                ));
+                anyhow::bail!("package hash does not match registry");
             }
         }
         if let (Some(reg_key), Some(manifest_key)) = (
@@ -1070,9 +1079,7 @@ pub async fn install_extension(
                 .and_then(|publisher| publisher.key_id.as_deref()),
         ) {
             if !reg_key.trim().eq_ignore_ascii_case(manifest_key.trim()) {
-                return Err(ApiError::bad_request(
-                    "publisher key mismatch between manifest and registry",
-                ));
+                anyhow::bail!("publisher key mismatch between manifest and registry");
             }
         }
     }
@@ -1090,17 +1097,16 @@ pub async fn install_extension(
     if let Some(hash) = package_hash.as_deref() {
         let package_signature = read_package_signature(&staged)
             .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         let signature = registry_entry
             .as_ref()
             .and_then(|entry| entry.signature.as_deref())
             .or(package_signature.as_deref());
         let has_material = signature.is_some() || publisher_key_id.is_some();
         if has_material {
-            verify_signature(hash, signature, publisher_key_id)
-                .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            verify_signature(hash, signature, publisher_key_id)?;
         } else if !allow_unsigned && !is_bundled_source {
-            return Err(ApiError::bad_request("package signature is required"));
+            anyhow::bail!("package signature is required");
         }
     }
 
@@ -1114,40 +1120,31 @@ pub async fn install_extension(
     let signing_key_id = publisher_key_id.take().map(|value| value.to_string());
 
     let policy = PermissionPolicy::new();
-    policy
-        .enforce(trust_level, &manifest.permissions, &manifest.id)
-        .map_err(|err| ApiError::forbidden(err.to_string()))?;
+    policy.enforce(trust_level, &manifest.permissions, &manifest.id)?;
 
     let new_version = Version::parse(&manifest.version)
-        .map_err(|_| ApiError::bad_request("extension version is not valid semver"))?;
+        .map_err(|_| anyhow::anyhow!("extension version is not valid semver"))?;
     let store = ExtensionStore::new(&state.db_pool);
     if let Some(existing) = store
         .get_extension(&manifest.id)
-        .await
-        .map_err(ApiError::from)?
+        .await?
     {
         validate_semver_upgrade(&existing, &new_version, package_hash.as_deref())?;
     }
-    let required = required_secrets_from_manifest(&manifest)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let required = required_secrets_from_manifest(&manifest)?;
     if !required.is_empty() {
         let instances = store
             .list_instances(Some(&manifest.id))
-            .await
-            .map_err(ApiError::from)?;
+            .await?;
         let instance_ids: Vec<_> = instances
             .into_iter()
             .filter(|instance| instance.enabled)
             .map(|instance| instance.instance_id)
             .collect();
         let missing = missing_required_secrets_for_instances(&store, &instance_ids, &required)
-            .await
-            .map_err(ApiError::from)?;
+            .await?;
         if !missing.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "missing required secrets: {}",
-                missing.join(", ")
-            )));
+            anyhow::bail!("missing required secrets: {}", missing.join(", "));
         }
     }
 
@@ -1159,16 +1156,16 @@ pub async fn install_extension(
     let extension_root = storage_paths.unpacked_dir.join(&extension_id);
     fs::create_dir_all(&extension_root)
         .await
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let unpacked_dir = extension_root.join(&version);
     if unpacked_dir.exists() {
         fs::remove_dir_all(&unpacked_dir)
             .await
-            .map_err(|err| ApiError::internal(err.to_string()))?;
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     }
     fs::rename(&staged, &unpacked_dir)
         .await
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
 
     store
         .upsert_extension(&NewExtension {
@@ -1183,17 +1180,16 @@ pub async fn install_extension(
             package_hash,
             enabled: true,
         })
-        .await
-        .map_err(ApiError::from)?;
+        .await?;
 
-    Ok(Json(InstallResponse {
+    Ok(InstallResponse {
         extension_id,
         name,
         version,
         kind,
         trust_level,
         enabled: true,
-    }))
+    })
 }
 
 pub async fn enable_extension(
@@ -1918,7 +1914,7 @@ pub async fn status_summary(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ExtensionStatusSummaryResponse>> {
     let store = ExtensionStore::new(&state.db_pool);
-    let response = build_extension_status_summary(&store)
+    let response = build_extension_status_summary(&state, &store)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(response))
@@ -2117,6 +2113,7 @@ async fn build_downloader_profile_response(
 }
 
 async fn build_extension_status_summary(
+    state: &AppState,
     store: &ExtensionStore<'_>,
 ) -> anyhow::Result<ExtensionStatusSummaryResponse> {
     let extensions = store.list_extensions().await?;
@@ -2186,7 +2183,16 @@ async fn build_extension_status_summary(
                 summarize_blueprint_extension(&extension, &pending_blueprints)
             }
             ExtensionKind::Connector => {
-                summarize_connector_extension(&extension, manifest.as_ref(), &available_targets)
+                summarize_connector_extension(
+                    state,
+                    store,
+                    &extension,
+                    manifest.as_ref(),
+                    &available_targets,
+                    &provider_instances_by_target,
+                    &providers_by_instance,
+                )
+                .await?
             }
             ExtensionKind::Module => {
                 summarize_module_extension(
@@ -2430,20 +2436,149 @@ fn addon_secret_key(
     }
 }
 
-fn summarize_connector_extension(
+fn normalize_connector_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+#[derive(Debug, Default)]
+struct ConnectorDownstreamVerification {
+    present: Vec<String>,
+    missing: Vec<String>,
+}
+
+async fn verify_connector_downstream_state(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    manifest: &ExtensionManifest,
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+    providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
+) -> anyhow::Result<Option<ConnectorDownstreamVerification>> {
+    let mut expected_indexers: Vec<String> = Vec::new();
+    let mut target_ref: Option<crate::extensions::manifest::ManifestCapabilityRef> = None;
+
+    for action in &manifest.actions {
+        if action.r#type != "driver_patch" {
+            continue;
+        }
+        let Some(target) = action.target.as_ref() else {
+            continue;
+        };
+        if target.capability != "indexer.registry" {
+            continue;
+        }
+        let Some(patch) = action.patch.as_ref() else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_value::<IndexerRegistryPatch>(patch.clone()) else {
+            continue;
+        };
+        if let IndexerRegistryPatch::RegisterIndexers { indexers } = parsed {
+            expected_indexers.extend(indexers.into_iter().map(|indexer| indexer.name));
+            target_ref = Some(target.clone());
+        }
+    }
+
+    if expected_indexers.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(target_ref) = target_ref else {
+        return Ok(None);
+    };
+    let Some(target_provider) = resolve_target_provider(
+        &target_ref,
+        provider_instances_by_target,
+        providers_by_instance,
+    ) else {
+        return Ok(None);
+    };
+    if target_provider.implementation.as_deref() != Some("prowlarr") {
+        return Ok(None);
+    }
+
+    let actual_names = list_prowlarr_indexer_names(state, store, target_provider).await?;
+    let actual_normalized: HashSet<String> = actual_names
+        .into_iter()
+        .map(|value| normalize_connector_name(&value))
+        .collect();
+
+    let mut verification = ConnectorDownstreamVerification::default();
+    for expected in expected_indexers {
+        if actual_normalized.contains(&normalize_connector_name(&expected)) {
+            verification.present.push(expected);
+        } else {
+            verification.missing.push(expected);
+        }
+    }
+    Ok(Some(verification))
+}
+
+fn resolve_target_provider<'a>(
+    target: &crate::extensions::manifest::ManifestCapabilityRef,
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+    providers_by_instance: &'a HashMap<Uuid, Vec<Provider>>,
+) -> Option<&'a Provider> {
+    let instance_ids =
+        provider_instances_by_target.get(&(target.capability.clone(), target.slot.clone()))?;
+    let mut unique = instance_ids.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != 1 {
+        return None;
+    }
+    let instance_id = *unique.first()?;
+    providers_by_instance
+        .get(&instance_id)?
+        .iter()
+        .find(|provider| provider.capability == target.capability && provider.slot_id == target.slot)
+}
+
+async fn list_prowlarr_indexer_names(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &Provider,
+) -> anyhow::Result<Vec<String>> {
+    let Some(instance) = store.get_instance(provider.instance_id).await? else {
+        anyhow::bail!("target provider instance is missing");
+    };
+    let api_key = resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
+        .await?;
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+    let value = request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("prowlarr indexer response was not an array"))?;
+    Ok(items
+        .iter()
+        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect())
+}
+
+async fn summarize_connector_extension(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
     extension: &Extension,
     manifest: Option<&ExtensionManifest>,
     available_targets: &HashSet<(String, String)>,
-) -> ExtensionStatusSummaryItem {
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+    providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
+) -> anyhow::Result<ExtensionStatusSummaryItem> {
     if !extension.enabled {
-        return disabled_extension_status(
+        return Ok(disabled_extension_status(
             extension,
             "disabled",
             "Disabled",
             "This connector is installed but turned off.",
             "enable",
             "Enable",
-        );
+        ));
     }
 
     let has_target = manifest
@@ -2455,24 +2590,78 @@ fn summarize_connector_extension(
         .unwrap_or(true);
 
     if !has_target {
-        return attention_extension_status(
+        return Ok(attention_extension_status(
             extension,
             "waiting_for_app",
             "Needs setup",
             "Install a compatible app to use this connector.",
             "finish_setup",
             "Finish setup",
-        );
+        ));
     }
 
-    ready_extension_status(
+    if let Some(manifest) = manifest {
+        let verification = match verify_connector_downstream_state(
+            state,
+            store,
+            manifest,
+            provider_instances_by_target,
+            providers_by_instance,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(attention_extension_status(
+                    extension,
+                    "downstream_verification_failed",
+                    "Needs attention",
+                    &format!(
+                        "Elixir could not verify this connector's downstream state yet: {err}"
+                    ),
+                    "open",
+                    "Open",
+                ));
+            }
+        };
+        if let Some(verification) = verification {
+            if !verification.missing.is_empty() {
+                return Ok(attention_extension_status(
+                    extension,
+                    "downstream_incomplete",
+                    "Needs attention",
+                    &format!(
+                        "Expected downstream items are missing: {}.",
+                        verification.missing.join(", ")
+                    ),
+                    "open",
+                    "Open",
+                ));
+            }
+
+            return Ok(ready_extension_status(
+                extension,
+                "ready",
+                "Ready",
+                &format!(
+                    "This connector is installed and managing {} downstream item{}.",
+                    verification.present.len(),
+                    if verification.present.len() == 1 { "" } else { "s" }
+                ),
+                "open",
+                "Open",
+            ));
+        }
+    }
+
+    Ok(ready_extension_status(
         extension,
         "ready",
         "Ready",
         "This connector is installed and ready for compatible apps.",
         "open",
         "Open",
-    )
+    ))
 }
 
 async fn summarize_module_extension(
@@ -2839,7 +3028,7 @@ async fn build_extension_control_surface(
     store: &ExtensionStore<'_>,
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlSurface> {
-    let context = load_extension_control_context(store, extension_id).await?;
+    let context = load_extension_control_context(state, store, extension_id).await?;
     let live_snapshot = load_extension_control_live_snapshot(state, store, &context)
         .await
         .unwrap_or_default();
@@ -2866,6 +3055,15 @@ async fn build_extension_control_surface(
         .and_then(|provider| provider.implementation.clone());
     let mut sections = Vec::new();
     if let Some(section) = build_extension_control_settings_section(state, store, &context).await? {
+        sections.push(section);
+    }
+    if let Some(section) = build_extension_control_prowlarr_indexers_section(state, store, &context).await? {
+        sections.push(section);
+    }
+    if let Some(section) = build_extension_control_prowlarr_connector_section(state, store, &context).await? {
+        sections.push(section);
+    }
+    if let Some(section) = build_extension_control_prowlarr_manual_section(&context).await? {
         sections.push(section);
     }
     if let Some(section) = build_extension_control_managed_items_section(store, &context).await? {
@@ -2895,7 +3093,414 @@ async fn build_extension_control_surface(
     })
 }
 
+fn is_indexer_registry_connector_manifest(manifest: &ExtensionManifest) -> bool {
+    manifest.actions.iter().any(|action| {
+        if action.r#type != "driver_patch" {
+            return false;
+        }
+        let Some(target) = action.target.as_ref() else {
+            return false;
+        };
+        if target.capability != "indexer.registry" {
+            return false;
+        }
+        let Some(patch) = action.patch.as_ref() else {
+            return false;
+        };
+        matches!(
+            serde_json::from_value::<IndexerRegistryPatch>(patch.clone()),
+            Ok(IndexerRegistryPatch::RegisterIndexers { .. })
+        )
+    })
+}
+
+fn managed_indexer_names_from_manifest(manifest: &ExtensionManifest) -> Vec<String> {
+    let mut names = Vec::new();
+    for action in &manifest.actions {
+        if action.r#type != "driver_patch" {
+            continue;
+        }
+        let Some(target) = action.target.as_ref() else {
+            continue;
+        };
+        if target.capability != "indexer.registry" {
+            continue;
+        }
+        let Some(patch) = action.patch.as_ref() else {
+            continue;
+        };
+        if let Ok(IndexerRegistryPatch::RegisterIndexers { indexers }) =
+            serde_json::from_value::<IndexerRegistryPatch>(patch.clone())
+        {
+            for indexer in indexers {
+                names.push(indexer.name);
+            }
+        }
+    }
+    names
+}
+
+fn normalized_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+async fn build_extension_control_prowlarr_indexers_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return Ok(None);
+    };
+    if provider.implementation.as_deref() != Some("prowlarr") {
+        return Ok(None);
+    }
+
+    let (base_url, api_key) = resolve_extension_control_arr_connection(state, store, context).await?;
+    let value = request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?;
+    let Some(indexers) = value.as_array() else {
+        return Ok(None);
+    };
+
+    let installed = store.list_extensions().await?;
+    let mut managed_by_name: HashMap<String, String> = HashMap::new();
+    for extension in &installed {
+        if !extension.enabled || extension.kind != ExtensionKind::Connector {
+            continue;
+        }
+        let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        else {
+            continue;
+        };
+        if !is_indexer_registry_connector_manifest(&manifest) {
+            continue;
+        }
+        for name in managed_indexer_names_from_manifest(&manifest) {
+            managed_by_name
+                .entry(normalized_name(&name))
+                .or_insert_with(|| extension.name.clone());
+        }
+    }
+
+    let mut entities = Vec::new();
+    for item in indexers {
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Indexer")
+            .to_string();
+        let normalized = normalized_name(&name);
+        let implementation = item
+            .get("implementation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+        let enabled = item
+            .get("enable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let ownership = managed_by_name.get(&normalized).cloned();
+        let subtitle = ownership
+            .as_ref()
+            .map(|connector| format!("Managed by Elixir via {connector}"))
+            .or_else(|| Some("Custom in Prowlarr".to_string()));
+        let mut details = vec![format!("Implementation: {implementation}")];
+        if let Some(app_profile_id) = item.get("appProfileId").and_then(serde_json::Value::as_i64) {
+            details.push(format!("App profile id {app_profile_id}"));
+        }
+        details.push(if enabled {
+            "Enabled".to_string()
+        } else {
+            "Disabled".to_string()
+        });
+        if ownership.is_none() {
+            details.push(
+                "Manual indexers are left alone by Elixir. Use the Prowlarr UI for site-specific login or custom tuning."
+                    .to_string(),
+            );
+        }
+        entities.push(ExtensionControlEntity {
+            id: name.clone(),
+            title: name,
+            subtitle,
+            details,
+            actions: Vec::new(),
+        });
+    }
+
+    entities.sort_by(|left, right| {
+        let left_manual = left
+            .subtitle
+            .as_deref()
+            .map(|value| value.starts_with("Custom"))
+            .unwrap_or(false);
+        let right_manual = right
+            .subtitle
+            .as_deref()
+            .map(|value| value.starts_with("Custom"))
+            .unwrap_or(false);
+        left_manual
+            .cmp(&right_manual)
+            .then_with(|| left.title.to_ascii_lowercase().cmp(&right.title.to_ascii_lowercase()))
+    });
+
+    Ok(Some(ExtensionControlSection {
+        id: "managedIndexers".to_string(),
+        title: "Managed indexers".to_string(),
+        description:
+            "Elixir-managed connectors keep known indexers aligned automatically. Indexers added manually in Prowlarr are shown here too, but Elixir will not overwrite or remove them."
+                .to_string(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }))
+}
+
+async fn build_extension_control_prowlarr_connector_section(
+    _state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return Ok(None);
+    };
+    if provider.implementation.as_deref() != Some("prowlarr") {
+        return Ok(None);
+    }
+
+    let selected_instance_id = context.selected_instance.as_ref().map(|instance| instance.instance_id);
+    let installed = store.list_extensions().await?;
+    let installed_by_id: HashMap<String, Extension> = installed
+        .iter()
+        .cloned()
+        .map(|extension| (extension.extension_id.clone(), extension))
+        .collect();
+
+    let mut entities = Vec::new();
+    let mut seen = HashSet::new();
+
+    for extension in &installed {
+        if extension.kind != ExtensionKind::Connector {
+            continue;
+        }
+        let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        else {
+            continue;
+        };
+        if !is_indexer_registry_connector_manifest(&manifest) {
+            continue;
+        }
+        seen.insert(extension.extension_id.clone());
+        let managed_names = managed_indexer_names_from_manifest(&manifest);
+        let subtitle = if extension.enabled {
+            Some("Managed by Elixir".to_string())
+        } else {
+            Some("Installed but disabled".to_string())
+        };
+        let details = if managed_names.is_empty() {
+            vec!["Indexer rules are defined by this connector.".to_string()]
+        } else {
+            vec![format!("Manages: {}", managed_names.join(", "))]
+        };
+        entities.push(ExtensionControlEntity {
+            id: extension.extension_id.clone(),
+            title: extension.name.clone(),
+            subtitle,
+            details,
+            actions: vec![if extension.enabled {
+                ExtensionControlAction {
+                    id: "open_connector".to_string(),
+                    label: "Open".to_string(),
+                    description: "Manage this connector in Elixir.".to_string(),
+                    kind: "secondary".to_string(),
+                    params: None,
+                    confirm_text: None,
+                    navigate_extension_id: Some(extension.extension_id.clone()),
+                    open_url: None,
+                    required_fields: Vec::new(),
+                    secret_keys: Vec::new(),
+                    secret_scope_instance_id: None,
+                }
+            } else {
+                ExtensionControlAction {
+                    id: "activate_connector".to_string(),
+                    label: "Enable".to_string(),
+                    description: "Enable this managed connector and reapply its rules."
+                        .to_string(),
+                    kind: "primary".to_string(),
+                    params: Some(json!({ "extensionId": extension.extension_id })),
+                    confirm_text: None,
+                    navigate_extension_id: None,
+                    open_url: None,
+                    required_fields: Vec::new(),
+                    secret_keys: Vec::new(),
+                    secret_scope_instance_id: selected_instance_id,
+                }
+            }],
+        });
+    }
+
+    for addon in collect_indexer_registry_optional_addons(&installed) {
+        if seen.contains(&addon.extension_id) {
+            continue;
+        }
+        let installed_extension = installed_by_id.get(&addon.extension_id);
+        let secret_keys: Vec<String> = addon
+            .required_fields
+            .iter()
+            .map(|field| addon_secret_key(&addon, field))
+            .collect();
+        let details = if addon.required_fields.is_empty() {
+            vec!["No credentials required.".to_string()]
+        } else {
+            vec![format!(
+                "Activation requires: {}",
+                addon.required_fields
+                    .iter()
+                    .map(|field| field.replace('_', " "))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )]
+        };
+        let action = if let Some(extension) = installed_extension {
+            if extension.enabled {
+                ExtensionControlAction {
+                    id: "open_connector".to_string(),
+                    label: "Open".to_string(),
+                    description: "Open this managed connector in Elixir.".to_string(),
+                    kind: "secondary".to_string(),
+                    params: None,
+                    confirm_text: None,
+                    navigate_extension_id: Some(extension.extension_id.clone()),
+                    open_url: None,
+                    required_fields: Vec::new(),
+                    secret_keys: Vec::new(),
+                    secret_scope_instance_id: None,
+                }
+            } else {
+                ExtensionControlAction {
+                    id: "activate_connector".to_string(),
+                    label: "Enable".to_string(),
+                    description: "Enable this managed connector and wire it into Prowlarr."
+                        .to_string(),
+                    kind: "primary".to_string(),
+                    params: Some(json!({ "extensionId": extension.extension_id })),
+                    confirm_text: None,
+                    navigate_extension_id: None,
+                    open_url: None,
+                    required_fields: addon.required_fields.clone(),
+                    secret_keys,
+                    secret_scope_instance_id: selected_instance_id,
+                }
+            }
+        } else {
+            ExtensionControlAction {
+                id: "activate_connector".to_string(),
+                label: "Activate".to_string(),
+                description: "Install this managed connector and wire it into Prowlarr."
+                    .to_string(),
+                kind: "primary".to_string(),
+                params: Some(json!({ "extensionId": addon.extension_id })),
+                confirm_text: None,
+                navigate_extension_id: None,
+                open_url: None,
+                required_fields: addon.required_fields.clone(),
+                secret_keys,
+                secret_scope_instance_id: selected_instance_id,
+            }
+        };
+        entities.push(ExtensionControlEntity {
+            id: addon.extension_id.clone(),
+            title: addon
+                .title
+                .clone()
+                .unwrap_or_else(|| addon.extension_id.clone()),
+            subtitle: Some("Available managed connector".to_string()),
+            details: if let Some(description) = addon.description.clone() {
+                let mut values = vec![description];
+                values.extend(details);
+                values
+            } else {
+                details
+            },
+            actions: vec![action],
+        });
+    }
+
+    entities.sort_by(|left, right| left.title.to_ascii_lowercase().cmp(&right.title.to_ascii_lowercase()));
+
+    Ok(Some(ExtensionControlSection {
+        id: "addConnector".to_string(),
+        title: "Add connector".to_string(),
+        description:
+            "Use managed connectors for curated indexer setups. Connectors keep their downstream Prowlarr entries aligned and let Elixir track whether they are actually working."
+                .to_string(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }))
+}
+
+fn collect_indexer_registry_optional_addons(
+    extensions: &[Extension],
+) -> Vec<crate::extensions::manifest::ManifestOptionalAddon> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for extension in extensions {
+        if extension.kind != ExtensionKind::Blueprint || !extension.enabled {
+            continue;
+        }
+        let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        else {
+            continue;
+        };
+        for addon in manifest.optional_addons {
+            let Some(target) = addon.target.as_ref() else {
+                continue;
+            };
+            if target.capability != "indexer.registry" {
+                continue;
+            }
+            if seen.insert(addon.extension_id.clone()) {
+                items.push(addon);
+            }
+        }
+    }
+    items
+}
+
+async fn build_extension_control_prowlarr_manual_section(
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return Ok(None);
+    };
+    if provider.implementation.as_deref() != Some("prowlarr") {
+        return Ok(None);
+    }
+
+    let mut actions = Vec::new();
+    if let Some(action) = build_extension_control_open_service_ui_action(context).await {
+        actions.push(action);
+    }
+
+    Ok(Some(ExtensionControlSection {
+        id: "manualSetup".to_string(),
+        title: "Manual setup".to_string(),
+        description:
+            "Use the native Prowlarr UI for trackers that need site-specific login, captcha, cookies, or settings Elixir does not own yet. Manual indexers remain visible in Elixir but are not overwritten."
+                .to_string(),
+        fields: Vec::new(),
+        entities: Vec::new(),
+        actions,
+    }))
+}
+
 async fn load_extension_control_context(
+    state: &AppState,
     store: &ExtensionStore<'_>,
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlContext> {
@@ -2903,7 +3508,7 @@ async fn load_extension_control_context(
         .get_extension(extension_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("extension not found"))?;
-    let summary = build_extension_status_summary(store)
+    let summary = build_extension_status_summary(state, store)
         .await?
         .items
         .into_iter()
@@ -3290,6 +3895,11 @@ fn build_extension_control_managed_item_entity(
             kind: "secondary".to_string(),
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: None,
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         });
         actions.push(ExtensionControlAction {
             id: "refresh_item".to_string(),
@@ -3298,6 +3908,11 @@ fn build_extension_control_managed_item_entity(
             kind: "secondary".to_string(),
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: None,
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         });
         actions.push(ExtensionControlAction {
             id: "remove_item".to_string(),
@@ -3307,6 +3922,11 @@ fn build_extension_control_managed_item_entity(
             kind: "danger".to_string(),
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: Some(format!("Remove {} from this manager?", title)),
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         });
     }
 
@@ -3336,6 +3956,11 @@ fn build_extension_control_manager_actions(
             kind: "secondary".to_string(),
             params: None,
             confirm_text: None,
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         },
         ExtensionControlAction {
             id: "search_missing".to_string(),
@@ -3345,6 +3970,11 @@ fn build_extension_control_manager_actions(
             kind: "primary".to_string(),
             params: None,
             confirm_text: None,
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         },
     ]
 }
@@ -3429,10 +4059,44 @@ fn build_extension_control_actions(
             kind: "primary".to_string(),
             params: None,
             confirm_text: None,
+            navigate_extension_id: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
         }];
     }
 
     Vec::new()
+}
+
+async fn build_extension_control_open_service_ui_action(
+    context: &ExtensionControlContext,
+) -> Option<ExtensionControlAction> {
+    let provider = context.selected_provider.as_ref()?;
+    if provider.implementation.as_deref() != Some("prowlarr") {
+        return None;
+    }
+    let instance = context.selected_instance.as_ref()?;
+    let endpoint_json = provider.endpoint_json.clone()?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json).ok()?;
+    let base_url = resolve_control_provider_transport_base_url(instance.instance_id, &endpoint)
+        .await
+        .ok()?;
+    Some(ExtensionControlAction {
+        id: "open_service_ui".to_string(),
+        label: "Open Prowlarr UI".to_string(),
+        description: "Open the native Prowlarr UI for advanced or site-specific setup."
+            .to_string(),
+        kind: "secondary".to_string(),
+        params: None,
+        confirm_text: None,
+        navigate_extension_id: None,
+        open_url: Some(base_url),
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    })
 }
 
 fn control_text_field(
@@ -3462,7 +4126,7 @@ async fn execute_extension_control_action(
     action_id: &str,
     params: &HashMap<String, serde_json::Value>,
 ) -> anyhow::Result<String> {
-    let context = load_extension_control_context(store, extension_id).await?;
+    let context = load_extension_control_context(state, store, extension_id).await?;
     let Some(provider) = context.selected_provider.as_ref() else {
         anyhow::bail!("no active provider is available for this extension yet");
     };
@@ -3561,8 +4225,64 @@ async fn execute_extension_control_action(
             }
             Ok(message)
         }
+        "activate_connector" => {
+            let target_extension_id = params
+                .get("extensionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("extensionId is required"))?;
+
+            let title = params
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(target_extension_id);
+
+            if let Some(existing) = store.get_extension(target_extension_id).await? {
+                if !existing.enabled {
+                    store.set_extension_enabled(target_extension_id, true).await?;
+                }
+            } else {
+                let entry = load_cached_registry_entry_by_extension_id(state, target_extension_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("connector is not available in the registry cache"))?;
+                install_extension_internal(
+                    state,
+                    &InstallRequest {
+                        download_url: Some(entry.download_url),
+                        package_path: None,
+                    },
+                )
+                .await?;
+            }
+
+            let config = ReconcileConfig::from_settings(&state.settings);
+            state.orchestrator.reconcile_once(&config).await?;
+            Ok(format!("{title} is now managed by Elixir."))
+        }
         _ => anyhow::bail!("unsupported control action '{action_id}'"),
     }
+}
+
+async fn load_cached_registry_entry_by_extension_id(
+    state: &AppState,
+    extension_id: &str,
+) -> anyhow::Result<Option<RegistryEntry>> {
+    let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+    let cache_store = RegistryCacheStore::new(storage_paths.registry_cache_dir.clone());
+    let cache = cache_store.load().await?;
+    Ok(cache.and_then(|cache| {
+        cache
+            .index
+            .extensions
+            .into_iter()
+            .filter(|entry| entry.id == extension_id)
+            .max_by(|left, right| {
+                Version::parse(&left.version)
+                    .ok()
+                    .cmp(&Version::parse(&right.version).ok())
+            })
+    }))
 }
 
 async fn load_extension_control_live_snapshot(
@@ -4400,13 +5120,11 @@ fn validate_semver_upgrade(
     existing: &Extension,
     new_version: &Version,
     package_hash: Option<&str>,
-) -> ApiResult<()> {
+) -> anyhow::Result<()> {
     let existing_version = Version::parse(&existing.version)
-        .map_err(|_| ApiError::bad_request("existing extension version is not valid semver"))?;
+        .map_err(|_| anyhow::anyhow!("existing extension version is not valid semver"))?;
     if new_version < &existing_version {
-        return Err(ApiError::bad_request(
-            "extension version downgrade is not allowed",
-        ));
+        anyhow::bail!("extension version downgrade is not allowed");
     }
     if new_version == &existing_version {
         if let (Some(existing_hash), Some(new_hash)) =
@@ -4416,9 +5134,7 @@ fn validate_semver_upgrade(
                 return Ok(());
             }
         }
-        return Err(ApiError::bad_request(
-            "extension version is already installed",
-        ));
+        anyhow::bail!("extension version is already installed");
     }
     Ok(())
 }
