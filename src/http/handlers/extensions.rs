@@ -5,12 +5,20 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::{
+    body::Bytes,
     Json,
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
+    http::{
+        HeaderMap as AxumHeaderMap, HeaderName as AxumHeaderName,
+        HeaderValue as AxumHeaderValue, Method, StatusCode, header as axum_header,
+    },
+    response::Response,
 };
 use base64::{Engine as _, engine::general_purpose};
 use rand::{RngCore, rngs::OsRng};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, HeaderMap as ReqwestHeaderMap, HeaderValue as ReqwestHeaderValue, USER_AGENT,
+};
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -44,6 +52,7 @@ use crate::extensions::store::{
     ExtensionStore, ManagedIngestIntent, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
     NewOperationStep, NewOrchestratorRun, NewSecret,
 };
+use crate::http::auth::CurrentUser;
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
 use crate::orchestrator::model::ProviderEndpoint;
@@ -380,6 +389,8 @@ pub struct ExtensionControlAction {
     pub confirm_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub navigate_extension_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigate_view: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -976,6 +987,139 @@ pub async fn run_extension_control_action(
         message,
         control_surface: surface,
     }))
+}
+
+pub async fn start_extension_ui_session(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    user: CurrentUser,
+) -> ApiResult<Response> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let instance = store
+        .get_instance(instance_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("extension instance not found"))?;
+    if !instance.enabled {
+        return Err(ApiError::conflict(
+            "the selected extension instance is not enabled",
+        ));
+    }
+
+    let (token, _) = state
+        .auth_service
+        .sign_access_token(user.user_id, user.session_id)
+        .map_err(ApiError::from)?;
+    let proxy_prefix = extension_ui_proxy_prefix(instance_id);
+    let cookie = format!(
+        "elixir_ui_token={token}; Path={proxy_prefix}; HttpOnly; SameSite=Lax"
+    );
+    let bootstrap_html = build_extension_ui_start_html(&proxy_prefix);
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum_header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(axum_header::CACHE_CONTROL, "no-cache, no-store")
+        .body(axum::body::Body::from(bootstrap_html))
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let cookie_header = AxumHeaderValue::from_str(&cookie)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    response
+        .headers_mut()
+        .append(axum_header::SET_COOKIE, cookie_header);
+    Ok(response)
+}
+
+fn build_extension_ui_start_html(proxy_prefix: &str) -> String {
+    let proxy_prefix_json =
+        serde_json::to_string(proxy_prefix).unwrap_or_else(|_| "\"/\"".to_string());
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <title>Opening extension UI…</title>
+</head>
+<body>
+  <p>Opening extension UI…</p>
+  <script>
+    (function() {{
+      const proxyPrefix = {proxy_prefix_json};
+      const scopePrefix = proxyPrefix.endsWith("/") ? proxyPrefix : proxyPrefix + "/";
+      const targetUrl = proxyPrefix + (proxyPrefix.indexOf("?") >= 0 ? "&" : "?") + "_elixir_ui=" + Date.now();
+
+      async function clearScopedBrowserState() {{
+        try {{
+          if ("serviceWorker" in navigator) {{
+            const registrations = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(registrations
+              .filter((registration) => String(registration.scope || "").indexOf(scopePrefix) >= 0)
+              .map((registration) => registration.unregister()));
+          }}
+        }} catch (_error) {{}}
+
+        try {{
+          if ("caches" in window) {{
+            const keys = await caches.keys();
+            await Promise.all(keys.map((key) => caches.delete(key)));
+          }}
+        }} catch (_error) {{}}
+
+        try {{
+          if ("sessionStorage" in window) {{
+            sessionStorage.clear();
+          }}
+        }} catch (_error) {{}}
+      }}
+
+      clearScopedBrowserState().finally(function() {{
+        window.location.replace(targetUrl);
+      }});
+    }})();
+  </script>
+  <noscript>
+    <meta http-equiv="refresh" content="0; url={proxy_prefix}">
+  </noscript>
+</body>
+</html>
+"#
+    )
+}
+
+pub async fn proxy_extension_ui_root(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    user: CurrentUser,
+    method: Method,
+    headers: AxumHeaderMap,
+    original_uri: OriginalUri,
+    body: Bytes,
+) -> ApiResult<Response> {
+    proxy_extension_ui_impl(
+        &state,
+        user,
+        instance_id,
+        String::new(),
+        method,
+        headers,
+        original_uri.0,
+        body,
+    )
+    .await
+}
+
+pub async fn proxy_extension_ui(
+    State(state): State<AppState>,
+    Path((instance_id, path)): Path<(Uuid, String)>,
+    user: CurrentUser,
+    method: Method,
+    headers: AxumHeaderMap,
+    original_uri: OriginalUri,
+    body: Bytes,
+) -> ApiResult<Response> {
+    proxy_extension_ui_impl(&state, user, instance_id, path, method, headers, original_uri.0, body)
+        .await
 }
 
 pub async fn install_extension(
@@ -3318,6 +3462,7 @@ async fn build_extension_control_prowlarr_connector_section(
                     params: None,
                     confirm_text: None,
                     navigate_extension_id: Some(extension.extension_id.clone()),
+                    navigate_view: None,
                     open_url: None,
                     required_fields: Vec::new(),
                     secret_keys: Vec::new(),
@@ -3333,6 +3478,7 @@ async fn build_extension_control_prowlarr_connector_section(
                     params: Some(json!({ "extensionId": extension.extension_id })),
                     confirm_text: None,
                     navigate_extension_id: None,
+                    navigate_view: None,
                     open_url: None,
                     required_fields: Vec::new(),
                     secret_keys: Vec::new(),
@@ -3374,6 +3520,7 @@ async fn build_extension_control_prowlarr_connector_section(
                     params: None,
                     confirm_text: None,
                     navigate_extension_id: Some(extension.extension_id.clone()),
+                    navigate_view: None,
                     open_url: None,
                     required_fields: Vec::new(),
                     secret_keys: Vec::new(),
@@ -3389,6 +3536,7 @@ async fn build_extension_control_prowlarr_connector_section(
                     params: Some(json!({ "extensionId": extension.extension_id })),
                     confirm_text: None,
                     navigate_extension_id: None,
+                    navigate_view: None,
                     open_url: None,
                     required_fields: addon.required_fields.clone(),
                     secret_keys,
@@ -3405,6 +3553,7 @@ async fn build_extension_control_prowlarr_connector_section(
                 params: Some(json!({ "extensionId": addon.extension_id })),
                 confirm_text: None,
                 navigate_extension_id: None,
+                navigate_view: None,
                 open_url: None,
                 required_fields: addon.required_fields.clone(),
                 secret_keys,
@@ -3439,7 +3588,25 @@ async fn build_extension_control_prowlarr_connector_section(
                 .to_string(),
         fields: Vec::new(),
         entities,
-        actions: Vec::new(),
+        actions: vec![ExtensionControlAction {
+            id: "browse_marketplace".to_string(),
+            label: "Browse indexer connectors".to_string(),
+            description: "Open the Extensions marketplace filtered to managed indexer connectors."
+                .to_string(),
+            kind: "secondary".to_string(),
+            params: Some(json!({
+                "marketplaceKind": "connector",
+                "marketplaceTargetCapability": "indexer.registry",
+                "marketplaceFilterLabel": "Indexer connectors"
+            })),
+            confirm_text: None,
+            navigate_extension_id: None,
+            navigate_view: Some("extensions_marketplace".to_string()),
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
+        }],
     }))
 }
 
@@ -3896,6 +4063,7 @@ fn build_extension_control_managed_item_entity(
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: None,
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -3909,6 +4077,7 @@ fn build_extension_control_managed_item_entity(
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: None,
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -3923,6 +4092,7 @@ fn build_extension_control_managed_item_entity(
             params: Some(json!({ "intentId": intent.intent_id.to_string() })),
             confirm_text: Some(format!("Remove {} from this manager?", title)),
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -3957,6 +4127,7 @@ fn build_extension_control_manager_actions(
             params: None,
             confirm_text: None,
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -3971,6 +4142,7 @@ fn build_extension_control_manager_actions(
             params: None,
             confirm_text: None,
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -4060,6 +4232,7 @@ fn build_extension_control_actions(
             params: None,
             confirm_text: None,
             navigate_extension_id: None,
+            navigate_view: None,
             open_url: None,
             required_fields: Vec::new(),
             secret_keys: Vec::new(),
@@ -4078,11 +4251,10 @@ async fn build_extension_control_open_service_ui_action(
         return None;
     }
     let instance = context.selected_instance.as_ref()?;
-    let endpoint_json = provider.endpoint_json.clone()?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json).ok()?;
-    let base_url = resolve_control_provider_transport_base_url(instance.instance_id, &endpoint)
-        .await
-        .ok()?;
+    let start_path = format!(
+        "/api/v1/extensions/instances/{}/ui/start",
+        instance.instance_id
+    );
     Some(ExtensionControlAction {
         id: "open_service_ui".to_string(),
         label: "Open Prowlarr UI".to_string(),
@@ -4092,11 +4264,329 @@ async fn build_extension_control_open_service_ui_action(
         params: None,
         confirm_text: None,
         navigate_extension_id: None,
-        open_url: Some(base_url),
+        navigate_view: None,
+        open_url: Some(start_path),
         required_fields: Vec::new(),
         secret_keys: Vec::new(),
         secret_scope_instance_id: None,
     })
+}
+
+fn extension_ui_proxy_prefix(instance_id: Uuid) -> String {
+    format!("/api/v1/extensions/instances/{instance_id}/ui")
+}
+
+struct ExtensionUiProxyTarget {
+    implementation: String,
+    base_url: String,
+    proxy_prefix: String,
+    api_key: Option<String>,
+}
+
+async fn resolve_extension_ui_proxy_target(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<ExtensionUiProxyTarget> {
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("extension instance not found"))?;
+    if !instance.enabled {
+        anyhow::bail!("extension instance is not enabled");
+    }
+
+    let providers = store.list_providers(Some(instance_id)).await?;
+    let provider = providers
+        .into_iter()
+        .find(|provider| provider.endpoint_json.is_some())
+        .ok_or_else(|| anyhow::anyhow!("extension instance does not expose a reachable service"))?;
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is not available"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url = resolve_control_provider_transport_base_url(instance_id, &endpoint).await?;
+    let implementation = provider.implementation.unwrap_or_default();
+    let implementation_key = implementation.trim().to_ascii_lowercase();
+    let api_key = match implementation_key.as_str() {
+        "prowlarr" => Some(
+            resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
+                .await?,
+        ),
+        "sonarr" => Some(
+            resolve_control_api_key(state, store, &instance, &["sonarr_api_key", "api_key"])
+                .await?,
+        ),
+        "radarr" => Some(
+            resolve_control_api_key(state, store, &instance, &["radarr_api_key", "api_key"])
+                .await?,
+        ),
+        "bazarr" => Some(
+            resolve_control_api_key(state, store, &instance, &["bazarr_api_key", "api_key"])
+                .await?,
+        ),
+        _ => None,
+    };
+
+    Ok(ExtensionUiProxyTarget {
+        implementation: implementation_key,
+        base_url,
+        proxy_prefix: extension_ui_proxy_prefix(instance_id),
+        api_key,
+    })
+}
+
+async fn proxy_extension_ui_impl(
+    state: &AppState,
+    _user: CurrentUser,
+    instance_id: Uuid,
+    path: String,
+    method: Method,
+    headers: AxumHeaderMap,
+    original_uri: axum::http::Uri,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let target = resolve_extension_ui_proxy_target(state, &store, instance_id)
+        .await
+        .map_err(ApiError::from)?;
+    let upstream_url =
+        build_extension_ui_proxy_url(&target.base_url, &path, original_uri.query()).map_err(ApiError::from)?;
+    let client = build_extension_ui_proxy_client(&target).map_err(ApiError::from)?;
+    let reqwest_method =
+        ReqwestMethod::from_bytes(method.as_str().as_bytes()).map_err(anyhow::Error::from).map_err(ApiError::from)?;
+    let mut request = client
+        .request(reqwest_method, upstream_url)
+        .headers(build_extension_ui_request_headers(&headers));
+    if !body.is_empty() && method != Method::GET && method != Method::HEAD {
+        request = request.body(body.to_vec());
+    }
+
+    let upstream = request.send().await.map_err(anyhow::Error::from).map_err(ApiError::from)?;
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    let mut response_headers = AxumHeaderMap::new();
+    copy_extension_ui_response_headers(
+        &upstream_headers,
+        &mut response_headers,
+        &target.base_url,
+        &target.proxy_prefix,
+    );
+
+    let content_type = upstream_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body_bytes = upstream.bytes().await.map_err(anyhow::Error::from).map_err(ApiError::from)?;
+    let normalized_path = path.trim_matches('/');
+    let response_bytes = if content_type.to_ascii_lowercase().contains("text/html") {
+        rewrite_extension_ui_html(&body_bytes, &target.proxy_prefix).into_bytes()
+    } else if normalized_path.eq_ignore_ascii_case("initialize.json") {
+        rewrite_extension_ui_initialize_json(&body_bytes, &target.proxy_prefix).into_bytes()
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+        .body(axum::body::Body::from(response_bytes))
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    *response.headers_mut() = response_headers;
+    Ok(response)
+}
+
+fn build_extension_ui_proxy_url(
+    base_url: &str,
+    path: &str,
+    query: Option<&str>,
+) -> anyhow::Result<Url> {
+    let normalized_path = path.trim_matches('/');
+    let upstream_path = if normalized_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized_path}")
+    };
+    let mut url = build_extension_control_url(base_url, &upstream_path)?;
+    url.set_query(query);
+    Ok(url)
+}
+
+fn build_extension_ui_proxy_client(target: &ExtensionUiProxyTarget) -> anyhow::Result<Client> {
+    let mut headers = ReqwestHeaderMap::new();
+    headers.insert(USER_AGENT, ReqwestHeaderValue::from_static("Elixir/1.0"));
+    if let Some(api_key) = target.api_key.as_deref() {
+        headers.insert(
+            "X-Api-Key",
+            ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
+        );
+    }
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+        .map_err(anyhow::Error::from)
+}
+
+fn build_extension_ui_request_headers(source: &AxumHeaderMap) -> ReqwestHeaderMap {
+    let mut headers = ReqwestHeaderMap::new();
+    const FORWARDED_HEADERS: &[&str] = &[
+        "accept",
+        "accept-language",
+        "content-type",
+        "origin",
+        "referer",
+        "user-agent",
+        "x-requested-with",
+    ];
+
+    for key in FORWARDED_HEADERS {
+        if let Some(value) = source.get(*key) {
+            if let Ok(value) = ReqwestHeaderValue::from_bytes(value.as_bytes()) {
+                headers.insert(*key, value);
+            }
+        }
+    }
+    headers
+}
+
+fn copy_extension_ui_response_headers(
+    source: &ReqwestHeaderMap,
+    target: &mut AxumHeaderMap,
+    base_url: &str,
+    proxy_prefix: &str,
+) {
+    for header_name in [
+        reqwest::header::CACHE_CONTROL,
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::ETAG,
+        reqwest::header::LAST_MODIFIED,
+    ] {
+        if let Some(value) = source.get(&header_name) {
+            if let (Ok(name), Ok(value)) = (
+                AxumHeaderName::from_bytes(header_name.as_str().as_bytes()),
+                AxumHeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                target.insert(name, value);
+            }
+        }
+    }
+
+    if let Some(location) = source.get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok())
+    {
+        let rewritten = rewrite_extension_ui_location(location, base_url, proxy_prefix);
+        if let Ok(value) = AxumHeaderValue::from_str(&rewritten) {
+            target.insert(axum_header::LOCATION, value);
+        }
+    }
+}
+
+fn rewrite_extension_ui_location(location: &str, base_url: &str, proxy_prefix: &str) -> String {
+    if location.starts_with(proxy_prefix) {
+        return location.to_string();
+    }
+    if let Some(rest) = location.strip_prefix(base_url) {
+        let rest = rest.trim_start_matches('/');
+        return if rest.is_empty() {
+            proxy_prefix.to_string()
+        } else {
+            format!("{proxy_prefix}/{rest}")
+        };
+    }
+    if let Some(rest) = location.strip_prefix('/') {
+        return if rest.is_empty() {
+            proxy_prefix.to_string()
+        } else {
+            format!("{proxy_prefix}/{rest}")
+        };
+    }
+    location.to_string()
+}
+
+fn rewrite_extension_ui_html(bytes: &[u8], proxy_prefix: &str) -> String {
+    let html = String::from_utf8_lossy(bytes).into_owned();
+    let prefix = format!("{proxy_prefix}/");
+    html.replace("urlBase: ''", &format!("urlBase: '{proxy_prefix}'"))
+        .replace("urlBase:\"\"", &format!("urlBase:\"{proxy_prefix}\""))
+        .replace("href=\"/", &format!("href=\"{prefix}"))
+        .replace("src=\"/", &format!("src=\"{prefix}"))
+        .replace("action=\"/", &format!("action=\"{prefix}"))
+        .replace("content=\"/", &format!("content=\"{prefix}"))
+        .replace("href='/", &format!("href='{prefix}"))
+        .replace("src='/", &format!("src='{prefix}"))
+        .replace("action='/", &format!("action='{prefix}"))
+        .replace("content='/", &format!("content='{prefix}"))
+}
+
+fn rewrite_extension_ui_initialize_json(bytes: &[u8], proxy_prefix: &str) -> String {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+
+    object.insert(
+        "urlBase".to_string(),
+        serde_json::Value::String(proxy_prefix.to_string()),
+    );
+
+    if let Some(api_root) = object.get("apiRoot").and_then(|value| value.as_str()) {
+        let rewritten_api_root = if api_root.starts_with(proxy_prefix) {
+            api_root.to_string()
+        } else if api_root.starts_with('/') {
+            format!("{proxy_prefix}{api_root}")
+        } else {
+            format!("{proxy_prefix}/{api_root}")
+        };
+        object.insert(
+            "apiRoot".to_string(),
+            serde_json::Value::String(rewritten_api_root),
+        );
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(test)]
+mod extension_ui_proxy_tests {
+    use super::{build_extension_ui_start_html, rewrite_extension_ui_initialize_json};
+    use serde_json::Value;
+
+    #[test]
+    fn start_html_bootstrap_targets_proxy_prefix() {
+        let html =
+            build_extension_ui_start_html("/api/v1/extensions/instances/test-instance/ui");
+        assert!(html.contains("Opening extension UI"));
+        assert!(html.contains("serviceWorker"));
+        assert!(html.contains("caches.keys()"));
+        assert!(html.contains("/api/v1/extensions/instances/test-instance/ui"));
+    }
+
+    #[test]
+    fn rewrites_initialize_json_to_proxy_prefix() {
+        let body = br#"{
+            "apiRoot": "/api/v1",
+            "urlBase": "",
+            "instanceName": "Prowlarr"
+        }"#;
+
+        let rewritten = rewrite_extension_ui_initialize_json(
+            body,
+            "/api/v1/extensions/instances/test-instance/ui",
+        );
+        let value: Value = serde_json::from_str(&rewritten).expect("valid rewritten json");
+
+        assert_eq!(
+            value.get("urlBase").and_then(Value::as_str),
+            Some("/api/v1/extensions/instances/test-instance/ui")
+        );
+        assert_eq!(
+            value.get("apiRoot").and_then(Value::as_str),
+            Some("/api/v1/extensions/instances/test-instance/ui/api/v1")
+        );
+    }
 }
 
 fn control_text_field(
@@ -4827,13 +5317,13 @@ async fn run_control_docker_stdout(args: &[&str]) -> anyhow::Result<String> {
 }
 
 fn build_extension_control_arr_client(api_key: &str) -> anyhow::Result<Client> {
-    let mut headers = HeaderMap::new();
+    let mut headers = ReqwestHeaderMap::new();
     headers.insert(
         "X-Api-Key",
-        HeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
+        ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
     );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(USER_AGENT, ReqwestHeaderValue::from_static("Elixir/1.0"));
+    headers.insert(ACCEPT, ReqwestHeaderValue::from_static("application/json"));
     Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .default_headers(headers)

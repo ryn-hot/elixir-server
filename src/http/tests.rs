@@ -7054,8 +7054,19 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
             .and_then(|action| action.get("openUrl"))
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .contains(&format!(":{}", prowlarr_addr.port())),
-        "expected manual section to expose Prowlarr URL: {}",
+            .contains("/api/v1/extensions/instances/"),
+        "expected manual section to expose proxied Elixir UI entrypoint: {}",
+        payload
+    );
+    assert!(
+        manual_actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("open_service_ui"))
+            .and_then(|action| action.get("openUrl"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .ends_with("/ui/start"),
+        "expected manual section to expose proxied start path: {}",
         payload
     );
 

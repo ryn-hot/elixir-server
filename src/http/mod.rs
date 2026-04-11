@@ -5,7 +5,7 @@ pub mod handlers;
 use axum::{
     Router,
     http::{Method, header},
-    routing::{delete, get, patch, post},
+    routing::{any, delete, get, patch, post},
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -33,6 +33,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/extensions/:id/control-surface/actions/:action_id",
             post(handlers::extensions::run_extension_control_action),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id/ui/start",
+            get(handlers::extensions::start_extension_ui_session),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id/ui",
+            any(handlers::extensions::proxy_extension_ui_root),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id/ui/",
+            any(handlers::extensions::proxy_extension_ui_root),
+        )
+        .route(
+            "/api/v1/extensions/instances/:id/ui/*path",
+            any(handlers::extensions::proxy_extension_ui),
         )
         .route(
             "/api/v1/extensions/registries/refresh",

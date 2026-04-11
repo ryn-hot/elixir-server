@@ -8,6 +8,7 @@ use quick_xml::events::Event;
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Url;
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::AnyPool;
 use tokio::fs;
 use tokio::net::lookup_host;
@@ -933,6 +934,8 @@ impl<'a> Executor<'a> {
                 if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
                     upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
                         .await?;
+                    self.normalize_prowlarr_auth_config_if_needed(&provider, &key, &endpoint)
+                        .await?;
                     self.probe
                         .probe_dns(&endpoint.host)
                         .await
@@ -1109,6 +1112,69 @@ impl<'a> Executor<'a> {
             }
             _ => {}
         }
+
+        Ok(())
+    }
+
+    async fn normalize_prowlarr_auth_config_if_needed(
+        &self,
+        provider: &Provider,
+        api_key: &str,
+        endpoint: &ProviderEndpoint,
+    ) -> Result<()> {
+        if provider.capability != "indexer.registry"
+            || provider.implementation.as_deref() != Some("prowlarr")
+        {
+            return Ok(());
+        }
+
+        let Some(base_url) =
+            resolve_driver_transport_base_url(provider.instance_id, endpoint).await?
+        else {
+            return Ok(());
+        };
+        let url = Url::parse(&base_url)
+            .context("parsing prowlarr transport base url")?
+            .join("/api/v1/config/host")
+            .context("building prowlarr host config url")?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("building prowlarr host config client")?;
+
+        let mut config: Value = client
+            .get(url.clone())
+            .header("X-Api-Key", api_key)
+            .send()
+            .await
+            .context("fetching prowlarr host config")?
+            .error_for_status()
+            .context("prowlarr host config request failed")?
+            .json()
+            .await
+            .context("decoding prowlarr host config")?;
+
+        if !prowlarr_host_auth_config_requires_normalization(&config) {
+            return Ok(());
+        }
+
+        let object = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("prowlarr host config must be a JSON object"))?;
+        object.insert(
+            "authenticationRequired".to_string(),
+            Value::String("disabledForLocalAddresses".to_string()),
+        );
+
+        client
+            .put(url)
+            .header("X-Api-Key", api_key)
+            .json(&config)
+            .send()
+            .await
+            .context("updating prowlarr host config")?
+            .error_for_status()
+            .context("prowlarr host config update failed")?;
 
         Ok(())
     }
@@ -2217,6 +2283,26 @@ async fn read_prowlarr_api_key_from_config(config_dir: &str) -> Result<Option<St
     read_arr_api_key_from_config(config_dir).await
 }
 
+fn prowlarr_host_auth_config_requires_normalization(config: &Value) -> bool {
+    let Some(object) = config.as_object() else {
+        return false;
+    };
+    let authentication_method = object
+        .get("authenticationMethod")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let authentication_required = object
+        .get("authenticationRequired")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    authentication_method == "none" && authentication_required == "enabled"
+}
+
 async fn read_arr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
     let path = Path::new(config_dir).join("config.xml");
     let content = match fs::read_to_string(&path).await {
@@ -2893,6 +2979,18 @@ mod tests {
     use crate::orchestrator::naming::container_name;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::secrets::SecretsManager;
+
+    #[test]
+    fn detects_invalid_prowlarr_none_plus_enabled_auth_state() {
+        assert!(prowlarr_host_auth_config_requires_normalization(&json!({
+            "authenticationMethod": "none",
+            "authenticationRequired": "enabled"
+        })));
+        assert!(!prowlarr_host_auth_config_requires_normalization(&json!({
+            "authenticationMethod": "none",
+            "authenticationRequired": "disabledForLocalAddresses"
+        })));
+    }
 
     struct RecordingDriver {
         capability: &'static str,
