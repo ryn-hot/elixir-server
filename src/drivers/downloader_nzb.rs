@@ -92,6 +92,8 @@ impl CapabilityDriver for DownloaderNzbDriver {
                 temp_dir,
                 script_dir,
                 log_file,
+                web_dir,
+                config_template,
                 use_incomplete,
                 server_connections,
                 article_retries,
@@ -122,6 +124,8 @@ impl CapabilityDriver for DownloaderNzbDriver {
                         temp_dir,
                         script_dir,
                         log_file,
+                        web_dir,
+                        config_template,
                         use_incomplete,
                         server_connections,
                         article_retries,
@@ -154,6 +158,8 @@ impl CapabilityDriver for DownloaderNzbDriver {
                             temp_dir,
                             script_dir,
                             log_file,
+                            web_dir,
+                            config_template,
                             use_incomplete,
                             server_connections,
                             article_retries,
@@ -352,6 +358,8 @@ impl NzbgetClient {
         temp_dir: Option<String>,
         script_dir: Option<String>,
         log_file: Option<String>,
+        web_dir: Option<String>,
+        config_template: Option<String>,
         use_incomplete: Option<bool>,
         server_connections: Option<u64>,
         article_retries: Option<u64>,
@@ -390,6 +398,8 @@ impl NzbgetClient {
         push_string_update(&mut updates, "TempDir", temp_dir);
         push_string_update(&mut updates, "ScriptDir", script_dir);
         push_string_update(&mut updates, "LogFile", log_file);
+        push_string_update(&mut updates, "WebDir", web_dir);
+        push_string_update(&mut updates, "ConfigTemplate", config_template);
         if let Some(connections) = server_connections {
             updates.extend(server_connection_updates(&config, connections));
         }
@@ -706,6 +716,8 @@ async fn set_preferences_in_file(
     temp_dir: Option<String>,
     script_dir: Option<String>,
     log_file: Option<String>,
+    web_dir: Option<String>,
+    config_template: Option<String>,
     use_incomplete: Option<bool>,
     server_connections: Option<u64>,
     article_retries: Option<u64>,
@@ -732,6 +744,8 @@ async fn set_preferences_in_file(
     let temp_dir = canonicalize_nzbget_managed_path("TempDir", temp_dir);
     let script_dir = canonicalize_nzbget_managed_path("ScriptDir", script_dir);
     let log_file = canonicalize_nzbget_managed_path("LogFile", log_file);
+    let web_dir = canonicalize_nzbget_managed_path("WebDir", web_dir);
+    let config_template = canonicalize_nzbget_managed_path("ConfigTemplate", config_template);
     let mut updates = Vec::new();
     push_string_update(&mut updates, "MainDir", main_dir);
     if let Some(path) = default_save_path {
@@ -750,6 +764,8 @@ async fn set_preferences_in_file(
     push_string_update(&mut updates, "TempDir", temp_dir);
     push_string_update(&mut updates, "ScriptDir", script_dir);
     push_string_update(&mut updates, "LogFile", log_file);
+    push_string_update(&mut updates, "WebDir", web_dir);
+    push_string_update(&mut updates, "ConfigTemplate", config_template);
     if let Some(connections) = server_connections {
         updates.extend(server_connection_updates(&config.items, connections));
     }
@@ -782,6 +798,8 @@ fn canonicalize_nzbget_managed_path(key: &str, value: Option<String>) -> Option<
         ("TempDir", Some(_)) => Some("/config/tmp".to_string()),
         ("ScriptDir", Some(_)) => Some("/config/scripts".to_string()),
         ("LogFile", Some(_)) => Some("/config/nzbget.log".to_string()),
+        ("WebDir", Some(_)) => Some("/app/nzbget/webui".to_string()),
+        ("ConfigTemplate", Some(_)) => Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
         (_, other) => other,
     }
 }
@@ -1206,6 +1224,8 @@ mod tests {
                         temp_dir: Some("/downloads/.tmp".to_string()),
                         script_dir: Some("/config/scripts".to_string()),
                         log_file: Some("/config/nzbget.log".to_string()),
+                        web_dir: Some("/app/nzbget/webui".to_string()),
+                        config_template: Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
                         use_incomplete: Some(true),
                         server_connections: None,
                         article_retries: Some(3),
@@ -1257,6 +1277,8 @@ mod tests {
         assert!(rendered.contains("TempDir=/config/tmp"));
         assert!(rendered.contains("ScriptDir=/config/scripts"));
         assert!(rendered.contains("LogFile=/config/nzbget.log"));
+        assert!(rendered.contains("WebDir=/app/nzbget/webui"));
+        assert!(rendered.contains("ConfigTemplate=/app/nzbget/webui/nzbget.conf.template"));
         assert!(rendered.contains("LockFile=/config/nzbget.lock"));
         assert!(rendered.contains("Category1.Name=tv"));
         assert!(rendered.contains("Category1.DestDir=/downloads/tv"));

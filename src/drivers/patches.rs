@@ -376,6 +376,10 @@ pub enum DownloaderNzbPatch {
         #[serde(default)]
         log_file: Option<String>,
         #[serde(default)]
+        web_dir: Option<String>,
+        #[serde(default)]
+        config_template: Option<String>,
+        #[serde(default)]
         use_incomplete: Option<bool>,
         #[serde(default)]
         server_connections: Option<u64>,
@@ -433,6 +437,8 @@ impl DownloaderNzbPatch {
                 temp_dir,
                 script_dir,
                 log_file,
+                web_dir,
+                config_template,
                 use_incomplete,
                 server_connections,
                 article_retries,
@@ -460,6 +466,8 @@ impl DownloaderNzbPatch {
                     && temp_dir.is_none()
                     && script_dir.is_none()
                     && log_file.is_none()
+                    && web_dir.is_none()
+                    && config_template.is_none()
                     && use_incomplete.is_none()
                     && server_connections.is_none()
                     && article_retries.is_none()
@@ -489,6 +497,8 @@ impl DownloaderNzbPatch {
                 ensure_optional_non_empty(temp_dir.as_deref(), "temp_dir")?;
                 ensure_optional_non_empty(script_dir.as_deref(), "script_dir")?;
                 ensure_optional_non_empty(log_file.as_deref(), "log_file")?;
+                ensure_optional_non_empty(web_dir.as_deref(), "web_dir")?;
+                ensure_optional_non_empty(config_template.as_deref(), "config_template")?;
                 ensure_optional_non_empty(par_check.as_deref(), "par_check")?;
                 ensure_optional_non_empty(par_scan.as_deref(), "par_scan")?;
                 Ok(())
@@ -1076,6 +1086,8 @@ mod tests {
             temp_dir: None,
             script_dir: None,
             log_file: None,
+            web_dir: None,
+            config_template: None,
             use_incomplete: None,
             server_connections: None,
             article_retries: None,
@@ -1133,6 +1145,8 @@ mod tests {
             temp_dir: Some("/downloads/.tmp".to_string()),
             script_dir: Some("/config/scripts".to_string()),
             log_file: Some("/config/nzbget.log".to_string()),
+            web_dir: Some("/app/nzbget/webui".to_string()),
+            config_template: Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
             use_incomplete: None,
             server_connections: Some(20),
             article_retries: Some(3),

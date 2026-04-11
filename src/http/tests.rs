@@ -99,9 +99,9 @@ fn control_surface_section<'a>(payload: &'a Value, section_id: &str) -> &'a Valu
         .get("sections")
         .and_then(Value::as_array)
         .and_then(|sections| {
-            sections.iter().find(|section| {
-                section.get("id").and_then(Value::as_str) == Some(section_id)
-            })
+            sections
+                .iter()
+                .find(|section| section.get("id").and_then(Value::as_str) == Some(section_id))
         })
         .unwrap_or_else(|| panic!("missing control-surface section '{section_id}': {payload}"))
 }
@@ -301,9 +301,7 @@ fn discover_test_host_ip() -> Result<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
     socket.connect("8.8.8.8:80")?;
     let host = socket.local_addr()?.ip().to_string();
-    if host == "0.0.0.0"
-        || matches!(host.as_str(), "127.0.0.1" | "::1")
-    {
+    if host == "0.0.0.0" || matches!(host.as_str(), "127.0.0.1" | "::1") {
         anyhow::bail!("failed to discover a non-localhost test host ip");
     }
     Ok(host)
@@ -356,25 +354,27 @@ async fn start_mock_prowlarr_indexer_server(
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
-    let names = Arc::new(indexer_names.into_iter().map(str::to_string).collect::<Vec<_>>());
+    let names = Arc::new(
+        indexer_names
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    );
 
-    let app = Router::new()
-        .route(
-            "/api/v1/indexer",
-            get({
+    let app = Router::new().route(
+        "/api/v1/indexer",
+        get({
+            let names = Arc::clone(&names);
+            move || {
                 let names = Arc::clone(&names);
-                move || {
-                    let names = Arc::clone(&names);
-                    async move {
-                        Json(Value::Array(
-                            names.iter()
-                                .map(|name| json!({ "name": name }))
-                                .collect(),
-                        ))
-                    }
+                async move {
+                    Json(Value::Array(
+                        names.iter().map(|name| json!({ "name": name })).collect(),
+                    ))
                 }
-            }),
-        );
+            }
+        }),
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -462,8 +462,8 @@ struct MockArrControlState {
     deletes: Arc<Mutex<Vec<String>>>,
 }
 
-async fn start_mock_sonarr_control_server(
-) -> Result<(String, SocketAddr, MockArrControlState, oneshot::Sender<()>)> {
+async fn start_mock_sonarr_control_server()
+-> Result<(String, SocketAddr, MockArrControlState, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
@@ -1471,8 +1471,7 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
     let connector = items
         .iter()
         .find(|item| {
-            item.get("extensionId")
-                .and_then(Value::as_str)
+            item.get("extensionId").and_then(Value::as_str)
                 == Some("elixir.connectors.prowlarr_public_indexers")
         })
         .expect("public indexer connector summary");
@@ -2934,10 +2933,7 @@ async fn find_media_acquisition_lists_active_intents() -> Result<()> {
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
 
-    assert_eq!(
-        payload.get("activeCount").and_then(Value::as_u64),
-        Some(1)
-    );
+    assert_eq!(payload.get("activeCount").and_then(Value::as_u64), Some(1));
     assert_eq!(
         payload.get("downloadingCount").and_then(Value::as_u64),
         Some(0)
@@ -2947,9 +2943,7 @@ async fn find_media_acquisition_lists_active_intents() -> Result<()> {
         Some(0)
     );
     assert_eq!(
-        payload
-            .get("recentCompletedCount")
-            .and_then(Value::as_u64),
+        payload.get("recentCompletedCount").and_then(Value::as_u64),
         Some(0)
     );
 
@@ -2962,9 +2956,18 @@ async fn find_media_acquisition_lists_active_intents() -> Result<()> {
         items[0].get("intentId").and_then(Value::as_str),
         Some(intent_id.to_string().as_str())
     );
-    assert_eq!(items[0].get("title").and_then(Value::as_str), Some("Noble House"));
-    assert_eq!(items[0].get("mediaType").and_then(Value::as_str), Some("tv"));
-    assert_eq!(items[0].get("stage").and_then(Value::as_str), Some("requested"));
+    assert_eq!(
+        items[0].get("title").and_then(Value::as_str),
+        Some("Noble House")
+    );
+    assert_eq!(
+        items[0].get("mediaType").and_then(Value::as_str),
+        Some("tv")
+    );
+    assert_eq!(
+        items[0].get("stage").and_then(Value::as_str),
+        Some("requested")
+    );
     assert_eq!(
         items[0].get("stageLabel").and_then(Value::as_str),
         Some("Requested")
@@ -6158,9 +6161,7 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
         Some("Ready")
     );
     assert_eq!(
-        payload
-            .pointer("/actions/0/id")
-            .and_then(Value::as_str),
+        payload.pointer("/actions/0/id").and_then(Value::as_str),
         Some("test_connection")
     );
 
@@ -6172,17 +6173,46 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
     assert!(
         metrics
             .iter()
-            .any(|metric| metric.get("id").and_then(Value::as_str) == Some("seriesCount")
-                && metric.get("value").and_then(Value::as_str) == Some("2")),
+            .any(
+                |metric| metric.get("id").and_then(Value::as_str) == Some("seriesCount")
+                    && metric.get("value").and_then(Value::as_str) == Some("2")
+            ),
         "expected series count metric in control surface: {}",
         payload
     );
     assert!(
         metrics
             .iter()
-            .any(|metric| metric.get("id").and_then(Value::as_str) == Some("downloadClientCount")
-                && metric.get("value").and_then(Value::as_str) == Some("1")),
+            .any(
+                |metric| metric.get("id").and_then(Value::as_str) == Some("downloadClientCount")
+                    && metric.get("value").and_then(Value::as_str) == Some("1")
+            ),
         "expected download client count metric in control surface: {}",
+        payload
+    );
+
+    let open_ui_actions = control_surface_section(&payload, "manualSetup")
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        open_ui_actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("open_service_ui"))
+            .and_then(|action| action.get("label"))
+            .and_then(Value::as_str),
+        Some("Open Sonarr UI")
+    );
+    assert!(
+        open_ui_actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("open_service_ui"))
+            .and_then(|action| action.get("openUrl"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .ends_with("/ui/start"),
+        "expected Sonarr control surface to expose proxied UI start path: {}",
         payload
     );
 
@@ -6420,16 +6450,20 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
     assert!(
         defaults_fields
             .iter()
-            .any(|field| field.get("id").and_then(Value::as_str) == Some("monitorOnAdd")
-                && field.get("value").and_then(Value::as_bool) == Some(true)),
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("monitorOnAdd")
+                    && field.get("value").and_then(Value::as_bool) == Some(true)
+            ),
         "expected monitorOnAdd field in defaults section: {}",
         payload
     );
     assert!(
         defaults_fields
             .iter()
-            .any(|field| field.get("id").and_then(Value::as_str) == Some("searchOnAdd")
-                && field.get("value").and_then(Value::as_bool) == Some(true)),
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("searchOnAdd")
+                    && field.get("value").and_then(Value::as_bool) == Some(true)
+            ),
         "expected searchOnAdd field in defaults section: {}",
         payload
     );
@@ -6792,11 +6826,19 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
         payload
     );
     let stored = store
-        .get_extension_setting(&format!("extensions.control_defaults.instance.{instance_id}"))
+        .get_extension_setting(&format!(
+            "extensions.control_defaults.instance.{instance_id}"
+        ))
         .await?
         .unwrap_or(Value::Null);
-    assert_eq!(stored.get("monitorOnAdd").and_then(Value::as_bool), Some(false));
-    assert_eq!(stored.get("searchOnAdd").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        stored.get("monitorOnAdd").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        stored.get("searchOnAdd").and_then(Value::as_bool),
+        Some(false)
+    );
 
     Ok(())
 }
@@ -7008,12 +7050,13 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
     let public_connector = connector_entities
         .iter()
         .find(|entity| {
-            entity.get("title").and_then(Value::as_str)
-                == Some("Prowlarr Public Indexers")
+            entity.get("title").and_then(Value::as_str) == Some("Prowlarr Public Indexers")
         })
         .expect("public connector entity");
     assert_eq!(
-        public_connector.pointer("/actions/0/navigateExtensionId").and_then(Value::as_str),
+        public_connector
+            .pointer("/actions/0/navigateExtensionId")
+            .and_then(Value::as_str),
         Some("elixir.connectors.prowlarr_public_indexers")
     );
 
@@ -7026,11 +7069,15 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
         Some("activate_connector")
     );
     assert_eq!(
-        nzbgeek.pointer("/actions/0/requiredFields/0").and_then(Value::as_str),
+        nzbgeek
+            .pointer("/actions/0/requiredFields/0")
+            .and_then(Value::as_str),
         Some("api_key")
     );
     assert_eq!(
-        nzbgeek.pointer("/actions/0/secretKeys/0").and_then(Value::as_str),
+        nzbgeek
+            .pointer("/actions/0/secretKeys/0")
+            .and_then(Value::as_str),
         Some("nzbgeek.api_key")
     );
 

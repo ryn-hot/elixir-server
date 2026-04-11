@@ -5,26 +5,27 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::{
-    body::Bytes,
     Json,
+    body::Bytes,
     extract::{OriginalUri, Path, Query, State},
     http::{
-        HeaderMap as AxumHeaderMap, HeaderName as AxumHeaderName,
-        HeaderValue as AxumHeaderValue, Method, StatusCode, header as axum_header,
+        HeaderMap as AxumHeaderMap, HeaderName as AxumHeaderName, HeaderValue as AxumHeaderValue,
+        Method, StatusCode, header as axum_header,
     },
     response::Response,
 };
 use base64::{Engine as _, engine::general_purpose};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::header::{
-    ACCEPT, HeaderMap as ReqwestHeaderMap, HeaderValue as ReqwestHeaderValue, USER_AGENT,
+    ACCEPT, COOKIE as REQWEST_COOKIE, HOST as REQWEST_HOST, HeaderMap as ReqwestHeaderMap,
+    HeaderValue as ReqwestHeaderValue, USER_AGENT,
 };
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::net::lookup_host;
 use tokio::fs;
+use tokio::net::lookup_host;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -34,7 +35,7 @@ use crate::db::models::{
     ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
     OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
 };
-use crate::drivers::IndexerRegistryPatch;
+use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
@@ -54,8 +55,8 @@ use crate::extensions::store::{
 };
 use crate::http::auth::CurrentUser;
 use crate::http::error::{ApiError, ApiResult};
-use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
 use crate::orchestrator::model::ProviderEndpoint;
+use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
@@ -64,6 +65,8 @@ use crate::orchestrator::planner::{
 };
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::state::AppState;
+
+const EXTENSION_UI_TOKEN_TTL_MINUTES: u64 = 60 * 12;
 
 #[derive(Debug, Serialize)]
 pub struct CatalogResponse {
@@ -950,7 +953,7 @@ pub async fn update_extension_control_surface_settings(
                 _ => {
                     return Err(ApiError::conflict(
                         "downloaderProfile must be balanced or aggressive",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1008,12 +1011,14 @@ pub async fn start_extension_ui_session(
 
     let (token, _) = state
         .auth_service
-        .sign_access_token(user.user_id, user.session_id)
+        .sign_access_token_with_ttl_minutes(
+            user.user_id,
+            user.session_id,
+            EXTENSION_UI_TOKEN_TTL_MINUTES,
+        )
         .map_err(ApiError::from)?;
     let proxy_prefix = extension_ui_proxy_prefix(instance_id);
-    let cookie = format!(
-        "elixir_ui_token={token}; Path={proxy_prefix}; HttpOnly; SameSite=Lax"
-    );
+    let cookie = format!("elixir_ui_token={token}; Path={proxy_prefix}; HttpOnly; SameSite=Lax");
     let bootstrap_html = build_extension_ui_start_html(&proxy_prefix);
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -1021,8 +1026,8 @@ pub async fn start_extension_ui_session(
         .header(axum_header::CACHE_CONTROL, "no-cache, no-store")
         .body(axum::body::Body::from(bootstrap_html))
         .map_err(|err| ApiError::internal(err.to_string()))?;
-    let cookie_header = AxumHeaderValue::from_str(&cookie)
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let cookie_header =
+        AxumHeaderValue::from_str(&cookie).map_err(|err| ApiError::internal(err.to_string()))?;
     response
         .headers_mut()
         .append(axum_header::SET_COOKIE, cookie_header);
@@ -1047,7 +1052,59 @@ fn build_extension_ui_start_html(proxy_prefix: &str) -> String {
     (function() {{
       const proxyPrefix = {proxy_prefix_json};
       const scopePrefix = proxyPrefix.endsWith("/") ? proxyPrefix : proxyPrefix + "/";
-      const targetUrl = proxyPrefix + (proxyPrefix.indexOf("?") >= 0 ? "&" : "?") + "_elixir_ui=" + Date.now();
+      const targetUrl = scopePrefix;
+
+      function scopeCookiePaths() {{
+        const paths = ["/"];
+        let current = scopePrefix.endsWith("/") && scopePrefix.length > 1
+          ? scopePrefix.slice(0, -1)
+          : scopePrefix;
+        while (current && current !== "/") {{
+          paths.push(current);
+          const nextIndex = current.lastIndexOf("/");
+          current = nextIndex > 0 ? current.slice(0, nextIndex) : "/";
+        }}
+        if (scopePrefix !== "/") {{
+          paths.push(scopePrefix);
+        }}
+        return Array.from(new Set(paths.filter(Boolean)));
+      }}
+
+      async function clearScopedIndexedDb() {{
+        try {{
+          if (!("indexedDB" in window) || typeof indexedDB.databases !== "function") {{
+            return;
+          }}
+          const databases = await indexedDB.databases();
+          await Promise.all(databases
+            .map((database) => database && database.name)
+            .filter(Boolean)
+            .map((name) => new Promise((resolve) => {{
+              const request = indexedDB.deleteDatabase(name);
+              request.onsuccess = () => resolve();
+              request.onerror = () => resolve();
+              request.onblocked = () => resolve();
+            }})));
+        }} catch (_error) {{}}
+      }}
+
+      function clearScopedCookies() {{
+        try {{
+          const cookiePairs = String(document.cookie || "")
+            .split(";")
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+            .map((entry) => entry.split("=")[0])
+            .filter(Boolean);
+          const cookiePaths = scopeCookiePaths();
+          const expired = "Thu, 01 Jan 1970 00:00:00 GMT";
+          cookiePairs.forEach((name) => {{
+            cookiePaths.forEach((path) => {{
+              document.cookie = name + "=; expires=" + expired + "; path=" + path + "; SameSite=Lax";
+            }});
+          }});
+        }} catch (_error) {{}}
+      }}
 
       async function clearScopedBrowserState() {{
         try {{
@@ -1067,10 +1124,19 @@ fn build_extension_ui_start_html(proxy_prefix: &str) -> String {
         }} catch (_error) {{}}
 
         try {{
+          if ("localStorage" in window) {{
+            localStorage.clear();
+          }}
+        }} catch (_error) {{}}
+
+        try {{
           if ("sessionStorage" in window) {{
             sessionStorage.clear();
           }}
         }} catch (_error) {{}}
+
+        clearScopedCookies();
+        await clearScopedIndexedDb();
       }}
 
       clearScopedBrowserState().finally(function() {{
@@ -1096,6 +1162,19 @@ pub async fn proxy_extension_ui_root(
     original_uri: OriginalUri,
     body: Bytes,
 ) -> ApiResult<Response> {
+    if !original_uri.0.path().ends_with('/') {
+        let redirect_location = match original_uri.0.query() {
+            Some(query) if !query.is_empty() => format!("{}/?{}", original_uri.0.path(), query),
+            _ => format!("{}/", original_uri.0.path()),
+        };
+        return Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(axum_header::LOCATION, redirect_location)
+            .header(axum_header::CACHE_CONTROL, "no-cache, no-store")
+            .body(axum::body::Body::empty())
+            .map_err(|err| ApiError::internal(err.to_string()));
+    }
+
     proxy_extension_ui_impl(
         &state,
         user,
@@ -1118,8 +1197,17 @@ pub async fn proxy_extension_ui(
     original_uri: OriginalUri,
     body: Bytes,
 ) -> ApiResult<Response> {
-    proxy_extension_ui_impl(&state, user, instance_id, path, method, headers, original_uri.0, body)
-        .await
+    proxy_extension_ui_impl(
+        &state,
+        user,
+        instance_id,
+        path,
+        method,
+        headers,
+        original_uri.0,
+        body,
+    )
+    .await
 }
 
 pub async fn install_extension(
@@ -1147,8 +1235,7 @@ async fn install_extension_internal(
         (Some(_), Some(_)) => {
             anyhow::bail!("provide download_url or package_path, not both");
         }
-        (Some(url), None) => download_package(url, &storage_paths.packages_dir)
-            .await?,
+        (Some(url), None) => download_package(url, &storage_paths.packages_dir).await?,
         (None, Some(path)) => PathBuf::from(path),
         (None, None) => {
             anyhow::bail!("download_url or package_path is required");
@@ -1180,8 +1267,7 @@ async fn install_extension_internal(
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         staging_dir.clone()
     } else if package_path.is_file() {
-        let hash = compute_sha256(&package_path)
-            .await?;
+        let hash = compute_sha256(&package_path).await?;
         package_hash = Some(hash);
         unpack_package(&package_path, &staging_dir)
             .await
@@ -1269,24 +1355,19 @@ async fn install_extension_internal(
     let new_version = Version::parse(&manifest.version)
         .map_err(|_| anyhow::anyhow!("extension version is not valid semver"))?;
     let store = ExtensionStore::new(&state.db_pool);
-    if let Some(existing) = store
-        .get_extension(&manifest.id)
-        .await?
-    {
+    if let Some(existing) = store.get_extension(&manifest.id).await? {
         validate_semver_upgrade(&existing, &new_version, package_hash.as_deref())?;
     }
     let required = required_secrets_from_manifest(&manifest)?;
     if !required.is_empty() {
-        let instances = store
-            .list_instances(Some(&manifest.id))
-            .await?;
+        let instances = store.list_instances(Some(&manifest.id)).await?;
         let instance_ids: Vec<_> = instances
             .into_iter()
             .filter(|instance| instance.enabled)
             .map(|instance| instance.instance_id)
             .collect();
-        let missing = missing_required_secrets_for_instances(&store, &instance_ids, &required)
-            .await?;
+        let missing =
+            missing_required_secrets_for_instances(&store, &instance_ids, &required).await?;
         if !missing.is_empty() {
             anyhow::bail!("missing required secrets: {}", missing.join(", "));
         }
@@ -2674,7 +2755,9 @@ fn resolve_target_provider<'a>(
     providers_by_instance
         .get(&instance_id)?
         .iter()
-        .find(|provider| provider.capability == target.capability && provider.slot_id == target.slot)
+        .find(|provider| {
+            provider.capability == target.capability && provider.slot_id == target.slot
+        })
 }
 
 async fn list_prowlarr_indexer_names(
@@ -2685,8 +2768,8 @@ async fn list_prowlarr_indexer_names(
     let Some(instance) = store.get_instance(provider.instance_id).await? else {
         anyhow::bail!("target provider instance is missing");
     };
-    let api_key = resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
-        .await?;
+    let api_key =
+        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
     let endpoint_json = provider
         .endpoint_json
         .clone()
@@ -2790,7 +2873,11 @@ async fn summarize_connector_extension(
                 &format!(
                     "This connector is installed and managing {} downstream item{}.",
                     verification.present.len(),
-                    if verification.present.len() == 1 { "" } else { "s" }
+                    if verification.present.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 ),
                 "open",
                 "Open",
@@ -3182,7 +3269,8 @@ async fn build_extension_control_surface(
         details.push(context.summary.description.clone());
     }
     if context.selected_instance.is_none() && !context.instances.is_empty() {
-        details.push("Create or enable a default instance to manage this extension here.".to_string());
+        details
+            .push("Create or enable a default instance to manage this extension here.".to_string());
     }
     let status = ExtensionControlStatus {
         health: control_health_for_summary(&context.summary),
@@ -3201,13 +3289,17 @@ async fn build_extension_control_surface(
     if let Some(section) = build_extension_control_settings_section(state, store, &context).await? {
         sections.push(section);
     }
-    if let Some(section) = build_extension_control_prowlarr_indexers_section(state, store, &context).await? {
+    if let Some(section) =
+        build_extension_control_prowlarr_indexers_section(state, store, &context).await?
+    {
         sections.push(section);
     }
-    if let Some(section) = build_extension_control_prowlarr_connector_section(state, store, &context).await? {
+    if let Some(section) =
+        build_extension_control_prowlarr_connector_section(state, store, &context).await?
+    {
         sections.push(section);
     }
-    if let Some(section) = build_extension_control_prowlarr_manual_section(&context).await? {
+    if let Some(section) = build_extension_control_open_web_ui_section(&context).await? {
         sections.push(section);
     }
     if let Some(section) = build_extension_control_managed_items_section(store, &context).await? {
@@ -3225,7 +3317,10 @@ async fn build_extension_control_surface(
         kind: context.extension.kind.clone(),
         trust_level: context.extension.trust_level.clone(),
         enabled: context.extension.enabled,
-        instance_id: context.selected_instance.as_ref().map(|instance| instance.instance_id),
+        instance_id: context
+            .selected_instance
+            .as_ref()
+            .map(|instance| instance.instance_id),
         instance_name: context
             .selected_instance
             .as_ref()
@@ -3300,7 +3395,8 @@ async fn build_extension_control_prowlarr_indexers_section(
         return Ok(None);
     }
 
-    let (base_url, api_key) = resolve_extension_control_arr_connection(state, store, context).await?;
+    let (base_url, api_key) =
+        resolve_extension_control_arr_connection(state, store, context).await?;
     let value = request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?;
     let Some(indexers) = value.as_array() else {
         return Ok(None);
@@ -3384,9 +3480,11 @@ async fn build_extension_control_prowlarr_indexers_section(
             .as_deref()
             .map(|value| value.starts_with("Custom"))
             .unwrap_or(false);
-        left_manual
-            .cmp(&right_manual)
-            .then_with(|| left.title.to_ascii_lowercase().cmp(&right.title.to_ascii_lowercase()))
+        left_manual.cmp(&right_manual).then_with(|| {
+            left.title
+                .to_ascii_lowercase()
+                .cmp(&right.title.to_ascii_lowercase())
+        })
     });
 
     Ok(Some(ExtensionControlSection {
@@ -3413,7 +3511,10 @@ async fn build_extension_control_prowlarr_connector_section(
         return Ok(None);
     }
 
-    let selected_instance_id = context.selected_instance.as_ref().map(|instance| instance.instance_id);
+    let selected_instance_id = context
+        .selected_instance
+        .as_ref()
+        .map(|instance| instance.instance_id);
     let installed = store.list_extensions().await?;
     let installed_by_id: HashMap<String, Extension> = installed
         .iter()
@@ -3472,8 +3573,7 @@ async fn build_extension_control_prowlarr_connector_section(
                 ExtensionControlAction {
                     id: "activate_connector".to_string(),
                     label: "Enable".to_string(),
-                    description: "Enable this managed connector and reapply its rules."
-                        .to_string(),
+                    description: "Enable this managed connector and reapply its rules.".to_string(),
                     kind: "primary".to_string(),
                     params: Some(json!({ "extensionId": extension.extension_id })),
                     confirm_text: None,
@@ -3503,7 +3603,8 @@ async fn build_extension_control_prowlarr_connector_section(
         } else {
             vec![format!(
                 "Activation requires: {}",
-                addon.required_fields
+                addon
+                    .required_fields
                     .iter()
                     .map(|field| field.replace('_', " "))
                     .collect::<Vec<_>>()
@@ -3578,7 +3679,11 @@ async fn build_extension_control_prowlarr_connector_section(
         });
     }
 
-    entities.sort_by(|left, right| left.title.to_ascii_lowercase().cmp(&right.title.to_ascii_lowercase()));
+    entities.sort_by(|left, right| {
+        left.title
+            .to_ascii_lowercase()
+            .cmp(&right.title.to_ascii_lowercase())
+    });
 
     Ok(Some(ExtensionControlSection {
         id: "addConnector".to_string(),
@@ -3639,30 +3744,38 @@ fn collect_indexer_registry_optional_addons(
     items
 }
 
-async fn build_extension_control_prowlarr_manual_section(
+async fn build_extension_control_open_web_ui_section(
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Option<ExtensionControlSection>> {
-    let Some(provider) = context.selected_provider.as_ref() else {
+    let Some(action) = build_extension_control_open_service_ui_action(context).await else {
         return Ok(None);
     };
-    if provider.implementation.as_deref() != Some("prowlarr") {
-        return Ok(None);
-    }
-
-    let mut actions = Vec::new();
-    if let Some(action) = build_extension_control_open_service_ui_action(context).await {
-        actions.push(action);
-    }
+    let implementation = context
+        .selected_provider
+        .as_ref()
+        .and_then(|provider| provider.implementation.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let description = match implementation.as_str() {
+        "prowlarr" => {
+            "Use the native Prowlarr UI for trackers that need site-specific login, captcha, cookies, or settings Elixir does not own yet. Manual indexers remain visible in Elixir but are not overwritten."
+        }
+        "sonarr" | "radarr" | "bazarr" => {
+            "Use the native service UI for advanced settings Elixir does not manage yet."
+        }
+        "qbittorrent" | "nzbget" => {
+            "Use the native downloader UI for queue inspection or advanced service options Elixir does not manage yet."
+        }
+        _ => "Open the native service UI for advanced management.",
+    };
 
     Ok(Some(ExtensionControlSection {
         id: "manualSetup".to_string(),
-        title: "Manual setup".to_string(),
-        description:
-            "Use the native Prowlarr UI for trackers that need site-specific login, captcha, cookies, or settings Elixir does not own yet. Manual indexers remain visible in Elixir but are not overwritten."
-                .to_string(),
+        title: "Open web UI".to_string(),
+        description: description.to_string(),
         fields: Vec::new(),
         entities: Vec::new(),
-        actions,
+        actions: vec![action],
     }))
 }
 
@@ -3700,10 +3813,12 @@ async fn load_extension_control_context(
     })
 }
 
-fn choose_extension_control_instance(
-    instances: &[ExtensionInstance],
-) -> Option<ExtensionInstance> {
-    let mut enabled: Vec<_> = instances.iter().filter(|instance| instance.enabled).cloned().collect();
+fn choose_extension_control_instance(instances: &[ExtensionInstance]) -> Option<ExtensionInstance> {
+    let mut enabled: Vec<_> = instances
+        .iter()
+        .filter(|instance| instance.enabled)
+        .cloned()
+        .collect();
     enabled.sort_by(|left, right| {
         let left_default = left.instance_name.eq_ignore_ascii_case("default");
         let right_default = right.instance_name.eq_ignore_ascii_case("default");
@@ -3801,7 +3916,12 @@ fn build_extension_control_overview_section(
     if let Some(instance) = context.selected_instance.as_ref() {
         fields.insert(
             2,
-            control_text_field("instanceName", "Selected instance", "", instance.instance_name.clone()),
+            control_text_field(
+                "instanceName",
+                "Selected instance",
+                "",
+                instance.instance_name.clone(),
+            ),
         );
     }
 
@@ -4109,9 +4229,7 @@ fn build_extension_control_managed_item_entity(
     }
 }
 
-fn build_extension_control_manager_actions(
-    implementation: &str,
-) -> Vec<ExtensionControlAction> {
+fn build_extension_control_manager_actions(implementation: &str) -> Vec<ExtensionControlAction> {
     let search_label = if implementation == "sonarr" {
         "Search missing"
     } else {
@@ -4121,8 +4239,7 @@ fn build_extension_control_manager_actions(
         ExtensionControlAction {
             id: "refresh_manager".to_string(),
             label: "Refresh library".to_string(),
-            description: "Refresh the manager so Elixir sees the latest manager state."
-                .to_string(),
+            description: "Refresh the manager so Elixir sees the latest manager state.".to_string(),
             kind: "secondary".to_string(),
             params: None,
             confirm_text: None,
@@ -4159,10 +4276,16 @@ async fn load_manager_control_defaults(
     let value = store.get_extension_setting(&key).await?;
     let mut defaults = ManagerControlDefaults::default();
     if let Some(object) = value.as_ref().and_then(serde_json::Value::as_object) {
-        if let Some(value) = object.get("monitorOnAdd").and_then(serde_json::Value::as_bool) {
+        if let Some(value) = object
+            .get("monitorOnAdd")
+            .and_then(serde_json::Value::as_bool)
+        {
             defaults.monitor_on_add = value;
         }
-        if let Some(value) = object.get("searchOnAdd").and_then(serde_json::Value::as_bool) {
+        if let Some(value) = object
+            .get("searchOnAdd")
+            .and_then(serde_json::Value::as_bool)
+        {
             defaults.search_on_add = value;
         }
     }
@@ -4227,7 +4350,8 @@ fn build_extension_control_actions(
         return vec![ExtensionControlAction {
             id: "test_connection".to_string(),
             label: "Test connection".to_string(),
-            description: "Check that Elixir can reach this service and read its status.".to_string(),
+            description: "Check that Elixir can reach this service and read its status."
+                .to_string(),
             kind: "primary".to_string(),
             params: None,
             confirm_text: None,
@@ -4247,7 +4371,38 @@ async fn build_extension_control_open_service_ui_action(
     context: &ExtensionControlContext,
 ) -> Option<ExtensionControlAction> {
     let provider = context.selected_provider.as_ref()?;
-    if provider.implementation.as_deref() != Some("prowlarr") {
+    let implementation = provider.implementation.as_deref()?.to_ascii_lowercase();
+    let (label, description) = match implementation.as_str() {
+        "prowlarr" => (
+            "Open Prowlarr UI",
+            "Open the native Prowlarr UI for advanced or site-specific setup.",
+        ),
+        "sonarr" => (
+            "Open Sonarr UI",
+            "Open the native Sonarr UI for advanced manager setup.",
+        ),
+        "radarr" => (
+            "Open Radarr UI",
+            "Open the native Radarr UI for advanced manager setup.",
+        ),
+        "bazarr" => (
+            "Open Bazarr UI",
+            "Open the native Bazarr UI for advanced subtitle setup.",
+        ),
+        "qbittorrent" => (
+            "Open qBittorrent UI",
+            "Open the native qBittorrent UI for queue and transfer management.",
+        ),
+        "nzbget" => (
+            "Open NZBGet UI",
+            "Open the native NZBGet UI for queue and post-processing management.",
+        ),
+        _ => return None,
+    };
+    if !matches!(
+        implementation.as_str(),
+        "prowlarr" | "sonarr" | "radarr" | "bazarr" | "qbittorrent" | "nzbget"
+    ) {
         return None;
     }
     let instance = context.selected_instance.as_ref()?;
@@ -4257,9 +4412,8 @@ async fn build_extension_control_open_service_ui_action(
     );
     Some(ExtensionControlAction {
         id: "open_service_ui".to_string(),
-        label: "Open Prowlarr UI".to_string(),
-        description: "Open the native Prowlarr UI for advanced or site-specific setup."
-            .to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
         kind: "secondary".to_string(),
         params: None,
         confirm_text: None,
@@ -4277,10 +4431,19 @@ fn extension_ui_proxy_prefix(instance_id: Uuid) -> String {
 }
 
 struct ExtensionUiProxyTarget {
-    implementation: String,
+    instance_id: Uuid,
+    endpoint_url: String,
     base_url: String,
     proxy_prefix: String,
-    api_key: Option<String>,
+    host_header: Option<String>,
+    upstream_auth: ExtensionUiUpstreamAuth,
+}
+
+enum ExtensionUiUpstreamAuth {
+    None,
+    ApiKey(String),
+    BasicAuth { username: String, password: String },
+    QbittorrentSession { username: String, password: String },
 }
 
 async fn resolve_extension_ui_proxy_target(
@@ -4309,31 +4472,67 @@ async fn resolve_extension_ui_proxy_target(
     let base_url = resolve_control_provider_transport_base_url(instance_id, &endpoint).await?;
     let implementation = provider.implementation.unwrap_or_default();
     let implementation_key = implementation.trim().to_ascii_lowercase();
-    let api_key = match implementation_key.as_str() {
-        "prowlarr" => Some(
+    let canonical_url = endpoint.canonical_url()?;
+    let host_header = extension_ui_proxy_host_header(&canonical_url, &base_url);
+    let upstream_auth = match implementation_key.as_str() {
+        "prowlarr" => ExtensionUiUpstreamAuth::ApiKey(
             resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
                 .await?,
         ),
-        "sonarr" => Some(
+        "sonarr" => ExtensionUiUpstreamAuth::ApiKey(
             resolve_control_api_key(state, store, &instance, &["sonarr_api_key", "api_key"])
                 .await?,
         ),
-        "radarr" => Some(
+        "radarr" => ExtensionUiUpstreamAuth::ApiKey(
             resolve_control_api_key(state, store, &instance, &["radarr_api_key", "api_key"])
                 .await?,
         ),
-        "bazarr" => Some(
+        "bazarr" => ExtensionUiUpstreamAuth::ApiKey(
             resolve_control_api_key(state, store, &instance, &["bazarr_api_key", "api_key"])
                 .await?,
         ),
-        _ => None,
+        "nzbget" => ExtensionUiUpstreamAuth::BasicAuth {
+            username: resolve_control_secret_value(
+                state,
+                store,
+                &instance,
+                &["nzbget_username", "username"],
+            )
+            .await?,
+            password: resolve_control_secret_value(
+                state,
+                store,
+                &instance,
+                &["nzbget_password", "password"],
+            )
+            .await?,
+        },
+        "qbittorrent" => ExtensionUiUpstreamAuth::QbittorrentSession {
+            username: resolve_control_secret_value(
+                state,
+                store,
+                &instance,
+                &["qbittorrent_username", "username"],
+            )
+            .await?,
+            password: resolve_control_secret_value(
+                state,
+                store,
+                &instance,
+                &["qbittorrent_password", "password"],
+            )
+            .await?,
+        },
+        _ => ExtensionUiUpstreamAuth::None,
     };
 
     Ok(ExtensionUiProxyTarget {
-        implementation: implementation_key,
+        instance_id,
+        endpoint_url: canonical_url,
         base_url,
         proxy_prefix: extension_ui_proxy_prefix(instance_id),
-        api_key,
+        host_header,
+        upstream_auth,
     })
 }
 
@@ -4351,19 +4550,30 @@ async fn proxy_extension_ui_impl(
     let target = resolve_extension_ui_proxy_target(state, &store, instance_id)
         .await
         .map_err(ApiError::from)?;
-    let upstream_url =
-        build_extension_ui_proxy_url(&target.base_url, &path, original_uri.query()).map_err(ApiError::from)?;
-    let client = build_extension_ui_proxy_client(&target).map_err(ApiError::from)?;
-    let reqwest_method =
-        ReqwestMethod::from_bytes(method.as_str().as_bytes()).map_err(anyhow::Error::from).map_err(ApiError::from)?;
-    let mut request = client
-        .request(reqwest_method, upstream_url)
-        .headers(build_extension_ui_request_headers(&headers));
+    let upstream_url = build_extension_ui_proxy_url(&target.base_url, &path, original_uri.query())
+        .map_err(ApiError::from)?;
+    let client = build_extension_ui_proxy_client().map_err(ApiError::from)?;
+    let reqwest_method = ReqwestMethod::from_bytes(method.as_str().as_bytes())
+        .map_err(anyhow::Error::from)
+        .map_err(ApiError::from)?;
+    let mut request = build_extension_ui_upstream_request(
+        &client,
+        &target,
+        reqwest_method,
+        upstream_url,
+        &headers,
+    )
+    .await
+    .map_err(ApiError::from)?;
     if !body.is_empty() && method != Method::GET && method != Method::HEAD {
         request = request.body(body.to_vec());
     }
 
-    let upstream = request.send().await.map_err(anyhow::Error::from).map_err(ApiError::from)?;
+    let upstream = request
+        .send()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ApiError::from)?;
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
     let mut response_headers = AxumHeaderMap::new();
@@ -4379,7 +4589,11 @@ async fn proxy_extension_ui_impl(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body_bytes = upstream.bytes().await.map_err(anyhow::Error::from).map_err(ApiError::from)?;
+    let body_bytes = upstream
+        .bytes()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ApiError::from)?;
     let normalized_path = path.trim_matches('/');
     let response_bytes = if content_type.to_ascii_lowercase().contains("text/html") {
         rewrite_extension_ui_html(&body_bytes, &target.proxy_prefix).into_bytes()
@@ -4413,15 +4627,9 @@ fn build_extension_ui_proxy_url(
     Ok(url)
 }
 
-fn build_extension_ui_proxy_client(target: &ExtensionUiProxyTarget) -> anyhow::Result<Client> {
+fn build_extension_ui_proxy_client() -> anyhow::Result<Client> {
     let mut headers = ReqwestHeaderMap::new();
     headers.insert(USER_AGENT, ReqwestHeaderValue::from_static("Elixir/1.0"));
-    if let Some(api_key) = target.api_key.as_deref() {
-        headers.insert(
-            "X-Api-Key",
-            ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
-        );
-    }
     Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .default_headers(headers)
@@ -4429,14 +4637,91 @@ fn build_extension_ui_proxy_client(target: &ExtensionUiProxyTarget) -> anyhow::R
         .map_err(anyhow::Error::from)
 }
 
-fn build_extension_ui_request_headers(source: &AxumHeaderMap) -> ReqwestHeaderMap {
+async fn build_extension_ui_upstream_request(
+    client: &Client,
+    target: &ExtensionUiProxyTarget,
+    method: ReqwestMethod,
+    upstream_url: Url,
+    headers: &AxumHeaderMap,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    let mut request = client
+        .request(method, upstream_url.clone())
+        .headers(build_extension_ui_request_headers(
+            headers,
+            target,
+            &upstream_url,
+        ));
+    if let Some(host_header) = target.host_header.as_deref() {
+        request = request.header(
+            REQWEST_HOST,
+            ReqwestHeaderValue::from_str(host_header).map_err(anyhow::Error::from)?,
+        );
+    }
+    match &target.upstream_auth {
+        ExtensionUiUpstreamAuth::None => {}
+        ExtensionUiUpstreamAuth::ApiKey(api_key) => {
+            request = request.header(
+                "X-Api-Key",
+                ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
+            );
+        }
+        ExtensionUiUpstreamAuth::BasicAuth { username, password } => {
+            request = request.basic_auth(username, Some(password));
+        }
+        ExtensionUiUpstreamAuth::QbittorrentSession { username, password } => {
+            let cookie = authenticate_qbittorrent_ui_session(target, username, password).await?;
+            request = request.header(
+                REQWEST_COOKIE,
+                ReqwestHeaderValue::from_str(&cookie).map_err(anyhow::Error::from)?,
+            );
+        }
+    }
+    Ok(request)
+}
+
+async fn authenticate_qbittorrent_ui_session(
+    target: &ExtensionUiProxyTarget,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<String> {
+    bootstrap_qbittorrent_session_cookie(
+        &target.endpoint_url,
+        Some(&target.base_url),
+        target.instance_id,
+        username,
+        password,
+    )
+    .await
+    .context("authenticating qbittorrent ui session")
+}
+
+fn extension_ui_proxy_host_header(canonical_url: &str, transport_url: &str) -> Option<String> {
+    let Ok(canonical) = Url::parse(canonical_url) else {
+        return None;
+    };
+    let Ok(transport) = Url::parse(transport_url) else {
+        return None;
+    };
+    let canonical_host = canonical.host_str()?;
+    let canonical_port = canonical.port_or_known_default().unwrap_or(80);
+    let transport_host = transport.host_str()?;
+    let transport_port = transport.port_or_known_default().unwrap_or(80);
+    if canonical_host.eq_ignore_ascii_case(transport_host) && canonical_port == transport_port {
+        return None;
+    }
+    Some(format!("{canonical_host}:{canonical_port}"))
+}
+
+fn build_extension_ui_request_headers(
+    source: &AxumHeaderMap,
+    target: &ExtensionUiProxyTarget,
+    upstream_url: &Url,
+) -> ReqwestHeaderMap {
     let mut headers = ReqwestHeaderMap::new();
     const FORWARDED_HEADERS: &[&str] = &[
         "accept",
         "accept-language",
         "content-type",
-        "origin",
-        "referer",
         "user-agent",
         "x-requested-with",
     ];
@@ -4448,7 +4733,51 @@ fn build_extension_ui_request_headers(source: &AxumHeaderMap) -> ReqwestHeaderMa
             }
         }
     }
+
+    let upstream_origin = extension_ui_upstream_origin(target, upstream_url);
+    if source.contains_key("origin") {
+        if let Some(origin) = upstream_origin.as_deref() {
+            if let Ok(value) = ReqwestHeaderValue::from_str(origin) {
+                headers.insert("origin", value);
+            }
+        }
+    }
+    if source.contains_key("referer") {
+        if let Some(referer) = extension_ui_upstream_referer(target, upstream_url).as_deref() {
+            if let Ok(value) = ReqwestHeaderValue::from_str(referer) {
+                headers.insert("referer", value);
+            }
+        }
+    }
+
     headers
+}
+
+fn extension_ui_upstream_origin(
+    target: &ExtensionUiProxyTarget,
+    upstream_url: &Url,
+) -> Option<String> {
+    let authority = if let Some(host_header) = target.host_header.as_deref() {
+        host_header.to_string()
+    } else {
+        let host = upstream_url.host_str()?.to_string();
+        match upstream_url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        }
+    };
+    Some(format!("{}://{}", upstream_url.scheme(), authority))
+}
+
+fn extension_ui_upstream_referer(
+    target: &ExtensionUiProxyTarget,
+    upstream_url: &Url,
+) -> Option<String> {
+    let mut referer = Url::parse(&extension_ui_upstream_origin(target, upstream_url)?).ok()?;
+    referer.set_path("/");
+    referer.set_query(None);
+    referer.set_fragment(None);
+    Some(referer.to_string())
 }
 
 fn copy_extension_ui_response_headers(
@@ -4473,7 +4802,9 @@ fn copy_extension_ui_response_headers(
         }
     }
 
-    if let Some(location) = source.get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok())
+    if let Some(location) = source
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
     {
         let rewritten = rewrite_extension_ui_location(location, base_url, proxy_prefix);
         if let Ok(value) = AxumHeaderValue::from_str(&rewritten) {
@@ -4551,16 +4882,35 @@ fn rewrite_extension_ui_initialize_json(bytes: &[u8], proxy_prefix: &str) -> Str
 
 #[cfg(test)]
 mod extension_ui_proxy_tests {
-    use super::{build_extension_ui_start_html, rewrite_extension_ui_initialize_json};
+    use super::{
+        ExtensionControlContext, ExtensionStatusSummaryItem, ExtensionUiProxyTarget,
+        ExtensionUiUpstreamAuth, build_extension_control_open_service_ui_action,
+        build_extension_ui_proxy_client, build_extension_ui_start_html,
+        build_extension_ui_upstream_request, rewrite_extension_ui_initialize_json,
+    };
+    use crate::db::models::{
+        Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel, Provider,
+        ProviderHealthState, SlotCardinality,
+    };
+    use axum::{Router, http::HeaderMap as AxumHeaderMap, routing::post};
+    use chrono::Utc;
+    use reqwest::{Method as ReqwestMethod, Url};
     use serde_json::Value;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     #[test]
     fn start_html_bootstrap_targets_proxy_prefix() {
-        let html =
-            build_extension_ui_start_html("/api/v1/extensions/instances/test-instance/ui");
+        let html = build_extension_ui_start_html("/api/v1/extensions/instances/test-instance/ui");
         assert!(html.contains("Opening extension UI"));
         assert!(html.contains("serviceWorker"));
         assert!(html.contains("caches.keys()"));
+        assert!(html.contains("localStorage.clear()"));
+        assert!(html.contains("indexedDB.deleteDatabase"));
+        assert!(html.contains("document.cookie"));
+        assert!(html.contains("const targetUrl = scopePrefix;"));
+        assert!(!html.contains("_elixir_ui"));
         assert!(html.contains("/api/v1/extensions/instances/test-instance/ui"));
     }
 
@@ -4585,6 +4935,276 @@ mod extension_ui_proxy_tests {
         assert_eq!(
             value.get("apiRoot").and_then(Value::as_str),
             Some("/api/v1/extensions/instances/test-instance/ui/api/v1")
+        );
+    }
+
+    #[test]
+    fn upstream_request_adds_basic_auth_header() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let client = build_extension_ui_proxy_client().expect("client");
+            let target = ExtensionUiProxyTarget {
+                instance_id: Uuid::new_v4(),
+                endpoint_url: "http://127.0.0.1:1234/".to_string(),
+                base_url: "http://127.0.0.1:1234/".to_string(),
+                proxy_prefix: "/api/v1/extensions/instances/test/ui".to_string(),
+                host_header: None,
+                upstream_auth: ExtensionUiUpstreamAuth::BasicAuth {
+                    username: "elixir".to_string(),
+                    password: "secret".to_string(),
+                },
+            };
+
+            let request = build_extension_ui_upstream_request(
+                &client,
+                &target,
+                ReqwestMethod::GET,
+                Url::parse("http://127.0.0.1:1234/").expect("url"),
+                &AxumHeaderMap::new(),
+            )
+            .await
+            .expect("request")
+            .build()
+            .expect("built request");
+
+            let authorization = request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            assert_eq!(authorization, Some("Basic ZWxpeGlyOnNlY3JldA=="));
+        });
+    }
+
+    #[test]
+    fn upstream_request_rewrites_origin_and_referer_to_upstream_origin() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let client = build_extension_ui_proxy_client().expect("client");
+            let target = ExtensionUiProxyTarget {
+                instance_id: Uuid::new_v4(),
+                endpoint_url: "http://svc-elixir-modules-qbittorrent-default:8080/".to_string(),
+                base_url: "http://127.0.0.1:32836/".to_string(),
+                proxy_prefix: "/api/v1/extensions/instances/test/ui".to_string(),
+                host_header: Some("svc-elixir-modules-qbittorrent-default:8080".to_string()),
+                upstream_auth: ExtensionUiUpstreamAuth::None,
+            };
+            let mut headers = AxumHeaderMap::new();
+            headers.insert(
+                axum::http::header::ORIGIN,
+                "http://ryans-macbook-pro.local:44301"
+                    .parse()
+                    .expect("origin header"),
+            );
+            headers.insert(
+                axum::http::header::REFERER,
+                "http://ryans-macbook-pro.local:44301/api/v1/extensions/instances/test/ui/start"
+                    .parse()
+                    .expect("referer header"),
+            );
+
+            let request = build_extension_ui_upstream_request(
+                &client,
+                &target,
+                ReqwestMethod::GET,
+                Url::parse("http://127.0.0.1:32836/").expect("url"),
+                &headers,
+            )
+            .await
+            .expect("request")
+            .build()
+            .expect("built request");
+
+            let origin = request
+                .headers()
+                .get(reqwest::header::ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            let referer = request
+                .headers()
+                .get(reqwest::header::REFERER)
+                .and_then(|value| value.to_str().ok());
+            assert_eq!(origin, Some("http://svc-elixir-modules-qbittorrent-default:8080"));
+            assert_eq!(referer, Some("http://svc-elixir-modules-qbittorrent-default:8080/"));
+        });
+    }
+
+    #[tokio::test]
+    async fn upstream_request_bootstraps_qbittorrent_cookie() {
+        async fn login() -> impl axum::response::IntoResponse {
+            (
+                [(axum::http::header::SET_COOKIE, "SID=test-cookie; HttpOnly")],
+                "Ok.",
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route("/api/v2/auth/login", post(login));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = build_extension_ui_proxy_client().expect("client");
+        let target = ExtensionUiProxyTarget {
+            instance_id: Uuid::new_v4(),
+            endpoint_url: format!("http://elx-qbittorrent:8080/"),
+            base_url: format!("http://127.0.0.1:{}/", addr.port()),
+            proxy_prefix: "/api/v1/extensions/instances/test/ui".to_string(),
+            host_header: Some("elx-qbittorrent:8080".to_string()),
+            upstream_auth: ExtensionUiUpstreamAuth::QbittorrentSession {
+                username: "elixir".to_string(),
+                password: "secret".to_string(),
+            },
+        };
+
+        let request = build_extension_ui_upstream_request(
+            &client,
+            &target,
+            ReqwestMethod::GET,
+            Url::parse(&format!("http://127.0.0.1:{}/", addr.port())).expect("url"),
+            &AxumHeaderMap::new(),
+        )
+        .await
+        .expect("request")
+        .build()
+        .expect("built request");
+
+        let cookie = request
+            .headers()
+            .get(reqwest::header::COOKIE)
+            .and_then(|value| value.to_str().ok());
+        let host = request
+            .headers()
+            .get(reqwest::header::HOST)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(cookie, Some("SID=test-cookie"));
+        assert_eq!(host, Some("elx-qbittorrent:8080"));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn open_service_ui_action_supports_sonarr_and_qbittorrent() {
+        fn context_for(
+            extension_id: &str,
+            extension_name: &str,
+            implementation: &str,
+        ) -> ExtensionControlContext {
+            let instance_id = Uuid::new_v4();
+            ExtensionControlContext {
+                extension: Extension {
+                    extension_id: extension_id.to_string(),
+                    name: extension_name.to_string(),
+                    version: "1.0.0".to_string(),
+                    kind: ExtensionKind::Module,
+                    publisher_name: None,
+                    signing_key_id: None,
+                    trust_level: ExtensionTrustLevel::Community,
+                    manifest_json: serde_json::json!({}),
+                    package_hash: None,
+                    installed_at: Utc::now(),
+                    enabled: true,
+                },
+                summary: ExtensionStatusSummaryItem {
+                    extension_id: extension_id.to_string(),
+                    name: extension_name.to_string(),
+                    version: "1.0.0".to_string(),
+                    kind: ExtensionKind::Module,
+                    trust_level: ExtensionTrustLevel::Community,
+                    enabled: true,
+                    severity: "ready".to_string(),
+                    status_code: "ready".to_string(),
+                    label: "Ready".to_string(),
+                    description: "Ready".to_string(),
+                    primary_action: "open".to_string(),
+                    primary_action_label: "Open".to_string(),
+                    optional_addons: Vec::new(),
+                },
+                instances: vec![ExtensionInstance {
+                    instance_id,
+                    extension_id: extension_id.to_string(),
+                    instance_name: "default".to_string(),
+                    config_json: None,
+                    runtime_version: None,
+                    rollback_version: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    enabled: true,
+                }],
+                selected_instance: Some(ExtensionInstance {
+                    instance_id,
+                    extension_id: extension_id.to_string(),
+                    instance_name: "default".to_string(),
+                    config_json: None,
+                    runtime_version: None,
+                    rollback_version: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    enabled: true,
+                }),
+                providers: vec![Provider {
+                    provider_id: Uuid::new_v4(),
+                    instance_id,
+                    capability: "service".to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: SlotCardinality::One,
+                    implementation: Some(implementation.to_string()),
+                    scope_json: None,
+                    endpoint_json: None,
+                    health_state: ProviderHealthState::Healthy,
+                    last_healthcheck_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                }],
+                selected_provider: Some(Provider {
+                    provider_id: Uuid::new_v4(),
+                    instance_id,
+                    capability: "service".to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: SlotCardinality::One,
+                    implementation: Some(implementation.to_string()),
+                    scope_json: None,
+                    endpoint_json: None,
+                    health_state: ProviderHealthState::Healthy,
+                    last_healthcheck_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                }),
+            }
+        }
+
+        let sonarr_action = build_extension_control_open_service_ui_action(&context_for(
+            "elixir.modules.sonarr",
+            "Sonarr",
+            "sonarr",
+        ))
+        .await
+        .expect("sonarr action");
+        assert_eq!(sonarr_action.label, "Open Sonarr UI");
+        assert!(
+            sonarr_action
+                .open_url
+                .unwrap_or_default()
+                .ends_with("/ui/start")
+        );
+
+        let qbittorrent_action = build_extension_control_open_service_ui_action(&context_for(
+            "elixir.modules.qbittorrent",
+            "qBittorrent",
+            "qbittorrent",
+        ))
+        .await
+        .expect("qbittorrent action");
+        assert_eq!(qbittorrent_action.label, "Open qBittorrent UI");
+        assert!(
+            qbittorrent_action
+                .open_url
+                .unwrap_or_default()
+                .ends_with("/ui/start")
         );
     }
 }
@@ -4690,7 +5310,8 @@ async fn execute_extension_control_action(
             if implementation != "sonarr" && implementation != "radarr" {
                 anyhow::bail!("item actions are not supported for this extension");
             }
-            let intent = resolve_extension_control_intent(store, provider.provider_id, params).await?;
+            let intent =
+                resolve_extension_control_intent(store, provider.provider_id, params).await?;
             let manager_item_id = intent
                 .manager_item_id
                 .as_deref()
@@ -4730,12 +5351,16 @@ async fn execute_extension_control_action(
 
             if let Some(existing) = store.get_extension(target_extension_id).await? {
                 if !existing.enabled {
-                    store.set_extension_enabled(target_extension_id, true).await?;
+                    store
+                        .set_extension_enabled(target_extension_id, true)
+                        .await?;
                 }
             } else {
                 let entry = load_cached_registry_entry_by_extension_id(state, target_extension_id)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("connector is not available in the registry cache"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("connector is not available in the registry cache")
+                    })?;
                 install_extension_internal(
                     state,
                     &InstallRequest {
@@ -4798,7 +5423,8 @@ async fn load_extension_control_live_snapshot(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
     let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url = resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
 
     match implementation.as_str() {
         "sonarr" => load_sonarr_control_snapshot(state, store, instance, &base_url).await,
@@ -4920,7 +5546,10 @@ async fn execute_extension_control_manager_command(
                 base_url,
                 api_key,
                 ReqwestMethod::DELETE,
-                &[&format!("api/v3/series/{item_id}?deleteFiles=false"), &format!("api/v4/series/{item_id}?deleteFiles=false")],
+                &[
+                    &format!("api/v3/series/{item_id}?deleteFiles=false"),
+                    &format!("api/v4/series/{item_id}?deleteFiles=false"),
+                ],
                 None,
             )
             .await?;
@@ -4978,7 +5607,10 @@ async fn execute_extension_control_manager_command(
                 base_url,
                 api_key,
                 ReqwestMethod::DELETE,
-                &[&format!("api/v3/movie/{item_id}?deleteFiles=false"), &format!("api/v4/movie/{item_id}?deleteFiles=false")],
+                &[
+                    &format!("api/v3/movie/{item_id}?deleteFiles=false"),
+                    &format!("api/v4/movie/{item_id}?deleteFiles=false"),
+                ],
                 None,
             )
             .await?;
@@ -4994,9 +5626,16 @@ async fn load_sonarr_control_snapshot(
     instance: &ExtensionInstance,
     base_url: &str,
 ) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key = resolve_control_api_key(state, store, instance, &["sonarr_api_key", "api_key"]).await?;
-    let status = request_control_json(base_url, &api_key, &["api/v3/system/status", "api/v4/system/status"]).await?;
-    let series = request_control_json(base_url, &api_key, &["api/v3/series", "api/v4/series"]).await?;
+    let api_key =
+        resolve_control_api_key(state, store, instance, &["sonarr_api_key", "api_key"]).await?;
+    let status = request_control_json(
+        base_url,
+        &api_key,
+        &["api/v3/system/status", "api/v4/system/status"],
+    )
+    .await?;
+    let series =
+        request_control_json(base_url, &api_key, &["api/v3/series", "api/v4/series"]).await?;
     let downloaders = request_control_json(
         base_url,
         &api_key,
@@ -5005,7 +5644,10 @@ async fn load_sonarr_control_snapshot(
     .await?;
 
     Ok(ExtensionControlLiveSnapshot {
-        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        version: status
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         metrics: vec![
             ExtensionControlMetric {
                 id: "version".to_string(),
@@ -5019,7 +5661,11 @@ async fn load_sonarr_control_snapshot(
             ExtensionControlMetric {
                 id: "seriesCount".to_string(),
                 label: "Series".to_string(),
-                value: series.as_array().map(|value| value.len()).unwrap_or(0).to_string(),
+                value: series
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
             },
             ExtensionControlMetric {
                 id: "downloadClientCount".to_string(),
@@ -5040,9 +5686,16 @@ async fn load_radarr_control_snapshot(
     instance: &ExtensionInstance,
     base_url: &str,
 ) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key = resolve_control_api_key(state, store, instance, &["radarr_api_key", "api_key"]).await?;
-    let status = request_control_json(base_url, &api_key, &["api/v3/system/status", "api/v4/system/status"]).await?;
-    let movies = request_control_json(base_url, &api_key, &["api/v3/movie", "api/v4/movie"]).await?;
+    let api_key =
+        resolve_control_api_key(state, store, instance, &["radarr_api_key", "api_key"]).await?;
+    let status = request_control_json(
+        base_url,
+        &api_key,
+        &["api/v3/system/status", "api/v4/system/status"],
+    )
+    .await?;
+    let movies =
+        request_control_json(base_url, &api_key, &["api/v3/movie", "api/v4/movie"]).await?;
     let downloaders = request_control_json(
         base_url,
         &api_key,
@@ -5051,7 +5704,10 @@ async fn load_radarr_control_snapshot(
     .await?;
 
     Ok(ExtensionControlLiveSnapshot {
-        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        version: status
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         metrics: vec![
             ExtensionControlMetric {
                 id: "version".to_string(),
@@ -5065,7 +5721,11 @@ async fn load_radarr_control_snapshot(
             ExtensionControlMetric {
                 id: "movieCount".to_string(),
                 label: "Movies".to_string(),
-                value: movies.as_array().map(|value| value.len()).unwrap_or(0).to_string(),
+                value: movies
+                    .as_array()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    .to_string(),
             },
             ExtensionControlMetric {
                 id: "downloadClientCount".to_string(),
@@ -5086,13 +5746,17 @@ async fn load_prowlarr_control_snapshot(
     instance: &ExtensionInstance,
     base_url: &str,
 ) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key = resolve_control_api_key(state, store, instance, &["prowlarr_api_key", "api_key"]).await?;
+    let api_key =
+        resolve_control_api_key(state, store, instance, &["prowlarr_api_key", "api_key"]).await?;
     let status = request_control_json(base_url, &api_key, &["api/v1/system/status"]).await?;
     let indexers = request_control_json(base_url, &api_key, &["api/v1/indexer"]).await?;
     let applications = request_control_json(base_url, &api_key, &["api/v1/applications"]).await?;
 
     Ok(ExtensionControlLiveSnapshot {
-        version: status.get("version").and_then(serde_json::Value::as_str).map(str::to_string),
+        version: status
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         metrics: vec![
             ExtensionControlMetric {
                 id: "version".to_string(),
@@ -5158,6 +5822,41 @@ async fn resolve_control_api_key(
     anyhow::bail!("service api key is not available yet");
 }
 
+async fn resolve_control_secret_value(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    candidate_keys: &[&str],
+) -> anyhow::Result<String> {
+    for key in candidate_keys {
+        if let Some(value) = instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.get(*key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(value.to_string());
+        }
+    }
+
+    for key in candidate_keys {
+        if let Some(secret) = store
+            .get_secret(SecretScope::Instance, Some(instance.instance_id), key)
+            .await?
+        {
+            let value = state.secrets.decrypt(&secret.value_encrypted)?;
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+
+    anyhow::bail!("required service credential is not available yet");
+}
+
 async fn request_control_json(
     base_url: &str,
     api_key: &str,
@@ -5180,7 +5879,10 @@ async fn request_control_json(
             let detail = resp.text().await.unwrap_or_default();
             anyhow::bail!("{path} failed ({status}): {}", detail.trim());
         }
-        return resp.json::<serde_json::Value>().await.map_err(anyhow::Error::from);
+        return resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(anyhow::Error::from);
     }
 
     anyhow::bail!("service endpoint is not available")
@@ -5201,10 +5903,7 @@ async fn request_control_write(
         if let Some(body) = body {
             request = request.json(body);
         }
-        let resp = request
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?;
+        let resp = request.send().await.map_err(anyhow::Error::from)?;
         if resp.status() == ReqwestStatusCode::NOT_FOUND {
             continue;
         }
@@ -5217,8 +5916,8 @@ async fn request_control_write(
         if bytes.is_empty() {
             return Ok(json!({}));
         }
-        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .unwrap_or_else(|_| json!({}));
+        let value =
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| json!({}));
         return Ok(value);
     }
 
@@ -5234,7 +5933,8 @@ async fn resolve_control_provider_transport_base_url(
         return Ok(canonical);
     }
 
-    if let Some(host_port) = lookup_control_docker_published_port(instance_id, endpoint.port).await?
+    if let Some(host_port) =
+        lookup_control_docker_published_port(instance_id, endpoint.port).await?
     {
         let base_path = if endpoint.base_path.trim().is_empty() {
             "/"

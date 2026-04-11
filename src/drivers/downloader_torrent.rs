@@ -237,6 +237,28 @@ const QBITTORRENT_BOOTSTRAP_USER: &str = "admin";
 const QBITTORRENT_BOOTSTRAP_PASS: &str = "adminadmin";
 const QBITTORRENT_AUTOGEN_PREFIX: &str = "elixir_";
 
+pub(crate) async fn bootstrap_qbittorrent_session_cookie(
+    endpoint_url: &str,
+    transport_url: Option<&str>,
+    instance_id: Uuid,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    let client = QbittorrentClient::from_config(
+        QbittorrentDriverConfig {
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+            base_url: None,
+            api_version: Some("v2".to_string()),
+        },
+        endpoint_url.to_string(),
+        transport_url.map(str::to_string),
+        instance_id,
+    )
+    .await?;
+    Ok(client.cookie)
+}
+
 impl QbittorrentClient {
     async fn from_config(
         config: QbittorrentDriverConfig,

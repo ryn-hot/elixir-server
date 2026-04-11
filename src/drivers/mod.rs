@@ -9,6 +9,7 @@ mod registry;
 
 pub use downloader_nzb::DownloaderNzbDriver;
 pub use downloader_torrent::DownloaderTorrentDriver;
+pub(crate) use downloader_torrent::bootstrap_qbittorrent_session_cookie;
 pub use driver_trait::{
     ActivitySnapshot, ApplyResult, ApplyStatus, CapabilityDriver, DriverCtx, StateSnapshot,
 };

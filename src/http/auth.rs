@@ -120,7 +120,10 @@ mod tests {
         let (token, _) = auth.sign_access_token(user_id, session_id).unwrap();
 
         let request = Request::builder()
-            .header("cookie", format!("foo=bar; elixir_ui_token={token}; theme=dark"))
+            .header(
+                "cookie",
+                format!("foo=bar; elixir_ui_token={token}; theme=dark"),
+            )
             .body(())
             .unwrap();
         let (parts, _) = request.into_parts();

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
+use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
@@ -8,8 +10,6 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::debug;
-use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
 
 #[derive(Debug, Default)]
 pub struct IndexerRegistryDriver;
@@ -253,7 +253,8 @@ impl ProwlarrClient {
         for indexer in indexers {
             let existing_item = find_by_name(&existing, &indexer.name);
             let schema_item = find_schema_optional(&schema, &indexer.implementation);
-            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone()) else {
+            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
+            else {
                 unsupported.push((indexer.name.clone(), indexer.implementation.clone()));
                 continue;
             };
@@ -824,7 +825,10 @@ fn extract_error_message(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::{get, post}};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -968,7 +972,9 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_indexers_fails_when_requested_implementation_is_missing_from_schema() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
 
         let app = Router::new()
@@ -977,7 +983,10 @@ mod tests {
                 get(|| async { Json(json!([{ "implementation": "Anidex", "fields": [] }])) }),
             )
             .route("/api/v1/indexer", get(|| async { Json(json!([])) }))
-            .route("/api/v1/indexer", post(|| async { Json(json!({ "id": 1 })) }));
+            .route(
+                "/api/v1/indexer",
+                post(|| async { Json(json!({ "id": 1 })) }),
+            );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -1028,7 +1037,9 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_indexers_assigns_default_app_profile_id_when_required() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let captured = Arc::new(Mutex::new(None::<Value>));
 

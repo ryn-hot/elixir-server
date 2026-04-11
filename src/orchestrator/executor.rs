@@ -882,6 +882,13 @@ impl<'a> Executor<'a> {
                 if let Some(key) = read_sonarr_api_key_from_config(&config_dir).await? {
                     upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key)
                         .await?;
+                    self.normalize_arr_auth_config_if_needed(
+                        provider.instance_id,
+                        &key,
+                        &endpoint,
+                        &["/api/v3/config/host", "/api/v4/config/host"],
+                    )
+                    .await?;
                     self.probe
                         .probe_dns(&endpoint.host)
                         .await
@@ -908,6 +915,13 @@ impl<'a> Executor<'a> {
                 if let Some(key) = read_radarr_api_key_from_config(&config_dir).await? {
                     upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key)
                         .await?;
+                    self.normalize_arr_auth_config_if_needed(
+                        provider.instance_id,
+                        &key,
+                        &endpoint,
+                        &["/api/v3/config/host", "/api/v4/config/host"],
+                    )
+                    .await?;
                     self.probe
                         .probe_dns(&endpoint.host)
                         .await
@@ -934,8 +948,13 @@ impl<'a> Executor<'a> {
                 if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
                     upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
                         .await?;
-                    self.normalize_prowlarr_auth_config_if_needed(&provider, &key, &endpoint)
-                        .await?;
+                    self.normalize_arr_auth_config_if_needed(
+                        provider.instance_id,
+                        &key,
+                        &endpoint,
+                        &["/api/v1/config/host"],
+                    )
+                    .await?;
                     self.probe
                         .probe_dns(&endpoint.host)
                         .await
@@ -1058,7 +1077,8 @@ impl<'a> Executor<'a> {
                 if nzbget_profile_version_matches(
                     config.performance_profile_version.as_deref(),
                     selected_profile,
-                ) {
+                ) && nzbget_managed_ui_paths_are_current(instance.config_json.as_ref()).await?
+                {
                     return Ok(());
                 }
                 let (username, password) =
@@ -1116,51 +1136,81 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    async fn normalize_prowlarr_auth_config_if_needed(
+    async fn normalize_arr_auth_config_if_needed(
         &self,
-        provider: &Provider,
+        instance_id: Uuid,
         api_key: &str,
         endpoint: &ProviderEndpoint,
+        config_paths: &[&str],
     ) -> Result<()> {
-        if provider.capability != "indexer.registry"
-            || provider.implementation.as_deref() != Some("prowlarr")
-        {
-            return Ok(());
-        }
-
-        let Some(base_url) =
-            resolve_driver_transport_base_url(provider.instance_id, endpoint).await?
-        else {
+        let Some(base_url) = resolve_driver_transport_base_url(instance_id, endpoint).await? else {
             return Ok(());
         };
-        let url = Url::parse(&base_url)
-            .context("parsing prowlarr transport base url")?
-            .join("/api/v1/config/host")
-            .context("building prowlarr host config url")?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
-            .context("building prowlarr host config client")?;
+            .context("building arr host config client")?;
 
-        let mut config: Value = client
-            .get(url.clone())
-            .header("X-Api-Key", api_key)
-            .send()
-            .await
-            .context("fetching prowlarr host config")?
-            .error_for_status()
-            .context("prowlarr host config request failed")?
-            .json()
-            .await
-            .context("decoding prowlarr host config")?;
+        let mut config = None;
+        let mut selected_url = None;
+        for path in config_paths {
+            let url = Url::parse(&base_url)
+                .context("parsing arr transport base url")?
+                .join(path)
+                .with_context(|| format!("building arr host config url for {path}"))?;
+            let response = client
+                .get(url.clone())
+                .header("X-Api-Key", api_key)
+                .send()
+                .await
+                .with_context(|| format!("fetching arr host config {path}"))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
+            let response = response
+                .error_for_status()
+                .with_context(|| format!("arr host config request failed for {path}"))?;
+            let value: Value = response
+                .json()
+                .await
+                .with_context(|| format!("decoding arr host config for {path}"))?;
+            config = Some(value);
+            selected_url = Some(url);
+            break;
+        }
 
-        if !prowlarr_host_auth_config_requires_normalization(&config) {
+        let Some(mut config) = config else {
+            return Ok(());
+        };
+        let Some(url) = selected_url else {
+            return Ok(());
+        };
+
+        if !arr_host_auth_config_requires_normalization(&config) {
             return Ok(());
         }
 
         let object = config
             .as_object_mut()
-            .ok_or_else(|| anyhow!("prowlarr host config must be a JSON object"))?;
+            .ok_or_else(|| anyhow!("arr host config must be a JSON object"))?;
+        let authentication_method = object
+            .get("authenticationMethod")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+
+        if authentication_method == "none" {
+            let (username, password) =
+                ensure_arr_ui_credentials(&self.store, self.secrets, instance_id).await?;
+            object.insert(
+                "authenticationMethod".to_string(),
+                Value::String("forms".to_string()),
+            );
+            object.insert("username".to_string(), Value::String(username));
+            object.insert("password".to_string(), Value::String(password.clone()));
+            object.insert("passwordConfirmation".to_string(), Value::String(password));
+        }
         object.insert(
             "authenticationRequired".to_string(),
             Value::String("disabledForLocalAddresses".to_string()),
@@ -1172,9 +1222,9 @@ impl<'a> Executor<'a> {
             .json(&config)
             .send()
             .await
-            .context("updating prowlarr host config")?
+            .context("updating arr host config")?
             .error_for_status()
-            .context("prowlarr host config update failed")?;
+            .context("arr host config update failed")?;
 
         Ok(())
     }
@@ -1193,8 +1243,10 @@ impl<'a> Executor<'a> {
 
 const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v1";
 const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v1";
-const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v3";
-const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v3";
+const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v4";
+const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v4";
+const NZBGET_MANAGED_WEB_DIR: &str = "/app/nzbget/webui";
+const NZBGET_MANAGED_CONFIG_TEMPLATE: &str = "/app/nzbget/webui/nzbget.conf.template";
 
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
@@ -1415,6 +1467,33 @@ async fn upsert_prowlarr_secret(
         .await
 }
 
+async fn upsert_arr_ui_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let encrypted_username = secrets.encrypt(username)?;
+    let encrypted_password = secrets.encrypt(password)?;
+    for (key, value_encrypted) in [
+        ("arr_ui_username", encrypted_username),
+        ("arr_ui_password", encrypted_password),
+    ] {
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: key.to_string(),
+                value_encrypted,
+                rotatable: false,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 async fn resolve_qbittorrent_credentials(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -1605,6 +1684,35 @@ async fn ensure_nzbget_credentials(
     }
 }
 
+async fn ensure_arr_ui_credentials(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+) -> Result<(String, String)> {
+    let username = store
+        .get_secret(SecretScope::Instance, Some(instance_id), "arr_ui_username")
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+    let password = store
+        .get_secret(SecretScope::Instance, Some(instance_id), "arr_ui_password")
+        .await?
+        .map(|secret| secrets.decrypt(&secret.value_encrypted))
+        .transpose()?
+        .filter(|value| !value.trim().is_empty());
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok((username, password)),
+        (None, None) => {
+            let (username, password) = generate_arr_ui_credentials();
+            upsert_arr_ui_secrets(store, secrets, instance_id, &username, &password).await?;
+            Ok((username, password))
+        }
+        _ => bail!("arr ui credentials are partially configured"),
+    }
+}
+
 fn generate_qbittorrent_credentials() -> (String, String) {
     let suffix: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1620,6 +1728,20 @@ fn generate_qbittorrent_credentials() -> (String, String) {
 }
 
 fn generate_nzbget_credentials() -> (String, String) {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let password: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(28)
+        .map(char::from)
+        .collect();
+    (format!("elixir_{suffix}"), password)
+}
+
+fn generate_arr_ui_credentials() -> (String, String) {
     let suffix: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(6)
@@ -2283,7 +2405,7 @@ async fn read_prowlarr_api_key_from_config(config_dir: &str) -> Result<Option<St
     read_arr_api_key_from_config(config_dir).await
 }
 
-fn prowlarr_host_auth_config_requires_normalization(config: &Value) -> bool {
+fn arr_host_auth_config_requires_normalization(config: &Value) -> bool {
     let Some(object) = config.as_object() else {
         return false;
     };
@@ -2300,7 +2422,7 @@ fn prowlarr_host_auth_config_requires_normalization(config: &Value) -> bool {
         .trim()
         .to_ascii_lowercase();
 
-    authentication_method == "none" && authentication_required == "enabled"
+    authentication_method == "none" || authentication_required == "enabled"
 }
 
 async fn read_arr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
@@ -2656,6 +2778,49 @@ fn nzbget_has_managed_config(instance_config: Option<&serde_json::Value>) -> boo
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+async fn nzbget_managed_ui_paths_are_current(
+    instance_config: Option<&serde_json::Value>,
+) -> Result<bool> {
+    let Some(config_dir) = instance_config
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.get("config_dir"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(true);
+    };
+
+    let config_path = Path::new(config_dir).join("nzbget.conf");
+    let contents = match fs::read_to_string(&config_path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("reading nzbget managed config {}", config_path.display())
+            });
+        }
+    };
+
+    Ok(matches!(
+        find_nzbget_config_value(&contents, "WebDir"),
+        Some(value) if value == NZBGET_MANAGED_WEB_DIR
+    ) && matches!(
+        find_nzbget_config_value(&contents, "ConfigTemplate"),
+        Some(value) if value == NZBGET_MANAGED_CONFIG_TEMPLATE
+    ))
+}
+
+fn find_nzbget_config_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let (name, value) = trimmed.split_once('=')?;
+        (name.trim() == key).then_some(value.trim())
+    })
+}
+
 fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
     let (
         max_connections,
@@ -2711,6 +2876,8 @@ fn nzbget_performance_profile_patch(profile: DownloaderPerformanceProfile) -> Dr
         temp_dir: Some("/config/tmp".to_string()),
         script_dir: Some("/config/scripts".to_string()),
         log_file: Some("/config/nzbget.log".to_string()),
+        web_dir: Some(NZBGET_MANAGED_WEB_DIR.to_string()),
+        config_template: Some(NZBGET_MANAGED_CONFIG_TEMPLATE.to_string()),
         use_incomplete: Some(true),
         server_connections: Some(server_connections),
         article_retries: Some(article_retries),
@@ -2981,15 +3148,62 @@ mod tests {
     use crate::secrets::SecretsManager;
 
     #[test]
-    fn detects_invalid_prowlarr_none_plus_enabled_auth_state() {
-        assert!(prowlarr_host_auth_config_requires_normalization(&json!({
+    fn detects_invalid_arr_none_plus_enabled_auth_state() {
+        assert!(arr_host_auth_config_requires_normalization(&json!({
             "authenticationMethod": "none",
             "authenticationRequired": "enabled"
         })));
-        assert!(!prowlarr_host_auth_config_requires_normalization(&json!({
+        assert!(arr_host_auth_config_requires_normalization(&json!({
             "authenticationMethod": "none",
             "authenticationRequired": "disabledForLocalAddresses"
         })));
+        assert!(!arr_host_auth_config_requires_normalization(&json!({
+            "authenticationMethod": "forms",
+            "authenticationRequired": "disabledForLocalAddresses"
+        })));
+    }
+
+    #[tokio::test]
+    async fn nzbget_managed_ui_paths_report_missing_when_web_keys_absent() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config_path = temp_dir.path().join("nzbget.conf");
+        fs::write(
+            &config_path,
+            "MainDir=/config\nDestDir=/downloads\n# WebDir intentionally missing\n",
+        )
+        .await?;
+
+        let config = json!({
+            "runtime": {
+                "config_dir": temp_dir.path().to_string_lossy().to_string()
+            }
+        });
+
+        assert!(!nzbget_managed_ui_paths_are_current(Some(&config)).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nzbget_managed_ui_paths_accept_expected_values() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config_path = temp_dir.path().join("nzbget.conf");
+        fs::write(
+            &config_path,
+            format!(
+                "WebDir={}\nConfigTemplate={}\n",
+                NZBGET_MANAGED_WEB_DIR, NZBGET_MANAGED_CONFIG_TEMPLATE
+            ),
+        )
+        .await?;
+
+        let config = json!({
+            "runtime": {
+                "config_dir": temp_dir.path().to_string_lossy().to_string()
+            }
+        });
+
+        assert!(nzbget_managed_ui_paths_are_current(Some(&config)).await?);
+        Ok(())
     }
 
     struct RecordingDriver {
@@ -4842,6 +5056,8 @@ mod tests {
             par_check,
             unpack_pause_queue,
             script_dir,
+            web_dir,
+            config_template,
             ..
         }) = &calls[0]
         else {
@@ -4854,6 +5070,11 @@ mod tests {
         assert_eq!(par_check.as_deref(), Some("auto"));
         assert_eq!(*unpack_pause_queue, Some(true));
         assert_eq!(script_dir.as_deref(), Some("/config/scripts"));
+        assert_eq!(web_dir.as_deref(), Some("/app/nzbget/webui"));
+        assert_eq!(
+            config_template.as_deref(),
+            Some("/app/nzbget/webui/nzbget.conf.template")
+        );
         drop(calls);
 
         let instance = store.get_instance(instance_id).await?.expect("instance");

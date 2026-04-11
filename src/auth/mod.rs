@@ -70,8 +70,21 @@ impl AuthService {
         user_id: Uuid,
         session_id: Uuid,
     ) -> Result<(String, DateTime<Utc>)> {
+        self.sign_access_token_with_ttl_minutes(
+            user_id,
+            session_id,
+            self.config.access_token_ttl_minutes,
+        )
+    }
+
+    pub fn sign_access_token_with_ttl_minutes(
+        &self,
+        user_id: Uuid,
+        session_id: Uuid,
+        ttl_minutes: u64,
+    ) -> Result<(String, DateTime<Utc>)> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as usize;
-        let exp = now + (self.config.access_token_ttl_minutes * 60) as usize;
+        let exp = now + (ttl_minutes * 60) as usize;
         let claims = AccessClaims {
             sub: user_id.to_string(),
             sid: session_id.to_string(),
