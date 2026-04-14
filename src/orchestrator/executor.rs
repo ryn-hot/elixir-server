@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -1040,13 +1040,22 @@ impl<'a> Executor<'a> {
                     )
                 })?;
                 let transport_base_url =
-                    resolve_driver_transport_base_url(provider.instance_id, endpoint).await?;
+                    resolve_driver_transport_base_url(provider.instance_id, endpoint)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "driver transport is not ready for instance {} endpoint {}:{}",
+                                provider.instance_id,
+                                endpoint.host,
+                                endpoint.port
+                            )
+                        })?;
                 let ctx = DriverCtx::new(
                     provider.provider_id,
                     provider.instance_id,
                     provider.capability.clone(),
                     endpoint.clone(),
-                    transport_base_url,
+                    Some(transport_base_url),
                     provider.implementation.clone(),
                     instance.config_json.clone(),
                     secrets,
@@ -1094,13 +1103,22 @@ impl<'a> Executor<'a> {
                     )
                 })?;
                 let transport_base_url =
-                    resolve_driver_transport_base_url(provider.instance_id, endpoint).await?;
+                    resolve_driver_transport_base_url(provider.instance_id, endpoint)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "driver transport is not ready for instance {} endpoint {}:{}",
+                                provider.instance_id,
+                                endpoint.host,
+                                endpoint.port
+                            )
+                        })?;
                 let ctx = DriverCtx::new(
                     provider.provider_id,
                     provider.instance_id,
                     provider.capability.clone(),
                     endpoint.clone(),
-                    transport_base_url,
+                    Some(transport_base_url),
                     provider.implementation.clone(),
                     instance.config_json.clone(),
                     secrets,
@@ -1332,14 +1350,22 @@ pub(crate) async fn build_driver_ctx_for_provider(
         secrets.insert("nzbget_password".to_string(), password);
     }
 
-    let transport_base_url =
-        resolve_driver_transport_base_url(provider.instance_id, &endpoint).await?;
+    let transport_base_url = resolve_driver_transport_base_url(provider.instance_id, &endpoint)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "driver transport is not ready for instance {} endpoint {}:{}",
+                provider.instance_id,
+                endpoint.host,
+                endpoint.port
+            )
+        })?;
     Ok(DriverCtx::new(
         provider.provider_id,
         provider.instance_id,
         provider.capability.clone(),
         endpoint,
-        transport_base_url,
+        Some(transport_base_url),
         provider.implementation.clone(),
         instance.config_json.clone(),
         secrets,
@@ -2469,36 +2495,55 @@ async fn resolve_driver_transport_base_url(
     instance_id: Uuid,
     endpoint: &ProviderEndpoint,
 ) -> Result<Option<String>> {
+    const TRANSPORT_RESOLUTION_ATTEMPTS: usize = 6;
+    const TRANSPORT_RESOLUTION_RETRY_DELAY_MS: u64 = 500;
+
     let canonical = endpoint.canonical_url()?;
-    if endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+    if endpoint_host_resolves(&endpoint.host, endpoint.port).await
+        || !endpoint_uses_container_network(endpoint)
+    {
         return Ok(Some(canonical));
     }
 
-    match lookup_docker_published_port(instance_id, endpoint.port).await {
-        Ok(Some(host_port)) => {
-            let base = format!("{}://127.0.0.1:{host_port}", endpoint.scheme);
-            return Ok(Some(format!("{base}{}", endpoint.base_path)));
+    let mut last_lookup_error = None;
+    for attempt in 0..TRANSPORT_RESOLUTION_ATTEMPTS {
+        match lookup_docker_published_port(instance_id, endpoint.port).await {
+            Ok(Some(host_port)) => {
+                return Ok(Some(driver_transport_base_url(endpoint, host_port)));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                last_lookup_error = Some(err);
+            }
         }
-        Ok(None) => {
-            tracing::warn!(
-                "driver transport fallback unavailable for instance {} endpoint {}:{}",
-                instance_id,
-                endpoint.host,
-                endpoint.port
-            );
+
+        if endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+            return Ok(Some(canonical.clone()));
         }
-        Err(err) => {
-            tracing::warn!(
-                "driver transport fallback failed for instance {} endpoint {}:{}: {}",
-                instance_id,
-                endpoint.host,
-                endpoint.port,
-                err
-            );
+
+        if attempt + 1 < TRANSPORT_RESOLUTION_ATTEMPTS {
+            sleep(Duration::from_millis(TRANSPORT_RESOLUTION_RETRY_DELAY_MS)).await;
         }
     }
 
-    Ok(Some(canonical))
+    if let Some(err) = last_lookup_error {
+        tracing::warn!(
+            "driver transport fallback failed for instance {} endpoint {}:{}: {}",
+            instance_id,
+            endpoint.host,
+            endpoint.port,
+            err
+        );
+    } else {
+        tracing::warn!(
+            "driver transport fallback unavailable for instance {} endpoint {}:{}",
+            instance_id,
+            endpoint.host,
+            endpoint.port
+        );
+    }
+
+    Ok(None)
 }
 
 async fn endpoint_host_resolves(host: &str, port: u16) -> bool {
@@ -2512,46 +2557,21 @@ async fn lookup_docker_published_port(
     instance_id: Uuid,
     container_port: u16,
 ) -> Result<Option<u16>> {
-    let ps_args = vec![
-        "ps".to_string(),
-        "-a".to_string(),
-        "--filter".to_string(),
-        format!("label=elixir.instance_id={instance_id}"),
-        "--format".to_string(),
-        "{{.Names}}".to_string(),
-    ];
-    let containers = run_docker_stdout(&ps_args).await?;
-    let container_name = containers
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string);
-    let Some(container_name) = container_name else {
-        return Ok(None);
-    };
+    let mut candidates = docker_transport_container_candidates(instance_id);
+    candidates.extend(list_docker_container_names(instance_id, true).await?);
+    candidates.extend(list_docker_container_names(instance_id, false).await?);
 
-    let inspect_args = vec![
-        "inspect".to_string(),
-        "--format".to_string(),
-        "{{json .NetworkSettings.Ports}}".to_string(),
-        container_name,
-    ];
-    let ports_json = run_docker_stdout(&inspect_args).await?;
-    let ports: serde_json::Value =
-        serde_json::from_str(ports_json.trim()).context("parsing docker ports inspect output")?;
-    let key = format!("{container_port}/tcp");
-    let bindings = ports.get(&key).and_then(serde_json::Value::as_array);
-    let Some(binding) = bindings.and_then(|values| values.first()) else {
-        return Ok(None);
-    };
-    let host_port = binding
-        .get("HostPort")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .parse::<u16>()
-        .ok();
-    Ok(host_port.filter(|port| *port > 0))
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if candidate.trim().is_empty() || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if let Some(host_port) = inspect_docker_published_port(&candidate, container_port).await? {
+            return Ok(Some(host_port));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn run_docker_stdout(args: &[String]) -> Result<String> {
@@ -2570,6 +2590,89 @@ async fn run_docker_stdout(args: &[String]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn endpoint_uses_container_network(endpoint: &ProviderEndpoint) -> bool {
+    endpoint
+        .network
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn driver_transport_base_url(endpoint: &ProviderEndpoint, host_port: u16) -> String {
+    format!(
+        "{}://127.0.0.1:{host_port}{}",
+        endpoint.scheme, endpoint.base_path
+    )
+}
+
+fn docker_transport_container_candidates(instance_id: Uuid) -> Vec<String> {
+    vec![container_name(instance_id)]
+}
+
+async fn list_docker_container_names(instance_id: Uuid, running_only: bool) -> Result<Vec<String>> {
+    let mut ps_args = vec!["ps".to_string()];
+    if !running_only {
+        ps_args.push("-a".to_string());
+    }
+    ps_args.extend([
+        "--filter".to_string(),
+        format!("label=elixir.instance_id={instance_id}"),
+        "--format".to_string(),
+        "{{.Names}}".to_string(),
+    ]);
+    let containers = run_docker_stdout(&ps_args).await?;
+    Ok(parse_docker_container_names(&containers))
+}
+
+fn parse_docker_container_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+async fn inspect_docker_published_port(
+    container_name: &str,
+    container_port: u16,
+) -> Result<Option<u16>> {
+    let inspect_args = vec![
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{json .NetworkSettings.Ports}}".to_string(),
+        container_name.to_string(),
+    ];
+    let ports_json = match run_docker_stdout(&inspect_args).await {
+        Ok(ports_json) => ports_json,
+        Err(err) if docker_container_missing_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    parse_docker_published_port(&ports_json, container_port)
+}
+
+fn parse_docker_published_port(ports_json: &str, container_port: u16) -> Result<Option<u16>> {
+    let ports: serde_json::Value =
+        serde_json::from_str(ports_json.trim()).context("parsing docker ports inspect output")?;
+    let key = format!("{container_port}/tcp");
+    let bindings = ports.get(&key).and_then(serde_json::Value::as_array);
+    let Some(binding) = bindings.and_then(|values| values.first()) else {
+        return Ok(None);
+    };
+    let host_port = binding
+        .get("HostPort")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .ok();
+    Ok(host_port.filter(|port| *port > 0))
+}
+
+fn docker_container_missing_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("no such object") || lower.contains("no such container")
 }
 
 fn ensure_probe_ok(result: crate::runtime::probe::ProbeResult, stage: &str) -> Result<()> {
@@ -3161,6 +3264,34 @@ mod tests {
             "authenticationMethod": "forms",
             "authenticationRequired": "disabledForLocalAddresses"
         })));
+    }
+
+    #[test]
+    fn docker_transport_candidates_start_with_runtime_container() {
+        let instance_id =
+            Uuid::parse_str("c1eaaec2-3dcf-40e4-85aa-adea48e4b221").expect("instance id");
+        let mut candidates = docker_transport_container_candidates(instance_id);
+        candidates.extend(parse_docker_container_names("elx-c1eaae-vpn\nelx-shadow\n"));
+        candidates.extend(parse_docker_container_names("elx-c1eaae\nelx-old\n"));
+
+        let mut seen = HashSet::new();
+        let ordered = candidates
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered[0], container_name(instance_id));
+        assert_eq!(ordered[1], "elx-c1eaae-vpn");
+        assert_eq!(ordered[2], "elx-shadow");
+        assert_eq!(ordered[3], "elx-old");
+    }
+
+    #[test]
+    fn parse_docker_published_port_reads_bound_tcp_port() -> Result<()> {
+        let ports_json = r#"{"6789/tcp":[{"HostIp":"0.0.0.0","HostPort":"32932"}]}"#;
+        let host_port = parse_docker_published_port(ports_json, 6789)?;
+        assert_eq!(host_port, Some(32932));
+        Ok(())
     }
 
     #[tokio::test]

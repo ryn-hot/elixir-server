@@ -66,6 +66,8 @@ use crate::orchestrator::planner::{
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::state::AppState;
 
+mod control;
+
 const EXTENSION_UI_TOKEN_TTL_MINUTES: u64 = 60 * 12;
 
 #[derive(Debug, Serialize)]
@@ -892,75 +894,9 @@ pub async fn update_extension_control_surface_settings(
         let context = load_extension_control_context(&state, &store, &extension_id)
             .await
             .map_err(ApiError::from)?;
-        let extension_key = context.extension.extension_id.to_ascii_lowercase();
-        if extension_key.contains("sonarr") || extension_key.contains("radarr") {
-            let Some(instance) = context.selected_instance.as_ref() else {
-                return Err(ApiError::conflict(
-                    "no active instance is available for this extension yet",
-                ));
-            };
-            save_manager_control_defaults(&store, instance.instance_id, &payload.values)
-                .await
-                .map_err(ApiError::from)?;
-        } else if extension_key.contains("qbittorrent") || extension_key.contains("nzbget") {
-            let Some(profile) = payload
-                .values
-                .get("downloaderProfile")
-                .and_then(serde_json::Value::as_str)
-                .map(|value| value.trim().to_ascii_lowercase())
-            else {
-                return Err(ApiError::conflict(
-                    "downloaderProfile is required for downloader defaults",
-                ));
-            };
-            match profile.as_str() {
-                "balanced" => {
-                    if state.settings.extensions.downloader_profile
-                        == DownloaderPerformanceProfile::Balanced
-                    {
-                        store
-                            .delete_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
-                            .await
-                            .map_err(ApiError::from)?;
-                    } else {
-                        store
-                            .upsert_extension_setting(
-                                DOWNLOADER_PROFILE_SETTING_KEY,
-                                &serde_json::Value::String(profile),
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                }
-                "aggressive" => {
-                    if state.settings.extensions.downloader_profile
-                        == DownloaderPerformanceProfile::Aggressive
-                    {
-                        store
-                            .delete_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
-                            .await
-                            .map_err(ApiError::from)?;
-                    } else {
-                        store
-                            .upsert_extension_setting(
-                                DOWNLOADER_PROFILE_SETTING_KEY,
-                                &serde_json::Value::String(profile),
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                }
-                _ => {
-                    return Err(ApiError::conflict(
-                        "downloaderProfile must be balanced or aggressive",
-                    ));
-                }
-            }
-        } else {
-            return Err(ApiError::conflict(
-                "this extension does not expose editable settings yet",
-            ));
-        }
+        control::update_settings(&state, &store, &context, &payload.values)
+            .await
+            .map_err(ApiError::from)?;
     }
     let surface = build_extension_control_surface(&state, &store, &extension_id)
         .await
@@ -2421,6 +2357,7 @@ async fn build_extension_status_summary(
             }
             ExtensionKind::Module => {
                 summarize_module_extension(
+                    state,
                     store,
                     &extension,
                     manifest.as_ref(),
@@ -2896,6 +2833,7 @@ async fn summarize_connector_extension(
 }
 
 async fn summarize_module_extension(
+    state: &AppState,
     store: &ExtensionStore<'_>,
     extension: &Extension,
     manifest: Option<&ExtensionManifest>,
@@ -3036,6 +2974,48 @@ async fn summarize_module_extension(
             "fix",
             "Fix",
         ));
+    }
+
+    if extension
+        .extension_id
+        .eq_ignore_ascii_case("elixir.modules.nzbget")
+    {
+        if let Some(instance) = choose_extension_control_instance(instances) {
+            match control::load_nzbget_provider_inventory_summary(
+                state,
+                store,
+                instance.instance_id,
+            )
+            .await
+            {
+                Ok(summary) if summary.configured_count == 0 => {
+                    return Ok(attention_extension_status(
+                        extension,
+                        "provider_setup_required",
+                        "Add provider",
+                        "Add at least one Usenet provider to start NZBGet downloads.",
+                        "open",
+                        "Add provider",
+                    ));
+                }
+                Ok(summary) if summary.active_count == 0 => {
+                    return Ok(attention_extension_status(
+                        extension,
+                        "provider_setup_required",
+                        "Activate provider",
+                        "Enable or add at least one active Usenet provider before NZBGet can download.",
+                        "open",
+                        "Manage providers",
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "extension summary nzbget provider inventory unavailable: {err}"
+                    );
+                }
+            }
+        }
     }
 
     let description = format!(
@@ -3260,7 +3240,7 @@ async fn build_extension_control_surface(
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlSurface> {
     let context = load_extension_control_context(state, store, extension_id).await?;
-    let live_snapshot = load_extension_control_live_snapshot(state, store, &context)
+    let live_snapshot = control::load_live_snapshot(state, store, &context)
         .await
         .unwrap_or_default();
 
@@ -3285,24 +3265,8 @@ async fn build_extension_control_surface(
         .selected_provider
         .as_ref()
         .and_then(|provider| provider.implementation.clone());
-    let mut sections = Vec::new();
-    if let Some(section) = build_extension_control_settings_section(state, store, &context).await? {
-        sections.push(section);
-    }
-    if let Some(section) =
-        build_extension_control_prowlarr_indexers_section(state, store, &context).await?
-    {
-        sections.push(section);
-    }
-    if let Some(section) =
-        build_extension_control_prowlarr_connector_section(state, store, &context).await?
-    {
-        sections.push(section);
-    }
+    let mut sections = control::build_sections(state, store, &context).await?;
     if let Some(section) = build_extension_control_open_web_ui_section(&context).await? {
-        sections.push(section);
-    }
-    if let Some(section) = build_extension_control_managed_items_section(store, &context).await? {
         sections.push(section);
     }
     if let Some(section) = build_extension_control_service_section(&context, &live_snapshot) {
@@ -3872,6 +3836,7 @@ fn choose_extension_control_provider(
 fn control_health_for_summary(summary: &ExtensionStatusSummaryItem) -> String {
     match summary.status_code.as_str() {
         "connection_issue" => "error".to_string(),
+        "provider_setup_required" => "action_required".to_string(),
         _ if summary.severity == "attention" => "attention".to_string(),
         _ if summary.severity == "disabled" => "disabled".to_string(),
         _ => "healthy".to_string(),
@@ -4338,33 +4303,7 @@ async fn save_manager_control_defaults(
 fn build_extension_control_actions(
     context: &ExtensionControlContext,
 ) -> Vec<ExtensionControlAction> {
-    if context.selected_provider.is_none() {
-        return Vec::new();
-    }
-
-    let extension_id = context.extension.extension_id.to_ascii_lowercase();
-    if extension_id.contains("sonarr")
-        || extension_id.contains("radarr")
-        || extension_id.contains("prowlarr")
-    {
-        return vec![ExtensionControlAction {
-            id: "test_connection".to_string(),
-            label: "Test connection".to_string(),
-            description: "Check that Elixir can reach this service and read its status."
-                .to_string(),
-            kind: "primary".to_string(),
-            params: None,
-            confirm_text: None,
-            navigate_extension_id: None,
-            navigate_view: None,
-            open_url: None,
-            required_fields: Vec::new(),
-            secret_keys: Vec::new(),
-            secret_scope_instance_id: None,
-        }];
-    }
-
-    Vec::new()
+    control::build_actions(context)
 }
 
 async fn build_extension_control_open_service_ui_action(
@@ -4644,13 +4583,14 @@ async fn build_extension_ui_upstream_request(
     upstream_url: Url,
     headers: &AxumHeaderMap,
 ) -> anyhow::Result<reqwest::RequestBuilder> {
-    let mut request = client
-        .request(method, upstream_url.clone())
-        .headers(build_extension_ui_request_headers(
-            headers,
-            target,
-            &upstream_url,
-        ));
+    let mut request =
+        client
+            .request(method, upstream_url.clone())
+            .headers(build_extension_ui_request_headers(
+                headers,
+                target,
+                &upstream_url,
+            ));
     if let Some(host_header) = target.host_header.as_deref() {
         request = request.header(
             REQWEST_HOST,
@@ -5022,8 +4962,14 @@ mod extension_ui_proxy_tests {
                 .headers()
                 .get(reqwest::header::REFERER)
                 .and_then(|value| value.to_str().ok());
-            assert_eq!(origin, Some("http://svc-elixir-modules-qbittorrent-default:8080"));
-            assert_eq!(referer, Some("http://svc-elixir-modules-qbittorrent-default:8080/"));
+            assert_eq!(
+                origin,
+                Some("http://svc-elixir-modules-qbittorrent-default:8080")
+            );
+            assert_eq!(
+                referer,
+                Some("http://svc-elixir-modules-qbittorrent-default:8080/")
+            );
         });
     }
 
@@ -5237,146 +5183,7 @@ async fn execute_extension_control_action(
     params: &HashMap<String, serde_json::Value>,
 ) -> anyhow::Result<String> {
     let context = load_extension_control_context(state, store, extension_id).await?;
-    let Some(provider) = context.selected_provider.as_ref() else {
-        anyhow::bail!("no active provider is available for this extension yet");
-    };
-    let Some(instance) = context.selected_instance.as_ref() else {
-        anyhow::bail!("no active instance is available for this extension yet");
-    };
-
-    match action_id {
-        "test_connection" => {
-            let snapshot = load_extension_control_live_snapshot(state, store, &context).await?;
-            let implementation = provider
-                .implementation
-                .as_deref()
-                .unwrap_or(extension_id)
-                .to_ascii_lowercase();
-            let label = if implementation == "sonarr" {
-                "Sonarr"
-            } else if implementation == "radarr" {
-                "Radarr"
-            } else if implementation == "prowlarr" {
-                "Prowlarr"
-            } else {
-                instance.instance_name.as_str()
-            };
-            let message = match snapshot.version {
-                Some(version) => format!("{label} is reachable. Version {version}."),
-                None => format!("{label} is reachable."),
-            };
-            Ok(message)
-        }
-        "search_missing" => {
-            let implementation = provider
-                .implementation
-                .as_deref()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let (base_url, api_key) =
-                resolve_extension_control_arr_connection(state, store, &context).await?;
-            execute_extension_control_manager_command(
-                &implementation,
-                &base_url,
-                &api_key,
-                action_id,
-                None,
-            )
-            .await
-        }
-        "refresh_manager" => {
-            let implementation = provider
-                .implementation
-                .as_deref()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let (base_url, api_key) =
-                resolve_extension_control_arr_connection(state, store, &context).await?;
-            execute_extension_control_manager_command(
-                &implementation,
-                &base_url,
-                &api_key,
-                action_id,
-                None,
-            )
-            .await
-        }
-        "search_item" | "refresh_item" | "remove_item" => {
-            let implementation = provider
-                .implementation
-                .as_deref()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if implementation != "sonarr" && implementation != "radarr" {
-                anyhow::bail!("item actions are not supported for this extension");
-            }
-            let intent =
-                resolve_extension_control_intent(store, provider.provider_id, params).await?;
-            let manager_item_id = intent
-                .manager_item_id
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("manager item id is not available for this item"))?;
-            let manager_item_id = manager_item_id
-                .parse::<i64>()
-                .context("parsing manager item id")?;
-            let (base_url, api_key) =
-                resolve_extension_control_arr_connection(state, store, &context).await?;
-            let message = execute_extension_control_manager_command(
-                &implementation,
-                &base_url,
-                &api_key,
-                action_id,
-                Some(manager_item_id),
-            )
-            .await?;
-            if action_id == "remove_item" {
-                store
-                    .deactivate_managed_ingest_intent(intent.intent_id)
-                    .await?;
-            }
-            Ok(message)
-        }
-        "activate_connector" => {
-            let target_extension_id = params
-                .get("extensionId")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("extensionId is required"))?;
-
-            let title = params
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(target_extension_id);
-
-            if let Some(existing) = store.get_extension(target_extension_id).await? {
-                if !existing.enabled {
-                    store
-                        .set_extension_enabled(target_extension_id, true)
-                        .await?;
-                }
-            } else {
-                let entry = load_cached_registry_entry_by_extension_id(state, target_extension_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("connector is not available in the registry cache")
-                    })?;
-                install_extension_internal(
-                    state,
-                    &InstallRequest {
-                        download_url: Some(entry.download_url),
-                        package_path: None,
-                    },
-                )
-                .await?;
-            }
-
-            let config = ReconcileConfig::from_settings(&state.settings);
-            state.orchestrator.reconcile_once(&config).await?;
-            Ok(format!("{title} is now managed by Elixir."))
-        }
-        _ => anyhow::bail!("unsupported control action '{action_id}'"),
-    }
+    control::execute_action(state, store, &context, action_id, params).await
 }
 
 async fn load_cached_registry_entry_by_extension_id(
@@ -5398,40 +5205,6 @@ async fn load_cached_registry_entry_by_extension_id(
                     .cmp(&Version::parse(&right.version).ok())
             })
     }))
-}
-
-async fn load_extension_control_live_snapshot(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    context: &ExtensionControlContext,
-) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let provider = match context.selected_provider.as_ref() {
-        Some(value) => value,
-        None => return Ok(ExtensionControlLiveSnapshot::default()),
-    };
-    let instance = match context.selected_instance.as_ref() {
-        Some(value) => value,
-        None => return Ok(ExtensionControlLiveSnapshot::default()),
-    };
-    let implementation = provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let endpoint_json = provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-
-    match implementation.as_str() {
-        "sonarr" => load_sonarr_control_snapshot(state, store, instance, &base_url).await,
-        "radarr" => load_radarr_control_snapshot(state, store, instance, &base_url).await,
-        "prowlarr" => load_prowlarr_control_snapshot(state, store, instance, &base_url).await,
-        _ => Ok(ExtensionControlLiveSnapshot::default()),
-    }
 }
 
 async fn resolve_extension_control_arr_connection(

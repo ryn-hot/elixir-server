@@ -22,9 +22,10 @@ use crate::auth::AuthService;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
+use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
 use crate::extensions::package::{read_manifest_from_dir, unpack_package};
 use crate::extensions::registry::start_registry_refresh_loop;
-use crate::extensions::store::ExtensionStore;
+use crate::extensions::store::{ExtensionStore, NewExtension};
 use crate::http::handlers::extensions::InstallRequest;
 use crate::http::router;
 use crate::library::LinkerService;
@@ -127,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
     );
     if let Err(err) = bootstrap_core_extensions(&state).await {
         tracing::warn!("core extension bootstrap failed: {err}");
+    }
+    if let Err(err) = repair_installed_extension_manifests(&state).await {
+        tracing::warn!("installed extension manifest repair failed: {err}");
     }
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");
@@ -332,6 +336,54 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
                 err
             ),
         }
+    }
+
+    Ok(())
+}
+
+async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Result<()> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let mut repaired = 0_u32;
+
+    for extension in store.list_extensions().await? {
+        let mut raw_json = extension.manifest_json.clone();
+        if !repair_builtin_manifest_json(&mut raw_json) {
+            continue;
+        }
+
+        let manifest: ExtensionManifest = serde_json::from_value(raw_json.clone())
+            .with_context(|| format!("parsing repaired manifest for {}", extension.extension_id))?;
+        manifest.validate().with_context(|| {
+            format!(
+                "validating repaired manifest for {}",
+                extension.extension_id
+            )
+        })?;
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension.extension_id.clone(),
+                name: extension.name.clone(),
+                version: extension.version.clone(),
+                kind: extension.kind,
+                publisher_name: extension.publisher_name.clone(),
+                signing_key_id: extension.signing_key_id.clone(),
+                trust_level: extension.trust_level,
+                manifest_json: raw_json,
+                package_hash: extension.package_hash.clone(),
+                enabled: extension.enabled,
+            })
+            .await?;
+
+        repaired += 1;
+        tracing::info!(
+            "repaired installed manifest for extension '{}'",
+            extension.extension_id
+        );
+    }
+
+    if repaired > 0 {
+        tracing::info!("repaired {repaired} installed extension manifest(s)");
     }
 
     Ok(())

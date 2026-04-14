@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -527,6 +528,246 @@ async fn start_mock_sonarr_control_server()
     Ok((host, addr, state, shutdown_tx))
 }
 
+#[derive(Clone)]
+struct MockNzbgetControlState {
+    config: Arc<Mutex<BTreeMap<String, String>>>,
+    save_calls: Arc<Mutex<Vec<Value>>>,
+    test_calls: Arc<Mutex<Vec<Value>>>,
+    testserver_result: Arc<Mutex<Value>>,
+    config_failures_remaining: Arc<Mutex<usize>>,
+    config_failures_after_save: Arc<Mutex<usize>>,
+    testserver_error_remaining: Arc<Mutex<Option<String>>>,
+    testserver_error_after_save: Arc<Mutex<Option<String>>>,
+}
+
+async fn start_mock_nzbget_control_server(
+    initial_config: Vec<(String, String)>,
+    testserver_result: Value,
+) -> Result<(
+    String,
+    SocketAddr,
+    MockNzbgetControlState,
+    oneshot::Sender<()>,
+)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+    let state = MockNzbgetControlState {
+        config: Arc::new(Mutex::new(initial_config.into_iter().collect())),
+        save_calls: Arc::new(Mutex::new(Vec::new())),
+        test_calls: Arc::new(Mutex::new(Vec::new())),
+        testserver_result: Arc::new(Mutex::new(testserver_result)),
+        config_failures_remaining: Arc::new(Mutex::new(0)),
+        config_failures_after_save: Arc::new(Mutex::new(0)),
+        testserver_error_remaining: Arc::new(Mutex::new(None)),
+        testserver_error_after_save: Arc::new(Mutex::new(None)),
+    };
+
+    async fn rpc_handler(
+        State(state): State<MockNzbgetControlState>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        let method = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = payload
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+
+        let response = match method {
+            "config" => {
+                let mut failures_remaining = state.config_failures_remaining.lock().unwrap();
+                if *failures_remaining > 0 {
+                    *failures_remaining -= 1;
+                    json!({
+                        "version": "1.1",
+                        "result": Value::Null,
+                        "error": { "message": "config temporarily unavailable" },
+                        "id": 1
+                    })
+                } else {
+                    let config = state.config.lock().unwrap();
+                    json!({
+                        "version": "1.1",
+                        "result": Value::Array(
+                            config
+                                .iter()
+                                .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                                .collect(),
+                        ),
+                        "error": Value::Null,
+                        "id": 1
+                    })
+                }
+            }
+            "saveconfig" => {
+                state.save_calls.lock().unwrap().push(params.clone());
+                if let Some(updates) = params.get(0).and_then(Value::as_array) {
+                    let mut config = state.config.lock().unwrap();
+                    for update in updates {
+                        let Some(name) = update.get("Name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let value = update
+                            .get("Value")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        config.insert(name.to_string(), value.to_string());
+                    }
+                }
+                let fail_after_save = *state.config_failures_after_save.lock().unwrap();
+                *state.config_failures_remaining.lock().unwrap() = fail_after_save;
+                let testserver_error_after_save =
+                    state.testserver_error_after_save.lock().unwrap().clone();
+                *state.testserver_error_remaining.lock().unwrap() = testserver_error_after_save;
+                json!({
+                    "version": "1.1",
+                    "result": json!(true),
+                    "error": Value::Null,
+                    "id": 1
+                })
+            }
+            "reload" => json!({
+                "version": "1.1",
+                "result": json!(true),
+                "error": Value::Null,
+                "id": 1
+            }),
+            "testserver" => {
+                state.test_calls.lock().unwrap().push(params.clone());
+                let testserver_error = state.testserver_error_remaining.lock().unwrap().clone();
+                if let Some(message) = testserver_error {
+                    json!({
+                        "version": "1.1",
+                        "result": Value::Null,
+                        "error": { "message": message },
+                        "id": 1
+                    })
+                } else {
+                    json!({
+                        "version": "1.1",
+                        "result": state.testserver_result.lock().unwrap().clone(),
+                        "error": Value::Null,
+                        "id": 1
+                    })
+                }
+            }
+            _ => json!({
+                "version": "1.1",
+                "result": Value::Null,
+                "error": Value::Null,
+                "id": 1
+            }),
+        };
+        Json(response)
+    }
+
+    let app = Router::new()
+        .route("/jsonrpc", post(rpc_handler))
+        .with_state(state.clone());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    sleep(Duration::from_millis(25)).await;
+
+    Ok((host, addr, state, shutdown_tx))
+}
+
+async fn seed_nzbget_control_extension(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    host: String,
+    port: u16,
+) -> Result<Uuid> {
+    let instance_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.nzbget".to_string(),
+            name: "NZBGet".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.nzbget",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "NZBGet",
+                "provides": [{
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "implementation": "nzbget"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/nzbget:latest"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.nzbget".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id,
+            capability: "downloader.nzb".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("nzbget".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": host,
+                "port": port,
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget_username".to_string(),
+            value_encrypted: secrets.encrypt("service-user")?,
+            rotatable: true,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget_password".to_string(),
+            value_encrypted: secrets.encrypt("service-pass")?,
+            rotatable: true,
+        })
+        .await?;
+
+    Ok(instance_id)
+}
+
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
     let mut settings = test_settings_with_db();
@@ -822,6 +1063,138 @@ async fn downloader_profile_update_persists_override_and_marks_pending_updates()
         .await?
         .expect("stored override");
     assert_eq!(stored.as_str(), Some("aggressive"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_updates_builtin_downloader_profile() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            name: "qBittorrent".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let initial_response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.qbittorrent/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(initial_response.status(), StatusCode::OK);
+    let initial_body = body::to_bytes(initial_response.into_body(), 1_048_576).await?;
+    let initial_payload: Value = serde_json::from_slice(&initial_body)?;
+    let initial_fields = control_surface_section(&initial_payload, "defaults")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        initial_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloaderProfile")
+                && field.get("value").and_then(Value::as_str) == Some("balanced")
+        }),
+        "expected balanced downloader profile field in control surface: {}",
+        initial_payload
+    );
+
+    let aggressive_response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.qbittorrent/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "values": {
+                        "downloaderProfile": "aggressive"
+                    }
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(aggressive_response.status(), StatusCode::OK);
+    let aggressive_body = body::to_bytes(aggressive_response.into_body(), 1_048_576).await?;
+    let aggressive_payload: Value = serde_json::from_slice(&aggressive_body)?;
+    let aggressive_fields = control_surface_section(&aggressive_payload, "defaults")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        aggressive_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloaderProfile")
+                && field.get("value").and_then(Value::as_str) == Some("aggressive")
+        }),
+        "expected aggressive downloader profile field in control surface: {}",
+        aggressive_payload
+    );
+    let aggressive_override = store.get_extension_setting("downloader_profile").await?;
+    assert_eq!(aggressive_override, Some(json!("aggressive")));
+
+    let balanced_response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.qbittorrent/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "values": {
+                        "downloaderProfile": "balanced"
+                    }
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(balanced_response.status(), StatusCode::OK);
+    let balanced_body = body::to_bytes(balanced_response.into_body(), 1_048_576).await?;
+    let balanced_payload: Value = serde_json::from_slice(&balanced_body)?;
+    let balanced_fields = control_surface_section(&balanced_payload, "defaults")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        balanced_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloaderProfile")
+                && field.get("value").and_then(Value::as_str) == Some("balanced")
+        }),
+        "expected balanced downloader profile field after reset: {}",
+        balanced_payload
+    );
+    assert!(
+        store
+            .get_extension_setting("downloader_profile")
+            .await?
+            .is_none(),
+        "expected downloader profile override to be cleared when reset to default"
+    );
 
     Ok(())
 }
@@ -6838,6 +7211,991 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
     assert_eq!(
         stored.get("searchOnAdd").and_then(Value::as_bool),
         Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_marks_nzbget_provider_setup_required() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, _mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let nzbget = items
+        .iter()
+        .find(|item| {
+            item.get("extensionId").and_then(Value::as_str) == Some("elixir.modules.nzbget")
+        })
+        .expect("nzbget summary item");
+    assert_eq!(
+        nzbget.get("statusCode").and_then(Value::as_str),
+        Some("provider_setup_required")
+    );
+    assert_eq!(
+        nzbget.get("label").and_then(Value::as_str),
+        Some("Add provider")
+    );
+    assert_eq!(
+        nzbget.get("primaryActionLabel").and_then(Value::as_str),
+        Some("Add provider")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_restores_persisted_nzbget_provider_inventory() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.username".to_string(),
+            value_encrypted: secrets.encrypt("reader")?,
+            rotatable: true,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.password".to_string(),
+            value_encrypted: secrets.encrypt("provider-secret")?,
+            rotatable: true,
+        })
+        .await?;
+    store
+        .update_instance_config(
+            instance_id,
+            Some(&json!({
+                "server_inventory": [{
+                    "slot": 1,
+                    "active": true,
+                    "name": "Newshosting",
+                    "level": 0,
+                    "host": "news.newshosting.com",
+                    "encryption": true,
+                    "port": 563,
+                    "connections": 30,
+                    "cert_verification": "strict"
+                }]
+            })),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let nzbget = items
+        .iter()
+        .find(|item| {
+            item.get("extensionId").and_then(Value::as_str) == Some("elixir.modules.nzbget")
+        })
+        .expect("nzbget summary item");
+    assert_eq!(
+        nzbget.get("statusCode").and_then(Value::as_str),
+        Some("ready")
+    );
+    assert_eq!(nzbget.get("label").and_then(Value::as_str), Some("Ready"));
+
+    let save_calls = mock_state.save_calls.lock().unwrap().clone();
+    assert_eq!(save_calls.len(), 1, "expected one restore saveconfig call");
+    let save_updates = save_calls[0]
+        .get(0)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        save_updates.iter().any(|update| {
+            update.get("Name").and_then(Value::as_str) == Some("Server1.Host")
+                && update.get("Value").and_then(Value::as_str) == Some("news.newshosting.com")
+        }),
+        "expected persisted provider to be restored into NZBGet config: {:?}",
+        save_updates
+    );
+    assert!(
+        mock_state
+            .config
+            .lock()
+            .unwrap()
+            .get("Server1.Host")
+            .map(|value| value == "news.newshosting.com")
+            .unwrap_or(false),
+        "expected restored provider host in live NZBGet config"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_drops_stale_nzbget_provider_inventory_without_credentials()
+-> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    store
+        .update_instance_config(
+            instance_id,
+            Some(&json!({
+                "server_inventory": [{
+                    "slot": 1,
+                    "active": true,
+                    "name": "XSNews",
+                    "level": 0,
+                    "host": "reader.xsnews.nl",
+                    "encryption": true,
+                    "port": 563,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }]
+            })),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.nzbget/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Add provider")
+    );
+
+    let servers = control_surface_section(&payload, "servers");
+    assert_eq!(
+        servers
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let save_calls = mock_state.save_calls.lock().unwrap().clone();
+    assert_eq!(
+        save_calls.len(),
+        0,
+        "stale persisted inventory should not be restored without credentials"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_ignores_stale_live_nzbget_inventory_absent_from_persisted_state()
+-> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) = start_mock_nzbget_control_server(
+        vec![
+            ("Server1.Active".to_string(), "yes".to_string()),
+            ("Server1.Name".to_string(), "XSNews".to_string()),
+            ("Server1.Level".to_string(), "0".to_string()),
+            ("Server1.Host".to_string(), "news.xsnews.nl".to_string()),
+            ("Server1.Encryption".to_string(), "yes".to_string()),
+            ("Server1.Port".to_string(), "563".to_string()),
+            ("Server1.Username".to_string(), "reader".to_string()),
+            (
+                "Server1.Password".to_string(),
+                "provider-secret".to_string(),
+            ),
+            ("Server1.Connections".to_string(), "32".to_string()),
+            ("Server1.CertVerification".to_string(), "strict".to_string()),
+        ],
+        json!(""),
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    store
+        .update_instance_config(instance_id, Some(&json!({ "server_inventory": [] })))
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.nzbget/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Add provider")
+    );
+
+    let servers = control_surface_section(&payload, "servers");
+    assert_eq!(
+        servers
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let save_calls = mock_state.save_calls.lock().unwrap().clone();
+    assert_eq!(
+        save_calls.len(),
+        0,
+        "stale live inventory should not be re-persisted when persisted state is empty"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_includes_nzbget_servers_section() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, _mock_state, shutdown_tx) = start_mock_nzbget_control_server(
+        vec![
+            ("Server1.Active".to_string(), "yes".to_string()),
+            ("Server1.Name".to_string(), "Newshosting".to_string()),
+            ("Server1.Level".to_string(), "0".to_string()),
+            (
+                "Server1.Host".to_string(),
+                "news.newshosting.com".to_string(),
+            ),
+            ("Server1.Encryption".to_string(), "yes".to_string()),
+            ("Server1.Port".to_string(), "563".to_string()),
+            ("Server1.Username".to_string(), "reader".to_string()),
+            ("Server1.Password".to_string(), "secret".to_string()),
+            ("Server1.Connections".to_string(), "30".to_string()),
+            ("Server1.CertVerification".to_string(), "strict".to_string()),
+        ],
+        json!(""),
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.nzbget/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let servers = control_surface_section(&payload, "servers");
+    let actions = servers
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("add_server"))
+            .and_then(|action| action.get("label"))
+            .and_then(Value::as_str),
+        Some("Add provider")
+    );
+    assert!(
+        actions
+            .iter()
+            .find(|action| action.get("id").and_then(Value::as_str) == Some("add_server"))
+            .and_then(|action| action.pointer("/params/promptFields"))
+            .and_then(Value::as_array)
+            .map(|fields| !fields.is_empty())
+            .unwrap_or(false),
+        "expected add_server prompt fields in NZBGet control surface: {}",
+        payload
+    );
+
+    let entities = servers
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let provider = entities
+        .iter()
+        .find(|entity| entity.get("title").and_then(Value::as_str) == Some("Newshosting"))
+        .expect("nzbget provider entity");
+    assert_eq!(
+        provider.pointer("/actions/0/id").and_then(Value::as_str),
+        Some("edit_server")
+    );
+    assert_eq!(
+        provider.pointer("/actions/1/id").and_then(Value::as_str),
+        Some("test_server")
+    );
+    assert_eq!(
+        provider.pointer("/actions/2/id").and_then(Value::as_str),
+        Some("remove_server")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_remove_nzbget_server_survives_reload_gap() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) = start_mock_nzbget_control_server(
+        vec![
+            ("Server1.Active".to_string(), "yes".to_string()),
+            ("Server1.Name".to_string(), "XSNews".to_string()),
+            ("Server1.Level".to_string(), "0".to_string()),
+            ("Server1.Host".to_string(), "reader.xsnews.nl".to_string()),
+            ("Server1.Encryption".to_string(), "yes".to_string()),
+            ("Server1.Port".to_string(), "563".to_string()),
+            ("Server1.Username".to_string(), "reader".to_string()),
+            (
+                "Server1.Password".to_string(),
+                "provider-secret".to_string(),
+            ),
+            ("Server1.Connections".to_string(), "20".to_string()),
+            ("Server1.CertVerification".to_string(), "strict".to_string()),
+        ],
+        json!(""),
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.username".to_string(),
+            value_encrypted: secrets.encrypt("reader")?,
+            rotatable: true,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.password".to_string(),
+            value_encrypted: secrets.encrypt("provider-secret")?,
+            rotatable: true,
+        })
+        .await?;
+    *mock_state.config_failures_after_save.lock().unwrap() = 4;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.nzbget/control-surface/actions/remove_server",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "params": { "slot": 1 }
+            }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected nzbget remove_server response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload.get("success").and_then(Value::as_bool), Some(true));
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("Removed XSNews from NZBGet."),
+        "expected successful removal message: {}",
+        payload
+    );
+    assert_eq!(
+        payload
+            .pointer("/controlSurface/status/summary")
+            .and_then(Value::as_str),
+        Some("Add provider")
+    );
+
+    let surface = payload
+        .get("controlSurface")
+        .expect("control surface in action response");
+    let servers = control_surface_section(surface, "servers");
+    assert_eq!(
+        servers
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    assert!(
+        store
+            .get_secret(
+                SecretScope::Instance,
+                Some(instance_id),
+                "nzbget.server.1.username",
+            )
+            .await?
+            .is_none(),
+        "expected username secret to be removed"
+    );
+    assert!(
+        store
+            .get_secret(
+                SecretScope::Instance,
+                Some(instance_id),
+                "nzbget.server.1.password",
+            )
+            .await?
+            .is_none(),
+        "expected password secret to be removed"
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let live_config = mock_state.config.lock().unwrap().clone();
+    assert_eq!(
+        live_config.get("Server1.Host").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        live_config.get("Server1.Active").map(String::as_str),
+        Some("no")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_add_nzbget_server_saves_config_and_secrets() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.nzbget/control-surface/actions/add_server",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "params": {
+                    "name": "Newshosting",
+                    "host": "news.newshosting.com",
+                    "port": 563,
+                    "username": "reader",
+                    "password": "provider-secret",
+                    "encryption": true,
+                    "connections": 30,
+                    "priority": 0,
+                    "certVerification": "strict",
+                    "active": true
+                }
+            }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected nzbget add_server response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload.get("success").and_then(Value::as_bool), Some(true));
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("Saved and validated Newshosting."),
+        "expected successful validation message: {}",
+        payload
+    );
+    assert_eq!(
+        payload
+            .pointer("/controlSurface/status/summary")
+            .and_then(Value::as_str),
+        Some("Ready")
+    );
+
+    let username_secret = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance_id),
+            "nzbget.server.1.username",
+        )
+        .await?
+        .expect("nzbget provider username secret");
+    let password_secret = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance_id),
+            "nzbget.server.1.password",
+        )
+        .await?
+        .expect("nzbget provider password secret");
+    assert_eq!(secrets.decrypt(&username_secret.value_encrypted)?, "reader");
+    assert_eq!(
+        secrets.decrypt(&password_secret.value_encrypted)?,
+        "provider-secret"
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory/0/host"))
+            .and_then(Value::as_str),
+        Some("news.newshosting.com")
+    );
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory/0/cert_verification"))
+            .and_then(Value::as_str),
+        Some("strict")
+    );
+
+    let save_calls = mock_state.save_calls.lock().unwrap().clone();
+    assert_eq!(save_calls.len(), 1, "expected one saveconfig call");
+    let save_updates = save_calls[0]
+        .get(0)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        save_updates.iter().any(|update| {
+            update.get("Name").and_then(Value::as_str) == Some("Server1.Host")
+                && update.get("Value").and_then(Value::as_str) == Some("news.newshosting.com")
+        }),
+        "expected Server1.Host saveconfig update: {:?}",
+        save_updates
+    );
+    assert!(
+        save_updates.iter().any(|update| {
+            update.get("Name").and_then(Value::as_str) == Some("Server1.Connections")
+                && update.get("Value").and_then(Value::as_str) == Some("30")
+        }),
+        "expected Server1.Connections saveconfig update: {:?}",
+        save_updates
+    );
+
+    let test_calls = mock_state.test_calls.lock().unwrap().clone();
+    assert_eq!(test_calls.len(), 1, "expected one testserver call");
+    let first_test = test_calls[0].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        first_test.get(0).and_then(Value::as_str),
+        Some("news.newshosting.com")
+    );
+    assert_eq!(first_test.get(2).and_then(Value::as_str), Some("reader"));
+    assert_eq!(
+        first_test.get(3).and_then(Value::as_str),
+        Some("provider-secret")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_add_nzbget_server_survives_validation_reload_gap() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    *mock_state.testserver_error_after_save.lock().unwrap() =
+        Some("validation temporarily unavailable".to_string());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.nzbget/control-surface/actions/add_server",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "params": {
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "username": "reader",
+                    "password": "provider-secret",
+                    "encryption": true,
+                    "connections": 32,
+                    "priority": 0,
+                    "certVerification": "strict",
+                    "active": true
+                }
+            }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected nzbget add_server response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload.get("success").and_then(Value::as_bool), Some(true));
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("did not come back quickly enough to validate"),
+        "expected validation retry/deferred message: {}",
+        payload
+    );
+    assert_eq!(
+        payload
+            .pointer("/controlSurface/status/summary")
+            .and_then(Value::as_str),
+        Some("Ready")
+    );
+    let surface = payload
+        .get("controlSurface")
+        .expect("control surface in action response");
+    let servers = control_surface_section(surface, "servers");
+    assert_eq!(
+        servers
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory/0/host"))
+            .and_then(Value::as_str),
+        Some("news.xsnews.nl")
+    );
+
+    let test_calls = mock_state.test_calls.lock().unwrap().clone();
+    assert_eq!(
+        test_calls.len(),
+        4,
+        "expected validation retries across reload gap"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_action_add_nzbget_server_reports_tls_validation_failures() -> Result<()>
+{
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, _mock_state, shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("certificate verify failed")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.nzbget/control-surface/actions/add_server",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "params": {
+                    "name": "TLS Provider",
+                    "host": "tls.example.com",
+                    "port": 563,
+                    "username": "reader",
+                    "password": "provider-secret",
+                    "encryption": true,
+                    "connections": 20,
+                    "priority": 0,
+                    "certVerification": "strict",
+                    "active": true
+                }
+            }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("TLS mismatch."),
+        "expected TLS validation classification: {}",
+        payload
     );
 
     Ok(())

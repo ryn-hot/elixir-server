@@ -45,6 +45,13 @@ pub struct ExtensionManifest {
     pub policies: Option<ManifestPolicies>,
     #[serde(default)]
     pub networking: Option<ManifestNetworking>,
+    // Reserved for a future generic control bridge.
+    //
+    // Current built-ins use handwritten server adapters, and the runtime does
+    // not yet execute manifest-defined control surfaces for community
+    // extensions. This field is intentionally dormant for now.
+    #[serde(default)]
+    pub control_surface: Option<ManifestControlSurface>,
 }
 
 impl ExtensionManifest {
@@ -156,6 +163,10 @@ impl ExtensionManifest {
 
         for addon in &self.optional_addons {
             addon.validate()?;
+        }
+
+        if let Some(control_surface) = &self.control_surface {
+            control_surface.validate()?;
         }
 
         Ok(())
@@ -474,6 +485,336 @@ pub struct ManifestServicePort {
     pub container_port: u16,
 }
 
+// Declarative control metadata reserved for a future generic runtime bridge.
+//
+// Validation is active so manifests can be shaped consistently, but the server
+// does not yet execute this contract for community extensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlSurface {
+    #[serde(default = "default_control_surface_adapter")]
+    pub adapter: String,
+    #[serde(default)]
+    pub owned_settings: Vec<ManifestControlOwnedSetting>,
+    #[serde(default)]
+    pub observed_state: Vec<ManifestControlObservedState>,
+    #[serde(default)]
+    pub entities: Vec<ManifestControlEntityCollection>,
+    #[serde(default)]
+    pub actions: Vec<ManifestControlActionDef>,
+    #[serde(default)]
+    pub native_only: Vec<ManifestControlNativeArea>,
+}
+
+impl ManifestControlSurface {
+    fn validate(&self) -> Result<()> {
+        let adapter = self.adapter.trim().to_ascii_lowercase();
+        if adapter != "generic_v1" {
+            bail!(
+                "unsupported control_surface.adapter '{}'; expected generic_v1",
+                self.adapter
+            );
+        }
+
+        ensure_unique_control_ids(
+            &self
+                .owned_settings
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            "control_surface.owned_settings",
+        )?;
+        ensure_unique_control_ids(
+            &self
+                .observed_state
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            "control_surface.observed_state",
+        )?;
+        ensure_unique_control_ids(
+            &self
+                .entities
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            "control_surface.entities",
+        )?;
+        ensure_unique_control_ids(
+            &self
+                .actions
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            "control_surface.actions",
+        )?;
+        ensure_unique_control_ids(
+            &self
+                .native_only
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            "control_surface.native_only",
+        )?;
+
+        for setting in &self.owned_settings {
+            setting.validate()?;
+        }
+        for state in &self.observed_state {
+            state.validate()?;
+        }
+        let action_ids = self
+            .actions
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect::<Vec<_>>();
+        for entity in &self.entities {
+            entity.validate(&action_ids)?;
+        }
+        for action in &self.actions {
+            action.validate()?;
+        }
+        for area in &self.native_only {
+            area.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlOwnedSetting {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub secret: bool,
+    pub storage: ManifestControlStorage,
+    #[serde(default)]
+    pub options: Vec<ManifestControlOption>,
+}
+
+impl ManifestControlOwnedSetting {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.id, "control_surface.owned_settings.id")?;
+        ensure_non_empty(&self.label, "control_surface.owned_settings.label")?;
+        let field_type = self.field_type.trim().to_ascii_lowercase();
+        if !matches!(
+            field_type.as_str(),
+            "text" | "password" | "toggle" | "select" | "number"
+        ) {
+            bail!(
+                "unsupported control_surface.owned_settings.type '{}'; expected text|password|toggle|select|number",
+                self.field_type
+            );
+        }
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "control_surface.owned_settings.description")?;
+        }
+        if field_type == "password" && !self.secret {
+            bail!(
+                "control_surface.owned_settings '{}' must set secret=true for password fields",
+                self.id
+            );
+        }
+        if self.secret && !matches!(field_type.as_str(), "text" | "password") {
+            bail!(
+                "control_surface.owned_settings '{}' uses secret=true but type '{}' is not supported for secret storage",
+                self.id,
+                self.field_type
+            );
+        }
+        if field_type == "select" && self.options.is_empty() {
+            bail!(
+                "control_surface.owned_settings '{}' requires options for select fields",
+                self.id
+            );
+        }
+        if field_type != "select" && !self.options.is_empty() {
+            bail!(
+                "control_surface.owned_settings '{}' only supports options for select fields",
+                self.id
+            );
+        }
+        self.storage.validate(self.secret, &self.id)?;
+        for option in &self.options {
+            option.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlStorage {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub key: String,
+}
+
+impl ManifestControlStorage {
+    fn validate(&self, secret: bool, setting_id: &str) -> Result<()> {
+        ensure_non_empty(&self.key, "control_surface.owned_settings.storage.key")?;
+        let storage_type = self.r#type.trim().to_ascii_lowercase();
+        if !matches!(
+            storage_type.as_str(),
+            "extension_setting" | "instance_setting" | "global_secret" | "instance_secret"
+        ) {
+            bail!(
+                "unsupported control_surface.owned_settings.storage.type '{}'; expected extension_setting|instance_setting|global_secret|instance_secret",
+                self.r#type
+            );
+        }
+        let is_secret_storage =
+            matches!(storage_type.as_str(), "global_secret" | "instance_secret");
+        if secret && !is_secret_storage {
+            bail!(
+                "control_surface.owned_settings '{}' uses secret=true and must store into instance_secret or global_secret",
+                setting_id
+            );
+        }
+        if !secret && is_secret_storage {
+            bail!(
+                "control_surface.owned_settings '{}' stores into secret scope but secret=false",
+                setting_id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlOption {
+    pub value: serde_json::Value,
+    pub label: String,
+}
+
+impl ManifestControlOption {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.label, "control_surface.owned_settings.options.label")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlObservedState {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl ManifestControlObservedState {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.id, "control_surface.observed_state.id")?;
+        ensure_non_empty(&self.label, "control_surface.observed_state.label")?;
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "control_surface.observed_state.description")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlEntityCollection {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub item_label: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+impl ManifestControlEntityCollection {
+    fn validate(&self, action_ids: &[&str]) -> Result<()> {
+        ensure_non_empty(&self.id, "control_surface.entities.id")?;
+        ensure_non_empty(&self.title, "control_surface.entities.title")?;
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "control_surface.entities.description")?;
+        }
+        if let Some(item_label) = self.item_label.as_deref() {
+            ensure_non_empty(item_label, "control_surface.entities.item_label")?;
+        }
+        for action in &self.actions {
+            ensure_non_empty(action, "control_surface.entities.actions")?;
+            if !action_ids.iter().any(|candidate| *candidate == action) {
+                bail!(
+                    "control_surface.entities '{}' references unknown action '{}'",
+                    self.id,
+                    action
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlActionDef {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default = "default_control_action_target")]
+    pub target: String,
+    #[serde(default = "default_control_action_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub confirm_text: Option<String>,
+}
+
+impl ManifestControlActionDef {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.id, "control_surface.actions.id")?;
+        ensure_non_empty(&self.label, "control_surface.actions.label")?;
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "control_surface.actions.description")?;
+        }
+        if let Some(confirm_text) = self.confirm_text.as_deref() {
+            ensure_non_empty(confirm_text, "control_surface.actions.confirm_text")?;
+        }
+        let target = self.target.trim().to_ascii_lowercase();
+        if !matches!(target.as_str(), "service" | "entity") {
+            bail!(
+                "unsupported control_surface.actions.target '{}'; expected service|entity",
+                self.target
+            );
+        }
+        let kind = self.kind.trim().to_ascii_lowercase();
+        if !matches!(kind.as_str(), "primary" | "secondary" | "danger") {
+            bail!(
+                "unsupported control_surface.actions.kind '{}'; expected primary|secondary|danger",
+                self.kind
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlNativeArea {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl ManifestControlNativeArea {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.id, "control_surface.native_only.id")?;
+        ensure_non_empty(&self.title, "control_surface.native_only.title")?;
+        if let Some(description) = self.description.as_deref() {
+            ensure_non_empty(description, "control_surface.native_only.description")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManifestParseResult {
     pub manifest: ExtensionManifest,
@@ -490,8 +831,63 @@ pub fn parse_manifest_yaml(yaml: &str) -> Result<ManifestParseResult> {
     Ok(ManifestParseResult { manifest, raw_json })
 }
 
+pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
+    let extension_id = raw_json
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match extension_id {
+        "elixir.blueprints.arr_stack" => ensure_string_array_item_after(
+            raw_json,
+            "connectors",
+            "elixir.connectors.nzbget_defaults",
+            "elixir.connectors.qbittorrent_defaults",
+        ),
+        _ => false,
+    }
+}
+
+fn ensure_string_array_item_after(
+    root: &mut serde_json::Value,
+    field: &str,
+    value: &str,
+    after: &str,
+) -> bool {
+    let Some(object) = root.as_object_mut() else {
+        return false;
+    };
+    let entry = object
+        .entry(field.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(array) = entry.as_array_mut() else {
+        return false;
+    };
+    if array.iter().any(|item| item.as_str() == Some(value)) {
+        return false;
+    }
+    let insert_index = array
+        .iter()
+        .position(|item| item.as_str() == Some(after))
+        .map(|index| index + 1)
+        .unwrap_or(array.len());
+    array.insert(insert_index, serde_json::Value::String(value.to_string()));
+    true
+}
+
 fn default_slot() -> String {
     "default".to_string()
+}
+
+fn default_control_surface_adapter() -> String {
+    "generic_v1".to_string()
+}
+
+fn default_control_action_target() -> String {
+    "service".to_string()
+}
+
+fn default_control_action_kind() -> String {
+    "secondary".to_string()
 }
 
 fn default_runtime_egress_mode() -> String {
@@ -505,6 +901,18 @@ fn default_true() -> bool {
 fn ensure_non_empty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("manifest {} is required", field);
+    }
+    Ok(())
+}
+
+fn ensure_unique_control_ids(ids: &[&str], field: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for value in ids {
+        ensure_non_empty(value, field)?;
+        let normalized = value.trim().to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            bail!("manifest {} contains duplicate id '{}'", field, value);
+        }
     }
     Ok(())
 }
@@ -626,6 +1034,7 @@ fn validate_scope_media_for_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn manifest_accepts_wireguard_runtime_egress() {
@@ -679,5 +1088,153 @@ runtime:
 "#;
         let err = parse_manifest_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("wireguard_config_secret"));
+    }
+
+    #[test]
+    fn manifest_accepts_generic_control_surface_contract() {
+        let yaml = r#"
+id: elixir.modules.community.test
+version: 1.0.0
+kind: module
+name: Community Test
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: community-test
+runtime:
+  type: container
+  image: example/community-test:1
+control_surface:
+  adapter: generic_v1
+  owned_settings:
+    - id: apiKey
+      label: API key
+      type: password
+      secret: true
+      storage:
+        type: instance_secret
+        key: community_api_key
+    - id: mode
+      label: Mode
+      type: select
+      storage:
+        type: instance_setting
+        key: mode
+      options:
+        - value: balanced
+          label: Balanced
+        - value: aggressive
+          label: Aggressive
+  observed_state:
+    - id: status
+      label: Status
+    - id: itemCount
+      label: Items
+  actions:
+    - id: sync_now
+      label: Sync now
+      target: service
+      kind: primary
+    - id: remove_item
+      label: Remove
+      target: entity
+      kind: danger
+      confirm_text: Remove this item?
+  entities:
+    - id: queue
+      title: Queue
+      item_label: Item
+      actions: [remove_item]
+  native_only:
+    - id: advanced_filters
+      title: Advanced filters
+      description: Managed only in the native UI.
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        let control_surface = parsed
+            .manifest
+            .control_surface
+            .expect("control surface should exist");
+        assert_eq!(control_surface.adapter, "generic_v1");
+        assert_eq!(control_surface.owned_settings.len(), 2);
+        assert_eq!(control_surface.entities.len(), 1);
+        assert_eq!(control_surface.actions.len(), 2);
+    }
+
+    #[test]
+    fn manifest_rejects_secret_control_field_with_non_secret_storage() {
+        let yaml = r#"
+id: elixir.modules.community.test
+version: 1.0.0
+kind: module
+name: Community Test
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: community-test
+runtime:
+  type: container
+  image: example/community-test:1
+control_surface:
+  owned_settings:
+    - id: apiKey
+      label: API key
+      type: password
+      secret: true
+      storage:
+        type: instance_setting
+        key: api_key
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("instance_secret or global_secret"));
+    }
+
+    #[test]
+    fn repair_builtin_manifest_adds_missing_arr_stack_nzbget_defaults_connector() {
+        let mut raw = json!({
+            "id": "elixir.blueprints.arr_stack",
+            "connectors": [
+                "elixir.connectors.prowlarr_public_indexers",
+                "elixir.connectors.qbittorrent_defaults",
+                "elixir.connectors.sonarr_qbittorrent",
+                "elixir.connectors.sonarr_nzbget"
+            ]
+        });
+
+        assert!(repair_builtin_manifest_json(&mut raw));
+
+        let connectors = raw
+            .get("connectors")
+            .and_then(serde_json::Value::as_array)
+            .expect("connectors array");
+        let values = connectors
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec![
+                "elixir.connectors.prowlarr_public_indexers",
+                "elixir.connectors.qbittorrent_defaults",
+                "elixir.connectors.nzbget_defaults",
+                "elixir.connectors.sonarr_qbittorrent",
+                "elixir.connectors.sonarr_nzbget"
+            ]
+        );
+    }
+
+    #[test]
+    fn repair_builtin_manifest_is_noop_when_arr_stack_nzbget_defaults_already_present() {
+        let mut raw = json!({
+            "id": "elixir.blueprints.arr_stack",
+            "connectors": [
+                "elixir.connectors.qbittorrent_defaults",
+                "elixir.connectors.nzbget_defaults",
+                "elixir.connectors.sonarr_nzbget"
+            ]
+        });
+
+        assert!(!repair_builtin_manifest_json(&mut raw));
     }
 }
