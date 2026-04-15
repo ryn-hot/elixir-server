@@ -1,24 +1,33 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
+use uuid::Uuid;
 
 use crate::runtime::RuntimeManager;
 use crate::runtime::model::{
-    ContainerHandle, ContainerSpec, ContainerState, PortMapping, VolumeMount,
+    ContainerHandle, ContainerSpec, ContainerState, PortMapping, VolumeMount, VolumeMountSourceKind,
 };
 
 const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"];
 
 pub struct DockerRuntimeManager {
     docker_bin: String,
+}
+
+#[derive(Debug)]
+struct ContainerMount {
+    mount_type: String,
+    source: Option<String>,
+    name: Option<String>,
+    destination: String,
+    read_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +41,55 @@ pub struct DockerStartupConfig {
 pub enum DockerDaemonStatus {
     Ready,
     StartedByElixir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerRuntimeFailureKind {
+    DaemonUnavailable,
+    DesktopGuestSocketMissing,
+    EngineKillStuck,
+    EngineDeadlineExceeded,
+    OciRuntimeFailure,
+}
+
+impl DockerRuntimeFailureKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::DaemonUnavailable => "docker_runtime_unavailable",
+            Self::DesktopGuestSocketMissing => "docker_desktop_guest_socket_missing",
+            Self::EngineKillStuck => "docker_engine_kill_stuck",
+            Self::EngineDeadlineExceeded => "docker_engine_deadline_exceeded",
+            Self::OciRuntimeFailure => "docker_oci_runtime_failure",
+        }
+    }
+}
+
+pub fn describe_docker_runtime_failure(
+    kind: DockerRuntimeFailureKind,
+    err: &anyhow::Error,
+) -> String {
+    match kind {
+        DockerRuntimeFailureKind::DaemonUnavailable => format!(
+            "Docker daemon is unavailable from Elixir. Docker may still be starting, stopped, or unreachable from the current host session. {}",
+            err
+        ),
+        DockerRuntimeFailureKind::DesktopGuestSocketMissing => format!(
+            "Docker Desktop is missing required guest sockets, which usually means its VM is only partially started or internally unhealthy. {}",
+            err
+        ),
+        DockerRuntimeFailureKind::EngineKillStuck => format!(
+            "Docker could not stop or remove an Elixir-managed container because the engine never delivered an exit event. {}",
+            err
+        ),
+        DockerRuntimeFailureKind::EngineDeadlineExceeded => format!(
+            "Docker timed out while handling a managed container lifecycle operation. {}",
+            err
+        ),
+        DockerRuntimeFailureKind::OciRuntimeFailure => format!(
+            "Docker reported an OCI runtime failure while starting or replacing a managed container. {}",
+            err
+        ),
+    }
 }
 
 impl DockerRuntimeManager {
@@ -199,6 +257,11 @@ impl DockerRuntimeManager {
         serde_json::from_str(&stdout).context("parsing docker inspect output")
     }
 
+    async fn container_top_output(&self, name: &str) -> Result<String> {
+        let args = vec!["top".to_string(), name.to_string()];
+        self.run_stdout(&args).await
+    }
+
     fn ensure_required_labels(labels: &HashMap<String, String>) -> Result<()> {
         for label in REQUIRED_LABELS {
             if !labels.contains_key(label) {
@@ -277,6 +340,66 @@ impl DockerRuntimeManager {
             .unwrap_or_default()
     }
 
+    fn extract_mounts(value: &Value) -> Vec<ContainerMount> {
+        value
+            .get("Mounts")
+            .and_then(Value::as_array)
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .filter_map(|mount| {
+                        let destination = mount
+                            .get("Destination")
+                            .and_then(Value::as_str)?
+                            .to_string();
+                        let mount_type = mount
+                            .get("Type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let source = mount
+                            .get("Source")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let name = mount
+                            .get("Name")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let read_only = mount
+                            .get("RW")
+                            .and_then(Value::as_bool)
+                            .map(|rw| !rw)
+                            .unwrap_or(false);
+                        Some(ContainerMount {
+                            mount_type,
+                            source,
+                            name,
+                            destination,
+                            read_only,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mount_matches(desired: &VolumeMount, actual: &ContainerMount) -> bool {
+        if actual.destination != desired.container_path || actual.read_only != desired.read_only {
+            return false;
+        }
+
+        match desired.source_kind {
+            VolumeMountSourceKind::Bind => {
+                actual.mount_type == "bind"
+                    && actual.source.as_deref() == Some(desired.host_path.as_str())
+            }
+            VolumeMountSourceKind::NamedVolume => {
+                actual.mount_type == "volume"
+                    && actual.name.as_deref() == Some(desired.host_path.as_str())
+            }
+        }
+    }
+
     fn aliases_conflict(spec: &ContainerSpec, value: &Value) -> bool {
         if spec.network_mode.is_some() || spec.aliases.is_empty() {
             return false;
@@ -288,7 +411,33 @@ impl DockerRuntimeManager {
         spec.aliases.iter().any(|alias| aliases.contains(alias))
     }
 
-    async fn list_managed_container_names(&self) -> Result<Vec<String>> {
+    fn top_output_has_defunct_processes(output: &str) -> bool {
+        output
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .any(|line| !line.is_empty() && line.to_ascii_lowercase().contains("<defunct>"))
+    }
+
+    fn container_file_missing_error(err: &anyhow::Error) -> bool {
+        let lower = err.to_string().to_ascii_lowercase();
+        lower.contains("could not find the file")
+            || lower.contains("no such file or directory")
+            || lower.contains("file does not exist")
+    }
+
+    fn temp_copy_path(path: &str) -> PathBuf {
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("copied");
+        std::env::temp_dir()
+            .join(format!("elixir-docker-copy-{}", Uuid::new_v4()))
+            .join(filename)
+    }
+
+    pub async fn list_managed_container_names(&self) -> Result<Vec<String>> {
         let args = vec![
             "ps".to_string(),
             "-a".to_string(),
@@ -303,7 +452,185 @@ impl DockerRuntimeManager {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(ToString::to_string)
-            .collect())
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn lookup_published_host_port(
+        &self,
+        container_name: &str,
+        container_port: u16,
+    ) -> Result<Option<u16>> {
+        let args = vec![
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{json .NetworkSettings.Ports}}".to_string(),
+            container_name.to_string(),
+        ];
+        let stdout = self.run_stdout(&args).await?;
+        Ok(parse_published_host_port(&stdout, container_port))
+    }
+
+    pub async fn stop_and_remove_managed_containers(&self) -> Result<Vec<String>> {
+        let mut names = self.list_managed_container_names().await?;
+        names.sort();
+
+        let mut removed = Vec::new();
+        for name in names {
+            let handle = ContainerHandle {
+                id: name.clone(),
+                name: name.clone(),
+            };
+            let stop_result = self.stop_container(&handle).await;
+            let existing = self.get_container_handle(&name).await?;
+            match existing {
+                Some(existing) => {
+                    self.remove_container(&existing).await?;
+                    removed.push(name);
+                }
+                None => {
+                    if stop_result.is_ok() {
+                        removed.push(name);
+                    }
+                }
+            }
+            if let Err(err) = stop_result {
+                tracing::debug!(
+                    "docker runtime: managed container '{}' did not stop cleanly before removal: {}",
+                    handle.name,
+                    err
+                );
+            }
+        }
+
+        Ok(removed)
+    }
+
+    pub async fn recreate_managed_network(&self, name: &str) -> Result<bool> {
+        let inspect_args = vec![
+            "network".to_string(),
+            "inspect".to_string(),
+            name.to_string(),
+        ];
+        let existed = self.run_capture(&inspect_args).await.is_ok();
+        if existed {
+            let remove_args = vec!["network".to_string(), "rm".to_string(), name.to_string()];
+            self.run_capture(&remove_args).await?;
+        }
+        self.ensure_network(name).await?;
+        Ok(existed)
+    }
+
+    pub async fn restart_docker_runtime(
+        &self,
+        config: &DockerStartupConfig,
+    ) -> Result<DockerDaemonStatus> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self
+                .run_start_attempt(&DockerStartAttempt::new(
+                    "osascript",
+                    vec![
+                        "-e".to_string(),
+                        "tell application \"Docker\" to quit".to_string(),
+                    ],
+                    "osascript quit Docker",
+                ))
+                .await;
+            sleep(Duration::from_secs(3)).await;
+            self.start_docker_runtime().await?;
+            let wait_config = DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: config.startup_timeout,
+                startup_poll_interval: config.startup_poll_interval,
+            };
+            return self.ensure_daemon_available(&wait_config).await;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = self
+                .run_start_attempt(&DockerStartAttempt::new(
+                    "cmd",
+                    vec![
+                        "/C".to_string(),
+                        "taskkill".to_string(),
+                        "/IM".to_string(),
+                        "Docker Desktop.exe".to_string(),
+                        "/F".to_string(),
+                    ],
+                    "taskkill Docker Desktop",
+                ))
+                .await;
+            let _ = self
+                .run_start_attempt(&DockerStartAttempt::new(
+                    "wsl",
+                    vec!["--shutdown".to_string()],
+                    "wsl --shutdown",
+                ))
+                .await;
+            sleep(Duration::from_secs(2)).await;
+            self.start_docker_runtime().await?;
+            let wait_config = DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: config.startup_timeout,
+                startup_poll_interval: config.startup_poll_interval,
+            };
+            return self.ensure_daemon_available(&wait_config).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let attempts = vec![
+                DockerStartAttempt::new(
+                    "systemctl",
+                    vec![
+                        "--user".to_string(),
+                        "restart".to_string(),
+                        "docker-desktop".to_string(),
+                    ],
+                    "systemctl --user restart docker-desktop",
+                ),
+                DockerStartAttempt::new(
+                    "systemctl",
+                    vec![
+                        "--user".to_string(),
+                        "restart".to_string(),
+                        "docker".to_string(),
+                    ],
+                    "systemctl --user restart docker",
+                ),
+                DockerStartAttempt::new(
+                    "systemctl",
+                    vec!["restart".to_string(), "docker".to_string()],
+                    "systemctl restart docker",
+                ),
+                DockerStartAttempt::new(
+                    "service",
+                    vec!["docker".to_string(), "restart".to_string()],
+                    "service docker restart",
+                ),
+            ];
+
+            let mut errors = Vec::new();
+            for attempt in attempts {
+                match self.run_start_attempt(&attempt).await {
+                    Ok(()) => {
+                        let wait_config = DockerStartupConfig {
+                            auto_start_runtime: false,
+                            startup_timeout: config.startup_timeout,
+                            startup_poll_interval: config.startup_poll_interval,
+                        };
+                        return self.ensure_daemon_available(&wait_config).await;
+                    }
+                    Err(err) => errors.push(format!("{}: {}", attempt.label, err)),
+                }
+            }
+
+            bail!("docker runtime restart failed: {}", errors.join(" | "));
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        bail!("docker runtime restart is not implemented for this platform")
     }
 
     async fn remove_conflicting_managed_containers(&self, spec: &ContainerSpec) -> Result<usize> {
@@ -498,6 +825,30 @@ impl DockerRuntimeManager {
             );
         }
 
+        let mounts = Self::extract_mounts(value);
+        for desired in &spec.volumes {
+            let Some(actual) = mounts
+                .iter()
+                .find(|mount| mount.destination == desired.container_path)
+            else {
+                bail!(
+                    "container '{}' is missing volume mount '{}'; recreate to fix",
+                    spec.name,
+                    desired.container_path
+                );
+            };
+            if !Self::mount_matches(desired, actual) {
+                bail!(
+                    "container '{}' has mismatched volume mount '{}' (actual type='{}' source='{}' name='{}'); recreate to fix",
+                    spec.name,
+                    desired.container_path,
+                    actual.mount_type,
+                    actual.source.as_deref().unwrap_or_default(),
+                    actual.name.as_deref().unwrap_or_default()
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -548,9 +899,45 @@ impl RuntimeManager for DockerRuntimeManager {
 
         if let Some(_) = self.find_container_id(&spec.name).await? {
             let inspect = self.inspect_container(&spec.name).await?;
-            self.ensure_container_attached(spec, &inspect).await?;
+            if let Err(err) = self.ensure_container_attached(spec, &inspect).await {
+                let state = Self::extract_state(&inspect)?;
+                tracing::warn!(
+                    "docker runtime: container '{}' no longer matches desired runtime spec; removing and recreating it: {}",
+                    spec.name,
+                    err
+                );
+                self.remove_container(&ContainerHandle {
+                    id: state.id,
+                    name: spec.name.clone(),
+                })
+                .await?;
+                return self.create_container(spec).await;
+            }
             let state = Self::extract_state(&inspect)?;
-            if !state.running {
+            if state.running {
+                match self.container_top_output(&spec.name).await {
+                    Ok(output) if Self::top_output_has_defunct_processes(&output) => {
+                        tracing::warn!(
+                            "docker runtime: container '{}' has defunct processes; removing and recreating it",
+                            spec.name
+                        );
+                        self.remove_container(&ContainerHandle {
+                            id: state.id.clone(),
+                            name: spec.name.clone(),
+                        })
+                        .await?;
+                        return self.create_container(spec).await;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::debug!(
+                            "docker runtime: unable to inspect process list for '{}': {}",
+                            spec.name,
+                            err
+                        );
+                    }
+                }
+            } else {
                 let args = vec!["start".to_string(), spec.name.clone()];
                 self.run_capture(&args).await?;
             }
@@ -626,6 +1013,116 @@ impl RuntimeManager for DockerRuntimeManager {
         let inspect = self.inspect_container(&handle.name).await?;
         Self::extract_state(&inspect)
     }
+
+    async fn read_container_file(
+        &self,
+        handle: &ContainerHandle,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let temp_path = Self::temp_copy_path(path);
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!("creating temp container copy dir {}", parent.display())
+            })?;
+        }
+
+        let args = vec![
+            "cp".to_string(),
+            format!("{}:{}", handle.name, path),
+            temp_path.to_string_lossy().to_string(),
+        ];
+        let copy_result = self.run_capture(&args).await;
+        match copy_result {
+            Ok(_) => {
+                let bytes = fs::read(&temp_path).await.with_context(|| {
+                    format!("reading copied container file {}", temp_path.display())
+                })?;
+                let _ = fs::remove_dir_all(
+                    temp_path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(std::env::temp_dir),
+                )
+                .await;
+                Ok(Some(bytes))
+            }
+            Err(err) if Self::container_file_missing_error(&err) => {
+                if let Some(parent) = temp_path.parent() {
+                    let _ = fs::remove_dir_all(parent).await;
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                if let Some(parent) = temp_path.parent() {
+                    let _ = fs::remove_dir_all(parent).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn copy_host_path_to_container(
+        &self,
+        handle: &ContainerHandle,
+        source_path: &Path,
+        destination_path: &str,
+    ) -> Result<()> {
+        let source = if source_path.is_dir() {
+            format!("{}/.", source_path.to_string_lossy())
+        } else {
+            source_path.to_string_lossy().to_string()
+        };
+        let args = vec![
+            "cp".to_string(),
+            source,
+            format!("{}:{}", handle.name, destination_path),
+        ];
+        self.run_capture(&args).await?;
+        Ok(())
+    }
+
+    async fn ensure_container_directories(
+        &self,
+        handle: &ContainerHandle,
+        paths: &[String],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "exec".to_string(),
+            handle.name.clone(),
+            "mkdir".to_string(),
+            "-p".to_string(),
+        ];
+        args.extend(paths.iter().cloned());
+        self.run_capture(&args).await?;
+        Ok(())
+    }
+
+    async fn ensure_container_directories_owned_like(
+        &self,
+        handle: &ContainerHandle,
+        reference_path: &str,
+        paths: &[String],
+    ) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+
+        let mut args = vec![
+            "exec".to_string(),
+            handle.name.clone(),
+            "sh".to_string(),
+            "-lc".to_string(),
+            "set -e; owner=\"$(stat -c '%u:%g' \"$1\")\"; shift; changed=0; for path in \"$@\"; do mkdir -p \"$path\"; current=\"$(stat -c '%u:%g' \"$path\")\"; if [ \"$current\" != \"$owner\" ]; then chown -R \"$owner\" \"$path\"; changed=1; fi; done; printf '%s' \"$changed\"".to_string(),
+            "elixir-runtime-init".to_string(),
+            reference_path.to_string(),
+        ];
+        args.extend(paths.iter().cloned());
+        let output = self.run_capture(&args).await?;
+        Ok(output.stdout.trim() == "1")
+    }
 }
 
 struct CommandOutput {
@@ -661,6 +1158,51 @@ fn is_docker_daemon_unavailable(err: &anyhow::Error) -> bool {
             && (message.contains("connection refused")
                 || message.contains("connect: no such file or directory")
                 || message.contains("no such file or directory")))
+}
+
+pub fn classify_docker_runtime_failure(err: &anyhow::Error) -> Option<DockerRuntimeFailureKind> {
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("docker.raw.sock")
+        || message.contains("lifecycle-server.sock")
+        || message.contains("diagnosticd.sock")
+        || message.contains("dns-forwarder.sock")
+    {
+        return Some(DockerRuntimeFailureKind::DesktopGuestSocketMissing);
+    }
+    if message.contains("did not receive an exit event")
+        || message.contains("tried to kill container")
+        || message.contains("could not kill running container")
+    {
+        return Some(DockerRuntimeFailureKind::EngineKillStuck);
+    }
+    if message.contains("context deadline exceeded") {
+        return Some(DockerRuntimeFailureKind::EngineDeadlineExceeded);
+    }
+    if message.contains("oci runtime")
+        || message.contains("setns")
+        || message.contains("failed to create shim task")
+    {
+        return Some(DockerRuntimeFailureKind::OciRuntimeFailure);
+    }
+    if is_docker_daemon_unavailable(err) {
+        return Some(DockerRuntimeFailureKind::DaemonUnavailable);
+    }
+    None
+}
+
+fn parse_published_host_port(ports_json: &str, container_port: u16) -> Option<u16> {
+    let value: Value = serde_json::from_str(ports_json).ok()?;
+    let key = format!("{container_port}/tcp");
+    let bindings = value.get(&key)?.as_array()?;
+    let binding = bindings.first()?;
+    binding
+        .get("HostPort")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
 }
 
 fn docker_start_attempts() -> Vec<DockerStartAttempt> {
@@ -794,11 +1336,41 @@ mod tests {
     #[test]
     fn volume_mapping_formats() {
         let volume = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
             host_path: "/data".to_string(),
             container_path: "/config".to_string(),
             read_only: true,
         };
         assert_eq!(format_volume(&volume), "/data:/config:ro");
+    }
+
+    #[test]
+    fn named_volume_mapping_formats() {
+        let volume = VolumeMount {
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: "elixir_cfg_test".to_string(),
+            container_path: "/config".to_string(),
+            read_only: false,
+        };
+        assert_eq!(format_volume(&volume), "elixir_cfg_test:/config");
+    }
+
+    #[test]
+    fn named_volume_mount_matching_uses_volume_name() {
+        let desired = VolumeMount {
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: "elixir_cfg_test".to_string(),
+            container_path: "/config".to_string(),
+            read_only: false,
+        };
+        let actual = ContainerMount {
+            mount_type: "volume".to_string(),
+            source: Some("/var/lib/docker/volumes/elixir_cfg_test/_data".to_string()),
+            name: Some("elixir_cfg_test".to_string()),
+            destination: "/config".to_string(),
+            read_only: false,
+        };
+        assert!(DockerRuntimeManager::mount_matches(&desired, &actual));
     }
 
     #[test]
@@ -828,12 +1400,27 @@ mod tests {
             "docker info failed (status Some(1)): Error response from daemon: dial unix docker.raw.sock: connect: no such file or directory"
         );
         assert!(is_docker_daemon_unavailable(&missing));
+        assert_eq!(
+            classify_docker_runtime_failure(&missing),
+            Some(DockerRuntimeFailureKind::DesktopGuestSocketMissing)
+        );
     }
 
     #[test]
     fn unrelated_docker_errors_are_not_classified_as_daemon_unavailable() {
         let err = anyhow::anyhow!("docker inspect foo failed: No such container: foo");
         assert!(!is_docker_daemon_unavailable(&err));
+    }
+
+    #[test]
+    fn kill_stuck_errors_are_classified() {
+        let err = anyhow::anyhow!(
+            "docker rm -f elx-b44181 failed (status Some(1)): Error response from daemon: Could not kill running container e12eaf..., cannot remove - tried to kill container, but did not receive an exit event"
+        );
+        assert_eq!(
+            classify_docker_runtime_failure(&err),
+            Some(DockerRuntimeFailureKind::EngineKillStuck)
+        );
     }
 
     #[test]
@@ -895,5 +1482,25 @@ mod tests {
             }
         });
         assert!(!DockerRuntimeManager::aliases_conflict(&spec, &inspect));
+    }
+
+    #[test]
+    fn top_output_detects_defunct_processes() {
+        let output = "\
+UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD
+911                 7608                7308                0                   12:27               ?                   00:03:36            [Sonarr] <defunct>";
+        assert!(DockerRuntimeManager::top_output_has_defunct_processes(
+            output
+        ));
+    }
+
+    #[test]
+    fn top_output_ignores_healthy_processes() {
+        let output = "\
+UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD
+911                 7608                7308                0                   12:27               ?                   00:03:36            /app/sonarr/bin/Sonarr -nobrowser";
+        assert!(!DockerRuntimeManager::top_output_has_defunct_processes(
+            output
+        ));
     }
 }

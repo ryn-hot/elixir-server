@@ -50,6 +50,7 @@ impl AppState {
             settings.extensions.storage_root.clone(),
             settings.extensions.bundled_dir.clone(),
             settings.library.local_root.clone(),
+            settings.extensions.core_extensions.clone(),
             settings.network.vpn.wireguard_gateway_image.clone(),
             if settings.network.vpn.enabled
                 && (settings.network.vpn.auto_wrap_qbittorrent

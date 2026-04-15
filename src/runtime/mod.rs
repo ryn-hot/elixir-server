@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
 
 pub mod docker;
+pub mod health;
 pub mod model;
 pub mod probe;
 
@@ -64,4 +65,26 @@ pub trait RuntimeManager: Send + Sync {
         since: Option<DateTime<Utc>>,
     ) -> anyhow::Result<String>;
     async fn inspect(&self, handle: &ContainerHandle) -> anyhow::Result<ContainerState>;
+    async fn read_container_file(
+        &self,
+        handle: &ContainerHandle,
+        path: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn copy_host_path_to_container(
+        &self,
+        handle: &ContainerHandle,
+        source_path: &Path,
+        destination_path: &str,
+    ) -> anyhow::Result<()>;
+    async fn ensure_container_directories(
+        &self,
+        handle: &ContainerHandle,
+        paths: &[String],
+    ) -> anyhow::Result<()>;
+    async fn ensure_container_directories_owned_like(
+        &self,
+        handle: &ContainerHandle,
+        reference_path: &str,
+        paths: &[String],
+    ) -> anyhow::Result<bool>;
 }

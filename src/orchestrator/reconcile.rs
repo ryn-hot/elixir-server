@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +21,9 @@ use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
 use crate::orchestrator::planner::{Plan, PlanDecisions, Planner};
+use crate::runtime::docker::classify_docker_runtime_failure;
+use crate::runtime::docker::describe_docker_runtime_failure;
+use crate::runtime::health::DockerRuntimeSupervisor;
 use crate::runtime::model::ContainerHandle;
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
@@ -71,6 +75,8 @@ pub struct Reconciler<'a> {
     retry_attempts: u32,
     retry_backoff: Duration,
     lock_ttl: Duration,
+    runtime_health: Arc<DockerRuntimeSupervisor>,
+    core_extensions: Vec<String>,
 }
 
 impl<'a> Reconciler<'a> {
@@ -86,6 +92,36 @@ impl<'a> Reconciler<'a> {
         default_downloader_profile: DownloaderPerformanceProfile,
         config: &ReconcileConfig,
     ) -> Self {
+        Self::new_with_runtime_health(
+            pool,
+            probe,
+            runtime,
+            drivers,
+            runtime_paths,
+            secrets,
+            wireguard_gateway_image,
+            default_wireguard_config_secret,
+            default_downloader_profile,
+            config,
+            Arc::new(DockerRuntimeSupervisor::new(None)),
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_runtime_health(
+        pool: &'a sqlx::AnyPool,
+        probe: &'a dyn ProbeRunner,
+        runtime: &'a dyn RuntimeManager,
+        drivers: &'a crate::drivers::DriverRegistry,
+        runtime_paths: RuntimePaths,
+        secrets: &'a SecretsManager,
+        wireguard_gateway_image: String,
+        default_wireguard_config_secret: Option<String>,
+        default_downloader_profile: DownloaderPerformanceProfile,
+        config: &ReconcileConfig,
+        runtime_health: Arc<DockerRuntimeSupervisor>,
+        core_extensions: Vec<String>,
+    ) -> Self {
         Self {
             pool,
             store: ExtensionStore::new(pool),
@@ -100,10 +136,24 @@ impl<'a> Reconciler<'a> {
             retry_attempts: config.retry_attempts.max(1),
             retry_backoff: config.retry_backoff,
             lock_ttl: config.lock_ttl,
+            runtime_health,
+            core_extensions,
         }
     }
 
     pub async fn run_once(&self) -> Result<()> {
+        if let Some((until, reason)) = self.runtime_health.circuit_open_until() {
+            warn!(
+                "reconcile: docker runtime circuit open until {}: {}",
+                until.to_rfc3339(),
+                reason
+            );
+            metrics::RECONCILE_RUNS
+                .with_label_values(&["skipped_runtime_circuit_open"])
+                .inc();
+            return Ok(());
+        }
+
         let owner_id = Uuid::new_v4().to_string();
         if !self
             .store
@@ -240,6 +290,17 @@ impl<'a> Reconciler<'a> {
             &mut manifest_cache,
         )
         .await?;
+        if let Some((until, reason)) = self.runtime_health.should_defer_dependency_actions() {
+            warn!(
+                "reconcile: deferring auto-wire and binding work until {} while runtime recovers: {}",
+                until.to_rfc3339(),
+                reason
+            );
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&["defer_dependency_actions", "ok"])
+                .inc();
+            return Ok(());
+        }
         self.reconcile_auto_wire().await?;
         self.reconcile_bindings(run_id, &mut step_index, &bindings, &instance_map)
             .await?;
@@ -638,7 +699,31 @@ impl<'a> Reconciler<'a> {
         .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
         .with_default_downloader_profile(self.default_downloader_profile);
 
-        for detail in providers {
+        let mut ordered: Vec<&ProviderDetails> = providers.iter().collect();
+        ordered.sort_by(|left, right| {
+            let left_order = instances
+                .get(&left.provider.instance_id)
+                .map(|instance| self.core_extension_order(&instance.extension_id))
+                .unwrap_or(usize::MAX);
+            let right_order = instances
+                .get(&right.provider.instance_id)
+                .map(|instance| self.core_extension_order(&instance.extension_id))
+                .unwrap_or(usize::MAX);
+            left_order
+                .cmp(&right_order)
+                .then_with(|| left.provider.provider_id.cmp(&right.provider.provider_id))
+        });
+
+        for detail in ordered {
+            if let Some((until, reason)) = self.runtime_health.circuit_open_until() {
+                warn!(
+                    "reconcile: stopping provider restarts while docker runtime is degraded until {}: {}",
+                    until.to_rfc3339(),
+                    reason
+                );
+                break;
+            }
+
             let provider = &detail.provider;
             let instance = match instances.get(&provider.instance_id) {
                 Some(instance) if instance.enabled => instance,
@@ -699,6 +784,8 @@ impl<'a> Reconciler<'a> {
                 metrics::RECONCILE_ACTIONS
                     .with_label_values(&["health_check", "ok"])
                     .inc();
+                self.runtime_health
+                    .clear_instance_quarantine(instance.instance_id);
                 continue;
             }
             metrics::RECONCILE_ACTIONS
@@ -708,6 +795,19 @@ impl<'a> Reconciler<'a> {
             let mut last_err = None;
             let mut restarted = false;
             for attempt in 0..self.retry_attempts {
+                if let Some(quarantine) = self
+                    .runtime_health
+                    .quarantined_instance(instance.instance_id)
+                {
+                    warn!(
+                        "reconcile: instance {} is quarantined until {}: {}",
+                        instance.instance_id,
+                        quarantine.until.to_rfc3339(),
+                        quarantine.reason
+                    );
+                    last_err = Some(anyhow::anyhow!(quarantine.reason));
+                    break;
+                }
                 if attempt > 0 {
                     sleep(self.retry_backoff).await;
                     metrics::RECONCILE_ACTIONS
@@ -753,6 +853,8 @@ impl<'a> Reconciler<'a> {
                 {
                     Ok(()) => {
                         last_err = None;
+                        self.runtime_health
+                            .clear_instance_quarantine(instance.instance_id);
                         metrics::RECONCILE_ACTIONS
                             .with_label_values(&["health_check", "ok"])
                             .inc();
@@ -792,6 +894,18 @@ impl<'a> Reconciler<'a> {
         extension: &crate::db::models::Extension,
         manifests: &mut HashMap<String, ExtensionManifest>,
     ) -> Result<()> {
+        if let Some(quarantine) = self
+            .runtime_health
+            .quarantined_instance(instance.instance_id)
+        {
+            bail!(
+                "instance '{}' is quarantined until {}: {}",
+                instance.instance_name,
+                quarantine.until.to_rfc3339(),
+                quarantine.reason
+            );
+        }
+
         if extension.kind != ExtensionKind::Module {
             bail!("extension '{}' has no runtime", extension.extension_id);
         }
@@ -817,6 +931,11 @@ impl<'a> Reconciler<'a> {
             bail!("unsupported runtime type '{}'", runtime.r#type);
         }
 
+        if let Some(delay) = self.runtime_health.restart_delay() {
+            sleep(delay).await;
+        }
+        self.runtime_health.note_restart_started();
+
         let (aliases, _) = build_aliases(
             &extension.extension_id,
             &instance.instance_name,
@@ -829,10 +948,30 @@ impl<'a> Reconciler<'a> {
             name: container_name(instance.instance_id),
         };
         if let Err(err) = self.runtime.stop_container(&handle).await {
+            self.handle_runtime_restart_failure(instance, extension, &err);
             warn!(
                 "reconcile: failed to stop container {}: {}",
                 handle.name, err
             );
+        }
+        match self.runtime.get_container_handle(&handle.name).await {
+            Ok(Some(existing)) => {
+                if let Err(err) = self.runtime.remove_container(&existing).await {
+                    self.handle_runtime_restart_failure(instance, extension, &err);
+                    warn!(
+                        "reconcile: failed to remove container {} after restart attempt: {}",
+                        existing.name, err
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.handle_runtime_restart_failure(instance, extension, &err);
+                warn!(
+                    "reconcile: failed to inspect container {} after restart attempt: {}",
+                    handle.name, err
+                );
+            }
         }
 
         let executor = Executor::new(
@@ -856,9 +995,52 @@ impl<'a> Reconciler<'a> {
                 networking,
                 aliases,
             })
-            .await?;
+            .await
+            .map_err(|err| {
+                self.handle_runtime_restart_failure(instance, extension, &err);
+                err
+            })?;
 
         Ok(())
+    }
+
+    fn handle_runtime_restart_failure(
+        &self,
+        instance: &crate::db::models::ExtensionInstance,
+        extension: &crate::db::models::Extension,
+        err: &anyhow::Error,
+    ) {
+        let Some(kind) = classify_docker_runtime_failure(err) else {
+            return;
+        };
+        self.runtime_health
+            .record_engine_failure(kind.code(), describe_docker_runtime_failure(kind, err));
+        if matches!(
+            kind,
+            crate::runtime::docker::DockerRuntimeFailureKind::EngineKillStuck
+                | crate::runtime::docker::DockerRuntimeFailureKind::EngineDeadlineExceeded
+        ) {
+            let quarantine = self.runtime_health.quarantine_instance(
+                instance.instance_id,
+                extension.extension_id.clone(),
+                extension.name.clone(),
+                instance.instance_name.clone(),
+                err.to_string(),
+            );
+            warn!(
+                "reconcile: quarantined instance {} until {}: {}",
+                quarantine.instance_id,
+                quarantine.until.to_rfc3339(),
+                quarantine.reason
+            );
+        }
+    }
+
+    fn core_extension_order(&self, extension_id: &str) -> usize {
+        self.core_extensions
+            .iter()
+            .position(|value| value == extension_id)
+            .unwrap_or(self.core_extensions.len().saturating_add(1))
     }
 
     async fn reconcile_bindings(
@@ -1084,6 +1266,8 @@ fn auto_wire_plan_equivalent(previous_plan_json: &serde_json::Value, current_pla
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1201,6 +1385,186 @@ mod tests {
                 running: true,
                 health: None,
             })
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    struct RestartCaptureRuntime {
+        calls: Mutex<Vec<String>>,
+        base_name: String,
+        stop_error: Option<String>,
+    }
+
+    impl RestartCaptureRuntime {
+        fn new(base_name: String, fail_stop: bool) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                base_name,
+                stop_error: fail_stop.then(|| "stop failed".to_string()),
+            }
+        }
+
+        fn with_stop_error(base_name: String, stop_error: impl Into<String>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                base_name,
+                stop_error: Some(stop_error.into()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for RestartCaptureRuntime {
+        async fn ensure_network(&self, name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .push(format!("ensure_network:{name}"));
+            Ok(())
+        }
+
+        async fn ensure_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .push(format!("ensure_container:{}", spec.name));
+            Ok(ContainerHandle {
+                id: spec.name.clone(),
+                name: spec.name.clone(),
+            })
+        }
+
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .push(format!("get:{name}"));
+            if name == self.base_name {
+                Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .push(format!("stop:{}", handle.name));
+            if let Some(error) = self.stop_error.as_deref() {
+                bail!(error.to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn rename_container(
+            &self,
+            _handle: &ContainerHandle,
+            _new_name: &str,
+        ) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("restart runtime calls lock")
+                .push(format!("remove:{}", handle.name));
+            Ok(())
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
         }
     }
 
@@ -1520,6 +1884,378 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_defers_bindings_while_runtime_is_recovering() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "ext.test".to_string(),
+                name: "ext.test".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.test".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let consumer_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let consumer_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-consumer".to_string(),
+            9898,
+            Some("/health".to_string()),
+            Some("elixir_net".to_string()),
+        )?;
+        let provider_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-provider".to_string(),
+            7878,
+            Some("/health".to_string()),
+            Some("elixir_net".to_string()),
+        )?;
+
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: consumer_id,
+                instance_id,
+                capability: "consumer.capability".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: None,
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(consumer_endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "provider.capability".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: None,
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(provider_endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let binding_id = Uuid::new_v4();
+        store
+            .upsert_binding(&NewBinding {
+                binding_id,
+                consumer_provider_id: consumer_id,
+                requires_capability: "provider.capability".to_string(),
+                requires_slot_id: "default".to_string(),
+                target_provider_id: provider_id,
+                binding_params_json: None,
+                status: BindingStatus::Failed,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+        };
+        let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
+        runtime_health.record_engine_failure("docker_runtime_unavailable", "daemon missing");
+        runtime_health.record_engine_ready(true);
+
+        let reconciler = Reconciler::new_with_runtime_health(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+            runtime_health,
+            Vec::new(),
+        );
+        reconciler.run_once().await?;
+
+        let runs = store.list_runs(Some(1)).await?;
+        let run = runs.first().expect("reconcile run");
+        let steps = store.list_steps(run.run_id).await?;
+        assert!(
+            steps.iter().all(|step| step.action_type != "apply_binding"),
+            "binding work should be deferred while runtime is recovering"
+        );
+
+        let binding = store
+            .list_bindings()
+            .await?
+            .into_iter()
+            .find(|item| item.binding_id == binding_id)
+            .expect("binding");
+        assert_eq!(binding.status, BindingStatus::Failed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_runtime_force_removes_container_when_graceful_stop_fails() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let extension_id = "ext.test.module";
+        let version = "1.0.0";
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "Test Module".to_string(),
+                version: version.to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": version,
+                    "kind": "module",
+                    "name": "Test Module",
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/test:1",
+                        "service_name": "svc-test"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 8080
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, version, None)
+            .await?;
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("instance should exist");
+        let extension = store
+            .get_extension(extension_id)
+            .await?
+            .expect("extension should exist");
+
+        let probe = StubProbe::default();
+        let runtime = RestartCaptureRuntime::new(container_name(instance_id), true);
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+        };
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+        );
+
+        reconciler
+            .restart_runtime(&instance, &extension, &mut HashMap::new())
+            .await?;
+
+        assert_eq!(
+            runtime.calls(),
+            vec![
+                format!("stop:{}", container_name(instance_id)),
+                format!("get:{}", container_name(instance_id)),
+                format!("remove:{}", container_name(instance_id)),
+                "ensure_network:elixir_net".to_string(),
+                format!("ensure_container:{}", container_name(instance_id)),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_runtime_quarantines_hard_docker_failures() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let extension_id = "ext.test.module";
+        let version = "1.0.0";
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "Test Module".to_string(),
+                version: version.to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": version,
+                    "kind": "module",
+                    "name": "Test Module",
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/test:1",
+                        "service_name": "elx-test"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 8080
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let extension = store
+            .get_extension(extension_id)
+            .await?
+            .expect("extension exists");
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("instance exists");
+
+        let probe = StubProbe::default();
+        let runtime = RestartCaptureRuntime::with_stop_error(
+            container_name(instance_id),
+            "docker stop elx-test failed (status Some(1)): Error response from daemon: cannot stop container: elx-test: tried to kill container, but did not receive an exit event",
+        );
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+        };
+        let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
+        let reconciler = Reconciler::new_with_runtime_health(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+            runtime_health.clone(),
+            Vec::new(),
+        );
+
+        reconciler
+            .restart_runtime(&instance, &extension, &mut HashMap::new())
+            .await?;
+
+        let quarantine = runtime_health
+            .quarantined_instance(instance_id)
+            .expect("instance should be quarantined");
+        assert_eq!(quarantine.extension_id, extension_id);
+        assert_eq!(
+            runtime_health.snapshot().state,
+            crate::runtime::health::DockerRuntimeHealthState::Degraded
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reconcile_reaps_stale_running_runs_before_new_run() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -1604,6 +2340,55 @@ mod tests {
             crate::db::models::OperationStepStatus::Failed
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_when_runtime_circuit_is_open() -> Result<()> {
+        let database = setup_db().await?;
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+        };
+        let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
+        runtime_health
+            .record_engine_failure("docker_runtime_unhealthy", "docker.raw.sock is missing");
+
+        let reconciler = Reconciler::new_with_runtime_health(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+            runtime_health,
+            Vec::new(),
+        );
+
+        reconciler.run_once().await?;
+
+        let store = ExtensionStore::new(&database.pool);
+        assert!(store.list_runs(None).await?.is_empty());
         Ok(())
     }
 

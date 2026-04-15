@@ -37,7 +37,9 @@ use crate::extensions::store::{
 use crate::orchestrator::bindings::ensure_binding_connectivity;
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::container_name;
-use crate::runtime::model::{ContainerHandle, ContainerSpec, EnvVar, PortMapping, VolumeMount};
+use crate::runtime::model::{
+    ContainerHandle, ContainerSpec, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
+};
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
@@ -101,6 +103,11 @@ pub struct Executor<'a> {
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
     default_downloader_profile: DownloaderPerformanceProfile,
+}
+
+struct PreparedRuntimeVolumes {
+    volumes: Vec<VolumeMount>,
+    legacy_config_bind_source: Option<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -281,6 +288,7 @@ impl<'a> Executor<'a> {
             .get_instance(instance_id)
             .await?
             .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
+        let existing_config_json = instance.config_json.clone();
         let extension = self
             .store
             .get_extension(&extension_id)
@@ -334,12 +342,14 @@ impl<'a> Executor<'a> {
 
         let env = resolve_runtime_env(&self.store, self.secrets, instance_id, runtime.env).await?;
 
-        let volumes = runtime
-            .volumes
-            .iter()
-            .map(|volume| resolve_volume_mount(volume, &self.runtime_paths))
-            .collect::<Result<Vec<_>>>()?;
-        let runtime_volumes = volumes.clone();
+        let prepared_volumes = prepare_runtime_volumes(
+            &extension_id,
+            instance_id,
+            &runtime.volumes,
+            &self.runtime_paths,
+        )?;
+        let volumes = prepared_volumes.volumes.clone();
+        let runtime_volumes = prepared_volumes.volumes.clone();
         if is_nzbget_extension_id(&extension_id) {
             prepare_nzbget_runtime_dirs(&runtime_volumes).await?;
         }
@@ -443,7 +453,7 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            if let Err(err) = self.runtime.ensure_container(&spec).await {
+            let handle = if let Err(err) = self.runtime.ensure_container(&spec).await {
                 if let Some(handle) = self.runtime.get_container_handle(&name).await? {
                     let _ = self.runtime.remove_container(&handle).await;
                 }
@@ -471,8 +481,55 @@ impl<'a> Executor<'a> {
                     }
                 }
                 return Err(err);
-            }
+            } else {
+                self.runtime
+                    .get_container_handle(&name)
+                    .await?
+                    .unwrap_or(ContainerHandle {
+                        id: name.clone(),
+                        name: name.clone(),
+                    })
+            };
 
+            if let Err(err) = self
+                .finalize_runtime_storage(
+                    instance_id,
+                    &extension_id,
+                    &handle,
+                    existing_config_json.as_ref(),
+                    &runtime_volumes,
+                    prepared_volumes.legacy_config_bind_source.as_deref(),
+                )
+                .await
+            {
+                if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+                    let _ = self.runtime.remove_container(&handle).await;
+                }
+                if backup_created {
+                    let rollback_handle = ContainerHandle {
+                        id: rollback_name.clone(),
+                        name: rollback_name.clone(),
+                    };
+                    if let Err(rename_err) =
+                        self.runtime.rename_container(&rollback_handle, &name).await
+                    {
+                        tracing::warn!(
+                            "upgrade: failed to restore rollback container {} after storage finalize error: {}",
+                            rollback_name,
+                            rename_err
+                        );
+                    } else {
+                        let _ = self
+                            .runtime
+                            .start_container(&ContainerHandle {
+                                id: name.clone(),
+                                name: name.clone(),
+                            })
+                            .await;
+                    }
+                }
+                return Err(err);
+            }
             persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
             let next_rollback = if backup_created {
                 current_version.as_deref().or(rollback_version.as_deref())
@@ -485,7 +542,16 @@ impl<'a> Executor<'a> {
             return Ok(());
         }
 
-        self.runtime.ensure_container(&spec).await?;
+        let handle = self.runtime.ensure_container(&spec).await?;
+        self.finalize_runtime_storage(
+            instance_id,
+            &extension_id,
+            &handle,
+            existing_config_json.as_ref(),
+            &runtime_volumes,
+            prepared_volumes.legacy_config_bind_source.as_deref(),
+        )
+        .await?;
         persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
         if current_version.is_none() {
             self.store
@@ -593,6 +659,7 @@ impl<'a> Executor<'a> {
             aliases: app_spec.aliases.clone(),
             env: gateway_env,
             volumes: vec![VolumeMount {
+                source_kind: VolumeMountSourceKind::Bind,
                 host_path: config_path,
                 container_path: "/gluetun/wireguard/wg0.conf".to_string(),
                 read_only: true,
@@ -683,6 +750,61 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    async fn finalize_runtime_storage(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        handle: &ContainerHandle,
+        _previous_config_json: Option<&serde_json::Value>,
+        volumes: &[VolumeMount],
+        legacy_config_bind_source: Option<&str>,
+    ) -> Result<()> {
+        let uses_named_config = volumes.iter().any(|volume| {
+            volume.container_path == "/config"
+                && volume.source_kind == VolumeMountSourceKind::NamedVolume
+        });
+        if !uses_named_config {
+            return Ok(());
+        }
+
+        let legacy_config_dir = legacy_config_bind_source
+            .map(Path::new)
+            .filter(|path| path.exists() && path.is_dir());
+        if let Some(source) = legacy_config_dir {
+            self.runtime.stop_container(handle).await?;
+            self.runtime
+                .copy_host_path_to_container(handle, source, "/config")
+                .await
+                .with_context(|| {
+                    format!(
+                        "migrating legacy config storage '{}' into {}",
+                        source.display(),
+                        handle.name
+                    )
+                })?;
+            self.runtime.start_container(handle).await?;
+        }
+
+        let directories = required_named_runtime_directories(extension_id, volumes);
+        if !directories.is_empty() {
+            let ownership_corrected = self
+                .runtime
+                .ensure_container_directories_owned_like(handle, "/config", &directories)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensuring owned named-volume runtime directories for instance {}",
+                        instance_id
+                    )
+                })?;
+            if ownership_corrected {
+                self.restart_instance_runtime(instance_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn create_or_update_provider(
         &self,
         provider_id: Uuid,
@@ -767,11 +889,17 @@ impl<'a> Executor<'a> {
 
         resolve_indexer_credentials(&self.store, self.secrets, provider.instance_id, &mut patch)
             .await?;
-        resolve_indexer_apps(&self.store, self.secrets, &mut patch).await?;
+        resolve_indexer_apps(&self.store, self.secrets, self.runtime, &mut patch).await?;
         resolve_downloader_credentials(&self.store, self.secrets, &mut patch).await?;
 
-        let ctx =
-            build_driver_ctx_for_provider(&self.store, self.secrets, &provider, &instance).await?;
+        let ctx = build_driver_ctx_for_provider(
+            &self.store,
+            self.secrets,
+            self.runtime,
+            &provider,
+            &instance,
+        )
+        .await?;
         let restart_nzbget_runtime =
             should_restart_nzbget_after_patch(&provider, instance.config_json.as_ref(), &patch);
         let result = driver.apply_patch(ctx, patch).await?;
@@ -878,32 +1006,35 @@ impl<'a> Executor<'a> {
             && provider.implementation.as_deref() == Some("sonarr")
         {
             let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(config_dir) = config.config_dir {
-                if let Some(key) = read_sonarr_api_key_from_config(&config_dir).await? {
-                    upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key)
-                        .await?;
-                    self.normalize_arr_auth_config_if_needed(
-                        provider.instance_id,
-                        &key,
-                        &endpoint,
-                        &["/api/v3/config/host", "/api/v4/config/host"],
-                    )
+            if let Some(key) = read_sonarr_api_key(
+                self.runtime,
+                provider.instance_id,
+                config.config_dir.as_deref(),
+            )
+            .await?
+            {
+                upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
+                self.normalize_arr_auth_config_if_needed(
+                    provider.instance_id,
+                    &key,
+                    &endpoint,
+                    &["/api/v3/config/host", "/api/v4/config/host"],
+                )
+                .await?;
+                self.probe
+                    .probe_dns(&endpoint.host)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
+                self.probe
+                    .probe_tcp(&endpoint.host, endpoint.port)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                self.ensure_provider_driver_ready(&provider, &instance)
                     .await?;
-                    self.probe
-                        .probe_dns(&endpoint.host)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                    self.probe
-                        .probe_tcp(&endpoint.host, endpoint.port)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                    self.ensure_provider_driver_ready(&provider, &instance)
-                        .await?;
-                    self.store
-                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                        .await?;
-                    return Ok(());
-                }
+                self.store
+                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                    .await?;
+                return Ok(());
             }
             bail!("sonarr config.xml not ready");
         }
@@ -911,32 +1042,35 @@ impl<'a> Executor<'a> {
             && provider.implementation.as_deref() == Some("radarr")
         {
             let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(config_dir) = config.config_dir {
-                if let Some(key) = read_radarr_api_key_from_config(&config_dir).await? {
-                    upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key)
-                        .await?;
-                    self.normalize_arr_auth_config_if_needed(
-                        provider.instance_id,
-                        &key,
-                        &endpoint,
-                        &["/api/v3/config/host", "/api/v4/config/host"],
-                    )
+            if let Some(key) = read_radarr_api_key(
+                self.runtime,
+                provider.instance_id,
+                config.config_dir.as_deref(),
+            )
+            .await?
+            {
+                upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
+                self.normalize_arr_auth_config_if_needed(
+                    provider.instance_id,
+                    &key,
+                    &endpoint,
+                    &["/api/v3/config/host", "/api/v4/config/host"],
+                )
+                .await?;
+                self.probe
+                    .probe_dns(&endpoint.host)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
+                self.probe
+                    .probe_tcp(&endpoint.host, endpoint.port)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                self.ensure_provider_driver_ready(&provider, &instance)
                     .await?;
-                    self.probe
-                        .probe_dns(&endpoint.host)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                    self.probe
-                        .probe_tcp(&endpoint.host, endpoint.port)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                    self.ensure_provider_driver_ready(&provider, &instance)
-                        .await?;
-                    self.store
-                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                        .await?;
-                    return Ok(());
-                }
+                self.store
+                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                    .await?;
+                return Ok(());
             }
             bail!("radarr config.xml not ready");
         }
@@ -944,32 +1078,36 @@ impl<'a> Executor<'a> {
             && provider.implementation.as_deref() == Some("prowlarr")
         {
             let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(config_dir) = config.config_dir {
-                if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
-                    upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
-                        .await?;
-                    self.normalize_arr_auth_config_if_needed(
-                        provider.instance_id,
-                        &key,
-                        &endpoint,
-                        &["/api/v1/config/host"],
-                    )
+            if let Some(key) = read_prowlarr_api_key(
+                self.runtime,
+                provider.instance_id,
+                config.config_dir.as_deref(),
+            )
+            .await?
+            {
+                upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
                     .await?;
-                    self.probe
-                        .probe_dns(&endpoint.host)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                    self.probe
-                        .probe_tcp(&endpoint.host, endpoint.port)
-                        .await
-                        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                    self.ensure_provider_driver_ready(&provider, &instance)
-                        .await?;
-                    self.store
-                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                        .await?;
-                    return Ok(());
-                }
+                self.normalize_arr_auth_config_if_needed(
+                    provider.instance_id,
+                    &key,
+                    &endpoint,
+                    &["/api/v1/config/host"],
+                )
+                .await?;
+                self.probe
+                    .probe_dns(&endpoint.host)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
+                self.probe
+                    .probe_tcp(&endpoint.host, endpoint.port)
+                    .await
+                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+                self.ensure_provider_driver_ready(&provider, &instance)
+                    .await?;
+                self.store
+                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                    .await?;
+                return Ok(());
             }
             bail!("prowlarr config.xml not ready");
         }
@@ -1000,8 +1138,14 @@ impl<'a> Executor<'a> {
         let Some(driver) = self.drivers.get(&provider.capability) else {
             return Ok(());
         };
-        let ctx =
-            build_driver_ctx_for_provider(&self.store, self.secrets, provider, instance).await?;
+        let ctx = build_driver_ctx_for_provider(
+            &self.store,
+            self.secrets,
+            self.runtime,
+            provider,
+            instance,
+        )
+        .await?;
         driver.read_state(ctx).await?;
         Ok(())
     }
@@ -1086,7 +1230,12 @@ impl<'a> Executor<'a> {
                 if nzbget_profile_version_matches(
                     config.performance_profile_version.as_deref(),
                     selected_profile,
-                ) && nzbget_managed_ui_paths_are_current(instance.config_json.as_ref()).await?
+                ) && nzbget_managed_ui_paths_are_current(
+                    self.runtime,
+                    instance.instance_id,
+                    instance.config_json.as_ref(),
+                )
+                .await?
                 {
                     return Ok(());
                 }
@@ -1095,6 +1244,9 @@ impl<'a> Executor<'a> {
                 let mut secrets = HashMap::new();
                 secrets.insert("nzbget_username".to_string(), username);
                 secrets.insert("nzbget_password".to_string(), password);
+                secrets.extend(
+                    resolve_nzbget_server_slot_secrets(&self.store, self.secrets, instance).await?,
+                );
 
                 let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
                     anyhow!(
@@ -1134,7 +1286,7 @@ impl<'a> Executor<'a> {
                             .unwrap_or_else(|| "driver deferred".to_string())
                     );
                 }
-                let restart_required = nzbget_has_managed_config(instance.config_json.as_ref());
+                let restart_required = runtime_has_bind_config_dir(instance.config_json.as_ref());
                 persist_managed_defaults_profile_version(
                     &self.store,
                     instance.instance_id,
@@ -1269,6 +1421,7 @@ const NZBGET_MANAGED_CONFIG_TEMPLATE: &str = "/app/nzbget/webui/nzbget.conf.temp
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
+    runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
     let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
@@ -1288,11 +1441,11 @@ async fn resolve_sonarr_api_key(
         return secrets.decrypt(&secret.value_encrypted);
     }
 
-    if let Some(config_dir) = config.config_dir {
-        if let Some(key) = read_sonarr_api_key_from_config(&config_dir).await? {
-            upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
-            return Ok(key);
-        }
+    if let Some(key) =
+        read_sonarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
+    {
+        upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
+        return Ok(key);
     }
 
     bail!("sonarr api key is not available yet");
@@ -1301,6 +1454,7 @@ async fn resolve_sonarr_api_key(
 pub(crate) async fn build_driver_ctx_for_provider(
     store: &ExtensionStore<'_>,
     secrets_manager: &SecretsManager,
+    runtime: &dyn RuntimeManager,
     provider: &Provider,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<DriverCtx> {
@@ -1317,20 +1471,20 @@ pub(crate) async fn build_driver_ctx_for_provider(
     if provider.capability == "media.manager.tv"
         && provider.implementation.as_deref() == Some("sonarr")
     {
-        let api_key = resolve_sonarr_api_key(store, secrets_manager, instance).await?;
+        let api_key = resolve_sonarr_api_key(store, secrets_manager, runtime, instance).await?;
         secrets.insert("sonarr_api_key".to_string(), api_key);
     }
     if provider.capability == "media.manager.movies"
         && provider.implementation.as_deref() == Some("radarr")
     {
-        let api_key = resolve_radarr_api_key(store, secrets_manager, instance).await?;
+        let api_key = resolve_radarr_api_key(store, secrets_manager, runtime, instance).await?;
         secrets.insert("radarr_api_key".to_string(), api_key.clone());
         secrets.insert("api_key".to_string(), api_key);
     }
     if provider.capability == "indexer.registry"
         && provider.implementation.as_deref() == Some("prowlarr")
     {
-        let api_key = resolve_prowlarr_api_key(store, secrets_manager, instance).await?;
+        let api_key = resolve_prowlarr_api_key(store, secrets_manager, runtime, instance).await?;
         secrets.insert("prowlarr_api_key".to_string(), api_key);
     }
     if provider.capability == "downloader.torrent"
@@ -1348,6 +1502,7 @@ pub(crate) async fn build_driver_ctx_for_provider(
             resolve_nzbget_credentials(store, secrets_manager, instance).await?;
         secrets.insert("nzbget_username".to_string(), username);
         secrets.insert("nzbget_password".to_string(), password);
+        secrets.extend(resolve_nzbget_server_slot_secrets(store, secrets_manager, instance).await?);
     }
 
     let transport_base_url = resolve_driver_transport_base_url(provider.instance_id, &endpoint)
@@ -1375,6 +1530,7 @@ pub(crate) async fn build_driver_ctx_for_provider(
 async fn resolve_radarr_api_key(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
+    runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
     let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
@@ -1394,11 +1550,11 @@ async fn resolve_radarr_api_key(
         return secrets.decrypt(&secret.value_encrypted);
     }
 
-    if let Some(config_dir) = config.config_dir {
-        if let Some(key) = read_radarr_api_key_from_config(&config_dir).await? {
-            upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
-            return Ok(key);
-        }
+    if let Some(key) =
+        read_radarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
+    {
+        upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
+        return Ok(key);
     }
 
     bail!("radarr api key is not available yet");
@@ -1445,6 +1601,7 @@ async fn upsert_radarr_secret(
 async fn resolve_prowlarr_api_key(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
+    runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
     let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
@@ -1464,11 +1621,11 @@ async fn resolve_prowlarr_api_key(
         return secrets.decrypt(&secret.value_encrypted);
     }
 
-    if let Some(config_dir) = config.config_dir {
-        if let Some(key) = read_prowlarr_api_key_from_config(&config_dir).await? {
-            upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
-            return Ok(key);
-        }
+    if let Some(key) =
+        read_prowlarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
+    {
+        upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
+        return Ok(key);
     }
 
     bail!("prowlarr api key is not available yet");
@@ -1796,6 +1953,7 @@ fn is_default_wireguard_downloader_extension_id(extension_id: &str) -> bool {
 async fn resolve_indexer_apps(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
+    runtime: &dyn RuntimeManager,
     patch: &mut DriverPatch,
 ) -> Result<()> {
     let apps = match patch {
@@ -1813,11 +1971,11 @@ async fn resolve_indexer_apps(
         let host_hint = url_host(&app.url);
         if is_sonarr_app(&app.implementation) {
             let instance = resolve_sonarr_instance_for_app(store, host_hint.as_deref()).await?;
-            let api_key = resolve_sonarr_api_key(store, secrets, &instance).await?;
+            let api_key = resolve_sonarr_api_key(store, secrets, runtime, &instance).await?;
             app.api_key = Some(api_key);
         } else if is_radarr_app(&app.implementation) {
             let instance = resolve_radarr_instance_for_app(store, host_hint.as_deref()).await?;
-            let api_key = resolve_radarr_api_key(store, secrets, &instance).await?;
+            let api_key = resolve_radarr_api_key(store, secrets, runtime, &instance).await?;
             app.api_key = Some(api_key);
         }
     }
@@ -2332,6 +2490,17 @@ struct ParsedNzbgetConfig {
     performance_profile_version: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+struct PersistedNzbgetServerSecretSlot {
+    slot: u32,
+}
+
+#[derive(Default, Deserialize)]
+struct PersistedNzbgetServerInventoryConfig {
+    #[serde(default)]
+    server_inventory: Vec<PersistedNzbgetServerSecretSlot>,
+}
+
 fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedSonarrConfig> {
     let Some(value) = value else {
         return Ok(ParsedSonarrConfig {
@@ -2419,16 +2588,70 @@ fn parse_nzbget_instance_config(value: Option<&serde_json::Value>) -> Result<Par
     })
 }
 
-async fn read_sonarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
-    read_arr_api_key_from_config(config_dir).await
+fn parse_nzbget_server_secret_slots(value: Option<&serde_json::Value>) -> Result<Vec<u32>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let config: PersistedNzbgetServerInventoryConfig =
+        serde_json::from_value(value.clone()).context("parsing nzbget server inventory config")?;
+    Ok(config
+        .server_inventory
+        .into_iter()
+        .map(|entry| entry.slot)
+        .filter(|slot| *slot > 0)
+        .collect())
 }
 
-async fn read_radarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
-    read_arr_api_key_from_config(config_dir).await
+async fn resolve_nzbget_server_slot_secrets(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance: &crate::db::models::ExtensionInstance,
+) -> Result<HashMap<String, String>> {
+    let mut resolved = HashMap::new();
+    for slot in parse_nzbget_server_secret_slots(instance.config_json.as_ref())? {
+        for key in ["username", "password"] {
+            let secret_key = format!("nzbget.server.{slot}.{key}");
+            let Some(secret) = store
+                .get_secret(
+                    SecretScope::Instance,
+                    Some(instance.instance_id),
+                    &secret_key,
+                )
+                .await?
+            else {
+                continue;
+            };
+            let value = secrets.decrypt(&secret.value_encrypted)?;
+            if !value.trim().is_empty() {
+                resolved.insert(secret_key, value);
+            }
+        }
+    }
+    Ok(resolved)
 }
 
-async fn read_prowlarr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
-    read_arr_api_key_from_config(config_dir).await
+async fn read_sonarr_api_key(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
+    config_dir: Option<&str>,
+) -> Result<Option<String>> {
+    read_arr_api_key(runtime, instance_id, config_dir).await
+}
+
+async fn read_radarr_api_key(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
+    config_dir: Option<&str>,
+) -> Result<Option<String>> {
+    read_arr_api_key(runtime, instance_id, config_dir).await
+}
+
+async fn read_prowlarr_api_key(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
+    config_dir: Option<&str>,
+) -> Result<Option<String>> {
+    read_arr_api_key(runtime, instance_id, config_dir).await
 }
 
 fn arr_host_auth_config_requires_normalization(config: &Value) -> bool {
@@ -2451,12 +2674,21 @@ fn arr_host_auth_config_requires_normalization(config: &Value) -> bool {
     authentication_method == "none" || authentication_required == "enabled"
 }
 
-async fn read_arr_api_key_from_config(config_dir: &str) -> Result<Option<String>> {
-    let path = Path::new(config_dir).join("config.xml");
-    let content = match fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+async fn read_arr_api_key(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
+    config_dir: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(content) = read_config_text(
+        runtime,
+        instance_id,
+        config_dir,
+        "config.xml",
+        "/config/config.xml",
+    )
+    .await?
+    else {
+        return Ok(None);
     };
     parse_arr_api_key(&content)
 }
@@ -2690,19 +2922,11 @@ async fn persist_runtime_config(
     instance_id: Uuid,
     volumes: &[VolumeMount],
 ) -> Result<()> {
-    let config_dir = volumes
-        .iter()
-        .find(|volume| volume.container_path == "/config")
-        .map(|volume| volume.host_path.clone());
-    if config_dir.is_none() {
-        return Ok(());
-    }
     let instance = store
         .get_instance(instance_id)
         .await?
         .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
-    let updated = merge_runtime_config(instance.config_json, config_dir, volumes)
-        .context("runtime config")?;
+    let updated = merge_runtime_config(instance.config_json, volumes).context("runtime config")?;
     if let Some(updated) = updated {
         store
             .update_instance_config(instance_id, Some(&updated))
@@ -2714,11 +2938,16 @@ async fn persist_runtime_config(
 async fn prepare_nzbget_runtime_dirs(volumes: &[VolumeMount]) -> Result<()> {
     let downloads_root = volumes
         .iter()
-        .find(|volume| volume.container_path == "/downloads")
+        .find(|volume| {
+            volume.container_path == "/downloads"
+                && volume.source_kind == VolumeMountSourceKind::Bind
+        })
         .map(|volume| volume.host_path.clone());
     let config_root = volumes
         .iter()
-        .find(|volume| volume.container_path == "/config")
+        .find(|volume| {
+            volume.container_path == "/config" && volume.source_kind == VolumeMountSourceKind::Bind
+        })
         .map(|volume| volume.host_path.clone());
 
     if let Some(downloads_root) = downloads_root {
@@ -2775,7 +3004,6 @@ async fn persist_managed_defaults_profile_version(
 
 fn merge_runtime_config(
     existing: Option<serde_json::Value>,
-    config_dir: Option<String>,
     volumes: &[VolumeMount],
 ) -> Result<Option<serde_json::Value>> {
     let mut changed = false;
@@ -2795,31 +3023,59 @@ fn merge_runtime_config(
         .as_object_mut()
         .ok_or_else(|| anyhow!("runtime config is not an object"))?;
 
-    if let Some(config_dir) = config_dir {
-        if !runtime.contains_key("config_dir") {
-            runtime.insert(
-                "config_dir".to_string(),
-                serde_json::Value::String(config_dir),
-            );
+    let config_mount = volumes
+        .iter()
+        .find(|volume| volume.container_path == "/config");
+    let config_dir = config_mount
+        .filter(|volume| volume.source_kind == VolumeMountSourceKind::Bind)
+        .map(|volume| volume.host_path.clone());
+    match config_dir {
+        Some(config_dir) => {
+            if runtime
+                .get("config_dir")
+                .and_then(serde_json::Value::as_str)
+                != Some(config_dir.as_str())
+            {
+                runtime.insert(
+                    "config_dir".to_string(),
+                    serde_json::Value::String(config_dir),
+                );
+                changed = true;
+            }
+        }
+        None => {
+            if runtime.remove("config_dir").is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(config_mount) = config_mount {
+        let config_storage = serde_json::json!({
+            "source_kind": config_mount.source_kind,
+            "source": config_mount.host_path,
+            "container_path": config_mount.container_path,
+        });
+        if runtime.get("config_storage") != Some(&config_storage) {
+            runtime.insert("config_storage".to_string(), config_storage);
             changed = true;
         }
     }
 
-    if !runtime.contains_key("volumes") {
-        let volume_values = volumes
-            .iter()
-            .map(|volume| {
-                serde_json::json!({
-                    "host_path": volume.host_path,
-                    "container_path": volume.container_path,
-                    "read_only": volume.read_only,
-                })
+    let volume_values = volumes
+        .iter()
+        .map(|volume| {
+            serde_json::json!({
+                "source_kind": volume.source_kind,
+                "host_path": volume.host_path,
+                "container_path": volume.container_path,
+                "read_only": volume.read_only,
             })
-            .collect::<Vec<_>>();
-        runtime.insert(
-            "volumes".to_string(),
-            serde_json::Value::Array(volume_values),
-        );
+        })
+        .collect::<Vec<_>>();
+    let volume_value = serde_json::Value::Array(volume_values);
+    if runtime.get("volumes") != Some(&volume_value) {
+        runtime.insert("volumes".to_string(), volume_value);
         changed = true;
     }
 
@@ -2861,7 +3117,7 @@ fn should_restart_nzbget_after_patch(
 ) -> bool {
     if provider.capability != "downloader.nzb"
         || provider.implementation.as_deref() != Some("nzbget")
-        || !nzbget_has_managed_config(instance_config)
+        || !runtime_has_bind_config_dir(instance_config)
     {
         return false;
     }
@@ -2873,7 +3129,7 @@ fn should_restart_nzbget_after_patch(
     )
 }
 
-fn nzbget_has_managed_config(instance_config: Option<&serde_json::Value>) -> bool {
+fn runtime_has_bind_config_dir(instance_config: Option<&serde_json::Value>) -> bool {
     instance_config
         .and_then(|value| value.get("runtime"))
         .and_then(|value| value.get("config_dir"))
@@ -2882,26 +3138,24 @@ fn nzbget_has_managed_config(instance_config: Option<&serde_json::Value>) -> boo
 }
 
 async fn nzbget_managed_ui_paths_are_current(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
     instance_config: Option<&serde_json::Value>,
 ) -> Result<bool> {
-    let Some(config_dir) = instance_config
+    let host_config_dir = instance_config
         .and_then(|value| value.get("runtime"))
         .and_then(|value| value.get("config_dir"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
+        .and_then(serde_json::Value::as_str);
+    let Some(contents) = read_config_text(
+        runtime,
+        instance_id,
+        host_config_dir,
+        "nzbget.conf",
+        "/config/nzbget.conf",
+    )
+    .await?
     else {
-        return Ok(true);
-    };
-
-    let config_path = Path::new(config_dir).join("nzbget.conf");
-    let contents = match fs::read_to_string(&config_path).await {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("reading nzbget managed config {}", config_path.display())
-            });
-        }
+        return Ok(false);
     };
 
     Ok(matches!(
@@ -2924,6 +3178,79 @@ fn find_nzbget_config_value<'a>(contents: &'a str, key: &str) -> Option<&'a str>
     })
 }
 
+async fn read_config_text(
+    runtime: &dyn RuntimeManager,
+    instance_id: Uuid,
+    host_config_dir: Option<&str>,
+    relative_name: &str,
+    container_path: &str,
+) -> Result<Option<String>> {
+    if let Some(config_dir) = host_config_dir.filter(|value| !value.trim().is_empty()) {
+        let path = Path::new(config_dir).join(relative_name);
+        let content = match fs::read_to_string(&path).await {
+            Ok(content) => Some(content),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        if content.is_some() {
+            return Ok(content);
+        }
+    }
+
+    let Some(handle) = runtime
+        .get_container_handle(&container_name(instance_id))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(bytes) = runtime.read_container_file(&handle, container_path).await? else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("decoding container config file {}", container_path))?;
+    Ok(Some(text))
+}
+
+fn qbittorrent_incomplete_path() -> &'static str {
+    if desktop_runtime_storage_migration_enabled() {
+        "/runtime/incomplete"
+    } else {
+        "/downloads/.incomplete"
+    }
+}
+
+fn nzbget_incomplete_path() -> &'static str {
+    if desktop_runtime_storage_migration_enabled() {
+        "/runtime/incomplete"
+    } else {
+        "/downloads/.incomplete"
+    }
+}
+
+fn nzbget_nzb_dir() -> &'static str {
+    if desktop_runtime_storage_migration_enabled() {
+        "/runtime/nzb"
+    } else {
+        "/config/nzb"
+    }
+}
+
+fn nzbget_queue_dir() -> &'static str {
+    if desktop_runtime_storage_migration_enabled() {
+        "/runtime/queue"
+    } else {
+        "/config/queue"
+    }
+}
+
+fn nzbget_temp_dir() -> &'static str {
+    if desktop_runtime_storage_migration_enabled() {
+        "/runtime/tmp"
+    } else {
+        "/config/tmp"
+    }
+}
+
 fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
     let (
         max_connections,
@@ -2941,7 +3268,7 @@ fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) 
     };
     DriverPatch::DownloaderTorrent(DownloaderTorrentPatch::SetPreferences {
         default_save_path: Some("/downloads".to_string()),
-        incomplete_path: Some("/downloads/.incomplete".to_string()),
+        incomplete_path: Some(qbittorrent_incomplete_path().to_string()),
         use_incomplete: Some(true),
         max_connections: Some(max_connections),
         max_connections_per_torrent: Some(max_connections_per_torrent),
@@ -2973,10 +3300,10 @@ fn nzbget_performance_profile_patch(profile: DownloaderPerformanceProfile) -> Dr
     DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
         main_dir: Some("/config".to_string()),
         default_save_path: Some("/downloads".to_string()),
-        incomplete_path: Some("/downloads/.incomplete".to_string()),
-        nzb_dir: Some("/config/nzb".to_string()),
-        queue_dir: Some("/config/queue".to_string()),
-        temp_dir: Some("/config/tmp".to_string()),
+        incomplete_path: Some(nzbget_incomplete_path().to_string()),
+        nzb_dir: Some(nzbget_nzb_dir().to_string()),
+        queue_dir: Some(nzbget_queue_dir().to_string()),
+        temp_dir: Some(nzbget_temp_dir().to_string()),
         script_dir: Some("/config/scripts".to_string()),
         log_file: Some("/config/nzbget.log".to_string()),
         web_dir: Some(NZBGET_MANAGED_WEB_DIR.to_string()),
@@ -3182,6 +3509,107 @@ async fn resolve_runtime_env(
     Ok(resolved)
 }
 
+fn prepare_runtime_volumes(
+    extension_id: &str,
+    instance_id: Uuid,
+    raw_volumes: &[String],
+    paths: &RuntimePaths,
+) -> Result<PreparedRuntimeVolumes> {
+    let mut volumes = raw_volumes
+        .iter()
+        .map(|volume| resolve_volume_mount(volume, paths))
+        .collect::<Result<Vec<_>>>()?;
+    let mut legacy_config_bind_source = None;
+
+    if !should_use_named_config_storage(extension_id) {
+        return Ok(PreparedRuntimeVolumes {
+            volumes,
+            legacy_config_bind_source,
+        });
+    }
+
+    if let Some(config_mount) = volumes
+        .iter_mut()
+        .find(|volume| volume.container_path == "/config")
+    {
+        if config_mount.source_kind == VolumeMountSourceKind::Bind {
+            legacy_config_bind_source = Some(config_mount.host_path.clone());
+        }
+        config_mount.source_kind = VolumeMountSourceKind::NamedVolume;
+        config_mount.host_path = config_volume_name(instance_id);
+    }
+
+    if extension_requires_runtime_volume(extension_id)
+        && !volumes
+            .iter()
+            .any(|volume| volume.container_path == "/runtime")
+    {
+        volumes.push(VolumeMount {
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: runtime_volume_name(instance_id),
+            container_path: "/runtime".to_string(),
+            read_only: false,
+        });
+    }
+
+    Ok(PreparedRuntimeVolumes {
+        volumes,
+        legacy_config_bind_source,
+    })
+}
+
+fn should_use_named_config_storage(extension_id: &str) -> bool {
+    desktop_runtime_storage_migration_enabled() && extension_id.starts_with("elixir.modules.")
+}
+
+fn extension_requires_runtime_volume(extension_id: &str) -> bool {
+    is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
+}
+
+fn desktop_runtime_storage_migration_enabled() -> bool {
+    cfg!(target_os = "macos") || cfg!(target_os = "windows")
+}
+
+fn config_volume_name(instance_id: Uuid) -> String {
+    format!("elixir_cfg_{}", instance_id.simple())
+}
+
+fn runtime_volume_name(instance_id: Uuid) -> String {
+    format!("elixir_rt_{}", instance_id.simple())
+}
+
+fn required_named_runtime_directories(extension_id: &str, volumes: &[VolumeMount]) -> Vec<String> {
+    let mut directories = Vec::new();
+    let has_named_config = volumes.iter().any(|volume| {
+        volume.container_path == "/config"
+            && volume.source_kind == VolumeMountSourceKind::NamedVolume
+    });
+    let has_named_runtime = volumes.iter().any(|volume| {
+        volume.container_path == "/runtime"
+            && volume.source_kind == VolumeMountSourceKind::NamedVolume
+    });
+
+    if is_nzbget_extension_id(extension_id) {
+        if has_named_config {
+            directories.push("/config/scripts".to_string());
+        }
+        if has_named_runtime {
+            directories.extend([
+                "/runtime/incomplete".to_string(),
+                "/runtime/nzb".to_string(),
+                "/runtime/queue".to_string(),
+                "/runtime/tmp".to_string(),
+            ]);
+        }
+    }
+
+    if is_qbittorrent_extension_id(extension_id) && has_named_runtime {
+        directories.push("/runtime/incomplete".to_string());
+    }
+
+    directories
+}
+
 fn resolve_volume_mount(raw: &str, paths: &RuntimePaths) -> Result<VolumeMount> {
     let parts: Vec<&str> = raw.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
@@ -3196,6 +3624,7 @@ fn resolve_volume_mount(raw: &str, paths: &RuntimePaths) -> Result<VolumeMount> 
 
     let host_path = resolve_placeholders(host_raw, paths)?;
     Ok(VolumeMount {
+        source_kind: VolumeMountSourceKind::Bind,
         host_path,
         container_path: container_path.to_string(),
         read_only,
@@ -3310,7 +3739,10 @@ mod tests {
             }
         });
 
-        assert!(!nzbget_managed_ui_paths_are_current(Some(&config)).await?);
+        assert!(
+            !nzbget_managed_ui_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config))
+                .await?
+        );
         Ok(())
     }
 
@@ -3333,7 +3765,10 @@ mod tests {
             }
         });
 
-        assert!(nzbget_managed_ui_paths_are_current(Some(&config)).await?);
+        assert!(
+            nzbget_managed_ui_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config))
+                .await?
+        );
         Ok(())
     }
 
@@ -3478,6 +3913,40 @@ mod tests {
         async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
             bail!("unexpected runtime call")
         }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            bail!("unexpected runtime call")
+        }
     }
 
     #[derive(Default)]
@@ -3558,6 +4027,40 @@ mod tests {
         }
 
         async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
             bail!("unexpected runtime call")
         }
     }
@@ -3707,6 +4210,40 @@ mod tests {
         async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
             bail!("unexpected runtime call")
         }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            bail!("unexpected runtime call")
+        }
     }
 
     #[derive(Default)]
@@ -3835,6 +4372,40 @@ mod tests {
         }
 
         async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            _source_path: &std::path::Path,
+            _destination_path: &str,
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
             bail!("unexpected runtime call")
         }
     }
@@ -5779,5 +6350,127 @@ PersistentKeepalive = 25
         );
         assert!(mount.host_path.ends_with("/data/bazarr"));
         Ok(())
+    }
+
+    #[test]
+    fn prepare_runtime_volumes_rewrites_first_party_config_storage_on_desktop() -> Result<()> {
+        let paths = RuntimePaths {
+            data_root: "/tmp/elixir/data".to_string(),
+            downloads_root: "/tmp/elixir/downloads".to_string(),
+            media_root: "/tmp/elixir/media".to_string(),
+        };
+        let instance_id =
+            Uuid::parse_str("c1eaaec2-3dcf-40e4-85aa-adea48e4b221").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.nzbget",
+            instance_id,
+            &[
+                "{data}/nzbget:/config".to_string(),
+                "{downloads}:/downloads".to_string(),
+            ],
+            &paths,
+        )?;
+
+        if desktop_runtime_storage_migration_enabled() {
+            let config_mount = prepared
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/config")
+                .expect("config mount");
+            assert_eq!(config_mount.source_kind, VolumeMountSourceKind::NamedVolume);
+            assert_eq!(config_mount.host_path, config_volume_name(instance_id));
+            assert_eq!(
+                prepared.legacy_config_bind_source.as_deref(),
+                Some("/tmp/elixir/data/nzbget")
+            );
+            assert!(
+                prepared
+                    .volumes
+                    .iter()
+                    .any(|volume| volume.container_path == "/runtime"
+                        && volume.source_kind == VolumeMountSourceKind::NamedVolume)
+            );
+        } else {
+            let config_mount = prepared
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/config")
+                .expect("config mount");
+            assert_eq!(config_mount.source_kind, VolumeMountSourceKind::Bind);
+            assert_eq!(config_mount.host_path, "/tmp/elixir/data/nzbget");
+            assert!(prepared.legacy_config_bind_source.is_none());
+            assert!(
+                prepared
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.container_path != "/runtime")
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn merge_runtime_config_rewrites_named_config_storage_metadata() -> Result<()> {
+        let updated = merge_runtime_config(
+            Some(json!({
+                "runtime": {
+                    "config_dir": "/tmp/legacy",
+                    "volumes": [{
+                        "source_kind": "bind",
+                        "host_path": "/tmp/legacy",
+                        "container_path": "/config",
+                        "read_only": false
+                    }]
+                }
+            })),
+            &[VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: "elixir_cfg_test".to_string(),
+                container_path: "/config".to_string(),
+                read_only: false,
+            }],
+        )?
+        .expect("updated config");
+
+        let runtime = updated
+            .get("runtime")
+            .and_then(serde_json::Value::as_object)
+            .expect("runtime object");
+        assert!(runtime.get("config_dir").is_none());
+        assert_eq!(
+            runtime
+                .get("config_storage")
+                .and_then(|value| value.get("source_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("named_volume")
+        );
+        assert_eq!(
+            runtime
+                .get("volumes")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|volumes| volumes.first())
+                .and_then(|volume| volume.get("source_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("named_volume")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_downloader_runtime_paths_switch_to_runtime_volume() {
+        if desktop_runtime_storage_migration_enabled() {
+            assert_eq!(qbittorrent_incomplete_path(), "/runtime/incomplete");
+            assert_eq!(nzbget_incomplete_path(), "/runtime/incomplete");
+            assert_eq!(nzbget_nzb_dir(), "/runtime/nzb");
+            assert_eq!(nzbget_queue_dir(), "/runtime/queue");
+            assert_eq!(nzbget_temp_dir(), "/runtime/tmp");
+        } else {
+            assert_eq!(qbittorrent_incomplete_path(), "/downloads/.incomplete");
+            assert_eq!(nzbget_incomplete_path(), "/downloads/.incomplete");
+            assert_eq!(nzbget_nzb_dir(), "/config/nzb");
+            assert_eq!(nzbget_queue_dir(), "/config/queue");
+            assert_eq!(nzbget_temp_dir(), "/config/tmp");
+        }
     }
 }

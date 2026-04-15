@@ -115,6 +115,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::extensions::reconcile_latest),
         )
         .route(
+            "/api/v1/extensions/runtime/reset",
+            post(handlers::extensions::reset_runtime),
+        )
+        .route(
             "/api/v1/extensions/auto-wire",
             get(handlers::extensions::auto_wire_status)
                 .post(handlers::extensions::update_auto_wire),

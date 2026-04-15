@@ -308,10 +308,67 @@ fn discover_test_host_ip() -> Result<String> {
     Ok(host)
 }
 
+fn mock_arr_download_clients() -> Vec<Value> {
+    vec![
+        json!({
+            "id": 11,
+            "name": "NZBGet",
+            "enable": true,
+            "protocol": "usenet",
+            "implementation": "Nzbget",
+            "priority": 10
+        }),
+        json!({
+            "id": 12,
+            "name": "qBittorrent",
+            "enable": true,
+            "protocol": "torrent",
+            "implementation": "QBittorrent",
+            "priority": 20
+        }),
+    ]
+}
+
+fn mock_arr_download_client_details() -> Vec<Value> {
+    vec![
+        json!({
+            "id": 11,
+            "name": "NZBGet",
+            "enable": true,
+            "protocol": "usenet",
+            "priority": 10,
+            "implementation": "Nzbget",
+            "fields": [
+                { "name": "host", "value": "elx-nzbget" },
+                { "name": "port", "value": 6789 },
+                { "name": "username", "value": "elixir" },
+                { "name": "password", "value": "********" },
+                { "name": "tvCategory", "value": "tv" }
+            ]
+        }),
+        json!({
+            "id": 12,
+            "name": "qBittorrent",
+            "enable": true,
+            "protocol": "torrent",
+            "priority": 20,
+            "implementation": "QBittorrent",
+            "fields": [
+                { "name": "host", "value": "elx-qbittorrent" },
+                { "name": "port", "value": 8080 },
+                { "name": "username", "value": "elixir" },
+                { "name": "password", "value": "********" },
+                { "name": "tvCategory", "value": "tv" }
+            ]
+        }),
+    ]
+}
+
 async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
+    let download_clients = Arc::new(mock_arr_download_clients());
 
     let app = Router::new()
         .route(
@@ -324,7 +381,13 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
         )
         .route(
             "/api/v3/downloadclient",
-            get(|| async { Json(json!([{ "id": 11 }])) }),
+            get({
+                let download_clients = Arc::clone(&download_clients);
+                move || {
+                    let download_clients = Arc::clone(&download_clients);
+                    async move { Json(Value::Array(download_clients.as_ref().clone())) }
+                }
+            }),
         );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -461,6 +524,8 @@ async fn start_mock_prowlarr_control_server(
 struct MockArrControlState {
     commands: Arc<Mutex<Vec<Value>>>,
     deletes: Arc<Mutex<Vec<String>>>,
+    download_clients: Arc<Mutex<Vec<Value>>>,
+    download_client_updates: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn start_mock_sonarr_control_server()
@@ -468,7 +533,10 @@ async fn start_mock_sonarr_control_server()
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
-    let state = MockArrControlState::default();
+    let state = MockArrControlState {
+        download_clients: Arc::new(Mutex::new(mock_arr_download_client_details())),
+        ..MockArrControlState::default()
+    };
 
     async fn system_status() -> Json<Value> {
         Json(json!({ "version": "4.0.0.778" }))
@@ -478,8 +546,82 @@ async fn start_mock_sonarr_control_server()
         Json(json!([{ "id": 42 }, { "id": 99 }]))
     }
 
-    async fn download_clients() -> Json<Value> {
-        Json(json!([{ "id": 11 }]))
+    async fn download_clients(State(state): State<MockArrControlState>) -> Json<Value> {
+        let items = state
+            .download_clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|client| {
+                json!({
+                    "id": client.get("id").cloned().unwrap_or(Value::Null),
+                    "name": client.get("name").cloned().unwrap_or(Value::Null),
+                    "enable": client.get("enable").cloned().unwrap_or(Value::Bool(true)),
+                    "protocol": client.get("protocol").cloned().unwrap_or(Value::Null),
+                    "implementation": client.get("implementation").cloned().unwrap_or(Value::Null),
+                    "priority": client.get("priority").cloned().unwrap_or(Value::from(1))
+                })
+            })
+            .collect();
+        Json(Value::Array(items))
+    }
+
+    async fn download_client_handler(
+        State(state): State<MockArrControlState>,
+        AxumPath(client_id): AxumPath<i64>,
+    ) -> impl IntoResponse {
+        let clients = state.download_clients.lock().unwrap();
+        if let Some(client) = clients
+            .iter()
+            .find(|client| client.get("id").and_then(Value::as_i64) == Some(client_id))
+        {
+            return (StatusCode::OK, Json(client.clone())).into_response();
+        }
+        StatusCode::NOT_FOUND.into_response()
+    }
+
+    async fn update_download_client_handler(
+        State(state): State<MockArrControlState>,
+        AxumPath(client_id): AxumPath<i64>,
+        Json(payload): Json<Value>,
+    ) -> impl IntoResponse {
+        let field_names = payload
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !field_names.contains(&"password") || !field_names.contains(&"tvCategory") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!([
+                    {
+                        "propertyName": "TvCategory",
+                        "errorMessage": "Category does not exist",
+                        "severity": "error"
+                    }
+                ])),
+            )
+                .into_response();
+        }
+        state
+            .download_client_updates
+            .lock()
+            .unwrap()
+            .push(payload.clone());
+        let mut clients = state.download_clients.lock().unwrap();
+        if let Some(existing) = clients
+            .iter_mut()
+            .find(|client| client.get("id").and_then(Value::as_i64) == Some(client_id))
+        {
+            *existing = payload.clone();
+            return (StatusCode::OK, Json(payload)).into_response();
+        }
+        (StatusCode::OK, Json(payload)).into_response()
     }
 
     async fn command_handler(
@@ -502,6 +644,10 @@ async fn start_mock_sonarr_control_server()
         .route("/api/v3/system/status", get(system_status))
         .route("/api/v3/series", get(series_list))
         .route("/api/v3/downloadclient", get(download_clients))
+        .route(
+            "/api/v3/downloadclient/:id",
+            get(download_client_handler).put(update_download_client_handler),
+        )
         .route("/api/v3/command", post(command_handler))
         .route("/api/v3/series/:id", delete(delete_series_handler))
         .with_state(state.clone());
@@ -6553,14 +6699,17 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
         "expected series count metric in control surface: {}",
         payload
     );
+    let preference_fields = control_surface_section(&payload, "downloadClientPreference")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        metrics
-            .iter()
-            .any(
-                |metric| metric.get("id").and_then(Value::as_str) == Some("downloadClientCount")
-                    && metric.get("value").and_then(Value::as_str) == Some("1")
-            ),
-        "expected download client count metric in control surface: {}",
+        preference_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
+                && field.get("value").and_then(Value::as_str) == Some("usenet")
+        }),
+        "expected sonarr download client preference field: {}",
         payload
     );
 
@@ -6838,6 +6987,41 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
                     && field.get("value").and_then(Value::as_bool) == Some(true)
             ),
         "expected searchOnAdd field in defaults section: {}",
+        payload
+    );
+
+    let preference_fields = control_surface_section(&payload, "downloadClientPreference")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        preference_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
+                && field.get("value").and_then(Value::as_str) == Some("usenet")
+        }),
+        "expected sonarr download client preference field: {}",
+        payload
+    );
+    let preference_entities = control_surface_section(&payload, "downloadClientPreference")
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        preference_entities.iter().any(|entity| {
+            entity.get("title").and_then(Value::as_str) == Some("NZBGet")
+                && entity
+                    .get("details")
+                    .and_then(Value::as_array)
+                    .map(|details| {
+                        details
+                            .iter()
+                            .any(|detail| detail.as_str() == Some("Client priority 10"))
+                    })
+                    .unwrap_or(false)
+        }),
+        "expected NZBGet client details in control surface: {}",
         payload
     );
 
@@ -7212,6 +7396,288 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
         stored.get("searchOnAdd").and_then(Value::as_bool),
         Some(false)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_uses_cached_sonarr_download_client_inventory_when_live_load_fails()
+-> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "svc-sonarr-timeout",
+                "port": 8989,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_extension_setting(
+            &format!("extensions.control_download_clients.instance.{instance_id}"),
+            &json!([
+                {
+                    "id": 1,
+                    "name": "NZBGet",
+                    "implementation": "Nzbget",
+                    "protocol": "usenet",
+                    "priority": 2,
+                    "enabled": true
+                },
+                {
+                    "id": 2,
+                    "name": "qBittorrent",
+                    "implementation": "QBittorrent",
+                    "protocol": "torrent",
+                    "priority": 1,
+                    "enabled": true
+                }
+            ]),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let preference_fields = control_surface_section(&payload, "downloadClientPreference")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        preference_fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
+                && field.get("value").and_then(Value::as_str) == Some("torrent")
+                && field.get("readonly").and_then(Value::as_bool) == Some(true)
+        }),
+        "expected cached sonarr preference field in control surface: {}",
+        payload
+    );
+    let preference_entities = control_surface_section(&payload, "downloadClientPreference")
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        preference_entities
+            .iter()
+            .any(|entity| entity.get("title").and_then(Value::as_str) == Some("qBittorrent")),
+        "expected cached qBittorrent entity in control surface: {}",
+        payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_settings_update_applies_sonarr_download_client_preference() -> Result<()>
+{
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "values": {
+                        "downloadClientPreference": "torrent"
+                    }
+                }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let fields = control_surface_section(&payload, "downloadClientPreference")
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        fields.iter().any(|field| {
+            field.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
+                && field.get("value").and_then(Value::as_str) == Some("torrent")
+        }),
+        "expected updated sonarr download client preference field: {}",
+        payload
+    );
+
+    let updates = server_state.download_client_updates.lock().unwrap().clone();
+    assert_eq!(
+        updates.len(),
+        2,
+        "expected both download clients to be updated"
+    );
+
+    let clients = server_state.download_clients.lock().unwrap().clone();
+    let nzbget_priority = clients
+        .iter()
+        .find(|client| client.get("name").and_then(Value::as_str) == Some("NZBGet"))
+        .and_then(|client| {
+            client
+                .get("fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| {
+                    fields.iter().find_map(|field| {
+                        if field.get("name").and_then(Value::as_str) == Some("priority") {
+                            field.get("value").and_then(Value::as_i64)
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+    let qbittorrent_priority = clients
+        .iter()
+        .find(|client| client.get("name").and_then(Value::as_str) == Some("qBittorrent"))
+        .and_then(|client| {
+            client
+                .get("fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| {
+                    fields.iter().find_map(|field| {
+                        if field.get("name").and_then(Value::as_str) == Some("priority") {
+                            field.get("value").and_then(Value::as_i64)
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+    assert_eq!(nzbget_priority, Some(11));
+    assert_eq!(qbittorrent_priority, Some(10));
 
     Ok(())
 }

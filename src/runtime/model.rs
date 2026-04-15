@@ -37,10 +37,20 @@ pub struct EnvVar {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
+    #[serde(default)]
+    pub source_kind: VolumeMountSourceKind,
     pub host_path: String,
     pub container_path: String,
     #[serde(default)]
     pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeMountSourceKind {
+    #[default]
+    Bind,
+    NamedVolume,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

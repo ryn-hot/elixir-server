@@ -36,10 +36,10 @@ use crate::db::models::{
     OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
 };
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
-use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
-    unpack_package, verify_signature,
+    unpack_package, verify_signature, write_manifest_to_dir,
 };
 use crate::extensions::permissions::PermissionPolicy;
 use crate::extensions::registry::{
@@ -64,6 +64,7 @@ use crate::orchestrator::planner::{
     Plan, PlanAction, PlanDecisions, Planner, SlotConflictResolution,
 };
 use crate::orchestrator::reconcile::ReconcileConfig;
+use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
 use crate::state::AppState;
 
 mod control;
@@ -228,6 +229,18 @@ pub struct ReconcileRunResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeResetResponse {
+    pub status: String,
+    pub message: String,
+    pub docker_restarted: bool,
+    pub reboot_recommended: bool,
+    pub removed_containers: Vec<String>,
+    pub recreated_networks: Vec<String>,
+    pub run: Option<OrchestratorRun>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DesiredBlueprintsClearResponse {
     pub deleted: u64,
 }
@@ -241,7 +254,48 @@ pub struct RunsClearResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionStatusSummaryResponse {
     pub needs_attention_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_runtime: Option<DockerRuntimeStatusSummary>,
     pub items: Vec<ExtensionStatusSummaryItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerRuntimeStatusSummary {
+    pub state: String,
+    pub severity: String,
+    pub code: String,
+    pub label: String,
+    pub description: String,
+    #[serde(default)]
+    pub reboot_recommended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reset_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub auto_reset_attempts_in_window: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_instances: Vec<DockerRuntimeQuarantineSummary>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerRuntimeQuarantineSummary {
+    pub instance_id: Uuid,
+    pub extension_id: String,
+    pub extension_name: String,
+    pub instance_name: String,
+    pub reason: String,
+    pub until: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1213,10 +1267,22 @@ async fn install_extension_internal(
     };
 
     let PackageManifest {
-        manifest, raw_json, ..
+        mut manifest,
+        mut raw_json,
+        ..
     } = read_manifest_from_dir(&staged)
         .await
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    if repair_builtin_manifest_json(&mut raw_json) {
+        manifest = serde_json::from_value(raw_json.clone())
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        manifest
+            .validate()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        write_manifest_to_dir(&staged, &raw_json)
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
 
     let registry_entry = if package_hash.is_some() {
         fetch_registry_entry(
@@ -1982,6 +2048,34 @@ pub async fn reconcile_latest(
     Ok(Json(ReconcileRunResponse { run }))
 }
 
+pub async fn reset_runtime(State(state): State<AppState>) -> ApiResult<Json<RuntimeResetResponse>> {
+    let config = ReconcileConfig::from_settings(&state.settings);
+    let outcome = state
+        .orchestrator
+        .reset_elixir_runtime(&config)
+        .await
+        .map_err(ApiError::from)?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let run = if outcome.reboot_recommended {
+        None
+    } else {
+        store
+            .get_latest_run_by_phase("reconcile")
+            .await
+            .map_err(ApiError::from)?
+    };
+
+    Ok(Json(RuntimeResetResponse {
+        status: outcome.status,
+        message: outcome.message,
+        docker_restarted: outcome.docker_restarted,
+        reboot_recommended: outcome.reboot_recommended,
+        removed_containers: outcome.removed_containers,
+        recreated_networks: outcome.recreated_networks,
+        run,
+    }))
+}
+
 pub async fn auto_wire_status(
     State(state): State<AppState>,
 ) -> ApiResult<Json<AutoWireStatusResponse>> {
@@ -2277,6 +2371,7 @@ async fn build_extension_status_summary(
     state: &AppState,
     store: &ExtensionStore<'_>,
 ) -> anyhow::Result<ExtensionStatusSummaryResponse> {
+    let runtime_snapshot = state.orchestrator.docker_runtime_snapshot();
     let extensions = store.list_extensions().await?;
     let instances = store.list_instances(None).await?;
     let providers = store.list_providers(None).await?;
@@ -2352,6 +2447,7 @@ async fn build_extension_status_summary(
                     &available_targets,
                     &provider_instances_by_target,
                     &providers_by_instance,
+                    &runtime_snapshot,
                 )
                 .await?
             }
@@ -2364,6 +2460,7 @@ async fn build_extension_status_summary(
                     &instances,
                     &providers_by_instance,
                     &failed_bindings_by_consumer,
+                    &runtime_snapshot,
                 )
                 .await?
             }
@@ -2416,7 +2513,108 @@ async fn build_extension_status_summary(
 
     Ok(ExtensionStatusSummaryResponse {
         needs_attention_count,
+        docker_runtime: summarize_docker_runtime(&runtime_snapshot),
         items,
+    })
+}
+
+fn summarize_docker_runtime(
+    snapshot: &DockerRuntimeHealthSnapshot,
+) -> Option<DockerRuntimeStatusSummary> {
+    let has_host_warning = snapshot
+        .host_warning
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if snapshot.state == DockerRuntimeHealthState::Healthy
+        && snapshot.quarantined_instances.is_empty()
+        && !has_host_warning
+        && !snapshot.reboot_recommended
+    {
+        return None;
+    }
+
+    let (state, severity, code, label, description) = if snapshot.reboot_recommended {
+        (
+            "reboot_required".to_string(),
+            "attention".to_string(),
+            snapshot
+                .code
+                .clone()
+                .unwrap_or_else(|| "docker_runtime_reboot_recommended".to_string()),
+            "Host reboot recommended".to_string(),
+            snapshot.reason.clone().unwrap_or_else(|| {
+                "Elixir exhausted its automatic Docker recovery budget. Reboot the computer, then relaunch Elixir."
+                    .to_string()
+            }),
+        )
+    } else {
+        match snapshot.state {
+            DockerRuntimeHealthState::Healthy => (
+                "healthy".to_string(),
+                "attention".to_string(),
+                "docker_host_warning".to_string(),
+                "Docker host warning".to_string(),
+                snapshot
+                    .host_warning
+                    .clone()
+                    .unwrap_or_else(|| "Docker host settings need attention.".to_string()),
+            ),
+            DockerRuntimeHealthState::Recovering => (
+                "recovering".to_string(),
+                "attention".to_string(),
+                snapshot
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| "docker_runtime_recovering".to_string()),
+                "Docker runtime recovering".to_string(),
+                snapshot.reason.clone().unwrap_or_else(|| {
+                    "Docker recovered recently. Elixir is restoring extension runtimes gradually."
+                        .to_string()
+                }),
+            ),
+            DockerRuntimeHealthState::Degraded => (
+                "degraded".to_string(),
+                "attention".to_string(),
+                snapshot
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| "docker_runtime_unhealthy".to_string()),
+                "Docker runtime unhealthy".to_string(),
+                snapshot.reason.clone().unwrap_or_else(|| {
+                    "Docker is unhealthy, so extension status is temporarily stale.".to_string()
+                }),
+            ),
+        }
+    };
+
+    Some(DockerRuntimeStatusSummary {
+        state,
+        severity,
+        code,
+        label,
+        description,
+        reboot_recommended: snapshot.reboot_recommended,
+        until: snapshot.until.clone(),
+        host_warning: snapshot.host_warning.clone(),
+        last_failure_code: snapshot.last_failure_code.clone(),
+        last_failure_reason: snapshot.last_failure_reason.clone(),
+        last_failure_at: snapshot.last_failure_at,
+        last_reset_attempt_at: snapshot.last_reset_attempt_at,
+        auto_reset_attempts_in_window: snapshot.auto_reset_attempts_in_window,
+        quarantined_instances: snapshot
+            .quarantined_instances
+            .iter()
+            .cloned()
+            .map(|item| DockerRuntimeQuarantineSummary {
+                instance_id: item.instance_id,
+                extension_id: item.extension_id,
+                extension_name: item.extension_name,
+                instance_name: item.instance_name,
+                reason: item.reason,
+                until: item.until,
+            })
+            .collect(),
     })
 }
 
@@ -2733,6 +2931,7 @@ async fn summarize_connector_extension(
     available_targets: &HashSet<(String, String)>,
     provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
     providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
+    runtime_snapshot: &DockerRuntimeHealthSnapshot,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
     if !extension.enabled {
         return Ok(disabled_extension_status(
@@ -2776,6 +2975,14 @@ async fn summarize_connector_extension(
         {
             Ok(value) => value,
             Err(err) => {
+                if runtime_snapshot.state != DockerRuntimeHealthState::Healthy {
+                    return Ok(runtime_status_stale_extension_status(
+                        extension,
+                        runtime_snapshot,
+                        "open",
+                        "Open",
+                    ));
+                }
                 return Ok(attention_extension_status(
                     extension,
                     "downstream_verification_failed",
@@ -2840,6 +3047,7 @@ async fn summarize_module_extension(
     instances: &[ExtensionInstance],
     providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
     failed_bindings_by_consumer: &HashMap<Uuid, usize>,
+    runtime_snapshot: &DockerRuntimeHealthSnapshot,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
     if !extension.enabled {
         return Ok(disabled_extension_status(
@@ -2932,6 +3140,20 @@ async fn summarize_module_extension(
             "Disabled",
             "All instances for this extension are turned off.",
             "finish_setup",
+            "Open",
+        ));
+    }
+
+    if runtime_snapshot.state != DockerRuntimeHealthState::Healthy
+        && manifest
+            .and_then(|value| value.runtime.as_ref())
+            .map(|runtime| runtime.r#type.eq_ignore_ascii_case("container"))
+            .unwrap_or(false)
+    {
+        return Ok(runtime_status_stale_extension_status(
+            extension,
+            runtime_snapshot,
+            "open",
             "Open",
         ));
     }
@@ -3040,6 +3262,44 @@ fn extension_status_sort_order(severity: &str) -> usize {
         "disabled" => 2,
         _ => 3,
     }
+}
+
+fn runtime_status_stale_extension_status(
+    extension: &Extension,
+    runtime_snapshot: &DockerRuntimeHealthSnapshot,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    let (status_code, label, description) = match runtime_snapshot.state {
+        DockerRuntimeHealthState::Degraded => (
+            "runtime_status_stale",
+            "Status stale",
+            runtime_snapshot.reason.as_deref().unwrap_or(
+                "Docker is unhealthy, so Elixir cannot verify this extension's live status yet.",
+            ),
+        ),
+        DockerRuntimeHealthState::Recovering => (
+            "runtime_status_recovering",
+            "Recovering",
+            runtime_snapshot.reason.as_deref().unwrap_or(
+                "Docker recovered recently and Elixir is restoring extension runtimes gradually.",
+            ),
+        ),
+        DockerRuntimeHealthState::Healthy => (
+            "ready",
+            "Ready",
+            "This extension is installed and ready to use.",
+        ),
+    };
+
+    attention_extension_status(
+        extension,
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
 }
 
 fn attention_extension_status(
@@ -3240,9 +3500,28 @@ async fn build_extension_control_surface(
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlSurface> {
     let context = load_extension_control_context(state, store, extension_id).await?;
-    let live_snapshot = control::load_live_snapshot(state, store, &context)
-        .await
-        .unwrap_or_default();
+    let live_snapshot = match tokio::time::timeout(
+        Duration::from_secs(2),
+        control::load_live_snapshot(state, store, &context),
+    )
+    .await
+    {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(err)) => {
+            tracing::debug!(
+                "control live snapshot unavailable for {}: {err}",
+                context.extension.extension_id
+            );
+            ExtensionControlLiveSnapshot::default()
+        }
+        Err(_) => {
+            tracing::debug!(
+                "control live snapshot timed out for {}",
+                context.extension.extension_id
+            );
+            ExtensionControlLiveSnapshot::default()
+        }
+    };
 
     let mut details = Vec::new();
     if !context.summary.description.trim().is_empty() {
@@ -3962,6 +4241,8 @@ fn build_extension_control_service_section(
 }
 
 const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.instance.";
+const ARR_DOWNLOAD_CLIENT_CACHE_SETTING_PREFIX: &str =
+    "extensions.control_download_clients.instance.";
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -3978,8 +4259,85 @@ impl Default for ManagerControlDefaults {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrDownloadClientPreference {
+    KeepCurrent,
+    Usenet,
+    Torrent,
+}
+
+impl ArrDownloadClientPreference {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepCurrent => "current",
+            Self::Usenet => "usenet",
+            Self::Torrent => "torrent",
+        }
+    }
+
+    fn from_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "current" => Some(Self::KeepCurrent),
+            "usenet" => Some(Self::Usenet),
+            "torrent" => Some(Self::Torrent),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrDownloadClientProtocol {
+    Usenet,
+    Torrent,
+    Unknown,
+}
+
+impl ArrDownloadClientProtocol {
+    fn as_setting_value(self) -> &'static str {
+        match self {
+            Self::Usenet => "usenet",
+            Self::Torrent => "torrent",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Usenet => "Usenet",
+            Self::Torrent => "Torrent",
+            Self::Unknown => "Other",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArrControlDownloadClient {
+    id: i64,
+    name: String,
+    implementation: Option<String>,
+    protocol: ArrDownloadClientProtocol,
+    priority: i64,
+    enabled: bool,
+    raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArrControlDownloadClientCacheEntry {
+    id: i64,
+    name: String,
+    implementation: Option<String>,
+    protocol: String,
+    priority: i64,
+    enabled: bool,
+}
+
 fn control_defaults_setting_key(instance_id: Uuid) -> String {
     format!("{CONTROL_DEFAULTS_SETTING_PREFIX}{instance_id}")
+}
+
+fn arr_download_client_cache_setting_key(instance_id: Uuid) -> String {
+    format!("{ARR_DOWNLOAD_CLIENT_CACHE_SETTING_PREFIX}{instance_id}")
 }
 
 async fn build_extension_control_settings_section(
@@ -4077,6 +4435,100 @@ async fn build_extension_control_settings_section(
     }
 
     Ok(None)
+}
+
+async fn build_extension_control_download_client_preference_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let extension_id = context.extension.extension_id.to_ascii_lowercase();
+    if !extension_id.contains("sonarr") && !extension_id.contains("radarr") {
+        return Ok(None);
+    }
+
+    let (clients, live_clients) =
+        match load_arr_control_download_clients_with_fallback(state, store, context).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(
+                    "manager download client preference unavailable for {}: {err}",
+                    context.extension.extension_id
+                );
+                return Ok(None);
+            }
+        };
+    if clients.is_empty() {
+        return Ok(None);
+    }
+
+    let current_preference = infer_arr_download_client_preference(&clients);
+    let (has_usenet, has_torrent) = arr_download_client_protocol_coverage(&clients);
+    let readonly = !live_clients || !has_usenet || !has_torrent;
+    let description = if !live_clients {
+        "Elixir is showing the last known manager client order while Sonarr or Radarr is still reloading download-client state."
+            .to_string()
+    } else if !has_usenet || !has_torrent {
+        "Add both a Usenet and a torrent client in the manager to switch protocol preference here."
+            .to_string()
+    } else {
+        "Choose which protocol group Sonarr or Radarr should favor. Elixir rewrites the manager's download client priorities; Keep current order leaves the existing manager order unchanged."
+            .to_string()
+    };
+
+    let mut entities = clients;
+    entities.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.enabled.cmp(&left.enabled))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    Ok(Some(ExtensionControlSection {
+        id: "downloadClientPreference".to_string(),
+        title: "Download client preference".to_string(),
+        description,
+        fields: vec![ExtensionControlField {
+            id: "downloadClientPreference".to_string(),
+            label: "Preferred source".to_string(),
+            description:
+                "Use this to favor Usenet or torrent clients in the manager without leaving Elixir."
+                    .to_string(),
+            field_type: "select".to_string(),
+            value: serde_json::Value::String(current_preference.as_str().to_string()),
+            required: true,
+            readonly,
+            secret: false,
+            options: vec![
+                ExtensionControlOption {
+                    value: serde_json::Value::String(
+                        ArrDownloadClientPreference::KeepCurrent
+                            .as_str()
+                            .to_string(),
+                    ),
+                    label: "Keep current order".to_string(),
+                },
+                ExtensionControlOption {
+                    value: serde_json::Value::String(
+                        ArrDownloadClientPreference::Usenet.as_str().to_string(),
+                    ),
+                    label: "Prefer Usenet".to_string(),
+                },
+                ExtensionControlOption {
+                    value: serde_json::Value::String(
+                        ArrDownloadClientPreference::Torrent.as_str().to_string(),
+                    ),
+                    label: "Prefer Torrent".to_string(),
+                },
+            ],
+            validation: None,
+        }],
+        entities: entities
+            .iter()
+            .map(build_arr_download_client_entity)
+            .collect(),
+        actions: Vec::new(),
+    }))
 }
 
 async fn build_extension_control_managed_items_section(
@@ -4294,6 +4746,473 @@ async fn save_manager_control_defaults(
     if updated {
         store
             .upsert_extension_setting(&key, &serde_json::Value::Object(object))
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn build_arr_download_client_entity(client: &ArrControlDownloadClient) -> ExtensionControlEntity {
+    let subtitle = Some(client.protocol.label().to_string());
+    let mut details = vec![format!("Client priority {}", client.priority)];
+    details.push(if client.enabled {
+        "Enabled".to_string()
+    } else {
+        "Disabled".to_string()
+    });
+    if let Some(implementation) = client
+        .implementation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("Implementation {implementation}"));
+    }
+
+    ExtensionControlEntity {
+        id: client.id.to_string(),
+        title: client.name.clone(),
+        subtitle,
+        details,
+        actions: Vec::new(),
+    }
+}
+
+fn arr_download_client_cache_entry_from_client(
+    client: &ArrControlDownloadClient,
+) -> ArrControlDownloadClientCacheEntry {
+    ArrControlDownloadClientCacheEntry {
+        id: client.id,
+        name: client.name.clone(),
+        implementation: client.implementation.clone(),
+        protocol: client.protocol.as_setting_value().to_string(),
+        priority: client.priority,
+        enabled: client.enabled,
+    }
+}
+
+fn arr_download_client_from_cache_entry(
+    entry: ArrControlDownloadClientCacheEntry,
+) -> ArrControlDownloadClient {
+    ArrControlDownloadClient {
+        id: entry.id,
+        name: entry.name,
+        implementation: entry.implementation,
+        protocol: arr_download_client_protocol_from_str(&entry.protocol),
+        priority: entry.priority,
+        enabled: entry.enabled,
+        raw: json!({}),
+    }
+}
+
+fn arr_download_client_protocol_from_str(value: &str) -> ArrDownloadClientProtocol {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.contains("usenet")
+        || normalized.contains("nzb")
+        || normalized.contains("sab")
+        || normalized.contains("newshost")
+    {
+        ArrDownloadClientProtocol::Usenet
+    } else if normalized.contains("torrent")
+        || normalized.contains("qbittorrent")
+        || normalized.contains("transmission")
+        || normalized.contains("deluge")
+        || normalized.contains("utorrent")
+        || normalized.contains("rtorrent")
+        || normalized.contains("vuze")
+        || normalized.contains("hadouken")
+    {
+        ArrDownloadClientProtocol::Torrent
+    } else {
+        ArrDownloadClientProtocol::Unknown
+    }
+}
+
+fn arr_download_client_protocol_coverage(clients: &[ArrControlDownloadClient]) -> (bool, bool) {
+    let mut has_usenet = false;
+    let mut has_torrent = false;
+    for client in clients.iter().filter(|client| client.enabled) {
+        match client.protocol {
+            ArrDownloadClientProtocol::Usenet => has_usenet = true,
+            ArrDownloadClientProtocol::Torrent => has_torrent = true,
+            ArrDownloadClientProtocol::Unknown => {}
+        }
+    }
+    (has_usenet, has_torrent)
+}
+
+async fn load_cached_arr_control_download_clients(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<Vec<ArrControlDownloadClient>> {
+    let Some(value) = store
+        .get_extension_setting(&arr_download_client_cache_setting_key(instance_id))
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let entries: Vec<ArrControlDownloadClientCacheEntry> =
+        serde_json::from_value(value).context("parsing cached arr download clients")?;
+    Ok(entries
+        .into_iter()
+        .map(arr_download_client_from_cache_entry)
+        .collect())
+}
+
+async fn save_cached_arr_control_download_clients(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    clients: &[ArrControlDownloadClient],
+) -> anyhow::Result<()> {
+    let entries = clients
+        .iter()
+        .map(arr_download_client_cache_entry_from_client)
+        .collect::<Vec<_>>();
+    store
+        .upsert_extension_setting(
+            &arr_download_client_cache_setting_key(instance_id),
+            &serde_json::to_value(entries)?,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn cached_arr_control_download_client_count(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<Option<usize>> {
+    let clients = load_cached_arr_control_download_clients(store, instance_id).await?;
+    if clients.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(clients.len()))
+    }
+}
+
+fn infer_arr_download_client_preference(
+    clients: &[ArrControlDownloadClient],
+) -> ArrDownloadClientPreference {
+    let usenet_priority = clients
+        .iter()
+        .filter(|client| client.enabled && client.protocol == ArrDownloadClientProtocol::Usenet)
+        .map(|client| client.priority)
+        .min();
+    let torrent_priority = clients
+        .iter()
+        .filter(|client| client.enabled && client.protocol == ArrDownloadClientProtocol::Torrent)
+        .map(|client| client.priority)
+        .min();
+
+    match (usenet_priority, torrent_priority) {
+        (Some(_), None) => ArrDownloadClientPreference::Usenet,
+        (None, Some(_)) => ArrDownloadClientPreference::Torrent,
+        (Some(usenet), Some(torrent)) if usenet < torrent => ArrDownloadClientPreference::Usenet,
+        (Some(usenet), Some(torrent)) if torrent < usenet => ArrDownloadClientPreference::Torrent,
+        _ => ArrDownloadClientPreference::KeepCurrent,
+    }
+}
+
+fn control_json_value_as_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|number| number.trim().parse::<i64>().ok())
+        })
+}
+
+fn extract_control_json_field_i64(value: &serde_json::Value, name: &str) -> Option<i64> {
+    value
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|fields| {
+            fields.iter().find_map(|field| {
+                let field_name = field.get("name").and_then(serde_json::Value::as_str)?;
+                if !field_name.eq_ignore_ascii_case(name) {
+                    return None;
+                }
+                field
+                    .get("value")
+                    .and_then(control_json_value_as_i64)
+                    .or_else(|| control_json_value_as_i64(field))
+            })
+        })
+}
+
+fn parse_arr_control_download_client(
+    value: &serde_json::Value,
+) -> Option<ArrControlDownloadClient> {
+    let id = value.get("id").and_then(control_json_value_as_i64)?;
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Download client")
+        .to_string();
+    let implementation = value
+        .get("implementation")
+        .or_else(|| value.get("implementationName"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let protocol = value
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        .map(arr_download_client_protocol_from_str)
+        .unwrap_or_else(|| {
+            implementation
+                .as_deref()
+                .map(arr_download_client_protocol_from_str)
+                .unwrap_or(ArrDownloadClientProtocol::Unknown)
+        });
+    let priority = value
+        .get("priority")
+        .and_then(control_json_value_as_i64)
+        .or_else(|| extract_control_json_field_i64(value, "priority"))
+        .unwrap_or(1);
+    let enabled = value
+        .get("enable")
+        .or_else(|| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    Some(ArrControlDownloadClient {
+        id,
+        name,
+        implementation,
+        protocol,
+        priority,
+        enabled,
+        raw: value.clone(),
+    })
+}
+
+async fn load_arr_control_download_clients(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Vec<ArrControlDownloadClient>> {
+    let (base_url, api_key) =
+        resolve_extension_control_arr_connection(state, store, context).await?;
+    let value = request_control_json(
+        &base_url,
+        &api_key,
+        &["api/v3/downloadclient", "api/v4/downloadclient"],
+    )
+    .await?;
+    let Some(items) = value.as_array() else {
+        anyhow::bail!("download client inventory response was not an array");
+    };
+
+    Ok(items
+        .iter()
+        .filter_map(parse_arr_control_download_client)
+        .collect())
+}
+
+async fn load_arr_control_download_client_detail(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    client_id: i64,
+) -> anyhow::Result<serde_json::Value> {
+    let (base_url, api_key) =
+        resolve_extension_control_arr_connection(state, store, context).await?;
+    request_control_json(
+        &base_url,
+        &api_key,
+        &[
+            &format!("api/v3/downloadclient/{client_id}"),
+            &format!("api/v4/downloadclient/{client_id}"),
+        ],
+    )
+    .await
+}
+
+async fn load_arr_control_download_clients_with_fallback(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<(Vec<ArrControlDownloadClient>, bool)> {
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        load_arr_control_download_clients(state, store, context),
+    )
+    .await
+    {
+        Ok(Ok(clients)) => {
+            save_cached_arr_control_download_clients(store, instance.instance_id, &clients).await?;
+            Ok((clients, true))
+        }
+        Ok(Err(err)) => {
+            let cached =
+                load_cached_arr_control_download_clients(store, instance.instance_id).await?;
+            if cached.is_empty() {
+                Err(err)
+            } else {
+                tracing::debug!(
+                    "using cached arr download client inventory for {} after live load failed: {err}",
+                    context.extension.extension_id
+                );
+                Ok((cached, false))
+            }
+        }
+        Err(_) => {
+            let cached =
+                load_cached_arr_control_download_clients(store, instance.instance_id).await?;
+            if cached.is_empty() {
+                anyhow::bail!("manager download client inventory timed out")
+            } else {
+                tracing::debug!(
+                    "using cached arr download client inventory for {} after live load timed out",
+                    context.extension.extension_id
+                );
+                Ok((cached, false))
+            }
+        }
+    }
+}
+
+fn set_arr_control_download_client_priority(
+    value: &mut serde_json::Value,
+    priority: i64,
+) -> anyhow::Result<()> {
+    let mut updated = false;
+
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("priority") {
+            object.insert("priority".to_string(), serde_json::Value::from(priority));
+            updated = true;
+        }
+    }
+
+    if let Some(fields) = value
+        .get_mut("fields")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for field in fields {
+            let field_name = field.get("name").and_then(serde_json::Value::as_str);
+            if field_name != Some("priority") {
+                continue;
+            }
+            if let Some(object) = field.as_object_mut() {
+                object.insert("value".to_string(), serde_json::Value::from(priority));
+                updated = true;
+            }
+        }
+    }
+
+    if !updated {
+        anyhow::bail!("download client priority is unavailable for this manager")
+    }
+
+    Ok(())
+}
+
+fn plan_arr_download_client_priority_updates(
+    clients: &[ArrControlDownloadClient],
+    preference: ArrDownloadClientPreference,
+) -> anyhow::Result<Vec<(i64, i64, serde_json::Value)>> {
+    if preference == ArrDownloadClientPreference::KeepCurrent
+        || infer_arr_download_client_preference(clients) == preference
+    {
+        return Ok(Vec::new());
+    }
+
+    let (has_usenet, has_torrent) = arr_download_client_protocol_coverage(clients);
+    if !has_usenet || !has_torrent {
+        anyhow::bail!(
+            "add both a Usenet and a torrent client in the manager before changing protocol preference"
+        );
+    }
+
+    let base_priority = clients
+        .iter()
+        .filter(|client| client.enabled)
+        .map(|client| client.priority)
+        .min()
+        .unwrap_or(1);
+    let mut updates = Vec::new();
+
+    for client in clients.iter().filter(|client| client.enabled) {
+        let target_priority = match (preference, client.protocol) {
+            (ArrDownloadClientPreference::Usenet, ArrDownloadClientProtocol::Usenet)
+            | (ArrDownloadClientPreference::Torrent, ArrDownloadClientProtocol::Torrent) => {
+                base_priority
+            }
+            (ArrDownloadClientPreference::Usenet, ArrDownloadClientProtocol::Torrent)
+            | (ArrDownloadClientPreference::Torrent, ArrDownloadClientProtocol::Usenet) => {
+                base_priority + 1
+            }
+            (_, ArrDownloadClientProtocol::Unknown) => base_priority + 2,
+            (ArrDownloadClientPreference::KeepCurrent, _) => client.priority,
+        };
+        if client.priority == target_priority {
+            continue;
+        }
+        let mut raw = client.raw.clone();
+        set_arr_control_download_client_priority(&mut raw, target_priority)?;
+        updates.push((client.id, target_priority, raw));
+    }
+
+    Ok(updates)
+}
+
+async fn update_arr_download_client_preference(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let raw_value = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("downloadClientPreference must be a string"))?;
+    let preference = ArrDownloadClientPreference::from_value(raw_value).ok_or_else(|| {
+        anyhow::anyhow!("downloadClientPreference must be one of current, usenet, or torrent")
+    })?;
+    let (base_url, api_key) =
+        resolve_extension_control_arr_connection(state, store, context).await?;
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    let clients = load_arr_control_download_clients(state, store, context).await?;
+    save_cached_arr_control_download_clients(store, instance.instance_id, &clients).await?;
+    let updates = plan_arr_download_client_priority_updates(&clients, preference)?;
+
+    for (id, target_priority, _) in &updates {
+        let mut detail =
+            load_arr_control_download_client_detail(state, store, context, *id).await?;
+        set_arr_control_download_client_priority(&mut detail, *target_priority)?;
+        request_control_write(
+            &base_url,
+            &api_key,
+            ReqwestMethod::PUT,
+            &[
+                &format!("api/v3/downloadclient/{id}"),
+                &format!("api/v4/downloadclient/{id}"),
+            ],
+            Some(&detail),
+        )
+        .await?;
+    }
+
+    if !updates.is_empty() {
+        let mut cached_clients = clients;
+        for (id, target_priority, _) in updates {
+            if let Some(client) = cached_clients.iter_mut().find(|client| client.id == id) {
+                client.priority = target_priority;
+            }
+        }
+        save_cached_arr_control_download_clients(store, instance.instance_id, &cached_clients)
             .await?;
     }
 
@@ -5409,47 +6328,42 @@ async fn load_sonarr_control_snapshot(
     .await?;
     let series =
         request_control_json(base_url, &api_key, &["api/v3/series", "api/v4/series"]).await?;
-    let downloaders = request_control_json(
-        base_url,
-        &api_key,
-        &["api/v3/downloadclient", "api/v4/downloadclient"],
-    )
-    .await?;
+    let mut metrics = vec![
+        ExtensionControlMetric {
+            id: "version".to_string(),
+            label: "Service version".to_string(),
+            value: status
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string(),
+        },
+        ExtensionControlMetric {
+            id: "seriesCount".to_string(),
+            label: "Series".to_string(),
+            value: series
+                .as_array()
+                .map(|value| value.len())
+                .unwrap_or(0)
+                .to_string(),
+        },
+    ];
+    if let Some(download_client_count) =
+        cached_arr_control_download_client_count(store, instance.instance_id).await?
+    {
+        metrics.push(ExtensionControlMetric {
+            id: "downloadClientCount".to_string(),
+            label: "Download clients".to_string(),
+            value: download_client_count.to_string(),
+        });
+    }
 
     Ok(ExtensionControlLiveSnapshot {
         version: status
             .get("version")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        metrics: vec![
-            ExtensionControlMetric {
-                id: "version".to_string(),
-                label: "Service version".to_string(),
-                value: status
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "seriesCount".to_string(),
-                label: "Series".to_string(),
-                value: series
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "downloadClientCount".to_string(),
-                label: "Download clients".to_string(),
-                value: downloaders
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-        ],
+        metrics,
     })
 }
 
@@ -5469,47 +6383,42 @@ async fn load_radarr_control_snapshot(
     .await?;
     let movies =
         request_control_json(base_url, &api_key, &["api/v3/movie", "api/v4/movie"]).await?;
-    let downloaders = request_control_json(
-        base_url,
-        &api_key,
-        &["api/v3/downloadclient", "api/v4/downloadclient"],
-    )
-    .await?;
+    let mut metrics = vec![
+        ExtensionControlMetric {
+            id: "version".to_string(),
+            label: "Service version".to_string(),
+            value: status
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string(),
+        },
+        ExtensionControlMetric {
+            id: "movieCount".to_string(),
+            label: "Movies".to_string(),
+            value: movies
+                .as_array()
+                .map(|value| value.len())
+                .unwrap_or(0)
+                .to_string(),
+        },
+    ];
+    if let Some(download_client_count) =
+        cached_arr_control_download_client_count(store, instance.instance_id).await?
+    {
+        metrics.push(ExtensionControlMetric {
+            id: "downloadClientCount".to_string(),
+            label: "Download clients".to_string(),
+            value: download_client_count.to_string(),
+        });
+    }
 
     Ok(ExtensionControlLiveSnapshot {
         version: status
             .get("version")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        metrics: vec![
-            ExtensionControlMetric {
-                id: "version".to_string(),
-                label: "Service version".to_string(),
-                value: status
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "movieCount".to_string(),
-                label: "Movies".to_string(),
-                value: movies
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "downloadClientCount".to_string(),
-                label: "Download clients".to_string(),
-                value: downloaders
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-        ],
+        metrics,
     })
 }
 
@@ -5798,7 +6707,7 @@ fn build_extension_control_arr_client(api_key: &str) -> anyhow::Result<Client> {
     headers.insert(USER_AGENT, ReqwestHeaderValue::from_static("Elixir/1.0"));
     headers.insert(ACCEPT, ReqwestHeaderValue::from_static("application/json"));
     Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(5))
         .default_headers(headers)
         .build()
         .map_err(anyhow::Error::from)

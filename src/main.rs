@@ -23,7 +23,7 @@ use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
-use crate::extensions::package::{read_manifest_from_dir, unpack_package};
+use crate::extensions::package::{read_manifest_from_dir, unpack_package, write_manifest_to_dir};
 use crate::extensions::registry::start_registry_refresh_loop;
 use crate::extensions::store::{ExtensionStore, NewExtension};
 use crate::http::handlers::extensions::InstallRequest;
@@ -151,6 +151,17 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("orchestrator startup recovery failed: {err}");
     }
+    if let Err(err) = state
+        .orchestrator
+        .restore_persisted_runtime_health_state()
+        .await
+    {
+        tracing::warn!("orchestrator runtime health restore failed: {err}");
+    }
+    state
+        .orchestrator
+        .clone()
+        .start_runtime_health_loop(reconcile_config.clone());
     state
         .orchestrator
         .clone()
@@ -344,6 +355,8 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
 async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Result<()> {
     let store = ExtensionStore::new(&state.db_pool);
     let mut repaired = 0_u32;
+    let mut rewritten_files = 0_u32;
+    let unpacked_root = PathBuf::from(&state.settings.extensions.storage_root).join("unpacked");
 
     for extension in store.list_extensions().await? {
         let mut raw_json = extension.manifest_json.clone();
@@ -359,6 +372,14 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
                 extension.extension_id
             )
         })?;
+
+        let unpacked_dir = unpacked_root
+            .join(&extension.extension_id)
+            .join(&extension.version);
+        if unpacked_dir.is_dir() {
+            write_manifest_to_dir(&unpacked_dir, &raw_json).await?;
+            rewritten_files += 1;
+        }
 
         store
             .upsert_extension(&NewExtension {
@@ -384,6 +405,9 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
 
     if repaired > 0 {
         tracing::info!("repaired {repaired} installed extension manifest(s)");
+    }
+    if rewritten_files > 0 {
+        tracing::info!("rewrote {rewritten_files} unpacked installed manifest file(s)");
     }
 
     Ok(())

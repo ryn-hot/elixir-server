@@ -118,6 +118,12 @@ impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
             sections.push(section);
         }
         if let Some(section) =
+            super::build_extension_control_download_client_preference_section(state, store, context)
+                .await?
+        {
+            sections.push(section);
+        }
+        if let Some(section) =
             super::build_extension_control_managed_items_section(store, context).await?
         {
             sections.push(section);
@@ -135,7 +141,7 @@ impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
 
     async fn update_settings(
         &self,
-        _state: &AppState,
+        state: &AppState,
         store: &ExtensionStore<'_>,
         context: &ExtensionControlContext,
         values: &HashMap<String, serde_json::Value>,
@@ -143,7 +149,30 @@ impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
         let Some(instance) = context.selected_instance.as_ref() else {
             anyhow::bail!("no active instance is available for this extension yet");
         };
-        super::save_manager_control_defaults(store, instance.instance_id, values).await
+        if let Some(field_id) = values.keys().find(|field_id| {
+            !matches!(
+                field_id.as_str(),
+                "monitorOnAdd" | "searchOnAdd" | "downloadClientPreference"
+            )
+        }) {
+            anyhow::bail!("unsupported control setting '{field_id}'");
+        }
+
+        let mut default_values = HashMap::new();
+        for field_id in ["monitorOnAdd", "searchOnAdd"] {
+            if let Some(value) = values.get(field_id) {
+                default_values.insert(field_id.to_string(), value.clone());
+            }
+        }
+        if !default_values.is_empty() {
+            super::save_manager_control_defaults(store, instance.instance_id, &default_values)
+                .await?;
+        }
+        if let Some(value) = values.get("downloadClientPreference") {
+            super::update_arr_download_client_preference(state, store, context, value).await?;
+        }
+
+        Ok(())
     }
 
     async fn execute_action(

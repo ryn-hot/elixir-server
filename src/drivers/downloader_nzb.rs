@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method, StatusCode, Url};
@@ -13,6 +13,7 @@ use crate::drivers::{
     ActivitySnapshot, ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot,
 };
 use tokio::fs;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Default)]
 pub struct DownloaderNzbDriver;
@@ -80,7 +81,15 @@ impl CapabilityDriver for DownloaderNzbDriver {
                     upsert_categories_in_file(path, &categories).await?;
                 } else {
                     let client = NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
-                    client.upsert_categories(&categories).await?;
+                    let preserved_server_updates = persisted_server_inventory_updates(&ctx, None)?;
+                    let managed_path_updates = live_managed_path_updates(&ctx);
+                    client
+                        .upsert_categories(
+                            &categories,
+                            preserved_server_updates,
+                            managed_path_updates,
+                        )
+                        .await?;
                 }
             }
             DownloaderNzbPatch::SetPreferences {
@@ -113,6 +122,10 @@ impl CapabilityDriver for DownloaderNzbDriver {
                 unpack_pause_queue,
                 download_rate_kib,
             } => {
+                let preserved_server_updates =
+                    persisted_server_inventory_updates(&ctx, server_connections)?;
+                let managed_path_updates = live_managed_path_updates(&ctx);
+                let managed_category_updates = managed_default_category_updates(&ctx);
                 if let Some(path) = managed_config_path.as_deref() {
                     set_preferences_in_file(
                         path,
@@ -144,6 +157,7 @@ impl CapabilityDriver for DownloaderNzbDriver {
                         unpack,
                         unpack_pause_queue,
                         download_rate_kib,
+                        preserved_server_updates,
                     )
                     .await?;
                 } else {
@@ -178,6 +192,9 @@ impl CapabilityDriver for DownloaderNzbDriver {
                             unpack,
                             unpack_pause_queue,
                             download_rate_kib,
+                            managed_path_updates,
+                            managed_category_updates,
+                            preserved_server_updates,
                         )
                         .await?;
                 }
@@ -277,6 +294,11 @@ struct NzbgetClient {
 }
 
 impl NzbgetClient {
+    const READY_RETRY_ATTEMPTS: usize = 8;
+    const READY_RETRY_DELAY_MS: u64 = 500;
+    const CONFIG_CONVERGENCE_RETRY_ATTEMPTS: usize = 20;
+    const CONFIG_CONVERGENCE_RETRY_DELAY_MS: u64 = 500;
+
     async fn from_config(config: NzbgetDriverConfig, endpoint_url: String) -> Result<Self> {
         let username = config
             .username
@@ -300,8 +322,34 @@ impl NzbgetClient {
             username,
             password,
         };
-        let _ = client.version().await?;
+        let _ = client
+            .wait_until_ready(
+                Self::READY_RETRY_ATTEMPTS,
+                Duration::from_millis(Self::READY_RETRY_DELAY_MS),
+            )
+            .await?;
         Ok(client)
+    }
+
+    async fn wait_until_ready(&self, attempts: usize, delay: Duration) -> Result<String> {
+        let attempts = attempts.max(1);
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            match self.version().await {
+                Ok(version) => return Ok(version),
+                Err(err) => {
+                    let detail = err.to_string();
+                    if detail.contains("auth rejected") {
+                        return Err(err);
+                    }
+                    last_error = Some(err);
+                }
+            }
+            if attempt + 1 < attempts {
+                sleep(delay).await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("nzbget version")))
     }
 
     async fn version(&self) -> Result<String> {
@@ -345,7 +393,57 @@ impl NzbgetClient {
         if !rpc_success(&reload) {
             bail!("nzbget reload returned unexpected payload: {reload}");
         }
+        let _ = self
+            .wait_until_ready(10, Duration::from_millis(500))
+            .await
+            .context("waiting for nzbget to come back after reload")?;
+        self.wait_until_config_reflects(
+            &updates,
+            Self::CONFIG_CONVERGENCE_RETRY_ATTEMPTS,
+            Duration::from_millis(Self::CONFIG_CONVERGENCE_RETRY_DELAY_MS),
+        )
+        .await
+        .context("waiting for nzbget config to reflect saved updates")?;
         Ok(())
+    }
+
+    async fn wait_until_config_reflects(
+        &self,
+        updates: &[NzbgetConfigUpdate],
+        attempts: usize,
+        delay: Duration,
+    ) -> Result<()> {
+        let expected = normalized_expected_updates(updates);
+        if expected.is_empty() {
+            return Ok(());
+        }
+
+        let attempts = attempts.max(1);
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            match self.read_config().await {
+                Ok(config) => {
+                    if config_reflects_updates(&config, &expected) {
+                        return Ok(());
+                    }
+                    last_error = Some(anyhow!(
+                        "nzbget config has not converged yet for keys: {}",
+                        expected.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Err(err) => {
+                    let detail = err.to_string();
+                    if detail.contains("auth rejected") {
+                        return Err(err);
+                    }
+                    last_error = Some(err);
+                }
+            }
+            if attempt + 1 < attempts {
+                sleep(delay).await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("nzbget config did not converge after save")))
     }
 
     async fn set_preferences(
@@ -378,9 +476,13 @@ impl NzbgetClient {
         unpack: Option<bool>,
         unpack_pause_queue: Option<bool>,
         download_rate_kib: Option<u64>,
+        managed_path_updates: Vec<NzbgetConfigUpdate>,
+        managed_category_updates: Vec<NzbgetConfigUpdate>,
+        preserved_server_updates: Vec<NzbgetConfigUpdate>,
     ) -> Result<()> {
         let config = self.read_config().await?;
         let mut updates = Vec::new();
+        let uses_managed_main_dir = matches!(main_dir.as_deref(), Some("/config"));
         push_string_update(&mut updates, "MainDir", main_dir);
         if let Some(path) = default_save_path {
             updates.push(NzbgetConfigUpdate::new("DestDir", path));
@@ -400,6 +502,9 @@ impl NzbgetClient {
         push_string_update(&mut updates, "LogFile", log_file);
         push_string_update(&mut updates, "WebDir", web_dir);
         push_string_update(&mut updates, "ConfigTemplate", config_template);
+        if uses_managed_main_dir {
+            updates.push(NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"));
+        }
         if let Some(connections) = server_connections {
             updates.extend(server_connection_updates(&config, connections));
         }
@@ -419,10 +524,19 @@ impl NzbgetClient {
         push_bool_update(&mut updates, "Unpack", unpack);
         push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
         push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
+        updates.extend(managed_path_updates);
+        updates.extend(preserved_category_updates(&config));
+        updates.extend(managed_category_updates);
+        updates.extend(preserved_server_updates);
         self.save_config(updates).await
     }
 
-    async fn upsert_categories(&self, categories: &[DownloadCategorySpec]) -> Result<()> {
+    async fn upsert_categories(
+        &self,
+        categories: &[DownloadCategorySpec],
+        preserved_server_updates: Vec<NzbgetConfigUpdate>,
+        managed_path_updates: Vec<NzbgetConfigUpdate>,
+    ) -> Result<()> {
         if categories.is_empty() {
             return Ok(());
         }
@@ -480,6 +594,8 @@ impl NzbgetClient {
             }
         }
 
+        updates.extend(managed_path_updates);
+        updates.extend(preserved_server_updates);
         self.save_config(updates).await
     }
 
@@ -531,6 +647,33 @@ struct NzbgetConfigItem {
     value: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistedNzbgetServerEntry {
+    slot: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    encryption: bool,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    level: u64,
+    #[serde(default)]
+    connections: Option<u64>,
+    #[serde(default)]
+    cert_verification: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistedNzbgetDriverInventoryConfig {
+    #[serde(default)]
+    server_inventory: Vec<PersistedNzbgetServerEntry>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct NzbgetConfigUpdate {
     #[serde(rename = "Name")]
@@ -570,6 +713,26 @@ fn category_slots(config: &[NzbgetConfigItem]) -> BTreeMap<u32, CategorySlot> {
     slots
 }
 
+fn preserved_category_updates(config: &[NzbgetConfigItem]) -> Vec<NzbgetConfigUpdate> {
+    let mut updates = Vec::new();
+    for (slot, category) in category_slots(config) {
+        if category.name.trim().is_empty() {
+            continue;
+        }
+        updates.push(NzbgetConfigUpdate::new(
+            format!("Category{slot}.Name"),
+            category.name,
+        ));
+        if !category.dest_dir.trim().is_empty() {
+            updates.push(NzbgetConfigUpdate::new(
+                format!("Category{slot}.DestDir"),
+                category.dest_dir,
+            ));
+        }
+    }
+    updates
+}
+
 fn server_connection_updates(
     config: &[NzbgetConfigItem],
     target_connections: u64,
@@ -606,6 +769,141 @@ fn server_connection_updates(
     updates
 }
 
+fn persisted_server_inventory_updates(
+    ctx: &DriverCtx,
+    server_connections_override: Option<u64>,
+) -> Result<Vec<NzbgetConfigUpdate>> {
+    let Some(value) = ctx.instance_config.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let config: PersistedNzbgetDriverInventoryConfig =
+        serde_json::from_value(value.clone()).context("parsing nzbget persisted inventory")?;
+    let mut updates = Vec::new();
+    for server in config.server_inventory {
+        if !persisted_nzbget_server_is_configured(&server) {
+            continue;
+        }
+        let username_key = format!("nzbget.server.{}.username", server.slot);
+        let password_key = format!("nzbget.server.{}.password", server.slot);
+        let username = ctx.secret(&username_key).ok_or_else(|| {
+            anyhow!(
+                "missing persisted nzbget server username secret for slot {}",
+                server.slot
+            )
+        })?;
+        let password = ctx.secret(&password_key).ok_or_else(|| {
+            anyhow!(
+                "missing persisted nzbget server password secret for slot {}",
+                server.slot
+            )
+        })?;
+        updates.extend(persisted_server_config_updates(
+            &server,
+            username,
+            password,
+            server_connections_override,
+        ));
+    }
+    Ok(updates)
+}
+
+fn persisted_nzbget_server_is_configured(server: &PersistedNzbgetServerEntry) -> bool {
+    server.slot > 0 && !server.host.trim().is_empty()
+}
+
+fn persisted_server_config_updates(
+    server: &PersistedNzbgetServerEntry,
+    username: &str,
+    password: &str,
+    server_connections_override: Option<u64>,
+) -> Vec<NzbgetConfigUpdate> {
+    let connections = server_connections_override
+        .or(server.connections)
+        .unwrap_or(20);
+    let cert_verification = server
+        .cert_verification
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("strict");
+    vec![
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Active", server.slot),
+            if server.active { "yes" } else { "no" },
+        ),
+        NzbgetConfigUpdate::new(format!("Server{}.Name", server.slot), server.name.clone()),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Level", server.slot),
+            server.level.to_string(),
+        ),
+        NzbgetConfigUpdate::new(format!("Server{}.Host", server.slot), server.host.clone()),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Encryption", server.slot),
+            if server.encryption { "yes" } else { "no" },
+        ),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Port", server.slot),
+            server.port.unwrap_or(563).to_string(),
+        ),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Username", server.slot),
+            username.trim().to_string(),
+        ),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Password", server.slot),
+            password.trim().to_string(),
+        ),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.Connections", server.slot),
+            connections.to_string(),
+        ),
+        NzbgetConfigUpdate::new(
+            format!("Server{}.CertVerification", server.slot),
+            cert_verification.to_string(),
+        ),
+    ]
+}
+
+fn live_managed_path_updates(ctx: &DriverCtx) -> Vec<NzbgetConfigUpdate> {
+    if !nzbget_managed_defaults_enabled(ctx) {
+        return Vec::new();
+    }
+    vec![
+        NzbgetConfigUpdate::new("MainDir", "/config"),
+        NzbgetConfigUpdate::new("DestDir", "/downloads"),
+        NzbgetConfigUpdate::new("InterDir", "/runtime/incomplete"),
+        NzbgetConfigUpdate::new("NzbDir", "/runtime/nzb"),
+        NzbgetConfigUpdate::new("QueueDir", "/runtime/queue"),
+        NzbgetConfigUpdate::new("TempDir", "/runtime/tmp"),
+        NzbgetConfigUpdate::new("ScriptDir", "/config/scripts"),
+        NzbgetConfigUpdate::new("LogFile", "/config/nzbget.log"),
+        NzbgetConfigUpdate::new("WebDir", "/app/nzbget/webui"),
+        NzbgetConfigUpdate::new("ConfigTemplate", "/app/nzbget/webui/nzbget.conf.template"),
+        NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"),
+    ]
+}
+
+fn managed_default_category_updates(ctx: &DriverCtx) -> Vec<NzbgetConfigUpdate> {
+    if !nzbget_managed_defaults_enabled(ctx) {
+        return Vec::new();
+    }
+    vec![
+        NzbgetConfigUpdate::new("Category1.Name", "tv"),
+        NzbgetConfigUpdate::new("Category1.DestDir", "/downloads/tv"),
+        NzbgetConfigUpdate::new("Category2.Name", "anime"),
+        NzbgetConfigUpdate::new("Category2.DestDir", "/downloads/anime"),
+        NzbgetConfigUpdate::new("Category3.Name", "movies"),
+        NzbgetConfigUpdate::new("Category3.DestDir", "/downloads/movies"),
+    ]
+}
+
+fn nzbget_managed_defaults_enabled(ctx: &DriverCtx) -> bool {
+    ctx.instance_config
+        .as_ref()
+        .and_then(|value| value.get("managed_defaults"))
+        .is_some()
+}
+
 fn parse_server_option(name: &str) -> Option<(u32, &str)> {
     let suffix = name.strip_prefix("Server")?;
     let (slot, field) = suffix.split_once('.')?;
@@ -632,6 +930,39 @@ fn push_string_update(updates: &mut Vec<NzbgetConfigUpdate>, key: &str, value: O
     if let Some(value) = value {
         updates.push(NzbgetConfigUpdate::new(key, value));
     }
+}
+
+fn normalized_expected_updates(updates: &[NzbgetConfigUpdate]) -> BTreeMap<String, String> {
+    let mut expected = BTreeMap::new();
+    for update in updates {
+        if should_skip_config_convergence_check(&update.name) {
+            continue;
+        }
+        expected.insert(update.name.clone(), update.value.clone());
+    }
+    expected
+}
+
+fn should_skip_config_convergence_check(name: &str) -> bool {
+    name.eq_ignore_ascii_case("ControlPassword")
+        || name.ends_with(".Password")
+        || name.eq_ignore_ascii_case("ServerPassword")
+}
+
+fn config_reflects_updates(
+    config: &[NzbgetConfigItem],
+    expected: &BTreeMap<String, String>,
+) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    let mut actual = BTreeMap::new();
+    for item in config {
+        actual.insert(item.name.as_str(), item.value.as_str());
+    }
+    expected
+        .iter()
+        .all(|(name, value)| actual.get(name.as_str()).copied() == Some(value.as_str()))
 }
 
 fn parse_nzb_bool(value: &str) -> bool {
@@ -736,6 +1067,7 @@ async fn set_preferences_in_file(
     unpack: Option<bool>,
     unpack_pause_queue: Option<bool>,
     download_rate_kib: Option<u64>,
+    preserved_server_updates: Vec<NzbgetConfigUpdate>,
 ) -> Result<()> {
     let mut config = read_managed_config(config_path).await?;
     let main_dir = canonicalize_nzbget_managed_path("MainDir", main_dir);
@@ -786,6 +1118,7 @@ async fn set_preferences_in_file(
     push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
     push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
     updates.push(NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"));
+    updates.extend(preserved_server_updates);
 
     write_config_updates(&mut config, updates).await
 }
@@ -1034,17 +1367,19 @@ fn describe_error_body(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CategorySlot, DownloaderNzbDriver, DriverCtx, NzbgetConfigItem, category_slots,
-        parse_category_option, rpc_success,
+        CategorySlot, DownloaderNzbDriver, DriverCtx, NzbgetClient, NzbgetConfigItem,
+        NzbgetDriverConfig, NzbgetDriverRuntimeConfig, category_slots, parse_category_option,
+        rpc_success,
     };
 
     use crate::drivers::CapabilityDriver;
     use crate::drivers::patches::DownloadCategorySpec;
     use anyhow::Result;
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, response::IntoResponse, routing::post};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[test]
@@ -1193,6 +1528,12 @@ mod tests {
             None,
             Some("elixir_net".to_string()),
         )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
         let ctx = DriverCtx::new(
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -1203,11 +1544,22 @@ mod tests {
             Some(json!({
                 "username": "elixir",
                 "password": "secret",
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }],
                 "runtime": {
                     "config_dir": config_dir.to_string_lossy()
                 }
             })),
-            HashMap::new(),
+            secrets,
         );
 
         let driver = DownloaderNzbDriver::new();
@@ -1284,6 +1636,798 @@ mod tests {
         assert!(rendered.contains("Category1.DestDir=/downloads/tv"));
         assert!(rendered.contains("Category2.Name=movies"));
         assert!(rendered.contains("Category2.DestDir=/downloads/movies"));
+        assert!(rendered.contains("Server1.Active=yes"));
+        assert!(rendered.contains("Server1.Name=XSNews"));
+        assert!(rendered.contains("Server1.Level=0"));
+        assert!(rendered.contains("Server1.Host=news.xsnews.nl"));
+        assert!(rendered.contains("Server1.Encryption=yes"));
+        assert!(rendered.contains("Server1.Port=563"));
+        assert!(rendered.contains("Server1.Username=reader"));
+        assert!(rendered.contains("Server1.Password=provider-secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn from_config_retries_nzbget_version_after_reload_gap() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            version_failures_remaining: Arc<Mutex<usize>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "version" {
+                let mut failures = state.version_failures_remaining.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({ "error": "reloading" })),
+                    )
+                        .into_response();
+                }
+            }
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": match method {
+                        "version" => json!("26.1"),
+                        _ => Value::Null,
+                    },
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            version_failures_remaining: Arc::new(Mutex::new(2)),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let client: NzbgetClient = NzbgetClient::from_config(
+            NzbgetDriverConfig {
+                username: Some("elixir".to_string()),
+                password: Some("secret".to_string()),
+                base_url: None,
+                runtime: NzbgetDriverRuntimeConfig::default(),
+            },
+            format!("http://127.0.0.1:{}", addr.port()),
+        )
+        .await?;
+
+        assert_eq!(client.version().await?, "26.1");
+        assert_eq!(
+            *state.version_failures_remaining.lock().unwrap(),
+            0,
+            "expected readiness retries to absorb the reload gap"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_preserves_persisted_server_inventory_for_live_nzbget() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            saved_updates: Arc<Mutex<Vec<(String, String)>>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                let updates = body
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut saved = state.saved_updates.lock().unwrap();
+                saved.clear();
+                for update in updates {
+                    let Some(name) = update.get("Name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = update.get("Value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    saved.push((name.to_string(), value.to_string()));
+                }
+                *state.config_items.lock().unwrap() = saved.clone();
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            saved_updates: Arc::new(Mutex::new(Vec::new())),
+            config_items: Arc::new(Mutex::new(vec![
+                ("Category1.Name".to_string(), "tv".to_string()),
+                ("Category1.DestDir".to_string(), "/downloads/tv".to_string()),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        let driver = DownloaderNzbDriver::new();
+        driver
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetPreferences {
+                        main_dir: Some("/config".to_string()),
+                        default_save_path: Some("/downloads".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        nzb_dir: Some("/runtime/nzb".to_string()),
+                        queue_dir: Some("/runtime/queue".to_string()),
+                        temp_dir: Some("/runtime/tmp".to_string()),
+                        script_dir: Some("/config/scripts".to_string()),
+                        log_file: Some("/config/nzbget.log".to_string()),
+                        web_dir: Some("/app/nzbget/webui".to_string()),
+                        config_template: Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
+                        use_incomplete: Some(true),
+                        server_connections: Some(32),
+                        article_retries: Some(4),
+                        article_timeout_seconds: Some(60),
+                        article_cache_mb: Some(384),
+                        direct_write: Some(true),
+                        write_buffer_kb: Some(2048),
+                        continue_partial: Some(true),
+                        par_check: Some("auto".to_string()),
+                        par_scan: Some("auto".to_string()),
+                        par_quick: Some(true),
+                        par_repair: Some(true),
+                        par_rename: Some(true),
+                        par_pause_queue: Some(true),
+                        par_threads: Some(4),
+                        unpack: Some(true),
+                        unpack_pause_queue: Some(true),
+                        download_rate_kib: Some(0),
+                    },
+                ),
+            )
+            .await?;
+
+        let saved = state.saved_updates.lock().unwrap().clone();
+        assert!(saved.contains(&("Server1.Active".to_string(), "yes".to_string())));
+        assert!(saved.contains(&("Server1.Name".to_string(), "XSNews".to_string())));
+        assert!(saved.contains(&("Server1.Host".to_string(), "news.xsnews.nl".to_string())));
+        assert!(saved.contains(&("Server1.Port".to_string(), "563".to_string())));
+        assert!(saved.contains(&("Server1.Username".to_string(), "reader".to_string())));
+        assert!(saved.contains(&(
+            "Server1.Password".to_string(),
+            "provider-secret".to_string()
+        )));
+        assert!(saved.contains(&("Server1.Connections".to_string(), "32".to_string())));
+        assert!(saved.contains(&("Category1.Name".to_string(), "tv".to_string())));
+        assert!(saved.contains(&("Category1.DestDir".to_string(), "/downloads/tv".to_string())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_set_categories_preserves_managed_paths_and_server_inventory() -> Result<()>
+    {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            saved_updates: Arc<Mutex<Vec<(String, String)>>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                let updates = body
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut saved = state.saved_updates.lock().unwrap();
+                saved.clear();
+                for update in updates {
+                    let Some(name) = update.get("Name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = update.get("Value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    saved.push((name.to_string(), value.to_string()));
+                }
+                *state.config_items.lock().unwrap() = saved.clone();
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            saved_updates: Arc::new(Mutex::new(Vec::new())),
+            config_items: Arc::new(Mutex::new(vec![
+                ("MainDir".to_string(), "/root/downloads".to_string()),
+                ("DestDir".to_string(), "/root/downloads/dst".to_string()),
+                ("NzbDir".to_string(), "/root/downloads/nzb".to_string()),
+                ("QueueDir".to_string(), "/root/downloads/queue".to_string()),
+                ("TempDir".to_string(), "/root/downloads/tmp".to_string()),
+                (
+                    "ScriptDir".to_string(),
+                    "/root/downloads/scripts".to_string(),
+                ),
+                (
+                    "LogFile".to_string(),
+                    "/root/downloads/nzbget.log".to_string(),
+                ),
+                (
+                    "LockFile".to_string(),
+                    "/root/downloads/nzbget.lock".to_string(),
+                ),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        let driver = DownloaderNzbDriver::new();
+        driver
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetCategories {
+                        categories: vec![
+                            DownloadCategorySpec {
+                                name: "tv".to_string(),
+                                save_path: Some("/downloads/tv".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "movies".to_string(),
+                                save_path: Some("/downloads/movies".to_string()),
+                            },
+                        ],
+                    },
+                ),
+            )
+            .await?;
+
+        let saved = state.saved_updates.lock().unwrap().clone();
+        assert!(saved.contains(&("MainDir".to_string(), "/config".to_string())));
+        assert!(saved.contains(&("DestDir".to_string(), "/downloads".to_string())));
+        assert!(saved.contains(&("LockFile".to_string(), "/config/nzbget.lock".to_string())));
+        assert!(saved.contains(&("Category1.Name".to_string(), "tv".to_string())));
+        assert!(saved.contains(&("Category1.DestDir".to_string(), "/downloads/tv".to_string())));
+        assert!(saved.contains(&("Category2.Name".to_string(), "movies".to_string())));
+        assert!(saved.contains(&(
+            "Category2.DestDir".to_string(),
+            "/downloads/movies".to_string()
+        )));
+        assert!(saved.contains(&("Server1.Host".to_string(), "news.xsnews.nl".to_string())));
+        assert!(saved.contains(&("Server1.Username".to_string(), "reader".to_string())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_waits_for_live_config_convergence_after_reload() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            saved_updates: Arc<Mutex<Vec<(String, String)>>>,
+            current_config_items: Arc<Mutex<Vec<(String, String)>>>,
+            pending_config_items: Arc<Mutex<Vec<(String, String)>>>,
+            stale_config_polls_remaining: Arc<Mutex<usize>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                let updates = body
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut saved = state.saved_updates.lock().unwrap();
+                saved.clear();
+                for update in updates {
+                    let Some(name) = update.get("Name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = update.get("Value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    saved.push((name.to_string(), value.to_string()));
+                }
+                *state.pending_config_items.lock().unwrap() = saved.clone();
+                *state.stale_config_polls_remaining.lock().unwrap() = 2;
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let mut remaining = state.stale_config_polls_remaining.lock().unwrap();
+                    if *remaining == 0 {
+                        let pending = state.pending_config_items.lock().unwrap().clone();
+                        *state.current_config_items.lock().unwrap() = pending;
+                    } else {
+                        *remaining -= 1;
+                    }
+                    let items = state
+                        .current_config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            saved_updates: Arc::new(Mutex::new(Vec::new())),
+            current_config_items: Arc::new(Mutex::new(vec![
+                ("MainDir".to_string(), "/config".to_string()),
+                ("DestDir".to_string(), "/downloads".to_string()),
+                ("InterDir".to_string(), "/runtime/incomplete".to_string()),
+                ("NzbDir".to_string(), "/runtime/nzb".to_string()),
+                ("QueueDir".to_string(), "/runtime/queue".to_string()),
+                ("TempDir".to_string(), "/runtime/tmp".to_string()),
+                ("Category1.Name".to_string(), "old-tv".to_string()),
+                (
+                    "Category1.DestDir".to_string(),
+                    "/downloads/old-tv".to_string(),
+                ),
+            ])),
+            pending_config_items: Arc::new(Mutex::new(Vec::new())),
+            stale_config_polls_remaining: Arc::new(Mutex::new(0)),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        let driver = DownloaderNzbDriver::new();
+        driver
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetCategories {
+                        categories: vec![
+                            DownloadCategorySpec {
+                                name: "tv".to_string(),
+                                save_path: Some("/downloads/tv".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "anime".to_string(),
+                                save_path: Some("/downloads/anime".to_string()),
+                            },
+                        ],
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *state.stale_config_polls_remaining.lock().unwrap(),
+            0,
+            "expected config convergence polling to wait through stale config reads"
+        );
+        let current = state.current_config_items.lock().unwrap().clone();
+        assert!(current.contains(&("Category1.Name".to_string(), "tv".to_string())));
+        assert!(current.contains(&("Category1.DestDir".to_string(), "/downloads/tv".to_string())));
+        assert!(current.contains(&("Category2.Name".to_string(), "anime".to_string())));
+        assert!(current.contains(&(
+            "Category2.DestDir".to_string(),
+            "/downloads/anime".to_string()
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_set_preferences_preserves_managed_defaults_on_live_nzbget() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            saved_updates: Arc<Mutex<Vec<(String, String)>>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                let updates = body
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut saved = state.saved_updates.lock().unwrap();
+                saved.clear();
+                for update in updates {
+                    let Some(name) = update.get("Name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = update.get("Value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    saved.push((name.to_string(), value.to_string()));
+                }
+                *state.config_items.lock().unwrap() = saved.clone();
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            saved_updates: Arc::new(Mutex::new(Vec::new())),
+            config_items: Arc::new(Mutex::new(vec![
+                ("DestDir".to_string(), "/downloads".to_string()),
+                ("InterDir".to_string(), "/runtime/incomplete".to_string()),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 20,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        let driver = DownloaderNzbDriver::new();
+        driver
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetPreferences {
+                        main_dir: None,
+                        default_save_path: Some("/downloads".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        nzb_dir: Some("/runtime/nzb".to_string()),
+                        queue_dir: Some("/runtime/queue".to_string()),
+                        temp_dir: Some("/runtime/tmp".to_string()),
+                        script_dir: None,
+                        log_file: None,
+                        web_dir: None,
+                        config_template: None,
+                        use_incomplete: Some(true),
+                        server_connections: Some(32),
+                        article_retries: None,
+                        article_timeout_seconds: None,
+                        article_cache_mb: None,
+                        direct_write: None,
+                        write_buffer_kb: None,
+                        continue_partial: None,
+                        par_check: None,
+                        par_scan: None,
+                        par_quick: None,
+                        par_repair: None,
+                        par_rename: None,
+                        par_pause_queue: None,
+                        par_threads: None,
+                        unpack: None,
+                        unpack_pause_queue: None,
+                        download_rate_kib: None,
+                    },
+                ),
+            )
+            .await?;
+
+        let saved = state.saved_updates.lock().unwrap().clone();
+        assert!(saved.contains(&("MainDir".to_string(), "/config".to_string())));
+        assert!(saved.contains(&("ScriptDir".to_string(), "/config/scripts".to_string())));
+        assert!(saved.contains(&("LogFile".to_string(), "/config/nzbget.log".to_string())));
+        assert!(saved.contains(&("LockFile".to_string(), "/config/nzbget.lock".to_string())));
+        assert!(saved.contains(&("Category1.Name".to_string(), "tv".to_string())));
+        assert!(saved.contains(&("Category2.Name".to_string(), "anime".to_string())));
+        assert!(saved.contains(&("Category3.Name".to_string(), "movies".to_string())));
         Ok(())
     }
 }

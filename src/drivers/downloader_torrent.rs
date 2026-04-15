@@ -703,7 +703,7 @@ async fn lookup_qbittorrent_temporary_password(instance_id: Uuid) -> Result<Opti
     if let Some(password) = extract_qbittorrent_temporary_password(&logs_output.combined()) {
         return Ok(Some(password));
     }
-    lookup_qbittorrent_temporary_password_from_mount(&container_name).await
+    lookup_qbittorrent_temporary_password_from_container(&container_name).await
 }
 
 #[derive(Debug)]
@@ -731,10 +731,18 @@ async fn run_docker_command(args: &[&str]) -> Result<DockerCommandOutput> {
         .await
         .with_context(|| format!("running docker {}", args.join(" ")))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
         bail!(
-            "docker {} failed with status {:?}",
+            "docker {} failed with status {:?}: {}",
             args.join(" "),
-            output.status.code()
+            output.status.code(),
+            detail
         );
     }
     Ok(DockerCommandOutput {
@@ -766,26 +774,25 @@ async fn reset_qbittorrent_webui_auth(instance_id: Uuid) -> Result<()> {
     // Stop first so qBittorrent does not overwrite config on shutdown after we patch it.
     let _ = run_docker_command(&["stop", &container_name]).await;
 
-    let config_root = match find_container_config_root(&container_name).await? {
-        Some(path) => path,
-        None => {
+    let config_path = "/config/qBittorrent/qBittorrent.conf";
+    let content = match read_docker_container_text_file(&container_name, config_path).await {
+        Ok(Some(content)) => content,
+        Ok(None) => {
             let _ = run_docker_command(&["start", &container_name]).await;
-            bail!("qbittorrent /config mount not found for recovery");
+            bail!("qbittorrent config file not found for recovery");
         }
-    };
-    let config_path = config_root.join("qBittorrent").join("qBittorrent.conf");
-    let content = match fs::read_to_string(&config_path).await {
-        Ok(content) => content,
         Err(err) => {
             let _ = run_docker_command(&["start", &container_name]).await;
-            return Err(err).with_context(|| format!("reading {}", config_path.display()));
+            return Err(err).with_context(|| format!("reading {}", config_path));
         }
     };
     let (rewritten, changed) = strip_qbittorrent_webui_auth_fields(&content);
     if changed {
-        if let Err(err) = fs::write(&config_path, rewritten).await {
+        if let Err(err) =
+            write_docker_container_text_file(&container_name, config_path, &rewritten).await
+        {
             let _ = run_docker_command(&["start", &container_name]).await;
-            return Err(err).with_context(|| format!("writing {}", config_path.display()));
+            return Err(err).with_context(|| format!("writing {}", config_path));
         }
     }
 
@@ -793,27 +800,18 @@ async fn reset_qbittorrent_webui_auth(instance_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn lookup_qbittorrent_temporary_password_from_mount(
+async fn lookup_qbittorrent_temporary_password_from_container(
     container_name: &str,
 ) -> Result<Option<String>> {
-    let Some(config_root) = find_container_config_root(container_name).await? else {
-        return Ok(None);
-    };
     let candidates = [
-        config_root
-            .join("qBittorrent")
-            .join("logs")
-            .join("qbittorrent.log"),
-        config_root
-            .join("qBittorrent")
-            .join("logs")
-            .join("qBittorrent.log"),
+        "/config/qBittorrent/logs/qbittorrent.log",
+        "/config/qBittorrent/logs/qBittorrent.log",
     ];
     for path in candidates {
-        let content = match fs::read_to_string(&path).await {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        let content = match read_docker_container_text_file(container_name, path).await {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path)),
         };
         if let Some(password) = extract_qbittorrent_temporary_password(&content) {
             return Ok(Some(password));
@@ -822,19 +820,72 @@ async fn lookup_qbittorrent_temporary_password_from_mount(
     Ok(None)
 }
 
-async fn find_container_config_root(container_name: &str) -> Result<Option<std::path::PathBuf>> {
-    let inspect_output = run_docker_command(&[
-        "inspect",
-        "--format",
-        "{{range .Mounts}}{{if eq .Destination \"/config\"}}{{.Source}}{{end}}{{end}}",
-        container_name,
+async fn read_docker_container_text_file(
+    container_name: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let temp_root = std::env::temp_dir().join(format!("elixir-qbt-copy-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_root)
+        .await
+        .with_context(|| format!("creating temp dir {}", temp_root.display()))?;
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("copied");
+    let temp_path = temp_root.join(filename);
+
+    let result = run_docker_command(&[
+        "cp",
+        &format!("{container_name}:{path}"),
+        &temp_path.to_string_lossy(),
     ])
-    .await?;
-    let config_root = inspect_output.stdout.trim();
-    if config_root.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(std::path::PathBuf::from(config_root)))
+    .await;
+    let content = match result {
+        Ok(_) => Some(
+            fs::read_to_string(&temp_path)
+                .await
+                .with_context(|| format!("reading {}", temp_path.display()))?,
+        ),
+        Err(err) if docker_cp_missing_file(&err) => None,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&temp_root).await;
+            return Err(err);
+        }
+    };
+    let _ = fs::remove_dir_all(&temp_root).await;
+    Ok(content)
+}
+
+async fn write_docker_container_text_file(
+    container_name: &str,
+    path: &str,
+    content: &str,
+) -> Result<()> {
+    let temp_root = std::env::temp_dir().join(format!("elixir-qbt-write-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_root)
+        .await
+        .with_context(|| format!("creating temp dir {}", temp_root.display()))?;
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("copied");
+    let temp_path = temp_root.join(filename);
+    fs::write(&temp_path, content)
+        .await
+        .with_context(|| format!("writing {}", temp_path.display()))?;
+    let result = run_docker_command(&[
+        "cp",
+        &temp_path.to_string_lossy(),
+        &format!("{container_name}:{path}"),
+    ])
+    .await;
+    let _ = fs::remove_dir_all(&temp_root).await;
+    result.map(|_| ())
+}
+
+fn docker_cp_missing_file(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("could not find the file") || lower.contains("no such file or directory")
 }
 
 async fn find_container_name_for_instance(instance_id: Uuid) -> Result<Option<String>> {

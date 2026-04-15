@@ -35,6 +35,15 @@ pub async fn read_manifest_from_dir(dir: &Path) -> Result<PackageManifest> {
     })
 }
 
+pub async fn write_manifest_to_dir(dir: &Path, raw_json: &serde_json::Value) -> Result<PathBuf> {
+    let manifest_path = resolve_manifest_path(dir).unwrap_or_else(|_| dir.join("manifest.yaml"));
+    let yaml = serde_yaml::to_string(raw_json).context("serializing repaired manifest yaml")?;
+    fs::write(&manifest_path, yaml)
+        .await
+        .with_context(|| format!("writing manifest at {}", manifest_path.display()))?;
+    Ok(manifest_path)
+}
+
 pub async fn unpack_package(package_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     if package_path.is_dir() {
         return Ok(package_path.to_path_buf());
