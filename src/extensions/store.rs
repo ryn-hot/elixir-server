@@ -114,6 +114,110 @@ pub struct ManagedIngestIntent {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewManagedLibraryProvenance {
+    pub media_item_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub intent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedLibraryProvenance {
+    pub media_item_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub intent_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManagedMediaTombstone {
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Option<Uuid>,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedMediaTombstone {
+    pub tombstone_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Option<Uuid>,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub action: String,
+    pub active: bool,
+    pub cleared_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManagedEpisodeTombstone {
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Option<Uuid>,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub absolute_episode_number: Option<i32>,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedEpisodeTombstone {
+    pub tombstone_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub title: String,
+    pub normalized_title: String,
+    pub year: Option<i32>,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Option<Uuid>,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub absolute_episode_number: Option<i32>,
+    pub action: String,
+    pub active: bool,
+    pub cleared_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewSecret {
     pub secret_id: Uuid,
     pub scope: SecretScope,
@@ -892,6 +996,461 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn upsert_managed_library_provenance(
+        &self,
+        data: &NewManagedLibraryProvenance,
+    ) -> Result<()> {
+        let external_ids_json = match data.external_ids.as_ref() {
+            Some(ids) => Some(
+                serde_json::to_value(ids)
+                    .context("serializing managed library provenance external ids")?,
+            ),
+            None => None,
+        };
+        let external_ids_json = json_to_string(external_ids_json.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_library_provenance (
+                media_item_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                external_ids_json,
+                manager_provider_id,
+                manager_item_id,
+                manager_label,
+                manager_implementation,
+                intent_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(media_item_id) DO UPDATE SET
+                media_type = excluded.media_type,
+                title = excluded.title,
+                normalized_title = excluded.normalized_title,
+                year = excluded.year,
+                external_ids_json = COALESCE(excluded.external_ids_json, managed_library_provenance.external_ids_json),
+                manager_provider_id = excluded.manager_provider_id,
+                manager_item_id = excluded.manager_item_id,
+                manager_label = excluded.manager_label,
+                manager_implementation = excluded.manager_implementation,
+                intent_id = excluded.intent_id,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.media_item_id.to_string())
+        .bind(data.media_type.as_str())
+        .bind(&data.title)
+        .bind(&data.normalized_title)
+        .bind(data.year)
+        .bind(external_ids_json.as_deref())
+        .bind(data.manager_provider_id.to_string())
+        .bind(data.manager_item_id.as_deref())
+        .bind(data.manager_label.as_deref())
+        .bind(data.manager_implementation.as_deref())
+        .bind(data.intent_id.map(|value| value.to_string()))
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_managed_library_provenance(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Option<ManagedLibraryProvenance>> {
+        let row = sqlx::query(
+            "SELECT
+                media_item_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                manager_provider_id,
+                CAST(manager_item_id AS TEXT) AS manager_item_id,
+                CAST(manager_label AS TEXT) AS manager_label,
+                CAST(manager_implementation AS TEXT) AS manager_implementation,
+                CAST(intent_id AS TEXT) AS intent_id,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM managed_library_provenance
+             WHERE media_item_id = ?
+             LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| map_managed_library_provenance(&row))
+            .transpose()
+    }
+
+    pub async fn upsert_managed_media_tombstone(
+        &self,
+        data: &NewManagedMediaTombstone,
+    ) -> Result<Uuid> {
+        let external_ids_json = match data.external_ids.as_ref() {
+            Some(ids) => {
+                Some(serde_json::to_value(ids).context("serializing managed media tombstone ids")?)
+            }
+            None => None,
+        };
+        let external_ids_json = json_to_string(external_ids_json.as_ref())?;
+
+        let existing_tombstone_id = if let (Some(provider_id), Some(manager_item_id)) =
+            (data.manager_provider_id, data.manager_item_id.as_deref())
+        {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_media_tombstones
+                 WHERE active = 1
+                   AND manager_provider_id = ?
+                   AND manager_item_id = ?
+                 LIMIT 1",
+            )
+            .bind(provider_id.to_string())
+            .bind(manager_item_id)
+            .fetch_optional(self.pool)
+            .await?
+        } else if let Some(year) = data.year {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_media_tombstones
+                 WHERE active = 1
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year = ?
+                 LIMIT 1",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .bind(year)
+            .fetch_optional(self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_media_tombstones
+                 WHERE active = 1
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year IS NULL
+                 LIMIT 1",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .fetch_optional(self.pool)
+            .await?
+        };
+
+        if let Some(existing_tombstone_id) = existing_tombstone_id {
+            sqlx::query::<sqlx::Any>(
+                "UPDATE managed_media_tombstones
+                 SET media_type = ?,
+                     title = ?,
+                     normalized_title = ?,
+                     year = ?,
+                     external_ids_json = COALESCE(?, external_ids_json),
+                     manager_provider_id = ?,
+                     manager_item_id = ?,
+                     manager_label = ?,
+                     manager_implementation = ?,
+                     action = ?,
+                     active = 1,
+                     cleared_at = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE tombstone_id = ?",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.title)
+            .bind(&data.normalized_title)
+            .bind(data.year)
+            .bind(external_ids_json.as_deref())
+            .bind(data.manager_provider_id.map(|value| value.to_string()))
+            .bind(data.manager_item_id.as_deref())
+            .bind(data.manager_label.as_deref())
+            .bind(data.manager_implementation.as_deref())
+            .bind(&data.action)
+            .bind(&existing_tombstone_id)
+            .execute(self.pool)
+            .await?;
+            return parse_uuid(
+                &existing_tombstone_id,
+                "managed_media_tombstones.tombstone_id",
+            );
+        }
+
+        let tombstone_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_media_tombstones (
+                tombstone_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                external_ids_json,
+                manager_provider_id,
+                manager_item_id,
+                manager_label,
+                manager_implementation,
+                action,
+                active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(tombstone_id.to_string())
+        .bind(data.media_type.as_str())
+        .bind(&data.title)
+        .bind(&data.normalized_title)
+        .bind(data.year)
+        .bind(external_ids_json.as_deref())
+        .bind(data.manager_provider_id.map(|value| value.to_string()))
+        .bind(data.manager_item_id.as_deref())
+        .bind(data.manager_label.as_deref())
+        .bind(data.manager_implementation.as_deref())
+        .bind(&data.action)
+        .execute(self.pool)
+        .await?;
+        Ok(tombstone_id)
+    }
+
+    pub async fn list_active_managed_media_tombstones(&self) -> Result<Vec<ManagedMediaTombstone>> {
+        let rows = sqlx::query(
+            "SELECT
+                tombstone_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(manager_provider_id AS TEXT) AS manager_provider_id,
+                CAST(manager_item_id AS TEXT) AS manager_item_id,
+                CAST(manager_label AS TEXT) AS manager_label,
+                CAST(manager_implementation AS TEXT) AS manager_implementation,
+                action,
+                CAST(active AS INTEGER) AS active,
+                CAST(cleared_at AS TEXT) AS cleared_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM managed_media_tombstones
+             WHERE active = 1
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_managed_media_tombstone(&row)?);
+        }
+        Ok(items)
+    }
+
+    pub async fn deactivate_managed_media_tombstone(&self, tombstone_id: Uuid) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_media_tombstones
+             SET active = 0,
+                 cleared_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE tombstone_id = ?",
+        )
+        .bind(tombstone_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_managed_episode_tombstone(
+        &self,
+        data: &NewManagedEpisodeTombstone,
+    ) -> Result<Uuid> {
+        let external_ids_json = match data.external_ids.as_ref() {
+            Some(ids) => Some(
+                serde_json::to_value(ids)
+                    .context("serializing managed episode tombstone external ids")?,
+            ),
+            None => None,
+        };
+        let external_ids_json = json_to_string(external_ids_json.as_ref())?;
+
+        let existing_tombstone_id = if let (Some(provider_id), Some(manager_item_id)) =
+            (data.manager_provider_id, data.manager_item_id.as_deref())
+        {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_episode_tombstones
+                 WHERE active = 1
+                   AND manager_provider_id = ?
+                   AND manager_item_id = ?
+                   AND season_number = ?
+                   AND episode_number = ?
+                 LIMIT 1",
+            )
+            .bind(provider_id.to_string())
+            .bind(manager_item_id)
+            .bind(data.season_number)
+            .bind(data.episode_number)
+            .fetch_optional(self.pool)
+            .await?
+        } else if let Some(year) = data.year {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_episode_tombstones
+                 WHERE active = 1
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year = ?
+                   AND season_number = ?
+                   AND episode_number = ?
+                 LIMIT 1",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .bind(year)
+            .bind(data.season_number)
+            .bind(data.episode_number)
+            .fetch_optional(self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT tombstone_id FROM managed_episode_tombstones
+                 WHERE active = 1
+                   AND media_type = ?
+                   AND normalized_title = ?
+                   AND year IS NULL
+                   AND season_number = ?
+                   AND episode_number = ?
+                 LIMIT 1",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.normalized_title)
+            .bind(data.season_number)
+            .bind(data.episode_number)
+            .fetch_optional(self.pool)
+            .await?
+        };
+
+        if let Some(existing_tombstone_id) = existing_tombstone_id {
+            sqlx::query::<sqlx::Any>(
+                "UPDATE managed_episode_tombstones
+                 SET media_type = ?,
+                     title = ?,
+                     normalized_title = ?,
+                     year = ?,
+                     external_ids_json = COALESCE(?, external_ids_json),
+                     manager_provider_id = ?,
+                     manager_item_id = ?,
+                     manager_label = ?,
+                     manager_implementation = ?,
+                     season_number = ?,
+                     episode_number = ?,
+                     absolute_episode_number = COALESCE(?, absolute_episode_number),
+                     action = ?,
+                     active = 1,
+                     cleared_at = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE tombstone_id = ?",
+            )
+            .bind(data.media_type.as_str())
+            .bind(&data.title)
+            .bind(&data.normalized_title)
+            .bind(data.year)
+            .bind(external_ids_json.as_deref())
+            .bind(data.manager_provider_id.map(|value| value.to_string()))
+            .bind(data.manager_item_id.as_deref())
+            .bind(data.manager_label.as_deref())
+            .bind(data.manager_implementation.as_deref())
+            .bind(data.season_number)
+            .bind(data.episode_number)
+            .bind(data.absolute_episode_number)
+            .bind(&data.action)
+            .bind(&existing_tombstone_id)
+            .execute(self.pool)
+            .await?;
+            return parse_uuid(
+                &existing_tombstone_id,
+                "managed_episode_tombstones.tombstone_id",
+            );
+        }
+
+        let tombstone_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_episode_tombstones (
+                tombstone_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                external_ids_json,
+                manager_provider_id,
+                manager_item_id,
+                manager_label,
+                manager_implementation,
+                season_number,
+                episode_number,
+                absolute_episode_number,
+                action,
+                active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(tombstone_id.to_string())
+        .bind(data.media_type.as_str())
+        .bind(&data.title)
+        .bind(&data.normalized_title)
+        .bind(data.year)
+        .bind(external_ids_json.as_deref())
+        .bind(data.manager_provider_id.map(|value| value.to_string()))
+        .bind(data.manager_item_id.as_deref())
+        .bind(data.manager_label.as_deref())
+        .bind(data.manager_implementation.as_deref())
+        .bind(data.season_number)
+        .bind(data.episode_number)
+        .bind(data.absolute_episode_number)
+        .bind(&data.action)
+        .execute(self.pool)
+        .await?;
+        Ok(tombstone_id)
+    }
+
+    pub async fn list_active_managed_episode_tombstones(
+        &self,
+    ) -> Result<Vec<ManagedEpisodeTombstone>> {
+        let rows = sqlx::query(
+            "SELECT
+                tombstone_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(manager_provider_id AS TEXT) AS manager_provider_id,
+                CAST(manager_item_id AS TEXT) AS manager_item_id,
+                CAST(manager_label AS TEXT) AS manager_label,
+                CAST(manager_implementation AS TEXT) AS manager_implementation,
+                season_number,
+                episode_number,
+                absolute_episode_number,
+                action,
+                CAST(active AS INTEGER) AS active,
+                CAST(cleared_at AS TEXT) AS cleared_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM managed_episode_tombstones
+             WHERE active = 1
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_managed_episode_tombstone(&row)?);
+        }
+        Ok(items)
+    }
+
+    pub async fn deactivate_managed_episode_tombstone(&self, tombstone_id: Uuid) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_episode_tombstones
+             SET active = 0,
+                 cleared_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE tombstone_id = ?",
+        )
+        .bind(tombstone_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn upsert_secret(&self, data: &NewSecret) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO secrets (secret_id, scope, scope_id, key, value_encrypted, rotatable) VALUES (?, ?, ?, ?, ?, ?) \n             ON CONFLICT(scope, scope_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, rotatable = excluded.rotatable",
@@ -1642,6 +2201,159 @@ fn map_managed_ingest_intent(row: &AnyRow) -> Result<ManagedIngestIntent> {
         created_at: parse_datetime(&created_at_raw, "managed_ingest_intents.created_at")?,
         updated_at: parse_datetime(&updated_at_raw, "managed_ingest_intents.updated_at")?,
     })
+}
+
+fn map_managed_library_provenance(row: &AnyRow) -> Result<ManagedLibraryProvenance> {
+    let media_item_id_raw: String = row.try_get("media_item_id")?;
+    let media_type_raw: String = row.try_get("media_type")?;
+    let external_ids_json = parse_json_opt(
+        row_get_opt_string(row, "external_ids_json")?,
+        "managed_library_provenance.external_ids_json",
+    )?;
+    let external_ids_json = external_ids_json
+        .map(serde_json::from_value::<ExternalIds>)
+        .transpose()
+        .context("parsing managed library provenance external ids")?;
+    let manager_provider_id_raw: String = row.try_get("manager_provider_id")?;
+    let intent_id_raw: Option<String> = row.try_get("intent_id").ok().flatten();
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(ManagedLibraryProvenance {
+        media_item_id: parse_uuid(
+            &media_item_id_raw,
+            "managed_library_provenance.media_item_id",
+        )?,
+        media_type: parse_media_type(&media_type_raw, "managed_library_provenance.media_type")?,
+        title: row.try_get("title")?,
+        normalized_title: row.try_get("normalized_title")?,
+        year: row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+        external_ids: external_ids_json,
+        manager_provider_id: parse_uuid(
+            &manager_provider_id_raw,
+            "managed_library_provenance.manager_provider_id",
+        )?,
+        manager_item_id: row.try_get("manager_item_id").ok().flatten(),
+        manager_label: row.try_get("manager_label").ok().flatten(),
+        manager_implementation: row.try_get("manager_implementation").ok().flatten(),
+        intent_id: intent_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "managed_library_provenance.intent_id"))
+            .transpose()?,
+        created_at: parse_datetime(&created_at_raw, "managed_library_provenance.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "managed_library_provenance.updated_at")?,
+    })
+}
+
+fn map_managed_media_tombstone(row: &AnyRow) -> Result<ManagedMediaTombstone> {
+    let tombstone_id_raw: String = row.try_get("tombstone_id")?;
+    let media_type_raw: String = row.try_get("media_type")?;
+    let external_ids_json = parse_json_opt(
+        row_get_opt_string(row, "external_ids_json")?,
+        "managed_media_tombstones.external_ids_json",
+    )?;
+    let external_ids_json = external_ids_json
+        .map(serde_json::from_value::<ExternalIds>)
+        .transpose()
+        .context("parsing managed media tombstone external ids")?;
+    let manager_provider_id_raw: Option<String> = row.try_get("manager_provider_id").ok().flatten();
+    let cleared_at_raw: Option<String> = row.try_get("cleared_at").ok().flatten();
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(ManagedMediaTombstone {
+        tombstone_id: parse_uuid(&tombstone_id_raw, "managed_media_tombstones.tombstone_id")?,
+        media_type: parse_media_type(&media_type_raw, "managed_media_tombstones.media_type")?,
+        title: row.try_get("title")?,
+        normalized_title: row.try_get("normalized_title")?,
+        year: row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+        external_ids: external_ids_json,
+        manager_provider_id: manager_provider_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "managed_media_tombstones.manager_provider_id"))
+            .transpose()?,
+        manager_item_id: row.try_get("manager_item_id").ok().flatten(),
+        manager_label: row.try_get("manager_label").ok().flatten(),
+        manager_implementation: row.try_get("manager_implementation").ok().flatten(),
+        action: row.try_get("action")?,
+        active: row
+            .try_get::<i64, _>("active")
+            .ok()
+            .map(|value| value != 0)
+            .unwrap_or(false),
+        cleared_at: cleared_at_raw
+            .as_deref()
+            .map(|value| parse_datetime(value, "managed_media_tombstones.cleared_at"))
+            .transpose()?,
+        created_at: parse_datetime(&created_at_raw, "managed_media_tombstones.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "managed_media_tombstones.updated_at")?,
+    })
+}
+
+fn map_managed_episode_tombstone(row: &AnyRow) -> Result<ManagedEpisodeTombstone> {
+    let tombstone_id_raw: String = row.try_get("tombstone_id")?;
+    let media_type_raw: String = row.try_get("media_type")?;
+    let external_ids_json = parse_json_opt(
+        row_get_opt_string(row, "external_ids_json")?,
+        "managed_episode_tombstones.external_ids_json",
+    )?;
+    let external_ids_json = external_ids_json
+        .map(serde_json::from_value::<ExternalIds>)
+        .transpose()
+        .context("parsing managed episode tombstone external ids")?;
+    let manager_provider_id_raw: Option<String> = row.try_get("manager_provider_id").ok().flatten();
+    let cleared_at_raw: Option<String> = row.try_get("cleared_at").ok().flatten();
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(ManagedEpisodeTombstone {
+        tombstone_id: parse_uuid(&tombstone_id_raw, "managed_episode_tombstones.tombstone_id")?,
+        media_type: parse_media_type(&media_type_raw, "managed_episode_tombstones.media_type")?,
+        title: row.try_get("title")?,
+        normalized_title: row.try_get("normalized_title")?,
+        year: row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+        external_ids: external_ids_json,
+        manager_provider_id: manager_provider_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "managed_episode_tombstones.manager_provider_id"))
+            .transpose()?,
+        manager_item_id: row.try_get("manager_item_id").ok().flatten(),
+        manager_label: row.try_get("manager_label").ok().flatten(),
+        manager_implementation: row.try_get("manager_implementation").ok().flatten(),
+        season_number: row
+            .try_get::<i64, _>("season_number")
+            .ok()
+            .unwrap_or_default() as i32,
+        episode_number: row
+            .try_get::<i64, _>("episode_number")
+            .ok()
+            .unwrap_or_default() as i32,
+        absolute_episode_number: row
+            .try_get::<i64, _>("absolute_episode_number")
+            .ok()
+            .map(|value| value as i32),
+        action: row.try_get("action")?,
+        active: row
+            .try_get::<i64, _>("active")
+            .ok()
+            .map(|value| value != 0)
+            .unwrap_or(false),
+        cleared_at: cleared_at_raw
+            .as_deref()
+            .map(|value| parse_datetime(value, "managed_episode_tombstones.cleared_at"))
+            .transpose()?,
+        created_at: parse_datetime(&created_at_raw, "managed_episode_tombstones.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "managed_episode_tombstones.updated_at")?,
+    })
+}
+
+fn parse_media_type(raw: &str, field: &str) -> Result<crate::db::models::MediaType> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "movie" => Ok(crate::db::models::MediaType::Movie),
+        "series" => Ok(crate::db::models::MediaType::Series),
+        "anime" => Ok(crate::db::models::MediaType::Anime),
+        _ => anyhow::bail!("invalid enum value '{}' for field {}", raw, field),
+    }
 }
 
 fn map_run(row: &AnyRow) -> Result<OrchestratorRun> {

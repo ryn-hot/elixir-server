@@ -593,12 +593,18 @@ pub struct ManifestControlOwnedSetting {
     pub required: bool,
     #[serde(default)]
     pub secret: bool,
+    #[serde(default = "default_control_owned_setting_ownership")]
+    pub ownership: String,
     pub storage: ManifestControlStorage,
     #[serde(default)]
     pub options: Vec<ManifestControlOption>,
 }
 
 impl ManifestControlOwnedSetting {
+    pub fn ownership_mode(&self) -> &str {
+        self.ownership.trim()
+    }
+
     fn validate(&self) -> Result<()> {
         ensure_non_empty(&self.id, "control_surface.owned_settings.id")?;
         ensure_non_empty(&self.label, "control_surface.owned_settings.label")?;
@@ -614,6 +620,13 @@ impl ManifestControlOwnedSetting {
         }
         if let Some(description) = self.description.as_deref() {
             ensure_non_empty(description, "control_surface.owned_settings.description")?;
+        }
+        let ownership = self.ownership.trim().to_ascii_lowercase();
+        if !matches!(ownership.as_str(), "seeded" | "managed") {
+            bail!(
+                "unsupported control_surface.owned_settings.ownership '{}'; expected seeded|managed",
+                self.ownership
+            );
         }
         if field_type == "password" && !self.secret {
             bail!(
@@ -1044,6 +1057,10 @@ fn default_slot() -> String {
 
 fn default_control_surface_adapter() -> String {
     "generic_v1".to_string()
+}
+
+fn default_control_owned_setting_ownership() -> String {
+    "managed".to_string()
 }
 
 fn default_control_action_target() -> String {

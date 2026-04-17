@@ -50,7 +50,8 @@ use crate::{
     extensions::package::compute_sha256,
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
-        NewManagedIngestIntent, NewOrchestratorRun, NewProvider, NewSecret,
+        NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedMediaTombstone,
+        NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
@@ -207,6 +208,166 @@ async fn setup_extension_instance(
     Ok((app, instance_id))
 }
 
+async fn setup_generic_control_surface_extension_with_id(
+    extension_id: &str,
+) -> Result<(Router, AppState, Uuid)> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&state.db_pool);
+
+    let manifest = json!({
+        "id": extension_id,
+        "version": "0.1.0",
+        "kind": "module",
+        "name": "Generic Control Module",
+        "provides": [
+            {
+                "capability": "service.generic",
+                "slot": "default",
+                "implementation": "generic_control"
+            }
+        ],
+        "runtime": {
+            "type": "internal"
+        },
+        "control_surface": {
+            "adapter": "generic_v1",
+            "owned_settings": [
+                {
+                    "id": "mode",
+                    "label": "Mode",
+                    "type": "select",
+                    "ownership": "seeded",
+                    "storage": {
+                        "type": "extension_setting",
+                        "key": "mode"
+                    },
+                    "options": [
+                        {
+                            "value": "balanced",
+                            "label": "Balanced"
+                        },
+                        {
+                            "value": "aggressive",
+                            "label": "Aggressive"
+                        }
+                    ]
+                },
+                {
+                    "id": "refreshInterval",
+                    "label": "Refresh interval",
+                    "type": "number",
+                    "ownership": "managed",
+                    "storage": {
+                        "type": "instance_setting",
+                        "key": "refresh_interval"
+                    }
+                },
+                {
+                    "id": "apiKey",
+                    "label": "API key",
+                    "type": "password",
+                    "secret": true,
+                    "ownership": "managed",
+                    "storage": {
+                        "type": "instance_secret",
+                        "key": "community_api_key"
+                    }
+                }
+            ],
+            "observed_state": [
+                {
+                    "id": "status",
+                    "label": "Status"
+                }
+            ],
+            "actions": [
+                {
+                    "id": "sync_now",
+                    "label": "Sync now",
+                    "target": "service",
+                    "kind": "primary"
+                }
+            ],
+            "native_only": [
+                {
+                    "id": "advanced_filters",
+                    "title": "Advanced filters",
+                    "description": "Managed only in the extension's native UI."
+                }
+            ]
+        }
+    });
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: "Generic Control Module".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: manifest,
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "refresh_interval": 30
+            })),
+            enabled: true,
+        })
+        .await?;
+
+    let mode_key = format!("control_surface:{extension_id}:mode");
+    store
+        .upsert_extension_setting(&mode_key, &json!("aggressive"))
+        .await?;
+
+    let encrypted = state.secrets.encrypt("initial-secret")?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "community_api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await?;
+
+    Ok((app, state, instance_id))
+}
+
+async fn setup_generic_control_surface_extension() -> Result<(Router, AppState, Uuid)> {
+    setup_generic_control_surface_extension_with_id("elixir.modules.generic_control").await
+}
+
 struct TestPackage {
     path: PathBuf,
     hash: String,
@@ -259,6 +420,240 @@ async fn build_signed_package(temp_dir: &std::path::Path) -> Result<TestPackage>
         extension_id,
         version,
     })
+}
+
+#[tokio::test]
+async fn extension_control_surface_renders_generic_manifest_contract_sections() -> Result<()> {
+    let (app, _state, _instance_id) = setup_generic_control_surface_extension().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.generic_control/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    let seeded_section = control_surface_section(&payload, "ownedSettingsSeeded");
+    assert_eq!(
+        seeded_section
+            .get("policy")
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str),
+        Some("seeded")
+    );
+    assert_eq!(
+        seeded_section
+            .get("fields")
+            .and_then(Value::as_array)
+            .and_then(|fields| fields.first())
+            .and_then(|field| field.get("id"))
+            .and_then(Value::as_str),
+        Some("mode")
+    );
+
+    let managed_section = control_surface_section(&payload, "ownedSettingsManaged");
+    assert_eq!(
+        managed_section
+            .get("policy")
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str),
+        Some("managed")
+    );
+    let managed_fields = managed_section
+        .get("fields")
+        .and_then(Value::as_array)
+        .expect("managed fields");
+    assert!(
+        managed_fields
+            .iter()
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
+                    && field.get("value").and_then(Value::as_i64) == Some(30)
+            )
+    );
+    assert!(
+        managed_fields
+            .iter()
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
+                    && field.get("secret").and_then(Value::as_bool) == Some(true)
+                    && field.get("value").and_then(Value::as_str) == Some("saved")
+            )
+    );
+
+    let native_only = control_surface_section(&payload, "nativeOnly");
+    assert_eq!(
+        native_only
+            .get("notices")
+            .and_then(Value::as_array)
+            .and_then(|notices| notices.first())
+            .and_then(|notice| notice.get("code"))
+            .and_then(Value::as_str),
+        Some("native_only")
+    );
+
+    let runtime_bridge = control_surface_section(&payload, "runtimeBridge");
+    assert_eq!(
+        runtime_bridge
+            .get("policy")
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str),
+        Some("observed")
+    );
+    assert!(
+        runtime_bridge
+            .get("notices")
+            .and_then(Value::as_array)
+            .map(|notices| !notices.is_empty())
+            .unwrap_or(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_updates_generic_manifest_owned_settings() -> Result<()> {
+    let (app, state, instance_id) = setup_generic_control_surface_extension().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.generic_control/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "values": {
+                            "mode": "balanced",
+                            "refreshInterval": 45,
+                            "apiKey": "updated-secret"
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let managed_section = control_surface_section(&payload, "ownedSettingsManaged");
+    let managed_fields = managed_section
+        .get("fields")
+        .and_then(Value::as_array)
+        .expect("managed fields");
+    assert!(
+        managed_fields
+            .iter()
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
+                    && field.get("value").and_then(Value::as_i64) == Some(45)
+            )
+    );
+    assert!(
+        managed_fields
+            .iter()
+            .any(
+                |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
+                    && field.get("value").and_then(Value::as_str) == Some("saved")
+            )
+    );
+
+    let seeded_section = control_surface_section(&payload, "ownedSettingsSeeded");
+    assert_eq!(
+        seeded_section
+            .get("fields")
+            .and_then(Value::as_array)
+            .and_then(|fields| fields.first())
+            .and_then(|field| field.get("value"))
+            .and_then(Value::as_str),
+        Some("balanced")
+    );
+
+    let store = ExtensionStore::new(&state.db_pool);
+    assert_eq!(
+        store
+            .get_extension_setting("control_surface:elixir.modules.generic_control:mode")
+            .await?,
+        Some(json!("balanced"))
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("instance should exist");
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|value| value.get("refresh_interval"))
+            .and_then(Value::as_i64),
+        Some(45)
+    );
+
+    let secret = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance_id),
+            "community_api_key",
+        )
+        .await?
+        .expect("secret should exist");
+    assert_eq!(
+        state.secrets.decrypt(&secret.value_encrypted)?,
+        "updated-secret".to_string()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_does_not_route_generic_manifest_by_extension_id_substring()
+-> Result<()> {
+    let extension_id = "elixir.modules.sonarr_helper";
+    let (app, _state, _instance_id) =
+        setup_generic_control_surface_extension_with_id(extension_id).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/extensions/{extension_id}/control-surface"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let sections = payload
+        .get("sections")
+        .and_then(Value::as_array)
+        .expect("control surface sections");
+
+    assert!(
+        sections
+            .iter()
+            .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsSeeded"))
+    );
+    assert!(
+        sections.iter().any(
+            |section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsManaged")
+        )
+    );
+    assert!(
+        !sections
+            .iter()
+            .any(|section| section.get("id").and_then(Value::as_str) == Some("defaults"))
+    );
+    assert!(!sections.iter().any(|section| {
+        section.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
+    }));
+
+    Ok(())
 }
 
 async fn start_registry_server(
@@ -380,6 +775,25 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
             get(|| async { Json(json!([{ "id": 1 }, { "id": 2 }])) }),
         )
         .route(
+            "/api/v3/series/lookup",
+            get(|| async {
+                Json(json!([{
+                    "id": 42,
+                    "title": "Blocked Show",
+                    "tvdbId": 321,
+                    "monitored": true
+                }]))
+            }),
+        )
+        .route(
+            "/api/v3/qualityprofile",
+            get(|| async { Json(json!([{ "id": 1, "name": "Default" }])) }),
+        )
+        .route(
+            "/api/v3/rootfolder",
+            get(|| async { Json(json!([{ "path": "/downloads/tv" }])) }),
+        )
+        .route(
             "/api/v3/downloadclient",
             get({
                 let download_clients = Arc::clone(&download_clients);
@@ -388,6 +802,10 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
                     async move { Json(Value::Array(download_clients.as_ref().clone())) }
                 }
             }),
+        )
+        .route(
+            "/api/v3/series",
+            post(|| async { Json(json!({ "id": 42 })) }),
         );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3926,6 +4344,174 @@ async fn find_media_add_returns_missing_required_secrets_conflict() -> Result<()
 }
 
 #[tokio::test]
+async fn find_media_add_clears_show_and_episode_tombstones_for_readded_show() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-add-clears-episode-blocks".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-add-readd@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["series"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    store
+        .upsert_managed_media_tombstone(&NewManagedMediaTombstone {
+            media_type: MediaType::Series,
+            title: "Blocked Show".to_string(),
+            normalized_title: "blockedshow".to_string(),
+            year: Some(2024),
+            external_ids: Some(ExternalIds {
+                tvdb: Some("321".to_string()),
+                tvdb_series: Some("321".to_string()),
+                ..Default::default()
+            }),
+            manager_provider_id: Some(provider_id),
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            manager_implementation: Some("sonarr".to_string()),
+            action: "stop_tracking".to_string(),
+        })
+        .await?;
+    for episode_number in [1, 2] {
+        store
+            .upsert_managed_episode_tombstone(&NewManagedEpisodeTombstone {
+                media_type: MediaType::Series,
+                title: "Blocked Show".to_string(),
+                normalized_title: "blockedshow".to_string(),
+                year: Some(2024),
+                external_ids: Some(ExternalIds {
+                    tvdb: Some("321".to_string()),
+                    tvdb_series: Some("321".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: Some(provider_id),
+                manager_item_id: Some("42".to_string()),
+                manager_label: Some("default (sonarr)".to_string()),
+                manager_implementation: Some("sonarr".to_string()),
+                season_number: 1,
+                episode_number,
+                absolute_episode_number: None,
+                action: "block_episode".to_string(),
+            })
+            .await?;
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "tv",
+                        "managerProviderId": provider_id.to_string(),
+                        "item": {
+                            "title": "Blocked Show",
+                            "year": 2024,
+                            "externalIds": {
+                                "tvdbSeries": "321",
+                                "tvdb": "321"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(
+        store
+            .list_active_managed_media_tombstones()
+            .await?
+            .is_empty(),
+        "expected title tombstone to be cleared on show re-add"
+    );
+    assert!(
+        store
+            .list_active_managed_episode_tombstones()
+            .await?
+            .is_empty(),
+        "expected episode tombstones to be cleared on show re-add"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn find_media_targets_manager_resolution_precedence() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "find-media-targets-precedence".to_string();
@@ -6969,6 +7555,13 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    assert_eq!(
+        control_surface_section(&payload, "defaults")
+            .get("policy")
+            .and_then(|policy| policy.get("mode"))
+            .and_then(Value::as_str),
+        Some("seeded")
+    );
     assert!(
         defaults_fields
             .iter()
@@ -6995,6 +7588,13 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    assert_eq!(
+        control_surface_section(&payload, "downloadClientPreference")
+            .get("policy")
+            .and_then(|policy| policy.get("mode"))
+            .and_then(Value::as_str),
+        Some("seeded")
+    );
     assert!(
         preference_fields.iter().any(|field| {
             field.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
@@ -7034,6 +7634,142 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
         entities.iter().any(|entity| entity.get("title").and_then(Value::as_str)
             == Some("Noble House (1988)")),
         "expected Noble House managed item in control surface: {}",
+        payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (sonarr_host, sonarr_addr, server_state, sonarr_shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let (nzbget_host, nzbget_addr, _nzbget_mock_state, nzbget_shutdown_tx) =
+        start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    let _nzbget_instance =
+        seed_nzbget_control_extension(&store, &secrets, nzbget_host.clone(), nzbget_addr.port())
+            .await?;
+
+    {
+        let mut clients = server_state.download_clients.lock().unwrap();
+        clients[0] = json!({
+            "id": 11,
+            "name": "NZBGet",
+            "enable": true,
+            "protocol": "usenet",
+            "priority": 10,
+            "implementation": "Nzbget",
+            "fields": [
+                { "name": "host", "value": "wrong-nzbget" },
+                { "name": "port", "value": 6789 },
+                { "name": "username", "value": "elixir" },
+                { "name": "password", "value": "********" },
+                { "name": "tvCategory", "value": "tv" }
+            ]
+        });
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = sonarr_shutdown_tx.send(());
+    let _ = nzbget_shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Managed drift detected")
+    );
+    let section = control_surface_section(&payload, "managedInvariants");
+    assert_eq!(
+        section
+            .get("policy")
+            .and_then(|policy| policy.get("mode"))
+            .and_then(Value::as_str),
+        Some("managed")
+    );
+    let notices = section
+        .get("notices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notices.iter().any(|notice| {
+            notice.get("code").and_then(Value::as_str) == Some("managed_downloader_endpoint_drift")
+                && notice.get("title").and_then(Value::as_str) == Some("NZBGet endpoint drifted")
+        }),
+        "expected managed downloader drift notice in control surface: {}",
         payload
     );
 
@@ -7148,6 +7884,643 @@ async fn extension_control_action_remove_item_deactivates_intent() -> Result<()>
     assert_eq!(
         server_state.deletes.lock().unwrap().as_slice(),
         &["42".to_string()],
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    let episode_id = Uuid::new_v4();
+    let media_file_id = Uuid::new_v4();
+    let temp_dir = tempdir()?;
+    let media_path = temp_dir.path().join("Noble.House.S01E01.mkv");
+    let subtitle_path = temp_dir.path().join("Noble.House.S01E01.srt");
+    std::fs::write(&media_path, b"video-bytes")?;
+    std::fs::write(&subtitle_path, b"subtitle-bytes")?;
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    let intent_id = store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: MediaType::Series,
+            title: "Noble House".to_string(),
+            normalized_title: "noblehouse".to_string(),
+            year: Some(1988),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt0094518".to_string()),
+                ..Default::default()
+            }),
+            manager_provider_id: provider_id,
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            source: "find_media".to_string(),
+        })
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_imdb, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("Noble House")
+    .bind(1988)
+    .bind("series")
+    .bind("tt0094518")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
+         VALUES (?, ?, 1, ?, NULL)",
+    )
+    .bind(season_id.to_string())
+    .bind(series_id.to_string())
+    .bind("Season 1")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episodes (
+            id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
+         ) VALUES (?, ?, ?, 1, 1, ?, 1, NULL)",
+    )
+    .bind(episode_id.to_string())
+    .bind(series_id.to_string())
+    .bind(season_id.to_string())
+    .bind("Episode 1")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind("series")
+    .bind(serde_json::to_string(&json!({ "imdb": "tt0094518" }))?)
+    .bind("Noble House")
+    .bind(1988)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files (
+            id, media_item_id, path, scan_state
+         ) VALUES (?, ?, ?, 'ok')",
+    )
+    .bind(media_file_id.to_string())
+    .bind(series_id.to_string())
+    .bind(media_path.to_string_lossy().to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episode_files (episode_id, media_file_id)
+         VALUES (?, ?)",
+    )
+    .bind(episode_id.to_string())
+    .bind(media_file_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO external_subtitles (
+            id, media_file_id, path, language
+         ) VALUES (?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(media_file_id.to_string())
+    .bind(subtitle_path.to_string_lossy().to_string())
+    .bind("en")
+    .execute(&db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/library/items/{}", series_id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "stopTracking": true
+                }))?))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(!media_path.exists(), "expected media file to be removed");
+    assert!(
+        !subtitle_path.exists(),
+        "expected subtitle file to be removed"
+    );
+
+    let (series_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM series WHERE id = ?")
+        .bind(series_id.to_string())
+        .fetch_one(&db_pool)
+        .await?;
+    assert_eq!(series_count, 0);
+
+    let (media_item_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_items WHERE id = ?")
+            .bind(series_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(media_item_count, 0);
+
+    let active_intents = store.list_active_managed_ingest_intents().await?;
+    assert!(
+        active_intents
+            .iter()
+            .all(|intent| intent.intent_id != intent_id),
+        "expected delete route to deactivate the matching intent"
+    );
+
+    let tombstones = store.list_active_managed_media_tombstones().await?;
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].manager_provider_id, Some(provider_id));
+    assert_eq!(tombstones[0].manager_item_id.as_deref(), Some("42"));
+    assert_eq!(tombstones[0].action, "stop_tracking");
+
+    assert_eq!(
+        server_state.deletes.lock().unwrap().as_slice(),
+        &["42".to_string()],
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    let episode_id = Uuid::new_v4();
+    let media_file_id = Uuid::new_v4();
+    let temp_dir = tempdir()?;
+    let media_path = temp_dir.path().join("Show.S01E02.mkv");
+    let subtitle_path = temp_dir.path().join("Show.S01E02.srt");
+    std::fs::write(&media_path, b"video-bytes")?;
+    std::fs::write(&subtitle_path, b"subtitle-bytes")?;
+
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_tvdb_series, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("Blocked Show")
+    .bind(2024)
+    .bind("series")
+    .bind("321")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
+         VALUES (?, ?, 1, ?, NULL)",
+    )
+    .bind(season_id.to_string())
+    .bind(series_id.to_string())
+    .bind("Season 1")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episodes (
+            id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
+         ) VALUES (?, ?, ?, 1, 2, ?, 1, NULL)",
+    )
+    .bind(episode_id.to_string())
+    .bind(series_id.to_string())
+    .bind(season_id.to_string())
+    .bind("Episode 2")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind("series")
+    .bind(serde_json::to_string(
+        &json!({ "tvdb": "321", "tvdb_series": "321" }),
+    )?)
+    .bind("Blocked Show")
+    .bind(2024)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files (
+            id, media_item_id, path, scan_state
+         ) VALUES (?, ?, ?, 'ok')",
+    )
+    .bind(media_file_id.to_string())
+    .bind(series_id.to_string())
+    .bind(media_path.to_string_lossy().to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episode_files (episode_id, media_file_id)
+         VALUES (?, ?)",
+    )
+    .bind(episode_id.to_string())
+    .bind(media_file_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO external_subtitles (
+            id, media_file_id, path, language
+         ) VALUES (?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(media_file_id.to_string())
+    .bind(subtitle_path.to_string_lossy().to_string())
+    .bind("en")
+    .execute(&db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/library/episodes/{}", episode_id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "blockInElixir": true
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(!media_path.exists(), "expected media file to be removed");
+    assert!(
+        !subtitle_path.exists(),
+        "expected subtitle file to be removed"
+    );
+
+    let (episode_has_file,): (i64,) =
+        sqlx::query_as("SELECT CAST(has_file AS INTEGER) FROM episodes WHERE id = ?")
+            .bind(episode_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(episode_has_file, 0);
+
+    let (media_file_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE id = ?")
+            .bind(media_file_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(media_file_count, 0);
+
+    let tombstones = store.list_active_managed_episode_tombstones().await?;
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].season_number, 1);
+    assert_eq!(tombstones[0].episode_number, 2);
+    assert_eq!(tombstones[0].action, "block_episode");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/library/seasons/{}/episodes", season_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    let blocked = payload
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("lifecycle"))
+        .and_then(|value| value.get("blockedInElixir"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        blocked,
+        "expected episode lifecycle to reflect blocked state"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_restore_blocked_episodes_clears_episode_tombstones() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    let episode_one_id = Uuid::new_v4();
+    let episode_two_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_tvdb_series, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("Blocked Show")
+    .bind(2024)
+    .bind("series")
+    .bind("321")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
+         VALUES (?, ?, 1, ?, NULL)",
+    )
+    .bind(season_id.to_string())
+    .bind(series_id.to_string())
+    .bind("Season 1")
+    .execute(&db_pool)
+    .await?;
+    for (episode_id, episode_number) in [(episode_one_id, 1), (episode_two_id, 2)] {
+        sqlx::query(
+            "INSERT INTO episodes (
+                id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
+             ) VALUES (?, ?, ?, 1, ?, ?, 0, NULL)",
+        )
+        .bind(episode_id.to_string())
+        .bind(series_id.to_string())
+        .bind(season_id.to_string())
+        .bind(episode_number)
+        .bind(format!("Episode {episode_number}"))
+        .execute(&db_pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind("series")
+    .bind(serde_json::to_string(
+        &json!({ "tvdb": "321", "tvdb_series": "321" }),
+    )?)
+    .bind("Blocked Show")
+    .bind(2024)
+    .execute(&db_pool)
+    .await?;
+
+    for episode_number in [1, 2] {
+        store
+            .upsert_managed_episode_tombstone(&NewManagedEpisodeTombstone {
+                media_type: MediaType::Series,
+                title: "Blocked Show".to_string(),
+                normalized_title: "blockedshow".to_string(),
+                year: Some(2024),
+                external_ids: Some(ExternalIds {
+                    tvdb: Some("321".to_string()),
+                    tvdb_series: Some("321".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: None,
+                manager_item_id: None,
+                manager_label: None,
+                manager_implementation: None,
+                season_number: 1,
+                episode_number,
+                absolute_episode_number: None,
+                action: "block_episode".to_string(),
+            })
+            .await?;
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/library/items/{}/restore-blocked-episodes",
+                series_id
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        payload.get("restoredCount").and_then(Value::as_i64),
+        Some(2)
+    );
+    assert!(
+        store
+            .list_active_managed_episode_tombstones()
+            .await?
+            .is_empty(),
+        "expected all episode tombstones to be cleared"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    let episode_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_tvdb_series, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("Blocked Show")
+    .bind(2024)
+    .bind("series")
+    .bind("321")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
+         VALUES (?, ?, 1, ?, NULL)",
+    )
+    .bind(season_id.to_string())
+    .bind(series_id.to_string())
+    .bind("Season 1")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episodes (
+            id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
+         ) VALUES (?, ?, ?, 1, 2, ?, 0, NULL)",
+    )
+    .bind(episode_id.to_string())
+    .bind(series_id.to_string())
+    .bind(season_id.to_string())
+    .bind("Episode 2")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind("series")
+    .bind(serde_json::to_string(
+        &json!({ "tvdb": "321", "tvdb_series": "321" }),
+    )?)
+    .bind("Blocked Show")
+    .bind(2024)
+    .execute(&db_pool)
+    .await?;
+
+    store
+        .upsert_managed_episode_tombstone(&NewManagedEpisodeTombstone {
+            media_type: MediaType::Series,
+            title: "Blocked Show".to_string(),
+            normalized_title: "blockedshow".to_string(),
+            year: Some(2024),
+            external_ids: Some(ExternalIds {
+                tvdb: Some("321".to_string()),
+                tvdb_series: Some("321".to_string()),
+                ..Default::default()
+            }),
+            manager_provider_id: None,
+            manager_item_id: None,
+            manager_label: None,
+            manager_implementation: None,
+            season_number: 1,
+            episode_number: 2,
+            absolute_episode_number: None,
+            action: "block_episode".to_string(),
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/library/episodes/{}/restore", episode_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        store
+            .list_active_managed_episode_tombstones()
+            .await?
+            .is_empty(),
+        "expected matching episode tombstone to be cleared"
     );
 
     Ok(())
@@ -8155,6 +9528,101 @@ async fn extension_control_surface_includes_nzbget_servers_section() -> Result<(
     assert_eq!(
         provider.pointer("/actions/2/id").and_then(Value::as_str),
         Some("remove_server")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_reports_nzbget_managed_invariant_drift() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, _mock_state, shutdown_tx) = start_mock_nzbget_control_server(
+        vec![
+            ("DestDir".to_string(), "/other/downloads".to_string()),
+            ("InterDir".to_string(), "/other/incomplete".to_string()),
+            ("NzbDir".to_string(), "/runtime/nzb".to_string()),
+            ("QueueDir".to_string(), "/runtime/queue".to_string()),
+            ("TempDir".to_string(), "/runtime/tmp".to_string()),
+            ("LockFile".to_string(), "/config/nzbget.lock".to_string()),
+            ("Category1.Name".to_string(), "tv".to_string()),
+            (
+                "Category1.DestDir".to_string(),
+                "/other/downloads/tv".to_string(),
+            ),
+            ("Category2.Name".to_string(), "anime".to_string()),
+            (
+                "Category2.DestDir".to_string(),
+                "/downloads/anime".to_string(),
+            ),
+            ("Category3.Name".to_string(), "movies".to_string()),
+            (
+                "Category3.DestDir".to_string(),
+                "/downloads/movies".to_string(),
+            ),
+        ],
+        json!(""),
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.nzbget/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Managed drift detected")
+    );
+    let section = control_surface_section(&payload, "managedInvariants");
+    let notices = section
+        .get("notices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notices.iter().any(|notice| {
+            notice.get("code").and_then(Value::as_str) == Some("managed_nzbget_path_drift")
+                && notice.get("title").and_then(Value::as_str) == Some("NZBGet DestDir drifted")
+        }),
+        "expected NZBGet path drift notice in control surface: {}",
+        payload
+    );
+    assert!(
+        notices.iter().any(|notice| {
+            notice.get("code").and_then(Value::as_str) == Some("managed_nzbget_category_drift")
+                && notice.get("title").and_then(Value::as_str)
+                    == Some("NZBGet category 'tv' drifted")
+        }),
+        "expected NZBGet category drift notice in control surface: {}",
+        payload
     );
 
     Ok(())

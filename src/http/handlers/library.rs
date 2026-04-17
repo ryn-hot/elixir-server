@@ -6,11 +6,29 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    io::ErrorKind,
+};
+use tokio::fs;
+use uuid::Uuid;
 
 use crate::{
-    extensions::ExternalIds, http::error::ApiResult,
-    library::run_full_scan_with_metadata_and_linkers, state::AppState,
+    db::models::MediaType,
+    extensions::{
+        ExternalIds, MediaIdentity,
+        store::{
+            ExtensionStore, ManagedEpisodeTombstone, ManagedLibraryProvenance,
+            NewManagedEpisodeTombstone, NewManagedMediaTombstone,
+        },
+    },
+    http::error::{ApiError, ApiResult},
+    library::{
+        managed_episode_tombstone_matches_series, match_managed_episode_tombstone,
+        match_managed_ingest_intent, normalize_managed_intent_title,
+        run_full_scan_with_metadata_and_linkers,
+    },
+    state::AppState,
 };
 
 #[derive(Serialize)]
@@ -217,7 +235,107 @@ pub struct LibraryDetailResponse {
     pub poster_url: Option<String>,
     pub banner_url: Option<String>,
     pub backdrop_url: Option<String>,
+    pub lifecycle: LibraryLifecycleResponse,
     pub files: Vec<LibraryFileResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryLifecycleResponse {
+    pub tracked_by_manager: bool,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub can_stop_tracking: bool,
+    pub blocked_episode_count: i32,
+    pub can_restore_blocked_episodes: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLibraryItemRequest {
+    #[serde(default)]
+    pub stop_tracking: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLibraryItemResponse {
+    pub id: String,
+    pub r#type: String,
+    pub stop_tracking: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeLifecycleResponse {
+    pub blocked_in_elixir: bool,
+    pub can_delete_locally: bool,
+    pub can_block_in_elixir: bool,
+    pub can_restore: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteEpisodeRequest {
+    #[serde(default)]
+    pub block_in_elixir: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteEpisodeResponse {
+    pub id: String,
+    pub series_id: String,
+    pub blocked_in_elixir: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreEpisodeResponse {
+    pub id: String,
+    pub series_id: String,
+    pub restored: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreBlockedEpisodesResponse {
+    pub id: String,
+    pub restored_count: i32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedManagedLifecycle {
+    manager_provider_id: Uuid,
+    manager_item_id: Option<String>,
+    manager_label: Option<String>,
+    manager_implementation: Option<String>,
+    intent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct SeriesIdentityContext {
+    series_id: String,
+    media_type: MediaType,
+    title: String,
+    year: Option<i32>,
+    external_ids: ExternalIds,
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeDeleteTarget {
+    episode_id: String,
+    series: SeriesIdentityContext,
+    season_number: i32,
+    episode_number: i32,
+    absolute_episode_number: Option<i32>,
+    file_paths: Vec<String>,
+    subtitle_paths: Vec<String>,
+    media_file_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -253,6 +371,7 @@ pub struct EpisodeResponse {
     pub description: Option<String>,
     pub thumbnail_url: Option<String>,
     pub has_file: bool,
+    pub lifecycle: EpisodeLifecycleResponse,
 }
 
 #[derive(Serialize)]
@@ -372,15 +491,16 @@ pub async fn list_episodes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<EpisodeResponse>>> {
     let preferred_languages = parse_language_header(&headers);
-    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM seasons WHERE id = ? LIMIT 1")
-        .bind(&season_id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
-
-    if exists.is_none() {
-        return Err(crate::http::error::ApiError::not_found("season not found"));
-    }
+    let series = load_series_identity_for_season(&state.db_pool, &season_id).await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let active_episode_tombstones = load_series_episode_tombstones(
+        &store,
+        series.media_type,
+        &series.title,
+        series.year,
+        &series.external_ids,
+    )
+    .await?;
 
     let rows = sqlx::query(
         "SELECT e.id, e.season_number, e.episode_number, e.absolute_episode_number, e.title, e.runtime_seconds, CAST(e.has_file AS INTEGER) AS has_file, e.metadata_json, aem.title as anime_title, aem.duration_seconds as anime_duration, aem.snapshot_url FROM episodes e LEFT JOIN anime_episode_meta aem ON aem.season_id = e.season_id AND aem.episode_number = e.episode_number WHERE e.season_id = ? ORDER BY e.episode_number",
@@ -435,21 +555,40 @@ pub async fn list_episodes(
                 .cloned()
                 .or_else(|| snapshot_url)
                 .or_else(|| extract_episode_thumbnail(metadata_json.as_ref()));
+            let season_number = row
+                .try_get::<i64, _>("season_number")
+                .ok()
+                .unwrap_or_default() as i32;
+            let episode_number = row
+                .try_get::<i64, _>("episode_number")
+                .ok()
+                .unwrap_or_default() as i32;
+            let absolute_episode_number = row
+                .try_get::<i64, _>("absolute_episode_number")
+                .ok()
+                .map(|v| v as i32);
+            let blocked_in_elixir = match_managed_episode_tombstone(
+                &MediaIdentity {
+                    r#type: series.media_type,
+                    external_ids: series.external_ids.clone(),
+                    title: series.title.clone(),
+                    year: series.year,
+                    season: Some(season_number),
+                    episode: Some(episode_number),
+                },
+                &series.external_ids,
+                season_number,
+                episode_number,
+                absolute_episode_number,
+                &active_episode_tombstones,
+            )
+            .is_some();
 
             EpisodeResponse {
                 id,
-                season_number: row
-                    .try_get::<i64, _>("season_number")
-                    .ok()
-                    .unwrap_or_default() as i32,
-                episode_number: row
-                    .try_get::<i64, _>("episode_number")
-                    .ok()
-                    .unwrap_or_default() as i32,
-                absolute_episode_number: row
-                    .try_get::<i64, _>("absolute_episode_number")
-                    .ok()
-                    .map(|v| v as i32),
+                season_number,
+                episode_number,
+                absolute_episode_number,
                 title,
                 runtime_seconds,
                 description,
@@ -459,6 +598,20 @@ pub async fn list_episodes(
                     .ok()
                     .map(|v| v != 0)
                     .unwrap_or(false),
+                lifecycle: EpisodeLifecycleResponse {
+                    blocked_in_elixir,
+                    can_delete_locally: row
+                        .try_get::<i64, _>("has_file")
+                        .ok()
+                        .map(|v| v != 0)
+                        .unwrap_or(false),
+                    can_block_in_elixir: row
+                        .try_get::<i64, _>("has_file")
+                        .ok()
+                        .map(|v| v != 0)
+                        .unwrap_or(false),
+                    can_restore: blocked_in_elixir,
+                },
             }
         })
         .collect();
@@ -544,31 +697,31 @@ pub async fn detail(
     .await
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-    let (item_type, title, year, runtime_seconds, metadata_json, external_ids) = if let Some(row) =
-        movie
-    {
-        let external_ids = ExternalIds {
-            imdb: row.try_get::<String, _>("external_imdb").ok(),
-            tmdb: row.try_get::<String, _>("external_tmdb").ok(),
-            ..Default::default()
-        };
-        let metadata_json: Option<Value> = row
-            .try_get::<String, _>("metadata_json")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        (
-            "movie".to_string(),
-            row.get::<String, _>("title"),
-            row.try_get::<i64, _>("year").ok().map(|v| v as i32),
-            row.try_get::<String, _>("runtime_seconds")
+    let (media_type, item_type, title, year, runtime_seconds, metadata_json, external_ids) =
+        if let Some(row) = movie {
+            let external_ids = ExternalIds {
+                imdb: row.try_get::<String, _>("external_imdb").ok(),
+                tmdb: row.try_get::<String, _>("external_tmdb").ok(),
+                ..Default::default()
+            };
+            let metadata_json: Option<Value> = row
+                .try_get::<String, _>("metadata_json")
                 .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(|v| v as i32),
-            metadata_json,
-            external_ids,
-        )
-    } else {
-        let series = sqlx::query(
+                .and_then(|s| serde_json::from_str(&s).ok());
+            (
+                MediaType::Movie,
+                "movie".to_string(),
+                row.get::<String, _>("title"),
+                row.try_get::<i64, _>("year").ok().map(|v| v as i32),
+                row.try_get::<String, _>("runtime_seconds")
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|v| v as i32),
+                metadata_json,
+                external_ids,
+            )
+        } else {
+            let series = sqlx::query(
             "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json FROM series WHERE id = ? LIMIT 1",
         )
         .bind(&id)
@@ -576,29 +729,36 @@ pub async fn detail(
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
-        let series =
-            series.ok_or_else(|| crate::http::error::ApiError::not_found("item not found"))?;
-        let external_tvdb: Option<String> = series.try_get("external_tvdb_series").ok();
-        let external_ids = ExternalIds {
-            imdb: series.try_get::<String, _>("external_imdb").ok(),
-            tvdb: external_tvdb.clone(),
-            tvdb_series: external_tvdb,
-            anilist: series.try_get::<String, _>("external_anilist").ok(),
-            ..Default::default()
+            let series =
+                series.ok_or_else(|| crate::http::error::ApiError::not_found("item not found"))?;
+            let external_tvdb: Option<String> = series.try_get("external_tvdb_series").ok();
+            let external_ids = ExternalIds {
+                imdb: series.try_get::<String, _>("external_imdb").ok(),
+                tvdb: external_tvdb.clone(),
+                tvdb_series: external_tvdb,
+                anilist: series.try_get::<String, _>("external_anilist").ok(),
+                ..Default::default()
+            };
+            let metadata_json: Option<Value> = series
+                .try_get::<String, _>("metadata_json")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let library_type = series.get::<String, _>("library_type");
+            let media_type = if library_type == "anime" {
+                MediaType::Anime
+            } else {
+                MediaType::Series
+            };
+            (
+                media_type,
+                library_type,
+                series.get::<String, _>("title"),
+                series.try_get::<i64, _>("year").ok().map(|v| v as i32),
+                None,
+                metadata_json,
+                external_ids,
+            )
         };
-        let metadata_json: Option<Value> = series
-            .try_get::<String, _>("metadata_json")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        (
-            series.get::<String, _>("library_type"),
-            series.get::<String, _>("title"),
-            series.try_get::<i64, _>("year").ok().map(|v| v as i32),
-            None,
-            metadata_json,
-            external_ids,
-        )
-    };
 
     let files = if item_type == "movie" {
         sqlx::query("SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, mf.size_bytes, mf.scan_state, mf.source_config_id, mf.extension_metadata FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = ?")
@@ -688,6 +848,9 @@ pub async fn detail(
     let poster_url = poster_map.get(&id).cloned();
     let banner_url = banner_map.get(&id).cloned();
     let backdrop_url = backdrop_map.get(&id).cloned();
+    let lifecycle =
+        resolve_library_item_lifecycle(&state, &id, media_type, &title, year, &external_ids)
+            .await?;
 
     let response = LibraryDetailResponse {
         id,
@@ -702,10 +865,830 @@ pub async fn detail(
         poster_url,
         banner_url,
         backdrop_url,
+        lifecycle,
         files,
     };
 
     Ok(Json(response))
+}
+
+struct LibraryDeleteTarget {
+    media_type: MediaType,
+    item_type: String,
+    title: String,
+    year: Option<i32>,
+    external_ids: ExternalIds,
+    file_paths: Vec<String>,
+    subtitle_paths: Vec<String>,
+}
+
+pub async fn delete_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<DeleteLibraryItemRequest>,
+) -> ApiResult<Json<DeleteLibraryItemResponse>> {
+    let target = load_library_delete_target(&state.db_pool, &id).await?;
+    let lifecycle = resolve_library_item_lifecycle_resolved(
+        &state,
+        &id,
+        target.media_type,
+        &target.title,
+        target.year,
+        &target.external_ids,
+    )
+    .await?;
+    let store = ExtensionStore::new(&state.db_pool);
+
+    if payload.stop_tracking {
+        let lifecycle = lifecycle.as_ref().ok_or_else(|| {
+            ApiError::conflict("This item is not linked to a managed Sonarr/Radarr record.")
+        })?;
+        if !can_stop_tracking(lifecycle) {
+            return Err(ApiError::conflict(
+                "Stop tracking is only available for Sonarr/Radarr-managed movies and shows.",
+            ));
+        }
+        let manager_item_id = lifecycle
+            .manager_item_id
+            .as_deref()
+            .ok_or_else(|| ApiError::conflict("Manager item id is not available for this item."))?
+            .parse::<i64>()
+            .map_err(|_| ApiError::conflict("Manager item id is invalid for this item."))?;
+        let provider = store
+            .get_provider(lifecycle.manager_provider_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .ok_or_else(|| {
+                ApiError::conflict("The linked manager provider is no longer available.")
+            })?;
+        crate::http::handlers::extensions::remove_managed_library_item_from_manager(
+            &state,
+            &store,
+            &provider,
+            manager_item_id,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::conflict(format!(
+                "Failed to stop tracking in {}: {}",
+                manager_display_name(
+                    lifecycle.manager_implementation.as_deref(),
+                    lifecycle.manager_label.as_deref()
+                ),
+                error
+            ))
+        })?;
+    }
+
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(target.file_paths.iter().cloned());
+    paths.extend(target.subtitle_paths.iter().cloned());
+    for path in paths {
+        delete_library_path(&path).await?;
+    }
+
+    if payload.stop_tracking {
+        if let Some(lifecycle) = lifecycle.as_ref() {
+            store
+                .upsert_managed_media_tombstone(&NewManagedMediaTombstone {
+                    media_type: target.media_type,
+                    title: target.title.clone(),
+                    normalized_title: normalize_managed_intent_title(&target.title),
+                    year: target.year,
+                    external_ids: Some(target.external_ids.clone()),
+                    manager_provider_id: Some(lifecycle.manager_provider_id),
+                    manager_item_id: lifecycle.manager_item_id.clone(),
+                    manager_label: lifecycle.manager_label.clone(),
+                    manager_implementation: lifecycle.manager_implementation.clone(),
+                    action: "stop_tracking".to_string(),
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            if let Some(intent_id) = lifecycle.intent_id {
+                store
+                    .deactivate_managed_ingest_intent(intent_id)
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+            }
+        }
+    }
+
+    match target.media_type {
+        MediaType::Movie => {
+            sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
+                .bind(&id)
+                .execute(&state.db_pool)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        MediaType::Series | MediaType::Anime => {
+            sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = ?")
+                .bind(&id)
+                .execute(&state.db_pool)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
+    sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
+        .bind(&id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    let message = if payload.stop_tracking {
+        format!(
+            "Deleted from Elixir and stopped {} from tracking it.",
+            lifecycle
+                .as_ref()
+                .map(|value| {
+                    manager_display_name(
+                        value.manager_implementation.as_deref(),
+                        value.manager_label.as_deref(),
+                    )
+                })
+                .unwrap_or_else(|| "the manager".to_string())
+        )
+    } else {
+        "Deleted from Elixir.".to_string()
+    };
+
+    Ok(Json(DeleteLibraryItemResponse {
+        id,
+        r#type: target.item_type,
+        stop_tracking: payload.stop_tracking,
+        message,
+    }))
+}
+
+pub async fn delete_episode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<DeleteEpisodeRequest>,
+) -> ApiResult<Json<DeleteEpisodeResponse>> {
+    let target = load_episode_delete_target(&state.db_pool, &id).await?;
+    let store = ExtensionStore::new(&state.db_pool);
+
+    let lifecycle = resolve_library_item_lifecycle_resolved(
+        &state,
+        &target.series.series_id,
+        target.series.media_type,
+        &target.series.title,
+        target.series.year,
+        &target.series.external_ids,
+    )
+    .await?;
+
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(target.file_paths.iter().cloned());
+    paths.extend(target.subtitle_paths.iter().cloned());
+    for path in paths {
+        delete_library_path(&path).await?;
+    }
+
+    for media_file_id in &target.media_file_ids {
+        sqlx::query::<sqlx::Any>("DELETE FROM media_files WHERE id = ?")
+            .bind(media_file_id)
+            .execute(&state.db_pool)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+
+    refresh_episode_has_file_state(&state.db_pool, &target.episode_id).await?;
+
+    if payload.block_in_elixir {
+        store
+            .upsert_managed_episode_tombstone(&NewManagedEpisodeTombstone {
+                media_type: target.series.media_type,
+                title: target.series.title.clone(),
+                normalized_title: normalize_managed_intent_title(&target.series.title),
+                year: target.series.year,
+                external_ids: Some(target.series.external_ids.clone()),
+                manager_provider_id: lifecycle.as_ref().map(|value| value.manager_provider_id),
+                manager_item_id: lifecycle
+                    .as_ref()
+                    .and_then(|value| value.manager_item_id.clone()),
+                manager_label: lifecycle
+                    .as_ref()
+                    .and_then(|value| value.manager_label.clone()),
+                manager_implementation: lifecycle
+                    .as_ref()
+                    .and_then(|value| value.manager_implementation.clone()),
+                season_number: target.season_number,
+                episode_number: target.episode_number,
+                absolute_episode_number: target.absolute_episode_number,
+                action: "block_episode".to_string(),
+            })
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+
+    let message = if payload.block_in_elixir {
+        format!(
+            "Deleted episode S{:02}E{:02} from Elixir and blocked it from being re-imported here.",
+            target.season_number, target.episode_number
+        )
+    } else {
+        format!(
+            "Deleted episode S{:02}E{:02} from Elixir. It can return later if it is downloaded again.",
+            target.season_number, target.episode_number
+        )
+    };
+
+    Ok(Json(DeleteEpisodeResponse {
+        id: target.episode_id,
+        series_id: target.series.series_id,
+        blocked_in_elixir: payload.block_in_elixir,
+        message,
+    }))
+}
+
+pub async fn restore_episode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RestoreEpisodeResponse>> {
+    let target = load_episode_delete_target(&state.db_pool, &id).await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let tombstones = load_series_episode_tombstones(
+        &store,
+        target.series.media_type,
+        &target.series.title,
+        target.series.year,
+        &target.series.external_ids,
+    )
+    .await?;
+
+    let tombstone = match_managed_episode_tombstone(
+        &MediaIdentity {
+            r#type: target.series.media_type,
+            external_ids: target.series.external_ids.clone(),
+            title: target.series.title.clone(),
+            year: target.series.year,
+            season: Some(target.season_number),
+            episode: Some(target.episode_number),
+        },
+        &target.series.external_ids,
+        target.season_number,
+        target.episode_number,
+        target.absolute_episode_number,
+        &tombstones,
+    )
+    .ok_or_else(|| ApiError::conflict("This episode is not currently blocked in Elixir."))?;
+
+    store
+        .deactivate_managed_episode_tombstone(tombstone.tombstone_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    Ok(Json(RestoreEpisodeResponse {
+        id: target.episode_id,
+        series_id: target.series.series_id,
+        restored: true,
+        message: format!(
+            "Episode S{:02}E{:02} can be imported into Elixir again.",
+            target.season_number, target.episode_number
+        ),
+    }))
+}
+
+pub async fn restore_blocked_episodes(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RestoreBlockedEpisodesResponse>> {
+    let series = load_series_identity_for_item(&state.db_pool, &id).await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let tombstones = load_series_episode_tombstones(
+        &store,
+        series.media_type,
+        &series.title,
+        series.year,
+        &series.external_ids,
+    )
+    .await?;
+
+    if tombstones.is_empty() {
+        return Ok(Json(RestoreBlockedEpisodesResponse {
+            id,
+            restored_count: 0,
+            message: "There are no blocked episodes to restore.".to_string(),
+        }));
+    }
+
+    for tombstone in &tombstones {
+        store
+            .deactivate_managed_episode_tombstone(tombstone.tombstone_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+
+    Ok(Json(RestoreBlockedEpisodesResponse {
+        id,
+        restored_count: tombstones.len() as i32,
+        message: if tombstones.len() == 1 {
+            "Restored 1 blocked episode.".to_string()
+        } else {
+            format!("Restored {} blocked episodes.", tombstones.len())
+        },
+    }))
+}
+
+async fn resolve_library_item_lifecycle(
+    state: &AppState,
+    item_id: &str,
+    media_type: MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids: &ExternalIds,
+) -> ApiResult<LibraryLifecycleResponse> {
+    let lifecycle = resolve_library_item_lifecycle_resolved(
+        state,
+        item_id,
+        media_type,
+        title,
+        year,
+        external_ids,
+    )
+    .await?;
+    let blocked_episode_count = if matches!(media_type, MediaType::Series | MediaType::Anime) {
+        let store = ExtensionStore::new(&state.db_pool);
+        load_series_episode_tombstones(&store, media_type, title, year, external_ids)
+            .await?
+            .len() as i32
+    } else {
+        0
+    };
+    Ok(match lifecycle {
+        Some(value) => {
+            let can_stop = can_stop_tracking(&value);
+            LibraryLifecycleResponse {
+                tracked_by_manager: true,
+                manager_label: value.manager_label,
+                manager_implementation: value.manager_implementation,
+                can_stop_tracking: can_stop,
+                blocked_episode_count,
+                can_restore_blocked_episodes: blocked_episode_count > 0,
+            }
+        }
+        None => LibraryLifecycleResponse {
+            blocked_episode_count,
+            can_restore_blocked_episodes: blocked_episode_count > 0,
+            ..LibraryLifecycleResponse::default()
+        },
+    })
+}
+
+async fn resolve_library_item_lifecycle_resolved(
+    state: &AppState,
+    item_id: &str,
+    media_type: MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids: &ExternalIds,
+) -> ApiResult<Option<ResolvedManagedLifecycle>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let item_uuid = Uuid::parse_str(item_id)
+        .map_err(|_| ApiError::bad_request("library item id is invalid"))?;
+
+    if let Some(provenance) = store
+        .get_managed_library_provenance(item_uuid)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    {
+        return enrich_provenance_with_provider(&store, provenance)
+            .await
+            .map(Some);
+    }
+
+    let intents = store
+        .list_active_managed_ingest_intents()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let identity = MediaIdentity {
+        r#type: media_type,
+        external_ids: external_ids.clone(),
+        title: title.to_string(),
+        year,
+        season: None,
+        episode: None,
+    };
+    let Some(intent) = match_managed_ingest_intent(&identity, external_ids, &intents).cloned()
+    else {
+        return Ok(None);
+    };
+    let provider = store
+        .get_provider(intent.manager_provider_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let manager_implementation = provider.and_then(|value| value.implementation);
+    Ok(Some(ResolvedManagedLifecycle {
+        manager_provider_id: intent.manager_provider_id,
+        manager_item_id: intent.manager_item_id,
+        manager_label: intent.manager_label,
+        manager_implementation,
+        intent_id: Some(intent.intent_id),
+    }))
+}
+
+async fn enrich_provenance_with_provider(
+    store: &ExtensionStore<'_>,
+    provenance: ManagedLibraryProvenance,
+) -> ApiResult<ResolvedManagedLifecycle> {
+    let provider = store
+        .get_provider(provenance.manager_provider_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let manager_implementation = provenance
+        .manager_implementation
+        .or_else(|| provider.and_then(|value| value.implementation));
+    Ok(ResolvedManagedLifecycle {
+        manager_provider_id: provenance.manager_provider_id,
+        manager_item_id: provenance.manager_item_id,
+        manager_label: provenance.manager_label,
+        manager_implementation,
+        intent_id: provenance.intent_id,
+    })
+}
+
+async fn load_library_delete_target(
+    pool: &sqlx::AnyPool,
+    item_id: &str,
+) -> ApiResult<LibraryDeleteTarget> {
+    let movie = sqlx::query(
+        "SELECT id, title, year, external_imdb, external_tmdb
+         FROM movies
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    let (media_type, item_type, title, year, external_ids) = if let Some(row) = movie {
+        (
+            MediaType::Movie,
+            "movie".to_string(),
+            row.get::<String, _>("title"),
+            row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+            ExternalIds {
+                imdb: row.try_get::<String, _>("external_imdb").ok(),
+                tmdb: row.try_get::<String, _>("external_tmdb").ok(),
+                ..Default::default()
+            },
+        )
+    } else {
+        let series = sqlx::query(
+            "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist
+             FROM series
+             WHERE id = ?
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::not_found("item not found"))?;
+        let item_type = series.get::<String, _>("library_type");
+        let tvdb_series = series.try_get::<String, _>("external_tvdb_series").ok();
+        (
+            if item_type == "anime" {
+                MediaType::Anime
+            } else {
+                MediaType::Series
+            },
+            item_type,
+            series.get::<String, _>("title"),
+            series
+                .try_get::<i64, _>("year")
+                .ok()
+                .map(|value| value as i32),
+            ExternalIds {
+                imdb: series.try_get::<String, _>("external_imdb").ok(),
+                tvdb: tvdb_series.clone(),
+                tvdb_series,
+                anilist: series.try_get::<String, _>("external_anilist").ok(),
+                ..Default::default()
+            },
+        )
+    };
+
+    let file_paths = if media_type == MediaType::Movie {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT mf.path
+             FROM media_files mf
+             JOIN movie_files mlf ON mlf.media_file_id = mf.id
+             WHERE mlf.movie_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    } else {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT DISTINCT mf.path
+             FROM media_files mf
+             JOIN episode_files ef ON ef.media_file_id = mf.id
+             JOIN episodes e ON e.id = ef.episode_id
+             WHERE e.series_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    let subtitle_paths = if media_type == MediaType::Movie {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT es.path
+             FROM external_subtitles es
+             JOIN media_files mf ON mf.id = es.media_file_id
+             JOIN movie_files mlf ON mlf.media_file_id = mf.id
+             WHERE mlf.movie_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    } else {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT DISTINCT es.path
+             FROM external_subtitles es
+             JOIN media_files mf ON mf.id = es.media_file_id
+             JOIN episode_files ef ON ef.media_file_id = mf.id
+             JOIN episodes e ON e.id = ef.episode_id
+             WHERE e.series_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    Ok(LibraryDeleteTarget {
+        media_type,
+        item_type,
+        title,
+        year,
+        external_ids,
+        file_paths,
+        subtitle_paths,
+    })
+}
+
+async fn load_series_identity_for_item(
+    pool: &sqlx::AnyPool,
+    item_id: &str,
+) -> ApiResult<SeriesIdentityContext> {
+    let series = sqlx::query(
+        "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist
+         FROM series
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .ok_or_else(|| ApiError::not_found("series not found"))?;
+
+    let item_type = series.get::<String, _>("library_type");
+    let tvdb_series = series.try_get::<String, _>("external_tvdb_series").ok();
+
+    Ok(SeriesIdentityContext {
+        series_id: series.get::<String, _>("id"),
+        media_type: if item_type == "anime" {
+            MediaType::Anime
+        } else {
+            MediaType::Series
+        },
+        title: series.get::<String, _>("title"),
+        year: series
+            .try_get::<i64, _>("year")
+            .ok()
+            .map(|value| value as i32),
+        external_ids: ExternalIds {
+            imdb: series.try_get::<String, _>("external_imdb").ok(),
+            tvdb: tvdb_series.clone(),
+            tvdb_series,
+            anilist: series.try_get::<String, _>("external_anilist").ok(),
+            ..Default::default()
+        },
+    })
+}
+
+async fn load_series_identity_for_season(
+    pool: &sqlx::AnyPool,
+    season_id: &str,
+) -> ApiResult<SeriesIdentityContext> {
+    let series_id = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT series_id FROM seasons WHERE id = ? LIMIT 1",
+    )
+    .bind(season_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .ok_or_else(|| ApiError::not_found("season not found"))?;
+    load_series_identity_for_item(pool, &series_id).await
+}
+
+async fn load_episode_delete_target(
+    pool: &sqlx::AnyPool,
+    episode_id: &str,
+) -> ApiResult<EpisodeDeleteTarget> {
+    let row = sqlx::query(
+        "SELECT e.id, e.series_id, e.season_number, e.episode_number, e.absolute_episode_number
+         FROM episodes e
+         WHERE e.id = ?
+         LIMIT 1",
+    )
+    .bind(episode_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .ok_or_else(|| ApiError::not_found("episode not found"))?;
+
+    let series_id = row.get::<String, _>("series_id");
+    let series = load_series_identity_for_item(pool, &series_id).await?;
+    let season_number = row
+        .try_get::<i64, _>("season_number")
+        .ok()
+        .unwrap_or_default() as i32;
+    let episode_number = row
+        .try_get::<i64, _>("episode_number")
+        .ok()
+        .unwrap_or_default() as i32;
+    let absolute_episode_number = row
+        .try_get::<i64, _>("absolute_episode_number")
+        .ok()
+        .map(|value| value as i32);
+
+    let media_file_ids = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT media_file_id FROM episode_files WHERE episode_id = ?",
+    )
+    .bind(episode_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    for media_file_id in &media_file_ids {
+        let linked_episode_count: i64 = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM episode_files WHERE media_file_id = ?",
+        )
+        .bind(media_file_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        if linked_episode_count > 1 {
+            return Err(ApiError::conflict(
+                "This file is linked to multiple episodes. Single-episode delete is not supported for multi-episode files yet.",
+            ));
+        }
+    }
+
+    let file_paths = if media_file_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut builder =
+            sqlx::QueryBuilder::<sqlx::Any>::new("SELECT path FROM media_files WHERE id IN (");
+        let mut separated = builder.separated(", ");
+        for media_file_id in &media_file_ids {
+            separated.push_bind(media_file_id);
+        }
+        separated.push_unseparated(")");
+        builder
+            .build_query_scalar::<String>()
+            .fetch_all(pool)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    let subtitle_paths = if media_file_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT path FROM external_subtitles WHERE media_file_id IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for media_file_id in &media_file_ids {
+            separated.push_bind(media_file_id);
+        }
+        separated.push_unseparated(")");
+        builder
+            .build_query_scalar::<String>()
+            .fetch_all(pool)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    Ok(EpisodeDeleteTarget {
+        episode_id: episode_id.to_string(),
+        series,
+        season_number,
+        episode_number,
+        absolute_episode_number,
+        file_paths,
+        subtitle_paths,
+        media_file_ids,
+    })
+}
+
+async fn load_series_episode_tombstones(
+    store: &ExtensionStore<'_>,
+    media_type: MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids: &ExternalIds,
+) -> ApiResult<Vec<ManagedEpisodeTombstone>> {
+    let tombstones = store
+        .list_active_managed_episode_tombstones()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(tombstones
+        .into_iter()
+        .filter(|tombstone| {
+            managed_episode_tombstone_matches_series(
+                media_type,
+                title,
+                year,
+                external_ids,
+                tombstone,
+            )
+        })
+        .collect())
+}
+
+async fn refresh_episode_has_file_state(pool: &sqlx::AnyPool, episode_id: &str) -> ApiResult<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE episodes
+         SET has_file = CASE WHEN EXISTS (
+             SELECT 1
+             FROM episode_files ef
+             JOIN media_files mf ON mf.id = ef.media_file_id
+             WHERE ef.episode_id = ?
+               AND mf.scan_state = 'ok'
+         ) THEN 1 ELSE 0 END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(episode_id)
+    .bind(episode_id)
+    .execute(pool)
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn delete_library_path(path: &str) -> ApiResult<()> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    match fs::remove_file(trimmed).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ApiError::internal(format!(
+            "failed to delete '{}': {}",
+            trimmed, error
+        ))),
+    }
+}
+
+fn can_stop_tracking(lifecycle: &ResolvedManagedLifecycle) -> bool {
+    matches!(
+        lifecycle
+            .manager_implementation
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("sonarr") | Some("radarr")
+    ) && lifecycle
+        .manager_item_id
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn manager_display_name(implementation: Option<&str>, label: Option<&str>) -> String {
+    if let Some(value) = implementation
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return match value.to_ascii_lowercase().as_str() {
+            "sonarr" => "Sonarr".to_string(),
+            "radarr" => "Radarr".to_string(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                    None => "the manager".to_string(),
+                }
+            }
+        };
+    }
+    label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the manager")
+        .to_string()
 }
 
 async fn load_media_tracks(

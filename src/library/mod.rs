@@ -34,7 +34,10 @@ use crate::{
     },
     config::ClassifierConfig,
     db::models::MediaType,
-    extensions::store::{ExtensionStore, ManagedIngestIntent},
+    extensions::store::{
+        ExtensionStore, ManagedEpisodeTombstone, ManagedIngestIntent, ManagedMediaTombstone,
+        NewManagedLibraryProvenance,
+    },
     extensions::{ExternalIds, make_identity_key},
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
     media::ffprobe,
@@ -102,6 +105,22 @@ pub async fn run_full_scan_with_metadata_and_linkers(
         merge_candidates(candidates, hash_dedupe);
     let extension_store = ExtensionStore::new(pool);
     let managed_ingest_intents = extension_store.list_active_managed_ingest_intents().await?;
+    let managed_media_tombstones = extension_store
+        .list_active_managed_media_tombstones()
+        .await?;
+    let managed_episode_tombstones = extension_store
+        .list_active_managed_episode_tombstones()
+        .await?;
+    let provider_implementations: HashMap<Uuid, String> = extension_store
+        .list_providers(None)
+        .await?
+        .into_iter()
+        .filter_map(|provider| {
+            provider
+                .implementation
+                .map(|implementation| (provider.provider_id, implementation))
+        })
+        .collect();
     let mut matched_managed_intent_ids: HashSet<Uuid> = HashSet::new();
     let classifier = build_classifier_pipeline(classifier_config);
     let anilist_bridge = build_anilist_identifier(classifier_config);
@@ -110,7 +129,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 
     for mut candidate in merged {
         let mut merged_ids = candidate.identity.external_ids.clone();
-        if let Some(intent) =
+        let matched_intent = if let Some(intent) =
             match_managed_ingest_intent(&candidate.identity, &merged_ids, &managed_ingest_intents)
         {
             if let Some(intent_ids) = intent.external_ids.clone() {
@@ -119,6 +138,25 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             candidate.identity.r#type =
                 merge_media_type_with_intent(candidate.identity.r#type, intent.media_type);
             matched_managed_intent_ids.insert(intent.intent_id);
+            Some(intent.clone())
+        } else {
+            None
+        };
+        if let Some(tombstone) = match_managed_media_tombstone(
+            &candidate.identity,
+            &merged_ids,
+            &managed_media_tombstones,
+        ) {
+            tracing::info!(
+                title = %candidate.identity.title,
+                media_type = %candidate.identity.r#type.as_str(),
+                tombstone_id = %tombstone.tombstone_id,
+                "skipping managed media candidate because it is blocked by a tombstone"
+            );
+            for file in candidate.files {
+                seen_paths.insert(file.descriptor.path);
+            }
+            continue;
         }
         let (
             classified_ids,
@@ -318,6 +356,27 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     meta.as_ref(),
                 )
                 .await?;
+                if let Some(intent) = matched_intent.as_ref() {
+                    extension_store
+                        .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+                            media_item_id: movie_id,
+                            media_type: candidate.identity.r#type,
+                            title: candidate.identity.title.clone(),
+                            normalized_title: normalize_managed_intent_title(
+                                &candidate.identity.title,
+                            ),
+                            year: candidate.identity.year,
+                            external_ids: Some(merged_ids.clone()),
+                            manager_provider_id: intent.manager_provider_id,
+                            manager_item_id: intent.manager_item_id.clone(),
+                            manager_label: intent.manager_label.clone(),
+                            manager_implementation: provider_implementations
+                                .get(&intent.manager_provider_id)
+                                .cloned(),
+                            intent_id: Some(intent.intent_id),
+                        })
+                        .await?;
+                }
                 if let Some(artwork_service) = artwork {
                     sync_movie_artwork(pool, artwork_service, movie_id, meta.as_ref()).await?;
                 }
@@ -555,6 +614,27 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     )
                     .await?;
                 }
+                if let Some(intent) = matched_intent.as_ref() {
+                    extension_store
+                        .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+                            media_item_id: series_id,
+                            media_type: candidate.identity.r#type,
+                            title: candidate.identity.title.clone(),
+                            normalized_title: normalize_managed_intent_title(
+                                &candidate.identity.title,
+                            ),
+                            year: candidate.identity.year,
+                            external_ids: Some(merged_ids.clone()),
+                            manager_provider_id: intent.manager_provider_id,
+                            manager_item_id: intent.manager_item_id.clone(),
+                            manager_label: intent.manager_label.clone(),
+                            manager_implementation: provider_implementations
+                                .get(&intent.manager_provider_id)
+                                .cloned(),
+                            intent_id: Some(intent.intent_id),
+                        })
+                        .await?;
+                }
 
                 if let Some(linker) = linkers {
                     for (season_number, season_id) in &season_ids {
@@ -599,6 +679,33 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                 }
 
                 for file in candidate.files {
+                    let resolved = resolved_numbers
+                        .get(&file.descriptor.path)
+                        .copied()
+                        .unwrap_or(ResolvedEpisodeNumbers {
+                            season: file.season,
+                            episode: file.episode,
+                            absolute_episode: file.absolute_episode,
+                        });
+                    if let Some(tombstone) = match_managed_episode_tombstone(
+                        &candidate.identity,
+                        &merged_ids,
+                        resolved.season.unwrap_or(1),
+                        resolved.episode.unwrap_or(1),
+                        resolved.absolute_episode,
+                        &managed_episode_tombstones,
+                    ) {
+                        tracing::info!(
+                            title = %candidate.identity.title,
+                            media_type = %candidate.identity.r#type.as_str(),
+                            season = resolved.season.unwrap_or(1),
+                            episode = resolved.episode.unwrap_or(1),
+                            tombstone_id = %tombstone.tombstone_id,
+                            "skipping managed episode candidate because it is blocked by an episode tombstone"
+                        );
+                        seen_paths.insert(file.descriptor.path);
+                        continue;
+                    }
                     seen_paths.insert(file.descriptor.path.clone());
                     let media_file = upsert_media_file(
                         pool,
@@ -612,14 +719,6 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                     if let Some(outcome) = review_outcomes.get(&file.descriptor.path) {
                         persist_review_outcome(pool, media_file.id, outcome).await?;
                     }
-                    let resolved = resolved_numbers
-                        .get(&file.descriptor.path)
-                        .copied()
-                        .unwrap_or(ResolvedEpisodeNumbers {
-                            season: file.season,
-                            episode: file.episode,
-                            absolute_episode: file.absolute_episode,
-                        });
                     let season_number = resolved.season.unwrap_or(1);
                     let episode_number = resolved.episode.unwrap_or(1);
                     let season_id = season_ids
@@ -771,7 +870,7 @@ fn merge_media_type_with_intent(current: MediaType, intent: MediaType) -> MediaT
     }
 }
 
-fn match_managed_ingest_intent<'a>(
+pub(crate) fn match_managed_ingest_intent<'a>(
     identity: &MediaIdentity,
     merged_ids: &ExternalIds,
     intents: &'a [ManagedIngestIntent],
@@ -822,6 +921,157 @@ fn match_managed_ingest_intent<'a>(
     }
 
     best.map(|(intent, _)| intent)
+}
+
+fn match_managed_media_tombstone<'a>(
+    identity: &MediaIdentity,
+    merged_ids: &ExternalIds,
+    tombstones: &'a [ManagedMediaTombstone],
+) -> Option<&'a ManagedMediaTombstone> {
+    let normalized_title = normalize_managed_intent_title(&identity.title);
+    let mut best: Option<(&ManagedMediaTombstone, i32)> = None;
+
+    for tombstone in tombstones {
+        if !managed_intent_media_type_compatible(identity.r#type, tombstone.media_type) {
+            continue;
+        }
+
+        let id_score = tombstone
+            .external_ids
+            .as_ref()
+            .map(|ids| managed_intent_id_overlap_score(merged_ids, ids))
+            .unwrap_or(0);
+        let title_match =
+            !normalized_title.is_empty() && normalized_title == tombstone.normalized_title;
+        let year_score = match (tombstone.year, identity.year) {
+            (Some(left), Some(right)) if left == right => 20,
+            (Some(_), Some(_)) => {
+                if id_score == 0 {
+                    continue;
+                }
+                0
+            }
+            (None, _) | (_, None) => 5,
+        };
+
+        if id_score == 0 && !title_match {
+            continue;
+        }
+
+        let mut score = id_score * 100;
+        if title_match {
+            score += 30;
+        }
+        score += year_score;
+        if tombstone.external_ids.is_some() {
+            score += 1;
+        }
+
+        match best {
+            Some((_, best_score)) if score <= best_score => {}
+            _ => best = Some((tombstone, score)),
+        }
+    }
+
+    best.map(|(tombstone, _)| tombstone)
+}
+
+pub(crate) fn match_managed_episode_tombstone<'a>(
+    identity: &MediaIdentity,
+    merged_ids: &ExternalIds,
+    season_number: i32,
+    episode_number: i32,
+    absolute_episode_number: Option<i32>,
+    tombstones: &'a [ManagedEpisodeTombstone],
+) -> Option<&'a ManagedEpisodeTombstone> {
+    let normalized_title = normalize_managed_intent_title(&identity.title);
+    let mut best: Option<(&ManagedEpisodeTombstone, i32)> = None;
+
+    for tombstone in tombstones {
+        if !managed_intent_media_type_compatible(identity.r#type, tombstone.media_type) {
+            continue;
+        }
+        let episode_scope_score = if tombstone.season_number == season_number
+            && tombstone.episode_number == episode_number
+        {
+            50
+        } else if let (Some(left), Some(right)) =
+            (tombstone.absolute_episode_number, absolute_episode_number)
+        {
+            if left == right { 30 } else { continue }
+        } else {
+            continue;
+        };
+
+        let id_score = tombstone
+            .external_ids
+            .as_ref()
+            .map(|ids| managed_intent_id_overlap_score(merged_ids, ids))
+            .unwrap_or(0);
+        let title_match =
+            !normalized_title.is_empty() && normalized_title == tombstone.normalized_title;
+        let year_score = match (tombstone.year, identity.year) {
+            (Some(left), Some(right)) if left == right => 20,
+            (Some(_), Some(_)) => {
+                if id_score == 0 {
+                    continue;
+                }
+                0
+            }
+            (None, _) | (_, None) => 5,
+        };
+
+        if id_score == 0 && !title_match {
+            continue;
+        }
+
+        let mut score = episode_scope_score + (id_score * 100) + year_score;
+        if title_match {
+            score += 30;
+        }
+        if tombstone.external_ids.is_some() {
+            score += 1;
+        }
+        if tombstone.absolute_episode_number.is_some()
+            && tombstone.absolute_episode_number == absolute_episode_number
+        {
+            score += 5;
+        }
+
+        match best {
+            Some((_, best_score)) if score <= best_score => {}
+            _ => best = Some((tombstone, score)),
+        }
+    }
+
+    best.map(|(tombstone, _)| tombstone)
+}
+
+pub(crate) fn managed_episode_tombstone_matches_series(
+    media_type: MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids: &ExternalIds,
+    tombstone: &ManagedEpisodeTombstone,
+) -> bool {
+    if !managed_intent_media_type_compatible(media_type, tombstone.media_type) {
+        return false;
+    }
+
+    let normalized_title = normalize_managed_intent_title(title);
+    let id_score = tombstone
+        .external_ids
+        .as_ref()
+        .map(|ids| managed_intent_id_overlap_score(external_ids, ids))
+        .unwrap_or(0);
+    let title_match =
+        !normalized_title.is_empty() && normalized_title == tombstone.normalized_title;
+    let year_match = match (tombstone.year, year) {
+        (Some(left), Some(right)) => left == right,
+        (None, _) | (_, None) => true,
+    };
+
+    year_match && (id_score > 0 || title_match)
 }
 
 fn managed_intent_media_type_compatible(candidate: MediaType, intent: MediaType) -> bool {
@@ -888,7 +1138,7 @@ fn managed_intent_id_match(
     }
 }
 
-fn normalize_managed_intent_title(value: &str) -> String {
+pub(crate) fn normalize_managed_intent_title(value: &str) -> String {
     value
         .trim()
         .to_ascii_lowercase()
@@ -4849,9 +5099,17 @@ mod tests {
     use crate::{
         config::DatabaseConfig,
         db::Database,
-        extensions::{ExternalIds as ExtIds, FileDescriptor as FD, MediaIdentity},
+        db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality},
+        extensions::{
+            ExternalIds as ExtIds, FileDescriptor as FD, MediaIdentity,
+            store::{
+                ExtensionStore, NewExtension, NewExtensionInstance, NewManagedIngestIntent,
+                NewManagedMediaTombstone, NewProvider,
+            },
+        },
     };
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     fn sample_identity() -> MediaIdentity {
         MediaIdentity {
@@ -5103,6 +5361,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_ingest_intent_persists_library_provenance() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let instance_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "elixir.modules.radarr".to_string(),
+                name: "Radarr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: serde_json::json!({}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.radarr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(serde_json::json!({})),
+                enabled: true,
+            })
+            .await?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "media.manager.movies".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("radarr".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        store
+            .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+                media_type: MediaType::Movie,
+                title: "Managed Movie".to_string(),
+                normalized_title: normalize_managed_intent_title("Managed Movie"),
+                year: Some(1988),
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt0096256".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("movie-123".to_string()),
+                manager_label: Some("default (radarr)".to_string()),
+                source: "find_media_add".to_string(),
+            })
+            .await?;
+
+        let candidates = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds::default(),
+                title: "Managed Movie".to_string(),
+                year: Some(1988),
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: "/media/managed_provenance_movie.mkv".to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, candidates, false).await?;
+
+        let row = sqlx::query(
+            "SELECT manager_provider_id, manager_item_id, manager_implementation
+             FROM managed_library_provenance
+             LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        let stored_provider_id: String = row.try_get("manager_provider_id")?;
+        let stored_manager_item_id: Option<String> = row.try_get("manager_item_id").ok();
+        let stored_implementation: Option<String> = row.try_get("manager_implementation").ok();
+        assert_eq!(stored_provider_id, provider_id.to_string());
+        assert_eq!(stored_manager_item_id.as_deref(), Some("movie-123"));
+        assert_eq!(stored_implementation.as_deref(), Some("radarr"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn managed_anime_intent_promotes_series_to_anime() -> Result<()> {
         let config = DatabaseConfig {
             url: "sqlite::memory:?cache=shared".to_string(),
@@ -5172,6 +5535,157 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await?;
         assert_eq!(pending_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_media_tombstone_blocks_reingest() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        store
+            .upsert_managed_media_tombstone(&NewManagedMediaTombstone {
+                media_type: MediaType::Movie,
+                title: "Blocked Movie".to_string(),
+                normalized_title: normalize_managed_intent_title("Blocked Movie"),
+                year: Some(2024),
+                external_ids: Some(ExtIds {
+                    tmdb: Some("987".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: None,
+                manager_item_id: None,
+                manager_label: None,
+                manager_implementation: None,
+                action: "stop_tracking".to_string(),
+            })
+            .await?;
+
+        let candidates = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds {
+                    tmdb: Some("987".to_string()),
+                    ..Default::default()
+                },
+                title: "Blocked Movie".to_string(),
+                year: Some(2024),
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: "/media/blocked_movie.mkv".to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, candidates, false).await?;
+
+        let (movie_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movies")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(movie_count, 0);
+
+        let (legacy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_items")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(legacy_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_episode_tombstone_blocks_reingest() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        store
+            .upsert_managed_episode_tombstone(
+                &crate::extensions::store::NewManagedEpisodeTombstone {
+                    media_type: MediaType::Series,
+                    title: "Blocked Show".to_string(),
+                    normalized_title: normalize_managed_intent_title("Blocked Show"),
+                    year: Some(2024),
+                    external_ids: Some(ExtIds {
+                        tvdb_series: Some("321".to_string()),
+                        tvdb: Some("321".to_string()),
+                        ..Default::default()
+                    }),
+                    manager_provider_id: None,
+                    manager_item_id: None,
+                    manager_label: None,
+                    manager_implementation: None,
+                    season_number: 1,
+                    episode_number: 2,
+                    absolute_episode_number: None,
+                    action: "block_episode".to_string(),
+                },
+            )
+            .await?;
+
+        let candidates = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Series,
+                external_ids: ExtIds {
+                    tvdb_series: Some("321".to_string()),
+                    tvdb: Some("321".to_string()),
+                    ..Default::default()
+                },
+                title: "Blocked Show".to_string(),
+                year: Some(2024),
+                season: Some(1),
+                episode: Some(2),
+            },
+            files: vec![FD {
+                path: "/media/Blocked.Show.S01E02.mkv".to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, candidates, false).await?;
+
+        let (series_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM series")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(series_count, 1);
+
+        let (legacy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_items")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(legacy_count, 1);
+
+        let (media_file_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(media_file_count, 0);
+
+        let (episode_link_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episode_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(episode_link_count, 0);
 
         Ok(())
     }

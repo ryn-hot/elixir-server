@@ -3,76 +3,20 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::control_contract::{
+    ExtensionControlProvider, GenericManifestControlProvider, UnsupportedControlProvider,
+};
 use super::*;
 
-// Adapter boundary for native Elixir extension control pages.
-//
-// Built-ins can keep bespoke logic behind this trait, while community
-// extensions can eventually bind through the manifest-driven generic path.
-//
-// Important: the manifest-declared generic control_surface contract is not
-// active at runtime yet. Current live behavior still comes from the handwritten
-// adapters below.
-#[async_trait::async_trait]
-trait ExtensionControlAdapterContract: Send + Sync {
-    async fn load_live_snapshot(
-        &self,
-        state: &AppState,
-        store: &ExtensionStore<'_>,
-        context: &ExtensionControlContext,
-    ) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-        let _ = (state, store, context);
-        Ok(ExtensionControlLiveSnapshot::default())
-    }
-
-    async fn build_sections(
-        &self,
-        state: &AppState,
-        store: &ExtensionStore<'_>,
-        context: &ExtensionControlContext,
-    ) -> anyhow::Result<Vec<ExtensionControlSection>> {
-        let _ = (state, store, context);
-        Ok(Vec::new())
-    }
-
-    fn build_actions(&self, _context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
-        Vec::new()
-    }
-
-    async fn update_settings(
-        &self,
-        state: &AppState,
-        store: &ExtensionStore<'_>,
-        context: &ExtensionControlContext,
-        values: &HashMap<String, serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        let _ = (state, store, context, values);
-        anyhow::bail!("this extension does not expose editable settings yet")
-    }
-
-    async fn execute_action(
-        &self,
-        state: &AppState,
-        store: &ExtensionStore<'_>,
-        context: &ExtensionControlContext,
-        action_id: &str,
-        params: &HashMap<String, serde_json::Value>,
-    ) -> anyhow::Result<String> {
-        let _ = (state, store, context, params);
-        anyhow::bail!("unsupported control action '{action_id}'")
-    }
-}
-
-struct UnsupportedControlAdapter;
+// First-party providers plug into the same platform-owned control contract as
+// the generic manifest path. Their custom logic lives here, but the
+// ownership/notice/action primitives are defined by the generic contract layer.
 struct ArrManagerControlAdapter {
     implementation: &'static str,
 }
 
 #[async_trait::async_trait]
-impl ExtensionControlAdapterContract for UnsupportedControlAdapter {}
-
-#[async_trait::async_trait]
-impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
+impl ExtensionControlProvider for ArrManagerControlAdapter {
     async fn load_live_snapshot(
         &self,
         state: &AppState,
@@ -192,6 +136,7 @@ impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
                     &snapshot,
                 ))
             }
+            "repair_managed_invariants" => super::run_extension_control_managed_repair(state).await,
             "search_missing" | "refresh_manager" => {
                 let (base_url, api_key) =
                     super::resolve_extension_control_arr_connection(state, store, context).await?;
@@ -244,7 +189,7 @@ impl ExtensionControlAdapterContract for ArrManagerControlAdapter {
 struct ProwlarrControlAdapter;
 
 #[async_trait::async_trait]
-impl ExtensionControlAdapterContract for ProwlarrControlAdapter {
+impl ExtensionControlProvider for ProwlarrControlAdapter {
     async fn load_live_snapshot(
         &self,
         state: &AppState,
@@ -397,7 +342,7 @@ impl DownloaderControlAdapter {
 }
 
 #[async_trait::async_trait]
-impl ExtensionControlAdapterContract for DownloaderControlAdapter {
+impl ExtensionControlProvider for DownloaderControlAdapter {
     async fn load_live_snapshot(
         &self,
         state: &AppState,
@@ -528,6 +473,10 @@ impl ExtensionControlAdapterContract for DownloaderControlAdapter {
                     &snapshot,
                 ))
             }
+            ("qbittorrent", "repair_managed_invariants")
+            | ("nzbget", "repair_managed_invariants") => {
+                super::run_extension_control_managed_repair(state).await
+            }
             ("qbittorrent", "pause_all") => {
                 qbittorrent_run_global_action(state, store, context, "pause_all").await
             }
@@ -611,31 +560,20 @@ pub(super) async fn execute_action(
         .await
 }
 
-fn resolve_adapter(context: &ExtensionControlContext) -> Box<dyn ExtensionControlAdapterContract> {
-    let provider_implementation = context
-        .selected_provider
-        .as_ref()
-        .and_then(|provider| provider.implementation.as_deref())
-        .map(|value| value.trim().to_ascii_lowercase());
-    let extension_key = context.extension.extension_id.to_ascii_lowercase();
-    let implementation = provider_implementation
-        .as_deref()
-        .unwrap_or(extension_key.as_str());
-
-    if implementation.contains("sonarr") {
-        Box::new(ArrManagerControlAdapter {
+fn resolve_adapter(context: &ExtensionControlContext) -> Box<dyn ExtensionControlProvider> {
+    match context.control_binding {
+        ExtensionControlBinding::Sonarr => Box::new(ArrManagerControlAdapter {
             implementation: "sonarr",
-        })
-    } else if implementation.contains("radarr") {
-        Box::new(ArrManagerControlAdapter {
+        }),
+        ExtensionControlBinding::Radarr => Box::new(ArrManagerControlAdapter {
             implementation: "radarr",
-        })
-    } else if implementation.contains("prowlarr") {
-        Box::new(ProwlarrControlAdapter)
-    } else if implementation.contains("qbittorrent") || implementation.contains("nzbget") {
-        Box::new(DownloaderControlAdapter)
-    } else {
-        Box::new(UnsupportedControlAdapter)
+        }),
+        ExtensionControlBinding::Prowlarr => Box::new(ProwlarrControlAdapter),
+        ExtensionControlBinding::Qbittorrent | ExtensionControlBinding::Nzbget => {
+            Box::new(DownloaderControlAdapter)
+        }
+        ExtensionControlBinding::GenericManifest => Box::new(GenericManifestControlProvider),
+        ExtensionControlBinding::Unsupported => Box::new(UnsupportedControlProvider),
     }
 }
 
@@ -1050,6 +988,8 @@ async fn build_nzbget_servers_section(
         description:
             "Configure one or more Usenet providers here. Elixir stores credentials as instance secrets, writes the NZBGet config, and validates each server with NZBGet's real connection test."
                 .to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: vec![nzbget_add_server_action()],
@@ -2306,6 +2246,10 @@ async fn build_qbittorrent_queue_section(
         description:
             "Live torrent activity from qBittorrent. Pause, resume, recheck, or remove items without leaving Elixir."
                 .to_string(),
+        policy: Some(super::control_policy_observed(
+            "Queue state is live-read from qBittorrent. Elixir reflects it but does not treat it as managed configuration.",
+        )),
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: vec![
@@ -2462,6 +2406,10 @@ async fn build_nzbget_queue_section(
         description:
             "Live Usenet queue activity from NZBGet. Pause, resume, or remove jobs without leaving Elixir."
                 .to_string(),
+        policy: Some(super::control_policy_observed(
+            "Queue state is live-read from NZBGet. Elixir reflects it but does not treat it as managed configuration.",
+        )),
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: vec![
@@ -2861,6 +2809,38 @@ async fn request_downloader_json(
         .with_context(|| format!("parsing downloader {} {path} response", method.as_str()))
 }
 
+pub(super) async fn load_qbittorrent_preferences(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    request_downloader_json(
+        state,
+        store,
+        context,
+        ReqwestMethod::GET,
+        "/api/v2/app/preferences",
+        None,
+    )
+    .await
+}
+
+pub(super) async fn load_qbittorrent_categories(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    request_downloader_json(
+        state,
+        store,
+        context,
+        ReqwestMethod::GET,
+        "/api/v2/torrents/categories",
+        None,
+    )
+    .await
+}
+
 async fn request_downloader_json_for_instance(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -2897,6 +2877,26 @@ async fn request_downloader_json_for_instance(
     }
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing downloader {} {path} response", method.as_str()))
+}
+
+pub(super) async fn load_nzbget_live_config_map(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let value = nzbget_rpc(state, store, context, "config", json!([])).await?;
+    parse_nzbget_control_config_map(value)
+}
+
+fn parse_nzbget_control_config_map(
+    value: serde_json::Value,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let items: Vec<NzbgetControlConfigItem> =
+        serde_json::from_value(value).context("parsing nzbget config items")?;
+    Ok(items
+        .into_iter()
+        .map(|item| (item.name, item.value))
+        .collect::<BTreeMap<_, _>>())
 }
 
 async fn request_downloader_form(

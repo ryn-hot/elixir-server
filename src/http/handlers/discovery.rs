@@ -28,6 +28,7 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
+    library::managed_episode_tombstone_matches_series,
     metadata::DiscoveryResult,
     orchestrator::model::ProviderEndpoint,
     state::AppState,
@@ -756,6 +757,42 @@ async fn persist_managed_ingest_intent(
             source: "find_media_add".to_string(),
         })
         .await?;
+
+    let tombstones = store.list_active_managed_media_tombstones().await?;
+    for tombstone in tombstones {
+        let same_provider_item = tombstone.manager_provider_id == Some(manager_provider_id)
+            && tombstone.manager_item_id.as_deref() == manager_item_id;
+        let same_title = managed_tombstone_media_type_compatible(media_type, tombstone.media_type)
+            && tombstone.normalized_title == normalize_name(title)
+            && match (tombstone.year, item.year) {
+                (Some(left), Some(right)) => left == right,
+                (None, _) | (_, None) => true,
+            };
+        if same_provider_item || same_title {
+            store
+                .deactivate_managed_media_tombstone(tombstone.tombstone_id)
+                .await?;
+        }
+    }
+
+    let episode_tombstones = store.list_active_managed_episode_tombstones().await?;
+    let external_ids = item.external_ids.clone().unwrap_or_default();
+    for tombstone in episode_tombstones {
+        let same_provider_item = tombstone.manager_provider_id == Some(manager_provider_id)
+            && tombstone.manager_item_id.as_deref() == manager_item_id;
+        let same_series = managed_episode_tombstone_matches_series(
+            media_type,
+            title,
+            item.year,
+            &external_ids,
+            &tombstone,
+        );
+        if same_provider_item || same_series {
+            store
+                .deactivate_managed_episode_tombstone(tombstone.tombstone_id)
+                .await?;
+        }
+    }
 
     debug!(
         media_type = ?media_type,
@@ -2935,6 +2972,12 @@ fn normalize_name(value: &str) -> String {
         .trim()
         .to_ascii_lowercase()
         .replace([' ', '-', '_', ':'], "")
+}
+
+fn managed_tombstone_media_type_compatible(candidate: MediaType, blocked: MediaType) -> bool {
+    candidate == blocked
+        || (candidate == MediaType::Series && blocked == MediaType::Anime)
+        || (candidate == MediaType::Anime && blocked == MediaType::Series)
 }
 
 fn sort_find_media_results(query: &str, results: &mut [FindMediaResult]) {

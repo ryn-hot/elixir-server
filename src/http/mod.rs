@@ -192,7 +192,14 @@ pub fn router(state: AppState) -> Router {
             post(handlers::auth::complete_password_reset),
         )
         .route("/api/v1/library/items", get(handlers::library::list_items))
-        .route("/api/v1/library/items/:id", get(handlers::library::detail))
+        .route(
+            "/api/v1/library/items/:id",
+            get(handlers::library::detail).delete(handlers::library::delete_item),
+        )
+        .route(
+            "/api/v1/library/items/:id/restore-blocked-episodes",
+            post(handlers::library::restore_blocked_episodes),
+        )
         .route(
             "/api/v1/library/series/:id/seasons",
             get(handlers::library::list_seasons),
@@ -204,6 +211,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/library/seasons/:id/episodes",
             get(handlers::library::list_episodes),
+        )
+        .route(
+            "/api/v1/library/episodes/:id",
+            delete(handlers::library::delete_episode),
+        )
+        .route(
+            "/api/v1/library/episodes/:id/restore",
+            post(handlers::library::restore_episode),
         )
         .route("/api/v1/library/scan", post(handlers::library::scan))
         .route("/api/v1/artwork/:id", get(handlers::artwork::get_artwork))

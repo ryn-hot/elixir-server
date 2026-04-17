@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +68,12 @@ use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthSta
 use crate::state::AppState;
 
 mod control;
+mod control_contract;
+
+use control_contract::{
+    control_notice, control_policy_managed, control_policy_observed, control_policy_seeded,
+    repair_managed_invariants_action, section_has_managed_drift,
+};
 
 const EXTENSION_UI_TOKEN_TTL_MINUTES: u64 = 60 * 12;
 
@@ -390,12 +396,35 @@ pub struct ExtensionControlSection {
     pub id: String,
     pub title: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ExtensionControlPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<ExtensionControlNotice>,
     #[serde(default)]
     pub fields: Vec<ExtensionControlField>,
     #[serde(default)]
     pub entities: Vec<ExtensionControlEntity>,
     #[serde(default)]
     pub actions: Vec<ExtensionControlAction>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlPolicy {
+    pub mode: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlNotice {
+    pub severity: String,
+    pub code: String,
+    pub title: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ExtensionControlAction>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2037,6 +2066,17 @@ pub async fn reconcile_now(State(state): State<AppState>) -> ApiResult<Json<Reco
     Ok(Json(ReconcileRunResponse { run }))
 }
 
+async fn run_managed_repair_once(state: &AppState) -> anyhow::Result<()> {
+    let config = ReconcileConfig::from_settings(&state.settings);
+    state.orchestrator.reconcile_once(&config).await?;
+    Ok(())
+}
+
+async fn run_extension_control_managed_repair(state: &AppState) -> anyhow::Result<String> {
+    run_managed_repair_once(state).await?;
+    Ok("Re-applied Elixir-managed settings.".to_string())
+}
+
 pub async fn reconcile_latest(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ReconcileRunResponse>> {
@@ -3481,17 +3521,74 @@ fn should_fetch_live_downloader_state(health_state: ProviderHealthState) -> bool
 #[derive(Debug, Clone)]
 struct ExtensionControlContext {
     extension: Extension,
+    manifest: ExtensionManifest,
     summary: ExtensionStatusSummaryItem,
     instances: Vec<ExtensionInstance>,
     selected_instance: Option<ExtensionInstance>,
     providers: Vec<Provider>,
     selected_provider: Option<Provider>,
+    control_binding: ExtensionControlBinding,
 }
 
 #[derive(Debug, Default, Clone)]
 struct ExtensionControlLiveSnapshot {
     version: Option<String>,
     metrics: Vec<ExtensionControlMetric>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExtensionControlBinding {
+    Sonarr,
+    Radarr,
+    Prowlarr,
+    Qbittorrent,
+    Nzbget,
+    GenericManifest,
+    Unsupported,
+}
+
+impl ExtensionControlBinding {
+    fn from_provider(provider: &Provider) -> Option<Self> {
+        Self::from_signature(&provider.capability, provider.implementation.as_deref())
+    }
+
+    fn from_manifest(manifest: &ExtensionManifest) -> Option<Self> {
+        let mut bindings = Vec::new();
+        for provide in &manifest.provides {
+            let Some(binding) =
+                Self::from_signature(&provide.capability, provide.implementation.as_deref())
+            else {
+                continue;
+            };
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        match bindings.as_slice() {
+            [binding] => Some(*binding),
+            _ => None,
+        }
+    }
+
+    fn from_signature(capability: &str, implementation: Option<&str>) -> Option<Self> {
+        let implementation = implementation.map(str::trim);
+        match (capability.trim(), implementation) {
+            ("media.manager.tv", Some("sonarr")) => Some(Self::Sonarr),
+            ("media.manager.movies", Some("radarr")) => Some(Self::Radarr),
+            ("indexer.registry", Some("prowlarr")) => Some(Self::Prowlarr),
+            ("downloader.torrent", Some("qbittorrent")) => Some(Self::Qbittorrent),
+            ("downloader.nzb", Some("nzbget")) => Some(Self::Nzbget),
+            _ => None,
+        }
+    }
+
+    fn arr_implementation(self) -> Option<&'static str> {
+        match self {
+            Self::Sonarr => Some("sonarr"),
+            Self::Radarr => Some("radarr"),
+            _ => None,
+        }
+    }
 }
 
 async fn build_extension_control_surface(
@@ -3531,7 +3628,7 @@ async fn build_extension_control_surface(
         details
             .push("Create or enable a default instance to manage this extension here.".to_string());
     }
-    let status = ExtensionControlStatus {
+    let mut status = ExtensionControlStatus {
         health: control_health_for_summary(&context.summary),
         summary: context.summary.label.clone(),
         details,
@@ -3545,6 +3642,11 @@ async fn build_extension_control_surface(
         .as_ref()
         .and_then(|provider| provider.implementation.clone());
     let mut sections = control::build_sections(state, store, &context).await?;
+    if let Some(section) =
+        build_extension_control_managed_invariants_section(state, store, &context).await?
+    {
+        sections.push(section);
+    }
     if let Some(section) = build_extension_control_open_web_ui_section(&context).await? {
         sections.push(section);
     }
@@ -3552,6 +3654,30 @@ async fn build_extension_control_surface(
         sections.push(section);
     }
     sections.push(build_extension_control_overview_section(&context));
+
+    let mut managed_drift_titles = Vec::new();
+    for section in &sections {
+        if !section_has_managed_drift(section) {
+            continue;
+        }
+        for notice in &section.notices {
+            if notice.code.starts_with("managed_") {
+                managed_drift_titles.push(notice.title.clone());
+            }
+        }
+    }
+    if !managed_drift_titles.is_empty() {
+        status.health = "attention".to_string();
+        status.summary = "Managed drift detected".to_string();
+        status.details.insert(
+            0,
+            "Elixir detected downstream changes to settings it owns. Repair them in Elixir instead of treating the downstream edits as the new source of truth."
+                .to_string(),
+        );
+        for title in managed_drift_titles.into_iter().take(3) {
+            status.details.push(format!("Managed drift: {title}"));
+        }
+    }
 
     Ok(ExtensionControlSurface {
         extension_id: context.extension.extension_id.clone(),
@@ -3736,6 +3862,10 @@ async fn build_extension_control_prowlarr_indexers_section(
         description:
             "Elixir-managed connectors keep known indexers aligned automatically. Indexers added manually in Prowlarr are shown here too, but Elixir will not overwrite or remove them."
                 .to_string(),
+        policy: Some(control_policy_observed(
+            "Elixir live-reads this downstream state. Manual Prowlarr indexers remain visible here and are not silently overwritten.",
+        )),
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: Vec::new(),
@@ -3934,6 +4064,8 @@ async fn build_extension_control_prowlarr_connector_section(
         description:
             "Use managed connectors for curated indexer setups. Connectors keep their downstream Prowlarr entries aligned and let Elixir track whether they are actually working."
                 .to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: vec![ExtensionControlAction {
@@ -4016,6 +4148,8 @@ async fn build_extension_control_open_web_ui_section(
         id: "manualSetup".to_string(),
         title: "Open web UI".to_string(),
         description: description.to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields: Vec::new(),
         entities: Vec::new(),
         actions: vec![action],
@@ -4031,6 +4165,7 @@ async fn load_extension_control_context(
         .get_extension(extension_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("extension not found"))?;
+    let manifest = parse_extension_control_manifest(&extension);
     let summary = build_extension_status_summary(state, store)
         .await?
         .items
@@ -4044,16 +4179,56 @@ async fn load_extension_control_context(
     } else {
         Vec::new()
     };
-    let selected_provider = choose_extension_control_provider(extension_id, &providers);
+    let selected_provider = choose_extension_control_provider(&manifest, &providers);
+    let control_binding =
+        determine_extension_control_binding(&manifest, selected_provider.as_ref());
 
     Ok(ExtensionControlContext {
         extension,
+        manifest,
         summary,
         instances,
         selected_instance,
         providers,
         selected_provider,
+        control_binding,
     })
+}
+
+fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest {
+    match serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone()) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(
+                "extension control manifest fallback for {}: {err}",
+                extension.extension_id
+            );
+            ExtensionManifest {
+                id: extension.extension_id.clone(),
+                version: extension.version.clone(),
+                kind: extension.kind.clone(),
+                name: extension.name.clone(),
+                description: None,
+                publisher: None,
+                trust: None,
+                permissions: Vec::new(),
+                provides: Vec::new(),
+                requires: Vec::new(),
+                conflicts: Vec::new(),
+                runtime: None,
+                targets: Vec::new(),
+                actions: Vec::new(),
+                connectors: Vec::new(),
+                optional_addons: Vec::new(),
+                wants: Vec::new(),
+                preferences: None,
+                bindings: Vec::new(),
+                policies: None,
+                networking: None,
+                control_surface: None,
+            }
+        }
+    }
 }
 
 fn choose_extension_control_instance(instances: &[ExtensionInstance]) -> Option<ExtensionInstance> {
@@ -4079,28 +4254,13 @@ fn choose_extension_control_instance(instances: &[ExtensionInstance]) -> Option<
 }
 
 fn choose_extension_control_provider(
-    extension_id: &str,
+    manifest: &ExtensionManifest,
     providers: &[Provider],
 ) -> Option<Provider> {
-    let extension_id = extension_id.to_ascii_lowercase();
-    let preferred_capability = if extension_id.contains("sonarr") {
-        Some("media.manager.tv")
-    } else if extension_id.contains("radarr") {
-        Some("media.manager.movies")
-    } else if extension_id.contains("prowlarr") {
-        Some("indexer.registry")
-    } else if extension_id.contains("qbittorrent") {
-        Some("downloader.torrent")
-    } else if extension_id.contains("nzbget") {
-        Some("downloader.nzb")
-    } else {
-        None
-    };
-
-    if let Some(capability) = preferred_capability {
+    if let Some(binding) = ExtensionControlBinding::from_manifest(manifest) {
         if let Some(provider) = providers
             .iter()
-            .find(|provider| provider.capability == capability)
+            .find(|provider| ExtensionControlBinding::from_provider(provider) == Some(binding))
             .cloned()
         {
             return Some(provider);
@@ -4110,6 +4270,29 @@ fn choose_extension_control_provider(
     let mut sorted = providers.to_vec();
     sorted.sort_by(|left, right| left.capability.cmp(&right.capability));
     sorted.into_iter().next()
+}
+
+fn determine_extension_control_binding(
+    manifest: &ExtensionManifest,
+    selected_provider: Option<&Provider>,
+) -> ExtensionControlBinding {
+    if let Some(provider) = selected_provider {
+        if let Some(binding) = ExtensionControlBinding::from_provider(provider) {
+            return binding;
+        }
+    }
+    if let Some(binding) = ExtensionControlBinding::from_manifest(manifest) {
+        return binding;
+    }
+    if manifest
+        .control_surface
+        .as_ref()
+        .map(|surface| surface.adapter.trim().eq_ignore_ascii_case("generic_v1"))
+        .unwrap_or(false)
+    {
+        return ExtensionControlBinding::GenericManifest;
+    }
+    ExtensionControlBinding::Unsupported
 }
 
 fn control_health_for_summary(summary: &ExtensionStatusSummaryItem) -> String {
@@ -4173,6 +4356,8 @@ fn build_extension_control_overview_section(
         id: "overview".to_string(),
         title: "Overview".to_string(),
         description: "High-level status for this extension.".to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields,
         entities: Vec::new(),
         actions: Vec::new(),
@@ -4234,6 +4419,8 @@ fn build_extension_control_service_section(
         id: "service".to_string(),
         title: "Service".to_string(),
         description: "Live status from the managed service when it is reachable.".to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields,
         entities: Vec::new(),
         actions: Vec::new(),
@@ -4345,9 +4532,10 @@ async fn build_extension_control_settings_section(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Option<ExtensionControlSection>> {
-    let extension_id = context.extension.extension_id.to_ascii_lowercase();
-
-    if extension_id.contains("sonarr") || extension_id.contains("radarr") {
+    if matches!(
+        context.control_binding,
+        ExtensionControlBinding::Sonarr | ExtensionControlBinding::Radarr
+    ) {
         let Some(instance) = context.selected_instance.as_ref() else {
             return Ok(None);
         };
@@ -4358,6 +4546,10 @@ async fn build_extension_control_settings_section(
             description:
                 "These defaults are used when you add media from Find Media into this manager."
                     .to_string(),
+            policy: Some(control_policy_seeded(
+                "Elixir seeds these defaults when you add media. Downstream manager edits are allowed and can become the new live value.",
+            )),
+            notices: Vec::new(),
             fields: vec![
                 ExtensionControlField {
                     id: "monitorOnAdd".to_string(),
@@ -4393,7 +4585,10 @@ async fn build_extension_control_settings_section(
         }));
     }
 
-    if extension_id.contains("qbittorrent") || extension_id.contains("nzbget") {
+    if matches!(
+        context.control_binding,
+        ExtensionControlBinding::Qbittorrent | ExtensionControlBinding::Nzbget
+    ) {
         let override_value = store
             .get_extension_setting(DOWNLOADER_PROFILE_SETTING_KEY)
             .await?;
@@ -4407,6 +4602,10 @@ async fn build_extension_control_settings_section(
             description:
                 "This shared profile tunes Elixir-managed downloaders for balanced or aggressive use."
                     .to_string(),
+            policy: Some(control_policy_seeded(
+                "Elixir seeds the downloader performance profile. The profile choice is a default, while stack-critical downloader paths and categories remain managed invariants.",
+            )),
+            notices: Vec::new(),
             fields: vec![ExtensionControlField {
                 id: "downloaderProfile".to_string(),
                 label: "Performance profile".to_string(),
@@ -4442,8 +4641,10 @@ async fn build_extension_control_download_client_preference_section(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Option<ExtensionControlSection>> {
-    let extension_id = context.extension.extension_id.to_ascii_lowercase();
-    if !extension_id.contains("sonarr") && !extension_id.contains("radarr") {
+    if !matches!(
+        context.control_binding,
+        ExtensionControlBinding::Sonarr | ExtensionControlBinding::Radarr
+    ) {
         return Ok(None);
     }
 
@@ -4488,6 +4689,10 @@ async fn build_extension_control_download_client_preference_section(
         id: "downloadClientPreference".to_string(),
         title: "Download client preference".to_string(),
         description,
+        policy: Some(control_policy_seeded(
+            "Elixir seeds manager protocol preference here. If you change download-client priority downstream, Elixir reflects the new live order instead of silently fighting it.",
+        )),
+        notices: Vec::new(),
         fields: vec![ExtensionControlField {
             id: "downloadClientPreference".to_string(),
             label: "Preferred source".to_string(),
@@ -4562,10 +4767,574 @@ async fn build_extension_control_managed_items_section(
         description:
             "Recent media accepted by this manager through Elixir. Use these actions to search, refresh, or remove a request."
                 .to_string(),
+        policy: None,
+        notices: Vec::new(),
         fields: Vec::new(),
         entities,
         actions: build_extension_control_manager_actions(&implementation),
     }))
+}
+
+#[derive(Debug, Clone)]
+struct ManagedArrDownloaderExpectation {
+    label: &'static str,
+    implementation: &'static str,
+    host: String,
+    port: u16,
+    category: &'static str,
+}
+
+async fn build_extension_control_managed_invariants_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let result = match context.control_binding {
+        ExtensionControlBinding::Sonarr => tokio::time::timeout(
+            Duration::from_secs(3),
+            build_arr_managed_invariants_section(state, store, context, "sonarr"),
+        )
+        .await
+        .ok()
+        .transpose()?
+        .flatten(),
+        ExtensionControlBinding::Radarr => tokio::time::timeout(
+            Duration::from_secs(3),
+            build_arr_managed_invariants_section(state, store, context, "radarr"),
+        )
+        .await
+        .ok()
+        .transpose()?
+        .flatten(),
+        ExtensionControlBinding::Qbittorrent => tokio::time::timeout(
+            Duration::from_secs(3),
+            build_qbittorrent_managed_invariants_section(state, store, context),
+        )
+        .await
+        .ok()
+        .transpose()?
+        .flatten(),
+        ExtensionControlBinding::Nzbget => tokio::time::timeout(
+            Duration::from_secs(3),
+            build_nzbget_managed_invariants_section(state, store, context),
+        )
+        .await
+        .ok()
+        .transpose()?
+        .flatten(),
+        _ => None,
+    };
+
+    Ok(result)
+}
+
+async fn build_arr_managed_invariants_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    implementation: &str,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let expected = resolve_arr_managed_downloader_expectations(store, implementation).await?;
+    if expected.is_empty() {
+        return Ok(None);
+    }
+
+    let clients = load_arr_control_download_clients(state, store, context).await?;
+    let mut notices = Vec::new();
+
+    for expected_client in expected {
+        let Some(client) =
+            find_arr_download_client_by_implementation(&clients, expected_client.implementation)
+        else {
+            notices.push(control_notice(
+                "error",
+                "managed_downloader_missing",
+                &format!("{} wiring missing", expected_client.label),
+                format!(
+                    "Elixir manages a {} download client in {}. The manager no longer exposes that client, so stack wiring has drifted.",
+                    expected_client.label,
+                    if implementation == "sonarr" {
+                        "Sonarr"
+                    } else {
+                        "Radarr"
+                    }
+                ),
+            ));
+            continue;
+        };
+
+        let detail =
+            load_arr_control_download_client_detail(state, store, context, client.id).await?;
+        let live_host_port = extract_arr_download_client_host_port(&detail);
+        match live_host_port {
+            Some((host, port))
+                if host.eq_ignore_ascii_case(&expected_client.host) && port == expected_client.port => {}
+            Some((host, port)) => notices.push(control_notice(
+                "error",
+                "managed_downloader_endpoint_drift",
+                &format!("{} endpoint drifted", expected_client.label),
+                format!(
+                    "Elixir manages this {} client at {}:{}, but the manager is currently pointing to {}:{}.",
+                    expected_client.label,
+                    expected_client.host,
+                    expected_client.port,
+                    host,
+                    port
+                ),
+            )),
+            None => notices.push(control_notice(
+                "warning",
+                "managed_downloader_endpoint_unknown",
+                &format!("{} endpoint could not be verified", expected_client.label),
+                format!(
+                    "Elixir could not read a host and port for the managed {} client, so endpoint drift cannot be ruled out.",
+                    expected_client.label
+                ),
+            )),
+        }
+
+        let live_category = extract_arr_download_client_category(&detail);
+        match live_category.as_deref() {
+            Some(value) if value.eq_ignore_ascii_case(expected_client.category) => {}
+            Some(value) => notices.push(control_notice(
+                "error",
+                "managed_downloader_category_drift",
+                &format!("{} category drifted", expected_client.label),
+                format!(
+                    "Elixir manages the {} category as '{}', but the manager is using '{}'.",
+                    expected_client.label,
+                    expected_client.category,
+                    value
+                ),
+            )),
+            None => notices.push(control_notice(
+                "warning",
+                "managed_downloader_category_missing",
+                &format!("{} category could not be verified", expected_client.label),
+                format!(
+                    "Elixir could not read the managed category field for {}. Downstream drift cannot be verified until the manager exposes it again.",
+                    expected_client.label
+                ),
+            )),
+        }
+
+        if !client.enabled {
+            notices.push(control_notice(
+                "error",
+                "managed_downloader_disabled",
+                &format!("{} is disabled", expected_client.label),
+                format!(
+                    "Elixir manages the {} client as enabled, but it is disabled downstream.",
+                    expected_client.label
+                ),
+            ));
+        }
+    }
+
+    if notices.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ExtensionControlSection {
+        id: "managedInvariants".to_string(),
+        title: "Managed invariants".to_string(),
+        description:
+            "Elixir owns stack-critical manager wiring here. Downstream edits are treated as drift and should be repaired instead of silently adopted."
+                .to_string(),
+        policy: Some(control_policy_managed(
+            "These settings are stack invariants. Elixir does not silently accept downstream edits because other extensions depend on them staying aligned.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities: Vec::new(),
+        actions: vec![repair_managed_invariants_action()],
+    }))
+}
+
+async fn build_qbittorrent_managed_invariants_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let prefs = control::load_qbittorrent_preferences(state, store, context).await?;
+    let categories = control::load_qbittorrent_categories(state, store, context).await?;
+    let mut notices = Vec::new();
+
+    let expected_prefs = [
+        (
+            "save_path",
+            serde_json::Value::String("/downloads".to_string()),
+        ),
+        (
+            "temp_path",
+            serde_json::Value::String("/runtime/incomplete".to_string()),
+        ),
+        ("temp_path_enabled", serde_json::Value::Bool(true)),
+    ];
+
+    for (key, expected) in expected_prefs {
+        match prefs.get(key) {
+            Some(value) if *value == expected => {}
+            Some(value) => notices.push(control_notice(
+                "error",
+                "managed_qbittorrent_pref_drift",
+                &format!("qBittorrent {} drifted", key.replace('_', " ")),
+                format!(
+                    "Elixir manages qBittorrent {} as {}, but the live value is {}.",
+                    key.replace('_', " "),
+                    display_control_json_value(&expected),
+                    display_control_json_value(value)
+                ),
+            )),
+            None => notices.push(control_notice(
+                "warning",
+                "managed_qbittorrent_pref_missing",
+                &format!("qBittorrent {} could not be read", key.replace('_', " ")),
+                format!(
+                    "Elixir could not read the live qBittorrent preference '{}', so managed drift cannot be ruled out.",
+                    key
+                ),
+            )),
+        }
+    }
+
+    let expected_categories = [
+        ("tv", "/downloads/tv"),
+        ("anime", "/downloads/anime"),
+        ("movies", "/downloads/movies"),
+    ];
+    for (name, expected_path) in expected_categories {
+        match categories
+            .get(name)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|value| value.get("savePath"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(path) if path == expected_path => {}
+            Some(path) => notices.push(control_notice(
+                "error",
+                "managed_qbittorrent_category_drift",
+                &format!("qBittorrent category '{}' drifted", name),
+                format!(
+                    "Elixir manages qBittorrent category '{}' at {}, but the live path is {}.",
+                    name, expected_path, path
+                ),
+            )),
+            None => notices.push(control_notice(
+                "error",
+                "managed_qbittorrent_category_missing",
+                &format!("qBittorrent category '{}' is missing", name),
+                format!(
+                    "Elixir manages qBittorrent category '{}' at {}, but the live category is missing.",
+                    name, expected_path
+                ),
+            )),
+        }
+    }
+
+    if notices.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ExtensionControlSection {
+        id: "managedInvariants".to_string(),
+        title: "Managed invariants".to_string(),
+        description:
+            "Elixir owns the downloader paths and category routing the rest of the stack depends on."
+                .to_string(),
+        policy: Some(control_policy_managed(
+            "These qBittorrent paths and categories are stack invariants. Downstream edits are flagged as drift because manager/downloader wiring depends on them.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities: Vec::new(),
+        actions: vec![repair_managed_invariants_action()],
+    }))
+}
+
+async fn build_nzbget_managed_invariants_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let config = control::load_nzbget_live_config_map(state, store, context).await?;
+    let mut notices = Vec::new();
+
+    for (key, expected) in [
+        ("DestDir", "/downloads"),
+        ("InterDir", "/runtime/incomplete"),
+        ("NzbDir", "/runtime/nzb"),
+        ("QueueDir", "/runtime/queue"),
+        ("TempDir", "/runtime/tmp"),
+        ("LockFile", "/config/nzbget.lock"),
+    ] {
+        match config.get(key) {
+            Some(value) if value == expected => {}
+            Some(value) => notices.push(control_notice(
+                "error",
+                "managed_nzbget_path_drift",
+                &format!("NZBGet {} drifted", key),
+                format!(
+                    "Elixir manages NZBGet {} as {}, but the live value is {}.",
+                    key, expected, value
+                ),
+            )),
+            None => notices.push(control_notice(
+                "warning",
+                "managed_nzbget_path_missing",
+                &format!("NZBGet {} could not be read", key),
+                format!(
+                    "Elixir could not read live NZBGet setting '{}', so managed drift cannot be ruled out.",
+                    key
+                ),
+            )),
+        }
+    }
+
+    let category_paths = parse_nzbget_live_category_paths(&config);
+    for (name, expected_path) in [
+        ("tv", "/downloads/tv"),
+        ("anime", "/downloads/anime"),
+        ("movies", "/downloads/movies"),
+    ] {
+        match category_paths.get(name) {
+            Some(path) if path == expected_path => {}
+            Some(path) => notices.push(control_notice(
+                "error",
+                "managed_nzbget_category_drift",
+                &format!("NZBGet category '{}' drifted", name),
+                format!(
+                    "Elixir manages NZBGet category '{}' at {}, but the live path is {}.",
+                    name, expected_path, path
+                ),
+            )),
+            None => notices.push(control_notice(
+                "error",
+                "managed_nzbget_category_missing",
+                &format!("NZBGet category '{}' is missing", name),
+                format!(
+                    "Elixir manages NZBGet category '{}' at {}, but the live category is missing.",
+                    name, expected_path
+                ),
+            )),
+        }
+    }
+
+    if notices.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ExtensionControlSection {
+        id: "managedInvariants".to_string(),
+        title: "Managed invariants".to_string(),
+        description: "Elixir owns the NZBGet paths and categories the Arr stack depends on."
+            .to_string(),
+        policy: Some(control_policy_managed(
+            "These NZBGet defaults are stack invariants. Downstream edits are flagged as drift because manager autowiring depends on them remaining aligned.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities: Vec::new(),
+        actions: vec![repair_managed_invariants_action()],
+    }))
+}
+
+async fn resolve_arr_managed_downloader_expectations(
+    store: &ExtensionStore<'_>,
+    implementation: &str,
+) -> anyhow::Result<Vec<ManagedArrDownloaderExpectation>> {
+    let category = if implementation == "sonarr" {
+        "tv"
+    } else {
+        "movies"
+    };
+    let mut items = Vec::new();
+
+    if let Some((host, port)) = resolve_first_party_downloader_endpoint(
+        store,
+        "elixir.modules.nzbget",
+        "downloader.nzb",
+        "nzbget",
+    )
+    .await?
+    {
+        items.push(ManagedArrDownloaderExpectation {
+            label: "NZBGet",
+            implementation: "nzbget",
+            host,
+            port,
+            category,
+        });
+    }
+    if let Some((host, port)) = resolve_first_party_downloader_endpoint(
+        store,
+        "elixir.modules.qbittorrent",
+        "downloader.torrent",
+        "qbittorrent",
+    )
+    .await?
+    {
+        items.push(ManagedArrDownloaderExpectation {
+            label: "qBittorrent",
+            implementation: "qbittorrent",
+            host,
+            port,
+            category,
+        });
+    }
+
+    Ok(items)
+}
+
+async fn resolve_first_party_downloader_endpoint(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    capability: &str,
+    implementation: &str,
+) -> anyhow::Result<Option<(String, u16)>> {
+    let instances = store.list_instances(Some(extension_id)).await?;
+    let Some(instance) = choose_extension_control_instance(&instances) else {
+        return Ok(None);
+    };
+    let providers = store.list_providers(Some(instance.instance_id)).await?;
+    let Some(provider) = providers.into_iter().find(|provider| {
+        provider.capability == capability
+            && provider
+                .implementation
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(implementation))
+                .unwrap_or(false)
+    }) else {
+        return Ok(None);
+    };
+    let endpoint_json = provider
+        .endpoint_json
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    Ok(Some((endpoint.host, endpoint.port)))
+}
+
+fn find_arr_download_client_by_implementation<'a>(
+    clients: &'a [ArrControlDownloadClient],
+    implementation: &str,
+) -> Option<&'a ArrControlDownloadClient> {
+    clients
+        .iter()
+        .find(|client| {
+            client
+                .implementation
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(implementation))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            clients.iter().find(|client| {
+                client
+                    .name
+                    .eq_ignore_ascii_case(if implementation == "qbittorrent" {
+                        "qBittorrent"
+                    } else {
+                        "NZBGet"
+                    })
+            })
+        })
+}
+
+fn extract_control_json_field_text(value: &serde_json::Value, name: &str) -> Option<String> {
+    value
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|fields| {
+            fields.iter().find_map(|field| {
+                let field_name = field.get("name").and_then(serde_json::Value::as_str)?;
+                if !field_name.eq_ignore_ascii_case(name) {
+                    return None;
+                }
+                field
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| field.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn extract_arr_download_client_host_port(value: &serde_json::Value) -> Option<(String, u16)> {
+    if let Some(url_text) = extract_control_json_field_text(value, "baseUrl")
+        .or_else(|| extract_control_json_field_text(value, "url"))
+    {
+        if let Ok(parsed) = Url::parse(&url_text) {
+            if let Some(host) = parsed.host_str() {
+                return Some((
+                    host.to_string(),
+                    parsed.port_or_known_default().unwrap_or(80),
+                ));
+            }
+        }
+    }
+
+    let host = extract_control_json_field_text(value, "host")?;
+    let port = extract_control_json_field_i64(value, "port")
+        .and_then(|number| u16::try_from(number).ok())?;
+    Some((host, port))
+}
+
+fn extract_arr_download_client_category(value: &serde_json::Value) -> Option<String> {
+    for key in ["category", "tvCategory", "movieCategory"] {
+        if let Some(value) = extract_control_json_field_text(value, key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn display_control_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_nzbget_live_category_paths(config: &BTreeMap<String, String>) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut paths = HashMap::new();
+
+    for (key, value) in config {
+        let Some((slot, field)) = parse_nzbget_live_category_key(key) else {
+            continue;
+        };
+        match field {
+            "Name" => {
+                names.insert(slot, value.trim().to_ascii_lowercase());
+            }
+            "DestDir" => {
+                paths.insert(slot, value.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let mut categories = HashMap::new();
+    for (slot, name) in names {
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(path) = paths.get(&slot) {
+            categories.insert(name, path.clone());
+        }
+    }
+    categories
+}
+
+fn parse_nzbget_live_category_key(name: &str) -> Option<(u32, &str)> {
+    let remainder = name.strip_prefix("Category")?;
+    let (slot, field) = remainder.split_once('.')?;
+    Some((slot.parse().ok()?, field))
 }
 
 fn build_extension_control_managed_item_entity(
@@ -5742,15 +6511,17 @@ fn rewrite_extension_ui_initialize_json(bytes: &[u8], proxy_prefix: &str) -> Str
 #[cfg(test)]
 mod extension_ui_proxy_tests {
     use super::{
-        ExtensionControlContext, ExtensionStatusSummaryItem, ExtensionUiProxyTarget,
-        ExtensionUiUpstreamAuth, build_extension_control_open_service_ui_action,
-        build_extension_ui_proxy_client, build_extension_ui_start_html,
-        build_extension_ui_upstream_request, rewrite_extension_ui_initialize_json,
+        ExtensionControlBinding, ExtensionControlContext, ExtensionStatusSummaryItem,
+        ExtensionUiProxyTarget, ExtensionUiUpstreamAuth,
+        build_extension_control_open_service_ui_action, build_extension_ui_proxy_client,
+        build_extension_ui_start_html, build_extension_ui_upstream_request,
+        rewrite_extension_ui_initialize_json,
     };
     use crate::db::models::{
         Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel, Provider,
         ProviderHealthState, SlotCardinality,
     };
+    use crate::extensions::manifest::ExtensionManifest;
     use axum::{Router, http::HeaderMap as AxumHeaderMap, routing::post};
     use chrono::Utc;
     use reqwest::{Method as ReqwestMethod, Url};
@@ -5960,6 +6731,30 @@ mod extension_ui_proxy_tests {
             implementation: &str,
         ) -> ExtensionControlContext {
             let instance_id = Uuid::new_v4();
+            let manifest = ExtensionManifest {
+                id: extension_id.to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                name: extension_name.to_string(),
+                description: None,
+                publisher: None,
+                trust: None,
+                permissions: Vec::new(),
+                provides: Vec::new(),
+                requires: Vec::new(),
+                conflicts: Vec::new(),
+                runtime: None,
+                targets: Vec::new(),
+                actions: Vec::new(),
+                connectors: Vec::new(),
+                optional_addons: Vec::new(),
+                wants: Vec::new(),
+                preferences: None,
+                bindings: Vec::new(),
+                policies: None,
+                networking: None,
+                control_surface: None,
+            };
             ExtensionControlContext {
                 extension: Extension {
                     extension_id: extension_id.to_string(),
@@ -5974,6 +6769,7 @@ mod extension_ui_proxy_tests {
                     installed_at: Utc::now(),
                     enabled: true,
                 },
+                manifest,
                 summary: ExtensionStatusSummaryItem {
                     extension_id: extension_id.to_string(),
                     name: extension_name.to_string(),
@@ -6039,6 +6835,7 @@ mod extension_ui_proxy_tests {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }),
+                control_binding: ExtensionControlBinding::Unsupported,
             }
         }
 
@@ -6310,6 +7107,44 @@ async fn execute_extension_control_manager_command(
         }
         _ => anyhow::bail!("unsupported control action '{action_id}' for {implementation}"),
     }
+}
+
+pub(crate) async fn remove_managed_library_item_from_manager(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &crate::db::models::Provider,
+    manager_item_id: i64,
+) -> anyhow::Result<String> {
+    let instance = store
+        .get_instance(provider.instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("manager instance is no longer available"))?;
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+    let implementation = provider
+        .implementation
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let candidate_keys = match implementation.as_str() {
+        "sonarr" => vec!["sonarr_api_key", "api_key"],
+        "radarr" => vec!["radarr_api_key", "api_key"],
+        _ => anyhow::bail!("stop tracking is not supported for {}", implementation),
+    };
+    let api_key = resolve_control_api_key(state, store, &instance, &candidate_keys).await?;
+    execute_extension_control_manager_command(
+        implementation.as_str(),
+        &base_url,
+        &api_key,
+        "remove_item",
+        Some(manager_item_id),
+    )
+    .await
 }
 
 async fn load_sonarr_control_snapshot(
