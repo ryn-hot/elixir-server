@@ -26,17 +26,18 @@ use crate::drivers::{
     IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
 };
 use crate::extensions::manifest::{
-    ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress, ManifestRuntimeEnv,
+    ExtensionManifest, ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress,
+    ManifestRuntimeEnv,
 };
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
 use crate::extensions::store::{
-    ExtensionStore, NewBinding, NewExtensionInstance, NewProvider, NewSecret,
+    ExtensionStore, NewBinding, NewExtensionInstance, NewProvider, NewSecret, ProviderDetails,
 };
 use crate::orchestrator::bindings::ensure_binding_connectivity;
 use crate::orchestrator::model::ProviderEndpoint;
-use crate::orchestrator::naming::container_name;
+use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::runtime::model::{
     ContainerHandle, ContainerSpec, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
 };
@@ -1998,28 +1999,39 @@ async fn resolve_downloader_credentials(
     };
 
     for downloader in downloaders {
-        if downloader_has_credentials(downloader) {
-            continue;
-        }
         let host_hint = url_host(&downloader.url);
         if is_qbittorrent_downloader(&downloader.r#type) {
-            let instance =
-                resolve_qbittorrent_instance_for_downloader(store, host_hint.as_deref()).await?;
+            let target =
+                resolve_qbittorrent_target_for_downloader(store, host_hint.as_deref()).await?;
+            downloader.url = target.endpoint.canonical_url()?;
+            if downloader_has_credentials(downloader) {
+                continue;
+            }
             let (username, password) =
-                resolve_qbittorrent_credentials(store, secrets, &instance).await?;
+                resolve_qbittorrent_credentials(store, secrets, &target.instance).await?;
             apply_downloader_credentials(downloader, username, password);
             continue;
         }
         if is_nzbget_downloader(&downloader.r#type) {
-            let instance =
-                resolve_nzbget_instance_for_downloader(store, host_hint.as_deref()).await?;
+            let target = resolve_nzbget_target_for_downloader(store, host_hint.as_deref()).await?;
+            downloader.url = target.endpoint.canonical_url()?;
+            if downloader_has_credentials(downloader) {
+                continue;
+            }
             let (username, password) =
-                resolve_nzbget_credentials(store, secrets, &instance).await?;
+                resolve_nzbget_credentials(store, secrets, &target.instance).await?;
             apply_downloader_credentials(downloader, username, password);
             continue;
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ManagedProviderTarget {
+    instance: crate::db::models::ExtensionInstance,
+    endpoint: ProviderEndpoint,
+    aliases: Vec<String>,
 }
 
 fn is_sonarr_app(implementation: &str) -> bool {
@@ -2091,242 +2103,175 @@ async fn resolve_sonarr_instance_for_app(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
 ) -> Result<crate::db::models::ExtensionInstance> {
-    let providers = store.list_provider_details().await?;
-    let mut candidates = Vec::new();
-    for detail in providers {
-        if detail.provider.capability != "media.manager.tv" {
-            continue;
-        }
-        if let Some(implementation) = detail.provider.implementation.as_deref() {
-            if !implementation.eq_ignore_ascii_case("sonarr") {
-                continue;
-            }
-        }
-        candidates.push(detail);
-    }
-
-    if candidates.is_empty() {
-        bail!("sonarr provider not found for prowlarr app registration");
-    }
-
-    let mut selected = None;
-    if let Some(host) = host_hint {
-        for detail in &candidates {
-            let endpoint_json = detail.provider.endpoint_json.as_ref();
-            let endpoint_json = match endpoint_json {
-                Some(value) => value,
-                None => continue,
-            };
-            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
-                Ok(endpoint) => endpoint,
-                Err(_) => continue,
-            };
-            if endpoint.host == host {
-                selected = Some(detail.clone());
-                break;
-            }
-        }
-    }
-
-    let selected = if let Some(selected) = selected {
-        selected
-    } else if candidates.len() == 1 {
-        candidates.remove(0)
-    } else {
-        bail!("multiple sonarr providers found; specify the elx-sonarr host in the app url");
-    };
-
-    store
-        .get_instance(selected.provider.instance_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "sonarr instance {} not found",
-                selected.provider.instance_id
-            )
-        })
+    Ok(resolve_provider_target(
+        store,
+        "media.manager.tv",
+        "sonarr",
+        host_hint,
+        "sonarr provider not found for prowlarr app registration",
+        "multiple sonarr providers found; specify a managed Sonarr host alias in the app url",
+    )
+    .await?
+    .instance)
 }
 
 async fn resolve_radarr_instance_for_app(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
 ) -> Result<crate::db::models::ExtensionInstance> {
-    let providers = store.list_provider_details().await?;
-    let mut candidates = Vec::new();
-    for detail in providers {
-        if detail.provider.capability != "media.manager.movies" {
-            continue;
-        }
-        if let Some(implementation) = detail.provider.implementation.as_deref() {
-            if !implementation.eq_ignore_ascii_case("radarr") {
-                continue;
-            }
-        }
-        candidates.push(detail);
-    }
-
-    if candidates.is_empty() {
-        bail!("radarr provider not found for prowlarr app registration");
-    }
-
-    let mut selected = None;
-    if let Some(host) = host_hint {
-        for detail in &candidates {
-            let endpoint_json = detail.provider.endpoint_json.as_ref();
-            let endpoint_json = match endpoint_json {
-                Some(value) => value,
-                None => continue,
-            };
-            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
-                Ok(endpoint) => endpoint,
-                Err(_) => continue,
-            };
-            if endpoint.host == host {
-                selected = Some(detail.clone());
-                break;
-            }
-        }
-    }
-
-    let selected = if let Some(selected) = selected {
-        selected
-    } else if candidates.len() == 1 {
-        candidates.remove(0)
-    } else {
-        bail!("multiple radarr providers found; specify the elx-radarr host in the app url");
-    };
-
-    store
-        .get_instance(selected.provider.instance_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "radarr instance {} not found",
-                selected.provider.instance_id
-            )
-        })
+    Ok(resolve_provider_target(
+        store,
+        "media.manager.movies",
+        "radarr",
+        host_hint,
+        "radarr provider not found for prowlarr app registration",
+        "multiple radarr providers found; specify a managed Radarr host alias in the app url",
+    )
+    .await?
+    .instance)
 }
 
-async fn resolve_qbittorrent_instance_for_downloader(
+async fn resolve_qbittorrent_target_for_downloader(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
-) -> Result<crate::db::models::ExtensionInstance> {
-    let providers = store.list_provider_details().await?;
-    let mut candidates = Vec::new();
-    for detail in providers {
-        if detail.provider.capability != "downloader.torrent" {
-            continue;
-        }
-        if let Some(implementation) = detail.provider.implementation.as_deref() {
-            if !implementation.eq_ignore_ascii_case("qbittorrent") {
-                continue;
-            }
-        }
-        candidates.push(detail);
-    }
-
-    if candidates.is_empty() {
-        bail!("qbittorrent provider not found for downloader credentials");
-    }
-
-    let mut selected = None;
-    if let Some(host) = host_hint {
-        for detail in &candidates {
-            let endpoint_json = detail.provider.endpoint_json.as_ref();
-            let endpoint_json = match endpoint_json {
-                Some(value) => value,
-                None => continue,
-            };
-            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
-                Ok(endpoint) => endpoint,
-                Err(_) => continue,
-            };
-            if endpoint.host == host {
-                selected = Some(detail.clone());
-                break;
-            }
-        }
-    }
-
-    let selected = if let Some(selected) = selected {
-        selected
-    } else if candidates.len() == 1 {
-        candidates.remove(0)
-    } else {
-        bail!(
-            "multiple qbittorrent providers found; specify the elx-qbittorrent host in the downloader url"
-        );
-    };
-
-    store
-        .get_instance(selected.provider.instance_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "qbittorrent instance {} not found",
-                selected.provider.instance_id
-            )
-        })
+) -> Result<ManagedProviderTarget> {
+    resolve_provider_target(
+        store,
+        "downloader.torrent",
+        "qbittorrent",
+        host_hint,
+        "qbittorrent provider not found for downloader credentials",
+        "multiple qbittorrent providers found; specify a managed qBittorrent host alias in the downloader url",
+    )
+    .await
 }
 
-async fn resolve_nzbget_instance_for_downloader(
+async fn resolve_nzbget_target_for_downloader(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
-) -> Result<crate::db::models::ExtensionInstance> {
+) -> Result<ManagedProviderTarget> {
+    resolve_provider_target(
+        store,
+        "downloader.nzb",
+        "nzbget",
+        host_hint,
+        "nzbget provider not found for downloader credentials",
+        "multiple nzbget providers found; specify a managed NZBGet host alias in the downloader url",
+    )
+    .await
+}
+
+async fn resolve_provider_target(
+    store: &ExtensionStore<'_>,
+    capability: &str,
+    implementation: &str,
+    host_hint: Option<&str>,
+    not_found_message: &str,
+    multiple_message: &str,
+) -> Result<ManagedProviderTarget> {
+    let candidates = list_managed_provider_targets(store, capability, implementation).await?;
+    if candidates.is_empty() {
+        bail!("{}", not_found_message);
+    }
+
+    if let Some(host) = host_hint {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| provider_host_matches_alias(host, &candidate.aliases))
+            .cloned()
+        {
+            return Ok(candidate);
+        }
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates[0].clone());
+    }
+
+    bail!("{}", multiple_message);
+}
+
+async fn list_managed_provider_targets(
+    store: &ExtensionStore<'_>,
+    capability: &str,
+    implementation: &str,
+) -> Result<Vec<ManagedProviderTarget>> {
     let providers = store.list_provider_details().await?;
     let mut candidates = Vec::new();
     for detail in providers {
-        if detail.provider.capability != "downloader.nzb" {
+        if detail.provider.capability != capability {
             continue;
         }
-        if let Some(implementation) = detail.provider.implementation.as_deref() {
-            if !implementation.eq_ignore_ascii_case("nzbget") {
+        if let Some(value) = detail.provider.implementation.as_deref() {
+            if !value.eq_ignore_ascii_case(implementation) {
                 continue;
             }
         }
-        candidates.push(detail);
+        let Some(endpoint_json) = detail.provider.endpoint_json.as_ref() else {
+            continue;
+        };
+        let endpoint: ProviderEndpoint =
+            serde_json::from_value(endpoint_json.clone()).context("parsing provider endpoint")?;
+        let instance = store
+            .get_instance(detail.provider.instance_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} instance {} not found",
+                    implementation,
+                    detail.provider.instance_id
+                )
+            })?;
+        let aliases = provider_host_aliases(store, &detail, &instance, &endpoint).await?;
+        candidates.push(ManagedProviderTarget {
+            instance,
+            endpoint,
+            aliases,
+        });
     }
+    Ok(candidates)
+}
 
-    if candidates.is_empty() {
-        bail!("nzbget provider not found for downloader credentials");
-    }
-
-    let mut selected = None;
-    if let Some(host) = host_hint {
-        for detail in &candidates {
-            let endpoint_json = detail.provider.endpoint_json.as_ref();
-            let endpoint_json = match endpoint_json {
-                Some(value) => value,
-                None => continue,
-            };
-            let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json.clone()) {
-                Ok(endpoint) => endpoint,
-                Err(_) => continue,
-            };
-            if endpoint.host == host {
-                selected = Some(detail.clone());
-                break;
-            }
+async fn provider_host_aliases(
+    store: &ExtensionStore<'_>,
+    detail: &ProviderDetails,
+    instance: &crate::db::models::ExtensionInstance,
+    endpoint: &ProviderEndpoint,
+) -> Result<Vec<String>> {
+    let extension = store.get_extension(&detail.extension_id).await?;
+    let service_name = extension.and_then(|extension| {
+        serde_json::from_value::<ExtensionManifest>(extension.manifest_json)
+            .ok()
+            .and_then(|manifest| {
+                manifest
+                    .runtime
+                    .and_then(|runtime| runtime.service_name)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    });
+    let (computed_aliases, _) = build_aliases(
+        &detail.extension_id,
+        &instance.instance_name,
+        instance.instance_id,
+        service_name,
+    );
+    let mut aliases = vec![endpoint.host.clone()];
+    for alias in computed_aliases {
+        if !aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&alias))
+        {
+            aliases.push(alias);
         }
     }
+    Ok(aliases)
+}
 
-    let selected = if let Some(selected) = selected {
-        selected
-    } else if candidates.len() == 1 {
-        candidates.remove(0)
-    } else {
-        bail!("multiple nzbget providers found; specify the elx-nzbget host in the downloader url");
-    };
-
-    store
-        .get_instance(selected.provider.instance_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "nzbget instance {} not found",
-                selected.provider.instance_id
-            )
-        })
+fn provider_host_matches_alias(host: &str, aliases: &[String]) -> bool {
+    aliases
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(host.trim()))
 }
 
 async fn upsert_qbittorrent_secrets(
@@ -4538,7 +4483,7 @@ mod tests {
                 cardinality: SlotCardinality::One,
                 implementation: Some("sonarr".to_string()),
                 scope_json: None,
-                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                endpoint_json: Some(serde_json::to_value(&endpoint)?),
                 health_state: ProviderHealthState::Unknown,
             })
             .await?;
@@ -5405,7 +5350,27 @@ mod tests {
     async fn resolve_downloader_credentials_injects_nzbget_settings() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
-        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+        insert_extension(
+            &store,
+            "elixir.modules.nzbget",
+            json!({
+                "id": "elixir.modules.nzbget",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "NZBGet",
+                "provides": [{
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "implementation": "nzbget"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/nzbget:latest",
+                    "service_name": "elx-nzbget"
+                }
+            }),
+        )
+        .await?;
 
         let instance_id = Uuid::new_v4();
         store
@@ -5420,7 +5385,7 @@ mod tests {
 
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "elx-nzbget".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
             6789,
             None,
             Some("elixir_net".to_string()),
@@ -5434,7 +5399,7 @@ mod tests {
                 cardinality: SlotCardinality::One,
                 implementation: Some("nzbget".to_string()),
                 scope_json: None,
-                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                endpoint_json: Some(serde_json::to_value(&endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
             .await?;
@@ -5461,6 +5426,11 @@ mod tests {
             panic!("expected media manager tv patch");
         };
         let downloader = downloaders.first().expect("nzbget downloader");
+        assert_eq!(
+            downloader.url,
+            endpoint.canonical_url()?,
+            "expected legacy downloader host to be rewritten to canonical provider url"
+        );
         let username = downloader
             .settings
             .get("username")

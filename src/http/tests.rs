@@ -7777,6 +7777,224 @@ async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> 
 }
 
 #[tokio::test]
+async fn extension_control_surface_accepts_managed_downloader_alias_hosts() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (sonarr_host, sonarr_addr, _server_state, sonarr_shutdown_tx) =
+        start_mock_sonarr_control_server().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let sonarr_instance_id = Uuid::new_v4();
+    let sonarr_provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: sonarr_instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: sonarr_provider_id,
+            instance_id: sonarr_instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": sonarr_host,
+                "port": sonarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let nzbget_instance_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.nzbget".to_string(),
+            name: "NZBGet".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.nzbget",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "NZBGet",
+                "provides": [{
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "implementation": "nzbget"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/nzbget:latest",
+                    "service_name": "elx-nzbget"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: nzbget_instance_id,
+            extension_id: "elixir.modules.nzbget".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: nzbget_instance_id,
+            capability: "downloader.nzb".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("nzbget".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "svc-elixir-modules-nzbget-default",
+                "port": 6789,
+                "network_name": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let qbittorrent_instance_id = Uuid::new_v4();
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            name: "qBittorrent".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.modules.qbittorrent",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "qBittorrent",
+                "provides": [{
+                    "capability": "downloader.torrent",
+                    "slot": "default",
+                    "implementation": "qbittorrent"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/qbittorrent:latest",
+                    "service_name": "elx-qbittorrent"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: qbittorrent_instance_id,
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: qbittorrent_instance_id,
+            capability: "downloader.torrent".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("qbittorrent".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "svc-elixir-modules-qbittorrent-default",
+                "port": 8080,
+                "network_name": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = sonarr_shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_ne!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Managed drift detected"),
+        "expected alias-compatible downloader hosts to avoid managed drift: {}",
+        payload
+    );
+    assert!(
+        payload
+            .get("sections")
+            .and_then(Value::as_array)
+            .is_some_and(|sections| sections.iter().all(|section| {
+                section.get("id").and_then(Value::as_str) != Some("managedInvariants")
+            })),
+        "expected no managed invariant drift section when legacy aliases still map to the managed providers: {}",
+        payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn extension_control_action_remove_item_deactivates_intent() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;

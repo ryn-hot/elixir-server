@@ -56,6 +56,7 @@ use crate::extensions::store::{
 use crate::http::auth::CurrentUser;
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::model::ProviderEndpoint;
+use crate::orchestrator::naming::build_aliases;
 use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
@@ -4780,6 +4781,7 @@ struct ManagedArrDownloaderExpectation {
     label: &'static str,
     implementation: &'static str,
     host: String,
+    aliases: Vec<String>,
     port: u16,
     category: &'static str,
 }
@@ -4868,7 +4870,8 @@ async fn build_arr_managed_invariants_section(
         let live_host_port = extract_arr_download_client_host_port(&detail);
         match live_host_port {
             Some((host, port))
-                if host.eq_ignore_ascii_case(&expected_client.host) && port == expected_client.port => {}
+                if host_matches_expected_alias(&host, &expected_client.aliases)
+                    && port == expected_client.port => {}
             Some((host, port)) => notices.push(control_notice(
                 "error",
                 "managed_downloader_endpoint_drift",
@@ -5150,7 +5153,7 @@ async fn resolve_arr_managed_downloader_expectations(
     };
     let mut items = Vec::new();
 
-    if let Some((host, port)) = resolve_first_party_downloader_endpoint(
+    if let Some((host, aliases, port)) = resolve_first_party_downloader_endpoint(
         store,
         "elixir.modules.nzbget",
         "downloader.nzb",
@@ -5162,11 +5165,12 @@ async fn resolve_arr_managed_downloader_expectations(
             label: "NZBGet",
             implementation: "nzbget",
             host,
+            aliases,
             port,
             category,
         });
     }
-    if let Some((host, port)) = resolve_first_party_downloader_endpoint(
+    if let Some((host, aliases, port)) = resolve_first_party_downloader_endpoint(
         store,
         "elixir.modules.qbittorrent",
         "downloader.torrent",
@@ -5178,6 +5182,7 @@ async fn resolve_arr_managed_downloader_expectations(
             label: "qBittorrent",
             implementation: "qbittorrent",
             host,
+            aliases,
             port,
             category,
         });
@@ -5191,7 +5196,7 @@ async fn resolve_first_party_downloader_endpoint(
     extension_id: &str,
     capability: &str,
     implementation: &str,
-) -> anyhow::Result<Option<(String, u16)>> {
+) -> anyhow::Result<Option<(String, Vec<String>, u16)>> {
     let instances = store.list_instances(Some(extension_id)).await?;
     let Some(instance) = choose_extension_control_instance(&instances) else {
         return Ok(None);
@@ -5211,7 +5216,54 @@ async fn resolve_first_party_downloader_endpoint(
         .endpoint_json
         .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
     let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    Ok(Some((endpoint.host, endpoint.port)))
+    let extension = store
+        .get_extension(extension_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("extension '{}' not found", extension_id))?;
+    let manifest = parse_extension_control_manifest(&extension);
+    let aliases = control_endpoint_aliases(extension_id, &manifest, &instance, &endpoint);
+    Ok(Some((endpoint.host, aliases, endpoint.port)))
+}
+
+fn host_matches_expected_alias(host: &str, aliases: &[String]) -> bool {
+    aliases
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(host.trim()))
+}
+
+fn control_endpoint_aliases(
+    extension_id: &str,
+    manifest: &ExtensionManifest,
+    instance: &ExtensionInstance,
+    endpoint: &ProviderEndpoint,
+) -> Vec<String> {
+    let service_name = manifest_runtime_service_name(manifest);
+    let (computed, _) = build_aliases(
+        extension_id,
+        &instance.instance_name,
+        instance.instance_id,
+        service_name,
+    );
+    let mut aliases = vec![endpoint.host.clone()];
+    for alias in computed {
+        if !aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&alias))
+        {
+            aliases.push(alias);
+        }
+    }
+    aliases
+}
+
+fn manifest_runtime_service_name(manifest: &ExtensionManifest) -> Option<String> {
+    manifest
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.service_name.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
 }
 
 fn find_arr_download_client_by_implementation<'a>(
