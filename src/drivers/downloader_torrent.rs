@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::drivers::patches::{DownloadCategorySpec, DownloaderTorrentPatch};
 use crate::drivers::{
-    ActivitySnapshot, ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot,
+    ActivitySnapshot, ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx, DriverPatch,
+    PatchSemantics, PatchSideEffect, StateSnapshot,
 };
 
 #[derive(Debug, Default)]
@@ -68,6 +69,118 @@ impl CapabilityDriver for DownloaderTorrentDriver {
             summary,
             activity: Some(activity),
         })
+    }
+
+    fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        match patch {
+            DriverPatch::DownloaderTorrent(DownloaderTorrentPatch::SetCategories { .. })
+            | DriverPatch::DownloaderTorrent(DownloaderTorrentPatch::SetPreferences { .. }) => {
+                PatchSemantics::desired_change_only(PatchSideEffect::LiveApiWrite)
+            }
+            _ => PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite),
+        }
+    }
+
+    async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        let patch = match patch {
+            DriverPatch::DownloaderTorrent(patch) => patch,
+            _ => bail!("downloader.torrent patch mismatch"),
+        };
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if !implementation.eq_ignore_ascii_case("qbittorrent") {
+            bail!(
+                "downloader.torrent implementation '{}' is not supported",
+                implementation
+            );
+        }
+
+        patch.validate()?;
+
+        let config = QbittorrentDriverConfig::from_ctx(&ctx)?;
+        let endpoint_url = ctx.endpoint.canonical_url()?;
+        let transport_url = ctx.canonical_url()?;
+        let transport_override = if transport_url != endpoint_url {
+            Some(transport_url)
+        } else {
+            None
+        };
+        let client = QbittorrentClient::from_config(
+            config,
+            endpoint_url,
+            transport_override,
+            ctx.instance_id,
+        )
+        .await?;
+
+        match patch {
+            DownloaderTorrentPatch::SetCategories { categories } => {
+                let existing = client.get_categories().await?;
+                let missing = diff_qbittorrent_categories(&existing, &categories);
+                if missing.is_empty() {
+                    Ok(DriftEvaluation::in_sync())
+                } else {
+                    Ok(DriftEvaluation::drifted(format!(
+                        "qBittorrent categories require repair: {}",
+                        missing.join(", ")
+                    )))
+                }
+            }
+            DownloaderTorrentPatch::SetPreferences {
+                default_save_path,
+                incomplete_path,
+                use_incomplete,
+                max_connections,
+                max_connections_per_torrent,
+                max_upload_slots,
+                max_upload_slots_per_torrent,
+                disk_cache_mb,
+                disk_cache_ttl_seconds,
+                queueing_enabled,
+                max_active_downloads,
+                max_active_torrents,
+                max_active_uploads,
+                random_port,
+                listen_port,
+                upnp,
+                preallocate_all,
+            } => {
+                let mut prefs = build_qbittorrent_preferences(
+                    default_save_path,
+                    incomplete_path,
+                    use_incomplete,
+                    max_connections,
+                    max_connections_per_torrent,
+                    max_upload_slots,
+                    max_upload_slots_per_torrent,
+                    disk_cache_mb,
+                    disk_cache_ttl_seconds,
+                    queueing_enabled,
+                    max_active_downloads,
+                    max_active_torrents,
+                    max_active_uploads,
+                    random_port,
+                    listen_port,
+                    upnp,
+                    preallocate_all,
+                );
+                if prefs.is_empty() {
+                    return Ok(DriftEvaluation::in_sync());
+                }
+                let existing = client.get_preferences().await?;
+                filter_qbittorrent_preferences(&mut prefs, &existing);
+                if prefs.is_empty() {
+                    Ok(DriftEvaluation::in_sync())
+                } else {
+                    Ok(DriftEvaluation::drifted(format!(
+                        "qBittorrent preferences require repair: {}",
+                        prefs.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )))
+                }
+            }
+        }
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
@@ -518,6 +631,11 @@ impl QbittorrentClient {
             .await
     }
 
+    async fn get_preferences(&self) -> Result<Value> {
+        self.request_json_value(Method::GET, "app/preferences", None)
+            .await
+    }
+
     async fn transfer_info(&self) -> Result<QbittorrentTransferInfo> {
         let value = self
             .request_json_value(Method::GET, "transfer/info", None)
@@ -598,43 +716,30 @@ impl QbittorrentClient {
         upnp: Option<bool>,
         preallocate_all: Option<bool>,
     ) -> Result<()> {
-        let mut prefs = serde_json::Map::new();
-        if let Some(path) = default_save_path {
-            prefs.insert("save_path".to_string(), Value::String(path));
-        }
-        if let Some(path) = incomplete_path {
-            prefs.insert("temp_path".to_string(), Value::String(path));
-        }
-        if let Some(flag) = use_incomplete {
-            prefs.insert("temp_path_enabled".to_string(), Value::Bool(flag));
-        }
-        insert_u64_pref(&mut prefs, "max_connec", max_connections);
-        insert_u64_pref(
-            &mut prefs,
-            "max_connec_per_torrent",
+        let mut prefs = build_qbittorrent_preferences(
+            default_save_path,
+            incomplete_path,
+            use_incomplete,
+            max_connections,
             max_connections_per_torrent,
-        );
-        insert_u64_pref(&mut prefs, "max_uploads", max_upload_slots);
-        insert_u64_pref(
-            &mut prefs,
-            "max_uploads_per_torrent",
+            max_upload_slots,
             max_upload_slots_per_torrent,
+            disk_cache_mb,
+            disk_cache_ttl_seconds,
+            queueing_enabled,
+            max_active_downloads,
+            max_active_torrents,
+            max_active_uploads,
+            random_port,
+            listen_port,
+            upnp,
+            preallocate_all,
         );
-        insert_u64_pref(&mut prefs, "disk_cache", disk_cache_mb);
-        insert_u64_pref(&mut prefs, "disk_cache_ttl", disk_cache_ttl_seconds);
-        insert_bool_pref(&mut prefs, "queueing_enabled", queueing_enabled);
-        insert_u64_pref(&mut prefs, "max_active_downloads", max_active_downloads);
-        insert_u64_pref(&mut prefs, "max_active_torrents", max_active_torrents);
-        insert_u64_pref(&mut prefs, "max_active_uploads", max_active_uploads);
-        insert_bool_pref(&mut prefs, "random_port", random_port);
-        if let Some(port) = listen_port {
-            prefs.insert(
-                "listen_port".to_string(),
-                Value::Number(serde_json::Number::from(port)),
-            );
+        if prefs.is_empty() {
+            return Ok(());
         }
-        insert_bool_pref(&mut prefs, "upnp", upnp);
-        insert_bool_pref(&mut prefs, "preallocate_all", preallocate_all);
+        let existing = self.get_preferences().await?;
+        filter_qbittorrent_preferences(&mut prefs, &existing);
         if prefs.is_empty() {
             return Ok(());
         }
@@ -661,6 +766,90 @@ impl QbittorrentClient {
     }
 }
 
+fn build_qbittorrent_preferences(
+    default_save_path: Option<String>,
+    incomplete_path: Option<String>,
+    use_incomplete: Option<bool>,
+    max_connections: Option<u64>,
+    max_connections_per_torrent: Option<u64>,
+    max_upload_slots: Option<u64>,
+    max_upload_slots_per_torrent: Option<u64>,
+    disk_cache_mb: Option<u64>,
+    disk_cache_ttl_seconds: Option<u64>,
+    queueing_enabled: Option<bool>,
+    max_active_downloads: Option<u64>,
+    max_active_torrents: Option<u64>,
+    max_active_uploads: Option<u64>,
+    random_port: Option<bool>,
+    listen_port: Option<u16>,
+    upnp: Option<bool>,
+    preallocate_all: Option<bool>,
+) -> serde_json::Map<String, Value> {
+    let mut prefs = serde_json::Map::new();
+    if let Some(path) = default_save_path {
+        prefs.insert("save_path".to_string(), Value::String(path));
+    }
+    if let Some(path) = incomplete_path {
+        prefs.insert("temp_path".to_string(), Value::String(path));
+    }
+    if let Some(flag) = use_incomplete {
+        prefs.insert("temp_path_enabled".to_string(), Value::Bool(flag));
+    }
+    insert_u64_pref(&mut prefs, "max_connec", max_connections);
+    insert_u64_pref(
+        &mut prefs,
+        "max_connec_per_torrent",
+        max_connections_per_torrent,
+    );
+    insert_u64_pref(&mut prefs, "max_uploads", max_upload_slots);
+    insert_u64_pref(
+        &mut prefs,
+        "max_uploads_per_torrent",
+        max_upload_slots_per_torrent,
+    );
+    insert_u64_pref(&mut prefs, "disk_cache", disk_cache_mb);
+    insert_u64_pref(&mut prefs, "disk_cache_ttl", disk_cache_ttl_seconds);
+    insert_bool_pref(&mut prefs, "queueing_enabled", queueing_enabled);
+    insert_u64_pref(&mut prefs, "max_active_downloads", max_active_downloads);
+    insert_u64_pref(&mut prefs, "max_active_torrents", max_active_torrents);
+    insert_u64_pref(&mut prefs, "max_active_uploads", max_active_uploads);
+    insert_bool_pref(&mut prefs, "random_port", random_port);
+    if let Some(port) = listen_port {
+        prefs.insert(
+            "listen_port".to_string(),
+            Value::Number(serde_json::Number::from(port)),
+        );
+    }
+    insert_bool_pref(&mut prefs, "upnp", upnp);
+    insert_bool_pref(&mut prefs, "preallocate_all", preallocate_all);
+    prefs
+}
+
+fn diff_qbittorrent_categories(
+    existing: &Value,
+    categories: &[DownloadCategorySpec],
+) -> Vec<String> {
+    let existing_map = existing.as_object().cloned().unwrap_or_default();
+    let mut missing = Vec::new();
+    for category in categories {
+        match existing_map.get(&category.name) {
+            Some(entry) => {
+                if let Some(save_path) = category.save_path.as_ref() {
+                    let existing_path = entry
+                        .get("savePath")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if existing_path != save_path.as_str() {
+                        missing.push(format!("{}:savePath", category.name));
+                    }
+                }
+            }
+            None => missing.push(category.name.clone()),
+        }
+    }
+    missing
+}
+
 fn insert_u64_pref(prefs: &mut serde_json::Map<String, Value>, key: &str, value: Option<u64>) {
     if let Some(value) = value {
         prefs.insert(
@@ -674,6 +863,16 @@ fn insert_bool_pref(prefs: &mut serde_json::Map<String, Value>, key: &str, value
     if let Some(value) = value {
         prefs.insert(key.to_string(), Value::Bool(value));
     }
+}
+
+fn filter_qbittorrent_preferences(prefs: &mut serde_json::Map<String, Value>, existing: &Value) {
+    let Some(existing) = existing.as_object() else {
+        return;
+    };
+    prefs.retain(|key, desired| match existing.get(key) {
+        Some(current) => current != desired,
+        None => true,
+    });
 }
 
 trait HostHeaderExt {
@@ -1190,7 +1389,10 @@ mod tests {
         response::{IntoResponse, Response},
         routing::{get, post},
     };
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     #[test]
     fn extracts_latest_temporary_password_from_logs() {
@@ -1332,6 +1534,140 @@ WebUI\\ServerDomains=*
         assert_eq!(
             snapshot.summary.as_deref(),
             Some("connected · 2 active · 1 issue")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filters_qbittorrent_preferences_when_existing_values_match() {
+        let mut prefs = serde_json::Map::new();
+        prefs.insert(
+            "save_path".to_string(),
+            Value::String("/downloads".to_string()),
+        );
+        prefs.insert(
+            "temp_path".to_string(),
+            Value::String("/runtime/incomplete".to_string()),
+        );
+        prefs.insert("temp_path_enabled".to_string(), Value::Bool(true));
+        prefs.insert("queueing_enabled".to_string(), Value::Bool(true));
+
+        let existing = serde_json::json!({
+            "save_path": "/downloads",
+            "temp_path": "/runtime/incomplete",
+            "temp_path_enabled": true,
+            "queueing_enabled": false
+        });
+
+        filter_qbittorrent_preferences(&mut prefs, &existing);
+
+        assert!(!prefs.contains_key("save_path"));
+        assert!(!prefs.contains_key("temp_path"));
+        assert!(!prefs.contains_key("temp_path_enabled"));
+        assert_eq!(prefs.get("queueing_enabled"), Some(&Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn set_preferences_skips_post_when_live_state_is_current() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            set_calls: Arc<Mutex<usize>>,
+        }
+
+        async fn login() -> Response {
+            (
+                [(SET_COOKIE, HeaderValue::from_static("SID=test; HttpOnly"))],
+                "Ok.",
+            )
+                .into_response()
+        }
+
+        async fn preferences() -> Json<Value> {
+            Json(serde_json::json!({
+                "save_path": "/downloads",
+                "temp_path": "/runtime/incomplete",
+                "temp_path_enabled": true,
+                "queueing_enabled": true,
+                "max_active_downloads": 6
+            }))
+        }
+
+        async fn set_preferences(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+        ) -> &'static str {
+            *state.set_calls.lock().unwrap() += 1;
+            "Ok."
+        }
+
+        let state = RpcState {
+            set_calls: Arc::new(Mutex::new(0)),
+        };
+        let app = Router::new()
+            .route("/api/v2/auth/login", post(login))
+            .route("/api/v2/app/preferences", get(preferences))
+            .route("/api/v2/app/setPreferences", post(set_preferences))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock qbittorrent server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbittorrent-default".to_string(),
+            addr.port(),
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.torrent".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("qbittorrent".to_string()),
+            Some(serde_json::json!({
+                "username": "admin",
+                "password": "adminadmin"
+            })),
+            HashMap::new(),
+        );
+
+        DownloaderTorrentDriver::new()
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderTorrent(
+                    crate::drivers::DownloaderTorrentPatch::SetPreferences {
+                        default_save_path: Some("/downloads".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        use_incomplete: Some(true),
+                        max_connections: None,
+                        max_connections_per_torrent: None,
+                        max_upload_slots: None,
+                        max_upload_slots_per_torrent: None,
+                        disk_cache_mb: None,
+                        disk_cache_ttl_seconds: None,
+                        queueing_enabled: Some(true),
+                        max_active_downloads: Some(6),
+                        max_active_torrents: None,
+                        max_active_uploads: None,
+                        random_port: None,
+                        listen_port: None,
+                        upnp: None,
+                        preallocate_all: None,
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *state.set_calls.lock().unwrap(),
+            0,
+            "expected qBittorrent setPreferences to be skipped when live prefs already match"
         );
         Ok(())
     }

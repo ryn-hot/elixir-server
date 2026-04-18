@@ -36,6 +36,33 @@ pub struct ReconcileConfig {
     pub retry_backoff: Duration,
     pub startup_settle: Duration,
     pub lock_ttl: Duration,
+    pub mode: ReconcileMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    SteadyState,
+    ExplicitRepair,
+}
+
+impl ReconcileMode {
+    fn run_source(self) -> &'static str {
+        match self {
+            Self::SteadyState => "reconcile",
+            Self::ExplicitRepair => "repair",
+        }
+    }
+
+    fn run_phase(self) -> &'static str {
+        match self {
+            Self::SteadyState => "reconcile",
+            Self::ExplicitRepair => "repair",
+        }
+    }
+
+    fn is_explicit_repair(self) -> bool {
+        matches!(self, Self::ExplicitRepair)
+    }
 }
 
 impl ReconcileConfig {
@@ -57,7 +84,14 @@ impl ReconcileConfig {
             retry_backoff,
             startup_settle,
             lock_ttl,
+            mode: ReconcileMode::SteadyState,
         }
+    }
+
+    pub fn explicit_repair_from_settings(settings: &Settings) -> Self {
+        let mut config = Self::from_settings(settings);
+        config.mode = ReconcileMode::ExplicitRepair;
+        config
     }
 }
 
@@ -75,6 +109,7 @@ pub struct Reconciler<'a> {
     retry_attempts: u32,
     retry_backoff: Duration,
     lock_ttl: Duration,
+    mode: ReconcileMode,
     runtime_health: Arc<DockerRuntimeSupervisor>,
     core_extensions: Vec<String>,
 }
@@ -136,6 +171,7 @@ impl<'a> Reconciler<'a> {
             retry_attempts: config.retry_attempts.max(1),
             retry_backoff: config.retry_backoff,
             lock_ttl: config.lock_ttl,
+            mode: config.mode,
             runtime_health,
             core_extensions,
         }
@@ -211,13 +247,15 @@ impl<'a> Reconciler<'a> {
         });
 
         let run_id = Uuid::new_v4();
+        let run_source = self.mode.run_source().to_string();
+        let run_phase = self.mode.run_phase().to_string();
         let result = if let Err(err) = self
             .store
             .create_run(&crate::extensions::store::NewOrchestratorRun {
                 run_id,
-                source: "reconcile".to_string(),
+                source: run_source.clone(),
                 status: crate::db::models::OrchestratorRunStatus::Running,
-                phase: Some("reconcile".to_string()),
+                phase: Some(run_phase.clone()),
                 plan_json: None,
                 error: None,
             })
@@ -235,7 +273,7 @@ impl<'a> Reconciler<'a> {
                     .update_run_status(
                         run_id,
                         crate::db::models::OrchestratorRunStatus::Completed,
-                        Some("reconcile"),
+                        Some(&run_phase),
                         None,
                     )
                     .await;
@@ -247,7 +285,7 @@ impl<'a> Reconciler<'a> {
                     .update_run_status(
                         run_id,
                         crate::db::models::OrchestratorRunStatus::Failed,
-                        Some("reconcile"),
+                        Some(&run_phase),
                         Some(&err.to_string()),
                     )
                     .await;
@@ -308,7 +346,7 @@ impl<'a> Reconciler<'a> {
         Ok(())
     }
 
-    async fn reconcile_desired_state(&self, run_id: Uuid, step_index: &mut i32) -> Result<()> {
+    async fn reconcile_desired_state(&self, _run_id: Uuid, _step_index: &mut i32) -> Result<()> {
         let desired = self.store.list_desired_blueprints(Some(true)).await?;
         if desired.is_empty() {
             return Ok(());
@@ -328,10 +366,11 @@ impl<'a> Reconciler<'a> {
         .with_default_downloader_profile(self.default_downloader_profile);
 
         for item in desired {
+            let desired_run_source = desired_blueprint_run_source(item.desired_id);
             let decisions = self
                 .decisions_for_desired(item.desired_id, item.decisions_json.clone())
                 .await?;
-            let plan = match planner
+            let mut plan = match planner
                 .plan_blueprint_with_decisions(
                     &self.store,
                     item.blueprint_extension_id.clone(),
@@ -352,6 +391,14 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             };
+
+            let pending_run = self
+                .store
+                .get_latest_run_by_source(
+                    &desired_run_source,
+                    Some(crate::db::models::OrchestratorRunStatus::Pending),
+                )
+                .await?;
 
             let missing = match missing_required_secrets_for_plan(&self.store, &plan.actions).await
             {
@@ -390,14 +437,107 @@ impl<'a> Reconciler<'a> {
                 continue;
             }
 
-            if plan.actions.is_empty() {
+            if plan.actions.is_empty() && plan.conflicts.is_empty() {
+                let _ = self
+                    .store
+                    .cancel_pending_runs_by_source(
+                        &desired_run_source,
+                        Some("no desired blueprint actions"),
+                    )
+                    .await;
                 metrics::RECONCILE_ACTIONS
                     .with_label_values(&["plan_actions", "empty"])
                     .inc();
                 continue;
             }
 
+            if pending_run.is_none()
+                && missing.is_empty()
+                && !has_unresolved_conflicts(&plan.conflicts)
+                && !self.mode.is_explicit_repair()
+            {
+                if let Some(previous) = self
+                    .store
+                    .get_latest_run_by_source(
+                        &desired_run_source,
+                        Some(crate::db::models::OrchestratorRunStatus::Completed),
+                    )
+                    .await?
+                {
+                    if let Some(previous_plan_json) = previous.plan_json {
+                        if stored_plan_equivalent(&previous_plan_json, &plan) {
+                            metrics::RECONCILE_ACTIONS
+                                .with_label_values(&["plan_blueprint", "unchanged"])
+                                .inc();
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let unresolved = has_unresolved_conflicts(&plan.conflicts);
+            if !missing.is_empty() || unresolved {
+                let desired_run_id = pending_run
+                    .as_ref()
+                    .map(|run| run.run_id)
+                    .unwrap_or(plan.plan_id);
+                plan.plan_id = desired_run_id;
+                let plan_json =
+                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
+                if let Some(run) = pending_run {
+                    self.store.update_run_plan(run.run_id, plan_json).await?;
+                } else {
+                    self.store
+                        .create_run(&crate::extensions::store::NewOrchestratorRun {
+                            run_id: desired_run_id,
+                            source: desired_run_source.clone(),
+                            status: crate::db::models::OrchestratorRunStatus::Pending,
+                            phase: Some("desired_blueprint".to_string()),
+                            plan_json: Some(plan_json),
+                            error: None,
+                        })
+                        .await?;
+                }
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&["plan_blueprint", "blocked"])
+                    .inc();
+                continue;
+            }
+
+            let desired_run_id = if let Some(run) = pending_run {
+                plan.plan_id = run.run_id;
+                let plan_json =
+                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
+                self.store.update_run_plan(run.run_id, plan_json).await?;
+                self.store
+                    .update_run_status(
+                        run.run_id,
+                        crate::db::models::OrchestratorRunStatus::Running,
+                        Some("desired_blueprint"),
+                        None,
+                    )
+                    .await?;
+                run.run_id
+            } else {
+                let desired_run_id = plan.plan_id;
+                let plan_json =
+                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
+                self.store
+                    .create_run(&crate::extensions::store::NewOrchestratorRun {
+                        run_id: desired_run_id,
+                        source: desired_run_source.clone(),
+                        status: crate::db::models::OrchestratorRunStatus::Running,
+                        phase: Some("desired_blueprint".to_string()),
+                        plan_json: Some(plan_json),
+                        error: None,
+                    })
+                    .await?;
+                desired_run_id
+            };
+
             let mut failed = false;
+            let mut error_message = None;
+            let mut desired_step_index = 0;
             for action in plan.actions {
                 let action_json = match serde_json::to_value(&action) {
                     Ok(value) => value,
@@ -406,6 +546,7 @@ impl<'a> Reconciler<'a> {
                             "reconcile: failed to serialize plan action for {}: {}",
                             item.blueprint_extension_id, err
                         );
+                        error_message = Some(format!("failed to serialize plan action: {err}"));
                         failed = true;
                         break;
                     }
@@ -417,15 +558,20 @@ impl<'a> Reconciler<'a> {
                             "reconcile: invalid plan action for {}: {}",
                             item.blueprint_extension_id, err
                         );
+                        error_message = Some(format!("invalid plan action: {err}"));
                         failed = true;
                         break;
                     }
                 };
                 let action_type = action.action_type().to_string();
                 let result = self
-                    .run_step(run_id, step_index, &action_type, action_json, || {
-                        executor.apply(executor_action)
-                    })
+                    .run_step(
+                        desired_run_id,
+                        &mut desired_step_index,
+                        &action_type,
+                        action_json,
+                        || executor.apply(executor_action),
+                    )
                     .await;
                 if let Err(err) = result {
                     warn!(
@@ -435,6 +581,7 @@ impl<'a> Reconciler<'a> {
                     metrics::RECONCILE_ACTIONS
                         .with_label_values(&[action_type.as_str(), "error"])
                         .inc();
+                    error_message = Some(err.to_string());
                     failed = true;
                     break;
                 }
@@ -444,8 +591,27 @@ impl<'a> Reconciler<'a> {
             }
 
             if failed {
+                let error =
+                    error_message.unwrap_or_else(|| "desired blueprint apply failed".to_string());
+                self.store
+                    .update_run_status(
+                        desired_run_id,
+                        crate::db::models::OrchestratorRunStatus::Failed,
+                        Some("desired_blueprint"),
+                        Some(&error),
+                    )
+                    .await?;
                 continue;
             }
+
+            self.store
+                .update_run_status(
+                    desired_run_id,
+                    crate::db::models::OrchestratorRunStatus::Completed,
+                    Some("desired_blueprint"),
+                    None,
+                )
+                .await?;
         }
 
         Ok(())
@@ -499,7 +665,11 @@ impl<'a> Reconciler<'a> {
             )
             .await?;
 
-        if pending_run.is_none() && missing.is_empty() && !unresolved {
+        if pending_run.is_none()
+            && missing.is_empty()
+            && !unresolved
+            && !self.mode.is_explicit_repair()
+        {
             if let Some(previous) = self
                 .store
                 .get_latest_run_by_source(
@@ -509,7 +679,7 @@ impl<'a> Reconciler<'a> {
                 .await?
             {
                 if let Some(previous_plan_json) = previous.plan_json {
-                    if auto_wire_plan_equivalent(&previous_plan_json, &plan) {
+                    if stored_plan_equivalent(&previous_plan_json, &plan) {
                         metrics::RECONCILE_ACTIONS
                             .with_label_values(&["auto_wire_plan", "unchanged"])
                             .inc();
@@ -1245,7 +1415,11 @@ fn parse_endpoint(value: &Option<serde_json::Value>) -> Result<ProviderEndpoint>
     Ok(endpoint)
 }
 
-fn auto_wire_plan_equivalent(previous_plan_json: &serde_json::Value, current_plan: &Plan) -> bool {
+fn desired_blueprint_run_source(desired_id: Uuid) -> String {
+    format!("desired_blueprint:{desired_id}")
+}
+
+fn stored_plan_equivalent(previous_plan_json: &serde_json::Value, current_plan: &Plan) -> bool {
     let previous_plan = match serde_json::from_value::<Plan>(previous_plan_json.clone()) {
         Ok(plan) => plan,
         Err(_) => return false,
@@ -1850,6 +2024,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -1857,7 +2032,7 @@ mod tests {
             &probe,
             &runtime,
             &drivers,
-            runtime_paths,
+            runtime_paths.clone(),
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
@@ -1990,6 +2165,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
         let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
         runtime_health.record_engine_failure("docker_runtime_unavailable", "daemon missing");
@@ -2110,13 +2286,14 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
         let reconciler = Reconciler::new(
             &database.pool,
             &probe,
             &runtime,
             &drivers,
-            runtime_paths,
+            runtime_paths.clone(),
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
@@ -2222,6 +2399,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
         let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
         let reconciler = Reconciler::new_with_runtime_health(
@@ -2310,6 +2488,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -2317,7 +2496,7 @@ mod tests {
             &probe,
             &runtime,
             &drivers,
-            runtime_paths,
+            runtime_paths.clone(),
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
@@ -2365,6 +2544,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
         let runtime_health = Arc::new(DockerRuntimeSupervisor::new(None));
         runtime_health
@@ -2393,7 +2573,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_applies_desired_blueprint_plan() -> Result<()> {
+    async fn reconcile_applies_desired_blueprint_plan_and_skips_unchanged_until_repair()
+    -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
 
@@ -2502,6 +2683,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -2509,7 +2691,7 @@ mod tests {
             &probe,
             &runtime,
             &drivers,
-            runtime_paths,
+            runtime_paths.clone(),
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
@@ -2517,6 +2699,8 @@ mod tests {
             &config,
         );
         reconciler.run_once().await?;
+
+        let desired_run_source = desired_blueprint_run_source(desired_id);
 
         let instances = store.list_instances(None).await?;
         assert!(
@@ -2534,14 +2718,77 @@ mod tests {
             "expected provider to be created"
         );
 
-        let runs = store.list_runs(Some(1)).await?;
-        let run = runs.first().expect("reconcile run");
+        let run = store
+            .get_latest_run_by_source(&desired_run_source, Some(OrchestratorRunStatus::Completed))
+            .await?
+            .expect("desired blueprint run");
         let steps = store.list_steps(run.run_id).await?;
         assert!(
             steps
                 .iter()
                 .any(|step| step.action_type == "ensure_instance_installed"),
             "expected ensure_instance_installed step"
+        );
+
+        let first_completed = store
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.source == desired_run_source.as_str()
+                    && run.status == OrchestratorRunStatus::Completed
+            })
+            .count();
+        assert_eq!(first_completed, 1);
+
+        reconciler.run_once().await?;
+        let second_completed = store
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.source == desired_run_source.as_str()
+                    && run.status == OrchestratorRunStatus::Completed
+            })
+            .count();
+        assert_eq!(
+            second_completed, 1,
+            "steady-state reconcile should skip unchanged desired blueprint plans"
+        );
+
+        let repair_config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::ExplicitRepair,
+        };
+        let repair_reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &repair_config,
+        );
+        repair_reconciler.run_once().await?;
+        let third_completed = store
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.source == desired_run_source.as_str()
+                    && run.status == OrchestratorRunStatus::Completed
+            })
+            .count();
+        assert_eq!(
+            third_completed, 2,
+            "explicit repair should reapply an unchanged desired blueprint plan"
         );
 
         Ok(())
@@ -2737,6 +2984,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -2789,6 +3037,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -2871,6 +3120,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -2940,6 +3190,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(
@@ -3033,6 +3284,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
         };
 
         let reconciler = Reconciler::new(

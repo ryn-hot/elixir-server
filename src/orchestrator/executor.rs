@@ -20,10 +20,18 @@ use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{
     BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality,
 };
-use crate::drivers::{ApplyStatus, DriverCtx, DriverPatch, DriverRegistry};
+use crate::drivers::{
+    ApplyStatus, DriftStatus, DriverCtx, DriverPatch, DriverRegistry, PatchApplyPolicy,
+    render_nzbget_config_patch,
+};
 use crate::drivers::{
     DownloaderNzbPatch, DownloaderSpec, DownloaderTorrentPatch, IndexerCredentialField,
     IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
+};
+use crate::extensions::managed_paths::{
+    DOWNLOADS_ROOT, NZBGET_CONFIG_TEMPLATE, NZBGET_INCOMPLETE_DIR, NZBGET_LOG_FILE,
+    NZBGET_MAIN_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR,
+    NZBGET_WEB_DIR, QBITTORRENT_INCOMPLETE_DIR,
 };
 use crate::extensions::manifest::{
     ExtensionManifest, ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress,
@@ -245,6 +253,47 @@ impl<'a> Executor<'a> {
 
     pub async fn check_provider_health(&self, provider_id: Uuid) -> Result<()> {
         self.health_gate_once(provider_id).await
+    }
+
+    pub async fn apply_builtin_downloader_profiles_now(&self) -> Result<()> {
+        let providers = self.store.list_providers(None).await?;
+        for provider in providers {
+            let Some(implementation) = provider.implementation.as_deref() else {
+                continue;
+            };
+            if !matches!(
+                (provider.capability.as_str(), implementation),
+                ("downloader.torrent", "qbittorrent") | ("downloader.nzb", "nzbget")
+            ) {
+                continue;
+            }
+
+            let endpoint_json = provider
+                .endpoint_json
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("provider {} has no endpoint", provider.provider_id))?;
+            let endpoint: ProviderEndpoint =
+                serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+            endpoint.validate()?;
+
+            let instance = self
+                .store
+                .get_instance(provider.instance_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "instance {} not found for provider {}",
+                        provider.instance_id,
+                        provider.provider_id
+                    )
+                })?;
+
+            self.apply_builtin_downloader_profile_if_needed(&provider, &instance, &endpoint)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn ensure_instance_installed(
@@ -803,6 +852,114 @@ impl<'a> Executor<'a> {
             }
         }
 
+        self.compact_nzbget_named_config_if_needed(instance_id, extension_id, handle, volumes)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn compact_nzbget_named_config_if_needed(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        handle: &ContainerHandle,
+        volumes: &[VolumeMount],
+    ) -> Result<()> {
+        let uses_named_config = volumes.iter().any(|volume| {
+            volume.container_path == "/config"
+                && volume.source_kind == VolumeMountSourceKind::NamedVolume
+        });
+        if !uses_named_config || !is_nzbget_extension_id(extension_id) {
+            return Ok(());
+        }
+
+        let Some(bytes) = self
+            .runtime
+            .read_container_file(handle, "/config/nzbget.conf")
+            .await?
+        else {
+            return Ok(());
+        };
+        let text = String::from_utf8(bytes).context("decoding nzbget named-volume config")?;
+        let compacted = compact_nzbget_config_text(&text);
+        if compacted == text {
+            return Ok(());
+        }
+        self.write_nzbget_named_config(instance_id, handle, &compacted)
+            .await
+    }
+
+    async fn apply_nzbget_named_volume_patch(
+        &self,
+        provider: &Provider,
+        instance: &crate::db::models::ExtensionInstance,
+        ctx: &DriverCtx,
+        patch: &DriverPatch,
+        provider_id: Uuid,
+    ) -> Result<bool> {
+        if !should_apply_nzbget_named_volume_patch(provider, instance.config_json.as_ref(), patch) {
+            return Ok(false);
+        }
+        let DriverPatch::DownloaderNzb(nzb_patch) = patch else {
+            return Ok(false);
+        };
+
+        let handle = self
+            .runtime
+            .get_container_handle(&container_name(instance.instance_id))
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime container '{}' not found",
+                    container_name(instance.instance_id)
+                )
+            })?;
+        let Some(bytes) = self
+            .runtime
+            .read_container_file(&handle, "/config/nzbget.conf")
+            .await?
+        else {
+            bail!(
+                "nzbget named-volume config file missing for instance {}",
+                instance.instance_id
+            );
+        };
+        let text = String::from_utf8(bytes).context("decoding nzbget named-volume config")?;
+        let Some(rendered) = render_nzbget_config_patch(ctx, &text, nzb_patch)? else {
+            return Ok(true);
+        };
+        self.write_nzbget_named_config(instance.instance_id, &handle, &rendered)
+            .await?;
+        self.health_gate(provider_id, 30).await?;
+        Ok(true)
+    }
+
+    async fn write_nzbget_named_config(
+        &self,
+        instance_id: Uuid,
+        handle: &ContainerHandle,
+        text: &str,
+    ) -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("elixir-nzbget-config-{}", instance_id.simple()));
+        fs::create_dir_all(&temp_dir)
+            .await
+            .with_context(|| format!("creating temp nzbget config dir {}", temp_dir.display()))?;
+        let temp_file = temp_dir.join("nzbget.conf");
+        fs::write(&temp_file, text.as_bytes())
+            .await
+            .with_context(|| format!("writing temp nzbget config {}", temp_file.display()))?;
+
+        self.runtime.stop_container(handle).await?;
+        let copy_result = self
+            .runtime
+            .copy_host_path_to_container(handle, &temp_file, "/config/nzbget.conf")
+            .await;
+        let start_result = self.runtime.start_container(handle).await;
+        let _ = fs::remove_dir_all(&temp_dir).await;
+
+        copy_result?;
+        start_result?;
         Ok(())
     }
 
@@ -901,8 +1058,45 @@ impl<'a> Executor<'a> {
             &instance,
         )
         .await?;
+        let semantics = driver.patch_semantics(&patch);
+        let evaluation = driver
+            .evaluate_patch(ctx.clone(), patch.clone())
+            .await
+            .context("evaluating driver patch drift")?;
+        match evaluation.status {
+            DriftStatus::InSync => return Ok(()),
+            DriftStatus::Unknown
+                if semantics.side_effect.is_service_disruptive()
+                    || semantics.apply_policy != PatchApplyPolicy::PeriodicSafe =>
+            {
+                let mut detail = evaluation.message.unwrap_or_else(|| {
+                    "driver patch drift could not be safely evaluated".to_string()
+                });
+                if !evaluation.non_comparable_fields.is_empty() {
+                    let fields = evaluation
+                        .non_comparable_fields
+                        .iter()
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    detail.push_str(&format!(" (non-comparable fields: {fields})"));
+                }
+                bail!(
+                    "driver patch requires explicit repair for connector {}: {}",
+                    connector_extension_id,
+                    detail
+                );
+            }
+            DriftStatus::Drifted | DriftStatus::Unknown => {}
+        }
         let restart_nzbget_runtime =
             should_restart_nzbget_after_patch(&provider, instance.config_json.as_ref(), &patch);
+        if self
+            .apply_nzbget_named_volume_patch(&provider, &instance, &ctx, &patch, target_provider_id)
+            .await?
+        {
+            return Ok(());
+        }
         let result = driver.apply_patch(ctx, patch).await?;
         if result.status == ApplyStatus::Deferred {
             let detail = result
@@ -1123,8 +1317,6 @@ impl<'a> Executor<'a> {
             .and_then(|result| ensure_probe_ok(result, "tcp"))?;
         self.ensure_provider_driver_ready(&provider, &instance)
             .await?;
-        self.apply_builtin_downloader_profile_if_needed(&provider, &instance, &endpoint)
-            .await?;
         self.store
             .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
             .await?;
@@ -1298,7 +1490,7 @@ impl<'a> Executor<'a> {
                 .await?;
                 if restart_required {
                     self.restart_instance_runtime(instance.instance_id).await?;
-                    bail!("nzbget runtime restarted to apply managed config");
+                    self.health_gate(provider.provider_id, 30).await?;
                 }
             }
             _ => {}
@@ -1416,8 +1608,6 @@ const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v1";
 const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v1";
 const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v4";
 const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v4";
-const NZBGET_MANAGED_WEB_DIR: &str = "/app/nzbget/webui";
-const NZBGET_MANAGED_CONFIG_TEMPLATE: &str = "/app/nzbget/webui/nzbget.conf.template";
 
 async fn resolve_sonarr_api_key(
     store: &ExtensionStore<'_>,
@@ -1937,6 +2127,47 @@ fn generate_arr_ui_credentials() -> (String, String) {
         .map(char::from)
         .collect();
     (format!("elixir_{suffix}"), password)
+}
+
+fn compact_nzbget_config_text(text: &str) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut last_assignment = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(key) = nzbget_config_key(line) {
+            last_assignment.insert(key, index);
+        }
+    }
+
+    let mut changed = false;
+    let mut rendered = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let Some(key) = nzbget_config_key(line) else {
+            rendered.push((*line).to_string());
+            continue;
+        };
+        if last_assignment.get(key).copied() != Some(index) {
+            changed = true;
+            continue;
+        }
+        rendered.push((*line).to_string());
+    }
+
+    if !changed {
+        return text.to_string();
+    }
+
+    let mut output = rendered.join("\n");
+    output.push('\n');
+    output
+}
+
+fn nzbget_config_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (name, _) = line.split_once('=')?;
+    Some(name.trim())
 }
 
 fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
@@ -3074,12 +3305,40 @@ fn should_restart_nzbget_after_patch(
     )
 }
 
+fn should_apply_nzbget_named_volume_patch(
+    provider: &Provider,
+    instance_config: Option<&serde_json::Value>,
+    patch: &DriverPatch,
+) -> bool {
+    if provider.capability != "downloader.nzb"
+        || provider.implementation.as_deref() != Some("nzbget")
+        || !runtime_uses_named_config_storage(instance_config)
+    {
+        return false;
+    }
+
+    matches!(
+        patch,
+        DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetCategories { .. })
+            | DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences { .. })
+    )
+}
+
 fn runtime_has_bind_config_dir(instance_config: Option<&serde_json::Value>) -> bool {
     instance_config
         .and_then(|value| value.get("runtime"))
         .and_then(|value| value.get("config_dir"))
         .and_then(serde_json::Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn runtime_uses_named_config_storage(instance_config: Option<&serde_json::Value>) -> bool {
+    instance_config
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.get("config_storage"))
+        .and_then(|value| value.get("source_kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("named_volume"))
 }
 
 async fn nzbget_managed_ui_paths_are_current(
@@ -3105,10 +3364,10 @@ async fn nzbget_managed_ui_paths_are_current(
 
     Ok(matches!(
         find_nzbget_config_value(&contents, "WebDir"),
-        Some(value) if value == NZBGET_MANAGED_WEB_DIR
+        Some(value) if value == NZBGET_WEB_DIR
     ) && matches!(
         find_nzbget_config_value(&contents, "ConfigTemplate"),
-        Some(value) if value == NZBGET_MANAGED_CONFIG_TEMPLATE
+        Some(value) if value == NZBGET_CONFIG_TEMPLATE
     ))
 }
 
@@ -3157,43 +3416,23 @@ async fn read_config_text(
 }
 
 fn qbittorrent_incomplete_path() -> &'static str {
-    if desktop_runtime_storage_migration_enabled() {
-        "/runtime/incomplete"
-    } else {
-        "/downloads/.incomplete"
-    }
+    QBITTORRENT_INCOMPLETE_DIR
 }
 
 fn nzbget_incomplete_path() -> &'static str {
-    if desktop_runtime_storage_migration_enabled() {
-        "/runtime/incomplete"
-    } else {
-        "/downloads/.incomplete"
-    }
+    NZBGET_INCOMPLETE_DIR
 }
 
 fn nzbget_nzb_dir() -> &'static str {
-    if desktop_runtime_storage_migration_enabled() {
-        "/runtime/nzb"
-    } else {
-        "/config/nzb"
-    }
+    NZBGET_NZB_DIR
 }
 
 fn nzbget_queue_dir() -> &'static str {
-    if desktop_runtime_storage_migration_enabled() {
-        "/runtime/queue"
-    } else {
-        "/config/queue"
-    }
+    NZBGET_QUEUE_DIR
 }
 
 fn nzbget_temp_dir() -> &'static str {
-    if desktop_runtime_storage_migration_enabled() {
-        "/runtime/tmp"
-    } else {
-        "/config/tmp"
-    }
+    NZBGET_TEMP_DIR
 }
 
 fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
@@ -3233,28 +3472,27 @@ fn qbittorrent_performance_profile_patch(profile: DownloaderPerformanceProfile) 
 }
 
 fn nzbget_performance_profile_patch(profile: DownloaderPerformanceProfile) -> DriverPatch {
-    let (server_connections, article_retries, article_cache_mb, write_buffer_kb, par_threads) =
-        match profile {
-            DownloaderPerformanceProfile::Balanced => {
-                (20, 3, 200, 1024, recommended_nzbget_par_threads(false))
-            }
-            DownloaderPerformanceProfile::Aggressive => {
-                (32, 4, 384, 2048, recommended_nzbget_par_threads(true))
-            }
-        };
+    let (article_retries, article_cache_mb, write_buffer_kb, par_threads) = match profile {
+        DownloaderPerformanceProfile::Balanced => {
+            (3, 200, 1024, recommended_nzbget_par_threads(false))
+        }
+        DownloaderPerformanceProfile::Aggressive => {
+            (4, 384, 2048, recommended_nzbget_par_threads(true))
+        }
+    };
     DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences {
-        main_dir: Some("/config".to_string()),
-        default_save_path: Some("/downloads".to_string()),
+        main_dir: Some(NZBGET_MAIN_DIR.to_string()),
+        default_save_path: Some(DOWNLOADS_ROOT.to_string()),
         incomplete_path: Some(nzbget_incomplete_path().to_string()),
         nzb_dir: Some(nzbget_nzb_dir().to_string()),
         queue_dir: Some(nzbget_queue_dir().to_string()),
         temp_dir: Some(nzbget_temp_dir().to_string()),
-        script_dir: Some("/config/scripts".to_string()),
-        log_file: Some("/config/nzbget.log".to_string()),
-        web_dir: Some(NZBGET_MANAGED_WEB_DIR.to_string()),
-        config_template: Some(NZBGET_MANAGED_CONFIG_TEMPLATE.to_string()),
+        script_dir: Some(NZBGET_SCRIPT_DIR.to_string()),
+        log_file: Some(NZBGET_LOG_FILE.to_string()),
+        web_dir: Some(NZBGET_WEB_DIR.to_string()),
+        config_template: Some(NZBGET_CONFIG_TEMPLATE.to_string()),
         use_incomplete: Some(true),
-        server_connections: Some(server_connections),
+        server_connections: None,
         article_retries: Some(article_retries),
         article_timeout_seconds: Some(60),
         article_cache_mb: Some(article_cache_mb),
@@ -3466,22 +3704,17 @@ fn prepare_runtime_volumes(
         .collect::<Result<Vec<_>>>()?;
     let mut legacy_config_bind_source = None;
 
-    if !should_use_named_config_storage(extension_id) {
-        return Ok(PreparedRuntimeVolumes {
-            volumes,
-            legacy_config_bind_source,
-        });
-    }
-
-    if let Some(config_mount) = volumes
-        .iter_mut()
-        .find(|volume| volume.container_path == "/config")
-    {
-        if config_mount.source_kind == VolumeMountSourceKind::Bind {
-            legacy_config_bind_source = Some(config_mount.host_path.clone());
+    if should_use_named_config_storage(extension_id) {
+        if let Some(config_mount) = volumes
+            .iter_mut()
+            .find(|volume| volume.container_path == "/config")
+        {
+            if config_mount.source_kind == VolumeMountSourceKind::Bind {
+                legacy_config_bind_source = Some(config_mount.host_path.clone());
+            }
+            config_mount.source_kind = VolumeMountSourceKind::NamedVolume;
+            config_mount.host_path = config_volume_name(instance_id);
         }
-        config_mount.source_kind = VolumeMountSourceKind::NamedVolume;
-        config_mount.host_path = config_volume_name(instance_id);
     }
 
     if extension_requires_runtime_volume(extension_id)
@@ -3699,7 +3932,7 @@ mod tests {
             &config_path,
             format!(
                 "WebDir={}\nConfigTemplate={}\n",
-                NZBGET_MANAGED_WEB_DIR, NZBGET_MANAGED_CONFIG_TEMPLATE
+                NZBGET_WEB_DIR, NZBGET_CONFIG_TEMPLATE
             ),
         )
         .await?;
@@ -3720,6 +3953,8 @@ mod tests {
     struct RecordingDriver {
         capability: &'static str,
         calls: Arc<Mutex<Vec<crate::drivers::DriverPatch>>>,
+        semantics: crate::drivers::PatchSemantics,
+        evaluation: crate::drivers::DriftEvaluation,
     }
 
     impl RecordingDriver {
@@ -3727,7 +3962,26 @@ mod tests {
             capability: &'static str,
             calls: Arc<Mutex<Vec<crate::drivers::DriverPatch>>>,
         ) -> Self {
-            Self { capability, calls }
+            Self {
+                capability,
+                calls,
+                semantics: crate::drivers::PatchSemantics::periodic_safe(
+                    crate::drivers::PatchSideEffect::LiveApiWrite,
+                ),
+                evaluation: crate::drivers::DriftEvaluation::unknown(
+                    "recording driver does not model drift",
+                ),
+            }
+        }
+
+        fn with_semantics(mut self, semantics: crate::drivers::PatchSemantics) -> Self {
+            self.semantics = semantics;
+            self
+        }
+
+        fn with_evaluation(mut self, evaluation: crate::drivers::DriftEvaluation) -> Self {
+            self.evaluation = evaluation;
+            self
         }
     }
 
@@ -3742,6 +3996,21 @@ mod tests {
                 summary: None,
                 activity: None,
             })
+        }
+
+        fn patch_semantics(
+            &self,
+            _patch: &crate::drivers::DriverPatch,
+        ) -> crate::drivers::PatchSemantics {
+            self.semantics
+        }
+
+        async fn evaluate_patch(
+            &self,
+            _ctx: DriverCtx,
+            _patch: crate::drivers::DriverPatch,
+        ) -> Result<crate::drivers::DriftEvaluation> {
+            Ok(self.evaluation.clone())
         }
 
         async fn apply_patch(
@@ -5458,7 +5727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_gate_applies_qbittorrent_performance_profile_once() -> Result<()> {
+    async fn apply_builtin_downloader_profiles_updates_qbittorrent_once() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
@@ -5477,10 +5746,10 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "svc-qbit".to_string(),
+            "127.0.0.1".to_string(),
             8080,
             None,
-            Some("elixir_net".to_string()),
+            None,
         )?;
         store
             .upsert_provider(&NewProvider {
@@ -5521,8 +5790,8 @@ mod tests {
             &secrets,
         );
 
-        executor.health_gate_once(provider_id).await?;
-        executor.health_gate_once(provider_id).await?;
+        executor.apply_builtin_downloader_profiles_now().await?;
+        executor.apply_builtin_downloader_profiles_now().await?;
 
         let calls = calls.lock().expect("recording driver lock");
         assert_eq!(calls.len(), 1, "profile should only apply once");
@@ -5556,13 +5825,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_gate_uses_aggressive_qbittorrent_profile_when_selected() -> Result<()> {
+    async fn health_gate_does_not_apply_qbittorrent_profile_implicitly() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
-        store
-            .upsert_extension_setting("downloader_profile", &json!("aggressive"))
-            .await?;
 
         let instance_id = Uuid::new_v4();
         store
@@ -5578,10 +5844,10 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "svc-qbit".to_string(),
+            "127.0.0.1".to_string(),
             8080,
             None,
-            Some("elixir_net".to_string()),
+            None,
         )?;
         store
             .upsert_provider(&NewProvider {
@@ -5623,6 +5889,87 @@ mod tests {
         );
 
         executor.health_gate_once(provider_id).await?;
+        executor.health_gate_once(provider_id).await?;
+
+        assert!(
+            calls.lock().expect("recording driver lock").is_empty(),
+            "steady-state health checks must not rewrite downloader profiles"
+        );
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let parsed = parse_qbittorrent_instance_config(instance.config_json.as_ref())?;
+        assert_eq!(parsed.performance_profile_version.as_deref(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_builtin_downloader_profiles_uses_aggressive_qbittorrent_profile_when_selected()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+        store
+            .upsert_extension_setting("downloader_profile", &json!("aggressive"))
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(RecordingDriver::new("downloader.torrent", calls.clone()));
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor.apply_builtin_downloader_profiles_now().await?;
 
         let calls = calls.lock().expect("recording driver lock");
         assert_eq!(calls.len(), 1, "profile should apply once");
@@ -5652,7 +5999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_gate_applies_nzbget_performance_profile_once() -> Result<()> {
+    async fn apply_builtin_downloader_profiles_updates_nzbget_once() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
@@ -5671,10 +6018,10 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "svc-nzb".to_string(),
+            "127.0.0.1".to_string(),
             6789,
             None,
-            Some("elixir_net".to_string()),
+            None,
         )?;
         store
             .upsert_provider(&NewProvider {
@@ -5715,8 +6062,8 @@ mod tests {
             &secrets,
         );
 
-        executor.health_gate_once(provider_id).await?;
-        executor.health_gate_once(provider_id).await?;
+        executor.apply_builtin_downloader_profiles_now().await?;
+        executor.apply_builtin_downloader_profiles_now().await?;
 
         let calls = calls.lock().expect("recording driver lock");
         assert_eq!(calls.len(), 1, "profile should only apply once");
@@ -5736,7 +6083,7 @@ mod tests {
             panic!("expected nzbget preferences patch");
         };
         assert_eq!(main_dir.as_deref(), Some("/config"));
-        assert_eq!(*server_connections, Some(20));
+        assert_eq!(*server_connections, None);
         assert_eq!(*write_buffer_kb, Some(1024));
         assert_eq!(*direct_write, Some(true));
         assert_eq!(par_check.as_deref(), Some("auto"));
@@ -5754,6 +6101,291 @@ mod tests {
         assert_eq!(
             parsed.performance_profile_version.as_deref(),
             Some(NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_driver_patch_skips_in_sync_disruptive_patch() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(
+            RecordingDriver::new("downloader.torrent", calls.clone())
+                .with_semantics(crate::drivers::PatchSemantics::desired_change_only(
+                    crate::drivers::PatchSideEffect::ReloadService,
+                ))
+                .with_evaluation(crate::drivers::DriftEvaluation::in_sync()),
+        );
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor
+            .apply_driver_patch(
+                "test.connector".to_string(),
+                provider_id,
+                json!({
+                    "op": "set_preferences",
+                    "queueing_enabled": false
+                }),
+            )
+            .await?;
+
+        assert!(
+            calls.lock().expect("recording driver lock").is_empty(),
+            "in-sync disruptive patch should not apply"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_driver_patch_requires_explicit_repair_for_unknown_disruptive_drift() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(
+            RecordingDriver::new("downloader.torrent", calls.clone())
+                .with_semantics(crate::drivers::PatchSemantics::desired_change_only(
+                    crate::drivers::PatchSideEffect::ReloadService,
+                ))
+                .with_evaluation(
+                    crate::drivers::DriftEvaluation::unknown(
+                        "opaque secret fields prevent safe live comparison",
+                    )
+                    .with_non_comparable_fields(vec![
+                        crate::drivers::DriftField::new(
+                            "Server1.Password",
+                            crate::drivers::FieldSemantics::OpaqueSecret,
+                        ),
+                    ]),
+                ),
+        );
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let err = executor
+            .apply_driver_patch(
+                "test.connector".to_string(),
+                provider_id,
+                json!({
+                    "op": "set_preferences",
+                    "queueing_enabled": false
+                }),
+            )
+            .await
+            .expect_err("unknown disruptive drift should require explicit repair");
+        let message = err.to_string();
+        assert!(
+            message.contains("requires explicit repair"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Server1.Password"),
+            "opaque field should be surfaced: {message}"
+        );
+        assert!(
+            calls.lock().expect("recording driver lock").is_empty(),
+            "unknown disruptive patch should not apply"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_driver_patch_allows_unknown_periodic_safe_patch() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(
+            RecordingDriver::new("downloader.torrent", calls.clone()).with_evaluation(
+                crate::drivers::DriftEvaluation::unknown(
+                    "periodic-safe patch did not provide semantic drift evaluation",
+                ),
+            ),
+        );
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([9u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor
+            .apply_driver_patch(
+                "test.connector".to_string(),
+                provider_id,
+                json!({
+                    "op": "set_preferences",
+                    "queueing_enabled": false
+                }),
+            )
+            .await?;
+
+        assert_eq!(
+            calls.lock().expect("recording driver lock").len(),
+            1,
+            "periodic-safe unknown patch should still apply"
         );
         Ok(())
     }
@@ -6373,7 +7005,8 @@ PersistentKeepalive = 25
                 prepared
                     .volumes
                     .iter()
-                    .all(|volume| volume.container_path != "/runtime")
+                    .any(|volume| volume.container_path == "/runtime"
+                        && volume.source_kind == VolumeMountSourceKind::NamedVolume)
             );
         }
 
@@ -6428,19 +7061,45 @@ PersistentKeepalive = 25
     }
 
     #[test]
-    fn desktop_downloader_runtime_paths_switch_to_runtime_volume() {
-        if desktop_runtime_storage_migration_enabled() {
-            assert_eq!(qbittorrent_incomplete_path(), "/runtime/incomplete");
-            assert_eq!(nzbget_incomplete_path(), "/runtime/incomplete");
-            assert_eq!(nzbget_nzb_dir(), "/runtime/nzb");
-            assert_eq!(nzbget_queue_dir(), "/runtime/queue");
-            assert_eq!(nzbget_temp_dir(), "/runtime/tmp");
-        } else {
-            assert_eq!(qbittorrent_incomplete_path(), "/downloads/.incomplete");
-            assert_eq!(nzbget_incomplete_path(), "/downloads/.incomplete");
-            assert_eq!(nzbget_nzb_dir(), "/config/nzb");
-            assert_eq!(nzbget_queue_dir(), "/config/queue");
-            assert_eq!(nzbget_temp_dir(), "/config/tmp");
-        }
+    fn downloader_runtime_paths_are_always_runtime_volume_backed() {
+        assert_eq!(qbittorrent_incomplete_path(), "/runtime/incomplete");
+        assert_eq!(nzbget_incomplete_path(), "/runtime/incomplete");
+        assert_eq!(nzbget_nzb_dir(), "/runtime/nzb");
+        assert_eq!(nzbget_queue_dir(), "/runtime/queue");
+        assert_eq!(nzbget_temp_dir(), "/runtime/tmp");
+    }
+
+    #[test]
+    fn compact_nzbget_config_text_deduplicates_keys_and_keeps_last_assignment() {
+        let text = "\
+# comment
+DestDir=/downloads/old
+InterDir=/runtime/incomplete
+DestDir=/downloads
+Category1.Name=tv
+Category1.Name=tv
+TempDir=/runtime/tmp
+";
+        let compacted = compact_nzbget_config_text(text);
+        assert_eq!(
+            compacted,
+            "\
+# comment
+InterDir=/runtime/incomplete
+DestDir=/downloads
+Category1.Name=tv
+TempDir=/runtime/tmp
+"
+        );
+    }
+
+    #[test]
+    fn compact_nzbget_config_text_is_noop_when_config_is_unique() {
+        let text = "\
+DestDir=/downloads
+InterDir=/runtime/incomplete
+Category1.Name=tv
+";
+        assert_eq!(compact_nzbget_config_text(text), text);
     }
 }

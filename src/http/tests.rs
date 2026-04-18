@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -13,7 +13,7 @@ use argon2::{
 use axum::{
     Json, Router,
     body::{self, Body},
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
@@ -759,11 +759,19 @@ fn mock_arr_download_client_details() -> Vec<Value> {
     ]
 }
 
+fn mock_arr_tags() -> Vec<Value> {
+    vec![json!({
+        "label": "elixir",
+        "id": 1
+    })]
+}
+
 async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
     let download_clients = Arc::new(mock_arr_download_clients());
+    let tags = Arc::new(mock_arr_tags());
 
     let app = Router::new()
         .route(
@@ -792,6 +800,16 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
         .route(
             "/api/v3/rootfolder",
             get(|| async { Json(json!([{ "path": "/downloads/tv" }])) }),
+        )
+        .route(
+            "/api/v3/tag",
+            get({
+                let tags = Arc::clone(&tags);
+                move || {
+                    let tags = Arc::clone(&tags);
+                    async move { Json(Value::Array(tags.as_ref().clone())) }
+                }
+            }),
         )
         .route(
             "/api/v3/downloadclient",
@@ -828,6 +846,117 @@ async fn start_mock_sonarr_server() -> Result<(String, SocketAddr, oneshot::Send
     }
 
     Ok((host, addr, shutdown_tx))
+}
+
+#[derive(Clone, Default)]
+struct MockRadarrAddState {
+    created_movies: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn start_mock_radarr_server()
+-> Result<(String, SocketAddr, MockRadarrAddState, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let addr = listener.local_addr()?;
+    let host = discover_test_host_ip()?;
+    let state = MockRadarrAddState::default();
+    let tags = Arc::new(mock_arr_tags());
+
+    async fn movie_lookup(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        let term = params.get("term").map(String::as_str).unwrap_or_default();
+        if term == "tmdb:4232"
+            || term == "imdb:tt0117571"
+            || term == "Scream 1996"
+            || term == "Scream"
+        {
+            return Json(json!([{
+                "id": 4232,
+                "title": "Scream",
+                "tmdbId": 4232,
+                "imdbId": "tt0117571",
+                "year": 1996,
+                "monitored": true
+            }]));
+        }
+        Json(json!([]))
+    }
+
+    async fn create_movie(
+        State(state): State<MockRadarrAddState>,
+        Json(payload): Json<Value>,
+    ) -> impl IntoResponse {
+        if payload
+            .get("addOptions")
+            .and_then(Value::as_object)
+            .and_then(|options| options.get("monitor"))
+            .is_some()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "https://tools.ietf.org/html/rfc7231#section-6.5.1",
+                    "title": "One or more validation errors occurred.",
+                    "status": 400,
+                    "errors": {
+                        "$.addOptions.monitor": [
+                            "The JSON value could not be converted to NzbDrone.Core.Movies.MonitorTypes."
+                        ]
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        state.created_movies.lock().unwrap().push(payload.clone());
+        (StatusCode::OK, Json(json!({ "id": 4232 }))).into_response()
+    }
+
+    let app = Router::new()
+        .route(
+            "/api/v3/system/status",
+            get(|| async { Json(json!({ "version": "5.9.1.9070" })) }),
+        )
+        .route("/api/v3/movie/lookup", get(movie_lookup))
+        .route(
+            "/api/v3/tag",
+            get({
+                let tags = Arc::clone(&tags);
+                move || {
+                    let tags = Arc::clone(&tags);
+                    async move { Json(Value::Array(tags.as_ref().clone())) }
+                }
+            }),
+        )
+        .route(
+            "/api/v3/qualityprofile",
+            get(|| async { Json(json!([{ "id": 1, "name": "Default" }])) }),
+        )
+        .route(
+            "/api/v3/rootfolder",
+            get(|| async { Json(json!([{ "path": "/downloads/movies" }])) }),
+        )
+        .route("/api/v3/movie", post(create_movie))
+        .with_state(state.clone());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let ready_url = format!("http://{}:{}/api/v3/system/status", host, addr.port());
+    for _ in 0..20 {
+        if let Ok(response) = reqwest::get(&ready_url).await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    Ok((host, addr, state, shutdown_tx))
 }
 
 async fn start_mock_prowlarr_indexer_server(
@@ -3902,6 +4031,18 @@ async fn find_media_acquisition_lists_active_intents() -> Result<()> {
         Some("tv")
     );
     assert_eq!(
+        items[0].get("phase").and_then(Value::as_str),
+        Some("requested")
+    );
+    assert_eq!(
+        items[0].get("phaseLabel").and_then(Value::as_str),
+        Some("Requested")
+    );
+    assert_eq!(
+        items[0].get("headline").and_then(Value::as_str),
+        Some("Waiting for manager confirmation.")
+    );
+    assert_eq!(
         items[0].get("stage").and_then(Value::as_str),
         Some("requested")
     );
@@ -4338,6 +4479,151 @@ async fn find_media_add_returns_missing_required_secrets_conflict() -> Result<()
     assert_eq!(
         payload.get("code").and_then(Value::as_str),
         Some("missing_required_secrets")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_add_movie_uses_prefixed_manager_lookup_terms() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-add-movie-prefixed-lookup".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("find-media-add-movie@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let (radarr_host, radarr_addr, radarr_state, shutdown_tx) = start_mock_radarr_server().await?;
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.radarr".to_string(),
+            name: "Radarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.radarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-radarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.movies".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("radarr".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie"],
+                "actions": ["add", "search", "monitor"]
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": radarr_host,
+                "port": radarr_addr.port(),
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "mediaType": "movie",
+                        "managerProviderId": provider_id.to_string(),
+                        "item": {
+                            "title": "Scream",
+                            "year": 1996,
+                            "externalIds": {
+                                "tmdb": "4232",
+                                "imdb": "tt0117571"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("managerItemId").and_then(Value::as_str),
+        Some("4232")
+    );
+    let created_movies = radarr_state.created_movies.lock().unwrap();
+    assert_eq!(created_movies.len(), 1);
+    assert_eq!(
+        created_movies[0]
+            .get("addOptions")
+            .and_then(Value::as_object)
+            .and_then(|options| options.get("searchForMovie"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        created_movies[0]
+            .get("addOptions")
+            .and_then(Value::as_object)
+            .and_then(|options| options.get("monitor"))
+            .is_none(),
+        "expected Radarr addOptions.monitor to be omitted: {}",
+        created_movies[0]
+    );
+    assert_eq!(
+        created_movies[0]
+            .get("tags")
+            .and_then(Value::as_array)
+            .cloned(),
+        Some(vec![json!(1)]),
+        "expected created movie to inherit the managed elixir tag: {}",
+        created_movies[0]
     );
 
     Ok(())
@@ -6293,6 +6579,160 @@ runtime:
     assert_eq!(
         payload.get("extension_id").and_then(Value::as_str),
         Some("elixir.modules.qbittorrent")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_allows_bundled_elx_install_without_signature_when_manifest_declares_key()
+-> Result<()> {
+    let temp = tempdir()?;
+    let bundled_dir = temp.path().join("bundled");
+    std::fs::create_dir_all(&bundled_dir)?;
+    let package_path = bundled_dir.join("prowlarr-nzbgeek-connector.elx");
+    let manifest = r#"id: elixir.connectors.prowlarr_nzbgeek
+version: 1.0.0
+kind: connector
+name: "Prowlarr NZBGeek Indexer"
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:koGwR9yOr6ynyG9xjnVlVjQ9B61vJtdCqEPtfV/avq0="
+permissions:
+  - drivers.configure.indexer.registry
+targets:
+  - capability: indexer.registry
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: indexer.registry
+      slot: default
+    patch:
+      op: register_indexers
+      indexers:
+        - name: "NZBGeek"
+          implementation: "NZBgeek"
+          url: "https://api.nzbgeek.info"
+"#;
+    let file = File::create(&package_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::<()>::default();
+    zip.start_file("manifest.yaml", options)?;
+    zip.write_all(manifest.as_bytes())?;
+    zip.finish()?;
+
+    let mut settings = test_settings_with_db();
+    settings.environment = RunEnvironment::Production;
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_path.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let status = install_resp.status();
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "install failed body: {payload}");
+    assert_eq!(
+        payload.get("extension_id").and_then(Value::as_str),
+        Some("elixir.connectors.prowlarr_nzbgeek")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_catalog_lists_bundled_elx_packages_without_registries() -> Result<()> {
+    let temp = tempdir()?;
+    let bundled_dir = temp.path().join("bundled");
+    std::fs::create_dir_all(&bundled_dir)?;
+    let package_path = bundled_dir.join("qbittorrent-module.elx");
+    let manifest = r#"id: elixir.modules.qbittorrent
+version: 1.0.0
+kind: module
+name: "qBittorrent"
+provides:
+  - capability: downloader.torrent
+    slot: default
+    implementation: "qbittorrent"
+runtime:
+  type: container
+  image: "example/qbittorrent:1"
+"#;
+    let file = File::create(&package_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::<()>::default();
+    zip.start_file("manifest.yaml", options)?;
+    zip.write_all(manifest.as_bytes())?;
+    zip.finish()?;
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
+    settings.extensions.registries = Vec::new();
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let response = app
+        .oneshot(Request::get("/api/v1/extensions/catalog").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let available = payload["available"].as_array().cloned().unwrap_or_default();
+    let entry = available
+        .iter()
+        .find(|item| item["id"].as_str() == Some("elixir.modules.qbittorrent"))
+        .expect("expected bundled qBittorrent package in catalog");
+    assert_eq!(entry["download_url"].as_str(), Some(""));
+    assert_eq!(
+        entry["package_path"].as_str(),
+        Some(package_path.to_string_lossy().as_ref())
     );
 
     Ok(())

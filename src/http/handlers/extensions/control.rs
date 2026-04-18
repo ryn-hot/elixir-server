@@ -7,6 +7,12 @@ use super::control_contract::{
     ExtensionControlProvider, GenericManifestControlProvider, UnsupportedControlProvider,
 };
 use super::*;
+use crate::drivers::render_nzbget_config_text_updates;
+use crate::extensions::managed_paths::{
+    DOWNLOADS_ROOT, NZBGET_CONFIG_TEMPLATE, NZBGET_INCOMPLETE_DIR, NZBGET_LOCK_FILE,
+    NZBGET_LOG_FILE, NZBGET_MAIN_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR,
+    NZBGET_TEMP_DIR, NZBGET_WEB_DIR,
+};
 
 // First-party providers plug into the same platform-owned control contract as
 // the generic manifest path. Their custom logic lives here, but the
@@ -451,6 +457,11 @@ impl ExtensionControlProvider for DownloaderControlAdapter {
             }
             _ => anyhow::bail!("downloaderProfile must be balanced or aggressive"),
         }
+
+        state
+            .orchestrator
+            .apply_builtin_downloader_profiles_now()
+            .await?;
 
         Ok(())
     }
@@ -1656,6 +1667,41 @@ async fn restore_nzbget_server_inventory(
     nzbget_save_config_for_instance(state, store, instance_id, updates).await
 }
 
+fn nzbget_managed_config_updates_for_config(
+    _config_json: Option<&serde_json::Value>,
+) -> Vec<NzbgetControlConfigUpdate> {
+    vec![
+        NzbgetControlConfigUpdate::new("MainDir", NZBGET_MAIN_DIR),
+        NzbgetControlConfigUpdate::new("DestDir", DOWNLOADS_ROOT),
+        NzbgetControlConfigUpdate::new("InterDir", NZBGET_INCOMPLETE_DIR),
+        NzbgetControlConfigUpdate::new("NzbDir", NZBGET_NZB_DIR),
+        NzbgetControlConfigUpdate::new("QueueDir", NZBGET_QUEUE_DIR),
+        NzbgetControlConfigUpdate::new("TempDir", NZBGET_TEMP_DIR),
+        NzbgetControlConfigUpdate::new("ScriptDir", NZBGET_SCRIPT_DIR),
+        NzbgetControlConfigUpdate::new("LogFile", NZBGET_LOG_FILE),
+        NzbgetControlConfigUpdate::new("WebDir", NZBGET_WEB_DIR),
+        NzbgetControlConfigUpdate::new("ConfigTemplate", NZBGET_CONFIG_TEMPLATE),
+        NzbgetControlConfigUpdate::new("LockFile", NZBGET_LOCK_FILE),
+    ]
+}
+
+fn dedupe_nzbget_config_updates(
+    updates: Vec<NzbgetControlConfigUpdate>,
+) -> Vec<NzbgetControlConfigUpdate> {
+    let mut last_assignment = HashMap::new();
+    for (index, update) in updates.iter().enumerate() {
+        last_assignment.insert(update.name.clone(), index);
+    }
+
+    let mut deduped = Vec::with_capacity(updates.len());
+    for (index, update) in updates.into_iter().enumerate() {
+        if last_assignment.get(&update.name).copied() == Some(index) {
+            deduped.push(update);
+        }
+    }
+    deduped
+}
+
 fn nzbget_server_config_updates(
     server: &NzbgetServerEntry,
     username: &str,
@@ -2040,6 +2086,40 @@ async fn nzbget_save_config_for_instance(
     if updates.is_empty() {
         return Ok(());
     }
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("NZBGet instance {instance_id} was not found"))?;
+    let updates = dedupe_nzbget_config_updates(
+        nzbget_managed_config_updates_for_config(instance.config_json.as_ref())
+            .into_iter()
+            .chain(updates.into_iter())
+            .collect(),
+    );
+    if nzbget_uses_named_config_storage(instance.config_json.as_ref()) {
+        let current_text = state
+            .orchestrator
+            .read_instance_container_text_file(instance_id, "/config/nzbget.conf")
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("nzbget config file is missing for instance {instance_id}")
+            })?;
+        let raw_updates = updates
+            .iter()
+            .map(|update| (update.name.clone(), update.value.clone()))
+            .collect::<Vec<_>>();
+        if let Some(rendered) = render_nzbget_config_text_updates(&current_text, &raw_updates) {
+            state
+                .orchestrator
+                .replace_instance_container_text_file_and_restart(
+                    instance_id,
+                    "/config/nzbget.conf",
+                    &rendered,
+                )
+                .await?;
+        }
+        return Ok(());
+    }
     let result =
         nzbget_rpc_for_instance(state, store, instance_id, "saveconfig", json!([updates])).await?;
     if !nzbget_rpc_success(&result) {
@@ -2050,6 +2130,15 @@ async fn nzbget_save_config_for_instance(
         anyhow::bail!("nzbget reload returned unexpected payload: {reload}");
     }
     Ok(())
+}
+
+fn nzbget_uses_named_config_storage(instance_config: Option<&serde_json::Value>) -> bool {
+    instance_config
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.get("config_storage"))
+        .and_then(|value| value.get("source_kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("named_volume"))
 }
 
 async fn nzbget_test_server_connection(
@@ -2204,6 +2293,66 @@ fn log_nzbget_control_availability(message: &str, err: &anyhow::Error) {
         tracing::debug!("{message}: {err}");
     } else {
         tracing::warn!("{message}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nzbget_managed_config_updates_use_runtime_paths_when_runtime_volume_exists() {
+        let config_json = json!({
+            "runtime": {
+                "volumes": [
+                    { "container_path": "/config" },
+                    { "container_path": "/runtime" }
+                ]
+            }
+        });
+        let updates = nzbget_managed_config_updates_for_config(Some(&config_json));
+        let as_map = updates
+            .into_iter()
+            .map(|update| (update.name, update.value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            as_map.get("InterDir").map(String::as_str),
+            Some("/runtime/incomplete")
+        );
+        assert_eq!(
+            as_map.get("NzbDir").map(String::as_str),
+            Some("/runtime/nzb")
+        );
+        assert_eq!(
+            as_map.get("QueueDir").map(String::as_str),
+            Some("/runtime/queue")
+        );
+        assert_eq!(
+            as_map.get("TempDir").map(String::as_str),
+            Some("/runtime/tmp")
+        );
+    }
+
+    #[test]
+    fn dedupe_nzbget_config_updates_keeps_last_assignment() {
+        let updates = vec![
+            NzbgetControlConfigUpdate::new("Server1.Connections", "32"),
+            NzbgetControlConfigUpdate::new("DestDir", "/downloads"),
+            NzbgetControlConfigUpdate::new("Server1.Connections", "8"),
+        ];
+        let deduped = dedupe_nzbget_config_updates(updates);
+        let as_map = deduped
+            .into_iter()
+            .map(|update| (update.name, update.value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            as_map.get("Server1.Connections").map(String::as_str),
+            Some("8")
+        );
+        assert_eq!(
+            as_map.get("DestDir").map(String::as_str),
+            Some("/downloads")
+        );
     }
 }
 
@@ -2849,34 +2998,7 @@ async fn request_downloader_json_for_instance(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut request =
-        request_downloader_builder_for_instance(state, store, instance_id, method.clone(), path)
-            .await?;
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("sending downloader {} {path}", method.as_str()))?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("reading downloader {} {path} response", method.as_str()))?;
-    if !status.is_success() {
-        let detail = describe_response_body(&bytes);
-        anyhow::bail!(
-            "downloader {} {path} failed ({}): {detail}",
-            method.as_str(),
-            status
-        );
-    }
-    if bytes.is_empty() {
-        return Ok(serde_json::Value::Null);
-    }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing downloader {} {path} response", method.as_str()))
+    super::request_instance_service_json(state, store, instance_id, method, path, body).await
 }
 
 pub(super) async fn load_nzbget_live_config_map(

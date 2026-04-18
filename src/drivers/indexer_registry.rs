@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
+use crate::drivers::{
+    ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx, DriverPatch, PatchSemantics,
+    PatchSideEffect, StateSnapshot,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
@@ -24,6 +27,53 @@ impl IndexerRegistryDriver {
 impl CapabilityDriver for IndexerRegistryDriver {
     fn capability(&self) -> &'static str {
         "indexer.registry"
+    }
+
+    fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        match patch {
+            DriverPatch::IndexerRegistry(_) => {
+                PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite)
+            }
+            _ => PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite),
+        }
+    }
+
+    async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        let patch = match patch {
+            DriverPatch::IndexerRegistry(patch) => patch,
+            _ => bail!("indexer.registry patch mismatch"),
+        };
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if implementation != "prowlarr" {
+            bail!(
+                "indexer.registry implementation '{}' is not supported",
+                implementation
+            );
+        }
+
+        let config = ProwlarrDriverConfig::from_ctx(&ctx)?;
+        let client = ProwlarrClient::from_config(config, ctx.canonical_url()?).await?;
+        let provider_endpoint_url = ctx.endpoint.canonical_url()?;
+
+        match patch {
+            IndexerRegistryPatch::RegisterIndexers { indexers } => Ok(drift_evaluation(
+                "Prowlarr indexers",
+                client.evaluate_indexers(&indexers).await?,
+            )),
+            IndexerRegistryPatch::RegisterApp { app } => Ok(drift_evaluation(
+                "Prowlarr apps",
+                client
+                    .evaluate_apps(std::slice::from_ref(&app), &provider_endpoint_url)
+                    .await?,
+            )),
+            IndexerRegistryPatch::RegisterApps { apps } => Ok(drift_evaluation(
+                "Prowlarr apps",
+                client.evaluate_apps(&apps, &provider_endpoint_url).await?,
+            )),
+        }
     }
 
     async fn read_state(&self, ctx: DriverCtx) -> Result<StateSnapshot> {
@@ -394,6 +444,37 @@ impl ProwlarrClient {
         Ok(tag_ids)
     }
 
+    async fn resolve_existing_tag_ids(&self, tags: &[String]) -> Result<(Vec<i64>, Vec<String>)> {
+        if tags.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let existing = self.get_json::<Vec<Value>>("tag").await?;
+        let mut by_name: HashMap<String, i64> = HashMap::new();
+        for tag in &existing {
+            if let (Some(name), Some(id)) = (
+                tag.get("label").and_then(Value::as_str),
+                tag.get("id").and_then(Value::as_i64),
+            ) {
+                by_name.insert(normalize_name(name), id);
+            }
+        }
+        let mut tag_ids = Vec::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for tag in tags {
+            let normalized = normalize_name(tag);
+            if !seen.insert(normalized.clone()) {
+                continue;
+            }
+            if let Some(id) = by_name.get(&normalized) {
+                tag_ids.push(*id);
+            } else {
+                missing.push(tag.clone());
+            }
+        }
+        Ok((tag_ids, missing))
+    }
+
     async fn resolve_default_app_profile_id(&self) -> Result<Option<i64>> {
         let profiles = self.get_json::<Vec<Value>>("appProfile").await?;
         if profiles.is_empty() {
@@ -417,6 +498,112 @@ impl ProwlarrClient {
             .filter_map(|profile| profile.get("id").and_then(Value::as_i64))
             .find(|id| *id > 0))
     }
+
+    async fn evaluate_indexers(&self, indexers: &[IndexerSpec]) -> Result<Vec<String>> {
+        if indexers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexer").await?;
+        let default_app_profile_id = self.resolve_default_app_profile_id().await?;
+        let mut drift = Vec::new();
+
+        for indexer in indexers {
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let schema_item = find_schema_optional(&schema, &indexer.implementation);
+            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
+            else {
+                bail!(
+                    "prowlarr schema does not support requested indexer '{}' ({})",
+                    indexer.name,
+                    indexer.implementation
+                );
+            };
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&indexer.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_or_existing,
+            };
+            let enabled = indexer.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", indexer.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &indexer.implementation)?;
+            apply_indexer_defaults(&mut target, default_app_profile_id)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+            apply_indexer_fields(fields, indexer)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(indexer.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_apps(&self, apps: &[AppSpec], prowlarr_url: &str) -> Result<Vec<String>> {
+        if apps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("applications/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("applications").await?;
+        let mut drift = Vec::new();
+
+        for app in apps {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&app.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let schema_item = find_schema(&schema, &app.implementation)?;
+            let existing_item = find_app_by_identity(&existing, app);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = app.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", app.name.clone())?;
+            if !tags.is_empty() {
+                set_array_i64(&mut target, "tags", &tags)?;
+            }
+            ensure_schema_fields(&mut target, &app.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("app fields missing"))?;
+            apply_app_fields(fields, app, prowlarr_url)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(app.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+}
+
+fn drift_evaluation(subject: &str, drift: Vec<String>) -> DriftEvaluation {
+    if drift.is_empty() {
+        DriftEvaluation::in_sync()
+    } else {
+        DriftEvaluation::drifted(format!("{subject} require repair: {}", drift.join(", ")))
+    }
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        let key = normalize_name(&value);
+        if seen.insert(key) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn normalize_root_url(base_url: &str) -> Result<Url> {

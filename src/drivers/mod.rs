@@ -3,15 +3,20 @@ mod downloader_torrent;
 mod driver_trait;
 mod indexer_registry;
 mod media_manager_movies;
+mod media_manager_support;
 mod media_manager_tv;
 mod patches;
 mod registry;
 
 pub use downloader_nzb::DownloaderNzbDriver;
+pub(crate) use downloader_nzb::render_nzbget_config_patch;
+pub(crate) use downloader_nzb::render_nzbget_config_text_updates;
 pub use downloader_torrent::DownloaderTorrentDriver;
 pub(crate) use downloader_torrent::bootstrap_qbittorrent_session_cookie;
 pub use driver_trait::{
-    ActivitySnapshot, ApplyResult, ApplyStatus, CapabilityDriver, DriverCtx, StateSnapshot,
+    ActivitySnapshot, AddMediaOptions, AddMediaRequest, AddMediaResult, ApplyResult, ApplyStatus,
+    CapabilityDriver, DriftEvaluation, DriftField, DriftStatus, DriverCtx, FieldSemantics,
+    PatchApplyPolicy, PatchSemantics, PatchSideEffect, StateSnapshot,
 };
 pub use indexer_registry::IndexerRegistryDriver;
 pub use media_manager_movies::MediaManagerMoviesDriver;

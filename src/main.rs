@@ -23,7 +23,9 @@ use crate::config::Settings;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
-use crate::extensions::package::{read_manifest_from_dir, unpack_package, write_manifest_to_dir};
+use crate::extensions::package::{
+    compute_sha256, read_manifest_from_dir, unpack_package, write_manifest_to_dir,
+};
 use crate::extensions::registry::start_registry_refresh_loop;
 use crate::extensions::store::{ExtensionStore, NewExtension};
 use crate::http::handlers::extensions::InstallRequest;
@@ -322,7 +324,7 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
         if store.get_extension(extension_id).await?.is_some() {
             continue;
         }
-        let Some(path) = package_map.get(extension_id) else {
+        let Some(package) = package_map.get(extension_id) else {
             tracing::warn!(
                 "core extension '{}' package not found in '{}'",
                 extension_id,
@@ -332,7 +334,7 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
         };
         let request = InstallRequest {
             download_url: None,
-            package_path: Some(path.to_string_lossy().to_string()),
+            package_path: Some(package.path.to_string_lossy().to_string()),
         };
         match crate::http::handlers::extensions::install_extension(
             State(state.clone()),
@@ -354,9 +356,57 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
 
 async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Result<()> {
     let store = ExtensionStore::new(&state.db_pool);
+    let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
+    let tmp_root = PathBuf::from(&state.settings.extensions.storage_root).join("tmp");
+    fs::create_dir_all(&tmp_root).await?;
+    let bundled_packages = if bundled_dir.is_dir() {
+        index_bundled_packages(&bundled_dir, &tmp_root).await?
+    } else {
+        HashMap::new()
+    };
+    let mut resynced = 0_u32;
     let mut repaired = 0_u32;
     let mut rewritten_files = 0_u32;
     let unpacked_root = PathBuf::from(&state.settings.extensions.storage_root).join("unpacked");
+
+    for extension in store.list_extensions().await? {
+        if let Some(package) = bundled_packages.get(&extension.extension_id) {
+            if bundled_package_drifted(
+                &extension.version,
+                extension.package_hash.as_deref(),
+                &package.version,
+                package.package_hash.as_deref(),
+            ) {
+                let request = InstallRequest {
+                    download_url: None,
+                    package_path: Some(package.path.to_string_lossy().to_string()),
+                };
+                match crate::http::handlers::extensions::install_extension(
+                    State(state.clone()),
+                    Json(request),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        resynced += 1;
+                        tracing::info!(
+                            extension_id = %extension.extension_id,
+                            installed_version = %extension.version,
+                            bundled_version = %package.version,
+                            "resynced installed bundled extension from current package"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            extension_id = %extension.extension_id,
+                            "failed to resync installed bundled extension: {:?}",
+                            err
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     for extension in store.list_extensions().await? {
         let mut raw_json = extension.manifest_json.clone();
@@ -403,6 +453,9 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
         );
     }
 
+    if resynced > 0 {
+        tracing::info!("resynced {resynced} installed bundled extension(s)");
+    }
     if repaired > 0 {
         tracing::info!("repaired {repaired} installed extension manifest(s)");
     }
@@ -416,7 +469,7 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
 async fn index_bundled_packages(
     bundled_dir: &Path,
     tmp_root: &Path,
-) -> anyhow::Result<HashMap<String, PathBuf>> {
+) -> anyhow::Result<HashMap<String, BundledPackage>> {
     let mut map = HashMap::new();
     let mut entries = fs::read_dir(bundled_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -458,13 +511,83 @@ async fn index_bundled_packages(
                 continue;
             }
         };
-        map.insert(package_manifest.manifest.id.clone(), path.clone());
+        let package_hash = if file_type.is_file() {
+            Some(compute_sha256(&path).await?)
+        } else {
+            None
+        };
+        map.insert(
+            package_manifest.manifest.id.clone(),
+            BundledPackage {
+                path: path.clone(),
+                version: package_manifest.manifest.version,
+                package_hash,
+            },
+        );
         if let Some(dir) = staging_dir {
             let _ = fs::remove_dir_all(dir).await;
         }
     }
 
     Ok(map)
+}
+
+#[derive(Debug, Clone)]
+struct BundledPackage {
+    path: PathBuf,
+    version: String,
+    package_hash: Option<String>,
+}
+
+fn bundled_package_drifted(
+    installed_version: &str,
+    installed_hash: Option<&str>,
+    bundled_version: &str,
+    bundled_hash: Option<&str>,
+) -> bool {
+    if installed_version != bundled_version {
+        return true;
+    }
+    match (installed_hash, bundled_hash) {
+        (Some(installed), Some(current)) => !installed.eq_ignore_ascii_case(current),
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bundled_package_drifted;
+
+    #[test]
+    fn bundled_package_drifted_detects_hash_changes_at_same_version() {
+        assert!(bundled_package_drifted(
+            "1.0.0",
+            Some("aaaa"),
+            "1.0.0",
+            Some("bbbb"),
+        ));
+    }
+
+    #[test]
+    fn bundled_package_drifted_ignores_identical_hashes_case_insensitively() {
+        assert!(!bundled_package_drifted(
+            "1.0.0",
+            Some("AAAA"),
+            "1.0.0",
+            Some("aaaa"),
+        ));
+    }
+
+    #[test]
+    fn bundled_package_drifted_detects_version_changes_without_hash_drift() {
+        assert!(bundled_package_drifted(
+            "1.0.0",
+            Some("aaaa"),
+            "1.0.1",
+            Some("aaaa"),
+        ));
+    }
 }
 
 async fn shutdown_signal() {

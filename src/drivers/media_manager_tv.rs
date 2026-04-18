@@ -9,11 +9,17 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::debug;
 
+use crate::drivers::media_manager_support::{
+    MANAGED_MEDIA_TAG, lookup_terms_for_add_request, select_lookup_item,
+};
 use crate::drivers::patches::{
     CustomFormatSpec, DownloaderSpec, IndexerSpec, LanguageProfileSpec, MediaManagerTvPatch,
     QualityProfileSpec, ReleaseProfileSpec, RootFolderSpec, SeriesTypeDefaultsSpec, WebhookSpec,
 };
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
+use crate::drivers::{
+    AddMediaRequest, AddMediaResult, ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx,
+    DriverPatch, PatchSemantics, PatchSideEffect, StateSnapshot,
+};
 
 #[derive(Debug, Default)]
 pub struct MediaManagerTvDriver;
@@ -28,6 +34,89 @@ impl MediaManagerTvDriver {
 impl CapabilityDriver for MediaManagerTvDriver {
     fn capability(&self) -> &'static str {
         "media.manager.tv"
+    }
+
+    fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        match patch {
+            DriverPatch::MediaManagerTv(_) => {
+                PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite)
+            }
+            _ => PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite),
+        }
+    }
+
+    async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        let patch = match patch {
+            DriverPatch::MediaManagerTv(patch) => patch,
+            _ => bail!("media.manager.tv patch mismatch"),
+        };
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if implementation != "sonarr" {
+            bail!(
+                "media.manager.tv implementation '{}' is not supported",
+                implementation
+            );
+        }
+
+        let config = SonarrDriverConfig::from_ctx(&ctx)?;
+        let client = SonarrClient::from_config(config, ctx.canonical_url()?).await?;
+
+        match patch {
+            MediaManagerTvPatch::SetIndexerRegistry { indexers } => Ok(drift_evaluation(
+                "Sonarr indexers",
+                client.evaluate_indexers(&indexers).await?,
+            )),
+            MediaManagerTvPatch::SetDownloaders { downloaders } => Ok(drift_evaluation(
+                "Sonarr download clients",
+                client.evaluate_downloaders(&downloaders).await?,
+            )),
+            MediaManagerTvPatch::SetRootFolders { roots } => Ok(drift_evaluation(
+                "Sonarr root folders",
+                client.evaluate_root_folders(&roots).await?,
+            )),
+            MediaManagerTvPatch::SetQualityProfiles { profiles } => Ok(drift_evaluation(
+                "Sonarr quality profiles",
+                client.evaluate_quality_profiles(&profiles).await?,
+            )),
+            MediaManagerTvPatch::SetLanguageProfiles { profiles } => Ok(drift_evaluation(
+                "Sonarr language profiles",
+                client.evaluate_language_profiles(&profiles).await?,
+            )),
+            MediaManagerTvPatch::SetSeriesTypeDefaults { defaults } => Ok(drift_evaluation(
+                "Sonarr series defaults",
+                client.evaluate_series_defaults(&defaults).await?,
+            )),
+            MediaManagerTvPatch::SetTags { tags } => Ok(drift_evaluation(
+                "Sonarr tags",
+                client.evaluate_tags(&tags).await?,
+            )),
+            MediaManagerTvPatch::AssignTags { series_ids, tags } => Ok(drift_evaluation(
+                "Sonarr series tags",
+                client.evaluate_assign_tags(&series_ids, &tags).await?,
+            )),
+            MediaManagerTvPatch::SetWebhooks { webhooks } => Ok(drift_evaluation(
+                "Sonarr webhooks",
+                client.evaluate_webhooks(&webhooks).await?,
+            )),
+            MediaManagerTvPatch::SetCustomFormats {
+                formats,
+                release_profiles,
+            } => {
+                let mut drift = client.evaluate_custom_formats(&formats).await?;
+                drift.extend(client.evaluate_release_profiles(&release_profiles).await?);
+                drift.extend(client.evaluate_custom_format_scores(&formats).await?);
+                Ok(drift_evaluation(
+                    "Sonarr custom formats",
+                    dedup_strings(drift),
+                ))
+            }
+            MediaManagerTvPatch::SetAuxServiceEndpoint { url } => {
+                bail!("aux service endpoint is not supported for Sonarr ({})", url);
+            }
+        }
     }
 
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
@@ -100,6 +189,23 @@ impl CapabilityDriver for MediaManagerTvDriver {
         }
 
         Ok(ApplyResult::applied())
+    }
+
+    async fn add_media(&self, ctx: DriverCtx, request: AddMediaRequest) -> Result<AddMediaResult> {
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if implementation != "sonarr" {
+            bail!(
+                "media.manager.tv implementation '{}' does not support add_media",
+                implementation
+            );
+        }
+
+        let config = SonarrDriverConfig::from_ctx(&ctx)?;
+        let client = SonarrClient::from_config(config, ctx.canonical_url()?).await?;
+        client.add_series(&request).await
     }
 }
 
@@ -279,6 +385,128 @@ impl SonarrClient {
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {} {path} response", method.as_str()))
+    }
+
+    async fn add_series(&self, request: &AddMediaRequest) -> Result<AddMediaResult> {
+        let lookup_terms = lookup_terms_for_add_request(request, "sonarr");
+        debug!(
+            lookup_terms = ?lookup_terms,
+            media_type = ?request.media_type,
+            title = %request.title,
+            year = request.year,
+            "adding media through sonarr driver"
+        );
+
+        let items = self
+            .lookup_candidates(&lookup_terms, "series/lookup")
+            .await?;
+        let mut selected = select_lookup_item(&items, request)
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve title in manager lookup"))?;
+
+        let quality_profile_id = match request.options.quality_profile_id {
+            Some(value) => value,
+            None => self.first_id("qualityprofile").await?,
+        };
+        let root_folder_path = match request.options.root_folder_path.as_deref() {
+            Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+            _ => self.first_path("rootfolder").await?,
+        };
+        let managed_tag_ids = self.ensure_tags(&[MANAGED_MEDIA_TAG.to_string()]).await?;
+
+        if let Some(payload) = selected.as_object_mut() {
+            payload.insert(
+                "qualityProfileId".to_string(),
+                Value::Number(quality_profile_id.into()),
+            );
+            payload.insert(
+                "rootFolderPath".to_string(),
+                Value::String(root_folder_path),
+            );
+            payload.insert(
+                "monitored".to_string(),
+                Value::Bool(request.options.monitor),
+            );
+            payload.insert("seasonFolder".to_string(), Value::Bool(true));
+            payload.insert(
+                "addOptions".to_string(),
+                json!({
+                    "searchForMissingEpisodes": request.options.search,
+                    "monitor": if request.options.monitor { "all" } else { "none" }
+                }),
+            );
+            if !managed_tag_ids.is_empty() {
+                let _ = merge_tags(&mut selected, &managed_tag_ids)?;
+            }
+        } else {
+            bail!("series payload must be an object");
+        }
+
+        let created = self.post_json("series", &selected).await?;
+        Ok(AddMediaResult {
+            manager_item_id: created
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string()),
+        })
+    }
+
+    async fn lookup_candidates(&self, queries: &[String], path: &str) -> Result<Vec<Value>> {
+        let mut last_items = Vec::new();
+        for query in queries {
+            let url = self.lookup_url(path, query)?;
+            let resp = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("GET {}?term={query}", path))?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                continue;
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .with_context(|| format!("reading GET {path} response"))?;
+            if !status.is_success() {
+                let detail = describe_error_body(&bytes);
+                bail!("{path} failed ({status}): {detail}");
+            }
+            let items: Vec<Value> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing GET {path} response"))?;
+            if !items.is_empty() {
+                return Ok(items);
+            }
+            last_items = items;
+        }
+        Ok(last_items)
+    }
+
+    fn lookup_url(&self, path: &str, term: &str) -> Result<Url> {
+        let mut url = self.api_url(path)?;
+        url.query_pairs_mut().append_pair("term", term);
+        Ok(url)
+    }
+
+    async fn first_id(&self, path: &str) -> Result<i64> {
+        let items = self.get_json::<Vec<Value>>(path).await?;
+        items
+            .first()
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("unable to determine {}", path))
+    }
+
+    async fn first_path(&self, path: &str) -> Result<String> {
+        let items = self.get_json::<Vec<Value>>(path).await?;
+        items
+            .first()
+            .and_then(|item| item.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow::anyhow!("unable to determine {}", path))
     }
 
     async fn upsert_indexers(&self, indexers: &[IndexerSpec]) -> Result<()> {
@@ -589,6 +817,37 @@ impl SonarrClient {
         Ok(tag_ids)
     }
 
+    async fn resolve_existing_tag_ids(&self, tags: &[String]) -> Result<(Vec<i64>, Vec<String>)> {
+        if tags.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let existing = self.get_json::<Vec<Value>>("tag").await?;
+        let mut by_name: HashMap<String, i64> = HashMap::new();
+        for tag in &existing {
+            if let (Some(name), Some(id)) = (
+                tag.get("label").and_then(Value::as_str),
+                tag.get("id").and_then(Value::as_i64),
+            ) {
+                by_name.insert(normalize_name(name), id);
+            }
+        }
+        let mut tag_ids = Vec::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for tag in tags {
+            let normalized = normalize_name(tag);
+            if !seen.insert(normalized.clone()) {
+                continue;
+            }
+            if let Some(id) = by_name.get(&normalized) {
+                tag_ids.push(*id);
+            } else {
+                missing.push(tag.clone());
+            }
+        }
+        Ok((tag_ids, missing))
+    }
+
     async fn assign_tags(&self, series_ids: &[i64], tags: &[String]) -> Result<()> {
         if series_ids.is_empty() {
             return Ok(());
@@ -605,6 +864,430 @@ impl SonarrClient {
             self.put_json(&path, &updated).await?;
         }
         Ok(())
+    }
+
+    async fn evaluate_indexers(&self, indexers: &[IndexerSpec]) -> Result<Vec<String>> {
+        if indexers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexer").await?;
+        let mut drift = Vec::new();
+
+        for indexer in indexers {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&indexer.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let schema_item = find_schema(&schema, &indexer.implementation)?;
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = indexer.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", indexer.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &indexer.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+            apply_indexer_fields(fields, indexer)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(indexer.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_downloaders(&self, downloaders: &[DownloaderSpec]) -> Result<Vec<String>> {
+        if downloaders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("downloadclient/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("downloadclient").await?;
+        let mut drift = Vec::new();
+
+        for downloader in downloaders {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&downloader.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let schema_item = find_schema(&schema, &downloader.r#type)?;
+            let existing_item = find_by_name(&existing, &downloader.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = downloader.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", downloader.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &downloader.r#type)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("download client fields missing"))?;
+            apply_downloader_fields(fields, downloader)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(downloader.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_root_folders(&self, roots: &[RootFolderSpec]) -> Result<Vec<String>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("rootfolder").await?;
+        let mut drift = Vec::new();
+        for root in roots {
+            if find_by_path(&existing, &root.path).is_none() {
+                drift.push(root.path.clone());
+            }
+        }
+        Ok(drift)
+    }
+
+    async fn evaluate_quality_profiles(
+        &self,
+        profiles: &[QualityProfileSpec],
+    ) -> Result<Vec<String>> {
+        if profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let template = existing
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("quality profile template missing"))?;
+        let mut drift = Vec::new();
+
+        for profile in profiles {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => template.clone(),
+            };
+            if target.get("id").is_none() {
+                target.as_object_mut().map(|obj| obj.remove("id"));
+            }
+            set_string(&mut target, "name", profile.name.clone())?;
+            if let Some(upgrade) = profile.upgrade_allowed {
+                set_bool(&mut target, "upgradeAllowed", upgrade)?;
+            }
+
+            let allowed = normalize_set(&profile.allowed);
+            let cutoff_name = profile.cutoff.as_deref().map(normalize_name);
+            let cutoff_id = apply_quality_items(&mut target, &allowed, cutoff_name.as_deref())?;
+            if let Some(cutoff_id) = cutoff_id {
+                set_i64(&mut target, "cutoff", cutoff_id)?;
+            } else if profile.cutoff.is_some() {
+                bail!(
+                    "quality cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
+            }
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(profile.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_language_profiles(
+        &self,
+        profiles: &[LanguageProfileSpec],
+    ) -> Result<Vec<String>> {
+        if profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_sonarr_v3("language profiles")?;
+        let existing = self
+            .get_json::<Vec<Value>>("languageprofile")
+            .await
+            .context("fetching language profiles")?;
+        let template = existing
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("language profile template missing"))?;
+        let mut drift = Vec::new();
+
+        for profile in profiles {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => template.clone(),
+            };
+            set_string(&mut target, "name", profile.name.clone())?;
+            let allowed = normalize_set(&profile.languages);
+            let cutoff_name = profile.cutoff.as_deref().map(normalize_name);
+            let cutoff_id = apply_language_items(&mut target, &allowed, cutoff_name.as_deref())?;
+            if let Some(cutoff_id) = cutoff_id {
+                set_i64(&mut target, "cutoff", cutoff_id)?;
+            } else if profile.cutoff.is_some() {
+                bail!(
+                    "language cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
+            }
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(profile.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_series_defaults(
+        &self,
+        defaults: &SeriesTypeDefaultsSpec,
+    ) -> Result<Vec<String>> {
+        let quality_profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let quality_id = match defaults.quality_profile.as_deref() {
+            Some(name) => Some(find_id_by_name(&quality_profiles, name)?),
+            None => None,
+        };
+
+        if defaults.language_profile.is_some() {
+            self.ensure_sonarr_v3("language profiles")?;
+        }
+        let language_profiles = if defaults.language_profile.is_some() {
+            Some(self.get_json::<Vec<Value>>("languageprofile").await?)
+        } else {
+            None
+        };
+        let language_id = match defaults.language_profile.as_deref() {
+            Some(name) => {
+                let profiles = language_profiles
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("language profiles not available"))?;
+                Some(find_id_by_name(profiles, name)?)
+            }
+            None => None,
+        };
+
+        let (tags, missing_tags) = self.resolve_existing_tag_ids(&defaults.tags).await?;
+        let mut drift = missing_tags
+            .into_iter()
+            .map(|tag| format!("tag:{tag}"))
+            .collect::<Vec<_>>();
+
+        let series_list = self.get_json::<Vec<Value>>("series").await?;
+        let target_type = normalize_name(&defaults.series_type);
+        for series in series_list {
+            let series_type = series
+                .get("seriesType")
+                .and_then(Value::as_str)
+                .map(normalize_name)
+                .unwrap_or_default();
+            if series_type != target_type {
+                continue;
+            }
+            let mut updated = series.clone();
+            if let Some(quality_id) = quality_id {
+                set_i64(&mut updated, "qualityProfileId", quality_id)?;
+            }
+            if let Some(language_id) = language_id {
+                set_i64(&mut updated, "languageProfileId", language_id)?;
+            }
+            set_bool(&mut updated, "seasonFolder", defaults.season_folder)?;
+            if !tags.is_empty() {
+                let _ = merge_tags(&mut updated, &tags)?;
+            }
+            if updated != series {
+                let label = series
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| defaults.series_type.clone());
+                drift.push(label);
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_tags(&self, tags: &[String]) -> Result<Vec<String>> {
+        let (_ids, missing) = self.resolve_existing_tag_ids(tags).await?;
+        Ok(missing)
+    }
+
+    async fn evaluate_assign_tags(
+        &self,
+        series_ids: &[i64],
+        tags: &[String],
+    ) -> Result<Vec<String>> {
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (tag_ids, missing_tags) = self.resolve_existing_tag_ids(tags).await?;
+        let mut drift = missing_tags
+            .into_iter()
+            .map(|tag| format!("tag:{tag}"))
+            .collect::<Vec<_>>();
+        let series_list = self.get_json::<Vec<Value>>("series").await?;
+        let by_id = series_list
+            .into_iter()
+            .filter_map(|series| {
+                series
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .map(|id| (id, series))
+            })
+            .collect::<HashMap<_, _>>();
+        for series_id in series_ids {
+            let Some(series) = by_id.get(series_id) else {
+                drift.push(format!("series:{series_id}"));
+                continue;
+            };
+            let mut updated = series.clone();
+            let changed = merge_tags(&mut updated, &tag_ids)?;
+            if changed {
+                let label = series
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("series:{series_id}"));
+                drift.push(label);
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_webhooks(&self, webhooks: &[WebhookSpec]) -> Result<Vec<String>> {
+        if webhooks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("notification/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("notification").await?;
+        let schema_item = schema
+            .iter()
+            .find(|value| is_webhook_schema(value))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("webhook schema not found"))?;
+        let mut drift = Vec::new();
+
+        for webhook in webhooks {
+            let existing_item = find_by_name(&existing, &webhook.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item.clone(),
+            };
+            let enabled = webhook.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", webhook.name.clone())?;
+            apply_notification_events(&mut target, &webhook.events)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("notification fields missing"))?;
+            set_field_value_optional(fields, "url", Value::String(webhook.url.clone()))?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(webhook.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_custom_formats(&self, formats: &[CustomFormatSpec]) -> Result<Vec<String>> {
+        if formats.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("customformat").await?;
+        let mut drift = Vec::new();
+        for format in formats {
+            let existing_item = find_by_name(&existing, &format.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => json!({}),
+            };
+            set_string(&mut target, "name", format.name.clone())?;
+            set_bool(&mut target, "includeCustomFormatWhenRenaming", false)?;
+            let specs = build_custom_format_specs(format)?;
+            target
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("custom format object missing"))?
+                .insert("specifications".to_string(), Value::Array(specs));
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(format.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_release_profiles(
+        &self,
+        profiles: &[ReleaseProfileSpec],
+    ) -> Result<Vec<String>> {
+        if profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_sonarr_v3("release profiles")?;
+        let existing = self.get_json::<Vec<Value>>("releaseprofile").await?;
+        let mut drift = Vec::new();
+        for profile in profiles {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => json!({}),
+            };
+            set_string(&mut target, "name", profile.name.clone())?;
+            set_string(&mut target, "required", join_lines(&profile.required))?;
+            set_string(&mut target, "ignored", join_lines(&profile.ignored))?;
+            set_string(&mut target, "preferred", join_lines(&profile.preferred))?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(profile.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_custom_format_scores(
+        &self,
+        formats: &[CustomFormatSpec],
+    ) -> Result<Vec<String>> {
+        let scored: Vec<&CustomFormatSpec> = formats
+            .iter()
+            .filter(|format| format.score.is_some())
+            .collect();
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let custom_formats = self.get_json::<Vec<Value>>("customformat").await?;
+        let mut score_map = HashMap::new();
+        let mut drift = Vec::new();
+        for format in scored {
+            if let Ok(id) = find_id_by_name(&custom_formats, &format.name) {
+                score_map.insert(id, format.score.unwrap_or(0));
+            } else {
+                drift.push(format.name.clone());
+            }
+        }
+
+        let quality_profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        for profile in quality_profiles {
+            let mut updated = profile.clone();
+            let changed = apply_format_items(&mut updated, &score_map)?;
+            if changed {
+                let label = profile
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "qualityprofile".to_string());
+                drift.push(label);
+            }
+        }
+        Ok(dedup_strings(drift))
     }
 
     async fn upsert_webhooks(&self, webhooks: &[WebhookSpec]) -> Result<()> {
@@ -1338,6 +2021,26 @@ fn extract_error_message(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn drift_evaluation(subject: &str, drift: Vec<String>) -> DriftEvaluation {
+    if drift.is_empty() {
+        DriftEvaluation::in_sync()
+    } else {
+        DriftEvaluation::drifted(format!("{subject} require repair: {}", drift.join(", ")))
+    }
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        let key = normalize_name(&value);
+        if seen.insert(key) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 #[cfg(test)]

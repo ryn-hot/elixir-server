@@ -10,7 +10,13 @@ use serde_json::{Value, json};
 
 use crate::drivers::patches::{DownloadCategorySpec, DownloaderNzbPatch};
 use crate::drivers::{
-    ActivitySnapshot, ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot,
+    ActivitySnapshot, ApplyResult, CapabilityDriver, DriftEvaluation, DriftField, DriverCtx,
+    DriverPatch, FieldSemantics, PatchSemantics, PatchSideEffect, StateSnapshot,
+};
+use crate::extensions::managed_paths::{
+    DOWNLOADS_ANIME_DIR, DOWNLOADS_MOVIES_DIR, DOWNLOADS_TV_DIR, NZBGET_CONFIG_TEMPLATE,
+    NZBGET_INCOMPLETE_DIR, NZBGET_LOCK_FILE, NZBGET_LOG_FILE, NZBGET_MAIN_DIR, NZBGET_NZB_DIR,
+    NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR, NZBGET_WEB_DIR,
 };
 use tokio::fs;
 use tokio::time::{Duration, sleep};
@@ -21,6 +27,116 @@ pub struct DownloaderNzbDriver;
 impl DownloaderNzbDriver {
     pub fn new() -> Self {
         Self
+    }
+}
+
+pub(crate) fn render_nzbget_config_patch(
+    ctx: &DriverCtx,
+    current_text: &str,
+    patch: &DownloaderNzbPatch,
+) -> Result<Option<String>> {
+    let config = parse_config_items(current_text);
+    let updates = match patch {
+        DownloaderNzbPatch::SetCategories { categories } => {
+            build_category_slot_updates(&config, categories)?
+        }
+        DownloaderNzbPatch::SetPreferences {
+            main_dir,
+            default_save_path,
+            incomplete_path,
+            nzb_dir,
+            queue_dir,
+            temp_dir,
+            script_dir,
+            log_file,
+            web_dir,
+            config_template,
+            use_incomplete,
+            server_connections,
+            article_retries,
+            article_timeout_seconds,
+            article_cache_mb,
+            direct_write,
+            write_buffer_kb,
+            continue_partial,
+            par_check,
+            par_scan,
+            par_quick,
+            par_repair,
+            par_rename,
+            par_pause_queue,
+            par_threads,
+            unpack,
+            unpack_pause_queue,
+            download_rate_kib,
+        } => {
+            let preserved_server_updates =
+                persisted_server_inventory_updates(ctx, *server_connections)?;
+            let mut updates = build_file_preference_updates(
+                &config,
+                main_dir.clone(),
+                default_save_path.clone(),
+                incomplete_path.clone(),
+                nzb_dir.clone(),
+                queue_dir.clone(),
+                temp_dir.clone(),
+                script_dir.clone(),
+                log_file.clone(),
+                web_dir.clone(),
+                config_template.clone(),
+                *use_incomplete,
+                *server_connections,
+                *article_retries,
+                *article_timeout_seconds,
+                *article_cache_mb,
+                *direct_write,
+                *write_buffer_kb,
+                *continue_partial,
+                par_check.clone(),
+                par_scan.clone(),
+                *par_quick,
+                *par_repair,
+                *par_rename,
+                *par_pause_queue,
+                *par_threads,
+                *unpack,
+                *unpack_pause_queue,
+                *download_rate_kib,
+                preserved_server_updates,
+            );
+            updates.extend(managed_default_category_updates(ctx));
+            filter_live_config_updates(&config, updates)
+        }
+    };
+    if updates.is_empty() {
+        return Ok(None);
+    }
+
+    let rendered = apply_updates_to_config_text(current_text, &updates);
+    if rendered == current_text {
+        Ok(None)
+    } else {
+        Ok(Some(rendered))
+    }
+}
+
+pub(crate) fn render_nzbget_config_text_updates(
+    current_text: &str,
+    updates: &[(String, String)],
+) -> Option<String> {
+    if updates.is_empty() {
+        return None;
+    }
+
+    let updates = updates
+        .iter()
+        .map(|(name, value)| NzbgetConfigUpdate::new(name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let rendered = apply_updates_to_config_text(current_text, &updates);
+    if rendered == current_text {
+        None
+    } else {
+        Some(rendered)
     }
 }
 
@@ -52,6 +168,217 @@ impl CapabilityDriver for DownloaderNzbDriver {
             summary: Some(summarize_nzbget_state(&version, &activity)),
             activity: Some(activity),
         })
+    }
+
+    fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        match patch {
+            DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetCategories { .. })
+            | DriverPatch::DownloaderNzb(DownloaderNzbPatch::SetPreferences { .. }) => {
+                PatchSemantics::desired_change_only(PatchSideEffect::ReloadService)
+            }
+            _ => PatchSemantics::periodic_safe(PatchSideEffect::ReloadService),
+        }
+    }
+
+    async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        let patch = match patch {
+            DriverPatch::DownloaderNzb(patch) => patch,
+            _ => bail!("downloader.nzb patch mismatch"),
+        };
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if !implementation.eq_ignore_ascii_case("nzbget") {
+            bail!(
+                "downloader.nzb implementation '{}' is not supported",
+                implementation
+            );
+        }
+
+        patch.validate()?;
+
+        let config = NzbgetDriverConfig::from_ctx(&ctx)?;
+        let managed_config_path = config.managed_config_path();
+        match patch {
+            DownloaderNzbPatch::SetCategories { categories } => {
+                if let Some(path) = managed_config_path.as_deref() {
+                    let config = read_managed_config(path).await?;
+                    let updates = build_category_slot_updates(&config.items, &categories)?;
+                    if updates.is_empty() {
+                        Ok(DriftEvaluation::in_sync())
+                    } else {
+                        Ok(DriftEvaluation::drifted(format!(
+                            "NZBGet categories require repair: {}",
+                            updates
+                                .iter()
+                                .map(|update| update.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )))
+                    }
+                } else {
+                    let client = NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
+                    let config = client.read_config().await?;
+                    let updates = build_live_category_updates(
+                        &config,
+                        &categories,
+                        persisted_server_inventory_updates(&ctx, None)?,
+                        live_managed_path_updates(&ctx),
+                    )?;
+                    if updates.is_empty() {
+                        Ok(DriftEvaluation::in_sync())
+                    } else {
+                        Ok(DriftEvaluation::drifted(format!(
+                            "NZBGet categories require repair: {}",
+                            updates
+                                .iter()
+                                .map(|update| update.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )))
+                    }
+                }
+            }
+            DownloaderNzbPatch::SetPreferences {
+                main_dir,
+                default_save_path,
+                incomplete_path,
+                nzb_dir,
+                queue_dir,
+                temp_dir,
+                script_dir,
+                log_file,
+                web_dir,
+                config_template,
+                use_incomplete,
+                server_connections,
+                article_retries,
+                article_timeout_seconds,
+                article_cache_mb,
+                direct_write,
+                write_buffer_kb,
+                continue_partial,
+                par_check,
+                par_scan,
+                par_quick,
+                par_repair,
+                par_rename,
+                par_pause_queue,
+                par_threads,
+                unpack,
+                unpack_pause_queue,
+                download_rate_kib,
+            } => {
+                let preserved_server_updates =
+                    persisted_server_inventory_updates(&ctx, server_connections)?;
+                let opaque_fields = preserved_server_updates
+                    .iter()
+                    .filter(|update| should_skip_config_convergence_check(&update.name))
+                    .map(|update| {
+                        DriftField::new(update.name.clone(), FieldSemantics::OpaqueSecret)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(path) = managed_config_path.as_deref() {
+                    let config = read_managed_config(path).await?;
+                    let updates = build_file_preference_updates(
+                        &config.items,
+                        main_dir,
+                        default_save_path,
+                        incomplete_path,
+                        nzb_dir,
+                        queue_dir,
+                        temp_dir,
+                        script_dir,
+                        log_file,
+                        web_dir,
+                        config_template,
+                        use_incomplete,
+                        server_connections,
+                        article_retries,
+                        article_timeout_seconds,
+                        article_cache_mb,
+                        direct_write,
+                        write_buffer_kb,
+                        continue_partial,
+                        par_check,
+                        par_scan,
+                        par_quick,
+                        par_repair,
+                        par_rename,
+                        par_pause_queue,
+                        par_threads,
+                        unpack,
+                        unpack_pause_queue,
+                        download_rate_kib,
+                        preserved_server_updates,
+                    );
+                    if updates.is_empty() {
+                        Ok(DriftEvaluation::in_sync().with_non_comparable_fields(opaque_fields))
+                    } else {
+                        Ok(DriftEvaluation::drifted(format!(
+                            "NZBGet preferences require repair: {}",
+                            updates
+                                .iter()
+                                .map(|update| update.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .with_non_comparable_fields(opaque_fields))
+                    }
+                } else {
+                    let client = NzbgetClient::from_config(config, ctx.canonical_url()?).await?;
+                    let config = client.read_config().await?;
+                    let updates = build_live_preference_updates(
+                        &config,
+                        main_dir,
+                        default_save_path,
+                        incomplete_path,
+                        nzb_dir,
+                        queue_dir,
+                        temp_dir,
+                        script_dir,
+                        log_file,
+                        web_dir,
+                        config_template,
+                        use_incomplete,
+                        server_connections,
+                        article_retries,
+                        article_timeout_seconds,
+                        article_cache_mb,
+                        direct_write,
+                        write_buffer_kb,
+                        continue_partial,
+                        par_check,
+                        par_scan,
+                        par_quick,
+                        par_repair,
+                        par_rename,
+                        par_pause_queue,
+                        par_threads,
+                        unpack,
+                        unpack_pause_queue,
+                        download_rate_kib,
+                        live_managed_path_updates(&ctx),
+                        managed_default_category_updates(&ctx),
+                        preserved_server_updates,
+                    );
+                    if updates.is_empty() {
+                        Ok(DriftEvaluation::in_sync().with_non_comparable_fields(opaque_fields))
+                    } else {
+                        Ok(DriftEvaluation::drifted(format!(
+                            "NZBGet preferences require repair: {}",
+                            updates
+                                .iter()
+                                .map(|update| update.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .with_non_comparable_fields(opaque_fields))
+                    }
+                }
+            }
+        }
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
@@ -481,53 +808,40 @@ impl NzbgetClient {
         preserved_server_updates: Vec<NzbgetConfigUpdate>,
     ) -> Result<()> {
         let config = self.read_config().await?;
-        let mut updates = Vec::new();
-        let uses_managed_main_dir = matches!(main_dir.as_deref(), Some("/config"));
-        push_string_update(&mut updates, "MainDir", main_dir);
-        if let Some(path) = default_save_path {
-            updates.push(NzbgetConfigUpdate::new("DestDir", path));
-        }
-        match use_incomplete {
-            Some(false) => updates.push(NzbgetConfigUpdate::new("InterDir", "")),
-            _ => {
-                if let Some(path) = incomplete_path {
-                    updates.push(NzbgetConfigUpdate::new("InterDir", path));
-                }
-            }
-        }
-        push_string_update(&mut updates, "NzbDir", nzb_dir);
-        push_string_update(&mut updates, "QueueDir", queue_dir);
-        push_string_update(&mut updates, "TempDir", temp_dir);
-        push_string_update(&mut updates, "ScriptDir", script_dir);
-        push_string_update(&mut updates, "LogFile", log_file);
-        push_string_update(&mut updates, "WebDir", web_dir);
-        push_string_update(&mut updates, "ConfigTemplate", config_template);
-        if uses_managed_main_dir {
-            updates.push(NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"));
-        }
-        if let Some(connections) = server_connections {
-            updates.extend(server_connection_updates(&config, connections));
-        }
-        push_numeric_update(&mut updates, "ArticleRetries", article_retries);
-        push_numeric_update(&mut updates, "ArticleTimeout", article_timeout_seconds);
-        push_numeric_update(&mut updates, "ArticleCache", article_cache_mb);
-        push_bool_update(&mut updates, "DirectWrite", direct_write);
-        push_numeric_update(&mut updates, "WriteBuffer", write_buffer_kb);
-        push_bool_update(&mut updates, "ContinuePartial", continue_partial);
-        push_string_update(&mut updates, "ParCheck", par_check);
-        push_string_update(&mut updates, "ParScan", par_scan);
-        push_bool_update(&mut updates, "ParQuick", par_quick);
-        push_bool_update(&mut updates, "ParRepair", par_repair);
-        push_bool_update(&mut updates, "ParRename", par_rename);
-        push_bool_update(&mut updates, "ParPauseQueue", par_pause_queue);
-        push_numeric_update(&mut updates, "ParThreads", par_threads);
-        push_bool_update(&mut updates, "Unpack", unpack);
-        push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
-        push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
-        updates.extend(managed_path_updates);
-        updates.extend(preserved_category_updates(&config));
-        updates.extend(managed_category_updates);
-        updates.extend(preserved_server_updates);
+        let updates = build_live_preference_updates(
+            &config,
+            main_dir,
+            default_save_path,
+            incomplete_path,
+            nzb_dir,
+            queue_dir,
+            temp_dir,
+            script_dir,
+            log_file,
+            web_dir,
+            config_template,
+            use_incomplete,
+            server_connections,
+            article_retries,
+            article_timeout_seconds,
+            article_cache_mb,
+            direct_write,
+            write_buffer_kb,
+            continue_partial,
+            par_check,
+            par_scan,
+            par_quick,
+            par_repair,
+            par_rename,
+            par_pause_queue,
+            par_threads,
+            unpack,
+            unpack_pause_queue,
+            download_rate_kib,
+            managed_path_updates,
+            managed_category_updates,
+            preserved_server_updates,
+        );
         self.save_config(updates).await
     }
 
@@ -541,61 +855,12 @@ impl NzbgetClient {
             return Ok(());
         }
         let config = self.read_config().await?;
-        let mut slots = category_slots(&config);
-        if slots.is_empty() {
-            for index in 1..=15 {
-                slots.insert(index, CategorySlot::default());
-            }
-        }
-
-        let mut used_slots = HashSet::new();
-        let mut updates = Vec::new();
-        for category in categories {
-            let desired = normalize_name(&category.name);
-            let selected_slot = slots
-                .iter()
-                .find_map(|(slot, current)| {
-                    if normalize_name(&current.name) == desired {
-                        Some(*slot)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    slots.iter().find_map(|(slot, current)| {
-                        if used_slots.contains(slot) {
-                            None
-                        } else if current.name.trim().is_empty() {
-                            Some(*slot)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .ok_or_else(|| anyhow::anyhow!("no free nzbget category slots available"))?;
-            used_slots.insert(selected_slot);
-
-            let current = slots.entry(selected_slot).or_default();
-            if current.name.trim() != category.name.trim() {
-                updates.push(NzbgetConfigUpdate::new(
-                    format!("Category{selected_slot}.Name"),
-                    category.name.clone(),
-                ));
-                current.name = category.name.clone();
-            }
-            if let Some(save_path) = category.save_path.as_ref() {
-                if current.dest_dir.trim() != save_path.trim() {
-                    updates.push(NzbgetConfigUpdate::new(
-                        format!("Category{selected_slot}.DestDir"),
-                        save_path.clone(),
-                    ));
-                    current.dest_dir = save_path.clone();
-                }
-            }
-        }
-
-        updates.extend(managed_path_updates);
-        updates.extend(preserved_server_updates);
+        let updates = build_live_category_updates(
+            &config,
+            categories,
+            preserved_server_updates,
+            managed_path_updates,
+        )?;
         self.save_config(updates).await
     }
 
@@ -711,6 +976,82 @@ fn category_slots(config: &[NzbgetConfigItem]) -> BTreeMap<u32, CategorySlot> {
         }
     }
     slots
+}
+
+fn build_category_slot_updates(
+    config: &[NzbgetConfigItem],
+    categories: &[DownloadCategorySpec],
+) -> Result<Vec<NzbgetConfigUpdate>> {
+    if categories.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut slots = category_slots(config);
+    if slots.is_empty() {
+        for index in 1..=15 {
+            slots.insert(index, CategorySlot::default());
+        }
+    }
+
+    let mut used_slots = HashSet::new();
+    let mut updates = Vec::new();
+    for category in categories {
+        let desired = normalize_name(&category.name);
+        let selected_slot = slots
+            .iter()
+            .find_map(|(slot, current)| {
+                if normalize_name(&current.name) == desired {
+                    Some(*slot)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                slots.iter().find_map(|(slot, current)| {
+                    if used_slots.contains(slot) {
+                        None
+                    } else if current.name.trim().is_empty() {
+                        Some(*slot)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("no free nzbget category slots available"))?;
+        used_slots.insert(selected_slot);
+
+        let current = slots.entry(selected_slot).or_default();
+        if current.name.trim() != category.name.trim() {
+            updates.push(NzbgetConfigUpdate::new(
+                format!("Category{selected_slot}.Name"),
+                category.name.clone(),
+            ));
+            current.name = category.name.clone();
+        }
+        if let Some(save_path) = category.save_path.as_ref() {
+            if current.dest_dir.trim() != save_path.trim() {
+                updates.push(NzbgetConfigUpdate::new(
+                    format!("Category{selected_slot}.DestDir"),
+                    save_path.clone(),
+                ));
+                current.dest_dir = save_path.clone();
+            }
+        }
+    }
+
+    Ok(updates)
+}
+
+fn build_live_category_updates(
+    config: &[NzbgetConfigItem],
+    categories: &[DownloadCategorySpec],
+    preserved_server_updates: Vec<NzbgetConfigUpdate>,
+    managed_path_updates: Vec<NzbgetConfigUpdate>,
+) -> Result<Vec<NzbgetConfigUpdate>> {
+    let mut updates = build_category_slot_updates(config, categories)?;
+    updates.extend(managed_path_updates);
+    updates.extend(preserved_server_updates);
+    Ok(filter_live_config_updates(config, updates))
 }
 
 fn preserved_category_updates(config: &[NzbgetConfigItem]) -> Vec<NzbgetConfigUpdate> {
@@ -869,18 +1210,189 @@ fn live_managed_path_updates(ctx: &DriverCtx) -> Vec<NzbgetConfigUpdate> {
         return Vec::new();
     }
     vec![
-        NzbgetConfigUpdate::new("MainDir", "/config"),
+        NzbgetConfigUpdate::new("MainDir", NZBGET_MAIN_DIR),
         NzbgetConfigUpdate::new("DestDir", "/downloads"),
-        NzbgetConfigUpdate::new("InterDir", "/runtime/incomplete"),
-        NzbgetConfigUpdate::new("NzbDir", "/runtime/nzb"),
-        NzbgetConfigUpdate::new("QueueDir", "/runtime/queue"),
-        NzbgetConfigUpdate::new("TempDir", "/runtime/tmp"),
-        NzbgetConfigUpdate::new("ScriptDir", "/config/scripts"),
-        NzbgetConfigUpdate::new("LogFile", "/config/nzbget.log"),
-        NzbgetConfigUpdate::new("WebDir", "/app/nzbget/webui"),
-        NzbgetConfigUpdate::new("ConfigTemplate", "/app/nzbget/webui/nzbget.conf.template"),
-        NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"),
+        NzbgetConfigUpdate::new("InterDir", NZBGET_INCOMPLETE_DIR),
+        NzbgetConfigUpdate::new("NzbDir", NZBGET_NZB_DIR),
+        NzbgetConfigUpdate::new("QueueDir", NZBGET_QUEUE_DIR),
+        NzbgetConfigUpdate::new("TempDir", NZBGET_TEMP_DIR),
+        NzbgetConfigUpdate::new("ScriptDir", NZBGET_SCRIPT_DIR),
+        NzbgetConfigUpdate::new("LogFile", NZBGET_LOG_FILE),
+        NzbgetConfigUpdate::new("WebDir", NZBGET_WEB_DIR),
+        NzbgetConfigUpdate::new("ConfigTemplate", NZBGET_CONFIG_TEMPLATE),
+        NzbgetConfigUpdate::new("LockFile", NZBGET_LOCK_FILE),
     ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_live_preference_updates(
+    config: &[NzbgetConfigItem],
+    main_dir: Option<String>,
+    default_save_path: Option<String>,
+    incomplete_path: Option<String>,
+    nzb_dir: Option<String>,
+    queue_dir: Option<String>,
+    temp_dir: Option<String>,
+    script_dir: Option<String>,
+    log_file: Option<String>,
+    web_dir: Option<String>,
+    config_template: Option<String>,
+    use_incomplete: Option<bool>,
+    server_connections: Option<u64>,
+    article_retries: Option<u64>,
+    article_timeout_seconds: Option<u64>,
+    article_cache_mb: Option<u64>,
+    direct_write: Option<bool>,
+    write_buffer_kb: Option<u64>,
+    continue_partial: Option<bool>,
+    par_check: Option<String>,
+    par_scan: Option<String>,
+    par_quick: Option<bool>,
+    par_repair: Option<bool>,
+    par_rename: Option<bool>,
+    par_pause_queue: Option<bool>,
+    par_threads: Option<u64>,
+    unpack: Option<bool>,
+    unpack_pause_queue: Option<bool>,
+    download_rate_kib: Option<u64>,
+    managed_path_updates: Vec<NzbgetConfigUpdate>,
+    managed_category_updates: Vec<NzbgetConfigUpdate>,
+    preserved_server_updates: Vec<NzbgetConfigUpdate>,
+) -> Vec<NzbgetConfigUpdate> {
+    let mut updates = Vec::new();
+    let uses_managed_main_dir = matches!(main_dir.as_deref(), Some("/config"));
+    push_string_update(&mut updates, "MainDir", main_dir);
+    if let Some(path) = default_save_path {
+        updates.push(NzbgetConfigUpdate::new("DestDir", path));
+    }
+    match use_incomplete {
+        Some(false) => updates.push(NzbgetConfigUpdate::new("InterDir", "")),
+        _ => {
+            if let Some(path) = incomplete_path {
+                updates.push(NzbgetConfigUpdate::new("InterDir", path));
+            }
+        }
+    }
+    push_string_update(&mut updates, "NzbDir", nzb_dir);
+    push_string_update(&mut updates, "QueueDir", queue_dir);
+    push_string_update(&mut updates, "TempDir", temp_dir);
+    push_string_update(&mut updates, "ScriptDir", script_dir);
+    push_string_update(&mut updates, "LogFile", log_file);
+    push_string_update(&mut updates, "WebDir", web_dir);
+    push_string_update(&mut updates, "ConfigTemplate", config_template);
+    if uses_managed_main_dir {
+        updates.push(NzbgetConfigUpdate::new("LockFile", NZBGET_LOCK_FILE));
+    }
+    if let Some(connections) = server_connections {
+        updates.extend(server_connection_updates(config, connections));
+    }
+    push_numeric_update(&mut updates, "ArticleRetries", article_retries);
+    push_numeric_update(&mut updates, "ArticleTimeout", article_timeout_seconds);
+    push_numeric_update(&mut updates, "ArticleCache", article_cache_mb);
+    push_bool_update(&mut updates, "DirectWrite", direct_write);
+    push_numeric_update(&mut updates, "WriteBuffer", write_buffer_kb);
+    push_bool_update(&mut updates, "ContinuePartial", continue_partial);
+    push_string_update(&mut updates, "ParCheck", par_check);
+    push_string_update(&mut updates, "ParScan", par_scan);
+    push_bool_update(&mut updates, "ParQuick", par_quick);
+    push_bool_update(&mut updates, "ParRepair", par_repair);
+    push_bool_update(&mut updates, "ParRename", par_rename);
+    push_bool_update(&mut updates, "ParPauseQueue", par_pause_queue);
+    push_numeric_update(&mut updates, "ParThreads", par_threads);
+    push_bool_update(&mut updates, "Unpack", unpack);
+    push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
+    push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
+    updates.extend(managed_path_updates);
+    updates.extend(preserved_category_updates(config));
+    updates.extend(managed_category_updates);
+    updates.extend(preserved_server_updates);
+    filter_live_config_updates(config, updates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_file_preference_updates(
+    config: &[NzbgetConfigItem],
+    main_dir: Option<String>,
+    default_save_path: Option<String>,
+    incomplete_path: Option<String>,
+    nzb_dir: Option<String>,
+    queue_dir: Option<String>,
+    temp_dir: Option<String>,
+    script_dir: Option<String>,
+    log_file: Option<String>,
+    web_dir: Option<String>,
+    config_template: Option<String>,
+    use_incomplete: Option<bool>,
+    server_connections: Option<u64>,
+    article_retries: Option<u64>,
+    article_timeout_seconds: Option<u64>,
+    article_cache_mb: Option<u64>,
+    direct_write: Option<bool>,
+    write_buffer_kb: Option<u64>,
+    continue_partial: Option<bool>,
+    par_check: Option<String>,
+    par_scan: Option<String>,
+    par_quick: Option<bool>,
+    par_repair: Option<bool>,
+    par_rename: Option<bool>,
+    par_pause_queue: Option<bool>,
+    par_threads: Option<u64>,
+    unpack: Option<bool>,
+    unpack_pause_queue: Option<bool>,
+    download_rate_kib: Option<u64>,
+    preserved_server_updates: Vec<NzbgetConfigUpdate>,
+) -> Vec<NzbgetConfigUpdate> {
+    let main_dir = canonicalize_nzbget_managed_path("MainDir", main_dir);
+    let incomplete_path = canonicalize_nzbget_managed_path("InterDir", incomplete_path);
+    let nzb_dir = canonicalize_nzbget_managed_path("NzbDir", nzb_dir);
+    let queue_dir = canonicalize_nzbget_managed_path("QueueDir", queue_dir);
+    let temp_dir = canonicalize_nzbget_managed_path("TempDir", temp_dir);
+    let script_dir = canonicalize_nzbget_managed_path("ScriptDir", script_dir);
+    let log_file = canonicalize_nzbget_managed_path("LogFile", log_file);
+    let web_dir = canonicalize_nzbget_managed_path("WebDir", web_dir);
+    let config_template = canonicalize_nzbget_managed_path("ConfigTemplate", config_template);
+    let mut updates = Vec::new();
+    push_string_update(&mut updates, "MainDir", main_dir);
+    if let Some(path) = default_save_path {
+        updates.push(NzbgetConfigUpdate::new("DestDir", path));
+    }
+    match use_incomplete {
+        Some(false) => updates.push(NzbgetConfigUpdate::new("InterDir", "")),
+        _ => {
+            if let Some(path) = incomplete_path {
+                updates.push(NzbgetConfigUpdate::new("InterDir", path));
+            }
+        }
+    }
+    push_string_update(&mut updates, "NzbDir", nzb_dir);
+    push_string_update(&mut updates, "QueueDir", queue_dir);
+    push_string_update(&mut updates, "TempDir", temp_dir);
+    push_string_update(&mut updates, "ScriptDir", script_dir);
+    push_string_update(&mut updates, "LogFile", log_file);
+    push_string_update(&mut updates, "WebDir", web_dir);
+    push_string_update(&mut updates, "ConfigTemplate", config_template);
+    if let Some(connections) = server_connections {
+        updates.extend(server_connection_updates(config, connections));
+    }
+    push_numeric_update(&mut updates, "ArticleRetries", article_retries);
+    push_numeric_update(&mut updates, "ArticleTimeout", article_timeout_seconds);
+    push_numeric_update(&mut updates, "ArticleCache", article_cache_mb);
+    push_bool_update(&mut updates, "DirectWrite", direct_write);
+    push_numeric_update(&mut updates, "WriteBuffer", write_buffer_kb);
+    push_bool_update(&mut updates, "ContinuePartial", continue_partial);
+    push_string_update(&mut updates, "ParCheck", par_check);
+    push_string_update(&mut updates, "ParScan", par_scan);
+    push_bool_update(&mut updates, "ParQuick", par_quick);
+    push_bool_update(&mut updates, "ParRepair", par_repair);
+    push_bool_update(&mut updates, "ParRename", par_rename);
+    push_bool_update(&mut updates, "ParPauseQueue", par_pause_queue);
+    push_numeric_update(&mut updates, "ParThreads", par_threads);
+    push_bool_update(&mut updates, "Unpack", unpack);
+    push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
+    push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
+    updates.push(NzbgetConfigUpdate::new("LockFile", NZBGET_LOCK_FILE));
+    updates.extend(preserved_server_updates);
+    filter_live_config_updates(config, updates)
 }
 
 fn managed_default_category_updates(ctx: &DriverCtx) -> Vec<NzbgetConfigUpdate> {
@@ -889,11 +1401,11 @@ fn managed_default_category_updates(ctx: &DriverCtx) -> Vec<NzbgetConfigUpdate> 
     }
     vec![
         NzbgetConfigUpdate::new("Category1.Name", "tv"),
-        NzbgetConfigUpdate::new("Category1.DestDir", "/downloads/tv"),
+        NzbgetConfigUpdate::new("Category1.DestDir", DOWNLOADS_TV_DIR),
         NzbgetConfigUpdate::new("Category2.Name", "anime"),
-        NzbgetConfigUpdate::new("Category2.DestDir", "/downloads/anime"),
+        NzbgetConfigUpdate::new("Category2.DestDir", DOWNLOADS_ANIME_DIR),
         NzbgetConfigUpdate::new("Category3.Name", "movies"),
-        NzbgetConfigUpdate::new("Category3.DestDir", "/downloads/movies"),
+        NzbgetConfigUpdate::new("Category3.DestDir", DOWNLOADS_MOVIES_DIR),
     ]
 }
 
@@ -965,6 +1477,43 @@ fn config_reflects_updates(
         .all(|(name, value)| actual.get(name.as_str()).copied() == Some(value.as_str()))
 }
 
+fn filter_live_config_updates(
+    config: &[NzbgetConfigItem],
+    updates: Vec<NzbgetConfigUpdate>,
+) -> Vec<NzbgetConfigUpdate> {
+    if updates.is_empty() {
+        return updates;
+    }
+
+    let mut desired = BTreeMap::new();
+    for update in updates {
+        desired.insert(update.name, update.value);
+    }
+
+    let actual = config
+        .iter()
+        .map(|item| (item.name.as_str(), item.value.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    desired
+        .into_iter()
+        .filter_map(|(name, value)| match actual.get(name.as_str()).copied() {
+            Some(current) if current == value.as_str() => None,
+            Some(current) if should_skip_opaque_live_compare(&name, current) => None,
+            _ => Some(NzbgetConfigUpdate::new(name, value)),
+        })
+        .collect()
+}
+
+fn should_skip_opaque_live_compare(name: &str, current: &str) -> bool {
+    should_skip_config_convergence_check(name) && is_opaque_secret_value(current)
+}
+
+fn is_opaque_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '*')
+}
+
 fn parse_nzb_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -976,63 +1525,8 @@ async fn upsert_categories_in_file(
     config_path: &Path,
     categories: &[DownloadCategorySpec],
 ) -> Result<()> {
-    if categories.is_empty() {
-        return Ok(());
-    }
     let mut config = read_managed_config(config_path).await?;
-    let mut slots = category_slots(&config.items);
-    if slots.is_empty() {
-        for index in 1..=15 {
-            slots.insert(index, CategorySlot::default());
-        }
-    }
-
-    let mut used_slots = HashSet::new();
-    let mut updates = Vec::new();
-    for category in categories {
-        let desired = normalize_name(&category.name);
-        let selected_slot = slots
-            .iter()
-            .find_map(|(slot, current)| {
-                if normalize_name(&current.name) == desired {
-                    Some(*slot)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                slots.iter().find_map(|(slot, current)| {
-                    if used_slots.contains(slot) {
-                        None
-                    } else if current.name.trim().is_empty() {
-                        Some(*slot)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("no free nzbget category slots available"))?;
-        used_slots.insert(selected_slot);
-
-        let current = slots.entry(selected_slot).or_default();
-        if current.name.trim() != category.name.trim() {
-            updates.push(NzbgetConfigUpdate::new(
-                format!("Category{selected_slot}.Name"),
-                category.name.clone(),
-            ));
-            current.name = category.name.clone();
-        }
-        if let Some(save_path) = category.save_path.as_ref() {
-            if current.dest_dir.trim() != save_path.trim() {
-                updates.push(NzbgetConfigUpdate::new(
-                    format!("Category{selected_slot}.DestDir"),
-                    save_path.clone(),
-                ));
-                current.dest_dir = save_path.clone();
-            }
-        }
-    }
-
+    let updates = build_category_slot_updates(&config.items, categories)?;
     write_config_updates(&mut config, updates).await
 }
 
@@ -1070,69 +1564,52 @@ async fn set_preferences_in_file(
     preserved_server_updates: Vec<NzbgetConfigUpdate>,
 ) -> Result<()> {
     let mut config = read_managed_config(config_path).await?;
-    let main_dir = canonicalize_nzbget_managed_path("MainDir", main_dir);
-    let nzb_dir = canonicalize_nzbget_managed_path("NzbDir", nzb_dir);
-    let queue_dir = canonicalize_nzbget_managed_path("QueueDir", queue_dir);
-    let temp_dir = canonicalize_nzbget_managed_path("TempDir", temp_dir);
-    let script_dir = canonicalize_nzbget_managed_path("ScriptDir", script_dir);
-    let log_file = canonicalize_nzbget_managed_path("LogFile", log_file);
-    let web_dir = canonicalize_nzbget_managed_path("WebDir", web_dir);
-    let config_template = canonicalize_nzbget_managed_path("ConfigTemplate", config_template);
-    let mut updates = Vec::new();
-    push_string_update(&mut updates, "MainDir", main_dir);
-    if let Some(path) = default_save_path {
-        updates.push(NzbgetConfigUpdate::new("DestDir", path));
-    }
-    match use_incomplete {
-        Some(false) => updates.push(NzbgetConfigUpdate::new("InterDir", "")),
-        _ => {
-            if let Some(path) = incomplete_path {
-                updates.push(NzbgetConfigUpdate::new("InterDir", path));
-            }
-        }
-    }
-    push_string_update(&mut updates, "NzbDir", nzb_dir);
-    push_string_update(&mut updates, "QueueDir", queue_dir);
-    push_string_update(&mut updates, "TempDir", temp_dir);
-    push_string_update(&mut updates, "ScriptDir", script_dir);
-    push_string_update(&mut updates, "LogFile", log_file);
-    push_string_update(&mut updates, "WebDir", web_dir);
-    push_string_update(&mut updates, "ConfigTemplate", config_template);
-    if let Some(connections) = server_connections {
-        updates.extend(server_connection_updates(&config.items, connections));
-    }
-    push_numeric_update(&mut updates, "ArticleRetries", article_retries);
-    push_numeric_update(&mut updates, "ArticleTimeout", article_timeout_seconds);
-    push_numeric_update(&mut updates, "ArticleCache", article_cache_mb);
-    push_bool_update(&mut updates, "DirectWrite", direct_write);
-    push_numeric_update(&mut updates, "WriteBuffer", write_buffer_kb);
-    push_bool_update(&mut updates, "ContinuePartial", continue_partial);
-    push_string_update(&mut updates, "ParCheck", par_check);
-    push_string_update(&mut updates, "ParScan", par_scan);
-    push_bool_update(&mut updates, "ParQuick", par_quick);
-    push_bool_update(&mut updates, "ParRepair", par_repair);
-    push_bool_update(&mut updates, "ParRename", par_rename);
-    push_bool_update(&mut updates, "ParPauseQueue", par_pause_queue);
-    push_numeric_update(&mut updates, "ParThreads", par_threads);
-    push_bool_update(&mut updates, "Unpack", unpack);
-    push_bool_update(&mut updates, "UnpackPauseQueue", unpack_pause_queue);
-    push_numeric_update(&mut updates, "DownloadRate", download_rate_kib);
-    updates.push(NzbgetConfigUpdate::new("LockFile", "/config/nzbget.lock"));
-    updates.extend(preserved_server_updates);
-
+    let updates = build_file_preference_updates(
+        &config.items,
+        main_dir,
+        default_save_path,
+        incomplete_path,
+        nzb_dir,
+        queue_dir,
+        temp_dir,
+        script_dir,
+        log_file,
+        web_dir,
+        config_template,
+        use_incomplete,
+        server_connections,
+        article_retries,
+        article_timeout_seconds,
+        article_cache_mb,
+        direct_write,
+        write_buffer_kb,
+        continue_partial,
+        par_check,
+        par_scan,
+        par_quick,
+        par_repair,
+        par_rename,
+        par_pause_queue,
+        par_threads,
+        unpack,
+        unpack_pause_queue,
+        download_rate_kib,
+        preserved_server_updates,
+    );
     write_config_updates(&mut config, updates).await
 }
 
 fn canonicalize_nzbget_managed_path(key: &str, value: Option<String>) -> Option<String> {
     match (key, value) {
-        ("MainDir", Some(_)) => Some("/config".to_string()),
-        ("NzbDir", Some(_)) => Some("/config/nzb".to_string()),
-        ("QueueDir", Some(_)) => Some("/config/queue".to_string()),
-        ("TempDir", Some(_)) => Some("/config/tmp".to_string()),
-        ("ScriptDir", Some(_)) => Some("/config/scripts".to_string()),
-        ("LogFile", Some(_)) => Some("/config/nzbget.log".to_string()),
-        ("WebDir", Some(_)) => Some("/app/nzbget/webui".to_string()),
-        ("ConfigTemplate", Some(_)) => Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
+        ("MainDir", Some(_)) => Some(NZBGET_MAIN_DIR.to_string()),
+        ("InterDir", Some(_)) => Some(NZBGET_INCOMPLETE_DIR.to_string()),
+        ("NzbDir", Some(_)) => Some(NZBGET_NZB_DIR.to_string()),
+        ("QueueDir", Some(_)) => Some(NZBGET_QUEUE_DIR.to_string()),
+        ("TempDir", Some(_)) => Some(NZBGET_TEMP_DIR.to_string()),
+        ("ScriptDir", Some(_)) => Some(NZBGET_SCRIPT_DIR.to_string()),
+        ("LogFile", Some(_)) => Some(NZBGET_LOG_FILE.to_string()),
+        ("WebDir", Some(_)) => Some(NZBGET_WEB_DIR.to_string()),
+        ("ConfigTemplate", Some(_)) => Some(NZBGET_CONFIG_TEMPLATE.to_string()),
         (_, other) => other,
     }
 }
@@ -1368,12 +1845,12 @@ fn describe_error_body(body: &[u8]) -> String {
 mod tests {
     use super::{
         CategorySlot, DownloaderNzbDriver, DriverCtx, NzbgetClient, NzbgetConfigItem,
-        NzbgetDriverConfig, NzbgetDriverRuntimeConfig, category_slots, parse_category_option,
-        rpc_success,
+        NzbgetConfigUpdate, NzbgetDriverConfig, NzbgetDriverRuntimeConfig, category_slots,
+        filter_live_config_updates, parse_category_option, render_nzbget_config_patch, rpc_success,
     };
 
-    use crate::drivers::CapabilityDriver;
     use crate::drivers::patches::DownloadCategorySpec;
+    use crate::drivers::{CapabilityDriver, DownloaderNzbPatch};
     use anyhow::Result;
     use axum::{Json, Router, response::IntoResponse, routing::post};
     use serde_json::{Value, json};
@@ -1409,6 +1886,25 @@ mod tests {
                 name: "tv".to_string(),
                 dest_dir: String::new(),
             })
+        );
+    }
+
+    #[test]
+    fn filter_live_config_updates_skips_opaque_password_values() {
+        let config = vec![NzbgetConfigItem {
+            name: "Server1.Password".to_string(),
+            value: "********".to_string(),
+        }];
+        let updates = vec![NzbgetConfigUpdate::new(
+            "Server1.Password",
+            "provider-secret",
+        )];
+
+        let filtered = filter_live_config_updates(&config, updates);
+
+        assert!(
+            filtered.is_empty(),
+            "opaque password values from nzbget config should not force a live save"
         );
     }
 
@@ -1518,7 +2014,7 @@ mod tests {
         let config_path = config_dir.join("nzbget.conf");
         fs::write(
             &config_path,
-            "# base\nDestDir=/downloads\nInterDir=/downloads/.incomplete\n",
+            "# base\nDestDir=/downloads\nInterDir=/runtime/incomplete\n",
         )?;
 
         let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
@@ -1570,7 +2066,7 @@ mod tests {
                     crate::drivers::DownloaderNzbPatch::SetPreferences {
                         main_dir: Some("/downloads".to_string()),
                         default_save_path: Some("/downloads".to_string()),
-                        incomplete_path: Some("/downloads/.incomplete".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
                         nzb_dir: Some("/downloads/.nzb".to_string()),
                         queue_dir: Some("/downloads/.queue".to_string()),
                         temp_dir: Some("/downloads/.tmp".to_string()),
@@ -1623,10 +2119,10 @@ mod tests {
         let rendered = fs::read_to_string(config_path)?;
         assert!(rendered.contains("MainDir=/config"));
         assert!(rendered.contains("DestDir=/downloads"));
-        assert!(rendered.contains("InterDir=/downloads/.incomplete"));
-        assert!(rendered.contains("NzbDir=/config/nzb"));
-        assert!(rendered.contains("QueueDir=/config/queue"));
-        assert!(rendered.contains("TempDir=/config/tmp"));
+        assert!(rendered.contains("InterDir=/runtime/incomplete"));
+        assert!(rendered.contains("NzbDir=/runtime/nzb"));
+        assert!(rendered.contains("QueueDir=/runtime/queue"));
+        assert!(rendered.contains("TempDir=/runtime/tmp"));
         assert!(rendered.contains("ScriptDir=/config/scripts"));
         assert!(rendered.contains("LogFile=/config/nzbget.log"));
         assert!(rendered.contains("WebDir=/app/nzbget/webui"));
@@ -2428,6 +2924,674 @@ mod tests {
         assert!(saved.contains(&("Category1.Name".to_string(), "tv".to_string())));
         assert!(saved.contains(&("Category2.Name".to_string(), "anime".to_string())));
         assert!(saved.contains(&("Category3.Name".to_string(), "movies".to_string())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_set_preferences_skips_saveconfig_when_live_state_is_current() -> Result<()>
+    {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            save_calls: Arc<Mutex<usize>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                *state.save_calls.lock().unwrap() += 1;
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            save_calls: Arc::new(Mutex::new(0)),
+            config_items: Arc::new(Mutex::new(vec![
+                ("MainDir".to_string(), "/config".to_string()),
+                ("DestDir".to_string(), "/downloads".to_string()),
+                ("InterDir".to_string(), "/runtime/incomplete".to_string()),
+                ("NzbDir".to_string(), "/runtime/nzb".to_string()),
+                ("QueueDir".to_string(), "/runtime/queue".to_string()),
+                ("TempDir".to_string(), "/runtime/tmp".to_string()),
+                ("ScriptDir".to_string(), "/config/scripts".to_string()),
+                ("LogFile".to_string(), "/config/nzbget.log".to_string()),
+                ("WebDir".to_string(), "/app/nzbget/webui".to_string()),
+                (
+                    "ConfigTemplate".to_string(),
+                    "/app/nzbget/webui/nzbget.conf.template".to_string(),
+                ),
+                ("LockFile".to_string(), "/config/nzbget.lock".to_string()),
+                ("Category1.Name".to_string(), "tv".to_string()),
+                ("Category1.DestDir".to_string(), "/downloads/tv".to_string()),
+                ("Category2.Name".to_string(), "anime".to_string()),
+                (
+                    "Category2.DestDir".to_string(),
+                    "/downloads/anime".to_string(),
+                ),
+                ("Category3.Name".to_string(), "movies".to_string()),
+                (
+                    "Category3.DestDir".to_string(),
+                    "/downloads/movies".to_string(),
+                ),
+                ("Server1.Active".to_string(), "yes".to_string()),
+                ("Server1.Name".to_string(), "XSNews".to_string()),
+                ("Server1.Level".to_string(), "0".to_string()),
+                ("Server1.Host".to_string(), "news.xsnews.nl".to_string()),
+                ("Server1.Encryption".to_string(), "yes".to_string()),
+                ("Server1.Port".to_string(), "563".to_string()),
+                ("Server1.Username".to_string(), "reader".to_string()),
+                (
+                    "Server1.Password".to_string(),
+                    "provider-secret".to_string(),
+                ),
+                ("Server1.Connections".to_string(), "32".to_string()),
+                ("Server1.CertVerification".to_string(), "strict".to_string()),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 32,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        DownloaderNzbDriver::new()
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetPreferences {
+                        main_dir: Some("/config".to_string()),
+                        default_save_path: Some("/downloads".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        nzb_dir: Some("/runtime/nzb".to_string()),
+                        queue_dir: Some("/runtime/queue".to_string()),
+                        temp_dir: Some("/runtime/tmp".to_string()),
+                        script_dir: Some("/config/scripts".to_string()),
+                        log_file: Some("/config/nzbget.log".to_string()),
+                        web_dir: Some("/app/nzbget/webui".to_string()),
+                        config_template: Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
+                        use_incomplete: Some(true),
+                        server_connections: Some(32),
+                        article_retries: None,
+                        article_timeout_seconds: None,
+                        article_cache_mb: None,
+                        direct_write: None,
+                        write_buffer_kb: None,
+                        continue_partial: None,
+                        par_check: None,
+                        par_scan: None,
+                        par_quick: None,
+                        par_repair: None,
+                        par_rename: None,
+                        par_pause_queue: None,
+                        par_threads: None,
+                        unpack: None,
+                        unpack_pause_queue: None,
+                        download_rate_kib: None,
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *state.save_calls.lock().unwrap(),
+            0,
+            "expected live set_preferences to skip saveconfig when config already matches"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_set_categories_skips_saveconfig_when_live_state_is_current() -> Result<()>
+    {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            save_calls: Arc<Mutex<usize>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                *state.save_calls.lock().unwrap() += 1;
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            save_calls: Arc::new(Mutex::new(0)),
+            config_items: Arc::new(Mutex::new(vec![
+                ("MainDir".to_string(), "/config".to_string()),
+                ("DestDir".to_string(), "/downloads".to_string()),
+                ("InterDir".to_string(), "/runtime/incomplete".to_string()),
+                ("NzbDir".to_string(), "/runtime/nzb".to_string()),
+                ("QueueDir".to_string(), "/runtime/queue".to_string()),
+                ("TempDir".to_string(), "/runtime/tmp".to_string()),
+                ("ScriptDir".to_string(), "/config/scripts".to_string()),
+                ("LogFile".to_string(), "/config/nzbget.log".to_string()),
+                ("WebDir".to_string(), "/app/nzbget/webui".to_string()),
+                (
+                    "ConfigTemplate".to_string(),
+                    "/app/nzbget/webui/nzbget.conf.template".to_string(),
+                ),
+                ("LockFile".to_string(), "/config/nzbget.lock".to_string()),
+                ("Category1.Name".to_string(), "tv".to_string()),
+                ("Category1.DestDir".to_string(), "/downloads/tv".to_string()),
+                ("Category2.Name".to_string(), "anime".to_string()),
+                (
+                    "Category2.DestDir".to_string(),
+                    "/downloads/anime".to_string(),
+                ),
+                ("Category3.Name".to_string(), "movies".to_string()),
+                (
+                    "Category3.DestDir".to_string(),
+                    "/downloads/movies".to_string(),
+                ),
+                ("Server1.Active".to_string(), "yes".to_string()),
+                ("Server1.Name".to_string(), "XSNews".to_string()),
+                ("Server1.Level".to_string(), "0".to_string()),
+                ("Server1.Host".to_string(), "news.xsnews.nl".to_string()),
+                ("Server1.Encryption".to_string(), "yes".to_string()),
+                ("Server1.Port".to_string(), "563".to_string()),
+                ("Server1.Username".to_string(), "reader".to_string()),
+                (
+                    "Server1.Password".to_string(),
+                    "provider-secret".to_string(),
+                ),
+                ("Server1.Connections".to_string(), "32".to_string()),
+                ("Server1.CertVerification".to_string(), "strict".to_string()),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 32,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        DownloaderNzbDriver::new()
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetCategories {
+                        categories: vec![
+                            DownloadCategorySpec {
+                                name: "tv".to_string(),
+                                save_path: Some("/downloads/tv".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "anime".to_string(),
+                                save_path: Some("/downloads/anime".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "movies".to_string(),
+                                save_path: Some("/downloads/movies".to_string()),
+                            },
+                        ],
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *state.save_calls.lock().unwrap(),
+            0,
+            "expected live set_categories to skip saveconfig when config already matches"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_set_preferences_skips_saveconfig_when_password_is_opaque() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct RpcState {
+            save_calls: Arc<Mutex<usize>>,
+            config_items: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn rpc(
+            axum::extract::State(state): axum::extract::State<RpcState>,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "saveconfig" {
+                *state.save_calls.lock().unwrap() += 1;
+            }
+
+            let result = match method {
+                "version" => json!("26.1"),
+                "config" => {
+                    let items = state
+                        .config_items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                        .collect::<Vec<_>>();
+                    json!(items)
+                }
+                "saveconfig" | "reload" => json!(true),
+                other => panic!("unexpected nzbget rpc method {other}"),
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "version": "1.1",
+                    "result": result,
+                    "error": Value::Null,
+                    "id": 1
+                })),
+            )
+                .into_response()
+        }
+
+        let state = RpcState {
+            save_calls: Arc::new(Mutex::new(0)),
+            config_items: Arc::new(Mutex::new(vec![
+                ("MainDir".to_string(), "/config".to_string()),
+                ("DestDir".to_string(), "/downloads".to_string()),
+                ("InterDir".to_string(), "/runtime/incomplete".to_string()),
+                ("NzbDir".to_string(), "/runtime/nzb".to_string()),
+                ("QueueDir".to_string(), "/runtime/queue".to_string()),
+                ("TempDir".to_string(), "/runtime/tmp".to_string()),
+                ("ScriptDir".to_string(), "/config/scripts".to_string()),
+                ("LogFile".to_string(), "/config/nzbget.log".to_string()),
+                ("WebDir".to_string(), "/app/nzbget/webui".to_string()),
+                (
+                    "ConfigTemplate".to_string(),
+                    "/app/nzbget/webui/nzbget.conf.template".to_string(),
+                ),
+                ("LockFile".to_string(), "/config/nzbget.lock".to_string()),
+                ("Category1.Name".to_string(), "tv".to_string()),
+                ("Category1.DestDir".to_string(), "/downloads/tv".to_string()),
+                ("Category2.Name".to_string(), "anime".to_string()),
+                (
+                    "Category2.DestDir".to_string(),
+                    "/downloads/anime".to_string(),
+                ),
+                ("Category3.Name".to_string(), "movies".to_string()),
+                (
+                    "Category3.DestDir".to_string(),
+                    "/downloads/movies".to_string(),
+                ),
+                ("Server1.Active".to_string(), "yes".to_string()),
+                ("Server1.Name".to_string(), "XSNews".to_string()),
+                ("Server1.Level".to_string(), "0".to_string()),
+                ("Server1.Host".to_string(), "news.xsnews.nl".to_string()),
+                ("Server1.Encryption".to_string(), "yes".to_string()),
+                ("Server1.Port".to_string(), "563".to_string()),
+                ("Server1.Username".to_string(), "reader".to_string()),
+                ("Server1.Password".to_string(), "********".to_string()),
+                ("Server1.Connections".to_string(), "32".to_string()),
+                ("Server1.CertVerification".to_string(), "strict".to_string()),
+            ])),
+        };
+        let app = Router::new()
+            .route("/jsonrpc", post(rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget.server.1.username".to_string(), "reader".to_string());
+        secrets.insert(
+            "nzbget.server.1.password".to_string(),
+            "provider-secret".to_string(),
+        );
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                },
+                "server_inventory": [{
+                    "slot": 1,
+                    "name": "XSNews",
+                    "host": "news.xsnews.nl",
+                    "port": 563,
+                    "encryption": true,
+                    "active": true,
+                    "level": 0,
+                    "connections": 32,
+                    "cert_verification": "strict"
+                }]
+            })),
+            secrets,
+        );
+
+        DownloaderNzbDriver::new()
+            .apply_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetPreferences {
+                        main_dir: Some("/config".to_string()),
+                        default_save_path: Some("/downloads".to_string()),
+                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        nzb_dir: Some("/runtime/nzb".to_string()),
+                        queue_dir: Some("/runtime/queue".to_string()),
+                        temp_dir: Some("/runtime/tmp".to_string()),
+                        script_dir: Some("/config/scripts".to_string()),
+                        log_file: Some("/config/nzbget.log".to_string()),
+                        web_dir: Some("/app/nzbget/webui".to_string()),
+                        config_template: Some("/app/nzbget/webui/nzbget.conf.template".to_string()),
+                        use_incomplete: Some(true),
+                        server_connections: Some(32),
+                        article_retries: None,
+                        article_timeout_seconds: None,
+                        article_cache_mb: None,
+                        direct_write: None,
+                        write_buffer_kb: None,
+                        continue_partial: None,
+                        par_check: None,
+                        par_scan: None,
+                        par_quick: None,
+                        par_repair: None,
+                        par_rename: None,
+                        par_pause_queue: None,
+                        par_threads: None,
+                        unpack: None,
+                        unpack_pause_queue: None,
+                        download_rate_kib: None,
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *state.save_calls.lock().unwrap(),
+            0,
+            "opaque server passwords should not force saveconfig when all other live values already match"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_nzbget_config_patch_appends_missing_categories_for_named_volume_text() -> Result<()> {
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            None,
+            Some("nzbget".to_string()),
+            Some(json!({
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                }
+            })),
+            HashMap::new(),
+        );
+
+        let rendered = render_nzbget_config_patch(
+            &ctx,
+            "DestDir=/downloads\n",
+            &DownloaderNzbPatch::SetCategories {
+                categories: vec![
+                    DownloadCategorySpec {
+                        name: "tv".to_string(),
+                        save_path: Some("/downloads/tv".to_string()),
+                    },
+                    DownloadCategorySpec {
+                        name: "movies".to_string(),
+                        save_path: Some("/downloads/movies".to_string()),
+                    },
+                ],
+            },
+        )?
+        .expect("named-volume config should gain missing category slots");
+
+        assert!(rendered.contains("Category1.Name=tv"));
+        assert!(rendered.contains("Category1.DestDir=/downloads/tv"));
+        assert!(rendered.contains("Category2.Name=movies"));
+        assert!(rendered.contains("Category2.DestDir=/downloads/movies"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_nzbget_config_patch_set_preferences_restores_managed_categories_for_named_volume_text()
+    -> Result<()> {
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            None,
+            Some("nzbget".to_string()),
+            Some(json!({
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                }
+            })),
+            HashMap::new(),
+        );
+
+        let rendered = render_nzbget_config_patch(
+            &ctx,
+            "DestDir=/downloads\nInterDir=/runtime/incomplete\n",
+            &DownloaderNzbPatch::SetPreferences {
+                main_dir: None,
+                default_save_path: Some("/downloads".to_string()),
+                incomplete_path: Some("/runtime/incomplete".to_string()),
+                nzb_dir: Some("/runtime/nzb".to_string()),
+                queue_dir: Some("/runtime/queue".to_string()),
+                temp_dir: Some("/runtime/tmp".to_string()),
+                script_dir: None,
+                log_file: None,
+                web_dir: None,
+                config_template: None,
+                use_incomplete: Some(true),
+                server_connections: None,
+                article_retries: None,
+                article_timeout_seconds: None,
+                article_cache_mb: None,
+                direct_write: None,
+                write_buffer_kb: None,
+                continue_partial: None,
+                par_check: None,
+                par_scan: None,
+                par_quick: None,
+                par_repair: None,
+                par_rename: None,
+                par_pause_queue: None,
+                par_threads: None,
+                unpack: None,
+                unpack_pause_queue: None,
+                download_rate_kib: None,
+            },
+        )?
+        .expect("managed defaults should restore category keys for named-volume config");
+
+        assert!(rendered.contains("Category1.Name=tv"));
+        assert!(rendered.contains("Category2.Name=anime"));
+        assert!(rendered.contains("Category3.Name=movies"));
         Ok(())
     }
 }

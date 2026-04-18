@@ -16,6 +16,7 @@ use elixir_classifier::HintParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
 
+pub mod managed_paths;
 pub mod manifest;
 pub mod package;
 pub mod permissions;

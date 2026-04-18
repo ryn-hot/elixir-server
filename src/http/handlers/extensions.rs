@@ -23,7 +23,7 @@ use reqwest::header::{
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::fs;
 use tokio::net::lookup_host;
 use tokio::process::Command;
@@ -891,11 +891,12 @@ pub async fn refresh_catalog(State(state): State<AppState>) -> ApiResult<Json<Ca
 async fn build_catalog(state: &AppState, force_refresh: bool) -> Result<CatalogResponse, ApiError> {
     let store = ExtensionStore::new(&state.db_pool);
     let installed = store.list_extensions().await.map_err(ApiError::from)?;
+    let bundled_available = bundled_catalog_entries(state).await?;
 
     if state.settings.extensions.registries.is_empty() {
         return Ok(CatalogResponse {
             installed,
-            available: Vec::new(),
+            available: bundled_available,
             registry_errors: Vec::new(),
             last_refreshed_at: None,
             last_refresh_success_at: None,
@@ -935,13 +936,101 @@ async fn build_catalog(state: &AppState, force_refresh: bool) -> Result<CatalogR
 
     Ok(CatalogResponse {
         installed,
-        available: cache.index.extensions,
+        available: merge_catalog_entries(cache.index.extensions, bundled_available),
         registry_errors: cache.registry_errors,
         last_refreshed_at: Some(cache.fetched_at),
         last_refresh_success_at: cache.last_success_at,
         last_refresh_error: cache.last_error,
         core_extensions: state.settings.extensions.core_extensions.clone(),
     })
+}
+
+async fn bundled_catalog_entries(state: &AppState) -> Result<Vec<RegistryEntry>, ApiError> {
+    let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
+    if !bundled_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let tmp_root = PathBuf::from(&state.settings.extensions.storage_root).join("tmp");
+    fs::create_dir_all(&tmp_root)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    let mut entries = Vec::new();
+    let mut dir = fs::read_dir(&bundled_dir)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    while let Some(entry) = dir
+        .next_entry()
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_elx = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("elx"))
+            .unwrap_or(false);
+        if !is_elx {
+            continue;
+        }
+
+        let staging_dir = tmp_root.join(Uuid::new_v4().to_string());
+        let unpacked = unpack_package(&path, &staging_dir)
+            .await
+            .map_err(ApiError::from)?;
+        let manifest = match read_manifest_from_dir(&unpacked).await {
+            Ok(manifest) => manifest.manifest,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&staging_dir).await;
+                tracing::warn!(
+                    "failed to read bundled catalog manifest from '{}': {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let _ = fs::remove_dir_all(&staging_dir).await;
+
+        entries.push(RegistryEntry {
+            id: manifest.id,
+            version: manifest.version,
+            download_url: String::new(),
+            package_path: Some(path.to_string_lossy().to_string()),
+            sha256: None,
+            signature: None,
+            publisher_key_id: manifest
+                .publisher
+                .as_ref()
+                .and_then(|publisher| publisher.key_id.clone()),
+            trust: manifest.trust,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn merge_catalog_entries(
+    mut registry_entries: Vec<RegistryEntry>,
+    bundled_entries: Vec<RegistryEntry>,
+) -> Vec<RegistryEntry> {
+    for entry in bundled_entries {
+        if registry_entries
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
+            continue;
+        }
+        registry_entries.push(entry);
+    }
+    registry_entries
 }
 
 pub async fn get_extension(
@@ -1366,7 +1455,14 @@ async fn install_extension_internal(
             .or(package_signature.as_deref());
         let has_material = signature.is_some() || publisher_key_id.is_some();
         if has_material {
-            verify_signature(hash, signature, publisher_key_id)?;
+            if is_bundled_source && signature.is_none() {
+                tracing::debug!(
+                    extension_id = %manifest.id,
+                    "allowing bundled package without signature material"
+                );
+            } else {
+                verify_signature(hash, signature, publisher_key_id)?;
+            }
         } else if !allow_unsigned && !is_bundled_source {
             anyhow::bail!("package signature is required");
         }
@@ -2068,14 +2164,18 @@ pub async fn reconcile_now(State(state): State<AppState>) -> ApiResult<Json<Reco
 }
 
 async fn run_managed_repair_once(state: &AppState) -> anyhow::Result<()> {
-    let config = ReconcileConfig::from_settings(&state.settings);
+    let config = ReconcileConfig::explicit_repair_from_settings(&state.settings);
     state.orchestrator.reconcile_once(&config).await?;
+    state
+        .orchestrator
+        .apply_builtin_downloader_profiles_now()
+        .await?;
     Ok(())
 }
 
 async fn run_extension_control_managed_repair(state: &AppState) -> anyhow::Result<String> {
     run_managed_repair_once(state).await?;
-    Ok("Re-applied Elixir-managed settings.".to_string())
+    Ok("Ran explicit repair for Elixir-managed settings.".to_string())
 }
 
 pub async fn reconcile_latest(
@@ -2251,6 +2351,11 @@ pub async fn update_downloader_profile(
             .await
             .map_err(ApiError::from)?;
     }
+    state
+        .orchestrator
+        .apply_builtin_downloader_profiles_now()
+        .await
+        .map_err(ApiError::from)?;
     let response = build_downloader_profile_response(
         &state,
         &store,
@@ -3497,8 +3602,8 @@ fn applied_profile_for_provider(
         .and_then(|value| value.get(key))
         .and_then(|value| value.as_str())?;
     match version {
-        "v1" | "balanced-v1" => Some(DownloaderPerformanceProfile::Balanced),
-        "aggressive-v1" => Some(DownloaderPerformanceProfile::Aggressive),
+        "v1" | "balanced-v1" | "balanced-v4" => Some(DownloaderPerformanceProfile::Balanced),
+        "aggressive-v1" | "aggressive-v4" => Some(DownloaderPerformanceProfile::Aggressive),
         _ => None,
     }
 }
@@ -4601,10 +4706,10 @@ async fn build_extension_control_settings_section(
             id: "defaults".to_string(),
             title: "Downloader defaults".to_string(),
             description:
-                "This shared profile tunes Elixir-managed downloaders for balanced or aggressive use."
+                "This shared profile seeds Elixir-managed downloaders for balanced or aggressive use."
                     .to_string(),
             policy: Some(control_policy_seeded(
-                "Elixir seeds the downloader performance profile. The profile choice is a default, while stack-critical downloader paths and categories remain managed invariants.",
+                "Elixir applies this profile on bootstrap, when you change it here, and during explicit repair. Steady-state reconcile observes downloader health but does not keep rewriting the profile in the background.",
             )),
             notices: Vec::new(),
             fields: vec![ExtensionControlField {
@@ -6290,6 +6395,53 @@ async fn proxy_extension_ui_impl(
     Ok(response)
 }
 
+pub(crate) async fn request_instance_service_json(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    method: ReqwestMethod,
+    path: &str,
+    body: Option<Value>,
+) -> anyhow::Result<Value> {
+    let target = resolve_extension_ui_proxy_target(state, store, instance_id).await?;
+    let client = build_extension_ui_proxy_client()?;
+    let upstream_url = build_extension_ui_proxy_url(&target.base_url, path, None)?;
+    let mut request = build_extension_ui_upstream_request(
+        &client,
+        &target,
+        method.clone(),
+        upstream_url,
+        &AxumHeaderMap::new(),
+    )
+    .await?;
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("sending service {} {path}", method.as_str()))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading service {} {path} response", method.as_str()))?;
+    if !status.is_success() {
+        let detail = describe_service_response_body(&bytes);
+        anyhow::bail!(
+            "service {} {path} failed ({}): {detail}",
+            method.as_str(),
+            status
+        );
+    }
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing service {} {path} response", method.as_str()))
+}
+
 fn build_extension_ui_proxy_url(
     base_url: &str,
     path: &str,
@@ -6304,6 +6456,13 @@ fn build_extension_ui_proxy_url(
     let mut url = build_extension_control_url(base_url, &upstream_path)?;
     url.set_query(query);
     Ok(url)
+}
+
+fn describe_service_response_body(body: &[u8]) -> String {
+    match std::str::from_utf8(body) {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => "<empty response>".to_string(),
+    }
 }
 
 fn build_extension_ui_proxy_client() -> anyhow::Result<Client> {

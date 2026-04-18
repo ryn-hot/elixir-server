@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::AnyPool;
 use std::collections::HashSet;
 use std::time::Duration;
+use tokio::fs;
 use tokio::net::TcpStream;
 
 use crate::config::DownloaderPerformanceProfile;
@@ -141,6 +142,80 @@ impl OrchestratorService {
         Ok(())
     }
 
+    pub async fn read_instance_container_text_file(
+        &self,
+        instance_id: uuid::Uuid,
+        container_path: &str,
+    ) -> Result<Option<String>> {
+        self.ensure_runtime_ready().await?;
+        let Some(handle) = self
+            .runtime
+            .get_container_handle(&container_name(instance_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = self
+            .runtime
+            .read_container_file(&handle, container_path)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(String::from_utf8(bytes).with_context(|| {
+            format!(
+                "decoding container file '{}' for instance {}",
+                container_path, instance_id
+            )
+        })?))
+    }
+
+    pub async fn replace_instance_container_text_file_and_restart(
+        &self,
+        instance_id: uuid::Uuid,
+        container_path: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.ensure_runtime_ready().await?;
+        let handle_name = container_name(instance_id);
+        let handle = self
+            .runtime
+            .get_container_handle(&handle_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("runtime container '{}' not found", handle_name))?;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("elixir-instance-file-{}", instance_id.simple()));
+        fs::create_dir_all(&temp_dir).await.with_context(|| {
+            format!(
+                "creating temp directory '{}' for instance file replacement",
+                temp_dir.display()
+            )
+        })?;
+        let temp_file = temp_dir.join("payload");
+        fs::write(&temp_file, text.as_bytes())
+            .await
+            .with_context(|| {
+                format!(
+                    "writing temp replacement file '{}' for instance {}",
+                    temp_file.display(),
+                    instance_id
+                )
+            })?;
+
+        self.runtime.stop_container(&handle).await?;
+        let copy_result = self
+            .runtime
+            .copy_host_path_to_container(&handle, &temp_file, container_path)
+            .await;
+        let start_result = self.runtime.start_container(&handle).await;
+        let _ = fs::remove_dir_all(&temp_dir).await;
+
+        copy_result?;
+        start_result?;
+        Ok(())
+    }
+
     pub async fn read_provider_state(
         &self,
         provider: &Provider,
@@ -160,6 +235,22 @@ impl OrchestratorService {
         )
         .await?;
         driver.read_state(ctx).await
+    }
+
+    pub async fn apply_builtin_downloader_profiles_now(&self) -> Result<()> {
+        self.ensure_runtime_ready().await?;
+        let executor = Executor::new(
+            &self.pool,
+            self.probe.as_ref(),
+            self.drivers.as_ref(),
+            self.runtime.as_ref(),
+            self.runtime_paths.clone(),
+            self.secrets.as_ref(),
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
+        executor.apply_builtin_downloader_profiles_now().await
     }
 
     pub fn start_reconcile_loop(self: std::sync::Arc<Self>, config: ReconcileConfig) {
@@ -1080,6 +1171,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: crate::orchestrator::reconcile::ReconcileMode::SteadyState,
         };
 
         service
@@ -1246,6 +1338,7 @@ mod tests {
             retry_backoff: Duration::from_secs(1),
             startup_settle: Duration::ZERO,
             lock_ttl: Duration::from_secs(60),
+            mode: crate::orchestrator::reconcile::ReconcileMode::SteadyState,
         };
 
         service

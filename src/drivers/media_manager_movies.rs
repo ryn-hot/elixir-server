@@ -12,10 +12,16 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::debug;
 
+use crate::drivers::media_manager_support::{
+    MANAGED_MEDIA_TAG, lookup_terms_for_add_request, select_lookup_item,
+};
 use crate::drivers::patches::{
     DownloaderSpec, IndexerSpec, MediaManagerMoviesPatch, RootFolderSpec,
 };
-use crate::drivers::{ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, StateSnapshot};
+use crate::drivers::{
+    AddMediaRequest, AddMediaResult, ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx,
+    DriverPatch, PatchSemantics, PatchSideEffect, StateSnapshot,
+};
 
 pub struct MediaManagerMoviesDriver;
 
@@ -29,6 +35,45 @@ impl MediaManagerMoviesDriver {
 impl CapabilityDriver for MediaManagerMoviesDriver {
     fn capability(&self) -> &'static str {
         "media.manager.movies"
+    }
+
+    fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        match patch {
+            DriverPatch::MediaManagerMovies(_) => {
+                PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite)
+            }
+            _ => PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite),
+        }
+    }
+
+    async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        let patch = match patch {
+            DriverPatch::MediaManagerMovies(patch) => patch,
+            _ => bail!("media.manager.movies patch mismatch"),
+        };
+
+        let endpoint_url = ctx.canonical_url()?;
+        let config = RadarrDriverConfig::from_ctx(&ctx)?;
+        let client = RadarrClient::from_config(config, endpoint_url).await?;
+
+        match patch {
+            MediaManagerMoviesPatch::SetIndexerRegistry { indexers } => Ok(drift_evaluation(
+                "Radarr indexers",
+                client.evaluate_indexers(&indexers).await?,
+            )),
+            MediaManagerMoviesPatch::SetDownloaders { downloaders } => Ok(drift_evaluation(
+                "Radarr download clients",
+                client.evaluate_downloaders(&downloaders).await?,
+            )),
+            MediaManagerMoviesPatch::SetRootFolders { roots } => Ok(drift_evaluation(
+                "Radarr root folders",
+                client.evaluate_root_folders(&roots).await?,
+            )),
+            MediaManagerMoviesPatch::SetTags { tags } => Ok(drift_evaluation(
+                "Radarr tags",
+                client.evaluate_tags(&tags).await?,
+            )),
+        }
     }
 
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
@@ -64,6 +109,24 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
         }
 
         Ok(ApplyResult::applied())
+    }
+
+    async fn add_media(&self, ctx: DriverCtx, request: AddMediaRequest) -> Result<AddMediaResult> {
+        let implementation = ctx
+            .implementation
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+        if implementation != "radarr" {
+            bail!(
+                "media.manager.movies implementation '{}' does not support add_media",
+                implementation
+            );
+        }
+
+        let endpoint_url = ctx.canonical_url()?;
+        let config = RadarrDriverConfig::from_ctx(&ctx)?;
+        let client = RadarrClient::from_config(config, endpoint_url).await?;
+        client.add_movie(&request).await
     }
 }
 
@@ -238,6 +301,125 @@ impl RadarrClient {
         Ok(value)
     }
 
+    async fn add_movie(&self, request: &AddMediaRequest) -> Result<AddMediaResult> {
+        let lookup_terms = lookup_terms_for_add_request(request, "radarr");
+        debug!(
+            lookup_terms = ?lookup_terms,
+            title = %request.title,
+            year = request.year,
+            "adding media through radarr driver"
+        );
+
+        let items = self
+            .lookup_candidates(&lookup_terms, "movie/lookup")
+            .await?;
+        let mut selected = select_lookup_item(&items, request)
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve title in manager lookup"))?;
+
+        let quality_profile_id = match request.options.quality_profile_id {
+            Some(value) => value,
+            None => self.first_id("qualityprofile").await?,
+        };
+        let root_folder_path = match request.options.root_folder_path.as_deref() {
+            Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+            _ => self.first_path("rootfolder").await?,
+        };
+        let managed_tag_ids = self.ensure_tags(&[MANAGED_MEDIA_TAG.to_string()]).await?;
+
+        if let Some(payload) = selected.as_object_mut() {
+            payload.insert(
+                "qualityProfileId".to_string(),
+                Value::Number(quality_profile_id.into()),
+            );
+            payload.insert(
+                "rootFolderPath".to_string(),
+                Value::String(root_folder_path),
+            );
+            payload.insert(
+                "monitored".to_string(),
+                Value::Bool(request.options.monitor),
+            );
+            payload.insert(
+                "addOptions".to_string(),
+                json!({
+                    "searchForMovie": request.options.search
+                }),
+            );
+            if !managed_tag_ids.is_empty() {
+                let _ = merge_tags(&mut selected, &managed_tag_ids)?;
+            }
+        } else {
+            bail!("movie payload must be an object");
+        }
+
+        let created = self.post_json("movie", &selected).await?;
+        Ok(AddMediaResult {
+            manager_item_id: created
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string()),
+        })
+    }
+
+    async fn lookup_candidates(&self, queries: &[String], path: &str) -> Result<Vec<Value>> {
+        let mut last_items = Vec::new();
+        for query in queries {
+            let url = self.lookup_url(path, query)?;
+            let resp = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("GET {}?term={query}", path))?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                continue;
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .with_context(|| format!("reading GET {path} response"))?;
+            if !status.is_success() {
+                let detail = describe_error_body(&bytes);
+                bail!("{path} failed ({status}): {detail}");
+            }
+            let items: Vec<Value> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing GET {path} response"))?;
+            if !items.is_empty() {
+                return Ok(items);
+            }
+            last_items = items;
+        }
+        Ok(last_items)
+    }
+
+    fn lookup_url(&self, path: &str, term: &str) -> Result<Url> {
+        let mut url = self.api_url(path)?;
+        url.query_pairs_mut().append_pair("term", term);
+        Ok(url)
+    }
+
+    async fn first_id(&self, path: &str) -> Result<i64> {
+        let items = self.get_json::<Vec<Value>>(path).await?;
+        items
+            .first()
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("unable to determine {}", path))
+    }
+
+    async fn first_path(&self, path: &str) -> Result<String> {
+        let items = self.get_json::<Vec<Value>>(path).await?;
+        items
+            .first()
+            .and_then(|item| item.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow::anyhow!("unable to determine {}", path))
+    }
+
     async fn ensure_root_folders(&self, roots: &[RootFolderSpec]) -> Result<()> {
         if roots.is_empty() {
             return Ok(());
@@ -376,6 +558,150 @@ impl RadarrClient {
         }
         Ok(tag_ids)
     }
+
+    async fn resolve_existing_tag_ids(&self, tags: &[String]) -> Result<(Vec<i64>, Vec<String>)> {
+        if tags.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let existing = self.get_json::<Vec<Value>>("tag").await?;
+        let mut by_name: HashMap<String, i64> = HashMap::new();
+        for tag in &existing {
+            if let (Some(name), Some(id)) = (
+                tag.get("label").and_then(Value::as_str),
+                tag.get("id").and_then(Value::as_i64),
+            ) {
+                by_name.insert(normalize_name(name), id);
+            }
+        }
+        let mut tag_ids = Vec::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for tag in tags {
+            let normalized = normalize_name(tag);
+            if !seen.insert(normalized.clone()) {
+                continue;
+            }
+            if let Some(id) = by_name.get(&normalized) {
+                tag_ids.push(*id);
+            } else {
+                missing.push(tag.clone());
+            }
+        }
+        Ok((tag_ids, missing))
+    }
+
+    async fn evaluate_root_folders(&self, roots: &[RootFolderSpec]) -> Result<Vec<String>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("rootfolder").await?;
+        let mut drift = Vec::new();
+        for root in roots {
+            if find_by_path(&existing, &root.path).is_none() {
+                drift.push(root.path.clone());
+            }
+        }
+        Ok(drift)
+    }
+
+    async fn evaluate_indexers(&self, indexers: &[IndexerSpec]) -> Result<Vec<String>> {
+        if indexers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexer").await?;
+        let mut drift = Vec::new();
+
+        for indexer in indexers {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&indexer.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let schema_item = find_schema(&schema, &indexer.implementation)?;
+            let existing_item = find_by_name(&existing, &indexer.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = indexer.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", indexer.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &indexer.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+            apply_indexer_fields(fields, indexer)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(indexer.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_downloaders(&self, downloaders: &[DownloaderSpec]) -> Result<Vec<String>> {
+        if downloaders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("downloadclient/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("downloadclient").await?;
+        let mut drift = Vec::new();
+
+        for downloader in downloaders {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&downloader.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let schema_item = find_schema(&schema, &downloader.r#type)?;
+            let existing_item = find_by_name(&existing, &downloader.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_item,
+            };
+            let enabled = downloader.enabled.unwrap_or(true);
+            set_enabled(&mut target, enabled)?;
+            set_string(&mut target, "name", downloader.name.clone())?;
+            set_array_i64(&mut target, "tags", &tags)?;
+            ensure_schema_fields(&mut target, &downloader.r#type)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("download client fields missing"))?;
+            apply_downloader_fields(fields, downloader)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(downloader.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_tags(&self, tags: &[String]) -> Result<Vec<String>> {
+        let (_ids, missing) = self.resolve_existing_tag_ids(tags).await?;
+        Ok(missing)
+    }
+}
+
+fn drift_evaluation(subject: &str, drift: Vec<String>) -> DriftEvaluation {
+    if drift.is_empty() {
+        DriftEvaluation::in_sync()
+    } else {
+        DriftEvaluation::drifted(format!("{subject} require repair: {}", drift.join(", ")))
+    }
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        let key = normalize_name(&value);
+        if seen.insert(key) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn normalize_version(value: &str) -> Result<&'static str> {
@@ -511,6 +837,35 @@ fn set_array_i64(target: &mut Value, field: &str, values: &[i64]) -> Result<()> 
         return Ok(());
     }
     bail!("payload must be an object");
+}
+
+fn merge_tags(target: &mut Value, tags: &[i64]) -> Result<bool> {
+    let existing = target
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|array| array.iter().filter_map(Value::as_i64).collect::<Vec<i64>>())
+        .unwrap_or_default();
+    let mut seen: HashSet<i64> = existing.iter().copied().collect();
+    let mut merged = existing.clone();
+    let mut changed = false;
+    for tag in tags {
+        if seen.insert(*tag) {
+            merged.push(*tag);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let mut array = Vec::new();
+    for tag in merged {
+        array.push(Value::Number(tag.into()));
+    }
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert("tags".to_string(), Value::Array(array));
+        return Ok(true);
+    }
+    bail!("expected object for tag merge");
 }
 
 fn parse_int_list(values: &[String]) -> Result<Vec<Value>> {
@@ -737,6 +1092,19 @@ mod tests {
             value_for_field(&fields, "movieCategory").cloned(),
             Some(json!("movies"))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn merge_tags_preserves_existing_order_and_avoids_duplicates() -> Result<()> {
+        let mut payload = json!({ "tags": [2, 1] });
+        let changed = merge_tags(&mut payload, &[1, 3])?;
+        assert!(changed);
+        assert_eq!(payload.get("tags"), Some(&json!([2, 1, 3])));
+
+        let changed = merge_tags(&mut payload, &[3])?;
+        assert!(!changed);
 
         Ok(())
     }

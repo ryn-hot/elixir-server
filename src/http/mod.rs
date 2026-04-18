@@ -328,8 +328,16 @@ pub fn router(state: AppState) -> Router {
             get(handlers::discovery::find_media_acquisition),
         )
         .route(
+            "/api/v1/find-media/acquisition/:intent_id/find-another-release",
+            post(handlers::discovery::find_media_acquisition_find_another_release),
+        )
+        .route(
             "/api/v1/find/acquisition",
             get(handlers::discovery::find_media_acquisition),
+        )
+        .route(
+            "/api/v1/find/acquisition/:intent_id/find-another-release",
+            post(handlers::discovery::find_media_acquisition_find_another_release),
         )
         .route(
             "/api/v1/find-media/preferences",

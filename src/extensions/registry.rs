@@ -25,6 +25,8 @@ pub struct RegistryEntry {
     pub version: String,
     pub download_url: String,
     #[serde(default)]
+    pub package_path: Option<String>,
+    #[serde(default)]
     pub sha256: Option<String>,
     #[serde(default)]
     pub signature: Option<String>,

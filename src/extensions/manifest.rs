@@ -4,6 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::{ExtensionKind, ExtensionTrustLevel, SlotCardinality};
+use crate::extensions::managed_paths::{
+    DOWNLOADS_ROOT, NZBGET_INCOMPLETE_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_TEMP_DIR,
+    QBITTORRENT_INCOMPLETE_DIR,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
@@ -845,13 +849,6 @@ pub fn parse_manifest_yaml(yaml: &str) -> Result<ManifestParseResult> {
 }
 
 pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
-    repair_builtin_manifest_json_for_hot_path_mode(raw_json, prefers_runtime_hot_paths())
-}
-
-fn repair_builtin_manifest_json_for_hot_path_mode(
-    raw_json: &mut serde_json::Value,
-    prefer_runtime_hot_paths: bool,
-) -> bool {
     let extension_id = raw_json
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -863,110 +860,42 @@ fn repair_builtin_manifest_json_for_hot_path_mode(
             "elixir.connectors.nzbget_defaults",
             "elixir.connectors.qbittorrent_defaults",
         ),
-        "elixir.connectors.qbittorrent_defaults" => {
-            repair_qbittorrent_defaults_manifest(raw_json, prefer_runtime_hot_paths)
-        }
-        "elixir.connectors.nzbget_defaults" => {
-            repair_nzbget_defaults_manifest(raw_json, prefer_runtime_hot_paths)
-        }
+        "elixir.connectors.qbittorrent_defaults" => repair_qbittorrent_defaults_manifest(raw_json),
+        "elixir.connectors.nzbget_defaults" => repair_nzbget_defaults_manifest(raw_json),
         _ => false,
     }
 }
 
-fn prefers_runtime_hot_paths() -> bool {
-    cfg!(any(target_os = "macos", target_os = "windows"))
-}
-
-fn repair_qbittorrent_defaults_manifest(
-    root: &mut serde_json::Value,
-    prefer_runtime_hot_paths: bool,
-) -> bool {
+fn repair_qbittorrent_defaults_manifest(root: &mut serde_json::Value) -> bool {
     let mut repaired = false;
     repaired |=
-        set_driver_patch_string_field(root, "set_preferences", "default_save_path", "/downloads");
+        set_driver_patch_string_field(root, "set_preferences", "default_save_path", DOWNLOADS_ROOT);
     repaired |= set_driver_patch_string_field(
         root,
         "set_preferences",
         "incomplete_path",
-        qbittorrent_incomplete_path(prefer_runtime_hot_paths),
+        QBITTORRENT_INCOMPLETE_DIR,
     );
     repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
     repaired
 }
 
-fn repair_nzbget_defaults_manifest(
-    root: &mut serde_json::Value,
-    prefer_runtime_hot_paths: bool,
-) -> bool {
+fn repair_nzbget_defaults_manifest(root: &mut serde_json::Value) -> bool {
     let mut repaired = false;
     repaired |=
-        set_driver_patch_string_field(root, "set_preferences", "default_save_path", "/downloads");
+        set_driver_patch_string_field(root, "set_preferences", "default_save_path", DOWNLOADS_ROOT);
     repaired |= set_driver_patch_string_field(
         root,
         "set_preferences",
         "incomplete_path",
-        nzbget_incomplete_path(prefer_runtime_hot_paths),
+        NZBGET_INCOMPLETE_DIR,
     );
-    repaired |= set_driver_patch_string_field(
-        root,
-        "set_preferences",
-        "nzb_dir",
-        nzbget_nzb_dir(prefer_runtime_hot_paths),
-    );
-    repaired |= set_driver_patch_string_field(
-        root,
-        "set_preferences",
-        "queue_dir",
-        nzbget_queue_dir(prefer_runtime_hot_paths),
-    );
-    repaired |= set_driver_patch_string_field(
-        root,
-        "set_preferences",
-        "temp_dir",
-        nzbget_temp_dir(prefer_runtime_hot_paths),
-    );
+    repaired |= set_driver_patch_string_field(root, "set_preferences", "nzb_dir", NZBGET_NZB_DIR);
+    repaired |=
+        set_driver_patch_string_field(root, "set_preferences", "queue_dir", NZBGET_QUEUE_DIR);
+    repaired |= set_driver_patch_string_field(root, "set_preferences", "temp_dir", NZBGET_TEMP_DIR);
     repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
     repaired
-}
-
-fn qbittorrent_incomplete_path(prefer_runtime_hot_paths: bool) -> &'static str {
-    if prefer_runtime_hot_paths {
-        "/runtime/incomplete"
-    } else {
-        "/downloads/.incomplete"
-    }
-}
-
-fn nzbget_incomplete_path(prefer_runtime_hot_paths: bool) -> &'static str {
-    if prefer_runtime_hot_paths {
-        "/runtime/incomplete"
-    } else {
-        "/downloads/.incomplete"
-    }
-}
-
-fn nzbget_nzb_dir(prefer_runtime_hot_paths: bool) -> &'static str {
-    if prefer_runtime_hot_paths {
-        "/runtime/nzb"
-    } else {
-        "/config/nzb"
-    }
-}
-
-fn nzbget_queue_dir(prefer_runtime_hot_paths: bool) -> &'static str {
-    if prefer_runtime_hot_paths {
-        "/runtime/queue"
-    } else {
-        "/config/queue"
-    }
-}
-
-fn nzbget_temp_dir(prefer_runtime_hot_paths: bool) -> &'static str {
-    if prefer_runtime_hot_paths {
-        "/runtime/tmp"
-    } else {
-        "/config/tmp"
-    }
 }
 
 fn set_driver_patch_string_field(
@@ -1420,7 +1349,7 @@ control_surface:
     }
 
     #[test]
-    fn repair_builtin_manifest_updates_qbittorrent_defaults_for_desktop_hot_paths() {
+    fn repair_builtin_manifest_updates_qbittorrent_defaults_to_runtime_paths() {
         let mut raw = json!({
             "id": "elixir.connectors.qbittorrent_defaults",
             "actions": [
@@ -1443,9 +1372,7 @@ control_surface:
             ]
         });
 
-        assert!(repair_builtin_manifest_json_for_hot_path_mode(
-            &mut raw, true
-        ));
+        assert!(repair_builtin_manifest_json(&mut raw));
         assert_eq!(
             raw.pointer("/actions/1/patch/incomplete_path")
                 .and_then(serde_json::Value::as_str),
@@ -1454,7 +1381,7 @@ control_surface:
     }
 
     #[test]
-    fn repair_builtin_manifest_updates_nzbget_defaults_for_desktop_hot_paths() {
+    fn repair_builtin_manifest_updates_nzbget_defaults_to_runtime_paths() {
         let mut raw = json!({
             "id": "elixir.connectors.nzbget_defaults",
             "actions": [
@@ -1477,9 +1404,7 @@ control_surface:
             ]
         });
 
-        assert!(repair_builtin_manifest_json_for_hot_path_mode(
-            &mut raw, true
-        ));
+        assert!(repair_builtin_manifest_json(&mut raw));
         assert_eq!(
             raw.pointer("/actions/1/patch/incomplete_path")
                 .and_then(serde_json::Value::as_str),
@@ -1503,7 +1428,7 @@ control_surface:
     }
 
     #[test]
-    fn repair_builtin_manifest_updates_nzbget_defaults_for_bind_config_hosts() {
+    fn repair_builtin_manifest_keeps_nzbget_defaults_on_runtime_paths() {
         let mut raw = json!({
             "id": "elixir.connectors.nzbget_defaults",
             "actions": [
@@ -1529,28 +1454,26 @@ control_surface:
             ]
         });
 
-        assert!(repair_builtin_manifest_json_for_hot_path_mode(
-            &mut raw, false
-        ));
+        assert!(!repair_builtin_manifest_json(&mut raw));
         assert_eq!(
             raw.pointer("/actions/1/patch/incomplete_path")
                 .and_then(serde_json::Value::as_str),
-            Some("/downloads/.incomplete")
+            Some("/runtime/incomplete")
         );
         assert_eq!(
             raw.pointer("/actions/1/patch/nzb_dir")
                 .and_then(serde_json::Value::as_str),
-            Some("/config/nzb")
+            Some("/runtime/nzb")
         );
         assert_eq!(
             raw.pointer("/actions/1/patch/queue_dir")
                 .and_then(serde_json::Value::as_str),
-            Some("/config/queue")
+            Some("/runtime/queue")
         );
         assert_eq!(
             raw.pointer("/actions/1/patch/temp_dir")
                 .and_then(serde_json::Value::as_str),
-            Some("/config/tmp")
+            Some("/runtime/tmp")
         );
     }
 }
