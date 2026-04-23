@@ -1,0 +1,32 @@
+id: elixir.connectors.prowlarr_byparr_proxy
+version: 1.0.1
+kind: connector
+name: "Prowlarr Byparr Proxy"
+description: "Register the managed Byparr service as a Prowlarr indexer proxy."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - drivers.configure.indexer.registry
+requires:
+  - capability: indexer.proxy
+    slot: byparr
+targets:
+  - capability: indexer.registry
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: indexer.registry
+      slot: default
+    patch:
+      op: register_indexer_proxies
+      proxies:
+        - name: "Byparr"
+          implementation: "FlareSolverr"
+          tags: ["byparr"]
+          enabled: true
+          settings:
+            host: "http://elx-byparr:8191/"
+            requestTimeout: 180

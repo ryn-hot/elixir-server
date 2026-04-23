@@ -33,9 +33,11 @@ use crate::config::{DownloaderPerformanceProfile, RunEnvironment};
 use crate::db::models::{
     Binding, BindingStatus, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind,
     ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
-    OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
+    OrchestratorRunStatus, Provider, ProviderHealthState, ProviderReadiness,
+    ProviderReadinessPhase, RuntimeLog, Secret, SecretScope,
 };
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
+use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
@@ -53,17 +55,17 @@ use crate::extensions::store::{
     ExtensionStore, ManagedIngestIntent, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
     NewOperationStep, NewOrchestratorRun, NewSecret,
 };
+use crate::extensions::updater::{ProxyRuntimeUpdateState, load_proxy_runtime_update_state};
 use crate::http::auth::CurrentUser;
 use crate::http::error::{ApiError, ApiResult};
+use crate::orchestrator::executor::ExecutorAction;
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::build_aliases;
 use crate::orchestrator::plan_executor::{PlanExecutor, PlannedStep};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
-use crate::orchestrator::planner::{
-    Plan, PlanAction, PlanDecisions, Planner, SlotConflictResolution,
-};
+use crate::orchestrator::planner::{Plan, PlanAction, PlanBlockedStage, PlanStage, Planner};
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
 use crate::state::AppState;
@@ -106,6 +108,18 @@ pub struct InstallResponse {
     pub enabled: bool,
 }
 
+struct InstallResult {
+    response: InstallResponse,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InstallPolicy {
+    pub allow_internal_directory_install: bool,
+    pub allow_internal_unsigned: bool,
+    pub allow_downgrade: bool,
+    pub allow_same_version_replace: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateInstanceRequest {
@@ -136,6 +150,8 @@ pub struct GraphResponse {
 pub struct ProviderHealthResponse {
     pub provider_id: Uuid,
     pub health_state: ProviderHealthState,
+    pub readiness_phase: ProviderReadinessPhase,
+    pub readiness_detail: Option<String>,
     pub last_healthcheck_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -148,21 +164,6 @@ pub struct RuntimeLogsResponse {
 #[derive(Debug, Deserialize)]
 pub struct RunsQuery {
     pub limit: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoWireStatusResponse {
-    pub enabled: bool,
-    pub pending_plan_id: Option<Uuid>,
-    pub pending_reason: Option<String>,
-    pub pending_conflicts: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoWireUpdateRequest {
-    pub enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +196,8 @@ pub struct DownloaderTelemetryItem {
     pub capability: String,
     pub implementation: Option<String>,
     pub health_state: ProviderHealthState,
+    pub readiness_phase: ProviderReadinessPhase,
+    pub readiness_detail: Option<String>,
     pub last_healthcheck_at: Option<chrono::DateTime<chrono::Utc>>,
     pub applied_profile: Option<DownloaderPerformanceProfile>,
     pub sync_state: String,
@@ -225,9 +228,32 @@ pub struct DesiredBlueprintsQuery {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunDetailResponse {
     pub run: OrchestratorRun,
     pub steps: Vec<OperationStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_summary: Option<RunStageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStageSummary {
+    pub current_stage_id: Option<String>,
+    pub current_stage_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_stage: Option<PlanBlockedStage>,
+    #[serde(default)]
+    pub stages: Vec<RunStageProgress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStageProgress {
+    pub stage_id: String,
+    pub status: String,
+    pub step_count: usize,
+    pub completed_step_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -320,8 +346,23 @@ pub struct ExtensionStatusSummaryItem {
     pub description: String,
     pub primary_action: String,
     pub primary_action_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<ExtensionAutoUpdateSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub optional_addons: Vec<ExtensionOptionalAddonSummaryItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionAutoUpdateSummary {
+    pub severity: String,
+    pub status_code: String,
+    pub label: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -575,16 +616,23 @@ pub async fn apply_blueprint(
 ) -> ApiResult<Json<Plan>> {
     let db_pool = state.db_pool.clone();
     let store = ExtensionStore::new(&db_pool);
+    let blueprint = store
+        .get_extension(&payload.blueprint_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+    let manifest: ExtensionManifest = serde_json::from_value(blueprint.manifest_json.clone())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if manifest.execution.is_some() {
+        ensure_execution_blueprint_packages_installed(&state, &manifest)
+            .await
+            .map_err(ApiError::from)?;
+    }
     let planner = Planner::new();
     let mut plan = planner
         .plan_blueprint(&store, payload.blueprint_id, payload.params)
         .await
         .map_err(ApiError::from)?;
-    let blueprint = store
-        .get_extension(&plan.blueprint_id)
-        .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
 
     let pending_runs = store
         .list_runs_by_source_status("blueprint", OrchestratorRunStatus::Pending)
@@ -667,17 +715,10 @@ pub struct PlanRunResponse {
     pub status: OrchestratorRunStatus,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfirmPlanRequest {
-    #[serde(default)]
-    pub decisions: Option<PlanDecisions>,
-}
-
 pub async fn confirm_plan(
     State(state): State<AppState>,
     Path(plan_id): Path<String>,
-    payload: Option<Json<ConfirmPlanRequest>>,
+    _payload: Option<Json<serde_json::Value>>,
 ) -> ApiResult<Json<PlanRunResponse>> {
     let run_id = Uuid::parse_str(&plan_id).map_err(|_| ApiError::bad_request("invalid plan id"))?;
     let db_pool = state.db_pool.clone();
@@ -699,39 +740,20 @@ pub async fn confirm_plan(
     let plan: Plan = serde_json::from_value(plan_json)
         .map_err(|err| ApiError::bad_request(format!("invalid plan payload: {err}")))?;
 
-    let decisions = payload.and_then(|payload| payload.decisions.clone());
-    if let Some(decisions) = decisions.as_ref() {
-        if decisions
-            .slot_conflicts
-            .iter()
-            .any(|decision| matches!(decision.action, SlotConflictResolution::Abort))
-        {
-            return Err(ApiError::conflict("plan confirmation aborted"));
+    if run.source == "blueprint" {
+        let blueprint = store
+            .get_extension(&plan.blueprint_id)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+        let manifest: ExtensionManifest = serde_json::from_value(blueprint.manifest_json.clone())
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        if manifest.execution.is_some() {
+            ensure_execution_blueprint_packages_installed(&state, &manifest)
+                .await
+                .map_err(ApiError::from)?;
         }
     }
-
-    let plan = if let Some(decisions) = decisions.as_ref() {
-        let planner = Planner::new();
-        let mut resolved = planner
-            .plan_blueprint_with_decisions(
-                &store,
-                plan.blueprint_id.clone(),
-                plan.params.clone(),
-                Some(decisions),
-            )
-            .await
-            .map_err(ApiError::from)?;
-        resolved.plan_id = run_id;
-        let plan_json =
-            serde_json::to_value(&resolved).map_err(|err| ApiError::internal(err.to_string()))?;
-        store
-            .update_run_plan(run_id, plan_json)
-            .await
-            .map_err(ApiError::from)?;
-        resolved
-    } else {
-        plan
-    };
 
     let missing = missing_required_secrets_for_plan(&store, &plan.actions)
         .await
@@ -747,12 +769,6 @@ pub async fn confirm_plan(
         return Err(ApiError::conflict("plan has unresolved conflicts"));
     }
 
-    let decisions_json = decisions
-        .as_ref()
-        .map(|value| serde_json::to_value(value))
-        .transpose()
-        .map_err(|err| ApiError::internal(err.to_string()))?;
-
     if run.source == "blueprint" {
         let blueprint = store
             .get_extension(&plan.blueprint_id)
@@ -765,7 +781,6 @@ pub async fn confirm_plan(
                 blueprint_extension_id: blueprint.extension_id,
                 blueprint_version: blueprint.version,
                 params_json: plan.params.clone(),
-                decisions_json: decisions_json.clone(),
             })
             .await
             .map_err(ApiError::from)?;
@@ -1031,6 +1046,86 @@ fn merge_catalog_entries(
         registry_entries.push(entry);
     }
     registry_entries
+}
+
+fn pick_best_catalog_entry(entries: &[RegistryEntry], extension_id: &str) -> Option<RegistryEntry> {
+    let mut matches = entries
+        .iter()
+        .filter(|entry| entry.id == extension_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        let left_version = Version::parse(&left.version).ok();
+        let right_version = Version::parse(&right.version).ok();
+        right_version
+            .cmp(&left_version)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    matches.into_iter().next()
+}
+
+async fn resolve_install_request_for_extension_id(
+    state: &AppState,
+    extension_id: &str,
+) -> anyhow::Result<InstallRequest> {
+    let catalog = build_catalog(state, false)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    let entry = pick_best_catalog_entry(&catalog.available, extension_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "extension '{}' is not available in the catalog",
+            extension_id
+        )
+    })?;
+    if let Some(package_path) = entry
+        .package_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(InstallRequest {
+            download_url: None,
+            package_path: Some(package_path.to_string()),
+        });
+    }
+    if !entry.download_url.trim().is_empty() {
+        return Ok(InstallRequest {
+            download_url: Some(entry.download_url),
+            package_path: None,
+        });
+    }
+    anyhow::bail!(
+        "extension '{}' catalog entry has no install source",
+        extension_id
+    );
+}
+
+async fn ensure_execution_blueprint_packages_installed(
+    state: &AppState,
+    manifest: &ExtensionManifest,
+) -> anyhow::Result<()> {
+    let Some(execution) = manifest.execution.as_ref() else {
+        return Ok(());
+    };
+    let store = ExtensionStore::new(&state.db_pool);
+    for extension_id in &execution.packages {
+        let desired_extension_id = extension_id.trim();
+        if desired_extension_id.is_empty() {
+            continue;
+        }
+        if let Some(existing) = store.get_extension(desired_extension_id).await? {
+            if !existing.enabled {
+                store
+                    .set_extension_enabled(desired_extension_id, true)
+                    .await?;
+            }
+            continue;
+        }
+
+        let request = resolve_install_request_for_extension_id(state, desired_extension_id).await?;
+        install_extension_internal_with_policy(state, &request, InstallPolicy::default()).await?;
+    }
+    Ok(())
 }
 
 pub async fn get_extension(
@@ -1323,16 +1418,37 @@ pub async fn install_extension(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
 ) -> ApiResult<Json<InstallResponse>> {
-    let response = install_extension_internal(&state, &payload)
+    let result = install_extension_internal(&state, &payload)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(response))
+    Ok(Json(result.response))
 }
 
 async fn install_extension_internal(
     state: &AppState,
     payload: &InstallRequest,
-) -> anyhow::Result<InstallResponse> {
+) -> anyhow::Result<InstallResult> {
+    install_extension_internal_with_policy(state, payload, InstallPolicy::default()).await
+}
+
+pub(crate) async fn install_internal_extension_from_dir(
+    state: &AppState,
+    package_dir: &std::path::Path,
+    policy: InstallPolicy,
+) -> anyhow::Result<()> {
+    let request = InstallRequest {
+        download_url: None,
+        package_path: Some(package_dir.to_string_lossy().to_string()),
+    };
+    install_extension_internal_with_policy(state, &request, policy).await?;
+    Ok(())
+}
+
+async fn install_extension_internal_with_policy(
+    state: &AppState,
+    payload: &InstallRequest,
+    policy: InstallPolicy,
+) -> anyhow::Result<InstallResult> {
     let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
     storage_paths.ensure_dirs().await?;
 
@@ -1361,12 +1477,15 @@ async fn install_extension_internal(
     let staging_dir = storage_paths.tmp_dir.join(Uuid::new_v4().to_string());
     let mut package_hash = None;
     let staged = if package_path.is_dir() {
-        if !allow_directory_install && !is_bundled_source {
+        if !allow_directory_install
+            && !is_bundled_source
+            && !policy.allow_internal_directory_install
+        {
             anyhow::bail!(
                 "directory installs are only allowed in development with extensions.allow_directory_install=true"
             );
         }
-        if !allow_unsigned && !is_bundled_source {
+        if !allow_unsigned && !is_bundled_source && !policy.allow_internal_unsigned {
             anyhow::bail!(
                 "unsigned installs are disabled; enable extensions.allow_unsigned for development"
             );
@@ -1477,14 +1596,14 @@ async fn install_extension_internal(
     let publisher_name = publisher.as_ref().map(|publisher| publisher.name.clone());
     let signing_key_id = publisher_key_id.take().map(|value| value.to_string());
 
-    let policy = PermissionPolicy::new();
-    policy.enforce(trust_level, &manifest.permissions, &manifest.id)?;
+    let permission_policy = PermissionPolicy::new();
+    permission_policy.enforce(trust_level, &manifest.permissions, &manifest.id)?;
 
     let new_version = Version::parse(&manifest.version)
         .map_err(|_| anyhow::anyhow!("extension version is not valid semver"))?;
     let store = ExtensionStore::new(&state.db_pool);
     if let Some(existing) = store.get_extension(&manifest.id).await? {
-        validate_semver_upgrade(&existing, &new_version, package_hash.as_deref())?;
+        validate_semver_upgrade(&existing, &new_version, package_hash.as_deref(), policy)?;
     }
     let required = required_secrets_from_manifest(&manifest)?;
     if !required.is_empty() {
@@ -1501,10 +1620,10 @@ async fn install_extension_internal(
         }
     }
 
-    let extension_id = manifest.id;
-    let name = manifest.name;
-    let version = manifest.version;
-    let kind = manifest.kind;
+    let extension_id = manifest.id.clone();
+    let name = manifest.name.clone();
+    let version = manifest.version.clone();
+    let kind = manifest.kind.clone();
 
     let extension_root = storage_paths.unpacked_dir.join(&extension_id);
     fs::create_dir_all(&extension_root)
@@ -1525,7 +1644,7 @@ async fn install_extension_internal(
             extension_id: extension_id.clone(),
             name: name.clone(),
             version: version.clone(),
-            kind,
+            kind: kind.clone(),
             publisher_name,
             signing_key_id,
             trust_level,
@@ -1535,13 +1654,15 @@ async fn install_extension_internal(
         })
         .await?;
 
-    Ok(InstallResponse {
-        extension_id,
-        name,
-        version,
-        kind,
-        trust_level,
-        enabled: true,
+    Ok(InstallResult {
+        response: InstallResponse {
+            extension_id,
+            name,
+            version,
+            kind,
+            trust_level,
+            enabled: true,
+        },
     })
 }
 
@@ -1690,6 +1811,10 @@ pub async fn uninstall_extension(
             .map_err(ApiError::from)?;
     }
 
+    cleanup_extension_downstream_state(&state, &store, &existing)
+        .await
+        .map_err(ApiError::from)?;
+
     remove_extension_instances(&state, &store, &existing.extension_id)
         .await
         .map_err(ApiError::from)?;
@@ -1699,6 +1824,9 @@ pub async fn uninstall_extension(
         .map_err(ApiError::from)?;
 
     for dependency in cascade_targets {
+        cleanup_extension_downstream_state(&state, &store, &dependency)
+            .await
+            .map_err(ApiError::from)?;
         remove_extension_instances(&state, &store, &dependency.extension_id)
             .await
             .map_err(ApiError::from)?;
@@ -1763,7 +1891,69 @@ pub async fn create_instance(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::internal("instance lookup failed"))?;
+    trigger_extensions_reconcile(&state, "manual extension instance create").await;
     Ok(Json(instance))
+}
+
+pub(super) async fn create_default_extension_instance(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    manifest: &ExtensionManifest,
+) -> anyhow::Result<bool> {
+    let created = ensure_default_extension_instance(store, manifest, true).await?;
+    if created {
+        trigger_extensions_reconcile(state, "manual default instance create").await;
+    }
+    Ok(created)
+}
+
+async fn ensure_default_extension_instance(
+    store: &ExtensionStore<'_>,
+    manifest: &ExtensionManifest,
+    allow_missing_manual_secrets: bool,
+) -> anyhow::Result<bool> {
+    if manifest.kind != ExtensionKind::Module || manifest.runtime.is_none() {
+        return Ok(false);
+    }
+
+    let instances = store.list_instances(Some(&manifest.id)).await?;
+    if !instances.is_empty() {
+        return Ok(false);
+    }
+
+    if !allow_missing_manual_secrets {
+        let required = required_secrets_from_manifest(manifest)?;
+        if !required.is_empty() {
+            let probe_instance_id = Uuid::new_v4();
+            let missing = filter_auto_managed_runtime_missing(
+                &manifest.id,
+                missing_required_secrets_for_instance(store, probe_instance_id, &required).await?,
+            );
+            if !missing.is_empty() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: manifest.id.clone(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+
+    Ok(true)
+}
+
+async fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
+    let config = ReconcileConfig::from_settings(&state.settings);
+    if let Err(err) = state.orchestrator.reconcile_once(&config).await {
+        tracing::warn!(reason = reason, "extension reconcile trigger failed: {err}");
+    }
 }
 
 pub async fn update_instance(
@@ -1925,9 +2115,18 @@ pub async fn provider_health(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let readiness = store
+        .get_provider_readiness(provider_id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ProviderHealthResponse {
         provider_id,
         health_state: provider.health_state,
+        readiness_phase: readiness
+            .as_ref()
+            .map(|value| value.readiness_phase)
+            .unwrap_or(ProviderReadinessPhase::Unknown),
+        readiness_detail: readiness.and_then(|value| value.readiness_detail),
         last_healthcheck_at: provider.last_healthcheck_at,
     }))
 }
@@ -2178,6 +2377,86 @@ async fn run_extension_control_managed_repair(state: &AppState) -> anyhow::Resul
     Ok("Ran explicit repair for Elixir-managed settings.".to_string())
 }
 
+async fn run_extension_control_targeted_managed_repair(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<String> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return run_extension_control_managed_repair(state).await;
+    };
+
+    let extensions = store.list_extensions().await?;
+    let mut actions = Vec::new();
+    let mut patched_connectors = Vec::new();
+    let mut readiness_gates_added = false;
+
+    for extension in extensions {
+        if !extension.enabled || extension.kind != ExtensionKind::Connector {
+            continue;
+        }
+
+        let manifest: ExtensionManifest = serde_json::from_value(extension.manifest_json.clone())
+            .with_context(|| {
+            format!(
+                "parsing manifest for connector '{}'",
+                extension.extension_id
+            )
+        })?;
+
+        for action in manifest.actions {
+            if action.r#type != "driver_patch" {
+                continue;
+            }
+            let Some(target) = action.target.as_ref() else {
+                continue;
+            };
+            if target.capability != provider.capability || target.slot != provider.slot_id {
+                continue;
+            }
+            let Some(patch) = action.patch.clone() else {
+                continue;
+            };
+
+            if !readiness_gates_added {
+                actions.push(ExecutorAction::TransportGate {
+                    provider_id: provider.provider_id,
+                    timeout_seconds: 30,
+                });
+                actions.push(ExecutorAction::BootstrapGate {
+                    provider_id: provider.provider_id,
+                    timeout_seconds: 30,
+                });
+                actions.push(ExecutorAction::HealthGate {
+                    provider_id: provider.provider_id,
+                    timeout_seconds: 30,
+                });
+                readiness_gates_added = true;
+            }
+            actions.push(ExecutorAction::ApplyDriverPatch {
+                connector_extension_id: extension.extension_id.clone(),
+                target_provider_id: provider.provider_id,
+                patch,
+            });
+            patched_connectors.push(extension.extension_id.clone());
+        }
+    }
+
+    if actions.is_empty() {
+        return run_extension_control_managed_repair(state).await;
+    }
+
+    state.orchestrator.apply_actions(actions).await?;
+    patched_connectors.sort();
+    patched_connectors.dedup();
+
+    Ok(format!(
+        "Reapplied {} managed connector patch(es): {}.",
+        patched_connectors.len(),
+        patched_connectors.join(", ")
+    ))
+}
+
 pub async fn reconcile_latest(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ReconcileRunResponse>> {
@@ -2215,95 +2494,6 @@ pub async fn reset_runtime(State(state): State<AppState>) -> ApiResult<Json<Runt
         recreated_networks: outcome.recreated_networks,
         run,
     }))
-}
-
-pub async fn auto_wire_status(
-    State(state): State<AppState>,
-) -> ApiResult<Json<AutoWireStatusResponse>> {
-    let store = ExtensionStore::new(&state.db_pool);
-    let enabled = store
-        .get_auto_wire_enabled()
-        .await
-        .map_err(ApiError::from)?;
-    let pending = store
-        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
-        .await
-        .map_err(ApiError::from)?;
-
-    let mut pending_plan_id = None;
-    let mut pending_reason = None;
-    let mut pending_conflicts = None;
-
-    if let Some(run) = pending {
-        if let Some(plan_json) = run.plan_json {
-            if let Ok(plan) = serde_json::from_value::<Plan>(plan_json) {
-                pending_plan_id = Some(plan.plan_id);
-                pending_conflicts = Some(plan.conflicts.len());
-                let has_missing = plan.conflicts.iter().any(|conflict| {
-                    conflict.get("code").and_then(|value| value.as_str())
-                        == Some("missing_required_secrets")
-                });
-                pending_reason = Some(if has_missing {
-                    "Missing required secrets".to_string()
-                } else if !plan.conflicts.is_empty() {
-                    "Conflicts require review".to_string()
-                } else {
-                    "Pending auto-wire actions".to_string()
-                });
-            } else {
-                pending_plan_id = Some(run.run_id);
-            }
-        } else {
-            pending_plan_id = Some(run.run_id);
-        }
-    }
-
-    Ok(Json(AutoWireStatusResponse {
-        enabled,
-        pending_plan_id,
-        pending_reason,
-        pending_conflicts,
-    }))
-}
-
-pub async fn update_auto_wire(
-    State(state): State<AppState>,
-    Json(payload): Json<AutoWireUpdateRequest>,
-) -> ApiResult<Json<AutoWireStatusResponse>> {
-    let store = ExtensionStore::new(&state.db_pool);
-    store
-        .set_auto_wire_enabled(payload.enabled)
-        .await
-        .map_err(ApiError::from)?;
-
-    if !payload.enabled {
-        let _ = store
-            .cancel_pending_runs_by_source("auto_wire", Some("auto-wire disabled"))
-            .await;
-    } else {
-        let config = ReconcileConfig::from_settings(&state.settings);
-        let orchestrator = state.orchestrator.clone();
-        tokio::spawn(async move {
-            let _ = orchestrator.reconcile_once(&config).await;
-        });
-    }
-
-    auto_wire_status(State(state)).await
-}
-
-pub async fn auto_wire_plan(State(state): State<AppState>) -> ApiResult<Json<Plan>> {
-    let store = ExtensionStore::new(&state.db_pool);
-    let run = store
-        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
-        .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("no pending auto-wire plan"))?;
-    let plan_json = run
-        .plan_json
-        .ok_or_else(|| ApiError::not_found("auto-wire plan missing"))?;
-    let plan: Plan = serde_json::from_value(plan_json)
-        .map_err(|err| ApiError::bad_request(format!("invalid plan payload: {err}")))?;
-    Ok(Json(plan))
 }
 
 pub async fn status_summary(
@@ -2380,6 +2570,12 @@ async fn build_downloader_profile_response(
     );
     let instances = store.list_instances(None).await?;
     let providers = store.list_provider_details().await?;
+    let readiness_by_provider: HashMap<Uuid, ProviderReadiness> = store
+        .list_provider_readiness()
+        .await?
+        .into_iter()
+        .map(|value| (value.provider_id, value))
+        .collect();
     let instance_map: HashMap<Uuid, ExtensionInstance> = instances
         .into_iter()
         .map(|instance| (instance.instance_id, instance))
@@ -2463,6 +2659,13 @@ async fn build_downloader_profile_response(
             capability: detail.provider.capability.clone(),
             implementation: detail.provider.implementation.clone(),
             health_state: detail.provider.health_state,
+            readiness_phase: readiness_by_provider
+                .get(&detail.provider.provider_id)
+                .map(|value| value.readiness_phase)
+                .unwrap_or(ProviderReadinessPhase::Unknown),
+            readiness_detail: readiness_by_provider
+                .get(&detail.provider.provider_id)
+                .and_then(|value| value.readiness_detail.clone()),
             last_healthcheck_at: detail.provider.last_healthcheck_at,
             applied_profile,
             sync_state: sync_state.to_string(),
@@ -2521,6 +2724,12 @@ async fn build_extension_status_summary(
     let extensions = store.list_extensions().await?;
     let instances = store.list_instances(None).await?;
     let providers = store.list_providers(None).await?;
+    let readiness_by_provider: HashMap<Uuid, ProviderReadiness> = store
+        .list_provider_readiness()
+        .await?
+        .into_iter()
+        .map(|value| (value.provider_id, value))
+        .collect();
     let bindings = store.list_bindings().await?;
     let desired_blueprints = store.list_desired_blueprints(None).await?;
 
@@ -2605,6 +2814,7 @@ async fn build_extension_status_summary(
                     manifest.as_ref(),
                     &instances,
                     &providers_by_instance,
+                    &readiness_by_provider,
                     &failed_bindings_by_consumer,
                     &runtime_snapshot,
                 )
@@ -2946,6 +3156,302 @@ fn normalize_connector_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn missing_required_connector_targets(
+    manifest: &ExtensionManifest,
+    available_targets: &HashSet<(String, String)>,
+) -> Vec<String> {
+    manifest
+        .requires
+        .iter()
+        .filter(|require| !require.optional)
+        .filter(|require| {
+            !available_targets.contains(&(require.capability.clone(), require.slot.clone()))
+        })
+        .map(|require| format!("{}/{}", require.capability, require.slot))
+        .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManagedProwlarrProxyCleanup {
+    target_ref: Option<crate::extensions::manifest::ManifestCapabilityRef>,
+    proxies: Vec<ManagedProwlarrProxyTarget>,
+}
+
+impl ManagedProwlarrProxyCleanup {
+    fn is_empty(&self) -> bool {
+        self.proxies.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManagedProwlarrProxyTarget {
+    name: String,
+    tags: Vec<String>,
+}
+
+fn managed_prowlarr_proxy_cleanup_from_manifest(
+    manifest: &ExtensionManifest,
+) -> ManagedProwlarrProxyCleanup {
+    let mut cleanup = ManagedProwlarrProxyCleanup::default();
+
+    for action in &manifest.actions {
+        if action.r#type != "driver_patch" {
+            continue;
+        }
+        let Some(target) = action.target.as_ref() else {
+            continue;
+        };
+        if target.capability != "indexer.registry" {
+            continue;
+        }
+        let Some(patch) = action.patch.as_ref() else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_value::<IndexerRegistryPatch>(patch.clone()) else {
+            continue;
+        };
+        if let IndexerRegistryPatch::RegisterIndexerProxies { proxies } = parsed {
+            cleanup.target_ref = Some(target.clone());
+            cleanup
+                .proxies
+                .extend(proxies.into_iter().map(|proxy| ManagedProwlarrProxyTarget {
+                    name: proxy.name,
+                    tags: proxy.tags,
+                }));
+        }
+    }
+
+    cleanup
+}
+
+async fn cleanup_extension_downstream_state(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension: &Extension,
+) -> anyhow::Result<()> {
+    if extension.kind != ExtensionKind::Connector {
+        return Ok(());
+    }
+
+    let Ok(manifest) = serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+    else {
+        tracing::warn!(
+            "failed to parse connector manifest during uninstall cleanup: {}",
+            extension.extension_id
+        );
+        return Ok(());
+    };
+    let cleanup = managed_prowlarr_proxy_cleanup_from_manifest(&manifest);
+    if cleanup.is_empty() {
+        return Ok(());
+    }
+
+    let Some(target_ref) = cleanup.target_ref.as_ref() else {
+        return Ok(());
+    };
+
+    let providers = store.list_providers(None).await?;
+    let mut provider_instances_by_target: HashMap<(String, String), Vec<Uuid>> = HashMap::new();
+    let mut providers_by_instance: HashMap<Uuid, Vec<Provider>> = HashMap::new();
+    for provider in providers {
+        provider_instances_by_target
+            .entry((provider.capability.clone(), provider.slot_id.clone()))
+            .or_default()
+            .push(provider.instance_id);
+        providers_by_instance
+            .entry(provider.instance_id)
+            .or_default()
+            .push(provider);
+    }
+
+    let Some(target_provider) = resolve_target_provider(
+        target_ref,
+        &provider_instances_by_target,
+        &providers_by_instance,
+    ) else {
+        return Ok(());
+    };
+    if target_provider.implementation.as_deref() != Some("prowlarr") {
+        return Ok(());
+    }
+
+    let Some(instance) = store.get_instance(target_provider.instance_id).await? else {
+        return Ok(());
+    };
+    let api_key =
+        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
+    let endpoint_json = target_provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+
+    let proxy_names = cleanup
+        .proxies
+        .iter()
+        .map(|proxy| proxy.name.clone())
+        .collect::<Vec<_>>();
+    delete_prowlarr_entities_by_name(&base_url, &api_key, "api/v1/indexerProxy", &proxy_names)
+        .await?;
+
+    let proxy_tags = cleanup
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.tags.iter().cloned())
+        .collect::<Vec<_>>();
+    delete_unused_prowlarr_tags(&base_url, &api_key, &proxy_tags).await?;
+
+    Ok(())
+}
+
+async fn delete_prowlarr_entities_by_name(
+    base_url: &str,
+    api_key: &str,
+    list_path: &str,
+    names: &[String],
+) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let value = request_control_json(base_url, api_key, &[list_path]).await?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{list_path} response was not an array"))?;
+    let expected_names = names
+        .iter()
+        .map(|name| normalize_connector_name(name))
+        .collect::<HashSet<_>>();
+
+    let mut delete_ids = Vec::new();
+    for item in items {
+        let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !expected_names.contains(&normalize_connector_name(name)) {
+            continue;
+        }
+        let Some(id) = prowlarr_entity_id(item) else {
+            continue;
+        };
+        delete_ids.push(id);
+    }
+
+    for id in delete_ids {
+        let path = format!("{list_path}/{id}");
+        request_control_write(
+            base_url,
+            api_key,
+            ReqwestMethod::DELETE,
+            &[path.as_str()],
+            None,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn delete_unused_prowlarr_tags(
+    base_url: &str,
+    api_key: &str,
+    labels: &[String],
+) -> anyhow::Result<()> {
+    if labels.is_empty() {
+        return Ok(());
+    }
+
+    let tags_value = request_control_json(base_url, api_key, &["api/v1/tag"]).await?;
+    let tags = tags_value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("api/v1/tag response was not an array"))?;
+    let expected_labels = labels
+        .iter()
+        .map(|label| normalize_connector_name(label))
+        .collect::<HashSet<_>>();
+    let mut candidate_tag_ids = Vec::new();
+    for tag in tags {
+        let Some(label) = tag.get("label").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !expected_labels.contains(&normalize_connector_name(label)) {
+            continue;
+        }
+        let Some(id) = prowlarr_entity_id(tag) else {
+            continue;
+        };
+        candidate_tag_ids.push(id);
+    }
+    if candidate_tag_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut used_tag_ids = HashSet::new();
+    for path in [
+        "api/v1/indexer",
+        "api/v1/indexerProxy",
+        "api/v1/applications",
+    ] {
+        let value = request_control_json(base_url, api_key, &[path]).await?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("{path} response was not an array"))?;
+        for item in items {
+            for tag_id in prowlarr_entity_tag_ids(item) {
+                used_tag_ids.insert(tag_id);
+            }
+        }
+    }
+
+    candidate_tag_ids.sort_unstable();
+    candidate_tag_ids.dedup();
+    for tag_id in candidate_tag_ids {
+        if used_tag_ids.contains(&tag_id) {
+            continue;
+        }
+        let path = format!("api/v1/tag/{tag_id}");
+        request_control_write(
+            base_url,
+            api_key,
+            ReqwestMethod::DELETE,
+            &[path.as_str()],
+            None,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn prowlarr_entity_id(value: &serde_json::Value) -> Option<i64> {
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|id| i64::try_from(id).ok())
+        })
+}
+
+fn prowlarr_entity_tag_ids(value: &serde_json::Value) -> Vec<i64> {
+    value
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    tag.as_i64()
+                        .or_else(|| tag.as_u64().and_then(|id| i64::try_from(id).ok()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Default)]
 struct ConnectorDownstreamVerification {
     present: Vec<String>,
@@ -2959,7 +3465,7 @@ async fn verify_connector_downstream_state(
     provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
     providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
 ) -> anyhow::Result<Option<ConnectorDownstreamVerification>> {
-    let mut expected_indexers: Vec<String> = Vec::new();
+    let mut expected_items: Vec<String> = Vec::new();
     let mut target_ref: Option<crate::extensions::manifest::ManifestCapabilityRef> = None;
 
     for action in &manifest.actions {
@@ -2978,13 +3484,20 @@ async fn verify_connector_downstream_state(
         let Ok(parsed) = serde_json::from_value::<IndexerRegistryPatch>(patch.clone()) else {
             continue;
         };
-        if let IndexerRegistryPatch::RegisterIndexers { indexers } = parsed {
-            expected_indexers.extend(indexers.into_iter().map(|indexer| indexer.name));
-            target_ref = Some(target.clone());
+        match parsed {
+            IndexerRegistryPatch::RegisterIndexers { indexers } => {
+                expected_items.extend(indexers.into_iter().map(|indexer| indexer.name));
+                target_ref = Some(target.clone());
+            }
+            IndexerRegistryPatch::RegisterIndexerProxies { proxies } => {
+                expected_items.extend(proxies.into_iter().map(|proxy| proxy.name));
+                target_ref = Some(target.clone());
+            }
+            _ => {}
         }
     }
 
-    if expected_indexers.is_empty() {
+    if expected_items.is_empty() {
         return Ok(None);
     }
 
@@ -3002,14 +3515,18 @@ async fn verify_connector_downstream_state(
         return Ok(None);
     }
 
-    let actual_names = list_prowlarr_indexer_names(state, store, target_provider).await?;
+    let actual_names = list_prowlarr_indexer_names(state, store, target_provider)
+        .await?
+        .into_iter()
+        .chain(list_prowlarr_indexer_proxy_names(state, store, target_provider).await?)
+        .collect::<Vec<_>>();
     let actual_normalized: HashSet<String> = actual_names
         .into_iter()
         .map(|value| normalize_connector_name(&value))
         .collect();
 
     let mut verification = ConnectorDownstreamVerification::default();
-    for expected in expected_indexers {
+    for expected in expected_items {
         if actual_normalized.contains(&normalize_connector_name(&expected)) {
             verification.present.push(expected);
         } else {
@@ -3069,6 +3586,34 @@ async fn list_prowlarr_indexer_names(
         .collect())
 }
 
+pub(crate) async fn list_prowlarr_indexer_proxy_names(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &Provider,
+) -> anyhow::Result<Vec<String>> {
+    let Some(instance) = store.get_instance(provider.instance_id).await? else {
+        anyhow::bail!("target provider instance is missing");
+    };
+    let api_key =
+        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
+    let endpoint_json = provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
+    let base_url =
+        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
+    let value = request_control_json(&base_url, &api_key, &["api/v1/indexerProxy"]).await?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("prowlarr indexer proxy response was not an array"))?;
+    Ok(items
+        .iter()
+        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect())
+}
+
 async fn summarize_connector_extension(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -3110,6 +3655,21 @@ async fn summarize_connector_extension(
     }
 
     if let Some(manifest) = manifest {
+        let missing_requires = missing_required_connector_targets(manifest, available_targets);
+        if !missing_requires.is_empty() {
+            return Ok(attention_extension_status(
+                extension,
+                "waiting_for_dependency",
+                "Needs setup",
+                &format!(
+                    "Required dependencies are missing: {}.",
+                    missing_requires.join(", ")
+                ),
+                "finish_setup",
+                "Finish setup",
+            ));
+        }
+
         let verification = match verify_connector_downstream_state(
             state,
             store,
@@ -3192,29 +3752,40 @@ async fn summarize_module_extension(
     manifest: Option<&ExtensionManifest>,
     instances: &[ExtensionInstance],
     providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
+    readiness_by_provider: &HashMap<Uuid, ProviderReadiness>,
     failed_bindings_by_consumer: &HashMap<Uuid, usize>,
     runtime_snapshot: &DockerRuntimeHealthSnapshot,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
     if !extension.enabled {
-        return Ok(disabled_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "disabled",
-            "Disabled",
-            "This extension is installed but turned off.",
-            "enable",
-            "Enable",
-        ));
+            disabled_extension_status(
+                extension,
+                "disabled",
+                "Disabled",
+                "This extension is installed but turned off.",
+                "enable",
+                "Enable",
+            ),
+        )
+        .await;
     }
 
     if instances.is_empty() {
-        return Ok(attention_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "missing_instance",
-            "Needs setup",
-            "Create an instance to start using this extension.",
-            "finish_setup",
-            "Finish setup",
-        ));
+            attention_extension_status(
+                extension,
+                "missing_instance",
+                "Needs setup",
+                "Create an instance to start using this extension.",
+                "finish_setup",
+                "Finish setup",
+            ),
+        )
+        .await;
     }
 
     let required_secret_keys = manifest
@@ -3226,6 +3797,8 @@ async fn summarize_module_extension(
     let mut missing_secret_count = 0usize;
     let mut unhealthy_provider_count = 0usize;
     let mut degraded_provider_count = 0usize;
+    let mut transport_ready_count = 0usize;
+    let mut bootstrap_ready_count = 0usize;
     let mut failed_binding_count = 0usize;
 
     for instance in instances {
@@ -3235,18 +3808,26 @@ async fn summarize_module_extension(
         enabled_instance_count += 1;
 
         if !required_secret_keys.is_empty() {
-            missing_secret_count += missing_required_secrets_for_instance(
+            let missing = missing_required_secrets_for_instance(
                 store,
                 instance.instance_id,
                 &required_secret_keys,
             )
-            .await?
-            .len();
+            .await?;
+            missing_secret_count +=
+                filter_auto_managed_runtime_missing(&extension.extension_id, missing).len();
         }
 
         if let Some(providers) = providers_by_instance.get(&instance.instance_id) {
             provider_count += providers.len();
             for provider in providers {
+                if let Some(readiness) = readiness_by_provider.get(&provider.provider_id) {
+                    match readiness.readiness_phase {
+                        ProviderReadinessPhase::TransportReady => transport_ready_count += 1,
+                        ProviderReadinessPhase::BootstrapReady => bootstrap_ready_count += 1,
+                        ProviderReadinessPhase::Unknown | ProviderReadinessPhase::DriverReady => {}
+                    }
+                }
                 match provider.health_state {
                     ProviderHealthState::Unhealthy => unhealthy_provider_count += 1,
                     ProviderHealthState::Degraded => degraded_provider_count += 1,
@@ -3266,28 +3847,38 @@ async fn summarize_module_extension(
         } else {
             "secrets are"
         };
-        return Ok(attention_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "missing_required_secrets",
-            "Needs setup",
-            &format!(
-                "Finish setup to add the {} required {noun} still missing.",
-                missing_secret_count
+            attention_extension_status(
+                extension,
+                "missing_required_secrets",
+                "Needs setup",
+                &format!(
+                    "Finish setup to add the {} required {noun} still missing.",
+                    missing_secret_count
+                ),
+                "finish_setup",
+                "Finish setup",
             ),
-            "finish_setup",
-            "Finish setup",
-        ));
+        )
+        .await;
     }
 
     if enabled_instance_count == 0 {
-        return Ok(disabled_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "instances_disabled",
-            "Disabled",
-            "All instances for this extension are turned off.",
-            "finish_setup",
-            "Open",
-        ));
+            disabled_extension_status(
+                extension,
+                "instances_disabled",
+                "Disabled",
+                "All instances for this extension are turned off.",
+                "finish_setup",
+                "Open",
+            ),
+        )
+        .await;
     }
 
     if runtime_snapshot.state != DockerRuntimeHealthState::Healthy
@@ -3296,23 +3887,53 @@ async fn summarize_module_extension(
             .map(|runtime| runtime.r#type.eq_ignore_ascii_case("container"))
             .unwrap_or(false)
     {
-        return Ok(runtime_status_stale_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            runtime_snapshot,
-            "open",
-            "Open",
-        ));
+            runtime_status_stale_extension_status(extension, runtime_snapshot, "open", "Open"),
+        )
+        .await;
     }
 
     if provider_count == 0 {
-        return Ok(attention_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "provider_not_ready",
-            "Needs setup",
-            "This extension is still finishing setup.",
-            "finish_setup",
-            "Finish setup",
-        ));
+            attention_extension_status(
+                extension,
+                "provider_not_ready",
+                "Needs setup",
+                "This extension is still finishing setup.",
+                "finish_setup",
+                "Finish setup",
+            ),
+        )
+        .await;
+    }
+
+    if unhealthy_provider_count == 0
+        && degraded_provider_count == 0
+        && (bootstrap_ready_count > 0 || transport_ready_count > 0)
+    {
+        let (code, title, description) = if bootstrap_ready_count > 0 {
+            (
+                "bootstrap_in_progress",
+                "Finishing setup",
+                "This extension is reachable and Elixir is still applying managed bootstrap.",
+            )
+        } else {
+            (
+                "runtime_starting",
+                "Starting up",
+                "This extension runtime is reachable and Elixir is waiting for the app to finish starting.",
+            )
+        };
+        return with_module_auto_update_summary(
+            store,
+            extension,
+            attention_extension_status(extension, code, title, description, "open", "Open"),
+        )
+        .await;
     }
 
     if unhealthy_provider_count > 0 || failed_binding_count > 0 {
@@ -3323,25 +3944,35 @@ async fn summarize_module_extension(
         } else {
             "This extension has a broken connection that needs repair."
         };
-        return Ok(attention_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "connection_issue",
-            "Connection issue",
-            description,
-            "fix",
-            "Fix",
-        ));
+            attention_extension_status(
+                extension,
+                "connection_issue",
+                "Connection issue",
+                description,
+                "fix",
+                "Fix",
+            ),
+        )
+        .await;
     }
 
     if degraded_provider_count > 0 {
-        return Ok(attention_extension_status(
+        return with_module_auto_update_summary(
+            store,
             extension,
-            "degraded_runtime",
-            "Needs attention",
-            "This extension is working, but it needs attention.",
-            "fix",
-            "Fix",
-        ));
+            attention_extension_status(
+                extension,
+                "degraded_runtime",
+                "Needs attention",
+                "This extension is working, but it needs attention.",
+                "fix",
+                "Fix",
+            ),
+        )
+        .await;
     }
 
     if extension
@@ -3357,24 +3988,34 @@ async fn summarize_module_extension(
             .await
             {
                 Ok(summary) if summary.configured_count == 0 => {
-                    return Ok(attention_extension_status(
+                    return with_module_auto_update_summary(
+                        store,
                         extension,
-                        "provider_setup_required",
-                        "Add provider",
-                        "Add at least one Usenet provider to start NZBGet downloads.",
-                        "open",
-                        "Add provider",
-                    ));
+                        attention_extension_status(
+                            extension,
+                            "provider_setup_required",
+                            "Add provider",
+                            "Add at least one Usenet provider to start NZBGet downloads.",
+                            "open",
+                            "Add provider",
+                        ),
+                    )
+                    .await;
                 }
                 Ok(summary) if summary.active_count == 0 => {
-                    return Ok(attention_extension_status(
+                    return with_module_auto_update_summary(
+                        store,
                         extension,
-                        "provider_setup_required",
-                        "Activate provider",
-                        "Enable or add at least one active Usenet provider before NZBGet can download.",
-                        "open",
-                        "Manage providers",
-                    ));
+                        attention_extension_status(
+                            extension,
+                            "provider_setup_required",
+                            "Activate provider",
+                            "Enable or add at least one active Usenet provider before NZBGet can download.",
+                            "open",
+                            "Manage providers",
+                        ),
+                    )
+                    .await;
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -3391,14 +4032,12 @@ async fn summarize_module_extension(
         enabled_instance_count,
         if enabled_instance_count == 1 { "" } else { "s" }
     );
-    Ok(ready_extension_status(
+    with_module_auto_update_summary(
+        store,
         extension,
-        "ready",
-        "Ready",
-        &description,
-        "open",
-        "Open",
-    ))
+        ready_extension_status(extension, "ready", "Ready", &description, "open", "Open"),
+    )
+    .await
 }
 
 fn extension_status_sort_order(severity: &str) -> usize {
@@ -3527,7 +4166,30 @@ fn extension_status_item(
         description: description.to_string(),
         primary_action: primary_action.to_string(),
         primary_action_label: primary_action_label.to_string(),
+        auto_update: None,
         optional_addons: Vec::new(),
+    }
+}
+
+async fn with_module_auto_update_summary(
+    store: &ExtensionStore<'_>,
+    extension: &Extension,
+    mut summary: ExtensionStatusSummaryItem,
+) -> anyhow::Result<ExtensionStatusSummaryItem> {
+    summary.auto_update = load_proxy_runtime_update_state(store, &extension.extension_id)
+        .await?
+        .map(extension_auto_update_summary);
+    Ok(summary)
+}
+
+fn extension_auto_update_summary(state: ProxyRuntimeUpdateState) -> ExtensionAutoUpdateSummary {
+    ExtensionAutoUpdateSummary {
+        severity: state.severity,
+        status_code: state.status_code,
+        label: state.label,
+        description: state.description,
+        checked_at: Some(state.checked_at),
+        release_version: state.release_version,
     }
 }
 
@@ -3730,7 +4392,7 @@ async fn build_extension_control_surface(
     if !context.summary.description.trim().is_empty() {
         details.push(context.summary.description.clone());
     }
-    if context.selected_instance.is_none() && !context.instances.is_empty() {
+    if context.selected_instance.is_none() && context.extension.kind != ExtensionKind::Blueprint {
         details
             .push("Create or enable a default instance to manage this extension here.".to_string());
     }
@@ -4322,6 +4984,7 @@ fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest 
                 requires: Vec::new(),
                 conflicts: Vec::new(),
                 runtime: None,
+                backup: None,
                 targets: Vec::new(),
                 actions: Vec::new(),
                 connectors: Vec::new(),
@@ -4329,6 +4992,7 @@ fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest 
                 wants: Vec::new(),
                 preferences: None,
                 bindings: Vec::new(),
+                execution: None,
                 policies: None,
                 networking: None,
                 control_surface: None,
@@ -6955,6 +7619,7 @@ mod extension_ui_proxy_tests {
                 requires: Vec::new(),
                 conflicts: Vec::new(),
                 runtime: None,
+                backup: None,
                 targets: Vec::new(),
                 actions: Vec::new(),
                 connectors: Vec::new(),
@@ -6962,6 +7627,7 @@ mod extension_ui_proxy_tests {
                 wants: Vec::new(),
                 preferences: None,
                 bindings: Vec::new(),
+                execution: None,
                 policies: None,
                 networking: None,
                 control_surface: None,
@@ -6994,6 +7660,7 @@ mod extension_ui_proxy_tests {
                     description: "Ready".to_string(),
                     primary_action: "open".to_string(),
                     primary_action_label: "Open".to_string(),
+                    auto_update: None,
                     optional_addons: Vec::new(),
                 },
                 instances: vec![ExtensionInstance {
@@ -7517,7 +8184,7 @@ async fn load_prowlarr_control_snapshot(
     })
 }
 
-async fn resolve_control_api_key(
+pub(crate) async fn resolve_control_api_key(
     state: &AppState,
     store: &ExtensionStore<'_>,
     instance: &ExtensionInstance,
@@ -7652,7 +8319,7 @@ async fn request_control_write(
     anyhow::bail!("service endpoint is not available")
 }
 
-async fn resolve_control_provider_transport_base_url(
+pub(crate) async fn resolve_control_provider_transport_base_url(
     instance_id: Uuid,
     endpoint: &ProviderEndpoint,
 ) -> anyhow::Result<String> {
@@ -7835,7 +8502,108 @@ pub async fn run_detail(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     let steps = store.list_steps(run_id).await.map_err(ApiError::from)?;
-    Ok(Json(RunDetailResponse { run, steps }))
+    let stage_summary = run
+        .plan_json
+        .as_ref()
+        .and_then(|plan_json| serde_json::from_value::<Plan>(plan_json.clone()).ok())
+        .map(|plan| summarize_run_stages(&run, &steps, &plan));
+    Ok(Json(RunDetailResponse {
+        run,
+        steps,
+        stage_summary,
+    }))
+}
+
+fn summarize_run_stages(
+    run: &OrchestratorRun,
+    steps: &[OperationStep],
+    plan: &Plan,
+) -> RunStageSummary {
+    let mut stages = Vec::new();
+    for stage in &plan.stages {
+        stages.push(stage_progress(stage, steps));
+    }
+
+    let current = stages
+        .iter()
+        .find(|stage| matches!(stage.status.as_str(), "failed" | "running" | "pending"))
+        .or_else(|| stages.iter().rev().find(|stage| stage.status == "completed"));
+
+    let blocked_stage = if matches!(
+        run.status,
+        OrchestratorRunStatus::Pending | OrchestratorRunStatus::Running
+    ) {
+        plan.blocked_stage.clone()
+    } else {
+        stages
+            .iter()
+            .find(|stage| stage.status == "failed")
+            .map(|stage| PlanBlockedStage {
+                stage_id: stage.stage_id.clone(),
+                code: run.status.as_str().to_string(),
+                detail: run.error.clone(),
+            })
+            .or_else(|| {
+                if run.status == OrchestratorRunStatus::Canceled {
+                    current.map(|stage| PlanBlockedStage {
+                        stage_id: stage.stage_id.clone(),
+                        code: "canceled".to_string(),
+                        detail: run.error.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+    };
+
+    RunStageSummary {
+        current_stage_id: current.map(|stage| stage.stage_id.clone()),
+        current_stage_status: current.map(|stage| stage.status.clone()),
+        blocked_stage,
+        stages,
+    }
+}
+
+fn stage_progress(stage: &PlanStage, steps: &[OperationStep]) -> RunStageProgress {
+    let stage_steps: Vec<&OperationStep> = steps
+        .iter()
+        .filter(|step| {
+            let index = step.step_index.max(0) as usize;
+            index >= stage.action_start_index && index < stage.action_end_index
+        })
+        .collect();
+    let step_count = stage.action_end_index.saturating_sub(stage.action_start_index);
+    let completed_step_count = stage_steps
+        .iter()
+        .filter(|step| step.status == OperationStepStatus::Completed)
+        .count();
+
+    let status = if stage_steps
+        .iter()
+        .any(|step| step.status == OperationStepStatus::Failed)
+    {
+        "failed"
+    } else if stage_steps
+        .iter()
+        .any(|step| step.status == OperationStepStatus::Running)
+    {
+        "running"
+    } else if step_count > 0 && completed_step_count == step_count {
+        "completed"
+    } else if !stage_steps.is_empty() {
+        "pending"
+    } else if step_count == 0 {
+        "empty"
+    } else {
+        "pending"
+    };
+
+    RunStageProgress {
+        stage_id: stage.stage_id.clone(),
+        status: status.to_string(),
+        step_count,
+        completed_step_count,
+    }
 }
 
 struct ExtensionStoragePaths {
@@ -7972,27 +8740,17 @@ fn blueprint_dependency_ids(manifest: &ExtensionManifest, blueprint_id: &str) ->
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    for connector in &manifest.connectors {
-        let trimmed = connector.trim();
+    let Some(execution) = manifest.execution.as_ref() else {
+        return out;
+    };
+
+    for extension_id in &execution.packages {
+        let trimmed = extension_id.trim();
         if trimmed.is_empty() || trimmed == blueprint_id {
             continue;
         }
         if seen.insert(trimmed.to_string()) {
             out.push(trimmed.to_string());
-        }
-    }
-
-    if let Some(preferences) = manifest.preferences.as_ref() {
-        for provider_preference in preferences.providers.values() {
-            for extension_id in &provider_preference.prefer {
-                let trimmed = extension_id.trim();
-                if trimmed.is_empty() || trimmed == blueprint_id {
-                    continue;
-                }
-                if seen.insert(trimmed.to_string()) {
-                    out.push(trimmed.to_string());
-                }
-            }
         }
     }
 
@@ -8038,13 +8796,20 @@ fn validate_semver_upgrade(
     existing: &Extension,
     new_version: &Version,
     package_hash: Option<&str>,
+    policy: InstallPolicy,
 ) -> anyhow::Result<()> {
     let existing_version = Version::parse(&existing.version)
         .map_err(|_| anyhow::anyhow!("existing extension version is not valid semver"))?;
     if new_version < &existing_version {
+        if policy.allow_downgrade {
+            return Ok(());
+        }
         anyhow::bail!("extension version downgrade is not allowed");
     }
     if new_version == &existing_version {
+        if policy.allow_same_version_replace {
+            return Ok(());
+        }
         if let (Some(existing_hash), Some(new_hash)) =
             (existing.package_hash.as_deref(), package_hash)
         {
@@ -8179,4 +8944,134 @@ async fn fetch_registry_entry(
     entries
         .into_iter()
         .find(|entry| entry.id == manifest.id && entry.version == manifest.version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        managed_prowlarr_proxy_cleanup_from_manifest, missing_required_connector_targets,
+        prowlarr_entity_id, prowlarr_entity_tag_ids,
+    };
+    use crate::extensions::manifest::ExtensionManifest;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn proxy_cleanup_manifest_extracts_names_and_tags() {
+        let manifest: ExtensionManifest = serde_json::from_value(json!({
+            "id": "elixir.connectors.prowlarr_byparr_proxy",
+            "version": "1.0.0",
+            "kind": "connector",
+            "name": "Prowlarr Byparr Proxy",
+            "targets": [
+                {
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }
+            ],
+            "actions": [
+                {
+                    "type": "driver_patch",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "patch": {
+                        "op": "register_indexer_proxies",
+                        "proxies": [
+                            {
+                                "name": "Byparr",
+                                "implementation": "FlareSolverr",
+                                "tags": ["byparr"],
+                                "settings": {
+                                    "host": "http://elx-byparr:8191/",
+                                    "requestTimeout": 180
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .expect("manifest");
+
+        let cleanup = managed_prowlarr_proxy_cleanup_from_manifest(&manifest);
+        assert_eq!(cleanup.proxies.len(), 1);
+        assert_eq!(cleanup.proxies[0].name, "Byparr");
+        assert_eq!(cleanup.proxies[0].tags, vec!["byparr".to_string()]);
+        assert_eq!(
+            cleanup
+                .target_ref
+                .as_ref()
+                .map(|target| target.capability.as_str()),
+            Some("indexer.registry")
+        );
+    }
+
+    #[test]
+    fn prowlarr_entity_helpers_handle_numeric_ids() {
+        let signed = json!({
+            "id": 7,
+            "tags": [2, 7]
+        });
+        let unsigned = json!({
+            "id": 9u64,
+            "tags": [2u64, 9u64]
+        });
+
+        assert_eq!(prowlarr_entity_id(&signed), Some(7));
+        assert_eq!(prowlarr_entity_id(&unsigned), Some(9));
+        assert_eq!(prowlarr_entity_tag_ids(&signed), vec![2, 7]);
+        assert_eq!(prowlarr_entity_tag_ids(&unsigned), vec![2, 9]);
+    }
+
+    #[test]
+    fn connector_requirement_helper_reports_missing_non_optional_targets() {
+        let manifest: ExtensionManifest = serde_json::from_value(json!({
+            "id": "elixir.connectors.prowlarr_flaresolverr_proxy",
+            "version": "1.1.0",
+            "kind": "connector",
+            "name": "Prowlarr FlareSolverr Proxy",
+            "requires": [
+                { "capability": "indexer.proxy", "slot": "flaresolverr" },
+                { "capability": "indexer.proxy", "slot": "optional", "optional": true }
+            ],
+            "targets": [
+                {
+                    "capability": "indexer.registry",
+                    "slot": "default"
+                }
+            ],
+            "actions": [
+                {
+                    "type": "driver_patch",
+                    "target": {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    },
+                    "patch": {
+                        "op": "register_indexer_proxies",
+                        "proxies": [
+                            {
+                                "name": "FlareSolverr",
+                                "implementation": "FlareSolverr",
+                                "tags": ["flaresolverr"],
+                                "settings": {
+                                    "host": "http://elx-flaresolverr:8191/",
+                                    "requestTimeout": 180
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .expect("manifest");
+
+        let available = HashSet::from([("indexer.registry".to_string(), "default".to_string())]);
+        assert_eq!(
+            missing_required_connector_targets(&manifest, &available),
+            vec!["indexer.proxy/flaresolverr".to_string()]
+        );
+    }
 }

@@ -58,6 +58,7 @@ impl CapabilityDriver for DownloaderTorrentDriver {
             endpoint_url,
             transport_override,
             ctx.instance_id,
+            false,
         )
         .await?;
         let transfer_info = client.transfer_info().await?;
@@ -112,6 +113,7 @@ impl CapabilityDriver for DownloaderTorrentDriver {
             endpoint_url,
             transport_override,
             ctx.instance_id,
+            false,
         )
         .await?;
 
@@ -214,6 +216,7 @@ impl CapabilityDriver for DownloaderTorrentDriver {
             endpoint_url,
             transport_override,
             ctx.instance_id,
+            false,
         )
         .await
         {
@@ -367,6 +370,7 @@ pub(crate) async fn bootstrap_qbittorrent_session_cookie(
         endpoint_url.to_string(),
         transport_url.map(str::to_string),
         instance_id,
+        true,
     )
     .await?;
     Ok(client.cookie)
@@ -378,6 +382,7 @@ impl QbittorrentClient {
         endpoint_url: String,
         transport_url: Option<String>,
         instance_id: Uuid,
+        allow_bootstrap_auth: bool,
     ) -> Result<Self> {
         let username = config
             .username
@@ -412,9 +417,15 @@ impl QbittorrentClient {
         } else {
             client.set_api_version("v2")?;
         }
-        client
-            .login_with_bootstrap(instance_id, &username, &password)
-            .await?;
+        if allow_bootstrap_auth {
+            client
+                .login_with_bootstrap(instance_id, &username, &password)
+                .await?;
+        } else {
+            client
+                .login_observe(instance_id, &username, &password)
+                .await?;
+        }
         Ok(client)
     }
 
@@ -422,6 +433,19 @@ impl QbittorrentClient {
         let version = normalize_version(version)?;
         self.api_base = build_api_base(&self.transport_root, version)?;
         Ok(())
+    }
+
+    async fn login_observe(
+        &mut self,
+        instance_id: Uuid,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        self.refresh_transport_port(instance_id).await?;
+        if self.try_login(username, password).await? {
+            return Ok(());
+        }
+        bail!("qbittorrent auth rejected for configured credentials");
     }
 
     async fn login_with_bootstrap(

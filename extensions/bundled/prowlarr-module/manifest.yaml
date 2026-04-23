@@ -1,0 +1,40 @@
+id: elixir.modules.prowlarr
+version: 1.0.3
+kind: module
+name: "Prowlarr"
+description: "Indexer registry module backed by Prowlarr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: indexer.registry
+    slot: default
+    cardinality: one
+    implementation: prowlarr
+requires: []
+conflicts:
+  - capability: indexer.registry
+    slot: default
+    policy: prompt_replace
+runtime:
+  type: container
+  image: "lscr.io/linuxserver/prowlarr:2.3.5"
+  network: "elixir_net"
+  service_name: "elx-prowlarr"
+  ports:
+    - container: 9696
+      host: 0
+backup:
+  retention: 5
+  items:
+    - id: config
+      label: "Prowlarr configuration"
+      container_path: /config
+networking:
+  service_port:
+    scheme: http
+    container_port: 9696

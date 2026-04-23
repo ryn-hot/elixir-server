@@ -26,11 +26,6 @@ impl PlanExecutor {
         Self { state }
     }
 
-    pub async fn execute(&self, actions: Vec<ExecutorAction>) -> Result<()> {
-        // Placeholder loop for plan execution; run/step tracking will wrap this later.
-        self.state.orchestrator.apply_actions(actions).await
-    }
-
     pub async fn execute_steps(&self, steps: Vec<PlannedStep>) -> Result<()> {
         let store = ExtensionStore::new(&self.state.db_pool);
         let owner_id = Uuid::new_v4().to_string();

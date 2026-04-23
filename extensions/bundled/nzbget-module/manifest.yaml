@@ -1,10 +1,11 @@
 id: elixir.modules.nzbget
-version: 1.0.0
+version: 1.0.1
 kind: module
 name: "NZBGet"
 description: "Usenet downloader module backed by NZBGet."
 publisher:
   name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
 trust: community
 permissions:
   - runtime.manage_containers
@@ -28,7 +29,6 @@ runtime:
     - container: 6789
       host: 0
   volumes:
-    - "{data}/nzbget:/config"
     - "{downloads}:/downloads"
   env:
     - name: "NZBGET_USER"

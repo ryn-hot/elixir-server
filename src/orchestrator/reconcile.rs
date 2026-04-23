@@ -9,18 +9,20 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::{DownloaderPerformanceProfile, Settings};
-use crate::db::models::{BindingStatus, ExtensionKind, ProviderHealthState};
+use crate::db::models::{
+    BindingStatus, ExtensionKind, ProviderHealthState, ProviderReadinessPhase,
+};
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
 use crate::metrics;
-use crate::orchestrator::executor::{Executor, ExecutorAction};
+use crate::orchestrator::executor::{Executor, ExecutorAction, deferred_dependency_message};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
-use crate::orchestrator::planner::{Plan, PlanDecisions, Planner};
+use crate::orchestrator::planner::{Plan, PlanAction, PlanStage, Planner};
 use crate::runtime::docker::classify_docker_runtime_failure;
 use crate::runtime::docker::describe_docker_runtime_failure;
 use crate::runtime::health::DockerRuntimeSupervisor;
@@ -301,8 +303,10 @@ impl<'a> Reconciler<'a> {
 
     async fn run_once_inner(&self, run_id: Uuid) -> Result<()> {
         let mut step_index = 0;
-        self.reconcile_desired_state(run_id, &mut step_index)
-            .await?;
+        if self.mode.is_explicit_repair() {
+            self.reconcile_explicit_repairs(run_id, &mut step_index)
+                .await?;
+        }
         let providers = self.store.list_provider_details().await?;
         let instances = self.store.list_instances(None).await?;
         let extensions = self.store.list_extensions().await?;
@@ -330,7 +334,7 @@ impl<'a> Reconciler<'a> {
         .await?;
         if let Some((until, reason)) = self.runtime_health.should_defer_dependency_actions() {
             warn!(
-                "reconcile: deferring auto-wire and binding work until {} while runtime recovers: {}",
+                "reconcile: deferring dependency and binding work until {} while runtime recovers: {}",
                 until.to_rfc3339(),
                 reason
             );
@@ -339,14 +343,13 @@ impl<'a> Reconciler<'a> {
                 .inc();
             return Ok(());
         }
-        self.reconcile_auto_wire().await?;
         self.reconcile_bindings(run_id, &mut step_index, &bindings, &instance_map)
             .await?;
 
         Ok(())
     }
 
-    async fn reconcile_desired_state(&self, _run_id: Uuid, _step_index: &mut i32) -> Result<()> {
+    async fn reconcile_explicit_repairs(&self, run_id: Uuid, step_index: &mut i32) -> Result<()> {
         let desired = self.store.list_desired_blueprints(Some(true)).await?;
         if desired.is_empty() {
             return Ok(());
@@ -366,16 +369,11 @@ impl<'a> Reconciler<'a> {
         .with_default_downloader_profile(self.default_downloader_profile);
 
         for item in desired {
-            let desired_run_source = desired_blueprint_run_source(item.desired_id);
-            let decisions = self
-                .decisions_for_desired(item.desired_id, item.decisions_json.clone())
-                .await?;
-            let mut plan = match planner
-                .plan_blueprint_with_decisions(
+            let plan = match planner
+                .plan_blueprint(
                     &self.store,
                     item.blueprint_extension_id.clone(),
                     item.params_json.clone(),
-                    decisions.as_ref(),
                 )
                 .await
             {
@@ -391,14 +389,6 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             };
-
-            let pending_run = self
-                .store
-                .get_latest_run_by_source(
-                    &desired_run_source,
-                    Some(crate::db::models::OrchestratorRunStatus::Pending),
-                )
-                .await?;
 
             let missing = match missing_required_secrets_for_plan(&self.store, &plan.actions).await
             {
@@ -437,108 +427,15 @@ impl<'a> Reconciler<'a> {
                 continue;
             }
 
-            if plan.actions.is_empty() && plan.conflicts.is_empty() {
-                let _ = self
-                    .store
-                    .cancel_pending_runs_by_source(
-                        &desired_run_source,
-                        Some("no desired blueprint actions"),
-                    )
-                    .await;
+            let repair_plan = bounded_repair_subgraph(plan);
+            if repair_plan.actions.is_empty() {
                 metrics::RECONCILE_ACTIONS
-                    .with_label_values(&["plan_actions", "empty"])
+                    .with_label_values(&["repair_subgraph", "empty"])
                     .inc();
                 continue;
             }
 
-            if pending_run.is_none()
-                && missing.is_empty()
-                && !has_unresolved_conflicts(&plan.conflicts)
-                && !self.mode.is_explicit_repair()
-            {
-                if let Some(previous) = self
-                    .store
-                    .get_latest_run_by_source(
-                        &desired_run_source,
-                        Some(crate::db::models::OrchestratorRunStatus::Completed),
-                    )
-                    .await?
-                {
-                    if let Some(previous_plan_json) = previous.plan_json {
-                        if stored_plan_equivalent(&previous_plan_json, &plan) {
-                            metrics::RECONCILE_ACTIONS
-                                .with_label_values(&["plan_blueprint", "unchanged"])
-                                .inc();
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            let unresolved = has_unresolved_conflicts(&plan.conflicts);
-            if !missing.is_empty() || unresolved {
-                let desired_run_id = pending_run
-                    .as_ref()
-                    .map(|run| run.run_id)
-                    .unwrap_or(plan.plan_id);
-                plan.plan_id = desired_run_id;
-                let plan_json =
-                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
-                if let Some(run) = pending_run {
-                    self.store.update_run_plan(run.run_id, plan_json).await?;
-                } else {
-                    self.store
-                        .create_run(&crate::extensions::store::NewOrchestratorRun {
-                            run_id: desired_run_id,
-                            source: desired_run_source.clone(),
-                            status: crate::db::models::OrchestratorRunStatus::Pending,
-                            phase: Some("desired_blueprint".to_string()),
-                            plan_json: Some(plan_json),
-                            error: None,
-                        })
-                        .await?;
-                }
-                metrics::RECONCILE_ACTIONS
-                    .with_label_values(&["plan_blueprint", "blocked"])
-                    .inc();
-                continue;
-            }
-
-            let desired_run_id = if let Some(run) = pending_run {
-                plan.plan_id = run.run_id;
-                let plan_json =
-                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
-                self.store.update_run_plan(run.run_id, plan_json).await?;
-                self.store
-                    .update_run_status(
-                        run.run_id,
-                        crate::db::models::OrchestratorRunStatus::Running,
-                        Some("desired_blueprint"),
-                        None,
-                    )
-                    .await?;
-                run.run_id
-            } else {
-                let desired_run_id = plan.plan_id;
-                let plan_json =
-                    serde_json::to_value(&plan).context("serializing desired blueprint plan")?;
-                self.store
-                    .create_run(&crate::extensions::store::NewOrchestratorRun {
-                        run_id: desired_run_id,
-                        source: desired_run_source.clone(),
-                        status: crate::db::models::OrchestratorRunStatus::Running,
-                        phase: Some("desired_blueprint".to_string()),
-                        plan_json: Some(plan_json),
-                        error: None,
-                    })
-                    .await?;
-                desired_run_id
-            };
-
-            let mut failed = false;
-            let mut error_message = None;
-            let mut desired_step_index = 0;
-            for action in plan.actions {
+            for action in repair_plan.actions {
                 let action_json = match serde_json::to_value(&action) {
                     Ok(value) => value,
                     Err(err) => {
@@ -546,8 +443,9 @@ impl<'a> Reconciler<'a> {
                             "reconcile: failed to serialize plan action for {}: {}",
                             item.blueprint_extension_id, err
                         );
-                        error_message = Some(format!("failed to serialize plan action: {err}"));
-                        failed = true;
+                        metrics::RECONCILE_ACTIONS
+                            .with_label_values(&["serialize_repair_action", "error"])
+                            .inc();
                         break;
                     }
                 };
@@ -558,294 +456,51 @@ impl<'a> Reconciler<'a> {
                             "reconcile: invalid plan action for {}: {}",
                             item.blueprint_extension_id, err
                         );
-                        error_message = Some(format!("invalid plan action: {err}"));
-                        failed = true;
+                        metrics::RECONCILE_ACTIONS
+                            .with_label_values(&["invalid_repair_action", "error"])
+                            .inc();
                         break;
                     }
                 };
                 let action_type = action.action_type().to_string();
                 let result = self
                     .run_step(
-                        desired_run_id,
-                        &mut desired_step_index,
+                        run_id,
+                        step_index,
                         &action_type,
                         action_json,
                         || executor.apply(executor_action),
                     )
                     .await;
                 if let Err(err) = result {
+                    if action_type == "apply_driver_patch" {
+                        if let Some(message) = deferred_dependency_message(&err) {
+                            warn!(
+                                "reconcile: deferring repair action {} for {}: {}",
+                                action_type, item.blueprint_extension_id, message
+                            );
+                            metrics::RECONCILE_ACTIONS
+                                .with_label_values(&[action_type.as_str(), "deferred"])
+                                .inc();
+                            break;
+                        }
+                    }
                     warn!(
-                        "reconcile: plan action {} failed for {}: {}",
+                        "reconcile: repair action {} failed for {}: {}",
                         action_type, item.blueprint_extension_id, err
                     );
                     metrics::RECONCILE_ACTIONS
                         .with_label_values(&[action_type.as_str(), "error"])
                         .inc();
-                    error_message = Some(err.to_string());
-                    failed = true;
                     break;
                 }
                 metrics::RECONCILE_ACTIONS
                     .with_label_values(&[action_type.as_str(), "ok"])
                     .inc();
             }
-
-            if failed {
-                let error =
-                    error_message.unwrap_or_else(|| "desired blueprint apply failed".to_string());
-                self.store
-                    .update_run_status(
-                        desired_run_id,
-                        crate::db::models::OrchestratorRunStatus::Failed,
-                        Some("desired_blueprint"),
-                        Some(&error),
-                    )
-                    .await?;
-                continue;
-            }
-
-            self.store
-                .update_run_status(
-                    desired_run_id,
-                    crate::db::models::OrchestratorRunStatus::Completed,
-                    Some("desired_blueprint"),
-                    None,
-                )
-                .await?;
         }
 
         Ok(())
-    }
-
-    async fn reconcile_auto_wire(&self) -> Result<()> {
-        if !self.store.get_auto_wire_enabled().await? {
-            return Ok(());
-        }
-
-        let planner = Planner::new();
-        let mut plan = match planner.plan_auto_wire(&self.store).await {
-            Ok(plan) => plan,
-            Err(err) => {
-                warn!("reconcile: auto-wire planning failed: {err}");
-                metrics::RECONCILE_ACTIONS
-                    .with_label_values(&["auto_wire_plan", "error"])
-                    .inc();
-                return Ok(());
-            }
-        };
-
-        if plan.actions.is_empty() && plan.conflicts.is_empty() {
-            let _ = self
-                .store
-                .cancel_pending_runs_by_source("auto_wire", Some("no auto-wire actions"))
-                .await;
-            metrics::RECONCILE_ACTIONS
-                .with_label_values(&["auto_wire_plan", "empty"])
-                .inc();
-            return Ok(());
-        }
-
-        let missing = match missing_required_secrets_for_plan(&self.store, &plan.actions).await {
-            Ok(missing) => missing,
-            Err(err) => {
-                warn!("reconcile: auto-wire required secrets lookup failed: {err}");
-                metrics::RECONCILE_ACTIONS
-                    .with_label_values(&["auto_wire_required_secrets", "error"])
-                    .inc();
-                return Ok(());
-            }
-        };
-        let unresolved = has_unresolved_conflicts(&plan.conflicts);
-
-        let pending_run = self
-            .store
-            .get_latest_run_by_source(
-                "auto_wire",
-                Some(crate::db::models::OrchestratorRunStatus::Pending),
-            )
-            .await?;
-
-        if pending_run.is_none()
-            && missing.is_empty()
-            && !unresolved
-            && !self.mode.is_explicit_repair()
-        {
-            if let Some(previous) = self
-                .store
-                .get_latest_run_by_source(
-                    "auto_wire",
-                    Some(crate::db::models::OrchestratorRunStatus::Completed),
-                )
-                .await?
-            {
-                if let Some(previous_plan_json) = previous.plan_json {
-                    if stored_plan_equivalent(&previous_plan_json, &plan) {
-                        metrics::RECONCILE_ACTIONS
-                            .with_label_values(&["auto_wire_plan", "unchanged"])
-                            .inc();
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        if !missing.is_empty() || unresolved {
-            let run_id = pending_run
-                .as_ref()
-                .map(|run| run.run_id)
-                .unwrap_or(plan.plan_id);
-            plan.plan_id = run_id;
-            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
-            if let Some(run) = pending_run {
-                self.store.update_run_plan(run.run_id, plan_json).await?;
-            } else {
-                self.store
-                    .create_run(&crate::extensions::store::NewOrchestratorRun {
-                        run_id,
-                        source: "auto_wire".to_string(),
-                        status: crate::db::models::OrchestratorRunStatus::Pending,
-                        phase: Some("auto_wire".to_string()),
-                        plan_json: Some(plan_json),
-                        error: None,
-                    })
-                    .await?;
-            }
-            metrics::RECONCILE_ACTIONS
-                .with_label_values(&["auto_wire_plan", "blocked"])
-                .inc();
-            return Ok(());
-        }
-
-        let run_id = if let Some(run) = pending_run {
-            plan.plan_id = run.run_id;
-            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
-            self.store.update_run_plan(run.run_id, plan_json).await?;
-            self.store
-                .update_run_status(
-                    run.run_id,
-                    crate::db::models::OrchestratorRunStatus::Running,
-                    Some("auto_wire"),
-                    None,
-                )
-                .await?;
-            run.run_id
-        } else {
-            let run_id = plan.plan_id;
-            let plan_json = serde_json::to_value(&plan).context("serializing auto-wire plan")?;
-            self.store
-                .create_run(&crate::extensions::store::NewOrchestratorRun {
-                    run_id,
-                    source: "auto_wire".to_string(),
-                    status: crate::db::models::OrchestratorRunStatus::Running,
-                    phase: Some("auto_wire".to_string()),
-                    plan_json: Some(plan_json),
-                    error: None,
-                })
-                .await?;
-            run_id
-        };
-
-        let executor = Executor::new(
-            self.pool,
-            self.probe,
-            self.drivers,
-            self.runtime,
-            self.runtime_paths.clone(),
-            self.secrets,
-        )
-        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
-        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
-        .with_default_downloader_profile(self.default_downloader_profile);
-        let mut step_index = 0;
-        let mut failed = false;
-        for action in plan.actions {
-            let action_json = match serde_json::to_value(&action) {
-                Ok(value) => value,
-                Err(err) => {
-                    warn!("reconcile: auto-wire action serialization failed: {err}");
-                    failed = true;
-                    break;
-                }
-            };
-            let executor_action = match action.clone().try_into() {
-                Ok(action) => action,
-                Err(err) => {
-                    warn!("reconcile: auto-wire invalid action: {err}");
-                    failed = true;
-                    break;
-                }
-            };
-            let action_type = action.action_type().to_string();
-            let result = self
-                .run_step(run_id, &mut step_index, &action_type, action_json, || {
-                    executor.apply(executor_action)
-                })
-                .await;
-            if let Err(err) = result {
-                warn!("reconcile: auto-wire action {action_type} failed: {err}");
-                metrics::RECONCILE_ACTIONS
-                    .with_label_values(&[action_type.as_str(), "error"])
-                    .inc();
-                failed = true;
-                break;
-            }
-            metrics::RECONCILE_ACTIONS
-                .with_label_values(&[action_type.as_str(), "ok"])
-                .inc();
-        }
-
-        if failed {
-            let _ = self
-                .store
-                .update_run_status(
-                    run_id,
-                    crate::db::models::OrchestratorRunStatus::Failed,
-                    Some("auto_wire"),
-                    Some("auto-wire apply failed"),
-                )
-                .await;
-        } else {
-            self.store
-                .update_run_status(
-                    run_id,
-                    crate::db::models::OrchestratorRunStatus::Completed,
-                    Some("auto_wire"),
-                    None,
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn decisions_for_desired(
-        &self,
-        desired_id: Uuid,
-        decisions_json: Option<serde_json::Value>,
-    ) -> Result<Option<PlanDecisions>> {
-        if let Some(decisions_json) = decisions_json {
-            match serde_json::from_value(decisions_json) {
-                Ok(decisions) => return Ok(Some(decisions)),
-                Err(err) => {
-                    warn!(
-                        "reconcile: failed to parse stored decisions for {}: {}",
-                        desired_id, err
-                    );
-                }
-            }
-        }
-        let run = self.store.get_run(desired_id).await?;
-        let Some(run) = run else {
-            return Ok(None);
-        };
-        let Some(plan_json) = run.plan_json else {
-            return Ok(None);
-        };
-        let plan: Plan = match serde_json::from_value(plan_json) {
-            Ok(plan) => plan,
-            Err(_) => return Ok(None),
-        };
-        Ok(PlanDecisions::from_conflicts(&plan.conflicts))
     }
 
     async fn reconcile_providers(
@@ -910,6 +565,14 @@ impl<'a> Reconciler<'a> {
                             ProviderHealthState::Unhealthy,
                         )
                         .await;
+                    let _ = self
+                        .store
+                        .upsert_provider_readiness(
+                            provider.provider_id,
+                            ProviderReadinessPhase::Unknown,
+                            Some("provider instance is missing"),
+                        )
+                        .await;
                     continue;
                 }
             };
@@ -929,6 +592,14 @@ impl<'a> Reconciler<'a> {
                             ProviderHealthState::Unhealthy,
                         )
                         .await;
+                    let _ = self
+                        .store
+                        .upsert_provider_readiness(
+                            provider.provider_id,
+                            ProviderReadinessPhase::Unknown,
+                            Some("provider extension is missing"),
+                        )
+                        .await;
                     continue;
                 }
             };
@@ -937,6 +608,14 @@ impl<'a> Reconciler<'a> {
                 let _ = self
                     .store
                     .update_provider_health(provider.provider_id, ProviderHealthState::Unhealthy)
+                    .await;
+                let _ = self
+                    .store
+                    .upsert_provider_readiness(
+                        provider.provider_id,
+                        ProviderReadinessPhase::Unknown,
+                        Some("provider endpoint is missing"),
+                    )
                     .await;
                 continue;
             }
@@ -1044,6 +723,15 @@ impl<'a> Reconciler<'a> {
                 let _ = self
                     .store
                     .update_provider_health(provider.provider_id, ProviderHealthState::Unhealthy)
+                    .await;
+                let detail = err.to_string();
+                let _ = self
+                    .store
+                    .upsert_provider_readiness(
+                        provider.provider_id,
+                        ProviderReadinessPhase::Unknown,
+                        Some(detail.as_str()),
+                    )
                     .await;
                 metrics::RECONCILE_ACTIONS
                     .with_label_values(&["mark_unhealthy", "ok"])
@@ -1415,25 +1103,53 @@ fn parse_endpoint(value: &Option<serde_json::Value>) -> Result<ProviderEndpoint>
     Ok(endpoint)
 }
 
-fn desired_blueprint_run_source(desired_id: Uuid) -> String {
-    format!("desired_blueprint:{desired_id}")
+fn bounded_repair_subgraph(plan: Plan) -> Plan {
+    let mut retained_actions = Vec::new();
+    let mut retained_stages = Vec::new();
+
+    for stage in &plan.stages {
+        let stage_start = retained_actions.len();
+        for action in plan.actions[stage.action_start_index..stage.action_end_index]
+            .iter()
+            .cloned()
+        {
+            if repair_action_allowed(&action) {
+                retained_actions.push(action);
+            }
+        }
+        let stage_end = retained_actions.len();
+        if stage_end > stage_start {
+            retained_stages.push(PlanStage {
+                stage_id: stage.stage_id.clone(),
+                barrier: stage.barrier,
+                action_start_index: stage_start,
+                action_end_index: stage_end,
+            });
+        }
+    }
+
+    Plan {
+        plan_id: plan.plan_id,
+        blueprint_id: plan.blueprint_id,
+        params: plan.params,
+        stages: retained_stages,
+        actions: retained_actions,
+        conflicts: Vec::new(),
+        blocked_stage: None,
+    }
 }
 
-fn stored_plan_equivalent(previous_plan_json: &serde_json::Value, current_plan: &Plan) -> bool {
-    let previous_plan = match serde_json::from_value::<Plan>(previous_plan_json.clone()) {
-        Ok(plan) => plan,
-        Err(_) => return false,
-    };
-
-    let previous_signature = serde_json::json!({
-        "actions": previous_plan.actions,
-        "conflicts": previous_plan.conflicts,
-    });
-    let current_signature = serde_json::json!({
-        "actions": &current_plan.actions,
-        "conflicts": &current_plan.conflicts,
-    });
-    previous_signature == current_signature
+fn repair_action_allowed(action: &PlanAction) -> bool {
+    matches!(
+        action,
+        PlanAction::EnsureRuntimeRunning { .. }
+            | PlanAction::CreateOrUpdateProvider { .. }
+            | PlanAction::TransportGate { .. }
+            | PlanAction::BootstrapGate { .. }
+            | PlanAction::HealthGate { .. }
+            | PlanAction::ApplyDriverPatch { .. }
+            | PlanAction::ApplyBinding { .. }
+    )
 }
 
 #[cfg(test)]
@@ -1443,23 +1159,23 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tempfile::TempDir;
 
     use crate::config::DatabaseConfig;
     use crate::db::Database;
     use crate::db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
-        ProviderHealthState, SecretScope, SlotCardinality,
+        ProviderHealthState, SlotCardinality,
     };
     use crate::drivers::{
         ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, DriverRegistry, StateSnapshot,
     };
     use crate::extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
-        NewProvider, NewSecret,
+        NewProvider,
     };
-    use crate::orchestrator::planner::{Plan, PlanAction, Planner};
+    use crate::orchestrator::planner::{Plan, PlanAction};
     use crate::runtime::RuntimePaths;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
     use crate::secrets::SecretsManager;
@@ -1772,149 +1488,6 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
-    }
-
-    struct AutoWireFixture {
-        instance_id: Uuid,
-        provider_id: Uuid,
-        secret_key: String,
-        connector_id: String,
-    }
-
-    async fn seed_auto_wire_indexer(store: &ExtensionStore<'_>) -> Result<AutoWireFixture> {
-        let module_id = "ext.indexer.registry";
-        let connector_id = "ext.indexer.connector";
-        let indexer_name = "Test Indexer";
-        let secret_key = "indexer.test-indexer.api_key".to_string();
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: module_id.to_string(),
-                name: "Indexer Registry".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Module,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Verified,
-                manifest_json: json!({
-                    "id": module_id,
-                    "version": "1.0.0",
-                    "kind": "module",
-                    "name": "Indexer Registry",
-                    "provides": [
-                        {
-                            "capability": "indexer.registry",
-                            "slot": "default",
-                            "implementation": "stub"
-                        }
-                    ],
-                    "runtime": {
-                        "type": "container",
-                        "image": "example/test:1",
-                        "service_name": "elx-indexer"
-                    },
-                    "networking": {
-                        "service_port": {
-                            "scheme": "http",
-                            "container_port": 9696
-                        }
-                    }
-                }),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: connector_id.to_string(),
-                name: "Indexer Connector".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Connector,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Verified,
-                manifest_json: json!({
-                    "id": connector_id,
-                    "version": "1.0.0",
-                    "kind": "connector",
-                    "name": "Indexer Connector",
-                    "targets": [
-                        {
-                            "capability": "indexer.registry",
-                            "slot": "default"
-                        }
-                    ],
-                    "actions": [
-                        {
-                            "type": "driver_patch",
-                            "target": {
-                                "capability": "indexer.registry",
-                                "slot": "default"
-                            },
-                            "patch": {
-                                "op": "register_indexers",
-                                "indexers": [
-                                    {
-                                        "name": indexer_name,
-                                        "implementation": "torznab",
-                                        "url": "https://example.invalid",
-                                        "auth": {
-                                            "requires_account": true,
-                                            "required_fields": ["api_key"]
-                                        },
-                                        "categories": [],
-                                        "tags": []
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        let instance_id = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id,
-                extension_id: module_id.to_string(),
-                instance_name: "default".to_string(),
-                config_json: None,
-                enabled: true,
-            })
-            .await?;
-
-        let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-indexer".to_string(),
-            9696,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
-        store
-            .upsert_provider(&NewProvider {
-                provider_id,
-                instance_id,
-                capability: "indexer.registry".to_string(),
-                slot_id: "default".to_string(),
-                cardinality: SlotCardinality::One,
-                implementation: Some("stub".to_string()),
-                scope_json: None,
-                endpoint_json: Some(serde_json::to_value(endpoint)?),
-                health_state: ProviderHealthState::Unknown,
-            })
-            .await?;
-
-        Ok(AutoWireFixture {
-            instance_id,
-            provider_id,
-            secret_key,
-            connector_id: connector_id.to_string(),
-        })
     }
 
     #[tokio::test]
@@ -2573,8 +2146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_applies_desired_blueprint_plan_and_skips_unchanged_until_repair()
-    -> Result<()> {
+    async fn reconcile_steady_state_does_not_replay_applied_blueprints() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
 
@@ -2630,21 +2202,41 @@ mod tests {
                     "version": "1.0.0",
                     "kind": "blueprint",
                     "name": "Desired Blueprint",
-                    "wants": [
-                        {
-                            "capability": "media.manager.tv",
-                            "slot": "default"
-                        }
-                    ],
-                    "preferences": {
-                        "providers": {
-                            "media.manager.tv/default": {
-                                "prefer": ["ext.module"]
+                    "execution": {
+                        "packages": ["ext.module"],
+                        "instances": [
+                            {
+                                "id": "module",
+                                "extension_id": "ext.module",
+                                "name": "default"
                             }
-                        }
-                    },
-                    "policies": {
-                        "reuse_existing": false
+                        ],
+                        "phases": [
+                            {
+                                "id": "install_packages",
+                                "steps": [
+                                    { "type": "ensure_package_installed", "extension_id": "ext.module" }
+                                ]
+                            },
+                            {
+                                "id": "create_instances",
+                                "steps": [
+                                    { "type": "ensure_instance_installed", "instance": "module" }
+                                ]
+                            },
+                            {
+                                "id": "start_runtime",
+                                "steps": [
+                                    { "type": "ensure_runtime_running", "instance": "module" }
+                                ]
+                            },
+                            {
+                                "id": "register_providers",
+                                "steps": [
+                                    { "type": "create_or_update_providers", "instance": "module" }
+                                ]
+                            }
+                        ]
                     }
                 }),
                 package_hash: None,
@@ -2659,7 +2251,6 @@ mod tests {
                 blueprint_extension_id: "blueprint.desired".to_string(),
                 blueprint_version: "1.0.0".to_string(),
                 params_json: None,
-                decisions_json: None,
             })
             .await?;
         store.mark_desired_applied(desired_id, true).await?;
@@ -2691,7 +2282,7 @@ mod tests {
             &probe,
             &runtime,
             &drivers,
-            runtime_paths.clone(),
+            runtime_paths,
             &secrets,
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
@@ -2700,63 +2291,265 @@ mod tests {
         );
         reconciler.run_once().await?;
 
-        let desired_run_source = desired_blueprint_run_source(desired_id);
-
-        let instances = store.list_instances(None).await?;
         assert!(
-            instances
-                .iter()
-                .any(|instance| instance.extension_id == "ext.module"),
-            "expected instance to be created"
+            store.list_instances(None).await?.is_empty(),
+            "steady-state reconcile must not install desired blueprints"
         );
+        let runs = store.list_runs(None).await?;
+        assert_eq!(runs.len(), 1, "expected only the reconcile run");
+        assert_eq!(runs[0].source, "reconcile");
 
-        let providers = store.list_providers(None).await?;
-        assert!(
-            providers.iter().any(|provider| {
-                provider.capability == "media.manager.tv" && provider.slot_id == "default"
-            }),
-            "expected provider to be created"
-        );
+        Ok(())
+    }
 
-        let run = store
-            .get_latest_run_by_source(&desired_run_source, Some(OrchestratorRunStatus::Completed))
-            .await?
-            .expect("desired blueprint run");
-        let steps = store.list_steps(run.run_id).await?;
-        assert!(
-            steps
-                .iter()
-                .any(|step| step.action_type == "ensure_instance_installed"),
-            "expected ensure_instance_installed step"
-        );
+    #[tokio::test]
+    async fn reconcile_explicit_repair_runs_bounded_subgraph_only() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
 
-        let first_completed = store
-            .list_runs(None)
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.source == desired_run_source.as_str()
-                    && run.status == OrchestratorRunStatus::Completed
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "ext.registry".to_string(),
+                name: "Registry Module".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": "ext.registry",
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "Registry Module",
+                    "provides": [
+                        {
+                            "capability": "indexer.registry",
+                            "slot": "default",
+                            "implementation": "test"
+                        }
+                    ],
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/test:1",
+                        "service_name": "localhost"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 9696
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
             })
-            .count();
-        assert_eq!(first_completed, 1);
-
-        reconciler.run_once().await?;
-        let second_completed = store
-            .list_runs(None)
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.source == desired_run_source.as_str()
-                    && run.status == OrchestratorRunStatus::Completed
+            .await?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "ext.connector".to_string(),
+                name: "Registry Connector".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Connector,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": "ext.connector",
+                    "version": "1.0.0",
+                    "kind": "connector",
+                    "name": "Registry Connector",
+                    "targets": [
+                        { "capability": "indexer.registry", "slot": "default" }
+                    ],
+                    "actions": [
+                        {
+                            "type": "driver_patch",
+                            "target": { "capability": "indexer.registry", "slot": "default" },
+                            "patch": {
+                                "op": "register_apps",
+                                "apps": [
+                                    {
+                                        "name": "Elixir",
+                                        "implementation": "Test",
+                                        "url": "http://example.test:9696",
+                                        "enabled": true
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }),
+                package_hash: None,
+                enabled: true,
             })
-            .count();
+            .await?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "blueprint.repair".to_string(),
+                name: "Repair Blueprint".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Blueprint,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": "blueprint.repair",
+                    "version": "1.0.0",
+                    "kind": "blueprint",
+                    "name": "Repair Blueprint",
+                    "execution": {
+                        "packages": ["ext.registry", "ext.connector"],
+                        "instances": [
+                            {
+                                "id": "registry",
+                                "extension_id": "ext.registry",
+                                "name": "default"
+                            }
+                        ],
+                        "ownership": [
+                            {
+                                "domain": "indexer.registry.defaults",
+                                "owner": "ext.connector"
+                            }
+                        ],
+                        "phases": [
+                            {
+                                "id": "install_packages",
+                                "steps": [
+                                    { "type": "ensure_package_installed", "extension_id": "ext.registry" },
+                                    { "type": "ensure_package_installed", "extension_id": "ext.connector" }
+                                ]
+                            },
+                            {
+                                "id": "create_instances",
+                                "steps": [
+                                    { "type": "ensure_instance_installed", "instance": "registry" }
+                                ]
+                            },
+                            {
+                                "id": "start_runtime",
+                                "steps": [
+                                    { "type": "ensure_runtime_running", "instance": "registry" }
+                                ]
+                            },
+                            {
+                                "id": "configure_registry",
+                                "steps": [
+                                    {
+                                        "type": "apply_connector",
+                                        "connector_id": "ext.connector",
+                                        "target_instance": "registry",
+                                        "target_capability": "indexer.registry",
+                                        "ownership_domains": ["indexer.registry.defaults"]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "example.com".to_string(),
+            9696,
+            None,
+            None,
+        )?;
+        let _ = store
+            .create_instance(&NewExtensionInstance {
+                instance_id: Uuid::new_v4(),
+                extension_id: "ext.registry".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let (instance_id, provider_id) = {
+            let instances = store.list_instances(None).await?;
+            let instance = instances
+                .into_iter()
+                .find(|instance| {
+                    instance.extension_id == "ext.registry" && instance.instance_name == "default"
+                })
+                .expect("existing instance");
+            let provider_id = Uuid::new_v4();
+            store
+                .upsert_provider(&NewProvider {
+                    provider_id,
+                    instance_id: instance.instance_id,
+                    capability: "indexer.registry".to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: SlotCardinality::One,
+                    implementation: Some("test".to_string()),
+                    scope_json: None,
+                    endpoint_json: Some(serde_json::to_value(endpoint)?),
+                    health_state: ProviderHealthState::Healthy,
+                })
+                .await?;
+            store
+                .update_instance_runtime_version(instance.instance_id, "0.9.0", None)
+                .await?;
+            (instance.instance_id, provider_id)
+        };
+
+        let desired_id = Uuid::new_v4();
+        store
+            .create_desired_blueprint(&NewDesiredBlueprint {
+                desired_id,
+                blueprint_extension_id: "blueprint.repair".to_string(),
+                blueprint_version: "1.0.0".to_string(),
+                params_json: None,
+            })
+            .await?;
+        store.mark_desired_applied(desired_id, true).await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let mut drivers = DriverRegistry::new();
+        drivers.register(StubIndexerDriver);
+        let planner = Planner::new();
+        let repair_plan = planner
+            .plan_blueprint(&store, "blueprint.repair".to_string(), None)
+            .await?;
+        let planned_patch_provider_ids = repair_plan
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                PlanAction::ApplyDriverPatch { patch } => Some(patch.target_provider_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned_patch_provider_ids, vec![provider_id]);
+        let repair_action_types = bounded_repair_subgraph(repair_plan)
+            .actions
+            .into_iter()
+            .map(|action| action.action_type().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
-            second_completed, 1,
-            "steady-state reconcile should skip unchanged desired blueprint plans"
+            repair_action_types,
+            vec![
+                "ensure_runtime_running",
+                "transport_gate",
+                "bootstrap_gate",
+                "health_gate",
+                "apply_driver_patch",
+            ]
         );
-
-        let repair_config = ReconcileConfig {
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
             interval: Duration::from_secs(1),
             retry_attempts: 1,
             retry_backoff: Duration::from_secs(1),
@@ -2764,7 +2557,8 @@ mod tests {
             lock_ttl: Duration::from_secs(60),
             mode: ReconcileMode::ExplicitRepair,
         };
-        let repair_reconciler = Reconciler::new(
+
+        let reconciler = Reconciler::new(
             &database.pool,
             &probe,
             &runtime,
@@ -2774,545 +2568,173 @@ mod tests {
             "qmcgaw/gluetun:v3.39.0".to_string(),
             None,
             DownloaderPerformanceProfile::Balanced,
-            &repair_config,
+            &config,
         );
-        repair_reconciler.run_once().await?;
-        let third_completed = store
+        reconciler.run_once().await?;
+
+        let run = store
             .list_runs(None)
             .await?
             .into_iter()
-            .filter(|run| {
-                run.source == desired_run_source.as_str()
-                    && run.status == OrchestratorRunStatus::Completed
-            })
-            .count();
-        assert_eq!(
-            third_completed, 2,
-            "explicit repair should reapply an unchanged desired blueprint plan"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_honors_persisted_keep_existing_decisions() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: "ext.existing".to_string(),
-                name: "Existing Module".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Module,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Verified,
-                manifest_json: json!({
-                    "id": "ext.existing",
-                    "version": "1.0.0",
-                    "kind": "module",
-                    "name": "Existing Module",
-                    "provides": [
-                        {
-                            "capability": "media.manager.tv",
-                            "slot": "default",
-                            "implementation": "sonarr"
-                        }
-                    ],
-                    "runtime": {
-                        "type": "container",
-                        "image": "example/test:1",
-                        "service_name": "elx-existing"
-                    },
-                    "networking": {
-                        "service_port": {
-                            "scheme": "http",
-                            "container_port": 8989
-                        }
-                    }
-                }),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: "ext.new".to_string(),
-                name: "New Module".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Module,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Verified,
-                manifest_json: json!({
-                    "id": "ext.new",
-                    "version": "1.0.0",
-                    "kind": "module",
-                    "name": "New Module",
-                    "provides": [
-                        {
-                            "capability": "media.manager.tv",
-                            "slot": "default",
-                            "implementation": "sonarr"
-                        }
-                    ],
-                    "runtime": {
-                        "type": "container",
-                        "image": "example/test:1",
-                        "service_name": "elx-new"
-                    },
-                    "networking": {
-                        "service_port": {
-                            "scheme": "http",
-                            "container_port": 8989
-                        }
-                    }
-                }),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: "blueprint.keep".to_string(),
-                name: "Keep Blueprint".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Blueprint,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Verified,
-                manifest_json: json!({
-                    "id": "blueprint.keep",
-                    "version": "1.0.0",
-                    "kind": "blueprint",
-                    "name": "Keep Blueprint",
-                    "wants": [
-                        {
-                            "capability": "media.manager.tv",
-                            "slot": "default"
-                        }
-                    ],
-                    "preferences": {
-                        "providers": {
-                            "media.manager.tv/default": {
-                                "prefer": ["ext.new"]
-                            }
-                        }
-                    },
-                    "policies": {
-                        "reuse_existing": false
-                    }
-                }),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        let existing_instance_id = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id: existing_instance_id,
-                extension_id: "ext.existing".to_string(),
-                instance_name: "default".to_string(),
-                config_json: None,
-                enabled: true,
-            })
-            .await?;
-
-        let existing_provider_id = Uuid::new_v4();
-        let existing_endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-existing".to_string(),
-            8989,
-            Some("/health".to_string()),
-            Some("elixir_net".to_string()),
-        )?;
-        store
-            .upsert_provider(&NewProvider {
-                provider_id: existing_provider_id,
-                instance_id: existing_instance_id,
-                capability: "media.manager.tv".to_string(),
-                slot_id: "default".to_string(),
-                cardinality: SlotCardinality::One,
-                implementation: Some("sonarr".to_string()),
-                scope_json: None,
-                endpoint_json: Some(serde_json::to_value(existing_endpoint)?),
-                health_state: ProviderHealthState::Healthy,
-            })
-            .await?;
-
-        let decisions_json = json!({
-            "slotConflicts": [
-                {
-                    "conflictId": "media.manager.tv/default",
-                    "action": "keep_existing"
-                }
-            ]
-        });
-
-        let desired_id = Uuid::new_v4();
-        store
-            .create_desired_blueprint(&NewDesiredBlueprint {
-                desired_id,
-                blueprint_extension_id: "blueprint.keep".to_string(),
-                blueprint_version: "1.0.0".to_string(),
-                params_json: None,
-                decisions_json: Some(decisions_json),
-            })
-            .await?;
-        store.mark_desired_applied(desired_id, true).await?;
-
-        let probe = StubProbe::default();
-        let runtime = StubRuntime;
-        let drivers = DriverRegistry::new();
-        let temp_dir = TempDir::new()?;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let config = ReconcileConfig {
-            interval: Duration::from_secs(1),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: ReconcileMode::SteadyState,
-        };
-
-        let reconciler = Reconciler::new(
-            &database.pool,
-            &probe,
-            &runtime,
-            &drivers,
-            runtime_paths,
-            &secrets,
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DownloaderPerformanceProfile::Balanced,
-            &config,
-        );
-        reconciler.run_once().await?;
-
-        let instances = store.list_instances(None).await?;
-        assert!(
-            instances
-                .iter()
-                .all(|instance| instance.extension_id != "ext.new"),
-            "keep_existing decisions should prevent installing ext.new"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_auto_wire_blocks_on_missing_secrets() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-        let fixture = seed_auto_wire_indexer(&store).await?;
-
-        let probe = StubProbe::default();
-        let runtime = StubRuntime;
-        let drivers = DriverRegistry::new();
-        let temp_dir = TempDir::new()?;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let config = ReconcileConfig {
-            interval: Duration::from_secs(1),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: ReconcileMode::SteadyState,
-        };
-
-        let reconciler = Reconciler::new(
-            &database.pool,
-            &probe,
-            &runtime,
-            &drivers,
-            runtime_paths,
-            &secrets,
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DownloaderPerformanceProfile::Balanced,
-            &config,
-        );
-        reconciler.run_once().await?;
-
-        let run = store
-            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
-            .await?
-            .expect("pending auto-wire run");
-        let plan_json = run.plan_json.expect("auto-wire plan");
-        let plan: Plan = serde_json::from_value(plan_json)?;
-        let expected_missing = format!("instance:{}:{}", fixture.instance_id, fixture.secret_key);
-        let missing_conflict = plan.conflicts.iter().find(|conflict| {
-            conflict.get("code").and_then(Value::as_str) == Some("missing_required_secrets")
-        });
-        assert!(
-            missing_conflict.is_some(),
-            "expected missing secrets conflict"
-        );
-        let missing = missing_conflict
-            .and_then(|conflict| conflict.get("missing"))
-            .and_then(Value::as_array)
-            .expect("missing list");
-        assert!(
-            missing
-                .iter()
-                .any(|value| value.as_str() == Some(expected_missing.as_str())),
-            "missing list should include the indexer secret"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_auto_wire_applies_when_clean() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-        let fixture = seed_auto_wire_indexer(&store).await?;
-
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let encrypted = secrets.encrypt("test-key")?;
-        store
-            .upsert_secret(&NewSecret {
-                secret_id: Uuid::new_v4(),
-                scope: SecretScope::Instance,
-                scope_id: Some(fixture.instance_id),
-                key: fixture.secret_key.clone(),
-                value_encrypted: encrypted,
-                rotatable: false,
-            })
-            .await?;
-
-        let probe = StubProbe::default();
-        let runtime = StubRuntime;
-        let mut drivers = DriverRegistry::new();
-        drivers.register(StubIndexerDriver::default());
-        let temp_dir = TempDir::new()?;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-        let config = ReconcileConfig {
-            interval: Duration::from_secs(1),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: ReconcileMode::SteadyState,
-        };
-
-        let reconciler = Reconciler::new(
-            &database.pool,
-            &probe,
-            &runtime,
-            &drivers,
-            runtime_paths,
-            &secrets,
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DownloaderPerformanceProfile::Balanced,
-            &config,
-        );
-        reconciler.run_once().await?;
-
-        let run = store
-            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Completed))
-            .await?
-            .expect("completed auto-wire run");
+            .find(|run| run.source == "repair")
+            .expect("repair run");
         let steps = store.list_steps(run.run_id).await?;
+        let step_debug = steps
+            .iter()
+            .map(|step| {
+                format!(
+                    "{}:{:?}:{}",
+                    step.action_type,
+                    step.status,
+                    step.error.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>();
+        let action_types = steps
+            .iter()
+            .map(|step| step.action_type.as_str())
+            .collect::<Vec<_>>();
         assert!(
-            steps
-                .iter()
-                .any(|step| step.action_type == "apply_driver_patch"),
-            "expected apply_driver_patch step"
+            !action_types.contains(&"ensure_instance_installed"),
+            "bounded repair must not replay install actions: {step_debug:?}"
         );
+        assert!(
+            action_types.contains(&"ensure_runtime_running"),
+            "repair should include runtime reconciliation: {step_debug:?}"
+        );
+        assert!(
+            action_types.contains(&"transport_gate"),
+            "repair should include transport gating: {step_debug:?}"
+        );
+        assert!(
+            action_types.contains(&"bootstrap_gate"),
+            "repair should include bootstrap gating: {step_debug:?}"
+        );
+        assert!(
+            action_types.contains(&"health_gate"),
+            "repair should include driver readiness gating: {step_debug:?}"
+        );
+        assert!(
+            action_types.contains(&"apply_driver_patch"),
+            "repair should include driver patch replay: {step_debug:?}"
+        );
+
+        let providers = store.list_providers(None).await?;
+        assert!(providers.iter().any(|provider| provider.provider_id == provider_id));
+        let instances = store.list_instances(None).await?;
+        assert!(instances.iter().any(|instance| instance.instance_id == instance_id));
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn reconcile_auto_wire_skips_when_plan_unchanged() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-        let fixture = seed_auto_wire_indexer(&store).await?;
-
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let encrypted = secrets.encrypt("test-key")?;
-        store
-            .upsert_secret(&NewSecret {
-                secret_id: Uuid::new_v4(),
-                scope: SecretScope::Instance,
-                scope_id: Some(fixture.instance_id),
-                key: fixture.secret_key.clone(),
-                value_encrypted: encrypted,
-                rotatable: false,
-            })
-            .await?;
-
-        let probe = StubProbe::default();
-        let runtime = StubRuntime;
-        let mut drivers = DriverRegistry::new();
-        drivers.register(StubIndexerDriver::default());
-        let temp_dir = TempDir::new()?;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-        let config = ReconcileConfig {
-            interval: Duration::from_secs(1),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: ReconcileMode::SteadyState,
-        };
-
-        let reconciler = Reconciler::new(
-            &database.pool,
-            &probe,
-            &runtime,
-            &drivers,
-            runtime_paths,
-            &secrets,
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DownloaderPerformanceProfile::Balanced,
-            &config,
-        );
-        reconciler.run_once().await?;
-        let first_completed = store
-            .list_runs(None)
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.source == "auto_wire" && run.status == OrchestratorRunStatus::Completed
-            })
-            .count();
-        assert_eq!(first_completed, 1);
-
-        reconciler.run_once().await?;
-        let second_completed = store
-            .list_runs(None)
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.source == "auto_wire" && run.status == OrchestratorRunStatus::Completed
-            })
-            .count();
-        assert_eq!(
-            second_completed, 1,
-            "unchanged auto-wire plan should not create another completed run"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_auto_wire_clears_pending_when_no_actions() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-        let fixture = seed_auto_wire_indexer(&store).await?;
-
-        let pending_id = Uuid::new_v4();
-        let pending_plan = Plan {
-            plan_id: pending_id,
-            blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
+    #[test]
+    fn bounded_repair_subgraph_filters_install_only_actions() {
+        let provider_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let plan = Plan {
+            plan_id: Uuid::new_v4(),
+            blueprint_id: "blueprint.repair".to_string(),
             params: None,
-            actions: vec![PlanAction::HealthGate {
-                provider_id: fixture.provider_id,
-                timeout_seconds: 5,
-            }],
+            stages: vec![
+                PlanStage {
+                    stage_id: "install_packages".to_string(),
+                    barrier: true,
+                    action_start_index: 0,
+                    action_end_index: 1,
+                },
+                PlanStage {
+                    stage_id: "repair_runtime".to_string(),
+                    barrier: true,
+                    action_start_index: 1,
+                    action_end_index: 7,
+                },
+            ],
+            actions: vec![
+                PlanAction::EnsureInstanceInstalled {
+                    instance: crate::orchestrator::planner::InstanceSpec {
+                        instance_id,
+                        extension_id: "ext.registry".to_string(),
+                        instance_name: "default".to_string(),
+                        config_json: None,
+                        enabled: true,
+                    },
+                },
+                PlanAction::EnsureRuntimeRunning {
+                    runtime: crate::orchestrator::planner::RuntimeSpec {
+                        instance_id,
+                        extension_id: "ext.registry".to_string(),
+                        instance_name: "default".to_string(),
+                        runtime: crate::extensions::manifest::ManifestRuntime {
+                            r#type: "container".to_string(),
+                            image: Some("example/test:1".to_string()),
+                            network: None,
+                            service_name: Some("elx-registry".to_string()),
+                            ports: Vec::new(),
+                            volumes: Vec::new(),
+                            env: Vec::new(),
+                            egress: None,
+                        },
+                        networking: None,
+                        aliases: Vec::new(),
+                    },
+                },
+                PlanAction::CreateOrUpdateProvider {
+                    provider: crate::orchestrator::planner::ProviderSpec {
+                        provider_id,
+                        instance_id,
+                        capability: "indexer.registry".to_string(),
+                        slot_id: "default".to_string(),
+                        cardinality: SlotCardinality::One,
+                        implementation: Some("test".to_string()),
+                        scope_json: None,
+                        endpoint: ProviderEndpoint::new(
+                            "http".to_string(),
+                            "svc-registry".to_string(),
+                            9696,
+                            None,
+                            Some("elixir_net".to_string()),
+                        )
+                        .expect("endpoint"),
+                    },
+                },
+                PlanAction::TransportGate {
+                    provider_id,
+                    timeout_seconds: 60,
+                },
+                PlanAction::BootstrapGate {
+                    provider_id,
+                    timeout_seconds: 60,
+                },
+                PlanAction::HealthGate {
+                    provider_id,
+                    timeout_seconds: 60,
+                },
+                PlanAction::RollbackRuntime { instance_id },
+            ],
             conflicts: Vec::new(),
-        };
-        store
-            .create_run(&crate::extensions::store::NewOrchestratorRun {
-                run_id: pending_id,
-                source: "auto_wire".to_string(),
-                status: OrchestratorRunStatus::Pending,
-                phase: Some("auto_wire".to_string()),
-                plan_json: Some(serde_json::to_value(&pending_plan)?),
-                error: None,
-            })
-            .await?;
-
-        store
-            .set_extension_enabled(&fixture.connector_id, false)
-            .await?;
-
-        let probe = StubProbe::default();
-        let runtime = StubRuntime;
-        let drivers = DriverRegistry::new();
-        let temp_dir = TempDir::new()?;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let config = ReconcileConfig {
-            interval: Duration::from_secs(1),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: ReconcileMode::SteadyState,
+            blocked_stage: None,
         };
 
-        let reconciler = Reconciler::new(
-            &database.pool,
-            &probe,
-            &runtime,
-            &drivers,
-            runtime_paths,
-            &secrets,
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DownloaderPerformanceProfile::Balanced,
-            &config,
+        let repair = bounded_repair_subgraph(plan);
+        let action_types = repair
+            .actions
+            .iter()
+            .map(PlanAction::action_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_types,
+            vec![
+                "ensure_runtime_running",
+                "create_or_update_provider",
+                "transport_gate",
+                "bootstrap_gate",
+                "health_gate"
+            ]
         );
-        reconciler.run_once().await?;
-
-        let canceled = store
-            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Canceled))
-            .await?
-            .expect("auto-wire pending run canceled");
-        assert_eq!(canceled.run_id, pending_id);
-
-        let pending = store
-            .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Pending))
-            .await?;
-        assert!(pending.is_none(), "pending auto-wire run should be cleared");
-
-        Ok(())
+        assert_eq!(repair.stages.len(), 1);
+        assert_eq!(repair.stages[0].stage_id, "repair_runtime");
+        assert_eq!(repair.stages[0].action_start_index, 0);
+        assert_eq!(repair.stages[0].action_end_index, 5);
     }
 
     #[test]

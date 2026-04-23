@@ -43,6 +43,15 @@ pub struct LibraryItemResponse {
     pub poster_url: Option<String>,
     pub banner_url: Option<String>,
     pub backdrop_url: Option<String>,
+    pub lifecycle: LibraryItemCardLifecycleResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryItemCardLifecycleResponse {
+    pub tracked_by_manager: bool,
+    pub manager_label: Option<String>,
+    pub can_stop_tracking: bool,
 }
 
 pub async fn list_items(
@@ -141,12 +150,15 @@ pub async fn list_items(
     )
     .await?;
 
-    let items = rows
-        .into_iter()
-        .map(|row| LibraryItemResponse {
-            id: row.get::<String, _>("id"),
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.get::<String, _>("id");
+        let item_type = row.get::<String, _>("type");
+        let lifecycle = resolve_library_item_card_lifecycle(&state, &id).await?;
+        items.push(LibraryItemResponse {
+            id: id.clone(),
             title: row.get::<String, _>("title"),
-            r#type: row.get::<String, _>("type"),
+            r#type: item_type.clone(),
             year: row.try_get::<i64, _>("year").ok().map(|v| v as i32),
             updated_at: row.get::<String, _>("updated_at"),
             runtime_seconds: row
@@ -158,32 +170,24 @@ pub async fn list_items(
                 .try_get::<String, _>("metadata_json")
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            poster_url: {
-                let id = row.get::<String, _>("id");
-                match row.get::<String, _>("type").as_str() {
-                    "movie" => movie_posters.get(&id).cloned(),
-                    "anime" => anime_posters.get(&id).cloned(),
-                    _ => series_posters.get(&id).cloned(),
-                }
+            poster_url: match item_type.as_str() {
+                "movie" => movie_posters.get(&id).cloned(),
+                "anime" => anime_posters.get(&id).cloned(),
+                _ => series_posters.get(&id).cloned(),
             },
-            banner_url: {
-                let id = row.get::<String, _>("id");
-                match row.get::<String, _>("type").as_str() {
-                    "anime" => anime_banners.get(&id).cloned(),
-                    "movie" => None,
-                    _ => series_banners.get(&id).cloned(),
-                }
+            banner_url: match item_type.as_str() {
+                "anime" => anime_banners.get(&id).cloned(),
+                "movie" => None,
+                _ => series_banners.get(&id).cloned(),
             },
-            backdrop_url: {
-                let id = row.get::<String, _>("id");
-                match row.get::<String, _>("type").as_str() {
-                    "movie" => movie_backdrops.get(&id).cloned(),
-                    "anime" => anime_backdrops.get(&id).cloned(),
-                    _ => series_backdrops.get(&id).cloned(),
-                }
+            backdrop_url: match item_type.as_str() {
+                "movie" => movie_backdrops.get(&id).cloned(),
+                "anime" => anime_backdrops.get(&id).cloned(),
+                _ => series_backdrops.get(&id).cloned(),
             },
-        })
-        .collect();
+            lifecycle,
+        });
+    }
 
     Ok(Json(items))
 }
@@ -1233,6 +1237,37 @@ async fn resolve_library_item_lifecycle(
             can_restore_blocked_episodes: blocked_episode_count > 0,
             ..LibraryLifecycleResponse::default()
         },
+    })
+}
+
+async fn resolve_library_item_card_lifecycle(
+    state: &AppState,
+    item_id: &str,
+) -> ApiResult<LibraryItemCardLifecycleResponse> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let item_uuid = Uuid::parse_str(item_id)
+        .map_err(|_| ApiError::bad_request("library item id is invalid"))?;
+    let Some(provenance) = store
+        .get_managed_library_provenance(item_uuid)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    else {
+        return Ok(LibraryItemCardLifecycleResponse::default());
+    };
+    let lifecycle = enrich_provenance_with_provider(&store, provenance).await?;
+    let manager_label =
+        if lifecycle.manager_implementation.is_some() || lifecycle.manager_label.is_some() {
+            Some(manager_display_name(
+                lifecycle.manager_implementation.as_deref(),
+                lifecycle.manager_label.as_deref(),
+            ))
+        } else {
+            None
+        };
+    Ok(LibraryItemCardLifecycleResponse {
+        tracked_by_manager: true,
+        manager_label,
+        can_stop_tracking: can_stop_tracking(&lifecycle),
     })
 }
 

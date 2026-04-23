@@ -76,6 +76,16 @@ pub enum ProviderHealthState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text")]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReadinessPhase {
+    Unknown,
+    TransportReady,
+    BootstrapReady,
+    DriverReady,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text")]
 #[serde(rename_all = "lowercase")]
 pub enum BindingStatus {
     Pending,
@@ -217,6 +227,16 @@ pub struct Provider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProviderReadiness {
+    pub provider_id: Uuid,
+    pub readiness_phase: ProviderReadinessPhase,
+    pub readiness_detail: Option<String>,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Binding {
     pub binding_id: Uuid,
     pub consumer_provider_id: Uuid,
@@ -237,7 +257,6 @@ pub struct DesiredBlueprint {
     pub blueprint_extension_id: String,
     pub blueprint_version: String,
     pub params_json: Option<serde_json::Value>,
-    pub decisions_json: Option<serde_json::Value>,
     pub applied: bool,
     pub created_at: DateTime<Utc>,
     pub applied_at: Option<DateTime<Utc>>,
@@ -567,6 +586,17 @@ impl ProviderHealthState {
     }
 }
 
+impl ProviderReadinessPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderReadinessPhase::Unknown => "unknown",
+            ProviderReadinessPhase::TransportReady => "transport_ready",
+            ProviderReadinessPhase::BootstrapReady => "bootstrap_ready",
+            ProviderReadinessPhase::DriverReady => "driver_ready",
+        }
+    }
+}
+
 impl BindingStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -660,6 +690,20 @@ impl std::str::FromStr for ProviderHealthState {
             "degraded" => Ok(ProviderHealthState::Degraded),
             "unhealthy" => Ok(ProviderHealthState::Unhealthy),
             other => Err(format!("unknown health state '{other}'")),
+        }
+    }
+}
+
+impl std::str::FromStr for ProviderReadinessPhase {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unknown" => Ok(ProviderReadinessPhase::Unknown),
+            "transport_ready" => Ok(ProviderReadinessPhase::TransportReady),
+            "bootstrap_ready" => Ok(ProviderReadinessPhase::BootstrapReady),
+            "driver_ready" => Ok(ProviderReadinessPhase::DriverReady),
+            other => Err(format!("unknown provider readiness phase '{other}'")),
         }
     }
 }

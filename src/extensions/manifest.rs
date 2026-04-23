@@ -32,6 +32,8 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub runtime: Option<ManifestRuntime>,
     #[serde(default)]
+    pub backup: Option<ManifestBackupPolicy>,
+    #[serde(default)]
     pub targets: Vec<ManifestCapabilityRef>,
     #[serde(default)]
     pub actions: Vec<ManifestAction>,
@@ -45,6 +47,8 @@ pub struct ExtensionManifest {
     pub preferences: Option<ManifestPreferences>,
     #[serde(default)]
     pub bindings: Vec<ManifestBinding>,
+    #[serde(default)]
+    pub execution: Option<ManifestExecution>,
     #[serde(default)]
     pub policies: Option<ManifestPolicies>,
     #[serde(default)]
@@ -109,8 +113,14 @@ impl ExtensionManifest {
                         );
                     }
                 }
+                if let Some(backup) = self.backup.as_ref() {
+                    backup.validate()?;
+                }
             }
             ExtensionKind::Connector => {
+                if self.backup.is_some() {
+                    bail!("only module manifests may declare backups");
+                }
                 if self.targets.is_empty() {
                     bail!("connector manifests must declare at least one target");
                 }
@@ -119,8 +129,24 @@ impl ExtensionManifest {
                 }
             }
             ExtensionKind::Blueprint => {
-                if self.wants.is_empty() {
-                    bail!("blueprint manifests must declare at least one want");
+                if self.backup.is_some() {
+                    bail!("only module manifests may declare backups");
+                }
+                let Some(execution) = self.execution.as_ref() else {
+                    bail!("blueprint manifests must declare execution");
+                };
+                execution.validate()?;
+                if !self.wants.is_empty() {
+                    bail!("execution blueprints must not declare wants");
+                }
+                if !self.connectors.is_empty() {
+                    bail!("execution blueprints must not declare connectors");
+                }
+                if self.preferences.is_some() {
+                    bail!("execution blueprints must not declare preferences");
+                }
+                if !self.bindings.is_empty() {
+                    bail!("execution blueprints must not declare bindings");
                 }
             }
         }
@@ -129,6 +155,9 @@ impl ExtensionManifest {
             ensure_non_empty(&runtime.r#type, "runtime.type")?;
             if runtime.r#type != "container" && runtime.r#type != "internal" {
                 bail!("unsupported runtime type '{}'", runtime.r#type);
+            }
+            if self.backup.is_some() && !runtime.r#type.eq_ignore_ascii_case("container") {
+                bail!("backup is only supported for container runtimes");
             }
             for env in &runtime.env {
                 ensure_non_empty(&env.name, "runtime.env.name")?;
@@ -173,6 +202,68 @@ impl ExtensionManifest {
             control_surface.validate()?;
         }
 
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestBackupPolicy {
+    #[serde(default = "default_backup_retention")]
+    pub retention: usize,
+    #[serde(default)]
+    pub items: Vec<ManifestBackupItem>,
+}
+
+impl ManifestBackupPolicy {
+    fn validate(&self) -> Result<()> {
+        if self.retention == 0 {
+            bail!("backup.retention must be greater than zero");
+        }
+        if self.items.is_empty() {
+            bail!("backup.items must declare at least one backup target");
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut paths = std::collections::HashSet::new();
+        for item in &self.items {
+            item.validate()?;
+            if !ids.insert(item.id.clone()) {
+                bail!("backup.items ids must be unique");
+            }
+            if !paths.insert(item.container_path.clone()) {
+                bail!("backup.items container_path values must be unique");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestBackupItem {
+    pub id: String,
+    pub label: String,
+    #[serde(default = "default_backup_item_kind")]
+    pub kind: String,
+    pub container_path: String,
+}
+
+impl ManifestBackupItem {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.id, "backup.items.id")?;
+        ensure_non_empty(&self.label, "backup.items.label")?;
+        ensure_non_empty(&self.kind, "backup.items.kind")?;
+        ensure_non_empty(&self.container_path, "backup.items.container_path")?;
+        if !self.kind.trim().eq_ignore_ascii_case("directory") {
+            bail!(
+                "unsupported backup.items.kind '{}'; expected directory",
+                self.kind
+            );
+        }
+        if !self.container_path.starts_with('/') {
+            bail!("backup.items.container_path must be absolute");
+        }
+        if self.container_path == "/" {
+            bail!("backup.items.container_path must not be '/'");
+        }
         Ok(())
     }
 }
@@ -375,6 +466,14 @@ pub struct ManifestRuntimeEnv {
     pub from_secret: Option<String>,
 }
 
+fn default_backup_retention() -> usize {
+    5
+}
+
+fn default_backup_item_kind() -> String {
+    "directory".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestCapabilityRef {
     pub capability: String,
@@ -462,6 +561,342 @@ pub struct ManifestProviderPreference {
 pub struct ManifestBinding {
     pub from: ManifestCapabilityRef,
     pub to: ManifestCapabilityRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestExecution {
+    #[serde(default)]
+    pub packages: Vec<String>,
+    #[serde(default)]
+    pub instances: Vec<ManifestExecutionInstance>,
+    #[serde(default)]
+    pub ownership: Vec<ManifestOwnershipDomain>,
+    #[serde(default)]
+    pub phases: Vec<ManifestExecutionPhase>,
+}
+
+impl ManifestExecution {
+    fn validate(&self) -> Result<()> {
+        if self.packages.is_empty() {
+            bail!("execution.packages must declare at least one package");
+        }
+        if self.instances.is_empty() {
+            bail!("execution.instances must declare at least one instance");
+        }
+        if self.phases.is_empty() {
+            bail!("execution.phases must declare at least one phase");
+        }
+
+        let mut packages = std::collections::HashSet::new();
+        for package in &self.packages {
+            ensure_non_empty(package, "execution.packages")?;
+            if !packages.insert(package.trim().to_string()) {
+                bail!("execution.packages must be unique");
+            }
+        }
+
+        let mut instance_ids = std::collections::HashSet::new();
+        for instance in &self.instances {
+            instance.validate(&packages)?;
+            if !instance_ids.insert(instance.id.clone()) {
+                bail!("execution.instances ids must be unique");
+            }
+        }
+
+        let mut phase_ids = std::collections::HashSet::new();
+        let mut ownership_domains = std::collections::HashSet::new();
+        let mut ownership_by_domain = std::collections::HashMap::new();
+        for entry in &self.ownership {
+            entry.validate(&packages)?;
+            if !ownership_domains.insert(entry.domain.clone()) {
+                bail!("ownership domains must be unique");
+            }
+            ownership_by_domain.insert(entry.domain.clone(), entry.owner.clone());
+        }
+
+        for phase in &self.phases {
+            if !phase_ids.insert(phase.id.clone()) {
+                bail!("execution.phases ids must be unique");
+            }
+            phase.validate(&instance_ids, &packages, &ownership_by_domain)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestOwnershipDomain {
+    pub domain: String,
+    pub owner: String,
+}
+
+impl ManifestOwnershipDomain {
+    fn validate(&self, packages: &std::collections::HashSet<String>) -> Result<()> {
+        ensure_non_empty(&self.domain, "ownership.domain")?;
+        ensure_non_empty(&self.owner, "ownership.owner")?;
+        if !packages.contains(self.owner.trim()) {
+            bail!(
+                "ownership domain '{}' references owner '{}' that is not declared in execution.packages",
+                self.domain,
+                self.owner
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestExecutionInstance {
+    pub id: String,
+    pub extension_id: String,
+    #[serde(default = "default_instance_name")]
+    pub name: String,
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
+}
+
+impl ManifestExecutionInstance {
+    fn validate(&self, packages: &std::collections::HashSet<String>) -> Result<()> {
+        ensure_non_empty(&self.id, "execution.instances.id")?;
+        ensure_non_empty(&self.extension_id, "execution.instances.extension_id")?;
+        ensure_non_empty(&self.name, "execution.instances.name")?;
+        if !packages.contains(self.extension_id.trim()) {
+            bail!(
+                "execution.instances '{}' references package '{}' that is not declared in execution.packages",
+                self.id,
+                self.extension_id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestExecutionPhase {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub barrier: bool,
+    #[serde(default)]
+    pub steps: Vec<ManifestExecutionStep>,
+}
+
+impl ManifestExecutionPhase {
+    fn validate(
+        &self,
+        instance_ids: &std::collections::HashSet<String>,
+        packages: &std::collections::HashSet<String>,
+        ownership_by_domain: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        ensure_non_empty(&self.id, "execution.phases.id")?;
+        if self.steps.is_empty() {
+            bail!(
+                "execution.phases '{}' must declare at least one step",
+                self.id
+            );
+        }
+        for step in &self.steps {
+            step.validate(instance_ids, packages, ownership_by_domain)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ManifestExecutionStep {
+    EnsurePackageInstalled {
+        extension_id: String,
+    },
+    EnsureInstanceInstalled {
+        instance: String,
+    },
+    EnsureRuntimeRunning {
+        instance: String,
+    },
+    CreateOrUpdateProviders {
+        instance: String,
+    },
+    TransportGate {
+        instance: String,
+        capability: String,
+        #[serde(default = "default_slot")]
+        slot: String,
+        #[serde(default = "default_health_gate_timeout")]
+        timeout_seconds: u64,
+    },
+    BootstrapGate {
+        instance: String,
+        capability: String,
+        #[serde(default = "default_slot")]
+        slot: String,
+        #[serde(default = "default_health_gate_timeout")]
+        timeout_seconds: u64,
+    },
+    HealthGate {
+        instance: String,
+        capability: String,
+        #[serde(default = "default_slot")]
+        slot: String,
+        #[serde(default = "default_health_gate_timeout")]
+        timeout_seconds: u64,
+    },
+    ApplyConnector {
+        connector_id: String,
+        target_instance: String,
+        target_capability: String,
+        #[serde(default = "default_slot")]
+        target_slot: String,
+        #[serde(default)]
+        ownership_domains: Vec<String>,
+    },
+    ApplyBinding {
+        consumer_instance: String,
+        consumer_capability: String,
+        #[serde(default = "default_slot")]
+        consumer_slot: String,
+        provider_instance: String,
+        provider_capability: String,
+        #[serde(default = "default_slot")]
+        provider_slot: String,
+        #[serde(default)]
+        reverse_probe: bool,
+    },
+}
+
+impl ManifestExecutionStep {
+    fn validate(
+        &self,
+        instance_ids: &std::collections::HashSet<String>,
+        packages: &std::collections::HashSet<String>,
+        ownership_by_domain: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        match self {
+            Self::EnsurePackageInstalled { extension_id } => {
+                ensure_non_empty(extension_id, "execution.steps.extension_id")?;
+                if !packages.contains(extension_id.trim()) {
+                    bail!(
+                        "execution step references package '{}' that is not declared in execution.packages",
+                        extension_id
+                    );
+                }
+            }
+            Self::EnsureInstanceInstalled { instance }
+            | Self::EnsureRuntimeRunning { instance }
+            | Self::CreateOrUpdateProviders { instance } => {
+                ensure_known_execution_instance(
+                    instance_ids,
+                    instance,
+                    "execution.steps.instance",
+                )?;
+            }
+            Self::TransportGate {
+                instance,
+                capability,
+                slot,
+                ..
+            }
+            | Self::BootstrapGate {
+                instance,
+                capability,
+                slot,
+                ..
+            }
+            | Self::HealthGate {
+                instance,
+                capability,
+                slot,
+                ..
+            } => {
+                ensure_known_execution_instance(
+                    instance_ids,
+                    instance,
+                    "execution.steps.instance",
+                )?;
+                ensure_non_empty(capability, "execution.steps.capability")?;
+                ensure_non_empty(slot, "execution.steps.slot")?;
+            }
+            Self::ApplyConnector {
+                connector_id,
+                target_instance,
+                target_capability,
+                target_slot,
+                ownership_domains,
+            } => {
+                ensure_non_empty(connector_id, "execution.steps.connector_id")?;
+                if !packages.contains(connector_id.trim()) {
+                    bail!(
+                        "execution step references connector '{}' that is not declared in execution.packages",
+                        connector_id
+                    );
+                }
+                ensure_known_execution_instance(
+                    instance_ids,
+                    target_instance,
+                    "execution.steps.target_instance",
+                )?;
+                ensure_non_empty(target_capability, "execution.steps.target_capability")?;
+                ensure_non_empty(target_slot, "execution.steps.target_slot")?;
+                if ownership_domains.is_empty() {
+                    bail!(
+                        "execution apply_connector '{}' must declare ownership_domains",
+                        connector_id
+                    );
+                }
+                let mut seen_domains = std::collections::HashSet::new();
+                for domain in ownership_domains {
+                    ensure_non_empty(domain, "execution.steps.ownership_domains")?;
+                    if !seen_domains.insert(domain.clone()) {
+                        bail!(
+                            "execution apply_connector '{}' must not repeat ownership domain '{}'",
+                            connector_id,
+                            domain
+                        );
+                    }
+                    let Some(owner) = ownership_by_domain.get(domain) else {
+                        bail!(
+                            "execution apply_connector '{}' references undeclared ownership domain '{}'",
+                            connector_id,
+                            domain
+                        );
+                    };
+                    if owner != connector_id {
+                        bail!(
+                            "execution apply_connector '{}' claims ownership domain '{}' owned by '{}'",
+                            connector_id,
+                            domain,
+                            owner
+                        );
+                    }
+                }
+            }
+            Self::ApplyBinding {
+                consumer_instance,
+                consumer_capability,
+                consumer_slot,
+                provider_instance,
+                provider_capability,
+                provider_slot,
+                ..
+            } => {
+                ensure_known_execution_instance(
+                    instance_ids,
+                    consumer_instance,
+                    "execution.steps.consumer_instance",
+                )?;
+                ensure_non_empty(consumer_capability, "execution.steps.consumer_capability")?;
+                ensure_non_empty(consumer_slot, "execution.steps.consumer_slot")?;
+                ensure_known_execution_instance(
+                    instance_ids,
+                    provider_instance,
+                    "execution.steps.provider_instance",
+                )?;
+                ensure_non_empty(provider_capability, "execution.steps.provider_capability")?;
+                ensure_non_empty(provider_slot, "execution.steps.provider_slot")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,12 +1289,10 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match extension_id {
-        "elixir.blueprints.arr_stack" => ensure_string_array_item_after(
-            raw_json,
-            "connectors",
-            "elixir.connectors.nzbget_defaults",
-            "elixir.connectors.qbittorrent_defaults",
-        ),
+        "elixir.blueprints.arr_stack" => false,
+        "elixir.connectors.prowlarr_sonarr_app" | "elixir.connectors.prowlarr_radarr_app" => {
+            remove_driver_patch_app_tags(raw_json)
+        }
         "elixir.connectors.qbittorrent_defaults" => repair_qbittorrent_defaults_manifest(raw_json),
         "elixir.connectors.nzbget_defaults" => repair_nzbget_defaults_manifest(raw_json),
         _ => false,
@@ -895,6 +1328,49 @@ fn repair_nzbget_defaults_manifest(root: &mut serde_json::Value) -> bool {
         set_driver_patch_string_field(root, "set_preferences", "queue_dir", NZBGET_QUEUE_DIR);
     repaired |= set_driver_patch_string_field(root, "set_preferences", "temp_dir", NZBGET_TEMP_DIR);
     repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
+    repaired
+}
+
+fn remove_driver_patch_app_tags(root: &mut serde_json::Value) -> bool {
+    let Some(actions) = root
+        .get_mut("actions")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut repaired = false;
+    for action in actions {
+        let Some(patch) = action.get_mut("patch") else {
+            continue;
+        };
+        let op = patch
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match op {
+            "register_app" => {
+                if let Some(app) = patch
+                    .get_mut("app")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    repaired |= app.remove("tags").is_some();
+                }
+            }
+            "register_apps" => {
+                if let Some(apps) = patch
+                    .get_mut("apps")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for app in apps {
+                        if let Some(object) = app.as_object_mut() {
+                            repaired |= object.remove("tags").is_some();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     repaired
 }
 
@@ -984,6 +1460,14 @@ fn default_slot() -> String {
     "default".to_string()
 }
 
+fn default_instance_name() -> String {
+    "default".to_string()
+}
+
+fn default_health_gate_timeout() -> u64 {
+    60
+}
+
 fn default_control_surface_adapter() -> String {
     "generic_v1".to_string()
 }
@@ -1023,6 +1507,22 @@ fn ensure_unique_control_ids(ids: &[&str], field: &str) -> Result<()> {
         if !seen.insert(normalized.clone()) {
             bail!("manifest {} contains duplicate id '{}'", field, value);
         }
+    }
+    Ok(())
+}
+
+fn ensure_known_execution_instance(
+    instance_ids: &std::collections::HashSet<String>,
+    value: &str,
+    field: &str,
+) -> Result<()> {
+    ensure_non_empty(value, field)?;
+    if !instance_ids.contains(value.trim()) {
+        bail!(
+            "manifest {} references unknown execution instance '{}'",
+            field,
+            value
+        );
     }
     Ok(())
 }
@@ -1145,6 +1645,75 @@ fn validate_scope_media_for_capability(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn manifest_accepts_container_backup_policy() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test
+provides:
+  - capability: media.manager.tv
+    slot: default
+    implementation: test
+    scope:
+      media_types: ["series"]
+      actions: ["add", "monitor", "search"]
+runtime:
+  type: container
+  image: test:latest
+  network: elixir_net
+  volumes:
+    - "{data}/test:/config"
+backup:
+  retention: 3
+  items:
+    - id: config
+      label: Test config
+      container_path: /config
+"#;
+        let manifest = parse_manifest_yaml(yaml).expect("manifest should parse");
+        let backup = manifest
+            .manifest
+            .backup
+            .expect("manifest should include backup policy");
+        assert_eq!(backup.retention, 3);
+        assert_eq!(backup.items.len(), 1);
+        assert_eq!(backup.items[0].container_path, "/config");
+    }
+
+    #[test]
+    fn manifest_rejects_relative_backup_path() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test
+provides:
+  - capability: media.manager.movies
+    slot: default
+    implementation: test
+    scope:
+      media_types: ["movie"]
+      actions: ["add", "monitor", "search"]
+runtime:
+  type: container
+  image: test:latest
+  network: elixir_net
+backup:
+  items:
+    - id: config
+      label: Test config
+      container_path: config
+"#;
+        let err =
+            parse_manifest_yaml(yaml).expect_err("manifest should reject relative backup paths");
+        assert!(
+            err.to_string()
+                .contains("backup.items.container_path must be absolute")
+        );
+    }
 
     #[test]
     fn manifest_accepts_wireguard_runtime_egress() {
@@ -1305,6 +1874,8 @@ control_surface:
             "id": "elixir.blueprints.arr_stack",
             "connectors": [
                 "elixir.connectors.prowlarr_public_indexers",
+                "elixir.connectors.prowlarr_sonarr_app",
+                "elixir.connectors.prowlarr_radarr_app",
                 "elixir.connectors.qbittorrent_defaults",
                 "elixir.connectors.sonarr_qbittorrent",
                 "elixir.connectors.sonarr_nzbget"
@@ -1326,6 +1897,8 @@ control_surface:
             values,
             vec![
                 "elixir.connectors.prowlarr_public_indexers",
+                "elixir.connectors.prowlarr_sonarr_app",
+                "elixir.connectors.prowlarr_radarr_app",
                 "elixir.connectors.qbittorrent_defaults",
                 "elixir.connectors.nzbget_defaults",
                 "elixir.connectors.sonarr_qbittorrent",
@@ -1341,6 +1914,7 @@ control_surface:
             "connectors": [
                 "elixir.connectors.qbittorrent_defaults",
                 "elixir.connectors.nzbget_defaults",
+                "elixir.connectors.prowlarr_radarr_app",
                 "elixir.connectors.sonarr_nzbget"
             ]
         });
@@ -1475,5 +2049,41 @@ control_surface:
                 .and_then(serde_json::Value::as_str),
             Some("/runtime/tmp")
         );
+    }
+
+    #[test]
+    fn repair_builtin_manifest_removes_prowlarr_app_tag_filters() {
+        for extension_id in [
+            "elixir.connectors.prowlarr_sonarr_app",
+            "elixir.connectors.prowlarr_radarr_app",
+        ] {
+            let mut raw = json!({
+                "id": extension_id,
+                "actions": [
+                    {
+                        "type": "driver_patch",
+                        "patch": {
+                            "op": "register_apps",
+                            "apps": [
+                                {
+                                    "name": "App",
+                                    "implementation": "App",
+                                    "url": "http://example:1234",
+                                    "categories": ["5000"],
+                                    "tags": ["elixir"],
+                                    "enabled": true
+                                }
+                            ]
+                        }
+                    }
+                ]
+            });
+
+            assert!(repair_builtin_manifest_json(&mut raw));
+            assert!(
+                raw.pointer("/actions/0/patch/apps/0/tags").is_none(),
+                "app tags should be removed for {extension_id}"
+            );
+        }
     }
 }

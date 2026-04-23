@@ -1,0 +1,449 @@
+id: elixir.blueprints.arr_stack
+version: 2.0.2
+kind: blueprint
+name: "Arr Stack"
+description: "Sonarr + Radarr + Prowlarr + Bazarr + FlareSolverr + Byparr + qBittorrent + NZBGet stack with explicit phased execution."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions: []
+execution:
+  packages:
+    - elixir.modules.sonarr
+    - elixir.modules.radarr
+    - elixir.modules.prowlarr
+    - elixir.modules.bazarr
+    - elixir.modules.flaresolverr
+    - elixir.modules.byparr
+    - elixir.modules.qbittorrent
+    - elixir.modules.nzbget
+    - elixir.connectors.prowlarr_public_indexers
+    - elixir.connectors.prowlarr_sonarr_app
+    - elixir.connectors.prowlarr_radarr_app
+    - elixir.connectors.prowlarr_antibot_proxies
+    - elixir.connectors.sonarr_defaults
+    - elixir.connectors.sonarr_quality_policy
+    - elixir.connectors.radarr_defaults
+    - elixir.connectors.radarr_quality_policy
+    - elixir.connectors.qbittorrent_defaults
+    - elixir.connectors.nzbget_defaults
+    - elixir.connectors.sonarr_qbittorrent
+    - elixir.connectors.radarr_qbittorrent
+    - elixir.connectors.sonarr_nzbget
+    - elixir.connectors.radarr_nzbget
+  instances:
+    - id: sonarr
+      extension_id: elixir.modules.sonarr
+      name: default
+    - id: radarr
+      extension_id: elixir.modules.radarr
+      name: default
+    - id: prowlarr
+      extension_id: elixir.modules.prowlarr
+      name: default
+    - id: bazarr
+      extension_id: elixir.modules.bazarr
+      name: default
+    - id: flaresolverr
+      extension_id: elixir.modules.flaresolverr
+      name: default
+    - id: byparr
+      extension_id: elixir.modules.byparr
+      name: default
+    - id: qbittorrent
+      extension_id: elixir.modules.qbittorrent
+      name: default
+    - id: nzbget
+      extension_id: elixir.modules.nzbget
+      name: default
+  ownership:
+    - domain: prowlarr.indexers.public
+      owner: elixir.connectors.prowlarr_public_indexers
+    - domain: prowlarr.apps.sonarr
+      owner: elixir.connectors.prowlarr_sonarr_app
+    - domain: prowlarr.apps.radarr
+      owner: elixir.connectors.prowlarr_radarr_app
+    - domain: prowlarr.proxies.antibot
+      owner: elixir.connectors.prowlarr_antibot_proxies
+    - domain: sonarr.defaults
+      owner: elixir.connectors.sonarr_defaults
+    - domain: sonarr.quality_policy.default
+      owner: elixir.connectors.sonarr_quality_policy
+    - domain: radarr.defaults
+      owner: elixir.connectors.radarr_defaults
+    - domain: radarr.quality_policy.default
+      owner: elixir.connectors.radarr_quality_policy
+    - domain: qbittorrent.defaults
+      owner: elixir.connectors.qbittorrent_defaults
+    - domain: nzbget.defaults
+      owner: elixir.connectors.nzbget_defaults
+    - domain: sonarr.download_clients.qbittorrent
+      owner: elixir.connectors.sonarr_qbittorrent
+    - domain: radarr.download_clients.qbittorrent
+      owner: elixir.connectors.radarr_qbittorrent
+    - domain: sonarr.download_clients.nzbget
+      owner: elixir.connectors.sonarr_nzbget
+    - domain: radarr.download_clients.nzbget
+      owner: elixir.connectors.radarr_nzbget
+  phases:
+    - id: install_packages
+      barrier: true
+      steps:
+        - type: ensure_package_installed
+          extension_id: elixir.modules.sonarr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.radarr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.prowlarr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.bazarr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.flaresolverr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.byparr
+        - type: ensure_package_installed
+          extension_id: elixir.modules.qbittorrent
+        - type: ensure_package_installed
+          extension_id: elixir.modules.nzbget
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.prowlarr_public_indexers
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.prowlarr_sonarr_app
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.prowlarr_radarr_app
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.prowlarr_antibot_proxies
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.sonarr_defaults
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.sonarr_quality_policy
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.radarr_defaults
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.radarr_quality_policy
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.qbittorrent_defaults
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.nzbget_defaults
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.sonarr_qbittorrent
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.radarr_qbittorrent
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.sonarr_nzbget
+        - type: ensure_package_installed
+          extension_id: elixir.connectors.radarr_nzbget
+    - id: create_instances
+      barrier: true
+      steps:
+        - type: ensure_instance_installed
+          instance: sonarr
+        - type: ensure_instance_installed
+          instance: radarr
+        - type: ensure_instance_installed
+          instance: prowlarr
+        - type: ensure_instance_installed
+          instance: bazarr
+        - type: ensure_instance_installed
+          instance: flaresolverr
+        - type: ensure_instance_installed
+          instance: byparr
+        - type: ensure_instance_installed
+          instance: qbittorrent
+        - type: ensure_instance_installed
+          instance: nzbget
+    - id: start_runtimes
+      barrier: true
+      steps:
+        - type: ensure_runtime_running
+          instance: sonarr
+        - type: ensure_runtime_running
+          instance: radarr
+        - type: ensure_runtime_running
+          instance: prowlarr
+        - type: ensure_runtime_running
+          instance: bazarr
+        - type: ensure_runtime_running
+          instance: flaresolverr
+        - type: ensure_runtime_running
+          instance: byparr
+        - type: ensure_runtime_running
+          instance: qbittorrent
+        - type: ensure_runtime_running
+          instance: nzbget
+    - id: register_providers
+      barrier: true
+      steps:
+        - type: create_or_update_providers
+          instance: sonarr
+        - type: create_or_update_providers
+          instance: radarr
+        - type: create_or_update_providers
+          instance: prowlarr
+        - type: create_or_update_providers
+          instance: bazarr
+        - type: create_or_update_providers
+          instance: flaresolverr
+        - type: create_or_update_providers
+          instance: byparr
+        - type: create_or_update_providers
+          instance: qbittorrent
+        - type: create_or_update_providers
+          instance: nzbget
+    - id: wait_transport
+      barrier: true
+      steps:
+        - type: transport_gate
+          instance: sonarr
+          capability: media.manager.tv
+          slot: default
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: radarr
+          capability: media.manager.movies
+          slot: default
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: prowlarr
+          capability: indexer.registry
+          slot: default
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: bazarr
+          capability: subtitles.manager
+          slot: default
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: flaresolverr
+          capability: indexer.proxy
+          slot: flaresolverr
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: byparr
+          capability: indexer.proxy
+          slot: byparr
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: qbittorrent
+          capability: downloader.torrent
+          slot: default
+          timeout_seconds: 120
+        - type: transport_gate
+          instance: nzbget
+          capability: downloader.nzb
+          slot: default
+          timeout_seconds: 120
+    - id: bootstrap_managed_providers
+      barrier: true
+      steps:
+        - type: bootstrap_gate
+          instance: sonarr
+          capability: media.manager.tv
+          slot: default
+          timeout_seconds: 120
+        - type: bootstrap_gate
+          instance: radarr
+          capability: media.manager.movies
+          slot: default
+          timeout_seconds: 120
+        - type: bootstrap_gate
+          instance: prowlarr
+          capability: indexer.registry
+          slot: default
+          timeout_seconds: 120
+        - type: bootstrap_gate
+          instance: qbittorrent
+          capability: downloader.torrent
+          slot: default
+          timeout_seconds: 120
+        - type: bootstrap_gate
+          instance: nzbget
+          capability: downloader.nzb
+          slot: default
+          timeout_seconds: 120
+    - id: wait_runtime_health
+      barrier: true
+      steps:
+        - type: health_gate
+          instance: sonarr
+          capability: media.manager.tv
+          slot: default
+          timeout_seconds: 120
+        - type: health_gate
+          instance: radarr
+          capability: media.manager.movies
+          slot: default
+          timeout_seconds: 120
+        - type: health_gate
+          instance: prowlarr
+          capability: indexer.registry
+          slot: default
+          timeout_seconds: 120
+        - type: health_gate
+          instance: bazarr
+          capability: subtitles.manager
+          slot: default
+          timeout_seconds: 120
+        - type: health_gate
+          instance: flaresolverr
+          capability: indexer.proxy
+          slot: flaresolverr
+          timeout_seconds: 120
+        - type: health_gate
+          instance: byparr
+          capability: indexer.proxy
+          slot: byparr
+          timeout_seconds: 120
+        - type: health_gate
+          instance: qbittorrent
+          capability: downloader.torrent
+          slot: default
+          timeout_seconds: 120
+        - type: health_gate
+          instance: nzbget
+          capability: downloader.nzb
+          slot: default
+          timeout_seconds: 120
+    - id: apply_wiring
+      barrier: true
+      steps:
+        - type: apply_connector
+          connector_id: elixir.connectors.prowlarr_public_indexers
+          target_instance: prowlarr
+          target_capability: indexer.registry
+          target_slot: default
+          ownership_domains: [prowlarr.indexers.public]
+        - type: apply_connector
+          connector_id: elixir.connectors.prowlarr_sonarr_app
+          target_instance: prowlarr
+          target_capability: indexer.registry
+          target_slot: default
+          ownership_domains: [prowlarr.apps.sonarr]
+        - type: apply_connector
+          connector_id: elixir.connectors.prowlarr_radarr_app
+          target_instance: prowlarr
+          target_capability: indexer.registry
+          target_slot: default
+          ownership_domains: [prowlarr.apps.radarr]
+        - type: apply_connector
+          connector_id: elixir.connectors.prowlarr_antibot_proxies
+          target_instance: prowlarr
+          target_capability: indexer.registry
+          target_slot: default
+          ownership_domains: [prowlarr.proxies.antibot]
+        - type: apply_connector
+          connector_id: elixir.connectors.sonarr_defaults
+          target_instance: sonarr
+          target_capability: media.manager.tv
+          target_slot: default
+          ownership_domains: [sonarr.defaults]
+        - type: apply_connector
+          connector_id: elixir.connectors.sonarr_quality_policy
+          target_instance: sonarr
+          target_capability: media.manager.tv
+          target_slot: default
+          ownership_domains: [sonarr.quality_policy.default]
+        - type: apply_connector
+          connector_id: elixir.connectors.radarr_defaults
+          target_instance: radarr
+          target_capability: media.manager.movies
+          target_slot: default
+          ownership_domains: [radarr.defaults]
+        - type: apply_connector
+          connector_id: elixir.connectors.radarr_quality_policy
+          target_instance: radarr
+          target_capability: media.manager.movies
+          target_slot: default
+          ownership_domains: [radarr.quality_policy.default]
+        - type: apply_connector
+          connector_id: elixir.connectors.qbittorrent_defaults
+          target_instance: qbittorrent
+          target_capability: downloader.torrent
+          target_slot: default
+          ownership_domains: [qbittorrent.defaults]
+        - type: apply_connector
+          connector_id: elixir.connectors.nzbget_defaults
+          target_instance: nzbget
+          target_capability: downloader.nzb
+          target_slot: default
+          ownership_domains: [nzbget.defaults]
+        - type: apply_connector
+          connector_id: elixir.connectors.sonarr_qbittorrent
+          target_instance: sonarr
+          target_capability: media.manager.tv
+          target_slot: default
+          ownership_domains: [sonarr.download_clients.qbittorrent]
+        - type: apply_connector
+          connector_id: elixir.connectors.radarr_qbittorrent
+          target_instance: radarr
+          target_capability: media.manager.movies
+          target_slot: default
+          ownership_domains: [radarr.download_clients.qbittorrent]
+        - type: apply_connector
+          connector_id: elixir.connectors.sonarr_nzbget
+          target_instance: sonarr
+          target_capability: media.manager.tv
+          target_slot: default
+          ownership_domains: [sonarr.download_clients.nzbget]
+        - type: apply_connector
+          connector_id: elixir.connectors.radarr_nzbget
+          target_instance: radarr
+          target_capability: media.manager.movies
+          target_slot: default
+          ownership_domains: [radarr.download_clients.nzbget]
+        - type: apply_binding
+          consumer_instance: sonarr
+          consumer_capability: media.manager.tv
+          consumer_slot: default
+          provider_instance: prowlarr
+          provider_capability: indexer.registry
+          provider_slot: default
+        - type: apply_binding
+          consumer_instance: sonarr
+          consumer_capability: media.manager.tv
+          consumer_slot: default
+          provider_instance: qbittorrent
+          provider_capability: downloader.torrent
+          provider_slot: default
+        - type: apply_binding
+          consumer_instance: sonarr
+          consumer_capability: media.manager.tv
+          consumer_slot: default
+          provider_instance: nzbget
+          provider_capability: downloader.nzb
+          provider_slot: default
+        - type: apply_binding
+          consumer_instance: radarr
+          consumer_capability: media.manager.movies
+          consumer_slot: default
+          provider_instance: prowlarr
+          provider_capability: indexer.registry
+          provider_slot: default
+        - type: apply_binding
+          consumer_instance: radarr
+          consumer_capability: media.manager.movies
+          consumer_slot: default
+          provider_instance: qbittorrent
+          provider_capability: downloader.torrent
+          provider_slot: default
+        - type: apply_binding
+          consumer_instance: radarr
+          consumer_capability: media.manager.movies
+          consumer_slot: default
+          provider_instance: nzbget
+          provider_capability: downloader.nzb
+          provider_slot: default
+optional_addons:
+  - extension_id: elixir.connectors.prowlarr_nzbgeek
+    title: "NZBGeek"
+    description: "Add your NZBGeek account to Prowlarr for more Usenet search results."
+    target:
+      capability: indexer.registry
+      slot: default
+    required_fields: ["api_key"]
+    secret_key_prefix: "indexer.nzbgeek"
+policies:
+  reuse_existing: true
+  conflicts: prompt
+  allow_community_extensions: true

@@ -49,7 +49,7 @@ impl Database {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
         let driver = DatabaseDriver::from_url(&config.url)?;
         if matches!(driver, DatabaseDriver::Sqlite) {
-            ensure_sqlite_parent_dir(&config.url).await?;
+            ensure_sqlite_file_ready(&config.url).await?;
         }
 
         // Enable default Any drivers (Postgres + SQLite). This is a no-op if already installed.
@@ -82,7 +82,7 @@ impl Database {
     }
 }
 
-async fn ensure_sqlite_parent_dir(url: &str) -> Result<()> {
+async fn ensure_sqlite_file_ready(url: &str) -> Result<()> {
     let Some(path) = sqlite_file_path(url) else {
         return Ok(());
     };
@@ -91,6 +91,12 @@ async fn ensure_sqlite_parent_dir(url: &str) -> Result<()> {
             .await
             .with_context(|| format!("creating sqlite directory {}", parent.display()))?;
     }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("creating sqlite database file {}", path.display()))?;
     Ok(())
 }
 

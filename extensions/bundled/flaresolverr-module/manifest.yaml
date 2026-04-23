@@ -1,0 +1,34 @@
+id: elixir.modules.flaresolverr
+version: 1.0.2
+kind: module
+name: "FlareSolverr"
+description: "Anti-bot solver module backed by FlareSolverr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: indexer.proxy
+    slot: flaresolverr
+    cardinality: one
+    implementation: flaresolverr
+requires: []
+conflicts:
+  - capability: indexer.proxy
+    slot: flaresolverr
+    policy: prompt_replace
+runtime:
+  type: container
+  image: "ghcr.io/flaresolverr/flaresolverr:v3.4.6"
+  network: "elixir_net"
+  service_name: "elx-flaresolverr"
+  ports:
+    - container: 8191
+      host: 0
+networking:
+  service_port:
+    scheme: http
+    container_port: 8191

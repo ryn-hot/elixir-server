@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::db::models::{
     Binding, BindingStatus, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind,
     ExtensionTrustLevel, OperationStep, OperationStepStatus, OrchestratorRun,
-    OrchestratorRunStatus, Provider, ProviderHealthState, RuntimeLog, Secret, SecretScope,
-    SlotCardinality,
+    OrchestratorRunStatus, Provider, ProviderHealthState, ProviderReadiness,
+    ProviderReadinessPhase, RuntimeLog, Secret, SecretScope, SlotCardinality,
 };
 use crate::extensions::ExternalIds;
 
@@ -79,7 +79,6 @@ pub struct NewDesiredBlueprint {
     pub blueprint_extension_id: String,
     pub blueprint_version: String,
     pub params_json: Option<serde_json::Value>,
-    pub decisions_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +539,14 @@ impl<'a> ExtensionStore<'a> {
         .bind(data.health_state.as_str())
         .execute(self.pool)
         .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO provider_readiness (provider_id, readiness_phase) VALUES (?, ?) \
+             ON CONFLICT(provider_id) DO NOTHING",
+        )
+        .bind(data.provider_id.to_string())
+        .bind(ProviderReadinessPhase::Unknown.as_str())
+        .execute(self.pool)
+        .await?;
         Ok(())
     }
 
@@ -603,6 +610,50 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn get_provider_readiness(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<Option<ProviderReadiness>> {
+        let row = sqlx::query(
+            "SELECT provider_id, readiness_phase, CAST(readiness_detail AS TEXT) as readiness_detail, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM provider_readiness WHERE provider_id = ? LIMIT 1",
+        )
+        .bind(provider_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| map_provider_readiness(&row)).transpose()
+    }
+
+    pub async fn list_provider_readiness(&self) -> Result<Vec<ProviderReadiness>> {
+        let rows = sqlx::query(
+            "SELECT provider_id, readiness_phase, CAST(readiness_detail AS TEXT) as readiness_detail, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM provider_readiness ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_provider_readiness(&row)?);
+        }
+        Ok(items)
+    }
+
+    pub async fn upsert_provider_readiness(
+        &self,
+        provider_id: Uuid,
+        readiness_phase: ProviderReadinessPhase,
+        readiness_detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO provider_readiness (provider_id, readiness_phase, readiness_detail, last_checked_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(provider_id) DO UPDATE SET readiness_phase = excluded.readiness_phase, readiness_detail = excluded.readiness_detail, last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(provider_id.to_string())
+        .bind(readiness_phase.as_str())
+        .bind(readiness_detail)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn delete_provider(&self, provider_id: Uuid) -> Result<()> {
         sqlx::query::<sqlx::Any>("DELETE FROM providers WHERE provider_id = ?")
             .bind(provider_id.to_string())
@@ -661,15 +712,13 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn create_desired_blueprint(&self, data: &NewDesiredBlueprint) -> Result<()> {
         let params_json = json_to_string(data.params_json.as_ref())?;
-        let decisions_json = json_to_string(data.decisions_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, decisions_json, applied) VALUES (?, ?, ?, ?, ?, 0)",
+            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, applied) VALUES (?, ?, ?, ?, 0)",
         )
         .bind(data.desired_id.to_string())
         .bind(&data.blueprint_extension_id)
         .bind(&data.blueprint_version)
         .bind(params_json)
-        .bind(decisions_json)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -677,21 +726,18 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn upsert_desired_blueprint(&self, data: &NewDesiredBlueprint) -> Result<()> {
         let params_json = json_to_string(data.params_json.as_ref())?;
-        let decisions_json = json_to_string(data.decisions_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, decisions_json, applied)
-             VALUES (?, ?, ?, ?, ?, 0)
+            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, applied)
+             VALUES (?, ?, ?, ?, 0)
              ON CONFLICT(desired_id) DO UPDATE SET
                 blueprint_extension_id = excluded.blueprint_extension_id,
                 blueprint_version = excluded.blueprint_version,
-                params_json = excluded.params_json,
-                decisions_json = excluded.decisions_json",
+                params_json = excluded.params_json",
         )
         .bind(data.desired_id.to_string())
         .bind(&data.blueprint_extension_id)
         .bind(&data.blueprint_version)
         .bind(params_json)
-        .bind(decisions_json)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -703,14 +749,14 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<Vec<DesiredBlueprint>> {
         let rows = if let Some(applied) = applied {
             sqlx::query(
-                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(decisions_json AS TEXT) as decisions_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints WHERE applied = ? ORDER BY created_at DESC",
+                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints WHERE applied = ? ORDER BY created_at DESC",
             )
             .bind(applied)
             .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(decisions_json AS TEXT) as decisions_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints ORDER BY created_at DESC",
+                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints ORDER BY created_at DESC",
             )
             .fetch_all(self.pool)
             .await?
@@ -727,22 +773,6 @@ impl<'a> ExtensionStore<'a> {
             "UPDATE desired_blueprints SET applied = ?, applied_at = CURRENT_TIMESTAMP WHERE desired_id = ?",
         )
         .bind(applied)
-        .bind(desired_id.to_string())
-        .execute(self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn update_desired_decisions(
-        &self,
-        desired_id: Uuid,
-        decisions_json: Option<serde_json::Value>,
-    ) -> Result<()> {
-        let decisions_json = json_to_string(decisions_json.as_ref())?;
-        sqlx::query::<sqlx::Any>(
-            "UPDATE desired_blueprints SET decisions_json = ? WHERE desired_id = ?",
-        )
-        .bind(decisions_json)
         .bind(desired_id.to_string())
         .execute(self.pool)
         .await?;
@@ -1954,16 +1984,6 @@ impl<'a> ExtensionStore<'a> {
             .await?;
         Ok(())
     }
-
-    pub async fn get_auto_wire_enabled(&self) -> Result<bool> {
-        let value = self.get_extension_setting("auto_wire_enabled").await?;
-        Ok(value.and_then(|value| value.as_bool()).unwrap_or(true))
-    }
-
-    pub async fn set_auto_wire_enabled(&self, enabled: bool) -> Result<()> {
-        self.upsert_extension_setting("auto_wire_enabled", &serde_json::json!(enabled))
-            .await
-    }
 }
 
 fn json_to_string(value: Option<&serde_json::Value>) -> Result<Option<String>> {
@@ -2079,6 +2099,25 @@ fn map_provider_detail(row: &AnyRow) -> Result<ProviderDetails> {
     })
 }
 
+fn map_provider_readiness(row: &AnyRow) -> Result<ProviderReadiness> {
+    let provider_id_raw: String = row.try_get("provider_id")?;
+    let readiness_phase_raw: String = row.try_get("readiness_phase")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(ProviderReadiness {
+        provider_id: parse_uuid(&provider_id_raw, "provider_readiness.provider_id")?,
+        readiness_phase: parse_enum(&readiness_phase_raw, "provider_readiness.readiness_phase")?,
+        readiness_detail: row_get_opt_string(row, "readiness_detail")?,
+        last_checked_at: parse_datetime_opt(
+            row_get_opt_string(row, "last_checked_at")?,
+            "provider_readiness.last_checked_at",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "provider_readiness.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "provider_readiness.updated_at")?,
+    })
+}
+
 fn map_binding(row: &AnyRow) -> Result<Binding> {
     let binding_id_raw: String = row.try_get("binding_id")?;
     let consumer_id_raw: String = row.try_get("consumer_provider_id")?;
@@ -2119,10 +2158,6 @@ fn map_desired_blueprint(row: &AnyRow) -> Result<DesiredBlueprint> {
         params_json: parse_json_opt(
             row_get_opt_string(row, "params_json")?,
             "desired_blueprints.params_json",
-        )?,
-        decisions_json: parse_json_opt(
-            row_get_opt_string(row, "decisions_json")?,
-            "desired_blueprints.decisions_json",
         )?,
         applied: row_get_bool(row, "applied")?,
         created_at: parse_datetime(&created_at_raw, "desired_blueprints.created_at")?,

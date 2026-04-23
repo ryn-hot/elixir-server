@@ -21,6 +21,18 @@ pub struct DockerRuntimeManager {
     docker_bin: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DockerImageMetadata {
+    pub repo_digests: Vec<String>,
+    pub labels: HashMap<String, String>,
+}
+
+fn bind_mount_source_matches(desired_source: &str, actual_source: &str) -> bool {
+    let desired = DockerRuntimeManager::normalized_bind_mount_sources(desired_source);
+    let actual = DockerRuntimeManager::normalized_bind_mount_sources(actual_source);
+    !desired.is_disjoint(&actual)
+}
+
 #[derive(Debug)]
 struct ContainerMount {
     mount_type: String,
@@ -138,6 +150,105 @@ impl DockerRuntimeManager {
         Ok(version.to_string())
     }
 
+    pub async fn pull_image(&self, image: &str) -> Result<()> {
+        self.run_capture(&["pull".to_string(), image.to_string()])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn inspect_image_metadata(&self, image: &str) -> Result<DockerImageMetadata> {
+        let stdout = self
+            .run_stdout(&[
+                "image".to_string(),
+                "inspect".to_string(),
+                image.to_string(),
+            ])
+            .await?;
+        let values: Vec<Value> =
+            serde_json::from_str(&stdout).context("parsing docker image inspect output")?;
+        let value = values
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("docker image inspect returned no entries"))?;
+        let repo_digests = value
+            .get("RepoDigests")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let labels = value
+            .get("Config")
+            .and_then(|config| config.get("Labels"))
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        Ok(DockerImageMetadata {
+            repo_digests,
+            labels,
+        })
+    }
+
+    pub async fn copy_named_volume_path_to_host(
+        &self,
+        helper_image: &str,
+        volume_name: &str,
+        volume_path: &str,
+        destination_path: &Path,
+    ) -> Result<()> {
+        fs::create_dir_all(destination_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "creating backup destination directory {}",
+                    destination_path.display()
+                )
+            })?;
+        let helper = self
+            .create_named_volume_helper(helper_image, volume_name, volume_path)
+            .await?;
+        let result = self
+            .copy_container_path_to_host(&helper, volume_path, destination_path)
+            .await;
+        let cleanup = self.remove_container(&helper).await;
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    pub async fn replace_named_volume_path_from_host(
+        &self,
+        helper_image: &str,
+        volume_name: &str,
+        volume_path: &str,
+        source_path: &Path,
+    ) -> Result<()> {
+        let helper = self
+            .create_named_volume_helper(helper_image, volume_name, volume_path)
+            .await?;
+        let result = async {
+            self.clear_helper_path(&helper, volume_path).await?;
+            self.copy_host_path_to_container(&helper, source_path, volume_path)
+                .await
+        }
+        .await;
+        let cleanup = self.remove_container(&helper).await;
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
     pub async fn ensure_daemon_available(
         &self,
         config: &DockerStartupConfig,
@@ -244,6 +355,66 @@ impl DockerRuntimeManager {
         let stdout = self.run_stdout(&args).await?;
         let id = stdout.lines().next().map(|s| s.trim().to_string());
         Ok(id.filter(|s| !s.is_empty()))
+    }
+
+    async fn create_named_volume_helper(
+        &self,
+        helper_image: &str,
+        volume_name: &str,
+        volume_path: &str,
+    ) -> Result<ContainerHandle> {
+        let helper_name = format!("elixir-volhelper-{}", Uuid::new_v4().simple());
+        let args = vec![
+            "run".to_string(),
+            "-d".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            helper_name.clone(),
+            "-v".to_string(),
+            format!("{volume_name}:{volume_path}"),
+            helper_image.to_string(),
+            "sh".to_string(),
+            "-lc".to_string(),
+            "trap 'exit 0' TERM INT; while true; do sleep 3600; done".to_string(),
+        ];
+        let stdout = self.run_stdout(&args).await?;
+        let id = stdout.lines().next().unwrap_or_default().trim().to_string();
+        if id.is_empty() {
+            bail!("docker run did not return a helper container id");
+        }
+        Ok(ContainerHandle {
+            id,
+            name: helper_name,
+        })
+    }
+
+    async fn copy_container_path_to_host(
+        &self,
+        handle: &ContainerHandle,
+        source_path: &str,
+        destination_path: &Path,
+    ) -> Result<()> {
+        let args = vec![
+            "cp".to_string(),
+            format!("{}:{}/.", handle.name, source_path.trim_end_matches('/')),
+            destination_path.to_string_lossy().to_string(),
+        ];
+        self.run_capture(&args).await?;
+        Ok(())
+    }
+
+    async fn clear_helper_path(&self, handle: &ContainerHandle, path: &str) -> Result<()> {
+        let args = vec![
+            "exec".to_string(),
+            handle.name.clone(),
+            "sh".to_string(),
+            "-lc".to_string(),
+            "set -e; target=\"$1\"; mkdir -p \"$target\"; find \"$target\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +".to_string(),
+            "elixir-volume-helper".to_string(),
+            path.to_string(),
+        ];
+        self.run_capture(&args).await?;
+        Ok(())
     }
 
     async fn inspect_container(&self, name: &str) -> Result<Value> {
@@ -391,13 +562,53 @@ impl DockerRuntimeManager {
         match desired.source_kind {
             VolumeMountSourceKind::Bind => {
                 actual.mount_type == "bind"
-                    && actual.source.as_deref() == Some(desired.host_path.as_str())
+                    && actual.source.as_deref().is_some_and(|actual_source| {
+                        bind_mount_source_matches(desired.host_path.as_str(), actual_source)
+                    })
             }
             VolumeMountSourceKind::NamedVolume => {
                 actual.mount_type == "volume"
                     && actual.name.as_deref() == Some(desired.host_path.as_str())
             }
         }
+    }
+
+    fn normalized_bind_mount_sources(path: &str) -> HashSet<String> {
+        let mut candidates = HashSet::new();
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return candidates;
+        }
+
+        candidates.insert(trimmed.to_string());
+
+        if let Some(stripped) = trimmed.strip_prefix("/host_mnt") {
+            let normalized = if stripped.is_empty() { "/" } else { stripped };
+            candidates.insert(normalized.to_string());
+        }
+
+        if let Some(stripped) = trimmed.strip_prefix("/private") {
+            let normalized = if stripped.is_empty() { "/" } else { stripped };
+            candidates.insert(normalized.to_string());
+        }
+
+        if !trimmed.starts_with("/private/")
+            && (trimmed == "/tmp"
+                || trimmed.starts_with("/tmp/")
+                || trimmed == "/var"
+                || trimmed.starts_with("/var/"))
+        {
+            candidates.insert(format!("/private{trimmed}"));
+        }
+
+        let current: Vec<String> = candidates.iter().cloned().collect();
+        for candidate in current {
+            if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+                candidates.insert(canonical.to_string_lossy().to_string());
+            }
+        }
+
+        candidates
     }
 
     fn aliases_conflict(spec: &ContainerSpec, value: &Value) -> bool {
@@ -512,12 +723,25 @@ impl DockerRuntimeManager {
             name.to_string(),
         ];
         let existed = self.run_capture(&inspect_args).await.is_ok();
+        let mut recreated = false;
         if existed {
             let remove_args = vec!["network".to_string(), "rm".to_string(), name.to_string()];
-            self.run_capture(&remove_args).await?;
+            match self.run_capture(&remove_args).await {
+                Ok(_) => {
+                    recreated = true;
+                }
+                Err(err) if network_has_attached_endpoints_error(&err) => {
+                    tracing::warn!(
+                        "docker runtime: leaving managed network '{}' in place because Docker still reports attached endpoints: {}",
+                        name,
+                        err
+                    );
+                }
+                Err(err) => return Err(err),
+            }
         }
         self.ensure_network(name).await?;
-        Ok(existed)
+        Ok(recreated)
     }
 
     pub async fn restart_docker_runtime(
@@ -1160,6 +1384,13 @@ fn is_docker_daemon_unavailable(err: &anyhow::Error) -> bool {
                 || message.contains("no such file or directory")))
 }
 
+fn network_has_attached_endpoints_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("active endpoints")
+        || message.contains("has endpoints")
+        || (message.contains("error while removing network") && message.contains("endpoint"))
+}
+
 pub fn classify_docker_runtime_failure(err: &anyhow::Error) -> Option<DockerRuntimeFailureKind> {
     let message = err.to_string().to_ascii_lowercase();
     if message.contains("docker.raw.sock")
@@ -1374,6 +1605,24 @@ mod tests {
     }
 
     #[test]
+    fn bind_mount_matching_normalizes_docker_desktop_host_mnt_prefix() {
+        let desired = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: "/Users/tester/elixir/media/tv".to_string(),
+            container_path: "/tv".to_string(),
+            read_only: false,
+        };
+        let actual = ContainerMount {
+            mount_type: "bind".to_string(),
+            source: Some("/host_mnt/Users/tester/elixir/media/tv".to_string()),
+            name: None,
+            destination: "/tv".to_string(),
+            read_only: false,
+        };
+        assert!(DockerRuntimeManager::mount_matches(&desired, &actual));
+    }
+
+    #[test]
     fn required_labels_enforced() {
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), "id".to_string());
@@ -1404,6 +1653,14 @@ mod tests {
             classify_docker_runtime_failure(&missing),
             Some(DockerRuntimeFailureKind::DesktopGuestSocketMissing)
         );
+    }
+
+    #[test]
+    fn active_endpoint_network_errors_are_detected() {
+        let err = anyhow::anyhow!(
+            "docker network rm elixir_net failed (status Some(1)): Error response from daemon: error while removing network: network elixir_net id 123 has active endpoints"
+        );
+        assert!(network_has_attached_endpoints_error(&err));
     }
 
     #[test]

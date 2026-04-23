@@ -16,7 +16,8 @@ use crate::drivers::{
 use crate::extensions::managed_paths::{
     DOWNLOADS_ANIME_DIR, DOWNLOADS_MOVIES_DIR, DOWNLOADS_TV_DIR, NZBGET_CONFIG_TEMPLATE,
     NZBGET_INCOMPLETE_DIR, NZBGET_LOCK_FILE, NZBGET_LOG_FILE, NZBGET_MAIN_DIR, NZBGET_NZB_DIR,
-    NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR, NZBGET_WEB_DIR,
+    NZBGET_QUEUE_DIR, NZBGET_REQUIRED_MANAGED_PATHS, NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR,
+    NZBGET_WEB_DIR,
 };
 use tokio::fs;
 use tokio::time::{Duration, sleep};
@@ -161,6 +162,8 @@ impl CapabilityDriver for DownloaderNzbDriver {
             NzbgetClient::from_config(NzbgetDriverConfig::from_ctx(&ctx)?, ctx.canonical_url()?)
                 .await?;
         let version = client.version().await?;
+        let config = client.read_config().await?;
+        ensure_nzbget_managed_config_ready(&ctx, &config)?;
         let status = client.status().await?;
         let groups = client.list_groups().await?;
         let activity = summarize_nzbget_activity(&status, &groups);
@@ -962,6 +965,8 @@ struct CategorySlot {
     dest_dir: String,
 }
 
+const NZBGET_CATEGORY_SLOT_LIMIT: u32 = 15;
+
 fn category_slots(config: &[NzbgetConfigItem]) -> BTreeMap<u32, CategorySlot> {
     let mut slots = BTreeMap::new();
     for item in config {
@@ -987,33 +992,45 @@ fn build_category_slot_updates(
     }
 
     let mut slots = category_slots(config);
-    if slots.is_empty() {
-        for index in 1..=15 {
-            slots.insert(index, CategorySlot::default());
-        }
+    for index in 1..=NZBGET_CATEGORY_SLOT_LIMIT {
+        slots.entry(index).or_insert_with(CategorySlot::default);
     }
 
     let mut used_slots = HashSet::new();
     let mut updates = Vec::new();
-    for category in categories {
+    for (index, category) in categories.iter().enumerate() {
         let desired = normalize_name(&category.name);
+        let preferred_slot = (index as u32) + 1;
         let selected_slot = slots
             .iter()
             .find_map(|(slot, current)| {
-                if normalize_name(&current.name) == desired {
+                if used_slots.contains(slot) {
+                    None
+                } else if normalize_name(&current.name) == desired {
                     Some(*slot)
                 } else {
                     None
                 }
             })
             .or_else(|| {
+                slots
+                    .get(&preferred_slot)
+                    .filter(|current| {
+                        !used_slots.contains(&preferred_slot)
+                            && category_slot_can_be_claimed(
+                                preferred_slot,
+                                current,
+                                categories.len(),
+                            )
+                    })
+                    .map(|_| preferred_slot)
+            })
+            .or_else(|| {
                 slots.iter().find_map(|(slot, current)| {
-                    if used_slots.contains(slot) {
+                    if used_slots.contains(slot) || !current.name.trim().is_empty() {
                         None
-                    } else if current.name.trim().is_empty() {
-                        Some(*slot)
                     } else {
-                        None
+                        Some(*slot)
                     }
                 })
             })
@@ -1040,6 +1057,24 @@ fn build_category_slot_updates(
     }
 
     Ok(updates)
+}
+
+fn category_slot_can_be_claimed(slot: u32, current: &CategorySlot, managed_count: usize) -> bool {
+    current.name.trim().is_empty()
+        || is_replaceable_upstream_category_slot(slot, current, managed_count)
+}
+
+fn is_replaceable_upstream_category_slot(
+    slot: u32,
+    current: &CategorySlot,
+    managed_count: usize,
+) -> bool {
+    slot as usize <= managed_count
+        && current.dest_dir.trim().is_empty()
+        && matches!(
+            normalize_name(&current.name).as_str(),
+            "movies" | "series" | "music" | "software"
+        )
 }
 
 fn build_live_category_updates(
@@ -1414,6 +1449,33 @@ fn nzbget_managed_defaults_enabled(ctx: &DriverCtx) -> bool {
         .as_ref()
         .and_then(|value| value.get("managed_defaults"))
         .is_some()
+}
+
+fn ensure_nzbget_managed_config_ready(ctx: &DriverCtx, config: &[NzbgetConfigItem]) -> Result<()> {
+    if !nzbget_managed_defaults_enabled(ctx) {
+        return Ok(());
+    }
+
+    let actual = config
+        .iter()
+        .map(|item| (item.name.as_str(), item.value.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let drifted = NZBGET_REQUIRED_MANAGED_PATHS
+        .iter()
+        .filter_map(|(name, expected)| match actual.get(name).copied() {
+            Some(value) if value == *expected => None,
+            Some(value) => Some(format!("{name}={value}")),
+            None => Some(format!("{name}=<missing>")),
+        })
+        .collect::<Vec<_>>();
+    if drifted.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "nzbget managed config drifted for keys: {}",
+            drifted.join(", ")
+        )
+    }
 }
 
 fn parse_server_option(name: &str) -> Option<(u32, &str)> {
@@ -1850,7 +1912,7 @@ mod tests {
     };
 
     use crate::drivers::patches::DownloadCategorySpec;
-    use crate::drivers::{CapabilityDriver, DownloaderNzbPatch};
+    use crate::drivers::{CapabilityDriver, DownloaderNzbPatch, DriftStatus};
     use anyhow::Result;
     use axum::{Json, Router, response::IntoResponse, routing::post};
     use serde_json::{Value, json};
@@ -1935,6 +1997,22 @@ mod tests {
                 .unwrap_or_default();
             let result = match method {
                 "version" => json!("24.3"),
+                "config" => json!([
+                    { "Name": "MainDir", "Value": "/config" },
+                    { "Name": "DestDir", "Value": "/downloads" },
+                    { "Name": "InterDir", "Value": "/runtime/incomplete" },
+                    { "Name": "NzbDir", "Value": "/runtime/nzb" },
+                    { "Name": "QueueDir", "Value": "/runtime/queue" },
+                    { "Name": "TempDir", "Value": "/runtime/tmp" },
+                    { "Name": "ScriptDir", "Value": "/config/scripts" },
+                    { "Name": "LogFile", "Value": "/config/nzbget.log" },
+                    { "Name": "WebDir", "Value": "/app/nzbget/webui" },
+                    {
+                        "Name": "ConfigTemplate",
+                        "Value": "/app/nzbget/webui/nzbget.conf.template"
+                    },
+                    { "Name": "LockFile", "Value": "/config/nzbget.lock" }
+                ]),
                 "status" => json!({
                     "DownloadRate": 3145728u64,
                     "DownloadedSizeLo": 268435456u64,
@@ -2003,6 +2081,86 @@ mod tests {
             snapshot.summary.as_deref(),
             Some("NZBGet 24.3 · downloading · 1 issue")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_state_rejects_managed_nzbget_when_required_paths_drift() -> Result<()> {
+        async fn rpc(Json(body): Json<Value>) -> Json<Value> {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = match method {
+                "version" => json!("24.3"),
+                "config" => json!([
+                    { "Name": "MainDir", "Value": "/config" },
+                    { "Name": "DestDir", "Value": "/root/downloads/dst" },
+                    { "Name": "InterDir", "Value": "/runtime/incomplete" },
+                    { "Name": "NzbDir", "Value": "/runtime/nzb" },
+                    { "Name": "QueueDir", "Value": "/runtime/queue" },
+                    { "Name": "TempDir", "Value": "/runtime/tmp" }
+                ]),
+                "status" => json!({
+                    "DownloadRate": 0u64,
+                    "DownloadedSizeLo": 0u64,
+                    "DownloadedSizeHi": 0u64,
+                    "PostJobCount": 0u64,
+                    "ServerStandBy": true,
+                    "DownloadPaused": true,
+                    "PostPaused": true
+                }),
+                "listgroups" => json!([]),
+                other => json!({ "unexpected": other }),
+            };
+            Json(json!({
+                "version": "1.1",
+                "result": result,
+                "error": Value::Null,
+                "id": 1
+            }))
+        }
+
+        let app = Router::new().route("/jsonrpc", post(rpc));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget server");
+        });
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-nzbget-default".to_string(),
+            addr.port(),
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{}", addr.port())),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret",
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "balanced-v5"
+                }
+            })),
+            HashMap::new(),
+        );
+
+        let err = DownloaderNzbDriver::new()
+            .read_state(ctx)
+            .await
+            .expect_err("managed path drift should fail readiness");
+        let detail = err.to_string();
+        assert!(detail.contains("DestDir=/root/downloads/dst"));
+        assert!(detail.contains("ScriptDir=<missing>"));
         Ok(())
     }
 
@@ -3529,6 +3687,62 @@ mod tests {
     }
 
     #[test]
+    fn render_nzbget_config_patch_replaces_upstream_default_categories_for_named_volume_text()
+    -> Result<()> {
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            None,
+            Some("nzbget".to_string()),
+            Some(json!({
+                "managed_defaults": {
+                    "nzbget_performance_profile_version": "aggressive-v4"
+                }
+            })),
+            HashMap::new(),
+        );
+
+        let rendered = render_nzbget_config_patch(
+            &ctx,
+            "Category1.Name=Movies\nCategory1.DestDir=\nCategory2.Name=Series\nCategory3.Name=Music\nCategory4.Name=Software\n",
+            &DownloaderNzbPatch::SetCategories {
+                categories: vec![
+                    DownloadCategorySpec {
+                        name: "tv".to_string(),
+                        save_path: Some("/downloads/tv".to_string()),
+                    },
+                    DownloadCategorySpec {
+                        name: "anime".to_string(),
+                        save_path: Some("/downloads/anime".to_string()),
+                    },
+                    DownloadCategorySpec {
+                        name: "movies".to_string(),
+                        save_path: Some("/downloads/movies".to_string()),
+                    },
+                ],
+            },
+        )?
+        .expect("managed config should replace upstream default category slots");
+
+        assert!(rendered.contains("Category1.Name=tv"));
+        assert!(rendered.contains("Category1.DestDir=/downloads/tv"));
+        assert!(rendered.contains("Category2.Name=anime"));
+        assert!(rendered.contains("Category2.DestDir=/downloads/anime"));
+        assert!(rendered.contains("Category3.Name=movies"));
+        assert!(rendered.contains("Category3.DestDir=/downloads/movies"));
+        Ok(())
+    }
+
+    #[test]
     fn render_nzbget_config_patch_set_preferences_restores_managed_categories_for_named_volume_text()
     -> Result<()> {
         let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
@@ -3592,6 +3806,79 @@ mod tests {
         assert!(rendered.contains("Category1.Name=tv"));
         assert!(rendered.contains("Category2.Name=anime"));
         assert!(rendered.contains("Category3.Name=movies"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evaluate_patch_set_categories_handles_upstream_default_named_volume_categories()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir)?;
+        let config_path = config_dir.join("nzbget.conf");
+        std::fs::write(
+            &config_path,
+            "MainDir=/config\nDestDir=/downloads\nCategory1.Name=Movies\nCategory1.DestDir=\nCategory2.Name=Series\nCategory3.Name=Music\nCategory4.Name=Software\n",
+        )?;
+
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let mut secrets = HashMap::new();
+        secrets.insert("nzbget_username".to_string(), "elixir".to_string());
+        secrets.insert("nzbget_password".to_string(), "secret".to_string());
+        let ctx = DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some("http://127.0.0.1:6789".to_string()),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "runtime": {
+                    "config_dir": config_dir.to_string_lossy()
+                }
+            })),
+            secrets,
+        );
+
+        let evaluation = DownloaderNzbDriver::new()
+            .evaluate_patch(
+                ctx,
+                crate::drivers::DriverPatch::DownloaderNzb(
+                    crate::drivers::DownloaderNzbPatch::SetCategories {
+                        categories: vec![
+                            DownloadCategorySpec {
+                                name: "tv".to_string(),
+                                save_path: Some("/downloads/tv".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "anime".to_string(),
+                                save_path: Some("/downloads/anime".to_string()),
+                            },
+                            DownloadCategorySpec {
+                                name: "movies".to_string(),
+                                save_path: Some("/downloads/movies".to_string()),
+                            },
+                        ],
+                    },
+                ),
+            )
+            .await?;
+
+        assert_eq!(evaluation.status, DriftStatus::Drifted);
+        assert!(
+            evaluation
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Category1.Name"),
+            "expected drift message to describe managed category repairs"
+        );
         Ok(())
     }
 }

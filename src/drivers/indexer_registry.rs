@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::drivers::patches::{AppSpec, IndexerRegistryPatch, IndexerSpec};
+use crate::drivers::patches::{AppSpec, IndexerProxySpec, IndexerRegistryPatch, IndexerSpec};
 use crate::drivers::{
     ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx, DriverPatch, PatchSemantics,
     PatchSideEffect, StateSnapshot,
@@ -62,6 +62,10 @@ impl CapabilityDriver for IndexerRegistryDriver {
             IndexerRegistryPatch::RegisterIndexers { indexers } => Ok(drift_evaluation(
                 "Prowlarr indexers",
                 client.evaluate_indexers(&indexers).await?,
+            )),
+            IndexerRegistryPatch::RegisterIndexerProxies { proxies } => Ok(drift_evaluation(
+                "Prowlarr indexer proxies",
+                client.evaluate_indexer_proxies(&proxies).await?,
             )),
             IndexerRegistryPatch::RegisterApp { app } => Ok(drift_evaluation(
                 "Prowlarr apps",
@@ -129,6 +133,9 @@ impl CapabilityDriver for IndexerRegistryDriver {
         match patch {
             IndexerRegistryPatch::RegisterIndexers { indexers } => {
                 client.upsert_indexers(&indexers).await?;
+            }
+            IndexerRegistryPatch::RegisterIndexerProxies { proxies } => {
+                client.upsert_indexer_proxies(&proxies).await?;
             }
             IndexerRegistryPatch::RegisterApp { app } => {
                 client.upsert_apps(&[app], &provider_endpoint_url).await?;
@@ -358,6 +365,77 @@ impl ProwlarrClient {
         Ok(())
     }
 
+    async fn upsert_indexer_proxies(&self, proxies: &[IndexerProxySpec]) -> Result<()> {
+        if proxies.is_empty() {
+            return Ok(());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexerProxy/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexerProxy").await?;
+        let mut unsupported: Vec<(String, String)> = Vec::new();
+        let mut realized = 0usize;
+
+        for proxy in proxies {
+            let existing_item = find_indexer_proxy_by_identity(&existing, proxy);
+            let schema_item = find_schema_optional(&schema, &proxy.implementation);
+            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
+            else {
+                unsupported.push((proxy.name.clone(), proxy.implementation.clone()));
+                continue;
+            };
+
+            let tags = if proxy.tags.is_empty() {
+                Vec::new()
+            } else {
+                self.ensure_tags(&proxy.tags).await?
+            };
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_or_existing,
+            };
+            set_enabled_if_present(&mut target, proxy.enabled.unwrap_or(true))?;
+            set_string(&mut target, "name", proxy.name.clone())?;
+            if target.get("tags").is_some() || !tags.is_empty() {
+                set_array_i64(&mut target, "tags", &tags)?;
+            }
+            ensure_schema_fields(&mut target, &proxy.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer proxy fields missing"))?;
+            apply_indexer_proxy_fields(fields, proxy)?;
+
+            if existing_item.as_ref() == Some(&target) {
+                realized += 1;
+                continue;
+            }
+
+            if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                let path = format!("indexerProxy/{id}");
+                self.put_json(&path, &target).await?;
+            } else {
+                remove_readonly_fields(&mut target);
+                self.post_json("indexerProxy", &target).await?;
+            }
+            realized += 1;
+        }
+
+        if !unsupported.is_empty() {
+            bail!(
+                "prowlarr schema does not support requested indexer proxies: {}",
+                unsupported
+                    .iter()
+                    .map(|(name, implementation)| format!("{name} ({implementation})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if realized == 0 {
+            bail!("prowlarr did not apply any requested indexer proxies");
+        }
+        Ok(())
+    }
+
     async fn upsert_apps(&self, apps: &[AppSpec], prowlarr_url: &str) -> Result<()> {
         if apps.is_empty() {
             return Ok(());
@@ -380,7 +458,7 @@ impl ProwlarrClient {
             let enabled = app.enabled.unwrap_or(true);
             set_enabled(&mut target, enabled)?;
             set_string(&mut target, "name", app.name.clone())?;
-            if !tags.is_empty() {
+            if target.get("tags").is_some() || !tags.is_empty() {
                 set_array_i64(&mut target, "tags", &tags)?;
             }
             ensure_schema_fields(&mut target, &app.implementation)?;
@@ -546,6 +624,54 @@ impl ProwlarrClient {
         Ok(dedup_strings(drift))
     }
 
+    async fn evaluate_indexer_proxies(&self, proxies: &[IndexerProxySpec]) -> Result<Vec<String>> {
+        if proxies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.get_json::<Vec<Value>>("indexerProxy/schema").await?;
+        let existing = self.get_json::<Vec<Value>>("indexerProxy").await?;
+        let mut drift = Vec::new();
+
+        for proxy in proxies {
+            let (tags, missing_tags) = self.resolve_existing_tag_ids(&proxy.tags).await?;
+            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+
+            let existing_item = find_indexer_proxy_by_identity(&existing, proxy);
+            let schema_item = find_schema_optional(&schema, &proxy.implementation);
+            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
+            else {
+                bail!(
+                    "prowlarr schema does not support requested indexer proxy '{}' ({})",
+                    proxy.name,
+                    proxy.implementation
+                );
+            };
+
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => schema_or_existing,
+            };
+            set_enabled_if_present(&mut target, proxy.enabled.unwrap_or(true))?;
+            set_string(&mut target, "name", proxy.name.clone())?;
+            if target.get("tags").is_some() || !tags.is_empty() {
+                set_array_i64(&mut target, "tags", &tags)?;
+            }
+            ensure_schema_fields(&mut target, &proxy.implementation)?;
+
+            let fields = target
+                .get_mut("fields")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("indexer proxy fields missing"))?;
+            apply_indexer_proxy_fields(fields, proxy)?;
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(proxy.name.clone());
+            }
+        }
+
+        Ok(dedup_strings(drift))
+    }
+
     async fn evaluate_apps(&self, apps: &[AppSpec], prowlarr_url: &str) -> Result<Vec<String>> {
         if apps.is_empty() {
             return Ok(Vec::new());
@@ -567,7 +693,7 @@ impl ProwlarrClient {
             let enabled = app.enabled.unwrap_or(true);
             set_enabled(&mut target, enabled)?;
             set_string(&mut target, "name", app.name.clone())?;
-            if !tags.is_empty() {
+            if target.get("tags").is_some() || !tags.is_empty() {
                 set_array_i64(&mut target, "tags", &tags)?;
             }
             ensure_schema_fields(&mut target, &app.implementation)?;
@@ -717,6 +843,46 @@ fn find_app_by_identity(items: &[Value], app: &AppSpec) -> Option<Value> {
     })
 }
 
+fn find_indexer_proxy_by_identity(items: &[Value], proxy: &IndexerProxySpec) -> Option<Value> {
+    let target_name = normalize_name(&proxy.name);
+    let target_impl = normalize_name(&proxy.implementation);
+    let target_host = proxy
+        .settings
+        .get("host")
+        .and_then(Value::as_str)
+        .map(normalize_url);
+
+    items.iter().find_map(|item| {
+        let implementation = item
+            .get("implementation")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("implementationName").and_then(Value::as_str))
+            .or_else(|| item.get("configContract").and_then(Value::as_str))
+            .map(normalize_name)
+            .unwrap_or_default();
+        if implementation != target_impl && !implementation.contains(&target_impl) {
+            return None;
+        }
+
+        let name_matches = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(normalize_name)
+            .is_some_and(|name| name == target_name);
+        let host_matches = target_host
+            .as_ref()
+            .zip(indexer_proxy_host_from_item(item))
+            .is_some_and(|(target_host, existing_host)| {
+                normalize_url(&existing_host) == *target_host
+            });
+        if !name_matches && !host_matches {
+            return None;
+        }
+
+        Some(item.clone())
+    })
+}
+
 fn app_url_from_item(item: &Value) -> Option<String> {
     let fields = item.get("fields")?.as_array()?;
     for key in ["baseUrl", "url", "serverUrl", "prowlarrUrl"] {
@@ -727,6 +893,17 @@ fn app_url_from_item(item: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn indexer_proxy_host_from_item(item: &Value) -> Option<String> {
+    let fields = item.get("fields")?.as_array()?;
+    let host = field_string_value(fields, "host")?;
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn field_string_value(fields: &[Value], key: &str) -> Option<String> {
@@ -915,6 +1092,18 @@ fn apply_app_fields(fields: &mut Vec<Value>, spec: &AppSpec, prowlarr_url: &str)
     Ok(())
 }
 
+fn apply_indexer_proxy_fields(fields: &mut Vec<Value>, spec: &IndexerProxySpec) -> Result<()> {
+    for (key, value) in &spec.settings {
+        if !set_field_value_optional(fields, key, value.clone())? {
+            debug!(
+                "indexer proxy field '{}' not present in schema; skipping",
+                key
+            );
+        }
+    }
+    Ok(())
+}
+
 fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> Result<bool> {
     for field in fields.iter_mut() {
         let field_name = field.get("name").and_then(Value::as_str);
@@ -926,6 +1115,18 @@ fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> R
         }
     }
     Ok(false)
+}
+
+fn set_enabled_if_present(target: &mut Value, enabled: bool) -> Result<()> {
+    if let Some(obj) = target.as_object_mut() {
+        if obj.contains_key("enable") {
+            obj.insert("enable".to_string(), Value::Bool(enabled));
+        } else if obj.contains_key("enabled") {
+            obj.insert("enabled".to_string(), Value::Bool(enabled));
+        }
+        return Ok(());
+    }
+    bail!("expected object for enabled update");
 }
 
 fn set_enabled(target: &mut Value, enabled: bool) -> Result<()> {
@@ -1014,7 +1215,7 @@ mod tests {
     use super::*;
     use axum::{
         Json, Router,
-        routing::{get, post},
+        routing::{get, post, put},
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1155,6 +1356,32 @@ mod tests {
 
         assert!(find_schema_optional(&schema, "Nyaa").is_none());
         assert!(find_schema_optional(&schema, "EZTV").is_none());
+    }
+
+    #[test]
+    fn indexer_proxy_identity_matches_existing_host_even_when_name_differs() {
+        let proxy = IndexerProxySpec {
+            name: "Managed FlareSolverr".to_string(),
+            implementation: "FlareSolverr".to_string(),
+            tags: Vec::new(),
+            enabled: Some(true),
+            settings: HashMap::from([(
+                "host".to_string(),
+                Value::String("http://elx-flaresolverr:8191/".to_string()),
+            )]),
+        };
+        let existing = vec![json!({
+            "id": 1,
+            "name": "FlareSolverr",
+            "implementation": "FlareSolverr",
+            "fields": [
+                { "name": "host", "value": "http://elx-flaresolverr:8191" },
+                { "name": "requestTimeout", "value": 60 }
+            ]
+        })];
+
+        let matched = find_indexer_proxy_by_identity(&existing, &proxy);
+        assert!(matched.is_some(), "proxy identity should match by host");
     }
 
     #[tokio::test]
@@ -1312,5 +1539,311 @@ mod tests {
             .clone()
             .expect("indexer create payload");
         assert_eq!(body.get("appProfileId").and_then(Value::as_i64), Some(1));
+    }
+
+    #[tokio::test]
+    async fn upsert_indexer_proxies_creates_flaresolverr_proxy_from_schema() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(None::<Value>));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/indexerProxy/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "",
+                        "implementation": "FlareSolverr",
+                        "implementationName": "FlareSolverr",
+                        "configContract": "FlareSolverrSettings",
+                        "fields": [
+                            { "name": "host", "value": "http://localhost:8191/" },
+                            { "name": "requestTimeout", "value": 60 }
+                        ],
+                        "tags": []
+                    }]))
+                }),
+            )
+            .route("/api/v1/indexerProxy", get(|| async { Json(json!([])) }))
+            .route(
+                "/api/v1/indexerProxy",
+                post({
+                    let captured = Arc::clone(&captured);
+                    move |Json(body): Json<Value>| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            *captured.lock().expect("capture payload") = Some(body);
+                            Json(json!({ "id": 1 }))
+                        }
+                    }
+                }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        client
+            .upsert_indexer_proxies(&[IndexerProxySpec {
+                name: "FlareSolverr".to_string(),
+                implementation: "FlareSolverr".to_string(),
+                tags: Vec::new(),
+                enabled: Some(true),
+                settings: HashMap::from([
+                    (
+                        "host".to_string(),
+                        Value::String("http://elx-flaresolverr:8191/".to_string()),
+                    ),
+                    ("requestTimeout".to_string(), Value::Number(60.into())),
+                ]),
+            }])
+            .await
+            .expect("indexer proxy creation should succeed");
+
+        let _ = shutdown_tx.send(());
+
+        let body = captured
+            .lock()
+            .expect("captured payload")
+            .clone()
+            .expect("indexer proxy create payload");
+        assert_eq!(
+            body.get("name").and_then(Value::as_str),
+            Some("FlareSolverr")
+        );
+        assert_eq!(
+            body.get("implementation").and_then(Value::as_str),
+            Some("FlareSolverr")
+        );
+        let fields = body
+            .get("fields")
+            .and_then(Value::as_array)
+            .expect("proxy fields");
+        assert_eq!(
+            field_string_value(fields, "host").as_deref(),
+            Some("http://elx-flaresolverr:8191/")
+        );
+        assert_eq!(
+            field_string_value(fields, "requestTimeout").as_deref(),
+            Some("60")
+        );
+        assert!(body.get("enable").is_none());
+        assert!(body.get("enabled").is_none());
+    }
+
+    #[tokio::test]
+    async fn evaluate_apps_detects_existing_tag_filter_when_desired_tags_are_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        let app = Router::new()
+            .route(
+                "/api/v1/applications/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "Sonarr",
+                        "implementation": "Sonarr",
+                        "fields": [
+                            { "name": "prowlarrUrl", "value": "" },
+                            { "name": "baseUrl", "value": "" },
+                            { "name": "apiKey", "value": "" },
+                            { "name": "syncCategories", "value": [] }
+                        ],
+                        "tags": []
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/applications",
+                get(|| async {
+                    Json(json!([{
+                        "id": 5,
+                        "name": "Sonarr",
+                        "implementation": "Sonarr",
+                        "tags": [2],
+                        "fields": [
+                            { "name": "prowlarrUrl", "value": "http://elx-prowlarr:9696/" },
+                            { "name": "baseUrl", "value": "http://elx-sonarr:8989" },
+                            { "name": "apiKey", "value": "abc" },
+                            { "name": "syncCategories", "value": [5000] }
+                        ]
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/tag",
+                get(|| async { Json(json!([{ "id": 2, "label": "elixir" }])) }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        let drift = client
+            .evaluate_apps(
+                &[AppSpec {
+                    name: "Sonarr".to_string(),
+                    implementation: "Sonarr".to_string(),
+                    url: "http://elx-sonarr:8989".to_string(),
+                    api_key: Some("abc".to_string()),
+                    categories: vec!["5000".to_string()],
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                }],
+                "http://elx-prowlarr:9696/",
+            )
+            .await
+            .expect("app evaluation should succeed");
+
+        let _ = shutdown_tx.send(());
+
+        assert_eq!(drift, vec!["Sonarr".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upsert_apps_clears_existing_tag_filter_when_desired_tags_are_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(None::<Value>));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/applications/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "Sonarr",
+                        "implementation": "Sonarr",
+                        "fields": [
+                            { "name": "prowlarrUrl", "value": "" },
+                            { "name": "baseUrl", "value": "" },
+                            { "name": "apiKey", "value": "" },
+                            { "name": "syncCategories", "value": [] }
+                        ],
+                        "tags": []
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/applications",
+                get(|| async {
+                    Json(json!([{
+                        "id": 5,
+                        "name": "Sonarr",
+                        "implementation": "Sonarr",
+                        "tags": [2],
+                        "fields": [
+                            { "name": "prowlarrUrl", "value": "http://elx-prowlarr:9696/" },
+                            { "name": "baseUrl", "value": "http://elx-sonarr:8989" },
+                            { "name": "apiKey", "value": "abc" },
+                            { "name": "syncCategories", "value": [5000] }
+                        ]
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/tag",
+                get(|| async { Json(json!([{ "id": 2, "label": "elixir" }])) }),
+            )
+            .route(
+                "/api/v1/applications/5",
+                put({
+                    let captured = Arc::clone(&captured);
+                    move |Json(body): Json<Value>| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            *captured.lock().expect("capture payload") = Some(body);
+                            Json(json!({ "id": 5 }))
+                        }
+                    }
+                }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        client
+            .upsert_apps(
+                &[AppSpec {
+                    name: "Sonarr".to_string(),
+                    implementation: "Sonarr".to_string(),
+                    url: "http://elx-sonarr:8989".to_string(),
+                    api_key: Some("abc".to_string()),
+                    categories: vec!["5000".to_string()],
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                }],
+                "http://elx-prowlarr:9696/",
+            )
+            .await
+            .expect("app upsert should succeed");
+
+        let _ = shutdown_tx.send(());
+
+        let body = captured
+            .lock()
+            .expect("captured payload")
+            .clone()
+            .expect("app update payload");
+        assert_eq!(
+            body.get("tags").and_then(Value::as_array),
+            Some(&Vec::new())
+        );
     }
 }

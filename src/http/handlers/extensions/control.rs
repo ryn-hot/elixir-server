@@ -82,11 +82,19 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
     }
 
     fn build_actions(&self, context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
+        let mut actions = Vec::new();
         if context.selected_provider.is_some() {
-            vec![build_test_connection_action()]
-        } else {
-            Vec::new()
+            actions.push(build_test_connection_action());
         }
+        if context.selected_instance.is_some()
+            && matches!(
+                context.summary.status_code.as_str(),
+                "connection_issue" | "degraded_runtime"
+            )
+        {
+            actions.push(build_repair_connection_issue_action(self.implementation));
+        }
+        actions
     }
 
     async fn update_settings(
@@ -142,7 +150,12 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
                     &snapshot,
                 ))
             }
-            "repair_managed_invariants" => super::run_extension_control_managed_repair(state).await,
+            "repair_connection_issue" => {
+                repair_arr_connection_issue(self, state, store, context, self.implementation).await
+            }
+            "repair_managed_invariants" => {
+                super::run_extension_control_targeted_managed_repair(state, store, context).await
+            }
             "search_missing" | "refresh_manager" => {
                 let (base_url, api_key) =
                     super::resolve_extension_control_arr_connection(state, store, context).await?;
@@ -539,13 +552,22 @@ pub(super) async fn build_sections(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Vec<ExtensionControlSection>> {
-    resolve_adapter(context)
+    let mut sections = resolve_adapter(context)
         .build_sections(state, store, context)
-        .await
+        .await?;
+    if let Some(section) = build_backup_section(state, context).await? {
+        sections.push(section);
+    }
+    Ok(sections)
 }
 
 pub(super) fn build_actions(context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
-    resolve_adapter(context).build_actions(context)
+    let mut actions = Vec::new();
+    if context.instances.is_empty() && context.extension.kind != ExtensionKind::Blueprint {
+        actions.push(build_create_default_instance_action());
+    }
+    actions.extend(resolve_adapter(context).build_actions(context));
+    actions
 }
 
 pub(super) async fn update_settings(
@@ -566,6 +588,21 @@ pub(super) async fn execute_action(
     action_id: &str,
     params: &HashMap<String, serde_json::Value>,
 ) -> anyhow::Result<String> {
+    if action_id == "create_default_instance" {
+        let created =
+            super::create_default_extension_instance(state, store, &context.manifest).await?;
+        return Ok(if created {
+            "Default instance created.".to_string()
+        } else {
+            "Default instance is already available.".to_string()
+        });
+    }
+    if action_id == "create_backup" {
+        return run_create_backup_action(state, context).await;
+    }
+    if action_id == "restore_backup" {
+        return run_restore_backup_action(state, context, params).await;
+    }
     resolve_adapter(context)
         .execute_action(state, store, context, action_id, params)
         .await
@@ -602,6 +639,392 @@ fn build_test_connection_action() -> ExtensionControlAction {
         required_fields: Vec::new(),
         secret_keys: Vec::new(),
         secret_scope_instance_id: None,
+    }
+}
+
+fn build_create_default_instance_action() -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "create_default_instance".to_string(),
+        label: "Create default instance".to_string(),
+        description: "Create the default runtime instance Elixir uses to manage this extension."
+            .to_string(),
+        kind: "primary".to_string(),
+        params: None,
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+fn build_repair_connection_issue_action(implementation: &str) -> ExtensionControlAction {
+    let label = match implementation {
+        "sonarr" => "Repair Sonarr",
+        "radarr" => "Repair Radarr",
+        _ => "Repair connection",
+    };
+    ExtensionControlAction {
+        id: "repair_connection_issue".to_string(),
+        label: label.to_string(),
+        description:
+            "Recreate this runtime, wait for it to come back, then re-apply Elixir-managed wiring."
+                .to_string(),
+        kind: "primary".to_string(),
+        params: None,
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+async fn build_backup_section(
+    state: &AppState,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let Some(policy) = context.manifest.backup.as_ref() else {
+        return Ok(None);
+    };
+    let Some(instance) = context.selected_instance.as_ref() else {
+        return Ok(None);
+    };
+    let snapshots = state
+        .orchestrator
+        .list_extension_backups(
+            &state.settings.extensions.storage_root,
+            &context.extension.extension_id,
+            instance.instance_id,
+        )
+        .await?;
+    let entities = snapshots
+        .iter()
+        .map(|snapshot| ExtensionControlEntity {
+            id: snapshot.snapshot_id.to_string(),
+            title: snapshot.label.clone(),
+            subtitle: Some(format!(
+                "{} • {}",
+                snapshot.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                snapshot.reason.replace('_', " ")
+            )),
+            details: vec![format!(
+                "Includes: {}",
+                snapshot
+                    .items
+                    .iter()
+                    .map(|item| item.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )],
+            actions: vec![build_restore_backup_action(snapshot.snapshot_id)],
+        })
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    if snapshots.is_empty() {
+        notices.push(control_notice(
+            "info",
+            "no_backups",
+            "No backups yet",
+            "Create a backup before using restore or performing risky repairs.",
+        ));
+    }
+    Ok(Some(ExtensionControlSection {
+        id: "backups".to_string(),
+        title: "Backups".to_string(),
+        description: format!(
+            "Elixir stores exact snapshots of the extension paths this manifest opted into backup. Retention: {} snapshot(s).",
+            policy.retention
+        ),
+        policy: Some(control_policy_managed(
+            "These snapshots are extension-defined recovery points. Elixir can create and restore them without reconfiguring unrelated services.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities,
+        actions: vec![build_create_backup_action()],
+    }))
+}
+
+fn build_create_backup_action() -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "create_backup".to_string(),
+        label: "Create backup".to_string(),
+        description: "Capture a recovery snapshot of this extension's backed-up state.".to_string(),
+        kind: "primary".to_string(),
+        params: None,
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+fn build_restore_backup_action(snapshot_id: Uuid) -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "restore_backup".to_string(),
+        label: "Restore".to_string(),
+        description:
+            "Replace this extension's backed-up state with the selected snapshot and recreate its runtime."
+                .to_string(),
+        kind: "secondary".to_string(),
+        params: Some(json!({
+            "snapshotId": snapshot_id.to_string()
+        })),
+        confirm_text: Some(
+            "Restore this backup? Elixir will first create a recovery point, then replace the extension's backed-up state and recreate its runtime.".to_string(),
+        ),
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+async fn run_create_backup_action(
+    state: &AppState,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<String> {
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    let snapshot = state
+        .orchestrator
+        .create_extension_backup(
+            &state.settings.extensions.storage_root,
+            &context.extension.extension_id,
+            instance,
+            &context.manifest,
+            None,
+            "manual",
+        )
+        .await?;
+    Ok(format!("Created backup '{}'.", snapshot.label))
+}
+
+async fn run_restore_backup_action(
+    state: &AppState,
+    context: &ExtensionControlContext,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    let snapshot_id = parse_snapshot_id(params)?;
+    let outcome = state
+        .orchestrator
+        .restore_extension_backup(
+            &state.settings.extensions.storage_root,
+            &context.extension.extension_id,
+            instance,
+            &context.manifest,
+            snapshot_id,
+        )
+        .await?;
+    Ok(match outcome.recovery_point {
+        Some(recovery_point) => format!(
+            "Restored backup '{}'. Elixir also created recovery point '{}'.",
+            outcome.restored_snapshot.label, recovery_point.label
+        ),
+        None => format!("Restored backup '{}'.", outcome.restored_snapshot.label),
+    })
+}
+
+fn parse_snapshot_id(params: &HashMap<String, serde_json::Value>) -> anyhow::Result<Uuid> {
+    let snapshot_id = params
+        .get("snapshotId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("backup restore action is missing snapshotId"))?;
+    Uuid::parse_str(snapshot_id).context("parsing backup snapshot id")
+}
+
+const ARR_CONNECTION_REPAIR_TIMEOUT: Duration = Duration::from_secs(75);
+const ARR_CONNECTION_REPAIR_REPAIR_TIMEOUT: Duration = Duration::from_secs(45);
+const ARR_CONNECTION_REPAIR_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const ARR_CONNECTION_REPAIR_LOG_WINDOW_MINUTES: i64 = 10;
+const ARR_CONNECTION_REPAIR_LOG_LINES: usize = 12;
+const ARR_CONNECTION_REPAIR_LOG_CHARS: usize = 1600;
+
+async fn repair_arr_connection_issue(
+    adapter: &ArrManagerControlAdapter,
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    implementation: &str,
+) -> anyhow::Result<String> {
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
+    let service_label = arr_service_label(implementation);
+
+    state
+        .orchestrator
+        .recreate_instance_runtime(&context.extension.extension_id, instance, &context.manifest)
+        .await
+        .with_context(|| format!("recreating {service_label} runtime"))?;
+
+    let recovered_snapshot = match wait_for_arr_live_snapshot(
+        adapter,
+        state,
+        store,
+        context,
+        ARR_CONNECTION_REPAIR_TIMEOUT,
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            anyhow::bail!(
+                "{}",
+                arr_runtime_repair_failure_message(state, instance.instance_id, service_label, err)
+                    .await
+            );
+        }
+    };
+
+    let repair_outcome = super::run_extension_control_managed_repair(state).await;
+    let final_snapshot = match wait_for_arr_live_snapshot(
+        adapter,
+        state,
+        store,
+        context,
+        ARR_CONNECTION_REPAIR_REPAIR_TIMEOUT,
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            if repair_outcome.is_err() {
+                recovered_snapshot
+            } else {
+                anyhow::bail!(
+                    "{}",
+                    arr_runtime_repair_failure_message(
+                        state,
+                        instance.instance_id,
+                        service_label,
+                        err
+                    )
+                    .await
+                );
+            }
+        }
+    };
+
+    let connection_message = test_connection_message(implementation, context, &final_snapshot);
+    match repair_outcome {
+        Ok(repair_message) => Ok(format!(
+            "{service_label} runtime recreated. {connection_message} {repair_message}"
+        )),
+        Err(err) => Ok(format!(
+            "{service_label} runtime recreated. {connection_message} Explicit repair reported a follow-up issue: {err}"
+        )),
+    }
+}
+
+async fn wait_for_arr_live_snapshot(
+    adapter: &ArrManagerControlAdapter,
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    timeout: Duration,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_error = match adapter.load_live_snapshot(state, store, context).await {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(err) => err,
+    };
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(ARR_CONNECTION_REPAIR_POLL_INTERVAL).await;
+        match adapter.load_live_snapshot(state, store, context).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) => last_error = err,
+        }
+    }
+
+    Err(last_error)
+}
+
+async fn arr_runtime_repair_failure_message(
+    state: &AppState,
+    instance_id: uuid::Uuid,
+    service_label: &str,
+    wait_err: anyhow::Error,
+) -> String {
+    let since =
+        chrono::Utc::now() - chrono::Duration::minutes(ARR_CONNECTION_REPAIR_LOG_WINDOW_MINUTES);
+    let logs = state
+        .orchestrator
+        .instance_runtime_logs(instance_id, Some(since))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let excerpt = summarize_runtime_log_excerpt(&logs);
+
+    if excerpt.is_empty() {
+        format!(
+            "{service_label} did not become reachable after recreate within {} seconds. {}",
+            ARR_CONNECTION_REPAIR_TIMEOUT.as_secs(),
+            wait_err
+        )
+    } else {
+        format!(
+            "{service_label} did not become reachable after recreate within {} seconds. {} Latest startup logs:\n{}",
+            ARR_CONNECTION_REPAIR_TIMEOUT.as_secs(),
+            wait_err,
+            excerpt
+        )
+    }
+}
+
+fn summarize_runtime_log_excerpt(logs: &str) -> String {
+    let mut lines = logs
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines.len() > ARR_CONNECTION_REPAIR_LOG_LINES {
+        lines = lines.split_off(lines.len() - ARR_CONNECTION_REPAIR_LOG_LINES);
+    }
+    let mut excerpt = lines.join("\n");
+    if excerpt.len() > ARR_CONNECTION_REPAIR_LOG_CHARS {
+        let keep = ARR_CONNECTION_REPAIR_LOG_CHARS.saturating_sub(1);
+        excerpt = excerpt
+            .chars()
+            .rev()
+            .take(keep)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        excerpt.insert(0, '…');
+    }
+    excerpt
+}
+
+fn arr_service_label(implementation: &str) -> &'static str {
+    match implementation {
+        "sonarr" => "Sonarr",
+        "radarr" => "Radarr",
+        _ => "Service",
     }
 }
 
@@ -2299,6 +2722,157 @@ fn log_nzbget_control_availability(message: &str, err: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn arr_context(status_code: &str) -> ExtensionControlContext {
+        let instance_id = uuid::Uuid::new_v4();
+        ExtensionControlContext {
+            extension: crate::db::models::Extension {
+                extension_id: "elixir.modules.sonarr".to_string(),
+                name: "Sonarr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: crate::db::models::ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: crate::db::models::ExtensionTrustLevel::Community,
+                manifest_json: json!({}),
+                package_hash: None,
+                installed_at: Utc::now(),
+                enabled: true,
+            },
+            manifest: crate::extensions::manifest::ExtensionManifest {
+                id: "elixir.modules.sonarr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: crate::db::models::ExtensionKind::Module,
+                name: "Sonarr".to_string(),
+                description: None,
+                publisher: None,
+                trust: None,
+                permissions: Vec::new(),
+                provides: Vec::new(),
+                requires: Vec::new(),
+                conflicts: Vec::new(),
+                runtime: None,
+                backup: None,
+                targets: Vec::new(),
+                actions: Vec::new(),
+                connectors: Vec::new(),
+                optional_addons: Vec::new(),
+                wants: Vec::new(),
+                preferences: None,
+                bindings: Vec::new(),
+                execution: None,
+                policies: None,
+                networking: None,
+                control_surface: None,
+            },
+            summary: ExtensionStatusSummaryItem {
+                extension_id: "elixir.modules.sonarr".to_string(),
+                name: "Sonarr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: crate::db::models::ExtensionKind::Module,
+                trust_level: crate::db::models::ExtensionTrustLevel::Community,
+                enabled: true,
+                severity: if status_code == "ready" {
+                    "ready".to_string()
+                } else {
+                    "attention".to_string()
+                },
+                status_code: status_code.to_string(),
+                label: status_code.to_string(),
+                description: status_code.to_string(),
+                primary_action: "fix".to_string(),
+                primary_action_label: "Fix".to_string(),
+                auto_update: None,
+                optional_addons: Vec::new(),
+            },
+            instances: vec![crate::db::models::ExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.sonarr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                runtime_version: None,
+                rollback_version: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                enabled: true,
+            }],
+            selected_instance: Some(crate::db::models::ExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.sonarr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                runtime_version: None,
+                rollback_version: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                enabled: true,
+            }),
+            providers: vec![crate::db::models::Provider {
+                provider_id: uuid::Uuid::new_v4(),
+                instance_id,
+                capability: "media.manager.tv".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: crate::db::models::SlotCardinality::One,
+                implementation: Some("sonarr".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: crate::db::models::ProviderHealthState::Unhealthy,
+                last_healthcheck_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            selected_provider: Some(crate::db::models::Provider {
+                provider_id: uuid::Uuid::new_v4(),
+                instance_id,
+                capability: "media.manager.tv".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: crate::db::models::SlotCardinality::One,
+                implementation: Some("sonarr".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: crate::db::models::ProviderHealthState::Unhealthy,
+                last_healthcheck_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }),
+            control_binding: ExtensionControlBinding::Sonarr,
+        }
+    }
+
+    #[test]
+    fn arr_manager_actions_include_runtime_repair_when_connection_is_broken() {
+        let context = arr_context("connection_issue");
+        let actions = ArrManagerControlAdapter {
+            implementation: "sonarr",
+        }
+        .build_actions(&context);
+        let action_ids = actions
+            .into_iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_ids,
+            vec![
+                "test_connection".to_string(),
+                "repair_connection_issue".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn arr_manager_actions_skip_runtime_repair_when_service_is_ready() {
+        let context = arr_context("ready");
+        let actions = ArrManagerControlAdapter {
+            implementation: "sonarr",
+        }
+        .build_actions(&context);
+        let action_ids = actions
+            .into_iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        assert_eq!(action_ids, vec!["test_connection".to_string()]);
+    }
 
     #[test]
     fn nzbget_managed_config_updates_use_runtime_paths_when_runtime_volume_exists() {
@@ -2352,6 +2926,22 @@ mod tests {
         assert_eq!(
             as_map.get("DestDir").map(String::as_str),
             Some("/downloads")
+        );
+    }
+
+    #[test]
+    fn restore_backup_action_includes_snapshot_id_param() {
+        let snapshot_id = uuid::Uuid::new_v4();
+        let action = build_restore_backup_action(snapshot_id);
+        assert_eq!(action.id, "restore_backup");
+        assert_eq!(
+            action
+                .params
+                .as_ref()
+                .and_then(|value| value.get("snapshotId"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            Some(snapshot_id.to_string())
         );
     }
 }

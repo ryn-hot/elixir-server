@@ -1,0 +1,24 @@
+id: elixir.connectors.sonarr_quality_policy
+version: 1.0.0
+kind: connector
+name: "Sonarr Quality Policy"
+description: "Apply Elixir's blended TRaSH quality policy preset to Sonarr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - drivers.configure.media.manager.tv
+targets:
+  - capability: media.manager.tv
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: media.manager.tv
+      slot: default
+    patch:
+      op: apply_quality_policy_preset
+      policy:
+        preset: modern_codecs
+        profile_name: "Elixir Modern Codecs"

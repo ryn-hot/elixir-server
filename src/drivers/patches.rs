@@ -103,6 +103,9 @@ pub enum MediaManagerTvPatch {
         #[serde(default)]
         release_profiles: Vec<ReleaseProfileSpec>,
     },
+    ApplyQualityPolicyPreset {
+        policy: QualityPolicyPresetSpec,
+    },
     SetAuxServiceEndpoint {
         url: String,
     },
@@ -174,6 +177,7 @@ impl MediaManagerTvPatch {
                 }
                 Ok(())
             }
+            MediaManagerTvPatch::ApplyQualityPolicyPreset { policy } => policy.validate(),
             MediaManagerTvPatch::SetAuxServiceEndpoint { url } => validate_url(url),
         }
     }
@@ -186,6 +190,7 @@ pub enum MediaManagerMoviesPatch {
     SetDownloaders { downloaders: Vec<DownloaderSpec> },
     SetRootFolders { roots: Vec<RootFolderSpec> },
     SetTags { tags: Vec<String> },
+    ApplyQualityPolicyPreset { policy: QualityPolicyPresetSpec },
 }
 
 impl MediaManagerMoviesPatch {
@@ -217,7 +222,28 @@ impl MediaManagerMoviesPatch {
                 validate_tags(tags, "tags")?;
                 Ok(())
             }
+            MediaManagerMoviesPatch::ApplyQualityPolicyPreset { policy } => policy.validate(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityPolicyPresetId {
+    StockTrash,
+    ModernCodecs,
+    StorageSaver,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityPolicyPresetSpec {
+    pub preset: QualityPolicyPresetId,
+    pub profile_name: String,
+}
+
+impl QualityPolicyPresetSpec {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.profile_name, "quality_policy.profile_name")
     }
 }
 
@@ -225,6 +251,7 @@ impl MediaManagerMoviesPatch {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IndexerRegistryPatch {
     RegisterIndexers { indexers: Vec<IndexerSpec> },
+    RegisterIndexerProxies { proxies: Vec<IndexerProxySpec> },
     RegisterApp { app: AppSpec },
     RegisterApps { apps: Vec<AppSpec> },
 }
@@ -236,6 +263,13 @@ impl IndexerRegistryPatch {
                 ensure_non_empty_list(indexers, "indexers")?;
                 for indexer in indexers {
                     indexer.validate()?;
+                }
+                Ok(())
+            }
+            IndexerRegistryPatch::RegisterIndexerProxies { proxies } => {
+                ensure_non_empty_list(proxies, "proxies")?;
+                for proxy in proxies {
+                    proxy.validate()?;
                 }
                 Ok(())
             }
@@ -543,6 +577,18 @@ pub struct AppSpec {
     pub settings: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexerProxySpec {
+    pub name: String,
+    pub implementation: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub settings: HashMap<String, serde_json::Value>,
+}
+
 impl AppSpec {
     fn validate(&self) -> Result<()> {
         ensure_non_empty(&self.name, "app.name")?;
@@ -639,6 +685,25 @@ impl IndexerSpec {
     }
 }
 
+impl IndexerProxySpec {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.name, "indexer_proxy.name")?;
+        ensure_non_empty(&self.implementation, "indexer_proxy.implementation")?;
+        validate_tags(&self.tags, "indexer_proxy.tags")?;
+        if let Some(host) = self
+            .settings
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+        {
+            validate_url(host)?;
+        }
+        for key in self.settings.keys() {
+            ensure_non_empty(key, "indexer_proxy.settings.key")?;
+        }
+        Ok(())
+    }
+}
+
 impl IndexerCredentialField {
     fn from_str(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -725,6 +790,12 @@ pub struct QualityProfileSpec {
     pub allowed: Vec<String>,
     #[serde(default)]
     pub upgrade_allowed: Option<bool>,
+    #[serde(default)]
+    pub min_format_score: Option<i32>,
+    #[serde(default)]
+    pub min_upgrade_format_score: Option<i32>,
+    #[serde(default)]
+    pub cutoff_format_score: Option<i32>,
 }
 
 impl QualityProfileSpec {
@@ -812,18 +883,67 @@ pub struct CustomFormatSpec {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub score: Option<i32>,
+    #[serde(default)]
+    pub include_custom_format_when_renaming: Option<bool>,
+    #[serde(default)]
+    pub specifications: Vec<serde_json::Value>,
 }
 
 impl CustomFormatSpec {
     fn validate(&self) -> Result<()> {
         ensure_non_empty(&self.name, "custom_format.name")?;
-        if self.include.is_empty() && self.exclude.is_empty() {
-            bail!("custom_format include or exclude entries are required");
+        if self.include.is_empty() && self.exclude.is_empty() && self.specifications.is_empty() {
+            bail!("custom_format include/exclude entries or specifications are required");
         }
         validate_tags(&self.include, "custom_format.include")?;
         validate_tags(&self.exclude, "custom_format.exclude")?;
+        for specification in &self.specifications {
+            if !specification.is_object() {
+                bail!("custom_format.specifications entries must be objects");
+            }
+        }
         Ok(())
     }
+}
+
+pub fn normalize_custom_format_specifications(
+    specifications: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    specifications
+        .iter()
+        .cloned()
+        .map(normalize_custom_format_specification)
+        .collect()
+}
+
+fn normalize_custom_format_specification(mut specification: serde_json::Value) -> Result<serde_json::Value> {
+    let Some(obj) = specification.as_object_mut() else {
+        bail!("custom_format.specifications entries must be objects");
+    };
+
+    let Some(fields) = obj.get_mut("fields") else {
+        return Ok(specification);
+    };
+
+    if fields.is_array() {
+        return Ok(specification);
+    }
+
+    let Some(field_map) = fields.as_object() else {
+        bail!("custom_format.specifications[].fields must be an object or array");
+    };
+
+    let normalized_fields = field_map
+        .iter()
+        .map(|(name, value)| {
+            serde_json::json!({
+                "name": name,
+                "value": value.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    *fields = serde_json::Value::Array(normalized_fields);
+    Ok(specification)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -927,6 +1047,7 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn media_manager_tv_patch_requires_url() {
@@ -973,6 +1094,14 @@ mod tests {
     #[test]
     fn indexer_registry_patch_requires_apps() {
         let patch = IndexerRegistryPatch::RegisterApps { apps: Vec::new() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn indexer_registry_patch_requires_indexer_proxies() {
+        let patch = IndexerRegistryPatch::RegisterIndexerProxies {
+            proxies: Vec::new(),
+        };
         assert!(patch.validate().is_err());
     }
 
@@ -1167,5 +1296,35 @@ mod tests {
             download_rate_kib: Some(0),
         };
         assert!(patch.validate().is_ok());
+    }
+
+    #[test]
+    fn normalize_custom_format_specifications_converts_field_maps_to_arrays() {
+        let normalized = normalize_custom_format_specifications(&[json!({
+            "name": "AV1",
+            "implementation": "ReleaseTitleSpecification",
+            "negate": false,
+            "required": true,
+            "fields": {
+                "value": "\\\\bAV1\\\\b"
+            }
+        })])
+        .expect("normalize specifications");
+
+        assert_eq!(
+            normalized,
+            vec![json!({
+                "name": "AV1",
+                "implementation": "ReleaseTitleSpecification",
+                "negate": false,
+                "required": true,
+                "fields": [
+                    {
+                        "name": "value",
+                        "value": "\\\\bAV1\\\\b"
+                    }
+                ]
+            })]
+        );
     }
 }

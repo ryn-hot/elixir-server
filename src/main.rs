@@ -1,3 +1,4 @@
+mod acquisition;
 mod artwork;
 mod auth;
 mod config;
@@ -21,19 +22,32 @@ use crate::artwork::ArtworkService;
 use crate::auth::AuthService;
 use crate::config::Settings;
 use crate::db::Database;
+use crate::db::models::{ExtensionInstance, ExtensionKind, SlotCardinality};
 use crate::extensions::ExtensionManager;
+use crate::extensions::auto_managed::{
+    filter_auto_managed_runtime_missing, is_nzbget_extension_id, is_qbittorrent_extension_id,
+};
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
 use crate::extensions::package::{
     compute_sha256, read_manifest_from_dir, unpack_package, write_manifest_to_dir,
 };
 use crate::extensions::registry::start_registry_refresh_loop;
-use crate::extensions::store::{ExtensionStore, NewExtension};
+use crate::extensions::required_secrets::{
+    missing_required_secrets_for_instance, required_secrets_from_manifest,
+};
+use crate::extensions::store::{
+    ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
+};
+use crate::extensions::updater::start_proxy_runtime_update_loop;
 use crate::http::handlers::extensions::InstallRequest;
 use crate::http::router;
 use crate::library::LinkerService;
 use crate::library::start_periodic_scan;
 use crate::metadata::MetadataService;
 use crate::network::{start_mdns, wan::start_wan_tasks};
+use crate::orchestrator::executor::ExecutorAction;
+use crate::orchestrator::naming::build_aliases;
+use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::playback::start_session_cleanup;
 use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
@@ -134,6 +148,24 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = repair_installed_extension_manifests(&state).await {
         tracing::warn!("installed extension manifest repair failed: {err}");
     }
+    match ensure_core_extension_instances(&state).await {
+        Ok(created) if created > 0 => {
+            tracing::info!("bootstrapped {created} core extension default instance(s)");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("core extension instance bootstrap failed: {err}");
+        }
+    };
+    match bootstrap_preinstalled_core_extension_runtimes(&state).await {
+        Ok(bootstrapped) if bootstrapped > 0 => {
+            tracing::info!("bootstrapped {bootstrapped} preinstalled core runtime(s)");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("preinstalled core runtime bootstrap failed: {err}");
+        }
+    };
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");
     }
@@ -169,6 +201,11 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .start_reconcile_loop(reconcile_config);
 
+    let acquisition_recovery_state = state.clone();
+    tokio::spawn(async move {
+        acquisition::start_acquisition_recovery_loop(acquisition_recovery_state).await;
+    });
+
     // Refresh extension registries on an interval.
     let registries = settings.extensions.registries.clone();
     let storage_root = settings.extensions.storage_root.clone();
@@ -178,6 +215,16 @@ async fn main() -> anyhow::Result<()> {
             registries,
             storage_root,
             std::time::Duration::from_secs(registry_interval),
+        )
+        .await;
+    });
+
+    let proxy_runtime_update_interval = settings.extensions.proxy_runtime_update_interval_seconds;
+    let proxy_runtime_update_state = state.clone();
+    tokio::spawn(async move {
+        start_proxy_runtime_update_loop(
+            proxy_runtime_update_state,
+            std::time::Duration::from_secs(proxy_runtime_update_interval),
         )
         .await;
     });
@@ -354,6 +401,216 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_core_extension_instances(state: &AppState) -> anyhow::Result<u32> {
+    if state.settings.extensions.core_extensions.is_empty() {
+        return Ok(0);
+    }
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let mut created = 0u32;
+    for extension_id in &state.settings.extensions.core_extensions {
+        let Some(extension) = store.get_extension(extension_id).await? else {
+            continue;
+        };
+        if !extension.enabled || extension.kind != crate::db::models::ExtensionKind::Module {
+            continue;
+        }
+        if !store.list_instances(Some(extension_id)).await?.is_empty() {
+            continue;
+        }
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id: Uuid::new_v4(),
+                extension_id: extension_id.clone(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        created += 1;
+    }
+
+    Ok(created)
+}
+
+async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> anyhow::Result<u32> {
+    if state.settings.extensions.core_extensions.is_empty() {
+        return Ok(0);
+    }
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let mut bootstrapped = 0u32;
+
+    for extension_id in &state.settings.extensions.core_extensions {
+        let Some(extension) = store.get_extension(extension_id).await? else {
+            continue;
+        };
+        if !extension.enabled || extension.kind != ExtensionKind::Module {
+            continue;
+        }
+
+        let manifest: ExtensionManifest = serde_json::from_value(extension.manifest_json.clone())
+            .context(format!(
+            "parsing core manifest '{}'",
+            extension.extension_id
+        ))?;
+        manifest.validate()?;
+        if manifest.runtime.is_none() {
+            continue;
+        }
+
+        let instances = store.list_instances(Some(extension_id)).await?;
+        for instance in instances {
+            if !instance.enabled {
+                continue;
+            }
+
+            let provider_count = store
+                .list_providers(Some(instance.instance_id))
+                .await?
+                .len();
+            if !core_instance_needs_startup_bootstrap(&instance, provider_count, &manifest) {
+                continue;
+            }
+
+            let required = required_secrets_from_manifest(&manifest)?;
+            let missing = filter_auto_managed_runtime_missing(
+                &extension.extension_id,
+                missing_required_secrets_for_instance(&store, instance.instance_id, &required)
+                    .await?,
+            );
+            if !missing.is_empty() {
+                tracing::warn!(
+                    extension_id = %extension.extension_id,
+                    instance_id = %instance.instance_id,
+                    instance_name = %instance.instance_name,
+                    missing = ?missing,
+                    "skipping preinstalled core runtime bootstrap because manual secrets are still missing"
+                );
+                continue;
+            }
+
+            let actions = build_preinstalled_core_bootstrap_actions(&instance, &manifest)?;
+            tracing::info!(
+                extension_id = %extension.extension_id,
+                instance_id = %instance.instance_id,
+                instance_name = %instance.instance_name,
+                "bootstrapping preinstalled core runtime"
+            );
+            match state.orchestrator.apply_actions(actions).await {
+                Ok(()) => bootstrapped += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        extension_id = %extension.extension_id,
+                        instance_id = %instance.instance_id,
+                        instance_name = %instance.instance_name,
+                        "preinstalled core runtime bootstrap failed: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    if bootstrapped > 0 {
+        if let Err(err) = state
+            .orchestrator
+            .apply_builtin_downloader_profiles_now()
+            .await
+        {
+            tracing::warn!("preinstalled downloader profile bootstrap failed: {err}");
+        }
+    }
+
+    Ok(bootstrapped)
+}
+
+fn core_instance_needs_startup_bootstrap(
+    instance: &ExtensionInstance,
+    provider_count: usize,
+    manifest: &ExtensionManifest,
+) -> bool {
+    if instance.runtime_version.is_none() {
+        return true;
+    }
+    provider_count < manifest.provides.len()
+}
+
+fn build_preinstalled_core_bootstrap_actions(
+    instance: &ExtensionInstance,
+    manifest: &ExtensionManifest,
+) -> anyhow::Result<Vec<ExecutorAction>> {
+    const PREINSTALLED_BOOTSTRAP_GATE_TIMEOUT_SECONDS: u64 = 120;
+
+    let runtime = manifest
+        .runtime
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("module runtime is missing"))?;
+    let networking = manifest.networking.clone();
+    let (aliases, primary_alias) = build_aliases(
+        &instance.extension_id,
+        &instance.instance_name,
+        instance.instance_id,
+        runtime.service_name.clone(),
+    );
+
+    let mut actions = vec![ExecutorAction::EnsureRuntimeRunning {
+        instance_id: instance.instance_id,
+        extension_id: instance.extension_id.clone(),
+        instance_name: instance.instance_name.clone(),
+        runtime,
+        networking: networking.clone(),
+        aliases,
+    }];
+
+    let defer_provider_health_gate = is_qbittorrent_extension_id(&instance.extension_id)
+        || is_nzbget_extension_id(&instance.extension_id);
+    let mut provider_actions = Vec::new();
+    for provide in &manifest.provides {
+        let provider_id =
+            stable_provider_id(instance.instance_id, &provide.capability, &provide.slot);
+        let endpoint = build_provider_endpoint(provide, &networking, &primary_alias)?;
+        provider_actions.push(ExecutorAction::CreateOrUpdateProvider {
+            provider_id,
+            instance_id: instance.instance_id,
+            capability: provide.capability.clone(),
+            slot_id: provide.slot.clone(),
+            cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
+            implementation: provide.implementation.clone(),
+            scope_json: provide
+                .scope
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .context("serializing provider scope")?,
+            endpoint,
+        });
+        provider_actions.push(ExecutorAction::TransportGate {
+            provider_id,
+            timeout_seconds: PREINSTALLED_BOOTSTRAP_GATE_TIMEOUT_SECONDS,
+        });
+        provider_actions.push(ExecutorAction::BootstrapGate {
+            provider_id,
+            timeout_seconds: PREINSTALLED_BOOTSTRAP_GATE_TIMEOUT_SECONDS,
+        });
+        if !defer_provider_health_gate {
+            provider_actions.push(ExecutorAction::HealthGate {
+                provider_id,
+                timeout_seconds: PREINSTALLED_BOOTSTRAP_GATE_TIMEOUT_SECONDS,
+            });
+        }
+    }
+
+    if provider_actions.is_empty() {
+        anyhow::bail!(
+            "preinstalled core module '{}' has no usable providers",
+            instance.extension_id
+        );
+    }
+
+    actions.extend(provider_actions);
+    Ok(actions)
+}
+
 async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Result<()> {
     let store = ExtensionStore::new(&state.db_pool);
     let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
@@ -366,6 +623,7 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
     };
     let mut resynced = 0_u32;
     let mut repaired = 0_u32;
+    let mut refreshed_desired = 0_u32;
     let mut rewritten_files = 0_u32;
     let unpacked_root = PathBuf::from(&state.settings.extensions.storage_root).join("unpacked");
 
@@ -453,11 +711,45 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
         );
     }
 
+    let extension_versions: HashMap<String, String> = store
+        .list_extensions()
+        .await?
+        .into_iter()
+        .map(|extension| (extension.extension_id, extension.version))
+        .collect();
+    for desired in store.list_desired_blueprints(None).await? {
+        let Some(version) = extension_versions.get(&desired.blueprint_extension_id) else {
+            continue;
+        };
+        if desired.blueprint_version == *version {
+            continue;
+        }
+        store
+            .upsert_desired_blueprint(&NewDesiredBlueprint {
+                desired_id: desired.desired_id,
+                blueprint_extension_id: desired.blueprint_extension_id.clone(),
+                blueprint_version: version.clone(),
+                params_json: desired.params_json.clone(),
+            })
+            .await?;
+        refreshed_desired += 1;
+        tracing::info!(
+            desired_id = %desired.desired_id,
+            blueprint_extension_id = %desired.blueprint_extension_id,
+            previous_version = %desired.blueprint_version,
+            refreshed_version = %version,
+            "refreshed desired blueprint version to match installed blueprint"
+        );
+    }
+
     if resynced > 0 {
         tracing::info!("resynced {resynced} installed bundled extension(s)");
     }
     if repaired > 0 {
         tracing::info!("repaired {repaired} installed extension manifest(s)");
+    }
+    if refreshed_desired > 0 {
+        tracing::info!("refreshed {refreshed_desired} desired blueprint version(s)");
     }
     if rewritten_files > 0 {
         tracing::info!("rewrote {rewritten_files} unpacked installed manifest file(s)");
@@ -471,13 +763,18 @@ async fn index_bundled_packages(
     tmp_root: &Path,
 ) -> anyhow::Result<HashMap<String, BundledPackage>> {
     let mut map = HashMap::new();
+    let mut paths = Vec::new();
     let mut entries = fs::read_dir(bundled_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
+        paths.push(entry.path());
+    }
+    paths.sort();
+
+    for path in paths {
+        let file_type = fs::metadata(&path).await?.file_type();
         if !file_type.is_file() && !file_type.is_dir() {
             continue;
         }
-        let path = entry.path();
         if file_type.is_file() {
             let is_elx = path
                 .extension()
@@ -516,14 +813,19 @@ async fn index_bundled_packages(
         } else {
             None
         };
-        map.insert(
-            package_manifest.manifest.id.clone(),
-            BundledPackage {
-                path: path.clone(),
-                version: package_manifest.manifest.version,
-                package_hash,
-            },
-        );
+        let extension_id = package_manifest.manifest.id.clone();
+        let candidate = BundledPackage {
+            path: path.clone(),
+            version: package_manifest.manifest.version,
+            package_hash,
+        };
+        let should_insert = match map.get(&extension_id) {
+            Some(existing) => should_replace_bundled_package(existing, &candidate),
+            None => true,
+        };
+        if should_insert {
+            map.insert(extension_id, candidate);
+        }
         if let Some(dir) = staging_dir {
             let _ = fs::remove_dir_all(dir).await;
         }
@@ -539,14 +841,57 @@ struct BundledPackage {
     package_hash: Option<String>,
 }
 
+fn should_replace_bundled_package(existing: &BundledPackage, candidate: &BundledPackage) -> bool {
+    match (
+        semver::Version::parse(&existing.version),
+        semver::Version::parse(&candidate.version),
+    ) {
+        (Ok(existing_version), Ok(candidate_version)) => {
+            if candidate_version > existing_version {
+                return true;
+            }
+            if candidate_version < existing_version {
+                return false;
+            }
+        }
+        _ if candidate.version != existing.version => {
+            return candidate.version > existing.version;
+        }
+        _ => {}
+    }
+
+    match (
+        existing.package_hash.as_ref(),
+        candidate.package_hash.as_ref(),
+    ) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        _ => false,
+    }
+}
+
 fn bundled_package_drifted(
     installed_version: &str,
     installed_hash: Option<&str>,
     bundled_version: &str,
     bundled_hash: Option<&str>,
 ) -> bool {
-    if installed_version != bundled_version {
-        return true;
+    match (
+        semver::Version::parse(installed_version),
+        semver::Version::parse(bundled_version),
+    ) {
+        (Ok(installed), Ok(bundled)) => {
+            if bundled < installed {
+                return false;
+            }
+            if bundled > installed {
+                return true;
+            }
+        }
+        _ if installed_version != bundled_version => {
+            return true;
+        }
+        _ => {}
     }
     match (installed_hash, bundled_hash) {
         (Some(installed), Some(current)) => !installed.eq_ignore_ascii_case(current),
@@ -557,7 +902,17 @@ fn bundled_package_drifted(
 
 #[cfg(test)]
 mod tests {
-    use super::bundled_package_drifted;
+    use super::{
+        BundledPackage, ExecutorAction, build_preinstalled_core_bootstrap_actions,
+        bundled_package_drifted, core_instance_needs_startup_bootstrap,
+        should_replace_bundled_package,
+    };
+    use crate::db::models::ExtensionInstance;
+    use crate::extensions::manifest::ExtensionManifest;
+    use chrono::Utc;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
     fn bundled_package_drifted_detects_hash_changes_at_same_version() {
@@ -586,6 +941,197 @@ mod tests {
             Some("aaaa"),
             "1.0.1",
             Some("aaaa"),
+        ));
+    }
+
+    #[test]
+    fn bundled_package_drifted_does_not_force_downgrade_from_newer_installed_version() {
+        assert!(!bundled_package_drifted("3.4.6", None, "1.0.2", None,));
+    }
+
+    #[test]
+    fn packaged_bundled_archive_wins_over_unpacked_manifest_at_same_version() {
+        let existing = BundledPackage {
+            path: PathBuf::from("flaresolverr-module"),
+            version: "1.0.0".to_string(),
+            package_hash: None,
+        };
+        let candidate = BundledPackage {
+            path: PathBuf::from("flaresolverr-module.elx"),
+            version: "1.0.0".to_string(),
+            package_hash: Some("abcd".to_string()),
+        };
+
+        assert!(should_replace_bundled_package(&existing, &candidate));
+    }
+
+    #[test]
+    fn unpacked_manifest_does_not_replace_packaged_archive_at_same_version() {
+        let existing = BundledPackage {
+            path: PathBuf::from("flaresolverr-module.elx"),
+            version: "1.0.0".to_string(),
+            package_hash: Some("abcd".to_string()),
+        };
+        let candidate = BundledPackage {
+            path: PathBuf::from("flaresolverr-module"),
+            version: "1.0.0".to_string(),
+            package_hash: None,
+        };
+
+        assert!(!should_replace_bundled_package(&existing, &candidate));
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_actions_include_runtime_and_provider_upsert() {
+        let manifest: ExtensionManifest = serde_json::from_value(json!({
+            "id": "elixir.modules.qbittorrent",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "qBittorrent",
+            "provides": [
+                {
+                    "capability": "downloader.torrent",
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": "qbittorrent"
+                }
+            ],
+            "runtime": {
+                "type": "container",
+                "image": "lscr.io/linuxserver/qbittorrent:latest",
+                "service_name": "svc-elixir-modules-qbittorrent-default"
+            },
+            "networking": {
+                "service_port": { "scheme": "http", "container_port": 8080 }
+            }
+        }))
+        .expect("manifest");
+
+        let instance = ExtensionInstance {
+            instance_id: Uuid::new_v4(),
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            runtime_version: None,
+            rollback_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            enabled: true,
+        };
+
+        let actions =
+            build_preinstalled_core_bootstrap_actions(&instance, &manifest).expect("actions");
+
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            actions[0],
+            ExecutorAction::EnsureRuntimeRunning { .. }
+        ));
+        assert!(matches!(
+            actions[1],
+            ExecutorAction::CreateOrUpdateProvider { .. }
+        ));
+        assert!(matches!(actions[2], ExecutorAction::TransportGate { .. }));
+        assert!(matches!(actions[3], ExecutorAction::BootstrapGate { .. }));
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_actions_add_full_readiness_sequence_for_non_downloaders() {
+        let manifest: ExtensionManifest = serde_json::from_value(json!({
+            "id": "elixir.modules.sonarr",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Sonarr",
+            "provides": [
+                {
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": "sonarr"
+                }
+            ],
+            "runtime": {
+                "type": "docker",
+                "image": "lscr.io/linuxserver/sonarr:latest"
+            },
+            "networking": {
+                "service_port": { "scheme": "http", "container_port": 8989 }
+            }
+        }))
+        .expect("manifest");
+
+        let instance = ExtensionInstance {
+            instance_id: Uuid::new_v4(),
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            runtime_version: None,
+            rollback_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            enabled: true,
+        };
+
+        let actions =
+            build_preinstalled_core_bootstrap_actions(&instance, &manifest).expect("actions");
+
+        assert_eq!(actions.len(), 5);
+        assert!(matches!(
+            actions[0],
+            ExecutorAction::EnsureRuntimeRunning { .. }
+        ));
+        assert!(matches!(
+            actions[1],
+            ExecutorAction::CreateOrUpdateProvider { .. }
+        ));
+        assert!(matches!(actions[2], ExecutorAction::TransportGate { .. }));
+        assert!(matches!(actions[3], ExecutorAction::BootstrapGate { .. }));
+        assert!(matches!(actions[4], ExecutorAction::HealthGate { .. }));
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_only_runs_for_unbootstrapped_instances() {
+        let manifest: ExtensionManifest = serde_json::from_value(json!({
+            "id": "elixir.modules.nzbget",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "NZBGet",
+            "provides": [
+                {
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "cardinality": "one",
+                    "implementation": "nzbget"
+                }
+            ],
+            "runtime": {
+                "type": "container",
+                "image": "lscr.io/linuxserver/nzbget:latest"
+            }
+        }))
+        .expect("manifest");
+
+        let bootstrapped_instance = ExtensionInstance {
+            instance_id: Uuid::new_v4(),
+            extension_id: "elixir.modules.nzbget".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            runtime_version: Some("1.0.0".to_string()),
+            rollback_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            enabled: true,
+        };
+
+        assert!(!core_instance_needs_startup_bootstrap(
+            &bootstrapped_instance,
+            1,
+            &manifest
+        ));
+        assert!(core_instance_needs_startup_bootstrap(
+            &bootstrapped_instance,
+            0,
+            &manifest
         ));
     }
 }

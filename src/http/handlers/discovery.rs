@@ -14,10 +14,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    acquisition::{AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView, load_intent_recovery_views},
     db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
     drivers::{
         AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
@@ -302,12 +303,37 @@ pub struct FindMediaAcquisitionItem {
     pub last_matched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<FindMediaAcquisitionChildItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindMediaAcquisitionChildItem {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    pub phase: String,
+    pub phase_label: String,
+    pub headline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<FindMediaAcquisitionBlocker>,
+    pub progress_percent: Option<f64>,
+    pub eta_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloader_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcquisitionPhase {
     Requested,
     AcceptedByManager,
+    FindingAnotherRelease,
     QueuedInDownloader,
     Downloading,
     PostProcessing,
@@ -322,6 +348,7 @@ impl AcquisitionPhase {
         match self {
             Self::Requested => "requested",
             Self::AcceptedByManager => "accepted_by_manager",
+            Self::FindingAnotherRelease => "finding_another_release",
             Self::QueuedInDownloader => "queued_in_downloader",
             Self::Downloading => "downloading",
             Self::PostProcessing => "post_processing",
@@ -336,11 +363,12 @@ impl AcquisitionPhase {
         match self {
             Self::Requested => "Requested",
             Self::AcceptedByManager => "Accepted by manager",
+            Self::FindingAnotherRelease => "Finding another release",
             Self::QueuedInDownloader => "Queued in downloader",
             Self::Downloading => "Downloading",
             Self::PostProcessing => "Post-processing",
             Self::Importing => "Importing",
-            Self::Completed => "Completed",
+            Self::Completed => "Downloaded",
             Self::NeedsAttention => "Needs attention",
             Self::Failed => "Failed",
         }
@@ -350,13 +378,14 @@ impl AcquisitionPhase {
         match self {
             Self::NeedsAttention => 0,
             Self::Failed => 1,
-            Self::Downloading => 2,
-            Self::PostProcessing => 3,
-            Self::Importing => 4,
-            Self::QueuedInDownloader => 5,
-            Self::AcceptedByManager => 6,
-            Self::Requested => 7,
-            Self::Completed => 8,
+            Self::FindingAnotherRelease => 2,
+            Self::Downloading => 3,
+            Self::PostProcessing => 4,
+            Self::Importing => 5,
+            Self::QueuedInDownloader => 6,
+            Self::AcceptedByManager => 7,
+            Self::Requested => 8,
+            Self::Completed => 9,
         }
     }
 
@@ -372,6 +401,7 @@ impl AcquisitionPhase {
         match self {
             Self::Requested => "requested",
             Self::AcceptedByManager => "searching",
+            Self::FindingAnotherRelease => "searching",
             Self::QueuedInDownloader => "queued",
             Self::Downloading => "downloading",
             Self::PostProcessing => "post_processing",
@@ -410,6 +440,30 @@ struct AcquisitionItemState {
     eta_seconds: Option<i64>,
     downloader_label: Option<String>,
     protocol: Option<String>,
+    children: Vec<FindMediaAcquisitionChildItem>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SonarrEpisodeDescriptor {
+    season_number: i64,
+    episode_number: i64,
+    title: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SonarrSeriesStats {
+    episode_count: usize,
+    episode_file_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SonarrBatchCounts {
+    queued: usize,
+    downloading: usize,
+    post_processing: usize,
+    importing: usize,
+    needs_attention: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,12 +630,12 @@ struct ProviderScopeDocument {
 }
 
 #[derive(Debug, Clone)]
-struct ProviderContext {
-    detail: crate::extensions::store::ProviderDetails,
-    instance_name: String,
-    instance_config: Option<Value>,
+pub(crate) struct ProviderContext {
+    pub(crate) detail: crate::extensions::store::ProviderDetails,
+    pub(crate) instance_name: String,
+    pub(crate) instance_config: Option<Value>,
     scope: ProviderScopeDocument,
-    media_types: Vec<MediaType>,
+    pub(crate) media_types: Vec<MediaType>,
 }
 
 fn deserialize_optional_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
@@ -1002,6 +1056,7 @@ async fn build_find_media_acquisition_response(
         .cloned()
         .map(|provider| (provider.detail.provider.provider_id, provider))
         .collect();
+    let recovery_views = load_intent_recovery_views(store).await?;
     let downloader_progress =
         load_acquisition_downloader_progress_index(state, store, &provider_contexts).await;
     let downloader_totals = load_acquisition_downloader_totals(state, store).await?;
@@ -1013,6 +1068,7 @@ async fn build_find_media_acquisition_response(
             state,
             store,
             &provider_map,
+            &recovery_views,
             &downloader_progress,
             &intent,
         )
@@ -1078,6 +1134,7 @@ async fn build_find_media_acquisition_item(
     state: &AppState,
     store: &ExtensionStore<'_>,
     provider_map: &HashMap<Uuid, ProviderContext>,
+    recovery_views: &HashMap<Uuid, IntentRecoveryView>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
     intent: &crate::extensions::store::ManagedIngestIntent,
 ) -> AnyResult<FindMediaAcquisitionItem> {
@@ -1091,6 +1148,7 @@ async fn build_find_media_acquisition_item(
         state,
         store,
         provider_map.get(&intent.manager_provider_id),
+        recovery_views.get(&intent.intent_id),
         downloader_progress,
         intent,
     )
@@ -1126,6 +1184,7 @@ async fn build_find_media_acquisition_item(
         last_matched_at: intent.last_matched_at,
         created_at: intent.created_at,
         updated_at: intent.updated_at,
+        children: state_view.children,
     })
 }
 
@@ -1133,22 +1192,13 @@ async fn resolve_acquisition_item_state(
     state: &AppState,
     store: &ExtensionStore<'_>,
     provider: Option<&ProviderContext>,
+    recovery_view: Option<&IntentRecoveryView>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
     intent: &crate::extensions::store::ManagedIngestIntent,
 ) -> AnyResult<AcquisitionItemState> {
-    if intent.last_matched_at.is_some() {
-        return Ok(AcquisitionItemState {
-            phase: AcquisitionPhase::Completed,
-            headline: "Matched in the library.".to_string(),
-            detail: Some("Elixir imported and matched this item in the library.".to_string()),
-            blocker: None,
-            evidence: base_acquisition_evidence(true, false, true, 0, None, None),
-            actions: Vec::new(),
-            progress_percent: Some(100.0),
-            eta_seconds: None,
-            downloader_label: None,
-            protocol: None,
-        });
+    let library_matched = intent.last_matched_at.is_some();
+    if library_matched && !matches!(intent.media_type, MediaType::Series | MediaType::Anime) {
+        return Ok(completed_acquisition_state());
     }
 
     let Some(provider) = provider else {
@@ -1212,6 +1262,7 @@ async fn resolve_acquisition_item_state(
             eta_seconds: None,
             downloader_label: None,
             protocol: None,
+            children: Vec::new(),
         });
     }
 
@@ -1230,6 +1281,7 @@ async fn resolve_acquisition_item_state(
             eta_seconds: None,
             downloader_label: None,
             protocol: None,
+            children: Vec::new(),
         });
     };
 
@@ -1274,12 +1326,42 @@ async fn resolve_acquisition_item_state(
     .await
     .ok();
 
+    let sonarr_episode_index = if implementation == "sonarr" {
+        let has_matching_queue_entries = queue_value
+            .as_ref()
+            .map(extract_arr_queue_records)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|entry| {
+                queue_entry_matches_manager_item(&entry, &implementation, manager_item_id)
+            });
+        if has_matching_queue_entries {
+            match load_sonarr_episode_index(&base_url, &api_key, manager_item_id).await {
+                Ok(index) => Some(index),
+                Err(err) => {
+                    warn!(
+                        manager_item_id = manager_item_id,
+                        "failed to load sonarr episode index for acquisition batch: {err}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(derive_arr_acquisition_state(
         &implementation,
         manager_item_id,
         &item_value,
         queue_value.as_ref(),
+        library_matched,
+        recovery_view,
         downloader_progress,
+        sonarr_episode_index.as_ref(),
     ))
 }
 
@@ -1288,93 +1370,8 @@ async fn execute_find_another_release(
     store: &ExtensionStore<'_>,
     intent_id: Uuid,
 ) -> AnyResult<String> {
-    let intent = store
-        .list_active_managed_ingest_intents()
-        .await?
-        .into_iter()
-        .find(|intent| intent.intent_id == intent_id)
-        .ok_or_else(|| anyhow::anyhow!("managed acquisition item is no longer available"))?;
-
-    let providers = load_provider_contexts(store).await?;
-    let provider_map: HashMap<Uuid, ProviderContext> = providers
-        .iter()
-        .cloned()
-        .map(|provider| (provider.detail.provider.provider_id, provider))
-        .collect();
-    let provider = provider_map
-        .get(&intent.manager_provider_id)
-        .ok_or_else(|| anyhow::anyhow!("manager provider is no longer available"))?;
-    let implementation = provider
-        .detail
-        .provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(implementation.as_str(), "sonarr" | "radarr") {
-        bail!("manager retry is not supported for implementation '{implementation}'");
-    }
-
-    let manager_item_id = intent
-        .manager_item_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("manager item id is not available yet"))?;
-    let manager_item_id = manager_item_id
-        .parse::<i64>()
-        .context("parsing manager item id")?;
-
-    let endpoint_json = provider
-        .detail
-        .provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint =
-        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let base_url =
-        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-            .await?;
-    let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
-    let manager_item_id_string = manager_item_id.to_string();
-
-    let queue_value = request_arr_json_with_query(
-        &base_url,
-        &api_key,
-        &manager_queue_paths(&implementation),
-        &[("page", "1".to_string()), ("pageSize", "250".to_string())],
-    )
-    .await
-    .ok();
-
-    let queue_entry = queue_value
-        .as_ref()
-        .map(extract_arr_queue_records)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|entry| {
-            queue_entry_matches_manager_item(entry, &implementation, &manager_item_id_string)
-        });
-
-    let mut removed_failed_download = false;
-    if let Some(entry) = queue_entry.as_ref()
-        && let Some(download_id) = queue_entry_download_id(entry)
-        && queue_entry_downloader_label(entry)
-            .map(|value| value.to_ascii_lowercase().contains("nzbget"))
-            .unwrap_or(false)
-        && let Some(nzbget_provider) = select_nzbget_provider(&providers)
-    {
-        removed_failed_download =
-            remove_nzbget_download_by_download_id(state, store, nzbget_provider, &download_id)
-                .await?;
-    }
-
-    request_arr_search_item(&implementation, &base_url, &api_key, manager_item_id).await?;
-
-    Ok(if removed_failed_download {
-        "Removed the failed NZBGet job and started a fresh search for another release.".to_string()
-    } else {
-        "Started a fresh search for another release.".to_string()
-    })
+    let _ = store;
+    crate::acquisition::execute_find_another_release(state, intent_id).await
 }
 
 async fn load_acquisition_downloader_progress_index(
@@ -1428,7 +1425,7 @@ async fn load_acquisition_downloader_progress_index(
     index
 }
 
-fn select_nzbget_provider(providers: &[ProviderContext]) -> Option<&ProviderContext> {
+pub(crate) fn select_nzbget_provider(providers: &[ProviderContext]) -> Option<&ProviderContext> {
     providers.iter().find(|provider| {
         provider.detail.provider.capability == "downloader.nzb"
             && provider
@@ -1442,7 +1439,7 @@ fn select_nzbget_provider(providers: &[ProviderContext]) -> Option<&ProviderCont
     })
 }
 
-async fn remove_nzbget_download_by_download_id(
+pub(crate) async fn remove_nzbget_download_by_download_id(
     state: &AppState,
     store: &ExtensionStore<'_>,
     provider: &ProviderContext,
@@ -1515,7 +1512,7 @@ async fn remove_nzbget_download_by_download_id(
     Ok(true)
 }
 
-async fn request_arr_search_item(
+pub(crate) async fn request_arr_search_item(
     implementation: &str,
     base_url: &str,
     api_key: &str,
@@ -1657,6 +1654,57 @@ async fn load_acquisition_downloader_totals(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct SonarrEpisodeRecord {
+    #[serde(default)]
+    id: i64,
+    #[serde(rename = "seasonNumber", default)]
+    season_number: i64,
+    #[serde(rename = "episodeNumber", default)]
+    episode_number: i64,
+    #[serde(default)]
+    title: String,
+}
+
+async fn load_sonarr_episode_index(
+    base_url: &str,
+    api_key: &str,
+    series_id: &str,
+) -> AnyResult<HashMap<i64, SonarrEpisodeDescriptor>> {
+    let value = request_arr_json_with_query(
+        base_url,
+        api_key,
+        &["api/v3/episode", "api/v4/episode"],
+        &[("seriesId", series_id.to_string())],
+    )
+    .await?;
+
+    let items = if let Some(entries) = value.as_array() {
+        entries.clone()
+    } else {
+        value
+            .get("records")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let mut index = HashMap::new();
+    for episode in serde_json::from_value::<Vec<SonarrEpisodeRecord>>(Value::Array(items))
+        .context("parsing sonarr episode batch index")?
+    {
+        index.insert(
+            episode.id,
+            SonarrEpisodeDescriptor {
+                season_number: episode.season_number,
+                episode_number: episode.episode_number,
+                title: episode.title,
+            },
+        );
+    }
+    Ok(index)
+}
+
 fn acquisition_attention(
     code: impl Into<String>,
     title: impl Into<String>,
@@ -1681,17 +1729,7 @@ fn acquisition_attention(
         eta_seconds: None,
         downloader_label: None,
         protocol: None,
-    }
-}
-
-fn acquisition_retry_action() -> FindMediaAcquisitionAction {
-    FindMediaAcquisitionAction {
-        id: "find_another_release".to_string(),
-        label: "Find another release".to_string(),
-        kind: "primary".to_string(),
-        confirm_text: Some(
-            "Remove the failed NZBGet job and search for another release?".to_string(),
-        ),
+        children: Vec::new(),
     }
 }
 
@@ -1699,6 +1737,7 @@ fn acquisition_phase_from_str(value: &str) -> AcquisitionPhase {
     match value {
         "requested" => AcquisitionPhase::Requested,
         "accepted_by_manager" => AcquisitionPhase::AcceptedByManager,
+        "finding_another_release" => AcquisitionPhase::FindingAnotherRelease,
         "queued_in_downloader" => AcquisitionPhase::QueuedInDownloader,
         "downloading" => AcquisitionPhase::Downloading,
         "post_processing" => AcquisitionPhase::PostProcessing,
@@ -1724,7 +1763,7 @@ fn manager_item_paths(implementation: &str, manager_item_id: &str) -> [String; 2
     }
 }
 
-fn manager_queue_paths(implementation: &str) -> [&str; 2] {
+pub(crate) fn manager_queue_paths(implementation: &str) -> [&str; 2] {
     match implementation {
         "sonarr" => ["api/v3/queue", "api/v4/queue"],
         "radarr" => ["api/v3/queue", "api/v4/queue"],
@@ -1737,7 +1776,10 @@ fn derive_arr_acquisition_state(
     manager_item_id: &str,
     item_value: &Value,
     queue_value: Option<&Value>,
+    library_matched: bool,
+    recovery_view: Option<&IntentRecoveryView>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
+    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
 ) -> AcquisitionItemState {
     let queue_entries: Vec<Value> = queue_value
         .map(extract_arr_queue_records)
@@ -1753,27 +1795,25 @@ fn derive_arr_acquisition_state(
         _ => false,
     };
 
-    let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
-    let protocol = queue_entries.first().and_then(queue_entry_protocol);
-
-    if let Some(message) = queue_entries
-        .iter()
-        .find_map(|entry| queue_entry_error_message(entry))
-    {
-        return acquisition_attention(
-            "manager_queue_error",
-            "Manager reported a problem",
-            message,
-            base_acquisition_evidence(
-                true,
-                false,
-                has_file,
-                queue_entry_count,
-                downloader_label.as_deref(),
-                protocol.as_deref(),
-            ),
+    if implementation == "sonarr" && !queue_entries.is_empty() {
+        return derive_sonarr_batch_acquisition_state(
+            item_value,
+            &queue_entries,
+            sonarr_episode_index,
+            downloader_progress,
         );
     }
+
+    if let Some(entry) = queue_entries.first() {
+        return derive_arr_queue_entry_state(entry, queue_entry_count, downloader_progress);
+    }
+
+    if acquisition_is_completed(implementation, item_value, library_matched) {
+        return completed_acquisition_state();
+    }
+
+    let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
+    let protocol = queue_entries.first().and_then(queue_entry_protocol);
 
     if has_file {
         return AcquisitionItemState {
@@ -1796,120 +1836,26 @@ fn derive_arr_acquisition_state(
             eta_seconds: None,
             downloader_label,
             protocol,
+            children: Vec::new(),
         };
     }
 
-    if let Some(entry) = queue_entries.first() {
-        let downloader_progress = queue_entry_download_id(entry)
-            .and_then(|download_id| downloader_progress.get(&download_id));
-        let progress_percent = downloader_progress
-            .and_then(|item| item.progress_percent)
-            .or_else(|| queue_entry_progress_percent(entry));
-        let eta_seconds = downloader_progress
-            .and_then(|item| item.eta_seconds)
-            .or_else(|| queue_entry_eta_seconds(entry));
-        let downloader_label = queue_entry_downloader_label(entry);
-        let protocol = queue_entry_protocol(entry);
-        let tracked_state = queue_entry_state(entry);
-        if let Some(issue) = downloader_progress.and_then(|item| item.issue.clone()) {
-            return AcquisitionItemState {
-                phase: AcquisitionPhase::NeedsAttention,
-                headline: issue.title.clone(),
-                detail: Some(issue.detail.clone()),
-                blocker: Some(FindMediaAcquisitionBlocker {
-                    code: issue.code,
-                    title: issue.title,
-                    detail: issue.detail,
-                    severity: "warning".to_string(),
-                }),
-                evidence: base_acquisition_evidence(
-                    true,
-                    true,
-                    false,
-                    queue_entry_count,
-                    downloader_label.as_deref(),
-                    protocol.as_deref(),
-                ),
-                actions: vec![acquisition_retry_action()],
-                progress_percent,
-                eta_seconds,
-                downloader_label,
-                protocol,
-            };
-        }
-        let phase = if tracked_state.contains("import") {
-            AcquisitionPhase::Importing
-        } else if tracked_state.contains("post")
-            || tracked_state.contains("extract")
-            || tracked_state.contains("verif")
-            || progress_percent.map(|value| value >= 99.5).unwrap_or(false)
-        {
-            AcquisitionPhase::PostProcessing
-        } else if tracked_state.contains("download")
-            || progress_percent.map(|value| value > 0.0).unwrap_or(false)
-        {
-            AcquisitionPhase::Downloading
-        } else {
-            AcquisitionPhase::QueuedInDownloader
-        };
-
-        let (headline, detail) = match phase {
-            AcquisitionPhase::Downloading => {
-                if let Some(label) = downloader_label.as_deref() {
-                    (
-                        format!("Downloading via {label}."),
-                        Some("Transfer is active in the downloader.".to_string()),
-                    )
-                } else {
-                    (
-                        "Download in progress.".to_string(),
-                        Some("Transfer is active in the downloader.".to_string()),
-                    )
-                }
-            }
-            AcquisitionPhase::PostProcessing => (
-                "Download finished.".to_string(),
-                Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
-            ),
-            AcquisitionPhase::Importing => (
-                "Manager is importing the completed download.".to_string(),
-                Some(
-                    "The downloader finished and the manager is finishing the import.".to_string(),
-                ),
-            ),
-            _ => {
-                if let Some(label) = downloader_label.as_deref() {
-                    (
-                        format!("Queued with {label}."),
-                        Some("Manager handed the item to the downloader. Waiting for transfer to start.".to_string()),
-                    )
-                } else {
-                    (
-                        "Waiting in the download queue.".to_string(),
-                        Some("Manager handed the item to the downloader. Waiting for transfer to start.".to_string()),
-                    )
-                }
-            }
-        };
-
+    if acquisition_recovery_is_transitioning(recovery_view) {
         return AcquisitionItemState {
-            phase,
-            headline,
-            detail,
-            blocker: None,
-            evidence: base_acquisition_evidence(
-                true,
-                true,
-                false,
-                queue_entry_count,
-                downloader_label.as_deref(),
-                protocol.as_deref(),
+            phase: AcquisitionPhase::FindingAnotherRelease,
+            headline: "Finding another release.".to_string(),
+            detail: Some(
+                "Elixir cleared the dead release and is waiting for the manager to provide another one."
+                    .to_string(),
             ),
+            blocker: None,
+            evidence: base_acquisition_evidence(true, false, false, 0, None, None),
             actions: Vec::new(),
-            progress_percent,
-            eta_seconds,
-            downloader_label,
-            protocol,
+            progress_percent: None,
+            eta_seconds: None,
+            downloader_label: None,
+            protocol: None,
+            children: Vec::new(),
         };
     }
 
@@ -1927,6 +1873,494 @@ fn derive_arr_acquisition_state(
         eta_seconds: None,
         downloader_label: None,
         protocol: None,
+        children: Vec::new(),
+    }
+}
+
+fn derive_arr_queue_entry_state(
+    entry: &Value,
+    queue_entry_count: usize,
+    downloader_progress_index: &AcquisitionDownloaderProgressIndex,
+) -> AcquisitionItemState {
+    let downloader_progress = queue_entry_download_id(entry)
+        .and_then(|download_id| downloader_progress_index.get(&download_id));
+    let progress_percent = downloader_progress.and_then(|item| item.progress_percent);
+    let eta_seconds = downloader_progress.and_then(|item| item.eta_seconds);
+    let downloader_label = queue_entry_downloader_label(entry);
+    let protocol = queue_entry_protocol(entry);
+
+    if let Some(message) = queue_entry_error_message(entry) {
+        return acquisition_attention(
+            "manager_queue_error",
+            "Manager reported a problem",
+            message,
+            base_acquisition_evidence(
+                true,
+                false,
+                false,
+                queue_entry_count,
+                downloader_label.as_deref(),
+                protocol.as_deref(),
+            ),
+        );
+    }
+
+    if let Some(issue) = downloader_progress.and_then(|item| item.issue.clone()) {
+        if matches!(
+            issue.code.as_str(),
+            "nzbget_release_failed" | "nzbget_release_unrecoverable"
+        ) {
+            return AcquisitionItemState {
+                phase: AcquisitionPhase::NeedsAttention,
+                headline: "Dead release detected.".to_string(),
+                detail: Some(
+                    "NZBGet marked the current release as damaged or unrecoverable. Elixir will clear it and ask the manager for another release."
+                        .to_string(),
+                ),
+                blocker: Some(FindMediaAcquisitionBlocker {
+                    code: issue.code,
+                    title: "Dead release detected".to_string(),
+                    detail: "The current NZBGet release is damaged or unrecoverable. Elixir is clearing it and will ask the manager for another release."
+                        .to_string(),
+                    severity: "warning".to_string(),
+                }),
+                evidence: base_acquisition_evidence(
+                    true,
+                    true,
+                    false,
+                    queue_entry_count,
+                    downloader_label.as_deref(),
+                    protocol.as_deref(),
+                ),
+                actions: Vec::new(),
+                progress_percent: None,
+                eta_seconds: None,
+                downloader_label,
+                protocol,
+                children: Vec::new(),
+            };
+        }
+
+        return AcquisitionItemState {
+            phase: AcquisitionPhase::NeedsAttention,
+            headline: issue.title.clone(),
+            detail: Some(issue.detail.clone()),
+            blocker: Some(FindMediaAcquisitionBlocker {
+                code: issue.code,
+                title: issue.title,
+                detail: issue.detail,
+                severity: "warning".to_string(),
+            }),
+            evidence: base_acquisition_evidence(
+                true,
+                true,
+                false,
+                queue_entry_count,
+                downloader_label.as_deref(),
+                protocol.as_deref(),
+            ),
+            actions: Vec::new(),
+            progress_percent,
+            eta_seconds,
+            downloader_label,
+            protocol,
+            children: Vec::new(),
+        };
+    }
+
+    let tracked_state = queue_entry_state(entry);
+    let phase = if tracked_state.contains("import") {
+        AcquisitionPhase::Importing
+    } else if tracked_state.contains("post")
+        || tracked_state.contains("extract")
+        || tracked_state.contains("verif")
+        || progress_percent.map(|value| value >= 99.5).unwrap_or(false)
+    {
+        AcquisitionPhase::PostProcessing
+    } else if tracked_state.contains("download")
+        || progress_percent.map(|value| value > 0.0).unwrap_or(false)
+    {
+        AcquisitionPhase::Downloading
+    } else {
+        AcquisitionPhase::QueuedInDownloader
+    };
+
+    let (headline, detail) = match phase {
+        AcquisitionPhase::Downloading => {
+            if let Some(label) = downloader_label.as_deref() {
+                (
+                    format!("Downloading via {label}."),
+                    Some("Transfer is active in the downloader.".to_string()),
+                )
+            } else {
+                (
+                    "Download in progress.".to_string(),
+                    Some("Transfer is active in the downloader.".to_string()),
+                )
+            }
+        }
+        AcquisitionPhase::PostProcessing => (
+            "Download finished.".to_string(),
+            Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
+        ),
+        AcquisitionPhase::Importing => (
+            "Manager is importing the completed download.".to_string(),
+            Some("The downloader finished and the manager is finishing the import.".to_string()),
+        ),
+        _ => {
+            if let Some(label) = downloader_label.as_deref() {
+                (
+                    format!("Queued with {label}."),
+                    Some(
+                        "Manager handed the item to the downloader. Waiting for transfer to start."
+                            .to_string(),
+                    ),
+                )
+            } else {
+                (
+                    "Waiting in the download queue.".to_string(),
+                    Some(
+                        "Manager handed the item to the downloader. Waiting for transfer to start."
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+    };
+
+    AcquisitionItemState {
+        phase,
+        headline,
+        detail,
+        blocker: None,
+        evidence: base_acquisition_evidence(
+            true,
+            true,
+            false,
+            queue_entry_count,
+            downloader_label.as_deref(),
+            protocol.as_deref(),
+        ),
+        actions: Vec::new(),
+        progress_percent,
+        eta_seconds,
+        downloader_label,
+        protocol,
+        children: Vec::new(),
+    }
+}
+
+fn derive_sonarr_batch_acquisition_state(
+    item_value: &Value,
+    queue_entries: &[Value],
+    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> AcquisitionItemState {
+    let mut children = queue_entries
+        .iter()
+        .map(|entry| build_sonarr_batch_child(entry, sonarr_episode_index, downloader_progress))
+        .collect::<Vec<_>>();
+    let counts = summarize_sonarr_batch_children(&children);
+    let stats = sonarr_series_stats(item_value);
+    let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
+    let protocol = queue_entries.first().and_then(queue_entry_protocol);
+    let phase = summarize_sonarr_batch_phase(counts);
+
+    let mut evidence = base_acquisition_evidence(
+        true,
+        true,
+        false,
+        queue_entries.len(),
+        downloader_label.as_deref(),
+        protocol.as_deref(),
+    );
+    evidence.push(acquisition_evidence(
+        "Episodes queued",
+        counts.queued.to_string(),
+        Some("neutral"),
+    ));
+    if counts.downloading > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes downloading",
+            counts.downloading.to_string(),
+            Some("success"),
+        ));
+    }
+    if counts.post_processing > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes post-processing",
+            counts.post_processing.to_string(),
+            Some("neutral"),
+        ));
+    }
+    if counts.importing > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes importing",
+            counts.importing.to_string(),
+            Some("neutral"),
+        ));
+    }
+    if counts.needs_attention + counts.failed > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes needing attention",
+            (counts.needs_attention + counts.failed).to_string(),
+            Some("warning"),
+        ));
+    }
+    if stats.episode_count > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes imported",
+            format!("{} / {}", stats.episode_file_count, stats.episode_count),
+            Some(if stats.episode_file_count > 0 {
+                "success"
+            } else {
+                "neutral"
+            }),
+        ));
+    } else if stats.episode_file_count > 0 {
+        evidence.push(acquisition_evidence(
+            "Episodes imported",
+            stats.episode_file_count.to_string(),
+            Some("success"),
+        ));
+    }
+
+    children.sort_by(|left, right| {
+        let left_phase = acquisition_phase_from_str(&left.phase);
+        let right_phase = acquisition_phase_from_str(&right.phase);
+        left_phase
+            .sort_priority()
+            .cmp(&right_phase.sort_priority())
+            .then_with(|| {
+                left.title
+                    .to_ascii_lowercase()
+                    .cmp(&right.title.to_ascii_lowercase())
+            })
+    });
+
+    AcquisitionItemState {
+        phase,
+        headline: format_sonarr_batch_headline(counts),
+        detail: Some(format_sonarr_batch_detail(stats)),
+        blocker: build_sonarr_batch_blocker(counts),
+        evidence,
+        actions: Vec::new(),
+        progress_percent: None,
+        eta_seconds: None,
+        downloader_label,
+        protocol,
+        children,
+    }
+}
+
+fn build_sonarr_batch_child(
+    entry: &Value,
+    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> FindMediaAcquisitionChildItem {
+    let state = derive_arr_queue_entry_state(entry, 1, downloader_progress);
+    let (title, subtitle) = sonarr_batch_child_title(entry, sonarr_episode_index);
+    let id = queue_entry_download_id(entry)
+        .or_else(|| as_id_string(entry.get("episodeId").unwrap_or(&Value::Null)))
+        .or_else(|| as_id_string(entry.get("id").unwrap_or(&Value::Null)))
+        .unwrap_or_else(|| title.clone());
+
+    FindMediaAcquisitionChildItem {
+        id,
+        title,
+        subtitle,
+        phase: state.phase.as_str().to_string(),
+        phase_label: state.phase.label().to_string(),
+        headline: state.headline,
+        detail: state.detail,
+        blocker: state.blocker,
+        progress_percent: state.progress_percent,
+        eta_seconds: state.eta_seconds,
+        downloader_label: state.downloader_label,
+        protocol: state.protocol,
+    }
+}
+
+fn sonarr_batch_child_title(
+    entry: &Value,
+    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
+) -> (String, Option<String>) {
+    let release_title = entry
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let Some(episode_id) = entry.get("episodeId").and_then(Value::as_i64) else {
+        return (
+            release_title
+                .clone()
+                .unwrap_or_else(|| "Episode".to_string()),
+            None,
+        );
+    };
+    let Some(episode) = sonarr_episode_index.and_then(|index| index.get(&episode_id)) else {
+        return (
+            release_title
+                .clone()
+                .unwrap_or_else(|| "Episode".to_string()),
+            None,
+        );
+    };
+
+    let code = format!(
+        "S{:02}E{:02}",
+        episode.season_number, episode.episode_number
+    );
+    let title = if episode.title.trim().is_empty() {
+        code
+    } else {
+        format!("{code} • {}", episode.title.trim())
+    };
+    let subtitle = release_title.filter(|value| value.trim() != title);
+    (title, subtitle)
+}
+
+fn summarize_sonarr_batch_children(
+    children: &[FindMediaAcquisitionChildItem],
+) -> SonarrBatchCounts {
+    let mut counts = SonarrBatchCounts::default();
+    for child in children {
+        match acquisition_phase_from_str(&child.phase) {
+            AcquisitionPhase::QueuedInDownloader => counts.queued += 1,
+            AcquisitionPhase::Downloading => counts.downloading += 1,
+            AcquisitionPhase::PostProcessing => counts.post_processing += 1,
+            AcquisitionPhase::Importing => counts.importing += 1,
+            AcquisitionPhase::NeedsAttention => counts.needs_attention += 1,
+            AcquisitionPhase::Failed => counts.failed += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn summarize_sonarr_batch_phase(counts: SonarrBatchCounts) -> AcquisitionPhase {
+    if counts.needs_attention > 0 || counts.failed > 0 {
+        AcquisitionPhase::NeedsAttention
+    } else if counts.downloading > 0 {
+        AcquisitionPhase::Downloading
+    } else if counts.post_processing > 0 {
+        AcquisitionPhase::PostProcessing
+    } else if counts.importing > 0 {
+        AcquisitionPhase::Importing
+    } else {
+        AcquisitionPhase::QueuedInDownloader
+    }
+}
+
+fn format_sonarr_batch_headline(counts: SonarrBatchCounts) -> String {
+    let mut parts = Vec::new();
+    if counts.needs_attention > 0 || counts.failed > 0 {
+        parts.push(format!(
+            "{} need attention",
+            format_episode_count(counts.needs_attention + counts.failed)
+        ));
+    }
+    if counts.downloading > 0 {
+        parts.push(format!(
+            "{} downloading",
+            format_episode_count(counts.downloading)
+        ));
+    }
+    if counts.post_processing > 0 {
+        parts.push(format!(
+            "{} post-processing",
+            format_episode_count(counts.post_processing)
+        ));
+    }
+    if counts.importing > 0 {
+        parts.push(format!(
+            "{} importing",
+            format_episode_count(counts.importing)
+        ));
+    }
+    if counts.queued > 0 {
+        parts.push(format!("{} queued", format_episode_count(counts.queued)));
+    }
+
+    if parts.is_empty() {
+        "Waiting for episode activity.".to_string()
+    } else {
+        format!("{}.", parts.join(", "))
+    }
+}
+
+fn format_sonarr_batch_detail(stats: SonarrSeriesStats) -> String {
+    if stats.episode_count > 0 {
+        format!(
+            "Sonarr is handling this series as a batch. {} of {} episode files are imported so far.",
+            stats.episode_file_count, stats.episode_count
+        )
+    } else if stats.episode_file_count > 0 {
+        format!(
+            "Sonarr is handling this series as a batch. {} episode files are already imported.",
+            stats.episode_file_count
+        )
+    } else {
+        "Sonarr is handling this series as a batch of episode downloads.".to_string()
+    }
+}
+
+fn build_sonarr_batch_blocker(counts: SonarrBatchCounts) -> Option<FindMediaAcquisitionBlocker> {
+    let attention = counts.needs_attention + counts.failed;
+    (attention > 0).then(|| FindMediaAcquisitionBlocker {
+        code: "series_batch_attention".to_string(),
+        title: "Episodes need attention".to_string(),
+        detail: format!(
+            "{} in this series currently need attention.",
+            format_episode_count(attention)
+        ),
+        severity: "warning".to_string(),
+    })
+}
+
+fn sonarr_series_stats(value: &Value) -> SonarrSeriesStats {
+    let statistics = value.get("statistics");
+    SonarrSeriesStats {
+        episode_count: statistics
+            .and_then(|item| item.get("episodeCount"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(0),
+        episode_file_count: statistics
+            .and_then(|item| item.get("episodeFileCount"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(0),
+    }
+}
+
+fn sonarr_series_is_complete(value: &Value) -> bool {
+    let stats = sonarr_series_stats(value);
+    stats.episode_count > 0 && stats.episode_file_count >= stats.episode_count
+}
+
+fn acquisition_is_completed(
+    implementation: &str,
+    item_value: &Value,
+    library_matched: bool,
+) -> bool {
+    if !library_matched {
+        return false;
+    }
+    match implementation {
+        "sonarr" => sonarr_series_is_complete(item_value),
+        "radarr" => true,
+        _ => true,
+    }
+}
+
+fn format_episode_count(count: usize) -> String {
+    if count == 1 {
+        "1 episode".to_string()
+    } else {
+        format!("{count} episodes")
     }
 }
 
@@ -1983,6 +2417,22 @@ fn base_acquisition_evidence(
     evidence
 }
 
+fn completed_acquisition_state() -> AcquisitionItemState {
+    AcquisitionItemState {
+        phase: AcquisitionPhase::Completed,
+        headline: "Downloaded.".to_string(),
+        detail: None,
+        blocker: None,
+        evidence: Vec::new(),
+        actions: Vec::new(),
+        progress_percent: None,
+        eta_seconds: None,
+        downloader_label: None,
+        protocol: None,
+        children: Vec::new(),
+    }
+}
+
 fn acquisition_evidence(
     label: impl Into<String>,
     value: impl Into<String>,
@@ -1995,7 +2445,7 @@ fn acquisition_evidence(
     }
 }
 
-fn extract_arr_queue_records(value: &Value) -> Vec<Value> {
+pub(crate) fn extract_arr_queue_records(value: &Value) -> Vec<Value> {
     if let Some(items) = value.as_array() {
         return items.clone();
     }
@@ -2006,7 +2456,7 @@ fn extract_arr_queue_records(value: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn queue_entry_matches_manager_item(
+pub(crate) fn queue_entry_matches_manager_item(
     entry: &Value,
     implementation: &str,
     manager_item_id: &str,
@@ -2099,21 +2549,7 @@ fn queue_entry_error_message(entry: &Value) -> Option<String> {
     None
 }
 
-fn queue_entry_progress_percent(entry: &Value) -> Option<f64> {
-    let size = entry.get("size").and_then(value_as_f64)?;
-    if size <= 0.0 {
-        return None;
-    }
-    let size_left = entry
-        .get("sizeleft")
-        .or_else(|| entry.get("sizeLeft"))
-        .and_then(value_as_f64)
-        .unwrap_or(size);
-    let progress = ((size - size_left).max(0.0) / size) * 100.0;
-    Some(progress.clamp(0.0, 100.0))
-}
-
-fn queue_entry_download_id(entry: &Value) -> Option<String> {
+pub(crate) fn queue_entry_download_id(entry: &Value) -> Option<String> {
     entry
         .get("downloadId")
         .and_then(Value::as_str)
@@ -2122,29 +2558,7 @@ fn queue_entry_download_id(entry: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn queue_entry_eta_seconds(entry: &Value) -> Option<i64> {
-    if let Some(value) = entry
-        .get("estimatedCompletionTime")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-            let eta = parsed.with_timezone(&Utc) - Utc::now();
-            return Some(eta.num_seconds().max(0));
-        }
-    }
-    if let Some(value) = entry
-        .get("timeleft")
-        .or_else(|| entry.get("timeLeft"))
-        .and_then(Value::as_str)
-    {
-        return parse_arr_duration_seconds(value);
-    }
-    None
-}
-
-fn queue_entry_downloader_label(entry: &Value) -> Option<String> {
+pub(crate) fn queue_entry_downloader_label(entry: &Value) -> Option<String> {
     entry
         .get("downloadClient")
         .or_else(|| entry.get("downloadClientName"))
@@ -2172,21 +2586,6 @@ fn nzbget_group_download_id(group: &AcquisitionNzbgetGroup) -> Option<&str> {
             .then_some(parameter.value.trim())
             .filter(|value| !value.is_empty())
     })
-}
-
-fn parse_arr_duration_seconds(value: &str) -> Option<i64> {
-    let mut parts = value
-        .trim()
-        .split(':')
-        .filter_map(|item| item.trim().parse::<i64>().ok())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return None;
-    }
-    while parts.len() < 3 {
-        parts.insert(0, 0);
-    }
-    Some(parts[0] * 3600 + parts[1] * 60 + parts[2])
 }
 
 fn normalize_download_id(value: &str) -> String {
@@ -2300,13 +2699,47 @@ fn downloader_progress_percent(
         return None;
     }
 
-    let completed = if let Some(remaining_size) = remaining_size {
+    let completed = if let Some(downloaded_size) = downloaded_size {
+        downloaded_size
+    } else if let Some(remaining_size) = remaining_size {
         total_size.saturating_sub(remaining_size)
     } else {
-        downloaded_size.unwrap_or(0)
+        return None;
     };
 
     Some(((completed as f64 / total_size as f64) * 100.0).clamp(0.0, 100.0))
+}
+
+fn acquisition_recovery_is_transitioning(recovery_view: Option<&IntentRecoveryView>) -> bool {
+    let Some(recovery_view) = recovery_view else {
+        return false;
+    };
+    if !recovery_view.last_attempt_succeeded {
+        return false;
+    }
+    if recovery_view
+        .last_attempted_download_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return false;
+    }
+
+    let now = Utc::now();
+    if recovery_view
+        .cooldown_until
+        .map(|until| until > now)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    recovery_view
+        .last_attempted_at
+        .map(|at| (now - at) <= ChronoDuration::seconds(AUTO_RECOVERY_COOLDOWN_SECONDS.max(1)))
+        .unwrap_or(false)
 }
 
 fn combine_size_parts(hi: Option<u64>, lo: Option<u64>) -> Option<u64> {
@@ -3081,8 +3514,6 @@ async fn resolve_blueprint_preferred_manager(
         .into_iter()
         .map(|extension| (extension.extension_id.clone(), extension))
         .collect();
-    let preference_keys = manager_preference_keys(media_type);
-
     for item in desired {
         let Some(extension) = extension_map.get(&item.blueprint_extension_id) else {
             continue;
@@ -3092,33 +3523,61 @@ async fn resolve_blueprint_preferred_manager(
         else {
             continue;
         };
-        let Some(preferences) = manifest.preferences.as_ref() else {
-            continue;
-        };
-
-        for key in &preference_keys {
-            let Some(preference) = preferences.providers.get(*key) else {
-                continue;
-            };
-            for extension_id in &preference.prefer {
-                if let Some(provider) = providers
-                    .iter()
-                    .find(|provider| provider.detail.extension_id == *extension_id)
-                {
-                    return Ok(Some(provider.detail.provider.provider_id));
-                }
-            }
+        if let Some(provider_id) =
+            resolve_execution_preferred_manager(&extension_map, &manifest, providers, media_type)
+        {
+            return Ok(Some(provider_id));
         }
     }
 
     Ok(None)
 }
 
-fn manager_preference_keys(media_type: MediaType) -> Vec<&'static str> {
+fn resolve_execution_preferred_manager(
+    extension_map: &HashMap<String, crate::db::models::Extension>,
+    manifest: &ExtensionManifest,
+    providers: &[ProviderContext],
+    media_type: MediaType,
+) -> Option<Uuid> {
+    let execution = manifest.execution.as_ref()?;
+    for capability in manager_capabilities_for_media_type(media_type) {
+        for instance in &execution.instances {
+            let Some(extension) = extension_map.get(&instance.extension_id) else {
+                continue;
+            };
+            let Ok(module_manifest) =
+                serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+            else {
+                continue;
+            };
+            let provides_manager = module_manifest.provides.iter().any(|provide| {
+                provide.capability == *capability && provide.slot.eq_ignore_ascii_case("default")
+            });
+            if !provides_manager {
+                continue;
+            }
+            if let Some(provider) = providers.iter().find(|provider| {
+                provider.detail.extension_id == instance.extension_id
+                    && provider.instance_name == instance.name
+                    && provider.detail.provider.capability == *capability
+                    && provider
+                        .detail
+                        .provider
+                        .slot_id
+                        .eq_ignore_ascii_case("default")
+            }) {
+                return Some(provider.detail.provider.provider_id);
+            }
+        }
+    }
+    None
+}
+
+fn manager_capabilities_for_media_type(media_type: MediaType) -> &'static [&'static str] {
     match media_type {
-        MediaType::Movie => vec!["media.manager.movies/default"],
-        MediaType::Series => vec!["media.manager.tv/default"],
-        MediaType::Anime => vec!["media.manager.anime/default", "media.manager.tv/default"],
+        MediaType::Movie => &["media.manager.movies"],
+        MediaType::Series => &["media.manager.tv"],
+        MediaType::Anime => &["media.manager.anime", "media.manager.tv"],
     }
 }
 
@@ -3150,7 +3609,9 @@ fn discovery_result_key(result: &DiscoveryResult) -> String {
     )
 }
 
-async fn load_provider_contexts(store: &ExtensionStore<'_>) -> AnyResult<Vec<ProviderContext>> {
+pub(crate) async fn load_provider_contexts(
+    store: &ExtensionStore<'_>,
+) -> AnyResult<Vec<ProviderContext>> {
     let details = store.list_provider_details().await?;
     let instances = store.list_instances(None).await?;
     let extensions = store.list_extensions().await?;
@@ -3805,7 +4266,7 @@ async fn search_with_provider(
     }
 }
 
-async fn resolve_arr_api_key(
+pub(crate) async fn resolve_arr_api_key(
     state: &AppState,
     store: &ExtensionStore<'_>,
     provider: &ProviderContext,
@@ -4006,7 +4467,7 @@ async fn request_arr_lookup(
     bail!("lookup endpoint is not available");
 }
 
-async fn request_arr_json_with_query<P: AsRef<str>>(
+pub(crate) async fn request_arr_json_with_query<P: AsRef<str>>(
     base_url: &str,
     api_key: &str,
     paths: &[P],
@@ -4049,7 +4510,7 @@ async fn request_arr_json_with_query<P: AsRef<str>>(
     bail!("manager endpoint is not available");
 }
 
-async fn request_arr_write(
+pub(crate) async fn request_arr_write(
     base_url: &str,
     api_key: &str,
     paths: &[&str],
@@ -4083,7 +4544,7 @@ async fn request_arr_write(
     bail!("manager write endpoint is not available");
 }
 
-async fn resolve_provider_transport_base_url(
+pub(crate) async fn resolve_provider_transport_base_url(
     instance_id: Uuid,
     endpoint: &ProviderEndpoint,
 ) -> AnyResult<String> {
@@ -4280,14 +4741,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_arr_duration_seconds_handles_hms() {
-        assert_eq!(parse_arr_duration_seconds("01:02:03"), Some(3723));
-        assert_eq!(parse_arr_duration_seconds("12:34"), Some(754));
-        assert_eq!(parse_arr_duration_seconds(""), None);
-    }
-
-    #[test]
-    fn derive_arr_acquisition_state_marks_downloading_from_queue_progress() {
+    fn derive_arr_acquisition_state_marks_downloading_from_queue_state_without_fake_progress() {
         let item = json!({
             "hasFile": false,
             "sizeOnDisk": 0
@@ -4310,16 +4764,17 @@ mod tests {
             "42",
             &item,
             Some(&queue),
+            false,
+            None,
             &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         assert_eq!(state.phase, AcquisitionPhase::Downloading);
         assert_eq!(state.headline, "Downloading via default (nzbget).");
         assert_eq!(state.downloader_label.as_deref(), Some("default (nzbget)"));
         assert_eq!(state.protocol.as_deref(), Some("usenet"));
-        assert_eq!(
-            state.progress_percent.map(|value| value.round() as i32),
-            Some(75)
-        );
+        assert_eq!(state.progress_percent, None);
+        assert_eq!(state.eta_seconds, None);
     }
 
     #[test]
@@ -4336,7 +4791,10 @@ mod tests {
             "9",
             &item,
             None,
+            false,
+            None,
             &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         assert_eq!(state.phase, AcquisitionPhase::Importing);
         assert_eq!(
@@ -4362,7 +4820,10 @@ mod tests {
             "77",
             &item,
             Some(&queue),
+            false,
+            None,
             &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         assert_eq!(state.phase, AcquisitionPhase::NeedsAttention);
         assert_eq!(
@@ -4390,7 +4851,10 @@ mod tests {
             "77",
             &item,
             Some(&queue),
+            false,
+            None,
             &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         assert_eq!(state.phase, AcquisitionPhase::NeedsAttention);
         assert_eq!(
@@ -4419,7 +4883,10 @@ mod tests {
             "9",
             &item,
             None,
+            false,
+            None,
             &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         assert_eq!(state.phase, AcquisitionPhase::AcceptedByManager);
         assert_eq!(state.headline, "Accepted by manager.");
@@ -4466,8 +4933,16 @@ mod tests {
             },
         );
 
-        let state =
-            derive_arr_acquisition_state("radarr", "42", &item, Some(&queue), &downloader_progress);
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "42",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &downloader_progress,
+            None,
+        );
 
         assert_eq!(state.phase, AcquisitionPhase::Downloading);
         assert_eq!(state.progress_percent, Some(77.0));
@@ -4475,7 +4950,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_arr_acquisition_state_marks_bad_nzbget_release_with_retry_action() {
+    fn derive_arr_acquisition_state_marks_bad_nzbget_release_as_needing_attention() {
         let item = json!({
             "hasFile": false,
             "sizeOnDisk": 0
@@ -4507,20 +4982,299 @@ mod tests {
             },
         );
 
-        let state =
-            derive_arr_acquisition_state("radarr", "42", &item, Some(&queue), &downloader_progress);
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "42",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &downloader_progress,
+            None,
+        );
 
         assert_eq!(state.phase, AcquisitionPhase::NeedsAttention);
+        assert_eq!(state.progress_percent, None);
+        assert_eq!(state.eta_seconds, None);
         assert_eq!(
             state.blocker.as_ref().map(|item| item.code.as_str()),
             Some("nzbget_release_unrecoverable")
         );
-        assert_eq!(state.actions.len(), 1);
-        assert_eq!(state.actions[0].id, "find_another_release");
+        assert!(state.actions.is_empty());
+        assert_eq!(state.headline, "Dead release detected.");
     }
 
     #[test]
-    fn nzbget_acquisition_progress_uses_drone_download_id_and_byte_totals() {
+    fn derive_arr_acquisition_state_marks_finding_another_release_after_successful_recovery() {
+        let item = json!({
+            "hasFile": false,
+            "sizeOnDisk": 0
+        });
+        let recovery = IntentRecoveryView {
+            last_attempted_download_id: Some("deadbeef".to_string()),
+            last_attempted_at: Some(Utc::now()),
+            cooldown_until: Some(Utc::now() + ChronoDuration::seconds(60)),
+            last_attempt_succeeded: true,
+        };
+
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "42",
+            &item,
+            None,
+            false,
+            Some(&recovery),
+            &AcquisitionDownloaderProgressIndex::default(),
+            None,
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::FindingAnotherRelease);
+        assert_eq!(state.progress_percent, None);
+        assert_eq!(state.eta_seconds, None);
+        assert_eq!(state.headline, "Finding another release.");
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_groups_sonarr_batch_children() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 0,
+                "episodeCount": 14,
+                "sizeOnDisk": 0
+            }
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "seriesId": 6,
+                    "episodeId": 38,
+                    "title": "Firefly.S01E12.Release",
+                    "downloadId": "child-a",
+                    "downloadClient": "NZBGet",
+                    "protocol": "usenet",
+                    "trackedDownloadState": "downloading",
+                    "status": "downloading"
+                },
+                {
+                    "seriesId": 6,
+                    "episodeId": 39,
+                    "title": "Firefly.S01E13.Release",
+                    "downloadId": "child-b",
+                    "downloadClient": "NZBGet",
+                    "protocol": "usenet",
+                    "trackedDownloadState": "queued",
+                    "status": "queued"
+                }
+            ]
+        });
+        let episode_index = HashMap::from([
+            (
+                38,
+                SonarrEpisodeDescriptor {
+                    season_number: 1,
+                    episode_number: 12,
+                    title: "The Message".to_string(),
+                },
+            ),
+            (
+                39,
+                SonarrEpisodeDescriptor {
+                    season_number: 1,
+                    episode_number: 13,
+                    title: "Heart of Gold".to_string(),
+                },
+            ),
+        ]);
+        let mut downloader_progress = AcquisitionDownloaderProgressIndex::default();
+        downloader_progress.insert(
+            "child-a",
+            AcquisitionDownloaderProgress {
+                progress_percent: Some(52.0),
+                eta_seconds: Some(600),
+                issue: None,
+            },
+        );
+
+        let state = derive_arr_acquisition_state(
+            "sonarr",
+            "6",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &downloader_progress,
+            Some(&episode_index),
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::Downloading);
+        assert_eq!(state.progress_percent, None);
+        assert_eq!(state.children.len(), 2);
+        assert_eq!(state.children[0].title, "S01E12 • The Message");
+        assert_eq!(
+            state.children[0].subtitle.as_deref(),
+            Some("Firefly.S01E12.Release")
+        );
+        assert_eq!(state.children[0].progress_percent, Some(52.0));
+        assert_eq!(state.children[1].phase, "queued_in_downloader");
+        assert!(
+            state
+                .evidence
+                .iter()
+                .any(|item| item.label == "Episodes downloading" && item.value == "1")
+        );
+        assert!(
+            state
+                .evidence
+                .iter()
+                .any(|item| item.label == "Episodes queued" && item.value == "1")
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_keeps_sonarr_batch_queue_visible_when_some_files_exist() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 3,
+                "episodeCount": 14,
+                "sizeOnDisk": 12345
+            }
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "seriesId": 6,
+                    "episodeId": 38,
+                    "title": "Firefly.S01E12.Release",
+                    "downloadId": "child-a",
+                    "downloadClient": "NZBGet",
+                    "protocol": "usenet",
+                    "trackedDownloadState": "queued",
+                    "status": "queued"
+                }
+            ]
+        });
+        let episode_index = HashMap::from([(
+            38,
+            SonarrEpisodeDescriptor {
+                season_number: 1,
+                episode_number: 12,
+                title: "The Message".to_string(),
+            },
+        )]);
+
+        let state = derive_arr_acquisition_state(
+            "sonarr",
+            "6",
+            &item,
+            Some(&queue),
+            true,
+            None,
+            &AcquisitionDownloaderProgressIndex::default(),
+            Some(&episode_index),
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::QueuedInDownloader);
+        assert_eq!(state.children.len(), 1);
+        assert_eq!(
+            state.detail.as_deref(),
+            Some(
+                "Sonarr is handling this series as a batch. 3 of 14 episode files are imported so far."
+            )
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_does_not_mark_sonarr_complete_after_first_import() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 1,
+                "episodeCount": 14,
+                "sizeOnDisk": 4501507231u64
+            }
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "seriesId": 6,
+                    "episodeId": 40,
+                    "title": "Firefly.S01E14.Release",
+                    "downloadId": "child-a",
+                    "downloadClient": "NZBGet",
+                    "protocol": "usenet",
+                    "trackedDownloadState": "downloading",
+                    "status": "downloading"
+                }
+            ]
+        });
+        let episode_index = HashMap::from([(
+            40,
+            SonarrEpisodeDescriptor {
+                season_number: 1,
+                episode_number: 14,
+                title: "The Message".to_string(),
+            },
+        )]);
+        let mut downloader_progress = AcquisitionDownloaderProgressIndex::default();
+        downloader_progress.insert(
+            "child-a",
+            AcquisitionDownloaderProgress {
+                progress_percent: Some(25.0),
+                eta_seconds: Some(1200),
+                issue: None,
+            },
+        );
+
+        let state = derive_arr_acquisition_state(
+            "sonarr",
+            "6",
+            &item,
+            Some(&queue),
+            true,
+            None,
+            &downloader_progress,
+            Some(&episode_index),
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::Downloading);
+        assert_eq!(state.children.len(), 1);
+        assert_eq!(
+            state.detail.as_deref(),
+            Some(
+                "Sonarr is handling this series as a batch. 1 of 14 episode files are imported so far."
+            )
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_sonarr_complete_only_when_series_is_fully_downloaded() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 14,
+                "episodeCount": 14,
+                "sizeOnDisk": 63021101234u64
+            }
+        });
+
+        let state = derive_arr_acquisition_state(
+            "sonarr",
+            "6",
+            &item,
+            None,
+            true,
+            None,
+            &AcquisitionDownloaderProgressIndex::default(),
+            None,
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::Completed);
+        assert_eq!(state.phase.label(), "Downloaded");
+        assert_eq!(state.headline, "Downloaded.");
+        assert!(state.evidence.is_empty());
+        assert!(state.detail.is_none());
+    }
+
+    #[test]
+    fn nzbget_acquisition_progress_uses_drone_download_id_and_actual_downloaded_bytes() {
         let group = AcquisitionNzbgetGroup {
             nzb_id: 6,
             status: Some("DOWNLOADING".to_string()),
@@ -4528,7 +5282,7 @@ mod tests {
             file_size_hi: Some(0),
             remaining_size_lo: Some(250),
             remaining_size_hi: Some(0),
-            downloaded_size_lo: Some(0),
+            downloaded_size_lo: Some(10),
             downloaded_size_hi: Some(0),
             failed_articles: Some(0),
             health: Some(1000),
@@ -4542,7 +5296,7 @@ mod tests {
         let (download_id, progress) = nzbget_acquisition_progress(&group).expect("nzbget progress");
 
         assert_eq!(download_id, "838cfa292491470a93b2c777b1a6d0b1");
-        assert_eq!(progress.progress_percent, Some(75.0));
+        assert_eq!(progress.progress_percent, Some(1.0));
         assert_eq!(progress.eta_seconds, None);
         assert!(progress.issue.is_none());
     }

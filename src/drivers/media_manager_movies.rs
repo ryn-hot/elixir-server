@@ -16,11 +16,13 @@ use crate::drivers::media_manager_support::{
     MANAGED_MEDIA_TAG, lookup_terms_for_add_request, select_lookup_item,
 };
 use crate::drivers::patches::{
-    DownloaderSpec, IndexerSpec, MediaManagerMoviesPatch, RootFolderSpec,
+    CustomFormatSpec, DownloaderSpec, IndexerSpec, MediaManagerMoviesPatch, QualityProfileSpec,
+    RootFolderSpec, normalize_custom_format_specifications,
 };
 use crate::drivers::{
     AddMediaRequest, AddMediaResult, ApplyResult, CapabilityDriver, DriftEvaluation, DriverCtx,
-    DriverPatch, PatchSemantics, PatchSideEffect, StateSnapshot,
+    DriverPatch, PatchSemantics, PatchSideEffect, StateSnapshot, build_radarr_quality_policy_plan,
+    is_elixir_managed_radarr_quality_profile,
 };
 
 pub struct MediaManagerMoviesDriver;
@@ -39,6 +41,9 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
 
     fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
         match patch {
+            DriverPatch::MediaManagerMovies(
+                MediaManagerMoviesPatch::ApplyQualityPolicyPreset { .. },
+            ) => PatchSemantics::desired_change_only(PatchSideEffect::LiveApiWrite),
             DriverPatch::MediaManagerMovies(_) => {
                 PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite)
             }
@@ -73,6 +78,25 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
                 "Radarr tags",
                 client.evaluate_tags(&tags).await?,
             )),
+            MediaManagerMoviesPatch::ApplyQualityPolicyPreset { policy } => {
+                let plan = build_radarr_quality_policy_plan(&policy)?;
+                let mut drift = client
+                    .evaluate_quality_profiles(std::slice::from_ref(&plan.quality_profile))
+                    .await?;
+                drift.extend(client.evaluate_custom_formats(&plan.custom_formats).await?);
+                drift.extend(
+                    client
+                        .evaluate_exact_custom_format_scores(
+                            &plan.quality_profile.name,
+                            &plan.custom_formats,
+                        )
+                        .await?,
+                );
+                Ok(drift_evaluation(
+                    "Radarr quality policy preset",
+                    dedup_strings(drift),
+                ))
+            }
         }
     }
 
@@ -105,6 +129,19 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
             }
             MediaManagerMoviesPatch::SetTags { tags } => {
                 let _ = client.ensure_tags(&tags).await?;
+            }
+            MediaManagerMoviesPatch::ApplyQualityPolicyPreset { policy } => {
+                let plan = build_radarr_quality_policy_plan(&policy)?;
+                client
+                    .upsert_quality_profiles(std::slice::from_ref(&plan.quality_profile))
+                    .await?;
+                client.upsert_custom_formats(&plan.custom_formats).await?;
+                client
+                    .apply_exact_custom_format_scores(
+                        &plan.quality_profile.name,
+                        &plan.custom_formats,
+                    )
+                    .await?;
             }
         }
 
@@ -318,7 +355,7 @@ impl RadarrClient {
 
         let quality_profile_id = match request.options.quality_profile_id {
             Some(value) => value,
-            None => self.first_id("qualityprofile").await?,
+            None => self.preferred_quality_profile_id().await?,
         };
         let root_folder_path = match request.options.root_folder_path.as_deref() {
             Some(path) if !path.trim().is_empty() => path.trim().to_string(),
@@ -406,6 +443,25 @@ impl RadarrClient {
             .and_then(|item| item.get("id"))
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow::anyhow!("unable to determine {}", path))
+    }
+
+    async fn preferred_quality_profile_id(&self) -> Result<i64> {
+        let profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        if let Some(id) = profiles.iter().find_map(|profile| {
+            let name = profile.get("name").and_then(Value::as_str)?;
+            if is_elixir_managed_radarr_quality_profile(name) {
+                profile.get("id").and_then(Value::as_i64)
+            } else {
+                None
+            }
+        }) {
+            return Ok(id);
+        }
+        profiles
+            .first()
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("unable to determine qualityprofile"))
     }
 
     async fn first_path(&self, path: &str) -> Result<String> {
@@ -604,6 +660,60 @@ impl RadarrClient {
         Ok(drift)
     }
 
+    async fn upsert_quality_profiles(&self, profiles: &[QualityProfileSpec]) -> Result<()> {
+        if profiles.is_empty() {
+            return Ok(());
+        }
+        let existing = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let template = existing
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("quality profile template missing"))?;
+
+        for profile in profiles {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => template.clone(),
+            };
+            if existing_item.is_none() {
+                target.as_object_mut().map(|obj| obj.remove("id"));
+            }
+            set_string(&mut target, "name", profile.name.clone())?;
+            if let Some(upgrade) = profile.upgrade_allowed {
+                set_bool(&mut target, "upgradeAllowed", upgrade)?;
+            }
+            apply_quality_profile_score_fields(&mut target, profile)?;
+
+            let allowed = normalize_set(&profile.allowed);
+            let cutoff_name = profile.cutoff.as_deref().map(normalize_name);
+            let cutoff_id = apply_quality_items(&mut target, &allowed, cutoff_name.as_deref())?;
+            if let Some(cutoff_id) = cutoff_id {
+                set_i64(&mut target, "cutoff", cutoff_id)?;
+            } else if profile.cutoff.is_some() {
+                bail!(
+                    "quality cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
+            }
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
+
+            if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                let path = format!("qualityprofile/{id}");
+                self.put_json(&path, &target).await?;
+            } else {
+                remove_readonly_fields(&mut target);
+                self.post_json("qualityprofile", &target).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn evaluate_indexers(&self, indexers: &[IndexerSpec]) -> Result<Vec<String>> {
         if indexers.is_empty() {
             return Ok(Vec::new());
@@ -636,6 +746,54 @@ impl RadarrClient {
 
             if existing_item.as_ref() != Some(&target) {
                 drift.push(indexer.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_quality_profiles(
+        &self,
+        profiles: &[QualityProfileSpec],
+    ) -> Result<Vec<String>> {
+        if profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let template = existing
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("quality profile template missing"))?;
+        let mut drift = Vec::new();
+
+        for profile in profiles {
+            let existing_item = find_by_name(&existing, &profile.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => template.clone(),
+            };
+            if existing_item.is_none() {
+                target.as_object_mut().map(|obj| obj.remove("id"));
+            }
+            set_string(&mut target, "name", profile.name.clone())?;
+            if let Some(upgrade) = profile.upgrade_allowed {
+                set_bool(&mut target, "upgradeAllowed", upgrade)?;
+            }
+            apply_quality_profile_score_fields(&mut target, profile)?;
+
+            let allowed = normalize_set(&profile.allowed);
+            let cutoff_name = profile.cutoff.as_deref().map(normalize_name);
+            let cutoff_id = apply_quality_items(&mut target, &allowed, cutoff_name.as_deref())?;
+            if let Some(cutoff_id) = cutoff_id {
+                set_i64(&mut target, "cutoff", cutoff_id)?;
+            } else if profile.cutoff.is_some() {
+                bail!(
+                    "quality cutoff '{}' not found",
+                    profile.cutoff.as_deref().unwrap_or("")
+                );
+            }
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(profile.name.clone());
             }
         }
         Ok(dedup_strings(drift))
@@ -681,6 +839,121 @@ impl RadarrClient {
     async fn evaluate_tags(&self, tags: &[String]) -> Result<Vec<String>> {
         let (_ids, missing) = self.resolve_existing_tag_ids(tags).await?;
         Ok(missing)
+    }
+
+    async fn evaluate_custom_formats(&self, formats: &[CustomFormatSpec]) -> Result<Vec<String>> {
+        if formats.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = self.get_json::<Vec<Value>>("customformat").await?;
+        let mut drift = Vec::new();
+        for format in formats {
+            let existing_item = find_by_name(&existing, &format.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => json!({}),
+            };
+            set_string(&mut target, "name", format.name.clone())?;
+            set_bool(
+                &mut target,
+                "includeCustomFormatWhenRenaming",
+                format.include_custom_format_when_renaming.unwrap_or(false),
+            )?;
+            let specs = build_custom_format_specs(format)?;
+            target
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("custom format object missing"))?
+                .insert("specifications".to_string(), Value::Array(specs));
+
+            if existing_item.as_ref() != Some(&target) {
+                drift.push(format.name.clone());
+            }
+        }
+        Ok(dedup_strings(drift))
+    }
+
+    async fn evaluate_exact_custom_format_scores(
+        &self,
+        profile_name: &str,
+        formats: &[CustomFormatSpec],
+    ) -> Result<Vec<String>> {
+        let custom_formats = self.get_json::<Vec<Value>>("customformat").await?;
+        let Some(expected) = build_named_score_map_if_present(formats, &custom_formats)? else {
+            return Ok(vec![profile_name.to_string()]);
+        };
+        let quality_profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let Some(profile) = find_by_name(&quality_profiles, profile_name) else {
+            return Ok(vec![profile_name.to_string()]);
+        };
+        let actual = extract_named_format_scores(&profile);
+        if actual == expected {
+            return Ok(Vec::new());
+        }
+        Ok(vec![profile_name.to_string()])
+    }
+
+    async fn upsert_custom_formats(&self, formats: &[CustomFormatSpec]) -> Result<()> {
+        if formats.is_empty() {
+            return Ok(());
+        }
+        let existing = self.get_json::<Vec<Value>>("customformat").await?;
+        for format in formats {
+            let existing_item = find_by_name(&existing, &format.name);
+            let mut target = match existing_item.clone() {
+                Some(existing) => existing,
+                None => json!({}),
+            };
+            set_string(&mut target, "name", format.name.clone())?;
+            set_bool(
+                &mut target,
+                "includeCustomFormatWhenRenaming",
+                format.include_custom_format_when_renaming.unwrap_or(false),
+            )?;
+            let specs = build_custom_format_specs(format)?;
+            target
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("custom format object missing"))?
+                .insert("specifications".to_string(), Value::Array(specs));
+
+            if let Some(existing_item) = existing_item {
+                if target == existing_item {
+                    continue;
+                }
+            }
+
+            if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                let path = format!("customformat/{id}");
+                self.put_json(&path, &target).await?;
+            } else {
+                remove_readonly_fields(&mut target);
+                self.post_json("customformat", &target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_exact_custom_format_scores(
+        &self,
+        profile_name: &str,
+        formats: &[CustomFormatSpec],
+    ) -> Result<()> {
+        let custom_formats = self.get_json::<Vec<Value>>("customformat").await?;
+        let expected = build_named_score_map(formats, &custom_formats)?;
+        let quality_profiles = self.get_json::<Vec<Value>>("qualityprofile").await?;
+        let profile = find_by_name(&quality_profiles, profile_name)
+            .ok_or_else(|| anyhow::anyhow!("quality profile '{}' not found", profile_name))?;
+        let mut updated = profile.clone();
+        set_exact_format_items(&mut updated, &expected)?;
+        if updated == profile {
+            return Ok(());
+        }
+        let id = updated
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("quality profile id missing"))?;
+        let path = format!("qualityprofile/{id}");
+        self.put_json(&path, &updated).await?;
+        Ok(())
     }
 }
 
@@ -839,6 +1112,87 @@ fn set_array_i64(target: &mut Value, field: &str, values: &[i64]) -> Result<()> 
     bail!("payload must be an object");
 }
 
+fn set_bool(target: &mut Value, field: &str, value: bool) -> Result<()> {
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert(field.to_string(), Value::Bool(value));
+        return Ok(());
+    }
+    bail!("payload must be an object");
+}
+
+fn set_i64(target: &mut Value, field: &str, value: i64) -> Result<()> {
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert(field.to_string(), Value::Number(value.into()));
+        return Ok(());
+    }
+    bail!("payload must be an object");
+}
+
+fn apply_quality_profile_score_fields(
+    target: &mut Value,
+    profile: &QualityProfileSpec,
+) -> Result<()> {
+    if let Some(value) = profile.min_format_score {
+        set_i64(target, "minFormatScore", i64::from(value))?;
+    }
+    if let Some(value) = profile.min_upgrade_format_score {
+        set_i64(target, "minUpgradeFormatScore", i64::from(value))?;
+    }
+    if let Some(value) = profile.cutoff_format_score {
+        set_i64(target, "cutoffFormatScore", i64::from(value))?;
+    }
+    Ok(())
+}
+
+fn normalize_set(values: &[String]) -> HashSet<String> {
+    values.iter().map(|value| normalize_name(value)).collect()
+}
+
+fn apply_quality_items(
+    profile: &mut Value,
+    allowed: &HashSet<String>,
+    cutoff: Option<&str>,
+) -> Result<Option<i64>> {
+    let items = profile
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("quality profile items missing"))?;
+    update_quality_items(items, allowed, cutoff)
+}
+
+fn update_quality_items(
+    items: &mut [Value],
+    allowed: &HashSet<String>,
+    cutoff: Option<&str>,
+) -> Result<Option<i64>> {
+    let mut cutoff_id = None;
+    for item in items {
+        if let Some(quality) = item.get("quality") {
+            let name = quality.get("name").and_then(Value::as_str);
+            let id = quality.get("id").and_then(Value::as_i64);
+            if let Some(name) = name {
+                let normalized = normalize_name(name);
+                let is_allowed = allowed.contains(&normalized);
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("allowed".to_string(), Value::Bool(is_allowed));
+                }
+                if let Some(cutoff_name) = cutoff {
+                    if normalized == normalize_name(cutoff_name) {
+                        cutoff_id = id;
+                    }
+                }
+            }
+        }
+        if let Some(children) = item.get_mut("items").and_then(Value::as_array_mut) {
+            let nested_cutoff = update_quality_items(children, allowed, cutoff)?;
+            if cutoff_id.is_none() {
+                cutoff_id = nested_cutoff;
+            }
+        }
+    }
+    Ok(cutoff_id)
+}
+
 fn merge_tags(target: &mut Value, tags: &[i64]) -> Result<bool> {
     let existing = target
         .get("tags")
@@ -960,6 +1314,106 @@ fn apply_url_fields(fields: &mut Vec<Value>, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn build_custom_format_specs(format: &CustomFormatSpec) -> Result<Vec<Value>> {
+    if !format.specifications.is_empty() {
+        return normalize_custom_format_specifications(&format.specifications);
+    }
+    let mut specs = Vec::new();
+    for pattern in &format.include {
+        specs.push(custom_format_spec(pattern, false)?);
+    }
+    for pattern in &format.exclude {
+        specs.push(custom_format_spec(pattern, true)?);
+    }
+    Ok(specs)
+}
+
+fn custom_format_spec(pattern: &str, negate: bool) -> Result<Value> {
+    if pattern.trim().is_empty() {
+        bail!("custom format pattern is required");
+    }
+    Ok(json!({
+        "name": "Release Title",
+        "implementation": "ReleaseTitleSpecification",
+        "negate": negate,
+        "required": true,
+        "fields": [
+            { "name": "value", "value": pattern }
+        ]
+    }))
+}
+
+fn build_named_score_map(
+    formats: &[CustomFormatSpec],
+    custom_formats: &[Value],
+) -> Result<HashMap<String, i32>> {
+    let mut score_map = HashMap::new();
+    for format in formats.iter().filter(|format| format.score.is_some()) {
+        let id = find_id_by_name(custom_formats, &format.name)?;
+        score_map.insert(id.to_string(), format.score.unwrap_or_default());
+    }
+    Ok(score_map)
+}
+
+fn build_named_score_map_if_present(
+    formats: &[CustomFormatSpec],
+    custom_formats: &[Value],
+) -> Result<Option<HashMap<String, i32>>> {
+    let mut score_map = HashMap::new();
+    for format in formats.iter().filter(|format| format.score.is_some()) {
+        let Ok(id) = find_id_by_name(custom_formats, &format.name) else {
+            return Ok(None);
+        };
+        score_map.insert(id.to_string(), format.score.unwrap_or_default());
+    }
+    Ok(Some(score_map))
+}
+
+fn extract_named_format_scores(profile: &Value) -> HashMap<String, i32> {
+    profile
+        .get("formatItems")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item
+                .get("format")
+                .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+                .or_else(|| item.get("formatId").and_then(Value::as_i64))?;
+            let score = item.get("score").and_then(Value::as_i64)?;
+            Some((id.to_string(), score as i32))
+        })
+        .collect()
+}
+
+fn set_exact_format_items(profile: &mut Value, scores: &HashMap<String, i32>) -> Result<()> {
+    let mut items = scores
+        .iter()
+        .map(|(format_id, score)| {
+            json!({
+                "format": format_id.parse::<i64>().unwrap_or_default(),
+                "score": score,
+            })
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_id = left
+            .get("format")
+            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .unwrap_or_default();
+        let right_id = right
+            .get("format")
+            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .unwrap_or_default();
+        left_id.cmp(&right_id)
+    });
+    if let Some(obj) = profile.as_object_mut() {
+        obj.insert("formatItems".to_string(), Value::Array(items));
+        return Ok(());
+    }
+    bail!("quality profile must be an object");
+}
+
 fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> Result<bool> {
     for field in fields.iter_mut() {
         let field_name = field.get("name").and_then(Value::as_str);
@@ -971,6 +1425,12 @@ fn set_field_value_optional(fields: &mut [Value], name: &str, value: Value) -> R
         }
     }
     Ok(false)
+}
+
+fn find_id_by_name(items: &[Value], name: &str) -> Result<i64> {
+    find_by_name(items, name)
+        .and_then(|item| item.get("id").and_then(Value::as_i64))
+        .ok_or_else(|| anyhow::anyhow!("'{}' not found", name))
 }
 
 #[cfg(test)]
@@ -1027,6 +1487,30 @@ mod tests {
             value_for_field(&fields, "priority").cloned(),
             Some(json!(42))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn quality_policy_score_map_evaluation_treats_missing_formats_as_drift() -> Result<()> {
+        let formats = vec![CustomFormatSpec {
+            name: "AV1".to_string(),
+            include_custom_format_when_renaming: None,
+            score: Some(1500),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            specifications: Vec::new(),
+        }];
+
+        let present =
+            build_named_score_map_if_present(&formats, &[json!({ "id": 11, "name": "AV1" })])?;
+        assert_eq!(
+            present,
+            Some(HashMap::from([(String::from("11"), 1500)]))
+        );
+
+        let missing = build_named_score_map_if_present(&formats, &[])?;
+        assert_eq!(missing, None);
 
         Ok(())
     }

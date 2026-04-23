@@ -1,0 +1,41 @@
+id: elixir.connectors.prowlarr_antibot_proxies
+version: 1.0.0
+kind: connector
+name: "Prowlarr Anti-Bot Proxies"
+description: "Register the managed FlareSolverr and Byparr services as Prowlarr indexer proxies."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - drivers.configure.indexer.registry
+requires:
+  - capability: indexer.proxy
+    slot: flaresolverr
+  - capability: indexer.proxy
+    slot: byparr
+targets:
+  - capability: indexer.registry
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: indexer.registry
+      slot: default
+    patch:
+      op: register_indexer_proxies
+      proxies:
+        - name: "FlareSolverr"
+          implementation: "FlareSolverr"
+          tags: ["flaresolverr"]
+          enabled: true
+          settings:
+            host: "http://elx-flaresolverr:8191/"
+            requestTimeout: 180
+        - name: "Byparr"
+          implementation: "FlareSolverr"
+          tags: ["byparr"]
+          enabled: true
+          settings:
+            host: "http://elx-byparr:8191/"
+            requestTimeout: 180

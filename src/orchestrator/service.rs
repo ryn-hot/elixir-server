@@ -1,19 +1,24 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{ExtensionInstance, Provider};
 use crate::drivers::DriverRegistry;
 use crate::extensions::manifest::ExtensionManifest;
 use crate::extensions::store::ExtensionStore;
-use crate::orchestrator::executor::{Executor, ExecutorAction, build_driver_ctx_for_provider};
+use crate::orchestrator::executor::{
+    Executor, ExecutorAction, build_driver_ctx_for_provider, resolve_runtime_volume_mounts,
+};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
-use crate::orchestrator::naming::container_name;
+use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::orchestrator::reconcile::{ReconcileConfig, Reconciler};
 use crate::runtime::docker::{
     DockerDaemonStatus, DockerRuntimeManager, DockerStartupConfig, classify_docker_runtime_failure,
@@ -24,6 +29,7 @@ use crate::runtime::health::{
     DockerRuntimeSupervisor, PersistedDockerRuntimeHealthState,
     detect_docker_desktop_filesharing_warning, runtime_health_poll_interval,
 };
+use crate::runtime::model::VolumeMountSourceKind;
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
@@ -41,6 +47,46 @@ pub struct RuntimeResetOutcome {
     pub reboot_recommended: bool,
     pub removed_containers: Vec<String>,
     pub recreated_networks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionBackupSnapshot {
+    pub snapshot_id: Uuid,
+    pub extension_id: String,
+    pub instance_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub label: String,
+    pub reason: String,
+    #[serde(default)]
+    pub items: Vec<ExtensionBackupSnapshotItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionBackupSnapshotItem {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub container_path: String,
+    pub archive_name: String,
+    pub source_kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionBackupRestoreOutcome {
+    pub restored_snapshot: ExtensionBackupSnapshot,
+    pub recovery_point: Option<ExtensionBackupSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedBackupItem {
+    id: String,
+    label: String,
+    kind: String,
+    container_path: String,
+    source_kind: VolumeMountSourceKind,
+    source_path: String,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -142,6 +188,77 @@ impl OrchestratorService {
         Ok(())
     }
 
+    pub async fn recreate_instance_runtime(
+        &self,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+    ) -> Result<()> {
+        self.ensure_runtime_ready().await?;
+
+        let runtime = manifest
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("module runtime is missing"))?;
+        if !runtime.r#type.eq_ignore_ascii_case("container") {
+            anyhow::bail!("unsupported runtime type '{}'", runtime.r#type);
+        }
+
+        if let Some(delay) = self.runtime_health.restart_delay() {
+            tokio::time::sleep(delay).await;
+        }
+        self.runtime_health.note_restart_started();
+
+        self.remove_instance_runtime(instance.instance_id).await?;
+
+        let (aliases, _) = build_aliases(
+            extension_id,
+            &instance.instance_name,
+            instance.instance_id,
+            runtime.service_name.clone(),
+        );
+        let executor = Executor::new(
+            &self.pool,
+            self.probe.as_ref(),
+            self.drivers.as_ref(),
+            self.runtime.as_ref(),
+            self.runtime_paths.clone(),
+            self.secrets.as_ref(),
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
+
+        executor
+            .apply(ExecutorAction::EnsureRuntimeRunning {
+                instance_id: instance.instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: instance.instance_name.clone(),
+                runtime,
+                networking: manifest.networking.clone(),
+                aliases,
+            })
+            .await
+    }
+
+    pub async fn instance_runtime_logs(
+        &self,
+        instance_id: uuid::Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<String>> {
+        self.ensure_runtime_ready().await?;
+        let Some(handle) = self
+            .runtime
+            .get_container_handle(&container_name(instance_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let logs = self.runtime.container_logs(&handle, since).await?;
+        Ok((!logs.trim().is_empty()).then_some(logs))
+    }
+
     pub async fn read_instance_container_text_file(
         &self,
         instance_id: uuid::Uuid,
@@ -216,6 +333,135 @@ impl OrchestratorService {
         Ok(())
     }
 
+    pub async fn list_extension_backups(
+        &self,
+        storage_root: &str,
+        extension_id: &str,
+        instance_id: Uuid,
+    ) -> Result<Vec<ExtensionBackupSnapshot>> {
+        list_backup_snapshots(&backups_instance_root(
+            storage_root,
+            extension_id,
+            instance_id,
+        ))
+        .await
+    }
+
+    pub async fn create_extension_backup(
+        &self,
+        storage_root: &str,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+        label: Option<String>,
+        reason: &str,
+    ) -> Result<ExtensionBackupSnapshot> {
+        self.create_extension_backup_inner(
+            storage_root,
+            extension_id,
+            instance,
+            manifest,
+            label,
+            reason,
+            &[],
+        )
+        .await
+    }
+
+    pub async fn restore_extension_backup(
+        &self,
+        storage_root: &str,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+        snapshot_id: Uuid,
+    ) -> Result<ExtensionBackupRestoreOutcome> {
+        let snapshot = load_snapshot_by_id(
+            &backups_instance_root(storage_root, extension_id, instance.instance_id),
+            snapshot_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("backup snapshot '{}' was not found", snapshot_id))?;
+
+        let resolved_items = self.resolve_backup_items(extension_id, instance, manifest)?;
+        validate_snapshot_matches_manifest(&snapshot, &resolved_items)?;
+
+        let recovery_point = Some(
+            self.create_extension_backup_inner(
+                storage_root,
+                extension_id,
+                instance,
+                manifest,
+                Some(format!(
+                    "Recovery point before restoring {}",
+                    snapshot.label
+                )),
+                "pre_restore",
+                &[snapshot.snapshot_id],
+            )
+            .await?,
+        );
+
+        self.ensure_runtime_ready().await?;
+        self.remove_instance_runtime(instance.instance_id).await?;
+
+        let snapshot_dir = snapshot_dir(
+            &backups_instance_root(storage_root, extension_id, instance.instance_id),
+            snapshot.snapshot_id,
+        );
+        let helper_image = backup_helper_image(manifest)?;
+        for item in resolved_items {
+            let snapshot_item = snapshot
+                .items
+                .iter()
+                .find(|candidate| candidate.id == item.id)
+                .ok_or_else(|| anyhow::anyhow!("backup snapshot is missing item '{}'", item.id))?;
+            let archive_path = snapshot_dir.join(&snapshot_item.archive_name);
+            let staging_dir = restore_staging_dir(
+                storage_root,
+                instance.instance_id,
+                snapshot.snapshot_id,
+                &item.id,
+            );
+            if staging_dir.exists() {
+                let _ = fs::remove_dir_all(&staging_dir).await;
+            }
+            extract_directory_archive(&archive_path, &staging_dir).await?;
+
+            match item.source_kind {
+                VolumeMountSourceKind::Bind => {
+                    replace_directory_from_snapshot(Path::new(&item.source_path), &staging_dir)
+                        .await?;
+                }
+                VolumeMountSourceKind::NamedVolume => {
+                    self.runtime
+                        .replace_named_volume_path_from_host(
+                            helper_image,
+                            &item.source_path,
+                            &item.container_path,
+                            &staging_dir,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "restoring named volume '{}' for {}",
+                                item.source_path, item.label
+                            )
+                        })?;
+                }
+            }
+            let _ = fs::remove_dir_all(&staging_dir).await;
+        }
+
+        self.recreate_instance_runtime(extension_id, instance, manifest)
+            .await?;
+
+        Ok(ExtensionBackupRestoreOutcome {
+            restored_snapshot: snapshot,
+            recovery_point,
+        })
+    }
+
     pub async fn read_provider_state(
         &self,
         provider: &Provider,
@@ -235,6 +481,143 @@ impl OrchestratorService {
         )
         .await?;
         driver.read_state(ctx).await
+    }
+
+    fn resolve_backup_items(
+        &self,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+    ) -> Result<Vec<ResolvedBackupItem>> {
+        let policy = manifest
+            .backup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this extension does not declare backup targets"))?;
+        let runtime = manifest
+            .runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("module runtime is missing"))?;
+        if !runtime.r#type.eq_ignore_ascii_case("container") {
+            anyhow::bail!("backup is only supported for container runtimes");
+        }
+        let mounts = resolve_runtime_volume_mounts(
+            extension_id,
+            instance.instance_id,
+            &runtime.volumes,
+            &self.runtime_paths,
+        )?;
+        let mut resolved = Vec::with_capacity(policy.items.len());
+        for item in &policy.items {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount.container_path == item.container_path && !mount.read_only)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "backup target '{}' must match a writable runtime volume root",
+                        item.container_path
+                    )
+                })?;
+            resolved.push(ResolvedBackupItem {
+                id: item.id.clone(),
+                label: item.label.clone(),
+                kind: item.kind.clone(),
+                container_path: item.container_path.clone(),
+                source_kind: mount.source_kind,
+                source_path: mount.host_path.clone(),
+            });
+        }
+        Ok(resolved)
+    }
+
+    async fn create_extension_backup_inner(
+        &self,
+        storage_root: &str,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+        label: Option<String>,
+        reason: &str,
+        preserve_snapshot_ids: &[Uuid],
+    ) -> Result<ExtensionBackupSnapshot> {
+        let policy = manifest
+            .backup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this extension does not declare backup targets"))?;
+        let helper_image = backup_helper_image(manifest)?;
+        let resolved_items = self.resolve_backup_items(extension_id, instance, manifest)?;
+        let created_at = Utc::now();
+        let snapshot_id = Uuid::new_v4();
+        let snapshot_root = backups_instance_root(storage_root, extension_id, instance.instance_id);
+        let snapshot_dir = snapshot_dir(&snapshot_root, snapshot_id);
+        fs::create_dir_all(&snapshot_dir).await.with_context(|| {
+            format!(
+                "creating extension backup directory '{}'",
+                snapshot_dir.display()
+            )
+        })?;
+
+        let snapshot_label = label
+            .unwrap_or_else(|| format!("Snapshot {}", created_at.format("%Y-%m-%d %H:%M:%S UTC")));
+        let mut snapshot_items = Vec::with_capacity(resolved_items.len());
+
+        for item in resolved_items {
+            let archive_name = format!("{}.tar", item.id);
+            let archive_path = snapshot_dir.join(&archive_name);
+            match item.source_kind {
+                VolumeMountSourceKind::Bind => {
+                    create_directory_archive(Path::new(&item.source_path), &archive_path).await?;
+                }
+                VolumeMountSourceKind::NamedVolume => {
+                    self.ensure_runtime_ready().await?;
+                    let staging_dir = backup_staging_dir(
+                        storage_root,
+                        instance.instance_id,
+                        snapshot_id,
+                        &item.id,
+                    );
+                    if staging_dir.exists() {
+                        let _ = fs::remove_dir_all(&staging_dir).await;
+                    }
+                    self.runtime
+                        .copy_named_volume_path_to_host(
+                            helper_image,
+                            &item.source_path,
+                            &item.container_path,
+                            &staging_dir,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "snapshotting named volume '{}' for {}",
+                                item.source_path, item.label
+                            )
+                        })?;
+                    create_directory_archive(&staging_dir, &archive_path).await?;
+                    let _ = fs::remove_dir_all(&staging_dir).await;
+                }
+            }
+            snapshot_items.push(ExtensionBackupSnapshotItem {
+                id: item.id,
+                label: item.label,
+                kind: item.kind,
+                container_path: item.container_path,
+                archive_name,
+                source_kind: backup_source_kind_label(item.source_kind).to_string(),
+            });
+        }
+
+        let snapshot = ExtensionBackupSnapshot {
+            snapshot_id,
+            extension_id: extension_id.to_string(),
+            instance_id: instance.instance_id,
+            created_at,
+            label: snapshot_label,
+            reason: reason.to_string(),
+            items: snapshot_items,
+        };
+        write_snapshot_metadata(&snapshot_dir, &snapshot).await?;
+        prune_backup_snapshots(&snapshot_root, policy.retention, preserve_snapshot_ids).await?;
+        Ok(snapshot)
     }
 
     pub async fn apply_builtin_downloader_profiles_now(&self) -> Result<()> {
@@ -323,6 +706,19 @@ impl OrchestratorService {
             tracing::warn!(
                 "orchestrator: canceled {} stale blueprint preview run(s) on startup",
                 canceled_blueprint_previews
+            );
+        }
+
+        let canceled_auto_wire_runs = store
+            .cancel_pending_runs_by_source(
+                "auto_wire",
+                Some("auto-wire retired; explicit stack execution only"),
+            )
+            .await?;
+        if canceled_auto_wire_runs > 0 {
+            tracing::warn!(
+                "orchestrator: canceled {} legacy auto-wire run(s) on startup",
+                canceled_auto_wire_runs
             );
         }
 
@@ -717,7 +1113,11 @@ impl OrchestratorService {
 
         for network in MANAGED_RUNTIME_NETWORKS {
             match self.runtime.recreate_managed_network(network).await {
-                Ok(_) => recreated_networks.push(network.to_string()),
+                Ok(recreated) => {
+                    if recreated {
+                        recreated_networks.push(network.to_string());
+                    }
+                }
                 Err(err) => {
                     if let Some(kind) = classify_docker_runtime_failure(&err) {
                         self.runtime_health
@@ -741,26 +1141,44 @@ impl OrchestratorService {
         self.runtime_health.record_engine_ready(docker_restarted);
 
         match self.reconcile_once(config).await {
-            Ok(()) => Ok(RuntimeResetOutcome {
-                status: "recovered".to_string(),
-                message: if docker_restarted {
+            Ok(()) => {
+                let recovery_snapshot = self.runtime_health.snapshot();
+                let removed_count = removed_containers.len();
+                let recreated_count = recreated_networks.len();
+                let prefix = if docker_restarted {
                     format!(
-                        "Elixir restarted Docker, removed {} managed container(s), recreated {} managed network(s), and kicked off a fresh reconcile.",
-                        removed_containers.len(),
-                        recreated_networks.len()
+                        "Elixir restarted Docker, removed {removed_count} managed container(s), and recreated {recreated_count} managed network(s)."
                     )
                 } else {
                     format!(
-                        "Elixir removed {} managed container(s), recreated {} managed network(s), and kicked off a fresh reconcile.",
-                        removed_containers.len(),
-                        recreated_networks.len()
+                        "Elixir removed {removed_count} managed container(s) and recreated {recreated_count} managed network(s)."
                     )
-                },
-                docker_restarted,
-                reboot_recommended: false,
-                removed_containers,
-                recreated_networks,
-            }),
+                };
+                let (status, message) = match recovery_snapshot.state {
+                    DockerRuntimeHealthState::Recovering => (
+                        "recovering".to_string(),
+                        format!(
+                            "{prefix} {}",
+                            recovery_snapshot.reason.unwrap_or_else(|| {
+                                "Docker is recovering and Elixir is restoring extension runtimes gradually."
+                                    .to_string()
+                            })
+                        ),
+                    ),
+                    _ => (
+                        "recovered".to_string(),
+                        format!("{prefix} Docker runtime health is back."),
+                    ),
+                };
+                Ok(RuntimeResetOutcome {
+                    status,
+                    message,
+                    docker_restarted,
+                    reboot_recommended: false,
+                    removed_containers,
+                    recreated_networks,
+                })
+            }
             Err(err) => {
                 if let Some(kind) = classify_docker_runtime_failure(&err) {
                     self.runtime_health.mark_reboot_recommended(format!(
@@ -883,6 +1301,289 @@ impl OrchestratorService {
     }
 }
 
+fn backups_instance_root(storage_root: &str, extension_id: &str, instance_id: Uuid) -> PathBuf {
+    PathBuf::from(storage_root)
+        .join("backups")
+        .join(extension_id)
+        .join(instance_id.to_string())
+}
+
+fn snapshot_dir(root: &Path, snapshot_id: Uuid) -> PathBuf {
+    root.join(snapshot_id.to_string())
+}
+
+fn snapshot_metadata_path(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join("metadata.json")
+}
+
+fn backup_staging_dir(
+    storage_root: &str,
+    instance_id: Uuid,
+    snapshot_id: Uuid,
+    item_id: &str,
+) -> PathBuf {
+    PathBuf::from(storage_root)
+        .join("tmp")
+        .join("backups")
+        .join(instance_id.to_string())
+        .join(snapshot_id.to_string())
+        .join(item_id)
+}
+
+fn restore_staging_dir(
+    storage_root: &str,
+    instance_id: Uuid,
+    snapshot_id: Uuid,
+    item_id: &str,
+) -> PathBuf {
+    PathBuf::from(storage_root)
+        .join("tmp")
+        .join("backup-restore")
+        .join(instance_id.to_string())
+        .join(snapshot_id.to_string())
+        .join(item_id)
+}
+
+fn backup_helper_image(manifest: &ExtensionManifest) -> Result<&str> {
+    manifest
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.image.as_deref())
+        .filter(|image| !image.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("module runtime image is missing"))
+}
+
+fn backup_source_kind_label(kind: VolumeMountSourceKind) -> &'static str {
+    match kind {
+        VolumeMountSourceKind::Bind => "bind",
+        VolumeMountSourceKind::NamedVolume => "named_volume",
+    }
+}
+
+fn validate_snapshot_matches_manifest(
+    snapshot: &ExtensionBackupSnapshot,
+    resolved_items: &[ResolvedBackupItem],
+) -> Result<()> {
+    for item in resolved_items {
+        if !snapshot
+            .items
+            .iter()
+            .any(|candidate| candidate.id == item.id)
+        {
+            anyhow::bail!(
+                "backup snapshot '{}' does not include required item '{}'",
+                snapshot.snapshot_id,
+                item.id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn list_backup_snapshots(root: &Path) -> Result<Vec<ExtensionBackupSnapshot>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut snapshots = Vec::new();
+    let mut entries = fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let metadata_path = snapshot_metadata_path(&entry.path());
+        let raw = match fs::read(&metadata_path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to read extension backup metadata '{}': {}",
+                    metadata_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        match serde_json::from_slice::<ExtensionBackupSnapshot>(&raw) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(err) => {
+                tracing::warn!(
+                    "failed to parse extension backup metadata '{}': {}",
+                    metadata_path.display(),
+                    err
+                );
+            }
+        }
+    }
+    snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(snapshots)
+}
+
+async fn load_snapshot_by_id(
+    root: &Path,
+    snapshot_id: Uuid,
+) -> Result<Option<ExtensionBackupSnapshot>> {
+    let metadata_path = snapshot_metadata_path(&snapshot_dir(root, snapshot_id));
+    match fs::read(&metadata_path).await {
+        Ok(raw) => Ok(Some(serde_json::from_slice::<ExtensionBackupSnapshot>(
+            &raw,
+        )?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "reading extension backup metadata '{}'",
+                metadata_path.display()
+            )
+        }),
+    }
+}
+
+async fn write_snapshot_metadata(
+    snapshot_dir: &Path,
+    snapshot: &ExtensionBackupSnapshot,
+) -> Result<()> {
+    let metadata_path = snapshot_metadata_path(snapshot_dir);
+    let raw = serde_json::to_vec_pretty(snapshot)?;
+    fs::write(&metadata_path, raw).await.with_context(|| {
+        format!(
+            "writing extension backup metadata '{}'",
+            metadata_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn prune_backup_snapshots(
+    root: &Path,
+    retention: usize,
+    preserve_snapshot_ids: &[Uuid],
+) -> Result<()> {
+    let preserve = preserve_snapshot_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let snapshots = list_backup_snapshots(root).await?;
+    for snapshot in snapshots.into_iter().skip(retention) {
+        if preserve.contains(&snapshot.snapshot_id) {
+            continue;
+        }
+        let snapshot_path = snapshot_dir(root, snapshot.snapshot_id);
+        let _ = fs::remove_dir_all(&snapshot_path).await;
+    }
+    Ok(())
+}
+
+async fn replace_directory_from_snapshot(target_dir: &Path, extracted_dir: &Path) -> Result<()> {
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).await.with_context(|| {
+            format!(
+                "removing directory '{}' before restore",
+                target_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(target_dir).await.with_context(|| {
+        format!(
+            "creating directory '{}' before restore",
+            target_dir.display()
+        )
+    })?;
+    let extracted_dir = extracted_dir.to_path_buf();
+    let target_dir = target_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        copy_extracted_snapshot_contents_sync(&extracted_dir, &target_dir)
+    })
+    .await
+    .context("joining restored snapshot copy task")??;
+    Ok(())
+}
+
+async fn create_directory_archive(source_dir: &Path, archive_path: &Path) -> Result<()> {
+    if !source_dir.is_dir() {
+        anyhow::bail!(
+            "backup source directory '{}' does not exist",
+            source_dir.display()
+        );
+    }
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let source_dir = source_dir.to_path_buf();
+    let archive_path = archive_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::create(&archive_path).with_context(|| {
+            format!(
+                "creating extension backup archive '{}'",
+                archive_path.display()
+            )
+        })?;
+        let mut builder = tar::Builder::new(file);
+        builder.follow_symlinks(false);
+        builder
+            .append_dir_all(".", &source_dir)
+            .with_context(|| format!("archiving directory '{}'", source_dir.display()))?;
+        builder
+            .finish()
+            .context("finalizing extension backup archive")?;
+        Ok(())
+    })
+    .await
+    .context("joining archive creation task")??;
+    Ok(())
+}
+
+async fn extract_directory_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).await?;
+    }
+    fs::create_dir_all(target_dir).await?;
+    let archive_path = archive_path.to_path_buf();
+    let target_dir = target_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&archive_path).with_context(|| {
+            format!(
+                "opening extension backup archive '{}'",
+                archive_path.display()
+            )
+        })?;
+        let mut archive = tar::Archive::new(file);
+        archive
+            .unpack(&target_dir)
+            .with_context(|| format!("unpacking archive into '{}'", target_dir.display()))?;
+        Ok(())
+    })
+    .await
+    .context("joining archive extraction task")??;
+    Ok(())
+}
+
+fn copy_extracted_snapshot_contents_sync(extracted_dir: &Path, target_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(extracted_dir).with_context(|| {
+        format!(
+            "reading restored snapshot staging directory '{}'",
+            extracted_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let source = entry.path();
+        let target = target_dir.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_extracted_snapshot_contents_sync(&source, &target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source, &target).with_context(|| {
+                format!(
+                    "copying restored file '{}' to '{}'",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +1592,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
+    use tempfile::tempdir;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
@@ -947,6 +1649,70 @@ mod tests {
                 details: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn directory_archive_round_trip_preserves_files() -> Result<()> {
+        let temp = tempdir()?;
+        let source = temp.path().join("source");
+        let restored = temp.path().join("restored");
+        fs::create_dir_all(source.join("nested")).await?;
+        fs::write(source.join("settings.json"), br#"{"ok":true}"#).await?;
+        fs::write(source.join("nested").join("value.txt"), b"hello").await?;
+
+        let archive = temp.path().join("snapshot.tar");
+        create_directory_archive(&source, &archive).await?;
+        extract_directory_archive(&archive, &restored).await?;
+
+        assert_eq!(
+            fs::read(restored.join("settings.json")).await?,
+            br#"{"ok":true}"#
+        );
+        assert_eq!(
+            fs::read(restored.join("nested").join("value.txt")).await?,
+            b"hello"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_backup_snapshots_keeps_newest_and_preserved() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("backups");
+        fs::create_dir_all(&root).await?;
+
+        let older_id = Uuid::new_v4();
+        let keep_id = Uuid::new_v4();
+        let newest_id = Uuid::new_v4();
+
+        for (snapshot_id, created_at) in [
+            (older_id, "2026-01-01T00:00:00Z"),
+            (keep_id, "2026-01-02T00:00:00Z"),
+            (newest_id, "2026-01-03T00:00:00Z"),
+        ] {
+            let dir = snapshot_dir(&root, snapshot_id);
+            fs::create_dir_all(&dir).await?;
+            write_snapshot_metadata(
+                &dir,
+                &ExtensionBackupSnapshot {
+                    snapshot_id,
+                    extension_id: "elixir.modules.test".to_string(),
+                    instance_id: Uuid::new_v4(),
+                    created_at: created_at.parse()?,
+                    label: snapshot_id.to_string(),
+                    reason: "manual".to_string(),
+                    items: Vec::new(),
+                },
+            )
+            .await?;
+        }
+
+        prune_backup_snapshots(&root, 1, &[keep_id]).await?;
+
+        assert!(snapshot_dir(&root, newest_id).is_dir());
+        assert!(snapshot_dir(&root, keep_id).is_dir());
+        assert!(!snapshot_dir(&root, older_id).exists());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1139,7 +1905,6 @@ mod tests {
                 blueprint_extension_id: "elixir.blueprints.arr_stack".to_string(),
                 blueprint_version: "1.0.0".to_string(),
                 params_json: None,
-                decisions_json: None,
             })
             .await?;
 

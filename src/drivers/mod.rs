@@ -6,6 +6,7 @@ mod media_manager_movies;
 mod media_manager_support;
 mod media_manager_tv;
 mod patches;
+mod quality_policy;
 mod registry;
 
 pub use downloader_nzb::DownloaderNzbDriver;
@@ -21,8 +22,14 @@ pub use driver_trait::{
 pub use indexer_registry::IndexerRegistryDriver;
 pub use media_manager_movies::MediaManagerMoviesDriver;
 pub use media_manager_tv::MediaManagerTvDriver;
+#[cfg(test)]
+pub use patches::AppSpec;
 pub use patches::{
     DownloaderNzbPatch, DownloaderSpec, DownloaderTorrentPatch, DriverPatch,
     IndexerCredentialField, IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
+};
+pub(crate) use quality_policy::{
+    build_radarr_quality_policy_plan, build_sonarr_quality_policy_plan,
+    is_elixir_managed_radarr_quality_profile, is_elixir_managed_sonarr_quality_profile,
 };
 pub use registry::DriverRegistry;

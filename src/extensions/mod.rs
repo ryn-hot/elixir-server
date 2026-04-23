@@ -16,6 +16,7 @@ use elixir_classifier::HintParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
 
+pub mod auto_managed;
 pub mod managed_paths;
 pub mod manifest;
 pub mod package;
@@ -23,6 +24,7 @@ pub mod permissions;
 pub mod registry;
 pub mod required_secrets;
 pub mod store;
+pub mod updater;
 
 mod sonarr;
 

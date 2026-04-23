@@ -172,6 +172,8 @@ impl NetworkProbe {
             .arg("--rm")
             .arg("--network")
             .arg(&self.config.network)
+            .arg("--add-host")
+            .arg("host.docker.internal:host-gateway")
             .arg("-v")
             .arg(format!(
                 "{}:/probe:ro",
@@ -345,6 +347,8 @@ impl NetworkProbe {
             .arg("--rm")
             .arg("--network")
             .arg(&self.config.network)
+            .arg("--add-host")
+            .arg("host.docker.internal:host-gateway")
             .arg("--entrypoint")
             .arg(entrypoint)
             .arg(&self.config.image)

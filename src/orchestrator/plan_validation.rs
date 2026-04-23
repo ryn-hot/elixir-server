@@ -7,6 +7,7 @@ use crate::drivers::DriverPatch;
 use crate::drivers::{
     DownloaderSpec, IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
 };
+use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
@@ -75,20 +76,6 @@ pub fn has_unresolved_conflicts(conflicts: &[serde_json::Value]) -> bool {
         let code = conflict.get("code").and_then(|value| value.as_str());
         match code {
             Some("missing_required_secrets") => false,
-            Some("slot_conflict") => {
-                let policy = conflict
-                    .get("policy")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("prompt");
-                let resolved = conflict
-                    .get("resolved")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                match policy {
-                    "auto_replace" => false,
-                    _ => !resolved,
-                }
-            }
             _ => true,
         }
     })
@@ -155,24 +142,6 @@ async fn missing_downloader_secrets_for_patch(
     Ok(Vec::new())
 }
 
-fn filter_auto_managed_runtime_missing(extension_id: &str, missing: Vec<String>) -> Vec<String> {
-    if is_qbittorrent_extension_id(extension_id) {
-        return filter_secret_suffixes(missing, &["qbittorrent_username", "qbittorrent_password"]);
-    }
-    if is_nzbget_extension_id(extension_id) {
-        return filter_secret_suffixes(missing, &["nzbget_username", "nzbget_password"]);
-    }
-    missing
-}
-
-fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
-    extension_id.to_ascii_lowercase().contains("qbittorrent")
-}
-
-fn is_nzbget_extension_id(extension_id: &str) -> bool {
-    extension_id.to_ascii_lowercase().contains("nzbget")
-}
-
 fn is_auto_managed_downloader(implementation: &str) -> bool {
     is_qbittorrent_downloader(implementation) || is_nzbget_downloader(implementation)
 }
@@ -189,17 +158,6 @@ fn is_nzbget_downloader(implementation: &str) -> bool {
         .trim()
         .to_ascii_lowercase()
         .starts_with("nzbget")
-}
-
-fn filter_secret_suffixes(missing: Vec<String>, suffixes: &[&str]) -> Vec<String> {
-    missing
-        .into_iter()
-        .filter(|value| {
-            !suffixes
-                .iter()
-                .any(|suffix| value.ends_with(&format!(":{suffix}")))
-        })
-        .collect()
 }
 
 fn downloader_has_credentials(downloader: &DownloaderSpec) -> bool {

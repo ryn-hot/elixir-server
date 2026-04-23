@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tempfile::tempdir;
 use uuid::Uuid;
 
 use crate::{
@@ -76,6 +77,54 @@ async fn migrations_apply_and_basic_inserts() -> Result<()> {
         .fetch_one(&database.pool)
         .await?;
     assert_eq!(count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_connect_creates_missing_file_on_disk() -> Result<()> {
+    let temp = tempdir()?;
+    let db_path = temp.path().join("fresh").join("elixir.db");
+    let config = DatabaseConfig {
+        url: format!("sqlite://{}", db_path.display()),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+
+    assert!(
+        !db_path.exists(),
+        "expected missing sqlite file before connect"
+    );
+
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.driver, DatabaseDriver::Sqlite);
+    assert!(db_path.exists(), "expected sqlite file to be created");
+
+    database.run_migrations().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn migrations_create_provider_readiness_table() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+
+    let database = Database::connect(&config).await?;
+    database.run_migrations().await?;
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM provider_readiness")
+        .fetch_one(&database.pool)
+        .await?;
+    assert_eq!(count, 0);
+
+    let applied_versions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 24")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(applied_versions, 1);
 
     Ok(())
 }

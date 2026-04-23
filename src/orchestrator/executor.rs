@@ -18,20 +18,22 @@ use uuid::Uuid;
 
 use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{
-    BindingStatus, Provider, ProviderHealthState, SecretScope, SlotCardinality,
+    BindingStatus, Provider, ProviderHealthState, ProviderReadinessPhase, SecretScope,
+    SlotCardinality,
 };
 use crate::drivers::{
     ApplyStatus, DriftStatus, DriverCtx, DriverPatch, DriverRegistry, PatchApplyPolicy,
-    render_nzbget_config_patch,
+    bootstrap_qbittorrent_session_cookie, render_nzbget_config_patch,
 };
 use crate::drivers::{
     DownloaderNzbPatch, DownloaderSpec, DownloaderTorrentPatch, IndexerCredentialField,
     IndexerRegistryPatch, MediaManagerMoviesPatch, MediaManagerTvPatch,
 };
+use crate::extensions::auto_managed::{is_nzbget_extension_id, is_qbittorrent_extension_id};
 use crate::extensions::managed_paths::{
     DOWNLOADS_ROOT, NZBGET_CONFIG_TEMPLATE, NZBGET_INCOMPLETE_DIR, NZBGET_LOG_FILE,
-    NZBGET_MAIN_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR,
-    NZBGET_WEB_DIR, QBITTORRENT_INCOMPLETE_DIR,
+    NZBGET_MAIN_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_REQUIRED_MANAGED_PATHS,
+    NZBGET_SCRIPT_DIR, NZBGET_TEMP_DIR, NZBGET_WEB_DIR, QBITTORRENT_INCOMPLETE_DIR,
 };
 use crate::extensions::manifest::{
     ExtensionManifest, ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress,
@@ -75,6 +77,14 @@ pub enum ExecutorAction {
     RollbackRuntime {
         instance_id: Uuid,
     },
+    TransportGate {
+        provider_id: Uuid,
+        timeout_seconds: u64,
+    },
+    BootstrapGate {
+        provider_id: Uuid,
+        timeout_seconds: u64,
+    },
     HealthGate {
         provider_id: Uuid,
         timeout_seconds: u64,
@@ -116,7 +126,31 @@ pub struct Executor<'a> {
 
 struct PreparedRuntimeVolumes {
     volumes: Vec<VolumeMount>,
-    legacy_config_bind_source: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DeferredDependencyActionError {
+    message: String,
+}
+
+impl std::fmt::Display for DeferredDependencyActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DeferredDependencyActionError {}
+
+pub(crate) fn deferred_dependency_error(message: impl Into<String>) -> anyhow::Error {
+    DeferredDependencyActionError {
+        message: message.into(),
+    }
+    .into()
+}
+
+pub(crate) fn deferred_dependency_message(err: &anyhow::Error) -> Option<String> {
+    err.downcast_ref::<DeferredDependencyActionError>()
+        .map(|value| value.message.clone())
 }
 
 impl<'a> Executor<'a> {
@@ -205,6 +239,14 @@ impl<'a> Executor<'a> {
             ExecutorAction::RollbackRuntime { instance_id } => {
                 self.rollback_runtime(instance_id).await
             }
+            ExecutorAction::TransportGate {
+                provider_id,
+                timeout_seconds,
+            } => self.transport_gate(provider_id, timeout_seconds).await,
+            ExecutorAction::BootstrapGate {
+                provider_id,
+                timeout_seconds,
+            } => self.bootstrap_gate(provider_id, timeout_seconds).await,
             ExecutorAction::HealthGate {
                 provider_id,
                 timeout_seconds,
@@ -252,7 +294,9 @@ impl<'a> Executor<'a> {
     }
 
     pub async fn check_provider_health(&self, provider_id: Uuid) -> Result<()> {
-        self.health_gate_once(provider_id).await
+        self.transport_gate(provider_id, 60).await?;
+        self.bootstrap_gate(provider_id, 60).await?;
+        self.health_gate(provider_id, 60).await
     }
 
     pub async fn apply_builtin_downloader_profiles_now(&self) -> Result<()> {
@@ -277,6 +321,9 @@ impl<'a> Executor<'a> {
                 serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
             endpoint.validate()?;
 
+            self.transport_gate(provider.provider_id, 60).await?;
+            self.bootstrap_gate(provider.provider_id, 60).await?;
+
             let instance = self
                 .store
                 .get_instance(provider.instance_id)
@@ -291,6 +338,7 @@ impl<'a> Executor<'a> {
 
             self.apply_builtin_downloader_profile_if_needed(&provider, &instance, &endpoint)
                 .await?;
+            self.health_gate(provider.provider_id, 60).await?;
         }
 
         Ok(())
@@ -338,7 +386,6 @@ impl<'a> Executor<'a> {
             .get_instance(instance_id)
             .await?
             .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
-        let existing_config_json = instance.config_json.clone();
         let extension = self
             .store
             .get_extension(&extension_id)
@@ -542,14 +589,7 @@ impl<'a> Executor<'a> {
             };
 
             if let Err(err) = self
-                .finalize_runtime_storage(
-                    instance_id,
-                    &extension_id,
-                    &handle,
-                    existing_config_json.as_ref(),
-                    &runtime_volumes,
-                    prepared_volumes.legacy_config_bind_source.as_deref(),
-                )
+                .finalize_runtime_storage(instance_id, &extension_id, &handle, &runtime_volumes)
                 .await
             {
                 if let Some(handle) = self.runtime.get_container_handle(&name).await? {
@@ -593,15 +633,8 @@ impl<'a> Executor<'a> {
         }
 
         let handle = self.runtime.ensure_container(&spec).await?;
-        self.finalize_runtime_storage(
-            instance_id,
-            &extension_id,
-            &handle,
-            existing_config_json.as_ref(),
-            &runtime_volumes,
-            prepared_volumes.legacy_config_bind_source.as_deref(),
-        )
-        .await?;
+        self.finalize_runtime_storage(instance_id, &extension_id, &handle, &runtime_volumes)
+            .await?;
         persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
         if current_version.is_none() {
             self.store
@@ -805,9 +838,7 @@ impl<'a> Executor<'a> {
         instance_id: Uuid,
         extension_id: &str,
         handle: &ContainerHandle,
-        _previous_config_json: Option<&serde_json::Value>,
         volumes: &[VolumeMount],
-        legacy_config_bind_source: Option<&str>,
     ) -> Result<()> {
         let uses_named_config = volumes.iter().any(|volume| {
             volume.container_path == "/config"
@@ -815,24 +846,6 @@ impl<'a> Executor<'a> {
         });
         if !uses_named_config {
             return Ok(());
-        }
-
-        let legacy_config_dir = legacy_config_bind_source
-            .map(Path::new)
-            .filter(|path| path.exists() && path.is_dir());
-        if let Some(source) = legacy_config_dir {
-            self.runtime.stop_container(handle).await?;
-            self.runtime
-                .copy_host_path_to_container(handle, source, "/config")
-                .await
-                .with_context(|| {
-                    format!(
-                        "migrating legacy config storage '{}' into {}",
-                        source.display(),
-                        handle.name
-                    )
-                })?;
-            self.runtime.start_container(handle).await?;
         }
 
         let directories = required_named_runtime_directories(extension_id, volumes);
@@ -930,6 +943,27 @@ impl<'a> Executor<'a> {
         };
         self.write_nzbget_named_config(instance.instance_id, &handle, &rendered)
             .await?;
+        let Some(contents) = read_config_text(
+            self.runtime,
+            instance.instance_id,
+            None,
+            "nzbget.conf",
+            "/config/nzbget.conf",
+        )
+        .await?
+        else {
+            bail!(
+                "nzbget named-volume config missing after patch for instance {}",
+                instance.instance_id
+            );
+        };
+        let missing = missing_nzbget_managed_paths(&contents);
+        if !missing.is_empty() {
+            bail!(
+                "nzbget named-volume config did not converge for keys: {}",
+                missing.join(", ")
+            );
+        }
         self.health_gate(provider_id, 30).await?;
         Ok(true)
     }
@@ -1047,8 +1081,15 @@ impl<'a> Executor<'a> {
 
         resolve_indexer_credentials(&self.store, self.secrets, provider.instance_id, &mut patch)
             .await?;
-        resolve_indexer_apps(&self.store, self.secrets, self.runtime, &mut patch).await?;
-        resolve_downloader_credentials(&self.store, self.secrets, &mut patch).await?;
+        resolve_indexer_apps(
+            &self.store,
+            self.secrets,
+            self.runtime,
+            self.probe,
+            &mut patch,
+        )
+        .await?;
+        resolve_downloader_credentials(&self.store, self.secrets, self.probe, &mut patch).await?;
 
         let ctx = build_driver_ctx_for_provider(
             &self.store,
@@ -1157,11 +1198,16 @@ impl<'a> Executor<'a> {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     if Instant::now() >= deadline {
+                        let detail = err.source.to_string();
                         let _ = self
-                            .store
-                            .update_provider_health(provider_id, ProviderHealthState::Unhealthy)
+                            .mark_provider_status(
+                                provider_id,
+                                ProviderHealthState::Unhealthy,
+                                err.phase,
+                                Some(detail.as_str()),
+                            )
                             .await;
-                        return Err(err);
+                        return Err(err.source);
                     }
                 }
             }
@@ -1169,158 +1215,349 @@ impl<'a> Executor<'a> {
         }
     }
 
-    async fn health_gate_once(&self, provider_id: Uuid) -> Result<()> {
+    async fn transport_gate(&self, provider_id: Uuid, timeout_seconds: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+        loop {
+            match self.transport_gate_once(provider_id).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        let detail = err.source.to_string();
+                        let _ = self
+                            .mark_provider_status(
+                                provider_id,
+                                ProviderHealthState::Unhealthy,
+                                err.phase,
+                                Some(detail.as_str()),
+                            )
+                            .await;
+                        return Err(err.source);
+                    }
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn transport_gate_once(
+        &self,
+        provider_id: Uuid,
+    ) -> std::result::Result<(), ReadinessCheckError> {
         let provider = self
             .store
             .get_provider(provider_id)
-            .await?
-            .ok_or_else(|| anyhow!("provider {} not found", provider_id))?;
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
+            .ok_or_else(|| {
+                ReadinessCheckError::new(
+                    ProviderReadinessPhase::Unknown,
+                    anyhow!("provider {} not found", provider_id),
+                )
+            })?;
 
-        let endpoint_json = provider
-            .endpoint_json
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("provider {} has no endpoint", provider.provider_id))?;
-        let endpoint: ProviderEndpoint =
-            serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-        endpoint.validate()?;
+        let endpoint_json = provider.endpoint_json.as_ref().cloned().ok_or_else(|| {
+            ReadinessCheckError::new(
+                ProviderReadinessPhase::Unknown,
+                anyhow!("provider {} has no endpoint", provider.provider_id),
+            )
+        })?;
+        let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)
+            .context("parsing provider endpoint")
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
+        endpoint
+            .validate()
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
+
+        probe_provider_transport(self.probe, provider.instance_id, &endpoint)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
+        self.record_provider_readiness(
+            provider.provider_id,
+            ProviderReadinessPhase::TransportReady,
+            None,
+        )
+        .await
+        .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::TransportReady, err))?;
+        Ok(())
+    }
+
+    async fn bootstrap_gate(&self, provider_id: Uuid, timeout_seconds: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+        loop {
+            match self.bootstrap_gate_once(provider_id).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        let detail = err.source.to_string();
+                        let _ = self
+                            .mark_provider_status(
+                                provider_id,
+                                ProviderHealthState::Unhealthy,
+                                err.phase,
+                                Some(detail.as_str()),
+                            )
+                            .await;
+                        return Err(err.source);
+                    }
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn bootstrap_gate_once(
+        &self,
+        provider_id: Uuid,
+    ) -> std::result::Result<(), ReadinessCheckError> {
+        let provider = self
+            .store
+            .get_provider(provider_id)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
+            .ok_or_else(|| {
+                ReadinessCheckError::new(
+                    ProviderReadinessPhase::Unknown,
+                    anyhow!("provider {} not found", provider_id),
+                )
+            })?;
+
+        let endpoint_json = provider.endpoint_json.as_ref().cloned().ok_or_else(|| {
+            ReadinessCheckError::new(
+                ProviderReadinessPhase::Unknown,
+                anyhow!("provider {} has no endpoint", provider.provider_id),
+            )
+        })?;
+        let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)
+            .context("parsing provider endpoint")
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
+        endpoint
+            .validate()
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
 
         let instance = self
             .store
             .get_instance(provider.instance_id)
-            .await?
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
             .ok_or_else(|| {
-                anyhow!(
-                    "instance {} not found for provider {}",
-                    provider.instance_id,
-                    provider.provider_id
+                ReadinessCheckError::new(
+                    ProviderReadinessPhase::Unknown,
+                    anyhow!(
+                        "instance {} not found for provider {}",
+                        provider.instance_id,
+                        provider.provider_id
+                    ),
                 )
             })?;
 
+        probe_provider_transport(self.probe, provider.instance_id, &endpoint)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?;
+        self.record_provider_readiness(
+            provider.provider_id,
+            ProviderReadinessPhase::TransportReady,
+            None,
+        )
+        .await
+        .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::TransportReady, err))?;
+
+        self.ensure_provider_bootstrap_ready(&provider, &instance, &endpoint)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::TransportReady, err))?;
+        Ok(())
+    }
+
+    async fn health_gate_once(
+        &self,
+        provider_id: Uuid,
+    ) -> std::result::Result<(), ReadinessCheckError> {
+        let provider = self
+            .store
+            .get_provider(provider_id)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
+            .ok_or_else(|| {
+                ReadinessCheckError::new(
+                    ProviderReadinessPhase::Unknown,
+                    anyhow!("provider {} not found", provider_id),
+                )
+            })?;
+
+        let instance = self
+            .store
+            .get_instance(provider.instance_id)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
+            .ok_or_else(|| {
+                ReadinessCheckError::new(
+                    ProviderReadinessPhase::Unknown,
+                    anyhow!(
+                        "instance {} not found for provider {}",
+                        provider.instance_id,
+                        provider.provider_id
+                    ),
+                )
+            })?;
+
+        let recorded_phase = self
+            .store
+            .get_provider_readiness(provider.provider_id)
+            .await
+            .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
+            .map(|readiness| readiness.readiness_phase)
+            .unwrap_or(ProviderReadinessPhase::Unknown);
+        let required_phase = health_gate_prerequisite_phase(&provider);
+        if !readiness_satisfies(recorded_phase, required_phase) {
+            return Err(ReadinessCheckError::new(
+                recorded_phase,
+                anyhow!(
+                    "driver readiness requires prior {} gate",
+                    required_phase.as_str()
+                ),
+            ));
+        }
+
+        let failure_phase = if matches!(recorded_phase, ProviderReadinessPhase::DriverReady) {
+            required_phase
+        } else {
+            recorded_phase
+        };
+        self.ensure_provider_driver_ready(&provider, &instance)
+            .await
+            .map_err(|err| ReadinessCheckError::new(failure_phase, err))?;
+        self.mark_provider_status(
+            provider.provider_id,
+            ProviderHealthState::Healthy,
+            ProviderReadinessPhase::DriverReady,
+            None,
+        )
+        .await
+        .map_err(|err| ReadinessCheckError::new(failure_phase, err))?;
+        Ok(())
+    }
+
+    async fn ensure_provider_bootstrap_ready(
+        &self,
+        provider: &Provider,
+        instance: &crate::db::models::ExtensionInstance,
+        endpoint: &ProviderEndpoint,
+    ) -> Result<Option<ProviderReadinessPhase>> {
         if provider.capability == "media.manager.tv"
             && provider.implementation.as_deref() == Some("sonarr")
         {
             let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(key) = read_sonarr_api_key(
+            let key = read_sonarr_api_key(
                 self.runtime,
                 provider.instance_id,
                 config.config_dir.as_deref(),
             )
             .await?
-            {
-                upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
-                self.normalize_arr_auth_config_if_needed(
-                    provider.instance_id,
-                    &key,
-                    &endpoint,
-                    &["/api/v3/config/host", "/api/v4/config/host"],
-                )
-                .await?;
-                self.probe
-                    .probe_dns(&endpoint.host)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                self.probe
-                    .probe_tcp(&endpoint.host, endpoint.port)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                self.ensure_provider_driver_ready(&provider, &instance)
-                    .await?;
-                self.store
-                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                    .await?;
-                return Ok(());
-            }
-            bail!("sonarr config.xml not ready");
+            .ok_or_else(|| anyhow!("sonarr config.xml not ready"))?;
+            upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
+            self.normalize_arr_auth_config_if_needed(
+                provider.instance_id,
+                &key,
+                endpoint,
+                &["/api/v3/config/host", "/api/v4/config/host"],
+            )
+            .await?;
+            self.record_provider_readiness(
+                provider.provider_id,
+                ProviderReadinessPhase::BootstrapReady,
+                None,
+            )
+            .await?;
+            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
         }
         if provider.capability == "media.manager.movies"
             && provider.implementation.as_deref() == Some("radarr")
         {
             let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(key) = read_radarr_api_key(
+            let key = read_radarr_api_key(
                 self.runtime,
                 provider.instance_id,
                 config.config_dir.as_deref(),
             )
             .await?
-            {
-                upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
-                self.normalize_arr_auth_config_if_needed(
-                    provider.instance_id,
-                    &key,
-                    &endpoint,
-                    &["/api/v3/config/host", "/api/v4/config/host"],
-                )
-                .await?;
-                self.probe
-                    .probe_dns(&endpoint.host)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                self.probe
-                    .probe_tcp(&endpoint.host, endpoint.port)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                self.ensure_provider_driver_ready(&provider, &instance)
-                    .await?;
-                self.store
-                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                    .await?;
-                return Ok(());
-            }
-            bail!("radarr config.xml not ready");
+            .ok_or_else(|| anyhow!("radarr config.xml not ready"))?;
+            upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
+            self.normalize_arr_auth_config_if_needed(
+                provider.instance_id,
+                &key,
+                endpoint,
+                &["/api/v3/config/host", "/api/v4/config/host"],
+            )
+            .await?;
+            self.record_provider_readiness(
+                provider.provider_id,
+                ProviderReadinessPhase::BootstrapReady,
+                None,
+            )
+            .await?;
+            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
         }
         if provider.capability == "indexer.registry"
             && provider.implementation.as_deref() == Some("prowlarr")
         {
             let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
-            if let Some(key) = read_prowlarr_api_key(
+            let key = read_prowlarr_api_key(
                 self.runtime,
                 provider.instance_id,
                 config.config_dir.as_deref(),
             )
             .await?
-            {
-                upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key)
-                    .await?;
-                self.normalize_arr_auth_config_if_needed(
-                    provider.instance_id,
-                    &key,
-                    &endpoint,
-                    &["/api/v1/config/host"],
-                )
-                .await?;
-                self.probe
-                    .probe_dns(&endpoint.host)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "dns"))?;
-                self.probe
-                    .probe_tcp(&endpoint.host, endpoint.port)
-                    .await
-                    .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-                self.ensure_provider_driver_ready(&provider, &instance)
-                    .await?;
-                self.store
-                    .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-                    .await?;
-                return Ok(());
-            }
-            bail!("prowlarr config.xml not ready");
+            .ok_or_else(|| anyhow!("prowlarr config.xml not ready"))?;
+            upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
+            self.normalize_arr_auth_config_if_needed(
+                provider.instance_id,
+                &key,
+                endpoint,
+                &["/api/v1/config/host"],
+            )
+            .await?;
+            self.record_provider_readiness(
+                provider.provider_id,
+                ProviderReadinessPhase::BootstrapReady,
+                None,
+            )
+            .await?;
+            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
+        }
+        if provider.capability == "downloader.torrent"
+            && provider.implementation.as_deref() == Some("qbittorrent")
+        {
+            let (username, password) =
+                resolve_qbittorrent_credentials(&self.store, self.secrets, instance).await?;
+            let endpoint_url = endpoint.canonical_url()?;
+            let transport_base_url =
+                resolve_driver_transport_base_url(provider.instance_id, endpoint)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "driver transport is not ready for instance {} endpoint {}:{}",
+                            provider.instance_id,
+                            endpoint.host,
+                            endpoint.port
+                        )
+                    })?;
+            bootstrap_qbittorrent_session_cookie(
+                &endpoint_url,
+                Some(transport_base_url.as_str()),
+                provider.instance_id,
+                &username,
+                &password,
+            )
+            .await?;
+            self.record_provider_readiness(
+                provider.provider_id,
+                ProviderReadinessPhase::BootstrapReady,
+                None,
+            )
+            .await?;
+            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
         }
 
-        self.probe
-            .probe_dns(&endpoint.host)
-            .await
-            .and_then(|result| ensure_probe_ok(result, "dns"))?;
-        self.probe
-            .probe_tcp(&endpoint.host, endpoint.port)
-            .await
-            .and_then(|result| ensure_probe_ok(result, "tcp"))?;
-        self.ensure_provider_driver_ready(&provider, &instance)
-            .await?;
-        self.store
-            .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
-            .await?;
-        Ok(())
+        Ok(None)
     }
 
     async fn ensure_provider_driver_ready(
@@ -1340,6 +1577,32 @@ impl<'a> Executor<'a> {
         )
         .await?;
         driver.read_state(ctx).await?;
+        Ok(())
+    }
+
+    async fn record_provider_readiness(
+        &self,
+        provider_id: Uuid,
+        readiness_phase: ProviderReadinessPhase,
+        readiness_detail: Option<&str>,
+    ) -> Result<()> {
+        self.store
+            .upsert_provider_readiness(provider_id, readiness_phase, readiness_detail)
+            .await
+    }
+
+    async fn mark_provider_status(
+        &self,
+        provider_id: Uuid,
+        health_state: ProviderHealthState,
+        readiness_phase: ProviderReadinessPhase,
+        readiness_detail: Option<&str>,
+    ) -> Result<()> {
+        self.record_provider_readiness(provider_id, readiness_phase, readiness_detail)
+            .await?;
+        self.store
+            .update_provider_health(provider_id, health_state)
+            .await?;
         Ok(())
     }
 
@@ -1423,7 +1686,7 @@ impl<'a> Executor<'a> {
                 if nzbget_profile_version_matches(
                     config.performance_profile_version.as_deref(),
                     selected_profile,
-                ) && nzbget_managed_ui_paths_are_current(
+                ) && nzbget_managed_paths_are_current(
                     self.runtime,
                     instance.instance_id,
                     instance.config_json.as_ref(),
@@ -1432,53 +1695,47 @@ impl<'a> Executor<'a> {
                 {
                     return Ok(());
                 }
-                let (username, password) =
-                    resolve_nzbget_credentials(&self.store, self.secrets, instance).await?;
-                let mut secrets = HashMap::new();
-                secrets.insert("nzbget_username".to_string(), username);
-                secrets.insert("nzbget_password".to_string(), password);
-                secrets.extend(
-                    resolve_nzbget_server_slot_secrets(&self.store, self.secrets, instance).await?,
-                );
-
-                let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
-                    anyhow!(
-                        "no driver registered for capability '{}'",
-                        provider.capability
+                let patch = nzbget_performance_profile_patch(selected_profile);
+                let ctx = build_driver_ctx_for_provider(
+                    &self.store,
+                    self.secrets,
+                    self.runtime,
+                    provider,
+                    instance,
+                )
+                .await?;
+                if !self
+                    .apply_nzbget_named_volume_patch(
+                        provider,
+                        instance,
+                        &ctx,
+                        &patch,
+                        provider.provider_id,
                     )
-                })?;
-                let transport_base_url =
-                    resolve_driver_transport_base_url(provider.instance_id, endpoint)
-                        .await?
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "driver transport is not ready for instance {} endpoint {}:{}",
-                                provider.instance_id,
-                                endpoint.host,
-                                endpoint.port
-                            )
-                        })?;
-                let ctx = DriverCtx::new(
-                    provider.provider_id,
-                    provider.instance_id,
-                    provider.capability.clone(),
-                    endpoint.clone(),
-                    Some(transport_base_url),
-                    provider.implementation.clone(),
-                    instance.config_json.clone(),
-                    secrets,
-                );
-                let result = driver
-                    .apply_patch(ctx, nzbget_performance_profile_patch(selected_profile))
-                    .await?;
-                if result.status == ApplyStatus::Deferred {
-                    bail!(
-                        "nzbget performance profile deferred: {}",
-                        result
-                            .message
-                            .unwrap_or_else(|| "driver deferred".to_string())
-                    );
+                    .await?
+                {
+                    let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
+                        anyhow!(
+                            "no driver registered for capability '{}'",
+                            provider.capability
+                        )
+                    })?;
+                    let result = driver.apply_patch(ctx, patch).await?;
+                    if result.status == ApplyStatus::Deferred {
+                        bail!(
+                            "nzbget performance profile deferred: {}",
+                            result
+                                .message
+                                .unwrap_or_else(|| "driver deferred".to_string())
+                        );
+                    }
                 }
+                self.record_provider_readiness(
+                    provider.provider_id,
+                    ProviderReadinessPhase::BootstrapReady,
+                    None,
+                )
+                .await?;
                 let restart_required = runtime_has_bind_config_dir(instance.config_json.as_ref());
                 persist_managed_defaults_profile_version(
                     &self.store,
@@ -2170,14 +2427,6 @@ fn nzbget_config_key(line: &str) -> Option<&str> {
     Some(name.trim())
 }
 
-fn is_qbittorrent_extension_id(extension_id: &str) -> bool {
-    extension_id.to_ascii_lowercase().contains("qbittorrent")
-}
-
-fn is_nzbget_extension_id(extension_id: &str) -> bool {
-    extension_id.to_ascii_lowercase().contains("nzbget")
-}
-
 fn is_default_wireguard_downloader_extension_id(extension_id: &str) -> bool {
     is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
 }
@@ -2186,6 +2435,7 @@ async fn resolve_indexer_apps(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
     runtime: &dyn RuntimeManager,
+    probe: &dyn ProbeRunner,
     patch: &mut DriverPatch,
 ) -> Result<()> {
     let apps = match patch {
@@ -2202,12 +2452,28 @@ async fn resolve_indexer_apps(
         }
         let host_hint = url_host(&app.url);
         if is_sonarr_app(&app.implementation) {
-            let instance = resolve_sonarr_instance_for_app(store, host_hint.as_deref()).await?;
-            let api_key = resolve_sonarr_api_key(store, secrets, runtime, &instance).await?;
+            let target = resolve_sonarr_target_for_app(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_reachable(
+                probe,
+                &target,
+                "Sonarr",
+                "Prowlarr application registration",
+            )
+            .await?;
+            let api_key = resolve_sonarr_api_key(store, secrets, runtime, &target.instance).await?;
+            app.url = target.endpoint.canonical_url()?;
             app.api_key = Some(api_key);
         } else if is_radarr_app(&app.implementation) {
-            let instance = resolve_radarr_instance_for_app(store, host_hint.as_deref()).await?;
-            let api_key = resolve_radarr_api_key(store, secrets, runtime, &instance).await?;
+            let target = resolve_radarr_target_for_app(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_reachable(
+                probe,
+                &target,
+                "Radarr",
+                "Prowlarr application registration",
+            )
+            .await?;
+            let api_key = resolve_radarr_api_key(store, secrets, runtime, &target.instance).await?;
+            app.url = target.endpoint.canonical_url()?;
             app.api_key = Some(api_key);
         }
     }
@@ -2217,6 +2483,7 @@ async fn resolve_indexer_apps(
 async fn resolve_downloader_credentials(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
+    probe: &dyn ProbeRunner,
     patch: &mut DriverPatch,
 ) -> Result<()> {
     let downloaders = match patch {
@@ -2234,6 +2501,13 @@ async fn resolve_downloader_credentials(
         if is_qbittorrent_downloader(&downloader.r#type) {
             let target =
                 resolve_qbittorrent_target_for_downloader(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_reachable(
+                probe,
+                &target,
+                "qBittorrent",
+                "download client registration",
+            )
+            .await?;
             downloader.url = target.endpoint.canonical_url()?;
             if downloader_has_credentials(downloader) {
                 continue;
@@ -2245,6 +2519,13 @@ async fn resolve_downloader_credentials(
         }
         if is_nzbget_downloader(&downloader.r#type) {
             let target = resolve_nzbget_target_for_downloader(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_reachable(
+                probe,
+                &target,
+                "NZBGet",
+                "download client registration",
+            )
+            .await?;
             downloader.url = target.endpoint.canonical_url()?;
             if downloader_has_credentials(downloader) {
                 continue;
@@ -2260,9 +2541,63 @@ async fn resolve_downloader_credentials(
 
 #[derive(Debug, Clone)]
 struct ManagedProviderTarget {
+    provider: Provider,
     instance: crate::db::models::ExtensionInstance,
     endpoint: ProviderEndpoint,
     aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostProbeTarget {
+    base_url: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug)]
+struct ReadinessCheckError {
+    phase: ProviderReadinessPhase,
+    source: anyhow::Error,
+}
+
+impl ReadinessCheckError {
+    fn new(phase: ProviderReadinessPhase, source: anyhow::Error) -> Self {
+        Self { phase, source }
+    }
+}
+
+fn readiness_satisfies(current: ProviderReadinessPhase, required: ProviderReadinessPhase) -> bool {
+    readiness_rank(current) >= readiness_rank(required)
+}
+
+fn readiness_rank(phase: ProviderReadinessPhase) -> u8 {
+    match phase {
+        ProviderReadinessPhase::Unknown => 0,
+        ProviderReadinessPhase::TransportReady => 1,
+        ProviderReadinessPhase::BootstrapReady => 2,
+        ProviderReadinessPhase::DriverReady => 3,
+    }
+}
+
+fn health_gate_prerequisite_phase(provider: &Provider) -> ProviderReadinessPhase {
+    if provider_requires_bootstrap(provider) {
+        ProviderReadinessPhase::BootstrapReady
+    } else {
+        ProviderReadinessPhase::TransportReady
+    }
+}
+
+fn provider_requires_bootstrap(provider: &Provider) -> bool {
+    matches!(
+        (
+            provider.capability.as_str(),
+            provider.implementation.as_deref(),
+        ),
+        ("media.manager.tv", Some("sonarr"))
+            | ("media.manager.movies", Some("radarr"))
+            | ("indexer.registry", Some("prowlarr"))
+            | ("downloader.torrent", Some("qbittorrent"))
+    )
 }
 
 fn is_sonarr_app(implementation: &str) -> bool {
@@ -2330,11 +2665,11 @@ fn downloader_setting_missing(settings: &HashMap<String, serde_json::Value>, key
     }
 }
 
-async fn resolve_sonarr_instance_for_app(
+async fn resolve_sonarr_target_for_app(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
-) -> Result<crate::db::models::ExtensionInstance> {
-    Ok(resolve_provider_target(
+) -> Result<ManagedProviderTarget> {
+    resolve_provider_target(
         store,
         "media.manager.tv",
         "sonarr",
@@ -2342,15 +2677,14 @@ async fn resolve_sonarr_instance_for_app(
         "sonarr provider not found for prowlarr app registration",
         "multiple sonarr providers found; specify a managed Sonarr host alias in the app url",
     )
-    .await?
-    .instance)
+    .await
 }
 
-async fn resolve_radarr_instance_for_app(
+async fn resolve_radarr_target_for_app(
     store: &ExtensionStore<'_>,
     host_hint: Option<&str>,
-) -> Result<crate::db::models::ExtensionInstance> {
-    Ok(resolve_provider_target(
+) -> Result<ManagedProviderTarget> {
+    resolve_provider_target(
         store,
         "media.manager.movies",
         "radarr",
@@ -2358,8 +2692,7 @@ async fn resolve_radarr_instance_for_app(
         "radarr provider not found for prowlarr app registration",
         "multiple radarr providers found; specify a managed Radarr host alias in the app url",
     )
-    .await?
-    .instance)
+    .await
 }
 
 async fn resolve_qbittorrent_target_for_downloader(
@@ -2455,12 +2788,29 @@ async fn list_managed_provider_targets(
             })?;
         let aliases = provider_host_aliases(store, &detail, &instance, &endpoint).await?;
         candidates.push(ManagedProviderTarget {
+            provider: detail.provider,
             instance,
             endpoint,
             aliases,
         });
     }
     Ok(candidates)
+}
+
+async fn ensure_dependency_provider_reachable(
+    probe: &dyn ProbeRunner,
+    target: &ManagedProviderTarget,
+    dependency_name: &str,
+    action_name: &str,
+) -> Result<()> {
+    if let Err(err) =
+        probe_provider_transport(probe, target.provider.instance_id, &target.endpoint).await
+    {
+        return Err(deferred_dependency_error(format!(
+            "{dependency_name} is not reachable yet; deferring {action_name}: {err}"
+        )));
+    }
+    Ok(())
 }
 
 async fn provider_host_aliases(
@@ -2954,6 +3304,84 @@ async fn resolve_driver_transport_base_url(
     Ok(None)
 }
 
+fn probe_container_host(host: &str) -> String {
+    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" {
+        "host.docker.internal".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+fn probe_target_from_endpoint(endpoint: &ProviderEndpoint) -> Result<HostProbeTarget> {
+    Ok(HostProbeTarget {
+        base_url: endpoint.canonical_url()?,
+        host: probe_container_host(&endpoint.host),
+        port: endpoint.port,
+    })
+}
+
+fn host_probe_target_from_base_url(base_url: &str) -> Result<HostProbeTarget> {
+    let parsed = Url::parse(base_url).context("parsing host probe transport base url")?;
+    let host = parsed
+        .host_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("host probe transport URL has no host: {base_url}"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("host probe transport URL has no port: {base_url}"))?;
+    Ok(HostProbeTarget {
+        base_url: base_url.to_string(),
+        host: probe_container_host(&host),
+        port,
+    })
+}
+
+async fn resolve_probe_target(
+    instance_id: Uuid,
+    endpoint: &ProviderEndpoint,
+) -> Result<HostProbeTarget> {
+    if endpoint_uses_container_network(endpoint) {
+        return probe_target_from_endpoint(endpoint);
+    }
+
+    let canonical = probe_target_from_endpoint(endpoint)?;
+    if endpoint_host_resolves(&endpoint.host, endpoint.port).await {
+        return Ok(canonical);
+    }
+
+    let Some(base_url) = resolve_driver_transport_base_url(instance_id, endpoint).await? else {
+        bail!(
+            "host probe transport is not ready for instance {} endpoint {}:{}",
+            instance_id,
+            endpoint.host,
+            endpoint.port
+        );
+    };
+    host_probe_target_from_base_url(&base_url)
+}
+
+async fn probe_host_target(probe: &dyn ProbeRunner, target: &HostProbeTarget) -> Result<()> {
+    probe
+        .probe_dns(&target.host)
+        .await
+        .and_then(|result| ensure_probe_ok(result, "dns"))?;
+    probe
+        .probe_tcp(&target.host, target.port)
+        .await
+        .and_then(|result| ensure_probe_ok(result, "tcp"))?;
+    Ok(())
+}
+
+async fn probe_provider_transport(
+    probe: &dyn ProbeRunner,
+    instance_id: Uuid,
+    endpoint: &ProviderEndpoint,
+) -> Result<HostProbeTarget> {
+    let target = resolve_probe_target(instance_id, endpoint).await?;
+    probe_host_target(probe, &target).await?;
+    Ok(target)
+}
+
 async fn endpoint_host_resolves(host: &str, port: u16) -> bool {
     lookup_host((host, port))
         .await
@@ -3341,7 +3769,7 @@ fn runtime_uses_named_config_storage(instance_config: Option<&serde_json::Value>
         .is_some_and(|value| value.eq_ignore_ascii_case("named_volume"))
 }
 
-async fn nzbget_managed_ui_paths_are_current(
+async fn nzbget_managed_paths_are_current(
     runtime: &dyn RuntimeManager,
     instance_id: Uuid,
     instance_config: Option<&serde_json::Value>,
@@ -3362,13 +3790,19 @@ async fn nzbget_managed_ui_paths_are_current(
         return Ok(false);
     };
 
-    Ok(matches!(
-        find_nzbget_config_value(&contents, "WebDir"),
-        Some(value) if value == NZBGET_WEB_DIR
-    ) && matches!(
-        find_nzbget_config_value(&contents, "ConfigTemplate"),
-        Some(value) if value == NZBGET_CONFIG_TEMPLATE
-    ))
+    Ok(missing_nzbget_managed_paths(&contents).is_empty())
+}
+
+fn missing_nzbget_managed_paths(contents: &str) -> Vec<&'static str> {
+    NZBGET_REQUIRED_MANAGED_PATHS
+        .iter()
+        .filter_map(
+            |(key, expected)| match find_nzbget_config_value(contents, key) {
+                Some(value) if value == *expected => None,
+                _ => Some(*key),
+            },
+        )
+        .collect()
 }
 
 fn find_nzbget_config_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
@@ -3692,6 +4126,15 @@ async fn resolve_runtime_env(
     Ok(resolved)
 }
 
+pub(crate) fn resolve_runtime_volume_mounts(
+    extension_id: &str,
+    instance_id: Uuid,
+    raw_volumes: &[String],
+    paths: &RuntimePaths,
+) -> Result<Vec<VolumeMount>> {
+    Ok(prepare_runtime_volumes(extension_id, instance_id, raw_volumes, paths)?.volumes)
+}
+
 fn prepare_runtime_volumes(
     extension_id: &str,
     instance_id: Uuid,
@@ -3702,18 +4145,21 @@ fn prepare_runtime_volumes(
         .iter()
         .map(|volume| resolve_volume_mount(volume, paths))
         .collect::<Result<Vec<_>>>()?;
-    let mut legacy_config_bind_source = None;
 
-    if should_use_named_config_storage(extension_id) {
+    if extension_uses_managed_config_volume(extension_id) {
         if let Some(config_mount) = volumes
             .iter_mut()
             .find(|volume| volume.container_path == "/config")
         {
-            if config_mount.source_kind == VolumeMountSourceKind::Bind {
-                legacy_config_bind_source = Some(config_mount.host_path.clone());
-            }
             config_mount.source_kind = VolumeMountSourceKind::NamedVolume;
             config_mount.host_path = config_volume_name(instance_id);
+        } else {
+            volumes.push(VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: config_volume_name(instance_id),
+                container_path: "/config".to_string(),
+                read_only: false,
+            });
         }
     }
 
@@ -3730,22 +4176,23 @@ fn prepare_runtime_volumes(
         });
     }
 
-    Ok(PreparedRuntimeVolumes {
-        volumes,
-        legacy_config_bind_source,
-    })
+    Ok(PreparedRuntimeVolumes { volumes })
 }
 
-fn should_use_named_config_storage(extension_id: &str) -> bool {
-    desktop_runtime_storage_migration_enabled() && extension_id.starts_with("elixir.modules.")
+fn extension_uses_managed_config_volume(extension_id: &str) -> bool {
+    matches!(
+        extension_id,
+        "elixir.modules.sonarr"
+            | "elixir.modules.radarr"
+            | "elixir.modules.prowlarr"
+            | "elixir.modules.bazarr"
+            | "elixir.modules.nzbget"
+            | "elixir.modules.qbittorrent"
+    )
 }
 
 fn extension_requires_runtime_volume(extension_id: &str) -> bool {
     is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
-}
-
-fn desktop_runtime_storage_migration_enabled() -> bool {
-    cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
 fn config_volume_name(instance_id: Uuid) -> String {
@@ -3849,6 +4296,7 @@ mod tests {
     use crate::db::models::{
         ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
     };
+    use crate::extensions::managed_paths::NZBGET_LOCK_FILE;
     use crate::extensions::manifest::ManifestRuntimePort;
     use crate::extensions::store::{
         ExtensionStore, NewExtension, NewExtensionInstance, NewProvider,
@@ -3901,8 +4349,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn host_probe_target_from_base_url_uses_resolved_transport_host_and_port() -> Result<()> {
+        let target = host_probe_target_from_base_url("http://127.0.0.1:33042/base/")?;
+        assert_eq!(target.base_url, "http://127.0.0.1:33042/base/");
+        assert_eq!(target.host, "host.docker.internal");
+        assert_eq!(target.port, 33042);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_target_from_endpoint_preserves_container_network_service_host() -> Result<()> {
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-sonarr".to_string(),
+            8989,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        let target = probe_target_from_endpoint(&endpoint)?;
+        assert_eq!(target.base_url, "http://svc-sonarr:8989/");
+        assert_eq!(target.host, "svc-sonarr");
+        assert_eq!(target.port, 8989);
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn nzbget_managed_ui_paths_report_missing_when_web_keys_absent() -> Result<()> {
+    async fn nzbget_managed_paths_report_missing_when_required_keys_absent() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let config_path = temp_dir.path().join("nzbget.conf");
         fs::write(
@@ -3918,21 +4391,30 @@ mod tests {
         });
 
         assert!(
-            !nzbget_managed_ui_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config))
-                .await?
+            !nzbget_managed_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config)).await?
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn nzbget_managed_ui_paths_accept_expected_values() -> Result<()> {
+    async fn nzbget_managed_paths_accept_expected_values() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let config_path = temp_dir.path().join("nzbget.conf");
         fs::write(
             &config_path,
             format!(
-                "WebDir={}\nConfigTemplate={}\n",
-                NZBGET_WEB_DIR, NZBGET_CONFIG_TEMPLATE
+                "MainDir={}\nDestDir={}\nInterDir={}\nNzbDir={}\nQueueDir={}\nTempDir={}\nScriptDir={}\nLogFile={}\nWebDir={}\nConfigTemplate={}\nLockFile={}\n",
+                NZBGET_MAIN_DIR,
+                DOWNLOADS_ROOT,
+                NZBGET_INCOMPLETE_DIR,
+                NZBGET_NZB_DIR,
+                NZBGET_QUEUE_DIR,
+                NZBGET_TEMP_DIR,
+                NZBGET_SCRIPT_DIR,
+                NZBGET_LOG_FILE,
+                NZBGET_WEB_DIR,
+                NZBGET_CONFIG_TEMPLATE,
+                NZBGET_LOCK_FILE
             ),
         )
         .await?;
@@ -3944,8 +4426,7 @@ mod tests {
         });
 
         assert!(
-            nzbget_managed_ui_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config))
-                .await?
+            nzbget_managed_paths_are_current(&StubRuntime, Uuid::new_v4(), Some(&config)).await?
         );
         Ok(())
     }
@@ -4029,17 +4510,32 @@ mod tests {
     #[derive(Default)]
     struct StubProbe {
         calls: Mutex<Vec<String>>,
+        fail_dns: HashSet<String>,
+        fail_tcp: HashSet<String>,
     }
 
     impl StubProbe {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("probe calls lock").clone()
         }
+
+        fn fail_dns_for(mut self, host: &str) -> Self {
+            self.fail_dns.insert(host.to_string());
+            self
+        }
+
+        fn fail_tcp_for(mut self, host: &str, port: u16) -> Self {
+            self.fail_tcp.insert(format!("{host}:{port}"));
+            self
+        }
     }
 
     #[async_trait]
     impl ProbeRunner for StubProbe {
         async fn probe_dns(&self, name: &str) -> Result<crate::runtime::probe::ProbeResult> {
+            if self.fail_dns.contains(name) {
+                bail!("dns unavailable for {name}");
+            }
             self.calls
                 .lock()
                 .expect("probe calls lock")
@@ -4056,6 +4552,9 @@ mod tests {
             host: &str,
             port: u16,
         ) -> Result<crate::runtime::probe::ProbeResult> {
+            if self.fail_tcp.contains(&format!("{host}:{port}")) {
+                bail!("tcp unavailable for {host}:{port}");
+            }
             self.calls
                 .lock()
                 .expect("probe calls lock")
@@ -4163,6 +4662,32 @@ mod tests {
         }
     }
 
+    async fn start_mock_qbittorrent_auth_server() -> Result<(String, u16)> {
+        async fn login() -> impl axum::response::IntoResponse {
+            (
+                [(
+                    axum::http::header::SET_COOKIE,
+                    axum::http::HeaderValue::from_static("SID=test; HttpOnly"),
+                )],
+                "Ok.",
+            )
+        }
+
+        let app = axum::Router::new().route("/api/v2/auth/login", axum::routing::post(login));
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let port = listener.local_addr()?.port();
+        let host = match local_ip_address::local_ip()? {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() => ip.to_string(),
+            ip => bail!("expected non-loopback IPv4 address for qBittorrent test server, got {ip}"),
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock qbittorrent auth server");
+        });
+        Ok((host, port))
+    }
+
     #[derive(Default)]
     struct CaptureRuntime {
         specs: Mutex<Vec<ContainerSpec>>,
@@ -4259,6 +4784,156 @@ mod tests {
             _destination_path: &str,
         ) -> Result<()> {
             bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            _paths: &[String],
+        ) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            bail!("unexpected runtime call")
+        }
+    }
+
+    struct NzbgetNamedVolumeRuntime {
+        config_text: Mutex<String>,
+        start_count: Mutex<usize>,
+        stop_count: Mutex<usize>,
+        copy_count: Mutex<usize>,
+    }
+
+    impl NzbgetNamedVolumeRuntime {
+        fn new(initial_config: &str) -> Self {
+            Self {
+                config_text: Mutex::new(initial_config.to_string()),
+                start_count: Mutex::new(0),
+                stop_count: Mutex::new(0),
+                copy_count: Mutex::new(0),
+            }
+        }
+
+        fn config_text(&self) -> String {
+            self.config_text
+                .lock()
+                .expect("nzbget runtime config lock")
+                .clone()
+        }
+
+        fn start_count(&self) -> usize {
+            *self
+                .start_count
+                .lock()
+                .expect("nzbget runtime start count lock")
+        }
+
+        fn stop_count(&self) -> usize {
+            *self
+                .stop_count
+                .lock()
+                .expect("nzbget runtime stop count lock")
+        }
+
+        fn copy_count(&self) -> usize {
+            *self
+                .copy_count
+                .lock()
+                .expect("nzbget runtime copy count lock")
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for NzbgetNamedVolumeRuntime {
+        async fn ensure_network(&self, _name: &str) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container(&self, _spec: &ContainerSpec) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            Ok(Some(ContainerHandle {
+                id: name.to_string(),
+                name: name.to_string(),
+            }))
+        }
+
+        async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            *self
+                .start_count
+                .lock()
+                .expect("nzbget runtime start count lock") += 1;
+            Ok(())
+        }
+
+        async fn stop_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            *self
+                .stop_count
+                .lock()
+                .expect("nzbget runtime stop count lock") += 1;
+            Ok(())
+        }
+
+        async fn rename_container(
+            &self,
+            _handle: &ContainerHandle,
+            _new_name: &str,
+        ) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn remove_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            if path != "/config/nzbget.conf" {
+                bail!("unexpected container file read {path}");
+            }
+            Ok(Some(self.config_text().into_bytes()))
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            source_path: &std::path::Path,
+            destination_path: &str,
+        ) -> Result<()> {
+            if destination_path != "/config/nzbget.conf" {
+                bail!("unexpected container copy destination {destination_path}");
+            }
+            *self
+                .copy_count
+                .lock()
+                .expect("nzbget runtime copy count lock") += 1;
+            let text = fs::read_to_string(source_path).await?;
+            *self.config_text.lock().expect("nzbget runtime config lock") = text;
+            Ok(())
         }
 
         async fn ensure_container_directories(
@@ -5687,7 +6362,8 @@ mod tests {
             }],
         });
 
-        resolve_downloader_credentials(&store, &secrets, &mut patch).await?;
+        let probe = StubProbe::default();
+        resolve_downloader_credentials(&store, &secrets, &probe, &mut patch).await?;
 
         let DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders { downloaders }) =
             patch
@@ -5727,10 +6403,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_indexer_apps_defers_when_sonarr_dependency_is_unreachable() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(
+            &store,
+            "elixir.modules.sonarr",
+            json!({
+                "id": "elixir.modules.sonarr",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Sonarr",
+                "provides": [{
+                    "capability": "media.manager.tv",
+                    "slot": "default",
+                    "implementation": "sonarr"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/sonarr:latest",
+                    "service_name": "elx-sonarr"
+                }
+            }),
+        )
+        .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.sonarr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({ "api_key": "sonarr-test-key" })),
+                enabled: true,
+            })
+            .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "sonarr.example".to_string(),
+            8989,
+            None,
+            None,
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: Uuid::new_v4(),
+                instance_id,
+                capability: "media.manager.tv".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("sonarr".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(&endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([9u8; 32], true);
+        let runtime = StubRuntime;
+        let probe = StubProbe::default().fail_tcp_for("sonarr.example", 8989);
+        let mut patch = DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps {
+            apps: vec![crate::drivers::AppSpec {
+                name: "Sonarr".to_string(),
+                implementation: "Sonarr".to_string(),
+                url: "http://sonarr.example:8989".to_string(),
+                api_key: None,
+                tags: Vec::new(),
+                categories: vec!["5000".to_string()],
+                enabled: Some(true),
+                settings: HashMap::new(),
+            }],
+        });
+
+        let err = resolve_indexer_apps(&store, &secrets, &runtime, &probe, &mut patch)
+            .await
+            .expect_err("expected deferred dependency error");
+        let message =
+            deferred_dependency_message(&err).expect("deferred dependency message should exist");
+        assert!(message.contains("Sonarr is not reachable yet"));
+        assert!(message.contains("Prowlarr application registration"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn apply_builtin_downloader_profiles_updates_qbittorrent_once() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+        let (host, port) = start_mock_qbittorrent_auth_server().await?;
 
         let instance_id = Uuid::new_v4();
         store
@@ -5738,19 +6500,16 @@ mod tests {
                 instance_id,
                 extension_id: "elixir.modules.qbittorrent".to_string(),
                 instance_name: "default".to_string(),
-                config_json: None,
+                config_json: Some(json!({
+                    "username": "admin",
+                    "password": "adminadmin"
+                })),
                 enabled: true,
             })
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "127.0.0.1".to_string(),
-            8080,
-            None,
-            None,
-        )?;
+        let endpoint = ProviderEndpoint::new("http".to_string(), host, port, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -5829,6 +6588,7 @@ mod tests {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+        let (host, port) = start_mock_qbittorrent_auth_server().await?;
 
         let instance_id = Uuid::new_v4();
         store
@@ -5836,19 +6596,16 @@ mod tests {
                 instance_id,
                 extension_id: "elixir.modules.qbittorrent".to_string(),
                 instance_name: "default".to_string(),
-                config_json: None,
+                config_json: Some(json!({
+                    "username": "admin",
+                    "password": "adminadmin"
+                })),
                 enabled: true,
             })
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "127.0.0.1".to_string(),
-            8080,
-            None,
-            None,
-        )?;
+        let endpoint = ProviderEndpoint::new("http".to_string(), host, port, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -5888,8 +6645,22 @@ mod tests {
             &secrets,
         );
 
-        executor.health_gate_once(provider_id).await?;
-        executor.health_gate_once(provider_id).await?;
+        executor
+            .transport_gate_once(provider_id)
+            .await
+            .map_err(|err| err.source)?;
+        executor
+            .bootstrap_gate_once(provider_id)
+            .await
+            .map_err(|err| err.source)?;
+        executor
+            .health_gate_once(provider_id)
+            .await
+            .map_err(|err| err.source)?;
+        executor
+            .health_gate_once(provider_id)
+            .await
+            .map_err(|err| err.source)?;
 
         assert!(
             calls.lock().expect("recording driver lock").is_empty(),
@@ -5925,7 +6696,7 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "127.0.0.1".to_string(),
+            "qbittorrent.example".to_string(),
             8080,
             None,
             None,
@@ -6018,7 +6789,7 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
-            "127.0.0.1".to_string(),
+            "example.com".to_string(),
             6789,
             None,
             None,
@@ -6095,6 +6866,100 @@ mod tests {
             Some("/app/nzbget/webui/nzbget.conf.template")
         );
         drop(calls);
+
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let parsed = parse_nzbget_instance_config(instance.config_json.as_ref())?;
+        assert_eq!(
+            parsed.performance_profile_version.as_deref(),
+            Some(NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_builtin_downloader_profiles_repairs_named_volume_nzbget_config() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({
+                    "username": "elixir",
+                    "password": "secret",
+                    "runtime": {
+                        "config_storage": {
+                            "source_kind": "named_volume"
+                        }
+                    }
+                })),
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "example.com".to_string(),
+            6789,
+            None,
+            None,
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = NzbgetNamedVolumeRuntime::new(
+            "InterDir=/runtime/incomplete\nNzbDir=/runtime/nzb\nQueueDir=/runtime/queue\nTempDir=/runtime/tmp\n",
+        );
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor.apply_builtin_downloader_profiles_now().await?;
+
+        let rendered = runtime.config_text();
+        for (key, value) in NZBGET_REQUIRED_MANAGED_PATHS {
+            assert!(
+                rendered.contains(&format!("{key}={value}")),
+                "expected rendered config to contain {key}={value}, got:\n{rendered}"
+            );
+        }
+        assert_eq!(runtime.stop_count(), 1);
+        assert_eq!(runtime.copy_count(), 1);
+        assert_eq!(runtime.start_count(), 1);
 
         let instance = store.get_instance(instance_id).await?.expect("instance");
         let parsed = parse_nzbget_instance_config(instance.config_json.as_ref())?;
@@ -6944,18 +7809,18 @@ PersistentKeepalive = 25
             downloads_root: "data/downloads".to_string(),
             media_root: "media".to_string(),
         };
-        let mount = resolve_volume_mount("{data}/bazarr:/config", &paths)?;
+        let mount = resolve_volume_mount("{data}/community-app:/config", &paths)?;
         assert!(
             Path::new(&mount.host_path).is_absolute(),
             "expected absolute host path, got {}",
             mount.host_path
         );
-        assert!(mount.host_path.ends_with("/data/bazarr"));
+        assert!(mount.host_path.ends_with("/data/community-app"));
         Ok(())
     }
 
     #[test]
-    fn prepare_runtime_volumes_rewrites_first_party_config_storage_on_desktop() -> Result<()> {
+    fn prepare_runtime_volumes_rewrites_first_party_config_storage_to_named_volume() -> Result<()> {
         let paths = RuntimePaths {
             data_root: "/tmp/elixir/data".to_string(),
             downloads_root: "/tmp/elixir/downloads".to_string(),
@@ -6967,49 +7832,57 @@ PersistentKeepalive = 25
             "elixir.modules.nzbget",
             instance_id,
             &[
-                "{data}/nzbget:/config".to_string(),
+                "{data}/legacy-nzbget-config:/config".to_string(),
                 "{downloads}:/downloads".to_string(),
             ],
             &paths,
         )?;
 
-        if desktop_runtime_storage_migration_enabled() {
-            let config_mount = prepared
+        let config_mount = prepared
+            .volumes
+            .iter()
+            .find(|volume| volume.container_path == "/config")
+            .expect("config mount");
+        assert_eq!(config_mount.source_kind, VolumeMountSourceKind::NamedVolume);
+        assert_eq!(config_mount.host_path, config_volume_name(instance_id));
+        assert!(
+            prepared
                 .volumes
                 .iter()
-                .find(|volume| volume.container_path == "/config")
-                .expect("config mount");
-            assert_eq!(config_mount.source_kind, VolumeMountSourceKind::NamedVolume);
-            assert_eq!(config_mount.host_path, config_volume_name(instance_id));
-            assert_eq!(
-                prepared.legacy_config_bind_source.as_deref(),
-                Some("/tmp/elixir/data/nzbget")
-            );
-            assert!(
-                prepared
-                    .volumes
-                    .iter()
-                    .any(|volume| volume.container_path == "/runtime"
-                        && volume.source_kind == VolumeMountSourceKind::NamedVolume)
-            );
-        } else {
-            let config_mount = prepared
-                .volumes
-                .iter()
-                .find(|volume| volume.container_path == "/config")
-                .expect("config mount");
-            assert_eq!(config_mount.source_kind, VolumeMountSourceKind::Bind);
-            assert_eq!(config_mount.host_path, "/tmp/elixir/data/nzbget");
-            assert!(prepared.legacy_config_bind_source.is_none());
-            assert!(
-                prepared
-                    .volumes
-                    .iter()
-                    .any(|volume| volume.container_path == "/runtime"
-                        && volume.source_kind == VolumeMountSourceKind::NamedVolume)
-            );
-        }
+                .any(|volume| volume.container_path == "/runtime"
+                    && volume.source_kind == VolumeMountSourceKind::NamedVolume)
+        );
 
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_runtime_volumes_injects_managed_config_mount_when_manifest_omits_config()
+    -> Result<()> {
+        let paths = RuntimePaths {
+            data_root: "/tmp/elixir/data".to_string(),
+            downloads_root: "/tmp/elixir/downloads".to_string(),
+            media_root: "/tmp/elixir/media".to_string(),
+        };
+        let instance_id =
+            Uuid::parse_str("b71d9e69-0290-5e73-b6c4-c9e771b993a6").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.sonarr",
+            instance_id,
+            &[
+                "{downloads}:/downloads".to_string(),
+                "{media}/tv:/tv".to_string(),
+            ],
+            &paths,
+        )?;
+
+        let config_mount = prepared
+            .volumes
+            .iter()
+            .find(|volume| volume.container_path == "/config")
+            .expect("config mount");
+        assert_eq!(config_mount.source_kind, VolumeMountSourceKind::NamedVolume);
+        assert_eq!(config_mount.host_path, config_volume_name(instance_id));
         Ok(())
     }
 

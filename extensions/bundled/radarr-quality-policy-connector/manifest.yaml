@@ -1,0 +1,24 @@
+id: elixir.connectors.radarr_quality_policy
+version: 1.0.0
+kind: connector
+name: "Radarr Quality Policy"
+description: "Apply Elixir's blended TRaSH quality policy preset to Radarr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - drivers.configure.media.manager.movies
+targets:
+  - capability: media.manager.movies
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: media.manager.movies
+      slot: default
+    patch:
+      op: apply_quality_policy_preset
+      policy:
+        preset: modern_codecs
+        profile_name: "Elixir Modern Codecs"

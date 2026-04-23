@@ -1,0 +1,34 @@
+id: elixir.modules.byparr
+version: 1.0.3
+kind: module
+name: "Byparr"
+description: "Anti-bot solver module backed by Byparr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: indexer.proxy
+    slot: byparr
+    cardinality: one
+    implementation: byparr
+requires: []
+conflicts:
+  - capability: indexer.proxy
+    slot: byparr
+    policy: prompt_replace
+runtime:
+  type: container
+  image: "ghcr.io/thephaseless/byparr@sha256:01a46a2865d9a6db5eb8ead04ec0dd33b8fbe233e8565ae70b50d4cc0af4cfb0"
+  network: "elixir_net"
+  service_name: "elx-byparr"
+  ports:
+    - container: 8191
+      host: 0
+networking:
+  service_port:
+    scheme: http
+    container_port: 8191

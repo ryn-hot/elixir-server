@@ -15,3 +15,17 @@ pub const NZBGET_LOG_FILE: &str = "/config/nzbget.log";
 pub const NZBGET_WEB_DIR: &str = "/app/nzbget/webui";
 pub const NZBGET_CONFIG_TEMPLATE: &str = "/app/nzbget/webui/nzbget.conf.template";
 pub const NZBGET_LOCK_FILE: &str = "/config/nzbget.lock";
+
+pub const NZBGET_REQUIRED_MANAGED_PATHS: [(&str, &str); 11] = [
+    ("MainDir", NZBGET_MAIN_DIR),
+    ("DestDir", DOWNLOADS_ROOT),
+    ("InterDir", NZBGET_INCOMPLETE_DIR),
+    ("NzbDir", NZBGET_NZB_DIR),
+    ("QueueDir", NZBGET_QUEUE_DIR),
+    ("TempDir", NZBGET_TEMP_DIR),
+    ("ScriptDir", NZBGET_SCRIPT_DIR),
+    ("LogFile", NZBGET_LOG_FILE),
+    ("WebDir", NZBGET_WEB_DIR),
+    ("ConfigTemplate", NZBGET_CONFIG_TEMPLATE),
+    ("LockFile", NZBGET_LOCK_FILE),
+];

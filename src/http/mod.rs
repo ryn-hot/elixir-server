@@ -119,15 +119,6 @@ pub fn router(state: AppState) -> Router {
             post(handlers::extensions::reset_runtime),
         )
         .route(
-            "/api/v1/extensions/auto-wire",
-            get(handlers::extensions::auto_wire_status)
-                .post(handlers::extensions::update_auto_wire),
-        )
-        .route(
-            "/api/v1/extensions/auto-wire/plan",
-            get(handlers::extensions::auto_wire_plan),
-        )
-        .route(
             "/api/v1/extensions/downloaders/profile",
             get(handlers::extensions::downloader_profile)
                 .patch(handlers::extensions::update_downloader_profile),

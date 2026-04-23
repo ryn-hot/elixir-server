@@ -150,6 +150,10 @@ impl Settings {
                 default_registry_refresh_interval_seconds(),
             )?
             .set_default(
+                "extensions.proxy_runtime_update_interval_seconds",
+                default_proxy_runtime_update_interval_seconds(),
+            )?
+            .set_default(
                 "extensions.reconcile_retry_attempts",
                 default_reconcile_retry_attempts(),
             )?
@@ -470,6 +474,8 @@ pub struct ExtensionsConfig {
     pub reconcile_interval_seconds: u64,
     #[serde(default = "default_registry_refresh_interval_seconds")]
     pub registry_refresh_interval_seconds: u64,
+    #[serde(default = "default_proxy_runtime_update_interval_seconds")]
+    pub proxy_runtime_update_interval_seconds: u64,
     #[serde(default = "default_reconcile_retry_attempts")]
     pub reconcile_retry_attempts: u32,
     #[serde(default = "default_reconcile_retry_backoff_seconds")]
@@ -493,6 +499,7 @@ impl Default for ExtensionsConfig {
             docker: ExtensionsDockerConfig::default(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             registry_refresh_interval_seconds: default_registry_refresh_interval_seconds(),
+            proxy_runtime_update_interval_seconds: default_proxy_runtime_update_interval_seconds(),
             reconcile_retry_attempts: default_reconcile_retry_attempts(),
             reconcile_retry_backoff_seconds: default_reconcile_retry_backoff_seconds(),
             reconcile_startup_settle_seconds: default_reconcile_startup_settle_seconds(),
@@ -755,6 +762,10 @@ fn default_reconcile_interval_seconds() -> u64 {
 
 fn default_registry_refresh_interval_seconds() -> u64 {
     900
+}
+
+fn default_proxy_runtime_update_interval_seconds() -> u64 {
+    6 * 60 * 60
 }
 
 fn default_reconcile_retry_attempts() -> u32 {

@@ -1,0 +1,57 @@
+id: elixir.modules.radarr
+version: 1.0.2
+kind: module
+name: "Radarr"
+description: "Movie manager module backed by Radarr."
+publisher:
+  name: "Elixir"
+  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: media.manager.movies
+    slot: default
+    cardinality: one
+    implementation: radarr
+    scope:
+      media_types: ["movie"]
+      actions: ["add", "monitor", "search"]
+      requires_account: false
+      required_fields: []
+  - capability: media.search.movies
+    slot: default
+    cardinality: many
+    implementation: radarr
+    scope:
+      media_types: ["movie"]
+      actions: ["search"]
+      requires_account: false
+      required_fields: []
+requires: []
+conflicts:
+  - capability: media.manager.movies
+    slot: default
+    policy: prompt_replace
+runtime:
+  type: container
+  image: "lscr.io/linuxserver/radarr:5.10.4"
+  network: "elixir_net"
+  service_name: "elx-radarr"
+  ports:
+    - container: 7878
+      host: 0
+  volumes:
+    - "{downloads}:/downloads"
+    - "{media}/movies:/movies"
+backup:
+  retention: 5
+  items:
+    - id: config
+      label: "Radarr configuration"
+      container_path: /config
+networking:
+  service_port:
+    scheme: http
+    container_port: 7878

@@ -50,8 +50,8 @@ use crate::{
     extensions::package::compute_sha256,
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
-        NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedMediaTombstone,
-        NewOrchestratorRun, NewProvider, NewSecret,
+        NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedLibraryProvenance,
+        NewManagedMediaTombstone, NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
@@ -60,7 +60,7 @@ use crate::{
     metadata::MetadataService,
     orchestrator::model::ProviderEndpoint,
     orchestrator::plan_validation::missing_required_secrets_for_plan,
-    orchestrator::planner::{DriverPatchSpec, Plan, PlanAction, Planner, ProviderSpec},
+    orchestrator::planner::{DriverPatchSpec, PlanAction, ProviderSpec},
     secrets::SecretsManager,
     state::AppState,
 };
@@ -5001,7 +5001,6 @@ async fn find_media_targets_manager_resolution_precedence() -> Result<()> {
             blueprint_extension_id: "elixir.blueprints.pref".to_string(),
             blueprint_version: "1.0.0".to_string(),
             params_json: None,
-            decisions_json: None,
         })
         .await?;
     store.mark_desired_applied(desired_id, true).await?;
@@ -5192,6 +5191,155 @@ async fn ingest_scan_endpoint_ingests_candidates() -> Result<()> {
     assert_eq!(
         detail_json.get("title").and_then(Value::as_str),
         Some("Scan Test")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_items_include_managed_card_lifecycle() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    let series_id = Uuid::new_v4();
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.sonarr".to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: "elixir.modules.sonarr".to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-sonarr",
+                "port": 8989,
+                "base_path": "/"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_imdb, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("Managed Show")
+    .bind(2024)
+    .bind("series")
+    .bind("tt1234567")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind("series")
+    .bind(serde_json::to_string(&json!({ "imdb": "tt1234567" }))?)
+    .bind("Managed Show")
+    .bind(2024)
+    .execute(&db_pool)
+    .await?;
+
+    store
+        .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+            media_item_id: series_id,
+            media_type: MediaType::Series,
+            title: "Managed Show".to_string(),
+            normalized_title: "managedshow".to_string(),
+            year: Some(2024),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt1234567".to_string()),
+                ..Default::default()
+            }),
+            manager_provider_id: provider_id,
+            manager_item_id: Some("42".to_string()),
+            manager_label: Some("default (sonarr)".to_string()),
+            manager_implementation: Some("sonarr".to_string()),
+            intent_id: None,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/library/items").body(Body::empty())?)
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "body: {}", payload);
+
+    let series_id_text = series_id.to_string();
+    let item = payload
+        .as_array()
+        .and_then(|items| {
+            items.iter().find(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(series_id_text.as_str())
+            })
+        })
+        .context("managed show list item")?;
+    let lifecycle = item
+        .get("lifecycle")
+        .context("library item lifecycle payload")?;
+    assert_eq!(
+        lifecycle.get("trackedByManager").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        lifecycle.get("canStopTracking").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        lifecycle.get("managerLabel").and_then(Value::as_str),
+        Some("Sonarr")
     );
 
     Ok(())
@@ -6585,6 +6733,81 @@ runtime:
 }
 
 #[tokio::test]
+async fn extensions_install_auto_provisions_default_instance_for_zero_config_module() -> Result<()>
+{
+    let temp = tempdir()?;
+    let package_dir = temp.path().join("byparr-module");
+    std::fs::create_dir_all(&package_dir)?;
+    let manifest = r#"id: elixir.modules.byparr
+version: 1.0.1
+kind: module
+name: "Byparr"
+provides:
+  - capability: indexer.proxy
+    slot: byparr
+    implementation: byparr
+runtime:
+  type: container
+  image: "example/byparr:1"
+  network: "elixir_net"
+  service_name: "elx-byparr"
+networking:
+  service_port:
+    scheme: http
+    container_port: 8191
+"#;
+    std::fs::write(package_dir.join("manifest.yaml"), manifest)?;
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = true;
+    settings.extensions.allow_directory_install = true;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let install_body = json!({
+        "packagePath": package_dir.to_string_lossy()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_body.to_string()))?,
+        )
+        .await?;
+    let status = install_resp.status();
+    let body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "install failed body: {payload}");
+
+    let store = ExtensionStore::new(&db_pool);
+    let instances = store.list_instances(Some("elixir.modules.byparr")).await?;
+    assert_eq!(instances.len(), 1, "expected auto-provisioned instance");
+    assert_eq!(instances[0].instance_name, "default");
+    assert!(instances[0].enabled);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn extensions_allows_bundled_elx_install_without_signature_when_manifest_declares_key()
 -> Result<()> {
     let temp = tempdir()?;
@@ -7150,7 +7373,7 @@ async fn extensions_enable_instance_requires_secret() -> Result<()> {
 }
 
 #[tokio::test]
-async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
+async fn extension_control_surface_can_create_default_instance_for_missing_module() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -7172,36 +7395,35 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
     ));
 
     let store = ExtensionStore::new(&db_pool);
-
     store
         .upsert_extension(&NewExtension {
-            extension_id: "ext.existing".to_string(),
-            name: "Existing Module".to_string(),
-            version: "0.1.0".to_string(),
+            extension_id: "elixir.modules.byparr".to_string(),
+            name: "Byparr".to_string(),
+            version: "1.0.1".to_string(),
             kind: ExtensionKind::Module,
             publisher_name: None,
             signing_key_id: None,
             trust_level: ExtensionTrustLevel::Verified,
             manifest_json: json!({
-                "id": "ext.existing",
-                "version": "0.1.0",
+                "id": "elixir.modules.byparr",
+                "version": "1.0.1",
                 "kind": "module",
-                "name": "Existing Module",
+                "name": "Byparr",
                 "provides": [
                     {
-                        "capability": "media.manager.tv",
-                        "slot": "default",
-                        "implementation": "sonarr"
+                        "capability": "indexer.proxy",
+                        "slot": "byparr",
+                        "implementation": "byparr"
                     }
                 ],
                 "runtime": {
                     "type": "container",
-                    "image": "example/test:1"
+                    "image": "example/byparr:1"
                 },
                 "networking": {
                     "service_port": {
                         "scheme": "http",
-                        "container_port": 8989
+                        "container_port": 8191
                     }
                 }
             }),
@@ -7210,229 +7432,40 @@ async fn extensions_plan_confirm_resolves_slot_conflict() -> Result<()> {
         })
         .await?;
 
-    store
-        .upsert_extension(&NewExtension {
-            extension_id: "ext.prompt".to_string(),
-            name: "Prompt Module".to_string(),
-            version: "0.1.0".to_string(),
-            kind: ExtensionKind::Module,
-            publisher_name: None,
-            signing_key_id: None,
-            trust_level: ExtensionTrustLevel::Verified,
-            manifest_json: json!({
-                "id": "ext.prompt",
-                "version": "0.1.0",
-                "kind": "module",
-                "name": "Prompt Module",
-                "provides": [
-                    {
-                        "capability": "media.manager.tv",
-                        "slot": "default",
-                        "implementation": "sonarr"
-                    }
-                ],
-                "conflicts": [
-                    {
-                        "capability": "media.manager.tv",
-                        "slot": "default",
-                        "policy": "prompt_replace"
-                    }
-                ],
-                "runtime": {
-                    "type": "container",
-                    "image": "example/test:1"
-                },
-                "networking": {
-                    "service_port": {
-                        "scheme": "http",
-                        "container_port": 8989
-                    }
-                }
-            }),
-            package_hash: None,
-            enabled: true,
-        })
-        .await?;
-
-    store
-        .upsert_extension(&NewExtension {
-            extension_id: "blueprint.conflict".to_string(),
-            name: "Conflict Blueprint".to_string(),
-            version: "0.1.0".to_string(),
-            kind: ExtensionKind::Blueprint,
-            publisher_name: None,
-            signing_key_id: None,
-            trust_level: ExtensionTrustLevel::Verified,
-            manifest_json: json!({
-                "id": "blueprint.conflict",
-                "version": "0.1.0",
-                "kind": "blueprint",
-                "name": "Conflict Blueprint",
-                "wants": [
-                    {
-                        "capability": "media.manager.tv",
-                        "slot": "default"
-                    }
-                ],
-                "preferences": {
-                    "providers": {
-                        "media.manager.tv/default": {
-                            "prefer": ["ext.prompt"]
-                        }
-                    }
-                },
-                "policies": {
-                    "reuse_existing": false
-                }
-            }),
-            package_hash: None,
-            enabled: true,
-        })
-        .await?;
-
-    let existing_instance_id = Uuid::new_v4();
-    store
-        .create_instance(&NewExtensionInstance {
-            instance_id: existing_instance_id,
-            extension_id: "ext.existing".to_string(),
-            instance_name: "default".to_string(),
-            config_json: None,
-            enabled: true,
-        })
-        .await?;
-    store
-        .update_instance_runtime_version(existing_instance_id, "0.1.0", None)
-        .await?;
-
-    let existing_provider_id = Uuid::new_v4();
-    store
-        .upsert_provider(&NewProvider {
-            provider_id: existing_provider_id,
-            instance_id: existing_instance_id,
-            capability: "media.manager.tv".to_string(),
-            slot_id: "default".to_string(),
-            cardinality: SlotCardinality::One,
-            implementation: Some("sonarr".to_string()),
-            scope_json: None,
-            endpoint_json: None,
-            health_state: ProviderHealthState::Healthy,
-        })
-        .await?;
-
-    let plan_response = app
+    let surface_resp = app
         .clone()
         .oneshot(
-            Request::post("/api/v1/extensions/blueprints/apply")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "blueprint_id": "blueprint.conflict"
-                    })
-                    .to_string(),
-                ))?,
+            Request::get("/api/v1/extensions/elixir.modules.byparr/control-surface")
+                .body(Body::empty())?,
         )
         .await?;
-
-    assert_eq!(plan_response.status(), StatusCode::OK);
-    let body = body::to_bytes(plan_response.into_body(), 1_048_576).await?;
-    let plan_json: Value = serde_json::from_slice(&body)?;
-    let plan_id = plan_json
-        .get("plan_id")
-        .and_then(Value::as_str)
-        .expect("plan_id");
-    let plan_uuid = Uuid::parse_str(plan_id)?;
-    assert!(
-        store
-            .list_desired_blueprints(None)
-            .await?
-            .into_iter()
-            .all(|item| item.desired_id != plan_uuid),
-        "preview should not persist durable desired state"
-    );
-
-    let conflicts = plan_json
-        .get("conflicts")
+    assert_eq!(surface_resp.status(), StatusCode::OK);
+    let body = body::to_bytes(surface_resp.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let actions = payload
+        .get("actions")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert!(
-        conflicts.iter().any(|conflict| {
-            conflict.get("code") == Some(&json!("slot_conflict"))
-                && conflict.get("policy") == Some(&json!("prompt"))
-        }),
-        "expected prompt slot conflict"
-    );
+    assert!(actions.iter().any(|action| {
+        action.get("id").and_then(Value::as_str) == Some("create_default_instance")
+    }));
 
-    let confirm_response = app
+    let action_resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/v1/extensions/plan/{plan_id}/confirm"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "decisions": {
-                            "slotConflicts": [
-                                {
-                                    "conflictId": "media.manager.tv/default",
-                                    "action": "keep_existing"
-                                }
-                            ]
-                        }
-                    })
-                    .to_string(),
-                ))?,
+            Request::post(
+                "/api/v1/extensions/elixir.modules.byparr/control-surface/actions/create_default_instance",
+            )
+            .body(Body::empty())?,
         )
         .await?;
+    assert_eq!(action_resp.status(), StatusCode::OK);
 
-    assert_eq!(confirm_response.status(), StatusCode::OK);
-    let body = body::to_bytes(confirm_response.into_body(), 1_048_576).await?;
-    let confirm_json: Value = serde_json::from_slice(&body)?;
-    assert_eq!(
-        confirm_json.get("status").and_then(Value::as_str),
-        Some("completed")
-    );
-
-    let run_id = confirm_json
-        .get("run_id")
-        .and_then(Value::as_str)
-        .expect("run_id");
-    let run = store
-        .get_run(Uuid::parse_str(run_id)?)
-        .await?
-        .expect("run exists");
-    let resolved_plan = run.plan_json.expect("plan_json");
-    let resolved_conflicts = resolved_plan
-        .get("conflicts")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        !resolved_conflicts
-            .iter()
-            .any(|conflict| { conflict.get("code") == Some(&json!("slot_conflict")) }),
-        "expected slot conflict to be resolved"
-    );
-
-    let desired = store.list_desired_blueprints(None).await?;
-    let desired_entry = desired
-        .iter()
-        .find(|item| item.desired_id == plan_uuid)
-        .expect("desired blueprint");
-    assert!(desired_entry.applied, "expected desired blueprint applied");
-    let decisions = desired_entry
-        .decisions_json
-        .as_ref()
-        .and_then(|value| value.get("slotConflicts"))
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        decisions.iter().any(|decision| {
-            decision.get("conflictId") == Some(&json!("media.manager.tv/default"))
-                && decision.get("action") == Some(&json!("keep_existing"))
-        }),
-        "expected keep_existing decision to persist"
-    );
+    let instances = store.list_instances(Some("elixir.modules.byparr")).await?;
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].instance_name, "default");
+    assert!(instances[0].enabled);
 
     Ok(())
 }
@@ -11177,7 +11210,6 @@ async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
             blueprint_extension_id: "blueprint.keep".to_string(),
             blueprint_version: "1.0.0".to_string(),
             params_json: None,
-            decisions_json: None,
         })
         .await?;
     store.mark_desired_applied(applied_id, true).await?;
@@ -11190,7 +11222,6 @@ async fn extensions_desired_blueprints_list_and_clear() -> Result<()> {
             blueprint_extension_id: "blueprint.keep".to_string(),
             blueprint_version: "1.0.0".to_string(),
             params_json: None,
-            decisions_json: None,
         })
         .await?;
 
@@ -11390,7 +11421,6 @@ async fn extensions_uninstall_blueprint_cascades_dependencies() -> Result<()> {
             blueprint_extension_id: "elixir.blueprints.arr_stack".to_string(),
             blueprint_version: "1.0.0".to_string(),
             params_json: None,
-            decisions_json: None,
         })
         .await?;
 
@@ -11589,239 +11619,6 @@ async fn extensions_reconcile_now_and_latest() -> Result<()> {
         .and_then(Value::as_str)
         .expect("latest run_id");
     assert_eq!(latest_run_id, run_id);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn extensions_auto_wire_status_default() -> Result<()> {
-    let settings = test_settings_with_db();
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let app = router(AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    ));
-
-    let status_resp = app
-        .clone()
-        .oneshot(Request::get("/api/v1/extensions/auto-wire").body(Body::empty())?)
-        .await?;
-    assert_eq!(status_resp.status(), StatusCode::OK);
-    let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
-    let status_json: Value = serde_json::from_slice(&status_body)?;
-    assert_eq!(
-        status_json.get("enabled").and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(status_json.get("pendingPlanId"), Some(&Value::Null));
-    assert_eq!(status_json.get("pendingReason"), Some(&Value::Null));
-    assert_eq!(status_json.get("pendingConflicts"), Some(&Value::Null));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn extensions_auto_wire_status_and_plan_pending() -> Result<()> {
-    let settings = test_settings_with_db();
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let db_pool = database.pool.clone();
-    let store = ExtensionStore::new(&db_pool);
-    let app = router(AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    ));
-
-    let plan_id = Uuid::new_v4();
-    let instance_id = Uuid::new_v4();
-    let plan = Plan {
-        plan_id,
-        blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
-        params: None,
-        actions: Vec::new(),
-        conflicts: vec![json!({
-            "code": "missing_required_secrets",
-            "extension_id": "ext.indexer",
-            "instance_id": instance_id,
-            "instance_name": "default",
-            "missing": [format!("instance:{instance_id}:indexer.test-indexer.api_key")],
-        })],
-    };
-    store
-        .create_run(&NewOrchestratorRun {
-            run_id: plan_id,
-            source: "auto_wire".to_string(),
-            status: OrchestratorRunStatus::Pending,
-            phase: Some("auto_wire".to_string()),
-            plan_json: Some(serde_json::to_value(&plan)?),
-            error: None,
-        })
-        .await?;
-
-    let status_resp = app
-        .clone()
-        .oneshot(Request::get("/api/v1/extensions/auto-wire").body(Body::empty())?)
-        .await?;
-    assert_eq!(status_resp.status(), StatusCode::OK);
-    let status_body = body::to_bytes(status_resp.into_body(), 1_048_576).await?;
-    let status_json: Value = serde_json::from_slice(&status_body)?;
-    assert_eq!(
-        status_json.get("enabled").and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        status_json.get("pendingPlanId").and_then(Value::as_str),
-        Some(plan_id.to_string().as_str())
-    );
-    assert_eq!(
-        status_json.get("pendingReason").and_then(Value::as_str),
-        Some("Missing required secrets")
-    );
-    assert_eq!(
-        status_json.get("pendingConflicts").and_then(Value::as_u64),
-        Some(1)
-    );
-
-    let plan_resp = app
-        .clone()
-        .oneshot(Request::get("/api/v1/extensions/auto-wire/plan").body(Body::empty())?)
-        .await?;
-    assert_eq!(plan_resp.status(), StatusCode::OK);
-    let plan_body = body::to_bytes(plan_resp.into_body(), 1_048_576).await?;
-    let plan_json: Value = serde_json::from_slice(&plan_body)?;
-    assert_eq!(
-        plan_json.get("plan_id").and_then(Value::as_str),
-        Some(plan_id.to_string().as_str())
-    );
-    assert_eq!(
-        plan_json.get("blueprint_id").and_then(Value::as_str),
-        Some(Planner::AUTO_WIRE_BLUEPRINT_ID)
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn extensions_auto_wire_toggle_disables_and_triggers_reconcile() -> Result<()> {
-    let settings = test_settings_with_db();
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let db_pool = database.pool.clone();
-    let store = ExtensionStore::new(&db_pool);
-    let app = router(AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    ));
-
-    let plan_id = Uuid::new_v4();
-    let pending_plan = Plan {
-        plan_id,
-        blueprint_id: Planner::AUTO_WIRE_BLUEPRINT_ID.to_string(),
-        params: None,
-        actions: Vec::new(),
-        conflicts: Vec::new(),
-    };
-    store
-        .create_run(&NewOrchestratorRun {
-            run_id: plan_id,
-            source: "auto_wire".to_string(),
-            status: OrchestratorRunStatus::Pending,
-            phase: Some("auto_wire".to_string()),
-            plan_json: Some(serde_json::to_value(&pending_plan)?),
-            error: None,
-        })
-        .await?;
-
-    let disable_resp = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/extensions/auto-wire")
-                .header("content-type", "application/json")
-                .body(Body::from("{\"enabled\":false}"))?,
-        )
-        .await?;
-    assert_eq!(disable_resp.status(), StatusCode::OK);
-
-    let canceled = store
-        .get_latest_run_by_source("auto_wire", Some(OrchestratorRunStatus::Canceled))
-        .await?
-        .expect("auto-wire run canceled");
-    assert_eq!(canceled.run_id, plan_id);
-
-    let disabled_body = body::to_bytes(disable_resp.into_body(), 1_048_576).await?;
-    let disabled_json: Value = serde_json::from_slice(&disabled_body)?;
-    assert_eq!(
-        disabled_json.get("pendingConflicts"),
-        Some(&Value::Null),
-        "pending_conflicts should be cleared after disable"
-    );
-    assert_eq!(
-        disabled_json.get("pendingPlanId"),
-        Some(&Value::Null),
-        "pending_plan_id should be cleared after disable"
-    );
-    assert_eq!(
-        disabled_json.get("pendingReason"),
-        Some(&Value::Null),
-        "pending_reason should be cleared after disable"
-    );
-
-    let enable_resp = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/extensions/auto-wire")
-                .header("content-type", "application/json")
-                .body(Body::from("{\"enabled\":true}"))?,
-        )
-        .await?;
-    assert_eq!(enable_resp.status(), StatusCode::OK);
-
-    let mut reconcile_run = None;
-    for _ in 0..20 {
-        reconcile_run = store.get_latest_run_by_phase("reconcile").await?;
-        if reconcile_run.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        reconcile_run.is_some(),
-        "expected reconcile run after enable"
-    );
 
     Ok(())
 }
