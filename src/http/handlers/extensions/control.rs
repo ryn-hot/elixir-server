@@ -1839,16 +1839,15 @@ async fn sanitize_live_nzbget_server_inventory(
     persisted_inventory: Option<&BTreeMap<u32, NzbgetServerEntry>>,
     inventory: BTreeMap<u32, NzbgetServerEntry>,
 ) -> anyhow::Result<BTreeMap<u32, NzbgetServerEntry>> {
-    let Some(persisted_inventory) = persisted_inventory else {
-        return Ok(inventory);
-    };
-
     let mut sanitized = BTreeMap::new();
     for (slot, server) in inventory {
         if !nzbget_server_is_configured(&server) {
             continue;
         }
-        if persisted_inventory.contains_key(&slot) {
+        if persisted_inventory
+            .map(|inventory| inventory.contains_key(&slot))
+            .unwrap_or(false)
+        {
             sanitized.insert(slot, server);
             continue;
         }
@@ -1859,9 +1858,13 @@ async fn sanitize_live_nzbget_server_inventory(
             .await?
             .unwrap_or_default();
         if username.trim().is_empty() || password.trim().is_empty() {
-            tracing::warn!(
-                "ignoring live nzbget server inventory for slot {slot} because it is absent from persisted inventory and credentials are missing"
-            );
+            if nzbget_server_is_upstream_sample(&server) {
+                tracing::debug!("ignoring stock nzbget sample server inventory for slot {slot}");
+            } else {
+                tracing::warn!(
+                    "ignoring live nzbget server inventory for slot {slot} because Elixir does not own it and credentials are missing"
+                );
+            }
             continue;
         }
         sanitized.insert(slot, server);
@@ -1937,6 +1940,16 @@ fn normalize_nzbget_cert_verification(value: &str) -> String {
 
 fn nzbget_server_is_configured(server: &NzbgetServerEntry) -> bool {
     !server.host.trim().is_empty()
+}
+
+fn nzbget_server_is_upstream_sample(server: &NzbgetServerEntry) -> bool {
+    server.host.trim().eq_ignore_ascii_case("my.newsserver.com")
+        && server.username.trim().eq_ignore_ascii_case("user")
+        && server.password.trim() == "pass"
+        && server.encryption
+        && nzbget_server_port(server) == 563
+        && nzbget_server_connections(server) == 8
+        && nzbget_server_cert_verification(server) == "strict"
 }
 
 fn nzbget_server_title(server: &NzbgetServerEntry) -> String {
@@ -2838,6 +2851,44 @@ mod tests {
             }),
             control_binding: ExtensionControlBinding::Sonarr,
         }
+    }
+
+    #[test]
+    fn nzbget_server_is_upstream_sample_matches_stock_defaults() {
+        let server = NzbgetServerEntry {
+            slot: 1,
+            active: true,
+            name: String::new(),
+            level: 0,
+            host: "my.newsserver.com".to_string(),
+            encryption: true,
+            port: Some(563),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            connections: Some(8),
+            cert_verification: "strict".to_string(),
+        };
+
+        assert!(nzbget_server_is_upstream_sample(&server));
+    }
+
+    #[test]
+    fn nzbget_server_is_upstream_sample_rejects_real_provider_shape() {
+        let server = NzbgetServerEntry {
+            slot: 1,
+            active: true,
+            name: "Newshosting".to_string(),
+            level: 0,
+            host: "news.newshosting.com".to_string(),
+            encryption: true,
+            port: Some(563),
+            username: "reader".to_string(),
+            password: "provider-secret".to_string(),
+            connections: Some(20),
+            cert_verification: "strict".to_string(),
+        };
+
+        assert!(!nzbget_server_is_upstream_sample(&server));
     }
 
     #[test]

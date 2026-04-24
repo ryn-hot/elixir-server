@@ -83,6 +83,12 @@ pub enum PlanAction {
     EnsureRuntimeRunning {
         runtime: RuntimeSpec,
     },
+    InstallRuntimeAsset {
+        asset: RuntimeAssetSpec,
+    },
+    RestartRuntime {
+        instance_id: Uuid,
+    },
     RollbackRuntime {
         instance_id: Uuid,
     },
@@ -109,10 +115,6 @@ pub enum PlanAction {
     },
     ApplyBinding {
         binding: BindingSpec,
-        consumer_endpoint: ProviderEndpoint,
-        provider_endpoint: ProviderEndpoint,
-        #[serde(default)]
-        reverse_probe: bool,
     },
 }
 
@@ -122,6 +124,8 @@ impl PlanAction {
             PlanAction::EnsureInstanceInstalled { .. } => "ensure_instance_installed",
             PlanAction::DeleteProvider { .. } => "delete_provider",
             PlanAction::EnsureRuntimeRunning { .. } => "ensure_runtime_running",
+            PlanAction::InstallRuntimeAsset { .. } => "install_runtime_asset",
+            PlanAction::RestartRuntime { .. } => "restart_runtime",
             PlanAction::RollbackRuntime { .. } => "rollback_runtime",
             PlanAction::TransportGate { .. } => "transport_gate",
             PlanAction::BootstrapGate { .. } => "bootstrap_gate",
@@ -159,6 +163,16 @@ impl TryFrom<PlanAction> for ExecutorAction {
                     networking: runtime.networking,
                     aliases: runtime.aliases,
                 })
+            }
+            PlanAction::InstallRuntimeAsset { asset } => Ok(ExecutorAction::InstallRuntimeAsset {
+                target_instance_id: asset.target_instance_id,
+                source_extension_id: asset.source_extension_id,
+                source_extension_version: asset.source_extension_version,
+                source_path: asset.source_path,
+                destination_path: asset.destination_path,
+            }),
+            PlanAction::RestartRuntime { instance_id } => {
+                Ok(ExecutorAction::RestartRuntime { instance_id })
             }
             PlanAction::RollbackRuntime { instance_id } => {
                 Ok(ExecutorAction::RollbackRuntime { instance_id })
@@ -201,21 +215,9 @@ impl TryFrom<PlanAction> for ExecutorAction {
                 target_provider_id: patch.target_provider_id,
                 patch: patch.patch,
             }),
-            PlanAction::ApplyBinding {
-                binding,
-                consumer_endpoint,
-                provider_endpoint,
-                reverse_probe,
-            } => {
-                consumer_endpoint.validate()?;
-                provider_endpoint.validate()?;
-                Ok(ExecutorAction::ApplyBinding {
-                    binding: binding.into_new_binding()?,
-                    consumer_endpoint,
-                    provider_endpoint,
-                    reverse_probe,
-                })
-            }
+            PlanAction::ApplyBinding { binding } => Ok(ExecutorAction::ApplyBinding {
+                binding: binding.into_new_binding()?,
+            }),
         }
     }
 }
@@ -241,6 +243,15 @@ pub struct RuntimeSpec {
     pub networking: Option<ManifestNetworking>,
     #[serde(default)]
     pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAssetSpec {
+    pub target_instance_id: Uuid,
+    pub source_extension_id: String,
+    pub source_extension_version: String,
+    pub source_path: String,
+    pub destination_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,8 +393,7 @@ impl Planner {
             .iter()
             .map(|entry| (entry.domain.clone(), entry.owner.clone()))
             .collect();
-        let mut claimed_ownership_domains: HashMap<String, ClaimedOwnershipDomain> =
-            HashMap::new();
+        let mut claimed_ownership_domains: HashMap<String, ClaimedOwnershipDomain> = HashMap::new();
 
         for definition in &execution.instances {
             let extension = match extension_map.get(&definition.extension_id) {
@@ -439,14 +449,12 @@ impl Planner {
                     && instance.instance_name == definition.name
             });
             let planned = match maybe_existing {
-                Some(existing) => {
-                    plan_existing_module_instance(
-                        candidate,
-                        existing,
-                        &existing_provider_ids,
-                        &mut plan.conflicts,
-                    )
-                }
+                Some(existing) => plan_existing_module_instance(
+                    candidate,
+                    existing,
+                    &existing_provider_ids,
+                    &mut plan.conflicts,
+                ),
                 None => plan_named_module_instance(
                     candidate,
                     explicit_stack_instance_id(&manifest.id, &definition.id),
@@ -520,6 +528,57 @@ impl Planner {
                                     .extend(missing);
                             }
                         }
+                    }
+                    ManifestExecutionStep::InstallRuntimeAsset {
+                        source_extension_id,
+                        source_path,
+                        target_instance,
+                        destination_path,
+                    } => {
+                        let Some(extension) = extension_map.get(source_extension_id) else {
+                            plan.conflicts.push(conflict_with_stage(
+                                serde_json::json!({
+                                    "code": "missing_package",
+                                    "extension_id": source_extension_id,
+                                    "detail": "runtime asset source package is not installed"
+                                }),
+                                phase.id.as_str(),
+                            ));
+                            continue;
+                        };
+                        if !extension.enabled
+                            || !trust_allowed(extension.trust_level, allow_community)
+                        {
+                            plan.conflicts.push(conflict_with_stage(
+                                serde_json::json!({
+                                    "code": "missing_package",
+                                    "extension_id": source_extension_id,
+                                    "detail": "runtime asset source package is not enabled or not allowed for this stack"
+                                }),
+                                phase.id.as_str(),
+                            ));
+                            continue;
+                        }
+                        let Some(planned) = planned_instances.get(target_instance) else {
+                            continue;
+                        };
+                        actions.push(PlanAction::InstallRuntimeAsset {
+                            asset: RuntimeAssetSpec {
+                                target_instance_id: planned.instance.instance_id,
+                                source_extension_id: source_extension_id.clone(),
+                                source_extension_version: extension.version.clone(),
+                                source_path: source_path.clone(),
+                                destination_path: destination_path.clone(),
+                            },
+                        });
+                    }
+                    ManifestExecutionStep::RestartRuntime { instance } => {
+                        let Some(planned) = planned_instances.get(instance) else {
+                            continue;
+                        };
+                        actions.push(PlanAction::RestartRuntime {
+                            instance_id: planned.instance.instance_id,
+                        });
                     }
                     ManifestExecutionStep::CreateOrUpdateProviders { instance } => {
                         let Some(planned) = planned_instances.get(instance) else {
@@ -837,7 +896,7 @@ impl Planner {
                         provider_instance,
                         provider_capability,
                         provider_slot,
-                        reverse_probe,
+                        ..
                     } => {
                         let consumer_ref = ManifestCapabilityRef {
                             capability: consumer_capability.clone(),
@@ -899,9 +958,6 @@ impl Planner {
                                 binding_params_json: None,
                                 status: Some(BindingStatus::Pending),
                             },
-                            consumer_endpoint: consumer_provider.endpoint.clone(),
-                            provider_endpoint: provider_provider.endpoint.clone(),
-                            reverse_probe: *reverse_probe,
                         });
                     }
                 }
@@ -974,18 +1030,22 @@ fn stage_for_missing_secrets<'a>(
         }
         for action in &actions[stage.action_start_index..stage.action_end_index] {
             match action {
-                PlanAction::EnsureRuntimeRunning { runtime } if runtime.instance_id == instance_id => {
+                PlanAction::EnsureRuntimeRunning { runtime }
+                    if runtime.instance_id == instance_id =>
+                {
                     return Some(stage.stage_id.as_str());
                 }
                 PlanAction::ApplyDriverPatch { patch } => {
-                    if let Some(PlanAction::CreateOrUpdateProvider { provider }) = actions.iter().find(
-                        |action| matches!(
-                            action,
-                            PlanAction::CreateOrUpdateProvider { provider }
-                                if provider.provider_id == patch.target_provider_id
-                                    && provider.instance_id == instance_id
-                        ),
-                    ) {
+                    if let Some(PlanAction::CreateOrUpdateProvider { provider }) =
+                        actions.iter().find(|action| {
+                            matches!(
+                                action,
+                                PlanAction::CreateOrUpdateProvider { provider }
+                                    if provider.provider_id == patch.target_provider_id
+                                        && provider.instance_id == instance_id
+                            )
+                        })
+                    {
                         let _ = provider;
                         return Some(stage.stage_id.as_str());
                     }
@@ -1889,7 +1949,7 @@ mod tests {
                     "steps": [
                         { "type": "create_or_update_providers", "instance": instance_id }
                     ]
-                })
+                }),
             ],
             Vec::new(),
         )
@@ -2090,7 +2150,7 @@ mod tests {
                                 "provider_capability": "indexer.registry"
                             }
                         ]
-                    })
+                    }),
                 ],
                 Vec::new(),
             ),
@@ -2118,9 +2178,11 @@ mod tests {
             .plan_blueprint(&store, "blueprint.test".to_string(), None)
             .await?;
 
-        assert!(plan.conflicts.iter().any(|conflict| {
-            conflict.get("code") == Some(&json!("invalid_provider_endpoint"))
-        }));
+        assert!(
+            plan.conflicts.iter().any(|conflict| {
+                conflict.get("code") == Some(&json!("invalid_provider_endpoint"))
+            })
+        );
         let blocked = plan.blocked_stage.expect("blocked stage");
         assert_eq!(blocked.stage_id, "create_instances");
         assert_eq!(blocked.code, "invalid_provider_endpoint");
@@ -2168,6 +2230,124 @@ mod tests {
                     })
                     .unwrap_or(false)
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_emits_runtime_asset_install_and_restart_actions() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(
+            &store,
+            "ext.prowlarr",
+            ExtensionKind::Module,
+            module_manifest("ext.prowlarr", "indexer.registry"),
+        )
+        .await?;
+        insert_extension(
+            &store,
+            "ext.prowlarr.asset",
+            ExtensionKind::Connector,
+            json!({
+                "id": "ext.prowlarr.asset",
+                "version": "1.2.3",
+                "kind": "connector",
+                "name": "Prowlarr Asset",
+                "targets": [
+                    {
+                        "capability": "indexer.registry",
+                        "slot": "default"
+                    }
+                ],
+                "actions": [
+                    {
+                        "type": "driver_patch",
+                        "target": {
+                            "capability": "indexer.registry",
+                            "slot": "default"
+                        },
+                        "patch": {
+                            "op": "register_indexers",
+                            "indexers": []
+                        }
+                    }
+                ]
+            }),
+        )
+        .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.prowlarr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        insert_extension(
+            &store,
+            "blueprint.ext.runtime_asset",
+            ExtensionKind::Blueprint,
+            execution_blueprint(
+                "blueprint.ext.runtime_asset",
+                vec!["ext.prowlarr", "ext.prowlarr.asset"],
+                vec![json!({
+                    "id": "prowlarr",
+                    "extension_id": "ext.prowlarr",
+                    "name": "default"
+                })],
+                vec![json!({
+                    "id": "install_definition",
+                    "steps": [
+                        {
+                            "type": "install_runtime_asset",
+                            "source_extension_id": "ext.prowlarr.asset",
+                            "source_path": "assets/config/custom-indexer.yml",
+                            "target_instance": "prowlarr",
+                            "destination_path": "/config/Definitions/Custom/custom-indexer.yml"
+                        },
+                        {
+                            "type": "restart_runtime",
+                            "instance": "prowlarr"
+                        }
+                    ]
+                })],
+                Vec::new(),
+            ),
+        )
+        .await?;
+
+        let planner = Planner::new();
+        let plan = planner
+            .plan_blueprint(&store, "blueprint.ext.runtime_asset".to_string(), None)
+            .await?;
+
+        let asset = plan
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                PlanAction::InstallRuntimeAsset { asset } => Some(asset),
+                _ => None,
+            })
+            .expect("runtime asset action");
+        assert_eq!(asset.target_instance_id, instance_id);
+        assert_eq!(asset.source_extension_id, "ext.prowlarr.asset");
+        assert_eq!(asset.source_extension_version, "1.0.0");
+        assert_eq!(asset.source_path, "assets/config/custom-indexer.yml");
+        assert_eq!(
+            asset.destination_path,
+            "/config/Definitions/Custom/custom-indexer.yml"
+        );
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            PlanAction::RestartRuntime { instance_id: restart_instance_id }
+            if *restart_instance_id == instance_id
+        )));
 
         Ok(())
     }
@@ -2337,11 +2517,7 @@ mod tests {
             &store,
             "blueprint.nzbget.runtime",
             ExtensionKind::Blueprint,
-            execution_blueprint_single_instance(
-                "blueprint.nzbget.runtime",
-                "ext.nzbget",
-                "nzbget",
-            ),
+            execution_blueprint_single_instance("blueprint.nzbget.runtime", "ext.nzbget", "nzbget"),
         )
         .await?;
 
@@ -2595,7 +2771,7 @@ mod tests {
                                 "ownership_domains": ["sonarr.defaults"]
                             }
                         ]
-                    })
+                    }),
                 ],
                 vec![json!({
                     "domain": "sonarr.defaults",
@@ -2705,7 +2881,7 @@ mod tests {
                                 "ownership_domains": ["sonarr.defaults"]
                             }
                         ]
-                    })
+                    }),
                 ],
                 vec![json!({
                     "domain": "sonarr.defaults",

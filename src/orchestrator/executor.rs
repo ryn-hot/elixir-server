@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -45,7 +45,6 @@ use crate::extensions::required_secrets::{
 use crate::extensions::store::{
     ExtensionStore, NewBinding, NewExtensionInstance, NewProvider, NewSecret, ProviderDetails,
 };
-use crate::orchestrator::bindings::ensure_binding_connectivity;
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::runtime::model::{
@@ -73,6 +72,16 @@ pub enum ExecutorAction {
         runtime: ManifestRuntime,
         networking: Option<ManifestNetworking>,
         aliases: Vec<String>,
+    },
+    InstallRuntimeAsset {
+        target_instance_id: Uuid,
+        source_extension_id: String,
+        source_extension_version: String,
+        source_path: String,
+        destination_path: String,
+    },
+    RestartRuntime {
+        instance_id: Uuid,
     },
     RollbackRuntime {
         instance_id: Uuid,
@@ -106,9 +115,6 @@ pub enum ExecutorAction {
     },
     ApplyBinding {
         binding: NewBinding,
-        consumer_endpoint: ProviderEndpoint,
-        provider_endpoint: ProviderEndpoint,
-        reverse_probe: bool,
     },
 }
 
@@ -198,6 +204,10 @@ impl<'a> Executor<'a> {
     }
 
     pub async fn apply(&self, action: ExecutorAction) -> Result<()> {
+        self.apply_with_note(action).await.map(|_| ())
+    }
+
+    pub async fn apply_with_note(&self, action: ExecutorAction) -> Result<Option<String>> {
         match action {
             ExecutorAction::EnsureInstanceInstalled {
                 instance_id,
@@ -213,10 +223,12 @@ impl<'a> Executor<'a> {
                     config_json,
                     enabled,
                 )
-                .await
+                .await?;
+                Ok(None)
             }
             ExecutorAction::DeleteProvider { provider_id } => {
-                self.delete_provider(provider_id).await
+                self.delete_provider(provider_id).await?;
+                Ok(None)
             }
             ExecutorAction::EnsureRuntimeRunning {
                 instance_id,
@@ -234,23 +246,55 @@ impl<'a> Executor<'a> {
                     networking,
                     aliases,
                 )
-                .await
+                .await?;
+                Ok(None)
+            }
+            ExecutorAction::InstallRuntimeAsset {
+                target_instance_id,
+                source_extension_id,
+                source_extension_version,
+                source_path,
+                destination_path,
+            } => {
+                self.install_runtime_asset(
+                    target_instance_id,
+                    source_extension_id,
+                    source_extension_version,
+                    source_path,
+                    destination_path,
+                )
+                .await?;
+                Ok(None)
+            }
+            ExecutorAction::RestartRuntime { instance_id } => {
+                self.restart_instance_runtime(instance_id).await?;
+                Ok(None)
             }
             ExecutorAction::RollbackRuntime { instance_id } => {
-                self.rollback_runtime(instance_id).await
+                self.rollback_runtime(instance_id).await?;
+                Ok(None)
             }
             ExecutorAction::TransportGate {
                 provider_id,
                 timeout_seconds,
-            } => self.transport_gate(provider_id, timeout_seconds).await,
+            } => {
+                self.transport_gate(provider_id, timeout_seconds).await?;
+                Ok(None)
+            }
             ExecutorAction::BootstrapGate {
                 provider_id,
                 timeout_seconds,
-            } => self.bootstrap_gate(provider_id, timeout_seconds).await,
+            } => {
+                self.bootstrap_gate(provider_id, timeout_seconds).await?;
+                Ok(None)
+            }
             ExecutorAction::HealthGate {
                 provider_id,
                 timeout_seconds,
-            } => self.health_gate(provider_id, timeout_seconds).await,
+            } => {
+                self.health_gate(provider_id, timeout_seconds).await?;
+                Ok(None)
+            }
             ExecutorAction::CreateOrUpdateProvider {
                 provider_id,
                 instance_id,
@@ -271,7 +315,8 @@ impl<'a> Executor<'a> {
                     scope_json,
                     endpoint,
                 )
-                .await
+                .await?;
+                Ok(None)
             }
             ExecutorAction::ApplyDriverPatch {
                 connector_extension_id,
@@ -281,14 +326,9 @@ impl<'a> Executor<'a> {
                 self.apply_driver_patch(connector_extension_id, target_provider_id, patch)
                     .await
             }
-            ExecutorAction::ApplyBinding {
-                binding,
-                consumer_endpoint,
-                provider_endpoint,
-                reverse_probe,
-            } => {
-                self.apply_binding(binding, consumer_endpoint, provider_endpoint, reverse_probe)
-                    .await
+            ExecutorAction::ApplyBinding { binding } => {
+                self.apply_binding(binding).await?;
+                Ok(None)
             }
         }
     }
@@ -833,6 +873,94 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    async fn install_runtime_asset(
+        &self,
+        target_instance_id: Uuid,
+        source_extension_id: String,
+        source_extension_version: String,
+        source_path: String,
+        destination_path: String,
+    ) -> Result<()> {
+        let name = container_name(target_instance_id);
+        let handle = self
+            .runtime
+            .get_container_handle(&name)
+            .await?
+            .ok_or_else(|| anyhow!("runtime container '{}' not found", name))?;
+
+        let resolved_source = self.resolve_runtime_asset_source_path(
+            &source_extension_id,
+            &source_extension_version,
+            &source_path,
+        )?;
+        let new_bytes = fs::read(&resolved_source).await.with_context(|| {
+            format!(
+                "reading runtime asset '{}' from extension {}@{}",
+                resolved_source.display(),
+                source_extension_id,
+                source_extension_version
+            )
+        })?;
+        if let Some(existing) = self
+            .runtime
+            .read_container_file(&handle, &destination_path)
+            .await?
+        {
+            if existing == new_bytes {
+                return Ok(());
+            }
+        }
+
+        let destination_parent = Path::new(&destination_path)
+            .parent()
+            .filter(|parent| *parent != Path::new("/"))
+            .map(|parent| parent.to_string_lossy().to_string());
+        if let Some(parent) = destination_parent {
+            self.runtime
+                .ensure_container_directories(&handle, &[parent])
+                .await?;
+        }
+
+        self.runtime
+            .copy_host_path_to_container(&handle, &resolved_source, &destination_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "copying runtime asset '{}' to '{}' for instance {}",
+                    resolved_source.display(),
+                    destination_path,
+                    target_instance_id
+                )
+            })?;
+        Ok(())
+    }
+
+    fn resolve_runtime_asset_source_path(
+        &self,
+        source_extension_id: &str,
+        source_extension_version: &str,
+        source_path: &str,
+    ) -> Result<PathBuf> {
+        let relative = Path::new(source_path);
+        if relative.is_absolute() {
+            bail!("runtime asset source_path must be relative");
+        }
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            bail!("runtime asset source_path must not escape the package root");
+        }
+
+        Ok(PathBuf::from(&self.runtime_paths.extensions_root)
+            .join("unpacked")
+            .join(source_extension_id)
+            .join(source_extension_version)
+            .join(relative))
+    }
+
     async fn finalize_runtime_storage(
         &self,
         instance_id: Uuid,
@@ -1031,7 +1159,7 @@ impl<'a> Executor<'a> {
         connector_extension_id: String,
         target_provider_id: Uuid,
         patch: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let provider = self
             .store
             .get_provider(target_provider_id)
@@ -1105,7 +1233,7 @@ impl<'a> Executor<'a> {
             .await
             .context("evaluating driver patch drift")?;
         match evaluation.status {
-            DriftStatus::InSync => return Ok(()),
+            DriftStatus::InSync => return Ok(None),
             DriftStatus::Unknown
                 if semantics.side_effect.is_service_disruptive()
                     || semantics.apply_policy != PatchApplyPolicy::PeriodicSafe =>
@@ -1136,7 +1264,7 @@ impl<'a> Executor<'a> {
             .apply_nzbget_named_volume_patch(&provider, &instance, &ctx, &patch, target_provider_id)
             .await?
         {
-            return Ok(());
+            return Ok(None);
         }
         let result = driver.apply_patch(ctx, patch).await?;
         if result.status == ApplyStatus::Deferred {
@@ -1153,35 +1281,18 @@ impl<'a> Executor<'a> {
             self.restart_instance_runtime(provider.instance_id).await?;
             self.health_gate(provider.provider_id, 30).await?;
         }
-        Ok(())
+        if let Some(detail) = result.message.as_ref() {
+            tracing::warn!(
+                connector_extension_id = %connector_extension_id,
+                provider_id = %provider.provider_id,
+                detail = %detail,
+                "driver patch completed with warnings"
+            );
+        }
+        Ok(result.message)
     }
 
-    async fn apply_binding(
-        &self,
-        binding: NewBinding,
-        consumer_endpoint: ProviderEndpoint,
-        provider_endpoint: ProviderEndpoint,
-        reverse_probe: bool,
-    ) -> Result<()> {
-        if let Err(err) = ensure_binding_connectivity(
-            self.probe,
-            &consumer_endpoint,
-            &provider_endpoint,
-            reverse_probe,
-        )
-        .await
-        {
-            let _ = self
-                .store
-                .update_binding_status(
-                    binding.binding_id,
-                    BindingStatus::Failed,
-                    Some(&err.to_string()),
-                )
-                .await;
-            return Err(err);
-        }
-
+    async fn apply_binding(&self, binding: NewBinding) -> Result<()> {
         let mut applied = binding;
         applied.status = BindingStatus::Applied;
         self.store.upsert_binding(&applied).await?;
@@ -4436,6 +4547,7 @@ mod tests {
         calls: Arc<Mutex<Vec<crate::drivers::DriverPatch>>>,
         semantics: crate::drivers::PatchSemantics,
         evaluation: crate::drivers::DriftEvaluation,
+        apply_result: crate::drivers::ApplyResult,
     }
 
     impl RecordingDriver {
@@ -4452,6 +4564,7 @@ mod tests {
                 evaluation: crate::drivers::DriftEvaluation::unknown(
                     "recording driver does not model drift",
                 ),
+                apply_result: crate::drivers::ApplyResult::applied(),
             }
         }
 
@@ -4462,6 +4575,11 @@ mod tests {
 
         fn with_evaluation(mut self, evaluation: crate::drivers::DriftEvaluation) -> Self {
             self.evaluation = evaluation;
+            self
+        }
+
+        fn with_apply_result(mut self, apply_result: crate::drivers::ApplyResult) -> Self {
+            self.apply_result = apply_result;
             self
         }
     }
@@ -4503,7 +4621,7 @@ mod tests {
                 .lock()
                 .expect("recording driver lock")
                 .push(patch);
-            Ok(crate::drivers::ApplyResult::applied())
+            Ok(self.apply_result.clone())
         }
     }
 
@@ -4792,6 +4910,152 @@ mod tests {
             _paths: &[String],
         ) -> Result<()> {
             bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container_directories_owned_like(
+            &self,
+            _handle: &ContainerHandle,
+            _reference_path: &str,
+            _paths: &[String],
+        ) -> Result<bool> {
+            bail!("unexpected runtime call")
+        }
+    }
+
+    #[derive(Default)]
+    struct AssetInstallRuntime {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+        copied_destinations: Mutex<Vec<String>>,
+        ensured_directories: Mutex<Vec<Vec<String>>>,
+        stop_count: Mutex<usize>,
+        start_count: Mutex<usize>,
+    }
+
+    impl AssetInstallRuntime {
+        fn copied_destinations(&self) -> Vec<String> {
+            self.copied_destinations
+                .lock()
+                .expect("asset runtime lock")
+                .clone()
+        }
+
+        fn ensured_directories(&self) -> Vec<Vec<String>> {
+            self.ensured_directories
+                .lock()
+                .expect("asset runtime lock")
+                .clone()
+        }
+
+        fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.files
+                .lock()
+                .expect("asset runtime lock")
+                .get(path)
+                .cloned()
+        }
+
+        fn stop_count(&self) -> usize {
+            *self.stop_count.lock().expect("asset runtime lock")
+        }
+
+        fn start_count(&self) -> usize {
+            *self.start_count.lock().expect("asset runtime lock")
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeManager for AssetInstallRuntime {
+        async fn ensure_network(&self, _name: &str) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn ensure_container(&self, _spec: &ContainerSpec) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            Ok(Some(ContainerHandle {
+                id: "asset".to_string(),
+                name: name.to_string(),
+            }))
+        }
+
+        async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            *self.start_count.lock().expect("asset runtime lock") += 1;
+            Ok(())
+        }
+
+        async fn stop_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            *self.stop_count.lock().expect("asset runtime lock") += 1;
+            Ok(())
+        }
+
+        async fn rename_container(
+            &self,
+            _handle: &ContainerHandle,
+            _new_name: &str,
+        ) -> Result<ContainerHandle> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn remove_container(&self, _handle: &ContainerHandle) -> Result<()> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn container_logs(
+            &self,
+            _handle: &ContainerHandle,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<String> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn inspect(&self, _handle: &ContainerHandle) -> Result<ContainerState> {
+            bail!("unexpected runtime call")
+        }
+
+        async fn read_container_file(
+            &self,
+            _handle: &ContainerHandle,
+            path: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(self
+                .files
+                .lock()
+                .expect("asset runtime lock")
+                .get(path)
+                .cloned())
+        }
+
+        async fn copy_host_path_to_container(
+            &self,
+            _handle: &ContainerHandle,
+            source_path: &std::path::Path,
+            destination_path: &str,
+        ) -> Result<()> {
+            let bytes = std::fs::read(source_path)
+                .with_context(|| format!("reading test asset {}", source_path.display()))?;
+            self.files
+                .lock()
+                .expect("asset runtime lock")
+                .insert(destination_path.to_string(), bytes);
+            self.copied_destinations
+                .lock()
+                .expect("asset runtime lock")
+                .push(destination_path.to_string());
+            Ok(())
+        }
+
+        async fn ensure_container_directories(
+            &self,
+            _handle: &ContainerHandle,
+            paths: &[String],
+        ) -> Result<()> {
+            self.ensured_directories
+                .lock()
+                .expect("asset runtime lock")
+                .push(paths.to_vec());
+            Ok(())
         }
 
         async fn ensure_container_directories_owned_like(
@@ -7256,6 +7520,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_driver_patch_returns_partial_warning_note() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-qbit".to_string(),
+            8080,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut drivers = DriverRegistry::new();
+        drivers.register(
+            RecordingDriver::new("downloader.torrent", calls.clone()).with_apply_result(
+                crate::drivers::ApplyResult::applied_with_message("partial apply: one item failed"),
+            ),
+        );
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([10u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let note = executor
+            .apply_driver_patch(
+                "test.connector".to_string(),
+                provider_id,
+                json!({
+                    "op": "set_preferences",
+                    "queueing_enabled": false
+                }),
+            )
+            .await?;
+
+        assert_eq!(note.as_deref(), Some("partial apply: one item failed"));
+        assert_eq!(calls.lock().expect("recording driver lock").len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_upgrade_rolls_back_on_failed_create() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -7492,6 +7840,116 @@ mod tests {
             format!("start:{base_name}"),
         ];
         assert_eq!(runtime.calls(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_runtime_asset_copies_extension_file_once_and_reuses_existing_bytes()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = AssetInstallRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let extensions_root = temp_dir.path().join("data").join("extensions");
+        let asset_dir = extensions_root
+            .join("unpacked")
+            .join("elixir.connectors.prowlarr_public_indexers")
+            .join("1.0.0")
+            .join("assets")
+            .join("config");
+        std::fs::create_dir_all(&asset_dir)?;
+        let asset_path = asset_dir.join("custom-indexer.yml");
+        std::fs::write(&asset_path, "id: customindexer\nname: Custom Indexer\n")?;
+
+        let runtime_paths = RuntimePaths::from_roots(
+            extensions_root.to_string_lossy().as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([21u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let instance_id = Uuid::new_v4();
+        let action = ExecutorAction::InstallRuntimeAsset {
+            target_instance_id: instance_id,
+            source_extension_id: "elixir.connectors.prowlarr_public_indexers".to_string(),
+            source_extension_version: "1.0.0".to_string(),
+            source_path: "assets/config/custom-indexer.yml".to_string(),
+            destination_path: "/config/Definitions/Custom/custom-indexer.yml".to_string(),
+        };
+
+        executor.apply(action).await?;
+        assert_eq!(
+            runtime.file_contents("/config/Definitions/Custom/custom-indexer.yml"),
+            Some(b"id: customindexer\nname: Custom Indexer\n".to_vec())
+        );
+        assert_eq!(
+            runtime.copied_destinations(),
+            vec!["/config/Definitions/Custom/custom-indexer.yml".to_string()]
+        );
+        assert_eq!(
+            runtime.ensured_directories(),
+            vec![vec!["/config/Definitions/Custom".to_string()]]
+        );
+
+        executor
+            .apply(ExecutorAction::InstallRuntimeAsset {
+                target_instance_id: instance_id,
+                source_extension_id: "elixir.connectors.prowlarr_public_indexers".to_string(),
+                source_extension_version: "1.0.0".to_string(),
+                source_path: "assets/config/custom-indexer.yml".to_string(),
+                destination_path: "/config/Definitions/Custom/custom-indexer.yml".to_string(),
+            })
+            .await?;
+        assert_eq!(
+            runtime.copied_destinations(),
+            vec!["/config/Definitions/Custom/custom-indexer.yml".to_string()]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_runtime_action_stops_then_starts_container() -> Result<()> {
+        let database = setup_db().await?;
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = AssetInstallRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([22u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        executor
+            .apply(ExecutorAction::RestartRuntime {
+                instance_id: Uuid::new_v4(),
+            })
+            .await?;
+
+        assert_eq!(runtime.stop_count(), 1);
+        assert_eq!(runtime.start_count(), 1);
         Ok(())
     }
 
@@ -7806,6 +8264,7 @@ PersistentKeepalive = 25
     fn resolve_volume_mount_makes_relative_placeholder_absolute() -> Result<()> {
         let paths = RuntimePaths {
             data_root: "data".to_string(),
+            extensions_root: "data/extensions".to_string(),
             downloads_root: "data/downloads".to_string(),
             media_root: "media".to_string(),
         };
@@ -7823,6 +8282,7 @@ PersistentKeepalive = 25
     fn prepare_runtime_volumes_rewrites_first_party_config_storage_to_named_volume() -> Result<()> {
         let paths = RuntimePaths {
             data_root: "/tmp/elixir/data".to_string(),
+            extensions_root: "/tmp/elixir/data/extensions".to_string(),
             downloads_root: "/tmp/elixir/downloads".to_string(),
             media_root: "/tmp/elixir/media".to_string(),
         };
@@ -7861,6 +8321,7 @@ PersistentKeepalive = 25
     -> Result<()> {
         let paths = RuntimePaths {
             data_root: "/tmp/elixir/data".to_string(),
+            extensions_root: "/tmp/elixir/data/extensions".to_string(),
             downloads_root: "/tmp/elixir/downloads".to_string(),
             media_root: "/tmp/elixir/media".to_string(),
         };

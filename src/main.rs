@@ -39,7 +39,7 @@ use crate::extensions::store::{
     ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
 };
 use crate::extensions::updater::start_proxy_runtime_update_loop;
-use crate::http::handlers::extensions::InstallRequest;
+use crate::http::handlers::extensions::{InstallPolicy, install_internal_extension_from_dir};
 use crate::http::router;
 use crate::library::LinkerService;
 use crate::library::start_periodic_scan;
@@ -54,7 +54,6 @@ use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
 use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
-use axum::{Json, extract::State};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -379,13 +378,10 @@ async fn bootstrap_core_extensions(state: &AppState) -> anyhow::Result<()> {
             );
             continue;
         };
-        let request = InstallRequest {
-            download_url: None,
-            package_path: Some(package.path.to_string_lossy().to_string()),
-        };
-        match crate::http::handlers::extensions::install_extension(
-            State(state.clone()),
-            Json(request),
+        match install_internal_extension_from_dir(
+            state,
+            &package.path,
+            bundled_install_policy(false),
         )
         .await
         {
@@ -611,6 +607,15 @@ fn build_preinstalled_core_bootstrap_actions(
     Ok(actions)
 }
 
+fn bundled_install_policy(allow_same_version_replace: bool) -> InstallPolicy {
+    InstallPolicy {
+        allow_internal_directory_install: true,
+        allow_internal_unsigned: true,
+        allow_downgrade: false,
+        allow_same_version_replace,
+    }
+}
+
 async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Result<()> {
     let store = ExtensionStore::new(&state.db_pool);
     let bundled_dir = PathBuf::from(&state.settings.extensions.bundled_dir);
@@ -635,13 +640,10 @@ async fn repair_installed_extension_manifests(state: &AppState) -> anyhow::Resul
                 &package.version,
                 package.package_hash.as_deref(),
             ) {
-                let request = InstallRequest {
-                    download_url: None,
-                    package_path: Some(package.path.to_string_lossy().to_string()),
-                };
-                match crate::http::handlers::extensions::install_extension(
-                    State(state.clone()),
-                    Json(request),
+                match install_internal_extension_from_dir(
+                    state,
+                    &package.path,
+                    bundled_install_policy(true),
                 )
                 .await
                 {
@@ -904,7 +906,7 @@ fn bundled_package_drifted(
 mod tests {
     use super::{
         BundledPackage, ExecutorAction, build_preinstalled_core_bootstrap_actions,
-        bundled_package_drifted, core_instance_needs_startup_bootstrap,
+        bundled_install_policy, bundled_package_drifted, core_instance_needs_startup_bootstrap,
         should_replace_bundled_package,
     };
     use crate::db::models::ExtensionInstance;
@@ -947,6 +949,24 @@ mod tests {
     #[test]
     fn bundled_package_drifted_does_not_force_downgrade_from_newer_installed_version() {
         assert!(!bundled_package_drifted("3.4.6", None, "1.0.2", None,));
+    }
+
+    #[test]
+    fn bundled_install_policy_allows_internal_same_version_resync() {
+        let policy = bundled_install_policy(true);
+        assert!(policy.allow_internal_directory_install);
+        assert!(policy.allow_internal_unsigned);
+        assert!(policy.allow_same_version_replace);
+        assert!(!policy.allow_downgrade);
+    }
+
+    #[test]
+    fn bundled_install_policy_keeps_bootstrap_replace_disabled() {
+        let policy = bundled_install_policy(false);
+        assert!(policy.allow_internal_directory_install);
+        assert!(policy.allow_internal_unsigned);
+        assert!(!policy.allow_same_version_replace);
+        assert!(!policy.allow_downgrade);
     }
 
     #[test]

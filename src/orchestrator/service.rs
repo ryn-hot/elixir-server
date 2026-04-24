@@ -154,6 +154,13 @@ impl OrchestratorService {
     }
 
     pub async fn apply_actions(&self, actions: Vec<ExecutorAction>) -> Result<()> {
+        self.apply_actions_with_notes(actions).await.map(|_| ())
+    }
+
+    pub(crate) async fn apply_actions_with_notes(
+        &self,
+        actions: Vec<ExecutorAction>,
+    ) -> Result<Vec<String>> {
         self.ensure_runtime_ready().await?;
         self.apply_actions_with_probe(actions, self.probe.as_ref(), self.runtime.as_ref())
             .await
@@ -1282,7 +1289,7 @@ impl OrchestratorService {
         actions: Vec<ExecutorAction>,
         probe: &dyn ProbeRunner,
         runtime: &dyn crate::runtime::RuntimeManager,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let executor = Executor::new(
             &self.pool,
             probe,
@@ -1294,10 +1301,13 @@ impl OrchestratorService {
         .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
         .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
         .with_default_downloader_profile(self.default_downloader_profile);
+        let mut notes = Vec::new();
         for action in actions {
-            executor.apply(action).await?;
+            if let Some(note) = executor.apply_with_note(action).await? {
+                notes.push(note);
+            }
         }
-        Ok(())
+        Ok(notes)
     }
 }
 
@@ -1606,7 +1616,6 @@ mod tests {
         ExtensionStore, NewBinding, NewExtension, NewExtensionInstance, NewOrchestratorRun,
         NewProvider, NewSecret,
     };
-    use crate::orchestrator::model::ProviderEndpoint;
     use crate::runtime::probe::{ProbeResult, ProbeRunner};
     use crate::secrets::SecretsManager;
 
@@ -1716,7 +1725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_actions_uses_probe_order() -> Result<()> {
+    async fn apply_actions_apply_binding_without_legacy_probe() -> Result<()> {
         let config = DatabaseConfig {
             url: "sqlite::memory:?cache=shared".to_string(),
             max_connections: 1,
@@ -1794,21 +1803,6 @@ mod tests {
             status: BindingStatus::Pending,
         };
 
-        let consumer_endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-consumer".to_string(),
-            7878,
-            Some("/health".to_string()),
-            Some("elixir_net".to_string()),
-        )?;
-        let provider_endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-provider".to_string(),
-            9696,
-            Some("/health".to_string()),
-            Some("elixir_net".to_string()),
-        )?;
-
         let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
         let service = OrchestratorService::new(
             database.pool.clone(),
@@ -1833,29 +1827,14 @@ mod tests {
 
         service
             .apply_actions_with_probe(
-                vec![ExecutorAction::ApplyBinding {
-                    binding,
-                    consumer_endpoint,
-                    provider_endpoint,
-                    reverse_probe: true,
-                }],
+                vec![ExecutorAction::ApplyBinding { binding }],
                 &probe,
                 &crate::runtime::docker::DockerRuntimeManager::new(None),
             )
             .await?;
 
         let calls = probe.calls().await;
-        assert_eq!(
-            calls,
-            vec![
-                "dns:svc-provider".to_string(),
-                "tcp:svc-provider:9696".to_string(),
-                "http:http://svc-provider:9696/health".to_string(),
-                "dns:svc-consumer".to_string(),
-                "tcp:svc-consumer:7878".to_string(),
-                "http:http://svc-consumer:7878/health".to_string(),
-            ]
-        );
+        assert!(calls.is_empty());
 
         Ok(())
     }

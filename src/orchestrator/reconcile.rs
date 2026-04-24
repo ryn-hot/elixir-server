@@ -17,7 +17,6 @@ use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
 use crate::metrics;
 use crate::orchestrator::executor::{Executor, ExecutorAction, deferred_dependency_message};
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
-use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
@@ -464,13 +463,9 @@ impl<'a> Reconciler<'a> {
                 };
                 let action_type = action.action_type().to_string();
                 let result = self
-                    .run_step(
-                        run_id,
-                        step_index,
-                        &action_type,
-                        action_json,
-                        || executor.apply(executor_action),
-                    )
+                    .run_step(run_id, step_index, &action_type, action_json, || {
+                        executor.apply(executor_action)
+                    })
                     .await;
                 if let Err(err) = result {
                     if action_type == "apply_driver_patch" {
@@ -965,35 +960,6 @@ impl<'a> Reconciler<'a> {
                 }
             }
 
-            let consumer_endpoint = match parse_endpoint(&consumer.endpoint_json) {
-                Ok(endpoint) => endpoint,
-                Err(err) => {
-                    let _ = self
-                        .store
-                        .update_binding_status(
-                            binding.binding_id,
-                            BindingStatus::Failed,
-                            Some(&format!("consumer endpoint invalid: {err}")),
-                        )
-                        .await;
-                    continue;
-                }
-            };
-            let provider_endpoint = match parse_endpoint(&target.endpoint_json) {
-                Ok(endpoint) => endpoint,
-                Err(err) => {
-                    let _ = self
-                        .store
-                        .update_binding_status(
-                            binding.binding_id,
-                            BindingStatus::Failed,
-                            Some(&format!("provider endpoint invalid: {err}")),
-                        )
-                        .await;
-                    continue;
-                }
-            };
-
             let action = ExecutorAction::ApplyBinding {
                 binding: NewBinding {
                     binding_id: binding.binding_id,
@@ -1004,9 +970,6 @@ impl<'a> Reconciler<'a> {
                     binding_params_json: binding.binding_params_json.clone(),
                     status: binding.status,
                 },
-                consumer_endpoint,
-                provider_endpoint,
-                reverse_probe: false,
             };
 
             let result = self
@@ -1093,16 +1056,6 @@ impl<'a> Reconciler<'a> {
     }
 }
 
-fn parse_endpoint(value: &Option<serde_json::Value>) -> Result<ProviderEndpoint> {
-    let value = value
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("endpoint missing"))?;
-    let endpoint: ProviderEndpoint =
-        serde_json::from_value(value).context("parsing provider endpoint")?;
-    endpoint.validate()?;
-    Ok(endpoint)
-}
-
 fn bounded_repair_subgraph(plan: Plan) -> Plan {
     let mut retained_actions = Vec::new();
     let mut retained_stages = Vec::new();
@@ -1175,6 +1128,7 @@ mod tests {
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewProvider,
     };
+    use crate::orchestrator::model::ProviderEndpoint;
     use crate::orchestrator::planner::{Plan, PlanAction};
     use crate::runtime::RuntimePaths;
     use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
@@ -2620,9 +2574,17 @@ mod tests {
         );
 
         let providers = store.list_providers(None).await?;
-        assert!(providers.iter().any(|provider| provider.provider_id == provider_id));
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.provider_id == provider_id)
+        );
         let instances = store.list_instances(None).await?;
-        assert!(instances.iter().any(|instance| instance.instance_id == instance_id));
+        assert!(
+            instances
+                .iter()
+                .any(|instance| instance.instance_id == instance_id)
+        );
 
         Ok(())
     }

@@ -115,6 +115,13 @@ impl ApplyResult {
         }
     }
 
+    pub fn applied_with_message(message: impl Into<String>) -> Self {
+        Self {
+            status: ApplyStatus::Applied,
+            message: Some(message.into()),
+        }
+    }
+
     pub fn deferred(message: impl Into<String>) -> Self {
         Self {
             status: ApplyStatus::Deferred,

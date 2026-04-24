@@ -916,7 +916,9 @@ pub fn normalize_custom_format_specifications(
         .collect()
 }
 
-fn normalize_custom_format_specification(mut specification: serde_json::Value) -> Result<serde_json::Value> {
+fn normalize_custom_format_specification(
+    mut specification: serde_json::Value,
+) -> Result<serde_json::Value> {
     let Some(obj) = specification.as_object_mut() else {
         bail!("custom_format.specifications entries must be objects");
     };

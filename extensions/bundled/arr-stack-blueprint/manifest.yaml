@@ -1,11 +1,11 @@
 id: elixir.blueprints.arr_stack
-version: 2.0.2
+version: 2.0.4
 kind: blueprint
 name: "Arr Stack"
 description: "Sonarr + Radarr + Prowlarr + Bazarr + FlareSolverr + Byparr + qBittorrent + NZBGet stack with explicit phased execution."
 publisher:
   name: "Elixir"
-  key_id: "ed25519:neCZ2Jpv0WIut2K/LWjlvMGBiehAMQp4wz17voV+Rbg="
+  key_id: "ed25519:ZXcPdxnr1ziJpDC3TwCNXWkt1vG7njkyQ/3l52mEhQI="
 trust: community
 permissions: []
 execution:
@@ -309,6 +309,12 @@ execution:
       barrier: true
       steps:
         - type: apply_connector
+          connector_id: elixir.connectors.prowlarr_antibot_proxies
+          target_instance: prowlarr
+          target_capability: indexer.registry
+          target_slot: default
+          ownership_domains: [prowlarr.proxies.antibot]
+        - type: apply_connector
           connector_id: elixir.connectors.prowlarr_public_indexers
           target_instance: prowlarr
           target_capability: indexer.registry
@@ -326,12 +332,6 @@ execution:
           target_capability: indexer.registry
           target_slot: default
           ownership_domains: [prowlarr.apps.radarr]
-        - type: apply_connector
-          connector_id: elixir.connectors.prowlarr_antibot_proxies
-          target_instance: prowlarr
-          target_capability: indexer.registry
-          target_slot: default
-          ownership_domains: [prowlarr.proxies.antibot]
         - type: apply_connector
           connector_id: elixir.connectors.sonarr_defaults
           target_instance: sonarr

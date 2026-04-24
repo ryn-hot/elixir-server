@@ -8527,7 +8527,12 @@ fn summarize_run_stages(
     let current = stages
         .iter()
         .find(|stage| matches!(stage.status.as_str(), "failed" | "running" | "pending"))
-        .or_else(|| stages.iter().rev().find(|stage| stage.status == "completed"));
+        .or_else(|| {
+            stages
+                .iter()
+                .rev()
+                .find(|stage| stage.status == "completed")
+        });
 
     let blocked_stage = if matches!(
         run.status,
@@ -8572,7 +8577,9 @@ fn stage_progress(stage: &PlanStage, steps: &[OperationStep]) -> RunStageProgres
             index >= stage.action_start_index && index < stage.action_end_index
         })
         .collect();
-    let step_count = stage.action_end_index.saturating_sub(stage.action_start_index);
+    let step_count = stage
+        .action_end_index
+        .saturating_sub(stage.action_start_index);
     let completed_step_count = stage_steps
         .iter()
         .filter(|step| step.status == OperationStepStatus::Completed)

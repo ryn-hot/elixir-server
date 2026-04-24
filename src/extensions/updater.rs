@@ -20,7 +20,6 @@ use crate::http::handlers::extensions::{
     InstallPolicy, install_internal_extension_from_dir, list_prowlarr_indexer_proxy_names,
     resolve_control_provider_transport_base_url,
 };
-use crate::orchestrator::executor::ExecutorAction;
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::runtime::docker::{DockerImageMetadata, DockerRuntimeManager};
@@ -504,19 +503,6 @@ async fn rollback_proxy_runtime_update(
     }
     install_result?;
 
-    if !instance_id.is_nil() {
-        if let Err(err) = state
-            .orchestrator
-            .apply_actions(vec![ExecutorAction::RollbackRuntime { instance_id }])
-            .await
-        {
-            warn!(
-                extension_id = definition.extension_id,
-                "proxy runtime rollback action failed; reconcile will attempt to restore previous manifest: {err}"
-            );
-        }
-    }
-
     let reconcile_config = ReconcileConfig::from_settings(&state.settings);
     let _ = state.orchestrator.reconcile_once(&reconcile_config).await;
     if instance_id.is_nil() {
@@ -546,14 +532,20 @@ async fn wait_for_proxy_runtime_health(
 
     loop {
         let store = ExtensionStore::new(&state.db_pool);
-        let Some(instance) = store.get_instance(instance_id).await? else {
+        if store.get_instance(instance_id).await?.is_none() {
             bail!(
                 "runtime instance '{}' disappeared during auto-update",
                 instance_id
             );
-        };
+        }
         let target_version_text = target_version.to_string();
-        if instance.runtime_version.as_deref() == Some(target_version_text.as_str()) {
+        let Some(extension) = store.get_extension(definition.extension_id).await? else {
+            bail!(
+                "extension '{}' disappeared during auto-update",
+                definition.extension_id
+            );
+        };
+        if extension.version == target_version_text {
             let providers = store.list_providers(Some(instance_id)).await?;
             if let Some(provider) = providers
                 .iter()

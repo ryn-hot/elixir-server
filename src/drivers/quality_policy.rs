@@ -15,8 +15,20 @@ pub const ELIXIR_MODERN_CODECS_4K_PROFILE: &str = "Elixir Modern Codecs 4K";
 pub const ELIXIR_STORAGE_SAVER_4K_PROFILE: &str = "Elixir Storage Saver 4K";
 pub const ELIXIR_STOCK_TRASH_4K_PROFILE: &str = "Elixir TRaSH 4K";
 
-const SONARR_WEB_1080P_ALLOWED: &[&str] = &["WEBDL-1080p", "WEBRip-1080p"];
-const SONARR_WEB_2160P_ALLOWED: &[&str] = &["WEBDL-2160p", "WEBRip-2160p"];
+// Sonarr should prefer modern WEB releases, but still accept viable legacy TV
+// sources so older catalog content does not become undiscoverable.
+const SONARR_HD_ALLOWED: &[&str] = &[
+    "WEBDL-1080p",
+    "WEBRip-1080p",
+    "Bluray-1080p",
+    "WEBDL-720p",
+    "WEBRip-720p",
+    "Bluray-720p",
+    "HDTV-1080p",
+    "HDTV-720p",
+    "DVD",
+];
+const SONARR_UHD_ALLOWED: &[&str] = &["WEBDL-2160p", "WEBRip-2160p", "Bluray-2160p"];
 
 const SONARR_WEB_1080P_BASE: &[&str] = &[
     "br-disk",
@@ -88,7 +100,17 @@ const SONARR_WEB_2160P_BASE: &[&str] = &[
     "web-scene",
 ];
 
-const RADARR_HD_ALLOWED: &[&str] = &["Bluray-1080p", "WEBDL-1080p", "WEBRip-1080p"];
+// Radarr should prefer modern HD/UHD releases, but still accept viable
+// fallback movie sources so older catalog titles do not become undiscoverable.
+const RADARR_HD_ALLOWED: &[&str] = &[
+    "Bluray-1080p",
+    "WEBDL-1080p",
+    "WEBRip-1080p",
+    "Bluray-720p",
+    "WEBDL-720p",
+    "WEBRip-720p",
+    "DVD",
+];
 const RADARR_UHD_ALLOWED: &[&str] = &["Bluray-2160p", "WEBDL-2160p", "WEBRip-2160p"];
 
 const RADARR_HD_BASE: &[&str] = &[
@@ -276,14 +298,14 @@ fn build_sonarr_quality_profile(
 ) -> QualityProfileSpec {
     let (allowed, cutoff) = match variant {
         SonarrProfileVariant::Web1080p => (
-            SONARR_WEB_1080P_ALLOWED
+            SONARR_HD_ALLOWED
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
             Some("WEB 1080p".to_string()),
         ),
         SonarrProfileVariant::Web2160p => (
-            SONARR_WEB_2160P_ALLOWED
+            SONARR_UHD_ALLOWED
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
@@ -625,9 +647,20 @@ mod tests {
             profile_name: ELIXIR_MODERN_CODECS_PROFILE.to_string(),
         })
         .expect("plan");
+        assert_eq!(plan.quality_profile.cutoff.as_deref(), Some("WEB 1080p"));
         assert_eq!(
-            plan.quality_profile.cutoff.as_deref(),
-            Some("WEB 1080p")
+            plan.quality_profile.allowed,
+            vec![
+                "WEBDL-1080p".to_string(),
+                "WEBRip-1080p".to_string(),
+                "Bluray-1080p".to_string(),
+                "WEBDL-720p".to_string(),
+                "WEBRip-720p".to_string(),
+                "Bluray-720p".to_string(),
+                "HDTV-1080p".to_string(),
+                "HDTV-720p".to_string(),
+                "DVD".to_string(),
+            ]
         );
 
         let x265 = plan
@@ -648,6 +681,25 @@ mod tests {
         assert_eq!(x265.score, Some(0));
         assert_eq!(x265_no_hdr.score, Some(0));
         assert_eq!(av1.score, Some(0));
+    }
+
+    #[test]
+    fn sonarr_modern_codecs_4k_accepts_bluray_fallback_without_lowering_cutoff() {
+        let plan = build_sonarr_quality_policy_plan(&QualityPolicyPresetSpec {
+            preset: QualityPolicyPresetId::ModernCodecs,
+            profile_name: ELIXIR_MODERN_CODECS_4K_PROFILE.to_string(),
+        })
+        .expect("plan");
+
+        assert_eq!(plan.quality_profile.cutoff.as_deref(), Some("WEB 2160p"));
+        assert_eq!(
+            plan.quality_profile.allowed,
+            vec![
+                "WEBDL-2160p".to_string(),
+                "WEBRip-2160p".to_string(),
+                "Bluray-2160p".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -710,6 +762,19 @@ mod tests {
             profile_name: ELIXIR_MODERN_CODECS_PROFILE.to_string(),
         })
         .expect("plan");
+        assert_eq!(plan.quality_profile.cutoff.as_deref(), Some("Bluray-1080p"));
+        assert_eq!(
+            plan.quality_profile.allowed,
+            vec![
+                "Bluray-1080p".to_string(),
+                "WEBDL-1080p".to_string(),
+                "WEBRip-1080p".to_string(),
+                "Bluray-720p".to_string(),
+                "WEBDL-720p".to_string(),
+                "WEBRip-720p".to_string(),
+                "DVD".to_string(),
+            ]
+        );
 
         let x265 = plan
             .custom_formats

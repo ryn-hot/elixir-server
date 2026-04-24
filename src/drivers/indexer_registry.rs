@@ -12,7 +12,7 @@ use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Default)]
 pub struct IndexerRegistryDriver;
@@ -132,7 +132,11 @@ impl CapabilityDriver for IndexerRegistryDriver {
 
         match patch {
             IndexerRegistryPatch::RegisterIndexers { indexers } => {
-                client.upsert_indexers(&indexers).await?;
+                let report = client.upsert_indexers(&indexers).await?;
+                return Ok(match report.warning_message("Prowlarr indexers") {
+                    Some(message) => ApplyResult::applied_with_message(message),
+                    None => ApplyResult::applied(),
+                });
             }
             IndexerRegistryPatch::RegisterIndexerProxies { proxies } => {
                 client.upsert_indexer_proxies(&proxies).await?;
@@ -188,6 +192,26 @@ struct ProwlarrClient {
     api_version: &'static str,
 }
 
+#[derive(Debug, Default)]
+struct BatchApplyReport {
+    realized: usize,
+    failures: Vec<String>,
+}
+
+impl BatchApplyReport {
+    fn warning_message(&self, subject: &str) -> Option<String> {
+        if self.failures.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{subject} partially applied: {} realized, {} failed. Failures: {}",
+            self.realized,
+            self.failures.len(),
+            self.failures.join("; ")
+        ))
+    }
+}
+
 impl ProwlarrClient {
     async fn from_config(config: ProwlarrDriverConfig, endpoint_url: String) -> Result<Self> {
         let api_key = config
@@ -201,8 +225,12 @@ impl ProwlarrClient {
         );
         headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        // Prowlarr validates indexers synchronously on create/update, and some
+        // public Cardigann trackers can legitimately take a long time on first
+        // contact. A short client timeout aborts Elixir's connector run even
+        // though Prowlarr continues creating the indexer.
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(180))
             .default_headers(headers)
             .build()
             .context("building prowlarr http client")?;
@@ -297,72 +325,90 @@ impl ProwlarrClient {
         self.request_json_value(Method::PUT, path, Some(body)).await
     }
 
-    async fn upsert_indexers(&self, indexers: &[IndexerSpec]) -> Result<()> {
+    async fn upsert_indexers(&self, indexers: &[IndexerSpec]) -> Result<BatchApplyReport> {
         if indexers.is_empty() {
-            return Ok(());
+            return Ok(BatchApplyReport::default());
         }
         let schema = self.get_json::<Vec<Value>>("indexer/schema").await?;
         let existing = self.get_json::<Vec<Value>>("indexer").await?;
         let default_app_profile_id = self.resolve_default_app_profile_id().await?;
-        let mut unsupported: Vec<(String, String)> = Vec::new();
-        let mut realized = 0usize;
+        let mut report = BatchApplyReport::default();
 
         for indexer in indexers {
-            let existing_item = find_by_name(&existing, &indexer.name);
-            let schema_item = find_schema_optional(&schema, &indexer.implementation);
-            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
-            else {
-                unsupported.push((indexer.name.clone(), indexer.implementation.clone()));
-                continue;
-            };
-            let tags = self.ensure_tags(&indexer.tags).await?;
-            let mut target = match existing_item.clone() {
-                Some(existing) => existing,
-                None => schema_or_existing,
-            };
-            let enabled = indexer.enabled.unwrap_or(true);
-            set_enabled(&mut target, enabled)?;
-            set_string(&mut target, "name", indexer.name.clone())?;
-            set_array_i64(&mut target, "tags", &tags)?;
-            ensure_schema_fields(&mut target, &indexer.implementation)?;
-            apply_indexer_defaults(&mut target, default_app_profile_id)?;
+            let attempt: Result<()> = async {
+                let existing_item = find_by_name(&existing, &indexer.name);
+                let schema_item = find_schema_optional(&schema, &indexer.implementation);
+                let Some(schema_or_existing) =
+                    schema_item.clone().or_else(|| existing_item.clone())
+                else {
+                    bail!(
+                        "schema does not support implementation '{}'",
+                        indexer.implementation
+                    );
+                };
+                let tags = self.ensure_tags(&indexer.tags).await?;
+                let mut target = match existing_item.clone() {
+                    Some(existing) => existing,
+                    None => schema_or_existing,
+                };
+                let enabled = indexer.enabled.unwrap_or(true);
+                set_enabled(&mut target, enabled)?;
+                set_string(&mut target, "name", indexer.name.clone())?;
+                set_array_i64(&mut target, "tags", &tags)?;
+                ensure_schema_fields(&mut target, &indexer.implementation)?;
+                apply_indexer_defaults(&mut target, default_app_profile_id)?;
 
-            let fields = target
-                .get_mut("fields")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
-            apply_indexer_fields(fields, indexer)?;
+                let fields = target
+                    .get_mut("fields")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+                apply_indexer_fields(fields, indexer)?;
 
-            if let Some(existing_item) = existing_item {
-                if target == existing_item {
-                    realized += 1;
-                    continue;
+                if let Some(existing_item) = existing_item {
+                    if target == existing_item {
+                        return Ok(());
+                    }
+                }
+
+                if let Some(id) = target.get("id").and_then(Value::as_i64) {
+                    let path = format!("indexer/{id}");
+                    self.put_json(&path, &target).await?;
+                } else {
+                    remove_readonly_fields(&mut target);
+                    self.post_json("indexer", &target).await?;
+                }
+                Ok(())
+            }
+            .await;
+
+            match attempt {
+                Ok(()) => {
+                    report.realized += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        indexer_name = %indexer.name,
+                        implementation = %indexer.implementation,
+                        error = %err,
+                        "prowlarr indexer apply failed; continuing batch"
+                    );
+                    report.failures.push(format!(
+                        "{} ({}): {}",
+                        indexer.name, indexer.implementation, err
+                    ));
                 }
             }
-
-            if let Some(id) = target.get("id").and_then(Value::as_i64) {
-                let path = format!("indexer/{id}");
-                self.put_json(&path, &target).await?;
-            } else {
-                remove_readonly_fields(&mut target);
-                self.post_json("indexer", &target).await?;
-            }
-            realized += 1;
         }
-        if !unsupported.is_empty() {
+        if report.realized == 0 {
+            if report.failures.is_empty() {
+                bail!("prowlarr did not apply any requested indexers");
+            }
             bail!(
-                "prowlarr schema does not support requested indexers: {}",
-                unsupported
-                    .iter()
-                    .map(|(name, implementation)| format!("{name} ({implementation})"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "prowlarr could not apply any requested indexers: {}",
+                report.failures.join("; ")
             );
         }
-        if realized == 0 {
-            bail!("prowlarr did not apply any requested indexers");
-        }
-        Ok(())
+        Ok(report)
     }
 
     async fn upsert_indexer_proxies(&self, proxies: &[IndexerProxySpec]) -> Result<()> {
@@ -587,38 +633,59 @@ impl ProwlarrClient {
         let mut drift = Vec::new();
 
         for indexer in indexers {
-            let existing_item = find_by_name(&existing, &indexer.name);
-            let schema_item = find_schema_optional(&schema, &indexer.implementation);
-            let Some(schema_or_existing) = schema_item.clone().or_else(|| existing_item.clone())
-            else {
-                bail!(
-                    "prowlarr schema does not support requested indexer '{}' ({})",
-                    indexer.name,
-                    indexer.implementation
-                );
-            };
-            let (tags, missing_tags) = self.resolve_existing_tag_ids(&indexer.tags).await?;
-            drift.extend(missing_tags.into_iter().map(|tag| format!("tag:{tag}")));
+            let evaluation: Result<Vec<String>> = async {
+                let existing_item = find_by_name(&existing, &indexer.name);
+                let schema_item = find_schema_optional(&schema, &indexer.implementation);
+                let Some(schema_or_existing) =
+                    schema_item.clone().or_else(|| existing_item.clone())
+                else {
+                    bail!(
+                        "schema does not support requested indexer '{}' ({})",
+                        indexer.name,
+                        indexer.implementation
+                    );
+                };
+                let (tags, missing_tags) = self.resolve_existing_tag_ids(&indexer.tags).await?;
+                let mut indexer_drift = missing_tags
+                    .into_iter()
+                    .map(|tag| format!("tag:{tag}"))
+                    .collect::<Vec<_>>();
 
-            let mut target = match existing_item.clone() {
-                Some(existing) => existing,
-                None => schema_or_existing,
-            };
-            let enabled = indexer.enabled.unwrap_or(true);
-            set_enabled(&mut target, enabled)?;
-            set_string(&mut target, "name", indexer.name.clone())?;
-            set_array_i64(&mut target, "tags", &tags)?;
-            ensure_schema_fields(&mut target, &indexer.implementation)?;
-            apply_indexer_defaults(&mut target, default_app_profile_id)?;
+                let mut target = match existing_item.clone() {
+                    Some(existing) => existing,
+                    None => schema_or_existing,
+                };
+                let enabled = indexer.enabled.unwrap_or(true);
+                set_enabled(&mut target, enabled)?;
+                set_string(&mut target, "name", indexer.name.clone())?;
+                set_array_i64(&mut target, "tags", &tags)?;
+                ensure_schema_fields(&mut target, &indexer.implementation)?;
+                apply_indexer_defaults(&mut target, default_app_profile_id)?;
 
-            let fields = target
-                .get_mut("fields")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
-            apply_indexer_fields(fields, indexer)?;
+                let fields = target
+                    .get_mut("fields")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow::anyhow!("indexer fields missing"))?;
+                apply_indexer_fields(fields, indexer)?;
 
-            if existing_item.as_ref() != Some(&target) {
-                drift.push(indexer.name.clone());
+                if existing_item.as_ref() != Some(&target) {
+                    indexer_drift.push(indexer.name.clone());
+                }
+                Ok(indexer_drift)
+            }
+            .await;
+
+            match evaluation {
+                Ok(indexer_drift) => drift.extend(indexer_drift),
+                Err(err) => {
+                    debug!(
+                        indexer_name = %indexer.name,
+                        implementation = %indexer.implementation,
+                        error = %err,
+                        "prowlarr indexer drift evaluation could not fully evaluate requested indexer; marking as drifted"
+                    );
+                    drift.push(indexer.name.clone());
+                }
             }
         }
         Ok(dedup_strings(drift))
@@ -958,6 +1025,8 @@ fn find_schema_optional(items: &[Value], implementation: &str) -> Option<Value> 
             .into_iter()
             .chain(value.get("implementationName").and_then(Value::as_str))
             .chain(value.get("name").and_then(Value::as_str))
+            .chain(value.get("definitionName").and_then(Value::as_str))
+            .chain(value.get("definitionFile").and_then(Value::as_str))
             .any(|candidate| normalize_name(candidate) == needle);
         if matches { Some(value.clone()) } else { None }
     });
@@ -976,6 +1045,8 @@ fn find_schema_optional(items: &[Value], implementation: &str) -> Option<Value> 
                 .into_iter()
                 .chain(value.get("implementationName").and_then(Value::as_str))
                 .chain(value.get("name").and_then(Value::as_str))
+                .chain(value.get("definitionName").and_then(Value::as_str))
+                .chain(value.get("definitionFile").and_then(Value::as_str))
                 .map(normalize_name)
                 .any(|candidate| candidate.starts_with(&needle) || needle.starts_with(&candidate));
             if matches { Some(value.clone()) } else { None }
@@ -1307,6 +1378,63 @@ mod tests {
     }
 
     #[test]
+    fn find_schema_optional_matches_cardigann_definition_by_name() {
+        let schema = vec![
+            json!({
+                "name": "TheRARBG",
+                "implementation": "Cardigann",
+                "definitionFile": "therarbg"
+            }),
+            json!({
+                "name": "1337x",
+                "implementation": "Cardigann",
+                "definitionFile": "1337x"
+            }),
+        ];
+
+        let found = find_schema_optional(&schema, "1337x");
+        assert!(found.is_some(), "expected 1337x schema to be found by name");
+        assert_eq!(
+            found
+                .as_ref()
+                .and_then(|value| value.get("definitionFile"))
+                .and_then(Value::as_str),
+            Some("1337x")
+        );
+    }
+
+    #[test]
+    fn find_schema_optional_matches_cardigann_definition_by_definition_name() {
+        let schema = vec![
+            json!({
+                "name": "Custom Indexer",
+                "implementation": "Cardigann",
+                "definitionName": "customindexer",
+                "definitionFile": "customindexer"
+            }),
+            json!({
+                "name": "YTS",
+                "implementation": "Cardigann",
+                "definitionName": "yts",
+                "definitionFile": "yts"
+            }),
+        ];
+
+        let found = find_schema_optional(&schema, "customindexer");
+        assert!(
+            found.is_some(),
+            "expected customindexer schema to be found by definition name"
+        );
+        assert_eq!(
+            found
+                .as_ref()
+                .and_then(|value| value.get("definitionName"))
+                .and_then(Value::as_str),
+            Some("customindexer")
+        );
+    }
+
+    #[test]
     fn find_schema_returns_error_when_implementation_missing() {
         let schema = vec![json!({
             "implementation": "Newznab"
@@ -1444,7 +1572,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("prowlarr schema does not support requested indexers"),
+                .contains("prowlarr could not apply any requested indexers"),
             "unexpected error: {err:#}"
         );
     }
@@ -1539,6 +1667,240 @@ mod tests {
             .clone()
             .expect("indexer create payload");
         assert_eq!(body.get("appProfileId").and_then(Value::as_i64), Some(1));
+    }
+
+    #[tokio::test]
+    async fn upsert_indexers_continues_after_failure_and_reports_partial_warning() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/indexer/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "Torznab",
+                        "implementation": "Torznab",
+                        "fields": [
+                            { "name": "baseUrl", "value": "" },
+                            { "name": "apiPath", "value": "/api" }
+                        ]
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v1/appProfile",
+                get(|| async { Json(json!([{ "name": "Standard", "id": 1 }])) }),
+            )
+            .route("/api/v1/tag", get(|| async { Json(json!([])) }))
+            .route("/api/v1/indexer", get(|| async { Json(json!([])) }))
+            .route(
+                "/api/v1/indexer",
+                post({
+                    let captured = Arc::clone(&captured);
+                    move |Json(body): Json<Value>| {
+                        let captured = Arc::clone(&captured);
+                        async move {
+                            let name = body
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            captured.lock().expect("capture payload").push(name.clone());
+                            if name == "Broken" {
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!([{
+                                        "errorMessage": "Unable to connect to indexer",
+                                        "severity": "error"
+                                    }])),
+                                )
+                            } else {
+                                (StatusCode::CREATED, Json(json!({ "id": 1 })))
+                            }
+                        }
+                    }
+                }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        let report = client
+            .upsert_indexers(&[
+                IndexerSpec {
+                    name: "AnimeTosho".to_string(),
+                    implementation: "Torznab".to_string(),
+                    url: "https://feed.animetosho.org".to_string(),
+                    auth: crate::drivers::patches::IndexerAuthSpec {
+                        requires_account: Some(false),
+                        required_fields: Vec::new(),
+                    },
+                    api_key: None,
+                    categories: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                },
+                IndexerSpec {
+                    name: "Broken".to_string(),
+                    implementation: "Torznab".to_string(),
+                    url: "https://broken.example".to_string(),
+                    auth: crate::drivers::patches::IndexerAuthSpec {
+                        requires_account: Some(false),
+                        required_fields: Vec::new(),
+                    },
+                    api_key: None,
+                    categories: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                },
+                IndexerSpec {
+                    name: "SubsPlease".to_string(),
+                    implementation: "Torznab".to_string(),
+                    url: "https://subsplease.org".to_string(),
+                    auth: crate::drivers::patches::IndexerAuthSpec {
+                        requires_account: Some(false),
+                        required_fields: Vec::new(),
+                    },
+                    api_key: None,
+                    categories: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                },
+            ])
+            .await
+            .expect("partial indexer failure should not abort batch");
+
+        let _ = shutdown_tx.send(());
+
+        assert_eq!(report.realized, 2);
+        assert_eq!(
+            captured.lock().expect("captured payload").as_slice(),
+            ["AnimeTosho", "Broken", "SubsPlease"]
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].contains("Broken"),
+            "unexpected failures: {:?}",
+            report.failures
+        );
+        assert!(
+            report
+                .warning_message("Prowlarr indexers")
+                .expect("partial warning")
+                .contains("partially applied")
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_indexers_marks_unsupported_entries_as_drift_instead_of_failing() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        let app = Router::new()
+            .route(
+                "/api/v1/indexer/schema",
+                get(|| async {
+                    Json(json!([{
+                        "name": "Torznab",
+                        "implementation": "Torznab",
+                        "fields": [
+                            { "name": "baseUrl", "value": "" },
+                            { "name": "apiPath", "value": "/api" }
+                        ]
+                    }]))
+                }),
+            )
+            .route("/api/v1/indexer", get(|| async { Json(json!([])) }))
+            .route("/api/v1/tag", get(|| async { Json(json!([])) }))
+            .route(
+                "/api/v1/appProfile",
+                get(|| async { Json(json!([{ "name": "Standard", "id": 1 }])) }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = ProwlarrClient::from_config(
+            ProwlarrDriverConfig {
+                api_key: Some("test".to_string()),
+                base_url: None,
+                api_version: None,
+            },
+            format!("http://127.0.0.1:{}/", addr.port()),
+        )
+        .await
+        .expect("build client");
+
+        let drift = client
+            .evaluate_indexers(&[
+                IndexerSpec {
+                    name: "AnimeTosho".to_string(),
+                    implementation: "Torznab".to_string(),
+                    url: "https://feed.animetosho.org".to_string(),
+                    auth: crate::drivers::patches::IndexerAuthSpec {
+                        requires_account: Some(false),
+                        required_fields: Vec::new(),
+                    },
+                    api_key: None,
+                    categories: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                },
+                IndexerSpec {
+                    name: "Unsupported".to_string(),
+                    implementation: "Nope".to_string(),
+                    url: "https://unsupported.example".to_string(),
+                    auth: crate::drivers::patches::IndexerAuthSpec {
+                        requires_account: Some(false),
+                        required_fields: Vec::new(),
+                    },
+                    api_key: None,
+                    categories: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: Some(true),
+                    settings: HashMap::new(),
+                },
+            ])
+            .await
+            .expect("unsupported indexer should be marked drifted, not abort evaluation");
+
+        let _ = shutdown_tx.send(());
+
+        assert!(drift.contains(&"AnimeTosho".to_string()));
+        assert!(drift.contains(&"Unsupported".to_string()));
     }
 
     #[tokio::test]

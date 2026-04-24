@@ -13,6 +13,7 @@ pub mod probe;
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub data_root: String,
+    pub extensions_root: String,
     pub downloads_root: String,
     pub media_root: String,
 }
@@ -22,6 +23,7 @@ impl RuntimePaths {
         let storage_path = absolutize_path(storage_root);
         let data_root_path = storage_path.parent().unwrap_or(&storage_path).to_path_buf();
         let data_root = data_root_path.to_string_lossy().to_string();
+        let extensions_root = storage_path.to_string_lossy().to_string();
         let downloads_root = data_root_path
             .join("downloads")
             .to_string_lossy()
@@ -29,6 +31,7 @@ impl RuntimePaths {
         let media_root = absolutize_path(media_root).to_string_lossy().to_string();
         Self {
             data_root,
+            extensions_root,
             downloads_root,
             media_root,
         }

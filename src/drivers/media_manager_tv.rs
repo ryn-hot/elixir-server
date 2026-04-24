@@ -1917,11 +1917,12 @@ fn update_quality_items(
         let mut group_has_allowed_child = None;
         if let Some(children) = item.get_mut("items").and_then(Value::as_array_mut) {
             nested_cutoff = update_quality_items(children, allowed, cutoff)?;
-            group_has_allowed_child = Some(
-                children
-                    .iter()
-                    .any(|child| child.get("allowed").and_then(Value::as_bool).unwrap_or(false)),
-            );
+            group_has_allowed_child = Some(children.iter().any(|child| {
+                child
+                    .get("allowed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            }));
         }
 
         if let Some(quality) = item.get("quality") {
@@ -1941,10 +1942,7 @@ fn update_quality_items(
             }
         }
 
-        let group_name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let group_name = item.get("name").and_then(Value::as_str).map(str::to_string);
         let group_id = item.get("id").and_then(Value::as_i64);
         if let Some(group_name) = group_name {
             if let Some(has_allowed_child) = group_has_allowed_child {
@@ -2122,7 +2120,11 @@ fn apply_format_items(profile: &mut Value, scores: &HashMap<i64, i32>) -> Result
         for item in items.iter_mut() {
             let current_id = item
                 .get("format")
-                .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+                .and_then(|format| {
+                    format
+                        .as_i64()
+                        .or_else(|| format.get("id").and_then(Value::as_i64))
+                })
                 .or_else(|| item.get("formatId").and_then(Value::as_i64));
             if current_id == Some(*format_id) {
                 let current_score = item.get("score").and_then(Value::as_i64);
@@ -2182,7 +2184,11 @@ fn extract_named_format_scores(profile: &Value) -> HashMap<String, i32> {
         .filter_map(|item| {
             let id = item
                 .get("format")
-                .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+                .and_then(|format| {
+                    format
+                        .as_i64()
+                        .or_else(|| format.get("id").and_then(Value::as_i64))
+                })
                 .or_else(|| item.get("formatId").and_then(Value::as_i64))?;
             let score = item.get("score").and_then(Value::as_i64)?;
             Some((id.to_string(), score as i32))
@@ -2203,11 +2209,19 @@ fn set_exact_format_items(profile: &mut Value, scores: &HashMap<String, i32>) ->
     items.sort_by(|left, right| {
         let left_id = left
             .get("format")
-            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .and_then(|format| {
+                format
+                    .as_i64()
+                    .or_else(|| format.get("id").and_then(Value::as_i64))
+            })
             .unwrap_or_default();
         let right_id = right
             .get("format")
-            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .and_then(|format| {
+                format
+                    .as_i64()
+                    .or_else(|| format.get("id").and_then(Value::as_i64))
+            })
             .unwrap_or_default();
         left_id.cmp(&right_id)
     });
@@ -2351,15 +2365,10 @@ mod tests {
             specifications: Vec::new(),
         }];
 
-        let present = build_named_score_map_if_present(
-            &formats,
-            &[json!({ "id": 7, "name": "AV1" })],
-        )
-        .expect("score map should build");
-        assert_eq!(
-            present,
-            Some(HashMap::from([(String::from("7"), 1500)]))
-        );
+        let present =
+            build_named_score_map_if_present(&formats, &[json!({ "id": 7, "name": "AV1" })])
+                .expect("score map should build");
+        assert_eq!(present, Some(HashMap::from([(String::from("7"), 1500)])));
 
         let missing = build_named_score_map_if_present(&formats, &[])
             .expect("missing formats should not error");
@@ -2402,8 +2411,14 @@ mod tests {
 
         assert_eq!(cutoff_id, Some(1002));
         assert_eq!(profile["items"][0]["allowed"], Value::Bool(true));
-        assert_eq!(profile["items"][0]["items"][0]["allowed"], Value::Bool(true));
-        assert_eq!(profile["items"][0]["items"][1]["allowed"], Value::Bool(true));
+        assert_eq!(
+            profile["items"][0]["items"][0]["allowed"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            profile["items"][0]["items"][1]["allowed"],
+            Value::Bool(true)
+        );
     }
 }
 

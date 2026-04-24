@@ -1378,7 +1378,11 @@ fn extract_named_format_scores(profile: &Value) -> HashMap<String, i32> {
         .filter_map(|item| {
             let id = item
                 .get("format")
-                .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+                .and_then(|format| {
+                    format
+                        .as_i64()
+                        .or_else(|| format.get("id").and_then(Value::as_i64))
+                })
                 .or_else(|| item.get("formatId").and_then(Value::as_i64))?;
             let score = item.get("score").and_then(Value::as_i64)?;
             Some((id.to_string(), score as i32))
@@ -1399,11 +1403,19 @@ fn set_exact_format_items(profile: &mut Value, scores: &HashMap<String, i32>) ->
     items.sort_by(|left, right| {
         let left_id = left
             .get("format")
-            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .and_then(|format| {
+                format
+                    .as_i64()
+                    .or_else(|| format.get("id").and_then(Value::as_i64))
+            })
             .unwrap_or_default();
         let right_id = right
             .get("format")
-            .and_then(|format| format.as_i64().or_else(|| format.get("id").and_then(Value::as_i64)))
+            .and_then(|format| {
+                format
+                    .as_i64()
+                    .or_else(|| format.get("id").and_then(Value::as_i64))
+            })
             .unwrap_or_default();
         left_id.cmp(&right_id)
     });
@@ -1504,10 +1516,7 @@ mod tests {
 
         let present =
             build_named_score_map_if_present(&formats, &[json!({ "id": 11, "name": "AV1" })])?;
-        assert_eq!(
-            present,
-            Some(HashMap::from([(String::from("11"), 1500)]))
-        );
+        assert_eq!(present, Some(HashMap::from([(String::from("11"), 1500)])));
 
         let missing = build_named_score_map_if_present(&formats, &[])?;
         assert_eq!(missing, None);

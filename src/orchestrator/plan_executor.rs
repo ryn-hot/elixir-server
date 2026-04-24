@@ -57,23 +57,31 @@ impl PlanExecutor {
             store
                 .update_step_status(step.step_id, OperationStepStatus::Running, None)
                 .await?;
-            if let Err(err) = self
+            let notes = match self
                 .state
                 .orchestrator
-                .apply_actions(vec![step.action])
+                .apply_actions_with_notes(vec![step.action])
                 .await
             {
-                let _ = store
-                    .update_step_status(
-                        step.step_id,
-                        OperationStepStatus::Failed,
-                        Some(&err.to_string()),
-                    )
-                    .await;
-                return Err(err);
-            }
+                Ok(notes) => notes,
+                Err(err) => {
+                    let _ = store
+                        .update_step_status(
+                            step.step_id,
+                            OperationStepStatus::Failed,
+                            Some(&err.to_string()),
+                        )
+                        .await;
+                    return Err(err);
+                }
+            };
+            let note = notes.join(" | ");
             store
-                .update_step_status(step.step_id, OperationStepStatus::Completed, None)
+                .update_step_status(
+                    step.step_id,
+                    OperationStepStatus::Completed,
+                    (!note.is_empty()).then_some(note.as_str()),
+                )
                 .await?;
         }
         Ok(())

@@ -10118,6 +10118,96 @@ async fn extension_control_surface_ignores_stale_live_nzbget_inventory_absent_fr
 }
 
 #[tokio::test]
+async fn extension_control_surface_ignores_sample_live_nzbget_inventory_without_persisted_state()
+-> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+
+    let (host, addr, mock_state, shutdown_tx) = start_mock_nzbget_control_server(
+        vec![
+            ("Server1.Active".to_string(), "yes".to_string()),
+            ("Server1.Name".to_string(), "my.newsserver.com".to_string()),
+            ("Server1.Level".to_string(), "0".to_string()),
+            ("Server1.Host".to_string(), "my.newsserver.com".to_string()),
+            ("Server1.Encryption".to_string(), "yes".to_string()),
+            ("Server1.Port".to_string(), "563".to_string()),
+            ("Server1.Username".to_string(), "user".to_string()),
+            ("Server1.Password".to_string(), "pass".to_string()),
+            ("Server1.Connections".to_string(), "8".to_string()),
+            ("Server1.CertVerification".to_string(), "strict".to_string()),
+        ],
+        json!(""),
+    )
+    .await?;
+    let store = ExtensionStore::new(&db_pool);
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.nzbget/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let _ = shutdown_tx.send(());
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.pointer("/status/summary").and_then(Value::as_str),
+        Some("Add provider")
+    );
+
+    let servers = control_surface_section(&payload, "servers");
+    assert_eq!(
+        servers
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("nzbget instance");
+    assert!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/server_inventory"))
+            .is_none(),
+        "sample live inventory should not be persisted when Elixir does not own it"
+    );
+
+    let save_calls = mock_state.save_calls.lock().unwrap().clone();
+    assert_eq!(
+        save_calls.len(),
+        0,
+        "sample live inventory should not trigger saveconfig writes"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn extension_control_surface_includes_nzbget_servers_section() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
@@ -10159,7 +10249,27 @@ async fn extension_control_surface_includes_nzbget_servers_section() -> Result<(
     )
     .await?;
     let store = ExtensionStore::new(&db_pool);
-    seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    let instance_id = seed_nzbget_control_extension(&store, &secrets, host, addr.port()).await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.username".to_string(),
+            value_encrypted: secrets.encrypt("reader")?,
+            rotatable: true,
+        })
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "nzbget.server.1.password".to_string(),
+            value_encrypted: secrets.encrypt("secret")?,
+            rotatable: true,
+        })
+        .await?;
 
     let response = app
         .clone()

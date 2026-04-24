@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -714,6 +715,15 @@ pub enum ManifestExecutionStep {
     EnsureRuntimeRunning {
         instance: String,
     },
+    InstallRuntimeAsset {
+        source_extension_id: String,
+        source_path: String,
+        target_instance: String,
+        destination_path: String,
+    },
+    RestartRuntime {
+        instance: String,
+    },
     CreateOrUpdateProviders {
         instance: String,
     },
@@ -783,12 +793,34 @@ impl ManifestExecutionStep {
             }
             Self::EnsureInstanceInstalled { instance }
             | Self::EnsureRuntimeRunning { instance }
+            | Self::RestartRuntime { instance }
             | Self::CreateOrUpdateProviders { instance } => {
                 ensure_known_execution_instance(
                     instance_ids,
                     instance,
                     "execution.steps.instance",
                 )?;
+            }
+            Self::InstallRuntimeAsset {
+                source_extension_id,
+                source_path,
+                target_instance,
+                destination_path,
+            } => {
+                ensure_non_empty(source_extension_id, "execution.steps.source_extension_id")?;
+                if !packages.contains(source_extension_id.trim()) {
+                    bail!(
+                        "execution step references package '{}' that is not declared in execution.packages",
+                        source_extension_id
+                    );
+                }
+                ensure_relative_runtime_asset_path(source_path, "execution.steps.source_path")?;
+                ensure_known_execution_instance(
+                    instance_ids,
+                    target_instance,
+                    "execution.steps.target_instance",
+                )?;
+                ensure_absolute_runtime_path(destination_path, "execution.steps.destination_path")?;
             }
             Self::TransportGate {
                 instance,
@@ -1495,6 +1527,35 @@ fn default_true() -> bool {
 fn ensure_non_empty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("manifest {} is required", field);
+    }
+    Ok(())
+}
+
+fn ensure_relative_runtime_asset_path(value: &str, field: &str) -> Result<()> {
+    ensure_non_empty(value, field)?;
+    let path = Path::new(value);
+    if path.is_absolute() {
+        bail!("manifest {} must be relative", field);
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        bail!("manifest {} must not escape its package root", field);
+    }
+    Ok(())
+}
+
+fn ensure_absolute_runtime_path(value: &str, field: &str) -> Result<()> {
+    ensure_non_empty(value, field)?;
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        bail!("manifest {} must be absolute", field);
+    }
+    if path == Path::new("/") {
+        bail!("manifest {} must not be '/'", field);
     }
     Ok(())
 }
