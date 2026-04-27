@@ -38,6 +38,7 @@ use crate::db::models::{
 };
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
+use crate::extensions::managed_paths::{DOWNLOADS_ROOT, QBITTORRENT_INCOMPLETE_DIR};
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
@@ -4264,8 +4265,12 @@ fn applied_profile_for_provider(
         .and_then(|value| value.get(key))
         .and_then(|value| value.as_str())?;
     match version {
-        "v1" | "balanced-v1" | "balanced-v4" => Some(DownloaderPerformanceProfile::Balanced),
-        "aggressive-v1" | "aggressive-v4" => Some(DownloaderPerformanceProfile::Aggressive),
+        "v1" | "balanced-v1" | "balanced-v2" | "balanced-v4" => {
+            Some(DownloaderPerformanceProfile::Balanced)
+        }
+        "aggressive-v1" | "aggressive-v2" | "aggressive-v4" => {
+            Some(DownloaderPerformanceProfile::Aggressive)
+        }
         _ => None,
     }
 }
@@ -5735,11 +5740,11 @@ async fn build_qbittorrent_managed_invariants_section(
     let expected_prefs = [
         (
             "save_path",
-            serde_json::Value::String("/downloads".to_string()),
+            serde_json::Value::String(DOWNLOADS_ROOT.to_string()),
         ),
         (
             "temp_path",
-            serde_json::Value::String("/runtime/incomplete".to_string()),
+            serde_json::Value::String(QBITTORRENT_INCOMPLETE_DIR.to_string()),
         ),
         ("temp_path_enabled", serde_json::Value::Bool(true)),
     ];
@@ -7104,6 +7109,42 @@ pub(crate) async fn request_instance_service_json(
     }
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing service {} {path} response", method.as_str()))
+}
+
+pub(crate) async fn request_instance_service_form(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    path: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let target = resolve_extension_ui_proxy_target(state, store, instance_id).await?;
+    let client = build_extension_ui_proxy_client()?;
+    let upstream_url = build_extension_ui_proxy_url(&target.base_url, path, None)?;
+    let request = build_extension_ui_upstream_request(
+        &client,
+        &target,
+        ReqwestMethod::POST,
+        upstream_url,
+        &AxumHeaderMap::new(),
+    )
+    .await?;
+
+    let response = request
+        .form(fields)
+        .send()
+        .await
+        .with_context(|| format!("sending service POST {path}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading service POST {path} response"))?;
+    if !status.is_success() {
+        let detail = describe_service_response_body(&bytes);
+        anyhow::bail!("service POST {path} failed ({status}): {detail}");
+    }
+    Ok(())
 }
 
 fn build_extension_ui_proxy_url(

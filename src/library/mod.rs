@@ -30,13 +30,14 @@ use uuid::Uuid;
 use crate::{
     artwork::{
         ArtworkCandidate, ArtworkKind, ArtworkService, extract_anilist_artwork,
-        extract_cinemeta_artwork, extract_tvdb_artworks, extract_tvdb_series_artwork,
+        extract_cinemeta_artwork, extract_tvdb_artworks, extract_tvdb_entity_artwork,
+        extract_tvdb_series_artwork,
     },
     config::ClassifierConfig,
     db::models::MediaType,
     extensions::store::{
-        ExtensionStore, ManagedEpisodeTombstone, ManagedIngestIntent, ManagedMediaTombstone,
-        NewManagedLibraryProvenance,
+        ExtensionStore, ManagedEpisodeTombstone, ManagedImportEvent, ManagedImportFile,
+        ManagedIngestIntent, ManagedMediaTombstone, NewManagedLibraryProvenance,
     },
     extensions::{ExternalIds, make_identity_key},
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
@@ -67,6 +68,585 @@ pub async fn run_full_scan(
         hash_dedupe,
     )
     .await
+}
+
+pub async fn ingest_managed_import_event(
+    pool: &AnyPool,
+    metadata: Option<&MetadataService>,
+    linkers: Option<&LinkerService>,
+    artwork: Option<&ArtworkService>,
+    intent: &ManagedIngestIntent,
+    event: &ManagedImportEvent,
+) -> Result<Option<Uuid>> {
+    if event.intent_id != intent.intent_id {
+        anyhow::bail!(
+            "managed import event {} does not belong to intent {}",
+            event.event_id,
+            intent.intent_id
+        );
+    }
+    if event.imported_files.is_empty() {
+        return Ok(None);
+    }
+
+    let media_type = merge_media_type_with_intent(event.media_type, intent.media_type);
+    let linked = match media_type {
+        MediaType::Movie => {
+            ingest_managed_movie_import_files(
+                pool,
+                metadata,
+                linkers,
+                artwork,
+                intent,
+                event.external_ids.as_ref(),
+                event.manager_implementation.clone(),
+                &event.imported_files,
+            )
+            .await?
+        }
+        MediaType::Series | MediaType::Anime => {
+            ingest_managed_series_import_files(
+                pool,
+                metadata,
+                linkers,
+                artwork,
+                intent,
+                event.external_ids.as_ref(),
+                event.manager_implementation.clone(),
+                media_type,
+                &event.imported_files,
+            )
+            .await?
+        }
+    };
+
+    if let Some(media_item_id) = linked {
+        let store = ExtensionStore::new(pool);
+        store
+            .mark_managed_import_event_linked(event.event_id, media_item_id)
+            .await?;
+    }
+
+    Ok(linked)
+}
+
+pub async fn ingest_managed_movie_import(
+    pool: &AnyPool,
+    metadata: Option<&MetadataService>,
+    artwork: Option<&ArtworkService>,
+    intent: &ManagedIngestIntent,
+    file_path: &str,
+) -> Result<Option<Uuid>> {
+    if intent.media_type != MediaType::Movie {
+        return Ok(None);
+    }
+    let file = ManagedImportFile {
+        path: file_path.to_string(),
+        season_number: None,
+        episode_number: None,
+        absolute_episode_number: None,
+        episode_title: None,
+        size_bytes: None,
+        container: None,
+        video_codec: None,
+        audio_codec: None,
+    };
+    ingest_managed_movie_import_files(pool, metadata, None, artwork, intent, None, None, &[file])
+        .await
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetadataHydration {
+    meta: Option<MetadataResult>,
+    tvdb_movie_meta: Option<serde_json::Value>,
+}
+
+async fn fetch_metadata_for_identity(
+    service: &MetadataService,
+    identity: &MediaIdentity,
+    context: &str,
+) -> Option<MetadataResult> {
+    match service.fetch_metadata(identity).await {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::warn!(
+                context,
+                media_type = identity.r#type.as_str(),
+                title = %identity.title,
+                year = ?identity.year,
+                imdb = ?identity.external_ids.imdb.as_deref(),
+                tmdb = ?identity.external_ids.tmdb.as_deref(),
+                tvdb = ?identity.external_ids.tvdb.as_deref(),
+                tvdb_series = ?identity.external_ids.tvdb_series.as_deref(),
+                tvdb_movie = ?identity.external_ids.tvdb_movie.as_deref(),
+                anilist = ?identity.external_ids.anilist.as_deref(),
+                error = %err,
+                "metadata fetch failed"
+            );
+            None
+        }
+    }
+}
+
+async fn fetch_movie_metadata_for_identity(
+    metadata: Option<&MetadataService>,
+    linkers: Option<&LinkerService>,
+    identity: &MediaIdentity,
+    context: &str,
+) -> MetadataHydration {
+    if let Some(linker) = linkers {
+        match fetch_tvdb_movie_metadata(linker, identity).await {
+            Ok(Some(hydration)) => return hydration,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    context,
+                    title = %identity.title,
+                    year = ?identity.year,
+                    imdb = ?identity.external_ids.imdb.as_deref(),
+                    tvdb = ?identity.external_ids.tvdb.as_deref(),
+                    tvdb_movie = ?identity.external_ids.tvdb_movie.as_deref(),
+                    error = %err,
+                    "tvdb movie metadata fetch failed"
+                );
+            }
+        }
+    }
+
+    MetadataHydration {
+        meta: if let Some(service) = metadata {
+            fetch_metadata_for_identity(service, identity, context).await
+        } else {
+            None
+        },
+        tvdb_movie_meta: None,
+    }
+}
+
+async fn fetch_tvdb_movie_metadata(
+    linker: &LinkerService,
+    identity: &MediaIdentity,
+) -> Result<Option<MetadataHydration>> {
+    if identity.r#type != MediaType::Movie {
+        return Ok(None);
+    }
+
+    let mut tvdb_movie_id = identity
+        .external_ids
+        .tvdb_movie
+        .as_ref()
+        .or(identity.external_ids.tvdb.as_ref())
+        .cloned();
+    if tvdb_movie_id.is_none() {
+        if let Some(imdb) = identity.external_ids.imdb.as_deref() {
+            tvdb_movie_id = linker.link_tvdb_movie_by_imdb(imdb).await?;
+        }
+    }
+    let Some(tvdb_movie_id) = tvdb_movie_id else {
+        return Ok(None);
+    };
+    let Some(movie_meta) = linker.fetch_tvdb_movie(&tvdb_movie_id).await? else {
+        return Ok(None);
+    };
+    let meta = metadata_result_from_tvdb_movie(&movie_meta, &tvdb_movie_id, &identity.external_ids);
+    Ok(Some(MetadataHydration {
+        meta: Some(meta),
+        tvdb_movie_meta: Some(movie_meta),
+    }))
+}
+
+fn metadata_result_from_tvdb_movie(
+    movie_meta: &serde_json::Value,
+    tvdb_movie_id: &str,
+    base_ids: &ExternalIds,
+) -> MetadataResult {
+    let mut external_ids = ExternalIds {
+        tvdb: Some(tvdb_movie_id.to_string()),
+        tvdb_movie: Some(tvdb_movie_id.to_string()),
+        ..Default::default()
+    };
+    external_ids.imdb =
+        extract_tvdb_remote_id(movie_meta, &["imdb"], true).or(base_ids.imdb.clone());
+    external_ids.tmdb = extract_tvdb_remote_id(movie_meta, &["tmdb", "themoviedb"], false)
+        .or(base_ids.tmdb.clone());
+
+    MetadataResult {
+        metadata_json: movie_meta.clone(),
+        runtime_seconds: extract_tvdb_runtime_seconds(movie_meta),
+        external_ids: Some(external_ids),
+        description: extract_tvdb_description(movie_meta),
+        genres: Some(extract_tvdb_genres(movie_meta)).filter(|values| !values.is_empty()),
+    }
+}
+
+fn extract_tvdb_runtime_seconds(meta: &serde_json::Value) -> Option<i32> {
+    json_i32(meta.get("runtime")).and_then(|minutes| minutes.checked_mul(60))
+}
+
+fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return i32::try_from(number).ok();
+    }
+    value.as_str()?.trim().parse::<i32>().ok()
+}
+
+fn extract_tvdb_description(meta: &serde_json::Value) -> Option<String> {
+    for key in ["overview", "description", "summary"] {
+        if let Some(value) = meta.get(key).and_then(serde_json::Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_tvdb_remote_id(
+    meta: &serde_json::Value,
+    sources: &[&str],
+    allow_imdb_prefix: bool,
+) -> Option<String> {
+    let values = meta
+        .get("remoteIds")
+        .or_else(|| meta.get("remote_ids"))
+        .and_then(serde_json::Value::as_array)?;
+    for entry in values {
+        let Some(id) = json_id_string(entry.get("id")) else {
+            continue;
+        };
+        if allow_imdb_prefix && id.to_ascii_lowercase().starts_with("tt") {
+            return Some(id);
+        }
+        let source = entry
+            .get("sourceName")
+            .or_else(|| entry.get("source_name"))
+            .or_else(|| entry.get("source"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if sources.iter().any(|expected| source.contains(expected)) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn json_id_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number.to_string());
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    None
+}
+
+async fn ingest_managed_movie_import_files(
+    pool: &AnyPool,
+    metadata: Option<&MetadataService>,
+    linkers: Option<&LinkerService>,
+    artwork: Option<&ArtworkService>,
+    intent: &ManagedIngestIntent,
+    event_external_ids: Option<&ExternalIds>,
+    manager_implementation: Option<String>,
+    files: &[ManagedImportFile],
+) -> Result<Option<Uuid>> {
+    let Some(file) = files.iter().find(|file| !file.path.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(descriptor) = descriptor_from_managed_import_file(file).await? else {
+        return Ok(None);
+    };
+
+    let store = ExtensionStore::new(pool);
+    let mut merged_ids = intent.external_ids.clone().unwrap_or_default();
+    merged_ids = merge_external_ids(&merged_ids, event_external_ids.cloned());
+    let mut identity = MediaIdentity {
+        r#type: MediaType::Movie,
+        external_ids: merged_ids.clone(),
+        title: intent.title.clone(),
+        year: intent.year,
+        season: None,
+        episode: None,
+    };
+
+    let movie_hydration =
+        fetch_movie_metadata_for_identity(metadata, linkers, &identity, "managed movie import")
+            .await;
+    let meta = movie_hydration.meta;
+    if let Some(meta_ids) = meta.as_ref().and_then(|m| m.external_ids.clone()) {
+        merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
+        identity.external_ids = merged_ids.clone();
+    }
+
+    let movie_id = upsert_movie(pool, &identity, &merged_ids, meta.as_ref()).await?;
+    persist_movie_external_ids(pool, movie_id, &merged_ids, "managed_import").await?;
+    upsert_legacy_media_item(pool, movie_id, &identity, &merged_ids, meta.as_ref()).await?;
+
+    let resolved_manager_implementation = if manager_implementation.is_some() {
+        manager_implementation
+    } else {
+        store
+            .list_providers(None)
+            .await?
+            .into_iter()
+            .find(|provider| provider.provider_id == intent.manager_provider_id)
+            .and_then(|provider| provider.implementation)
+    };
+    store
+        .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+            media_item_id: movie_id,
+            media_type: MediaType::Movie,
+            title: intent.title.clone(),
+            normalized_title: normalize_managed_intent_title(&intent.title),
+            year: intent.year,
+            external_ids: Some(merged_ids.clone()),
+            manager_provider_id: intent.manager_provider_id,
+            manager_item_id: intent.manager_item_id.clone(),
+            manager_label: intent.manager_label.clone(),
+            manager_implementation: resolved_manager_implementation,
+            intent_id: Some(intent.intent_id),
+        })
+        .await?;
+
+    let media_file = upsert_media_file(pool, movie_id, None, &descriptor, None, false).await?;
+    link_movie_file(pool, movie_id, media_file.id).await?;
+    if let Some(duration) = media_file.duration_seconds {
+        update_movie_runtime_if_missing(pool, movie_id, duration).await?;
+    }
+    if let Some(artwork_service) = artwork {
+        sync_movie_artwork(
+            pool,
+            artwork_service,
+            movie_id,
+            meta.as_ref(),
+            movie_hydration.tvdb_movie_meta.as_ref(),
+        )
+        .await?;
+    }
+    store
+        .mark_managed_ingest_intent_matched(intent.intent_id)
+        .await?;
+
+    Ok(Some(movie_id))
+}
+
+async fn ingest_managed_series_import_files(
+    pool: &AnyPool,
+    metadata: Option<&MetadataService>,
+    linkers: Option<&LinkerService>,
+    artwork: Option<&ArtworkService>,
+    intent: &ManagedIngestIntent,
+    event_external_ids: Option<&ExternalIds>,
+    manager_implementation: Option<String>,
+    media_type: MediaType,
+    files: &[ManagedImportFile],
+) -> Result<Option<Uuid>> {
+    let store = ExtensionStore::new(pool);
+    let mut merged_ids = intent.external_ids.clone().unwrap_or_default();
+    merged_ids = merge_external_ids(&merged_ids, event_external_ids.cloned());
+    let mut identity = MediaIdentity {
+        r#type: media_type,
+        external_ids: merged_ids.clone(),
+        title: intent.title.clone(),
+        year: intent.year,
+        season: None,
+        episode: None,
+    };
+
+    let meta = if let Some(service) = metadata {
+        fetch_metadata_for_identity(service, &identity, "managed series import").await
+    } else {
+        None
+    };
+    if let Some(meta_ids) = meta.as_ref().and_then(|m| m.external_ids.clone()) {
+        merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
+        identity.external_ids = merged_ids.clone();
+    }
+
+    let series_ids = if media_type == MediaType::Anime {
+        strip_anime_ids(&merged_ids)
+    } else {
+        merged_ids.clone()
+    };
+    let series_id = upsert_series(pool, &identity, &series_ids, meta.as_ref()).await?;
+    upsert_legacy_media_item(pool, series_id, &identity, &series_ids, meta.as_ref()).await?;
+    persist_series_external_ids(pool, series_id, &series_ids, "managed_import").await?;
+    if media_type == MediaType::Anime {
+        mark_series_as_anime(pool, series_id).await?;
+    }
+
+    let resolved_manager_implementation = if manager_implementation.is_some() {
+        manager_implementation
+    } else {
+        store
+            .list_providers(None)
+            .await?
+            .into_iter()
+            .find(|provider| provider.provider_id == intent.manager_provider_id)
+            .and_then(|provider| provider.implementation)
+    };
+    store
+        .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+            media_item_id: series_id,
+            media_type,
+            title: intent.title.clone(),
+            normalized_title: normalize_managed_intent_title(&intent.title),
+            year: intent.year,
+            external_ids: Some(merged_ids.clone()),
+            manager_provider_id: intent.manager_provider_id,
+            manager_item_id: intent.manager_item_id.clone(),
+            manager_label: intent.manager_label.clone(),
+            manager_implementation: resolved_manager_implementation,
+            intent_id: Some(intent.intent_id),
+        })
+        .await?;
+
+    let managed_episode_tombstones = store.list_active_managed_episode_tombstones().await?;
+    let mut season_ids: HashMap<i32, Uuid> = HashMap::new();
+    let mut media_files_by_path: HashMap<String, MediaFileUpsert> = HashMap::new();
+    let mut linked_any = false;
+
+    for file in files {
+        let Some(season_number) = file.season_number else {
+            tracing::warn!(
+                intent_id = %intent.intent_id,
+                path = %file.path,
+                "managed series import event file is missing a season number"
+            );
+            continue;
+        };
+        let Some(episode_number) = file.episode_number else {
+            tracing::warn!(
+                intent_id = %intent.intent_id,
+                path = %file.path,
+                "managed series import event file is missing an episode number"
+            );
+            continue;
+        };
+        if match_managed_episode_tombstone(
+            &identity,
+            &merged_ids,
+            season_number,
+            episode_number,
+            file.absolute_episode_number,
+            &managed_episode_tombstones,
+        )
+        .is_some()
+        {
+            tracing::info!(
+                intent_id = %intent.intent_id,
+                path = %file.path,
+                season = season_number,
+                episode = episode_number,
+                "skipping managed series import file because it is blocked by an episode tombstone"
+            );
+            continue;
+        }
+        let Some(descriptor) = descriptor_from_managed_import_file(file).await? else {
+            continue;
+        };
+
+        let season_id = if let Some(season_id) = season_ids.get(&season_number).copied() {
+            season_id
+        } else {
+            let season_id = upsert_season(pool, series_id, season_number).await?;
+            season_ids.insert(season_number, season_id);
+            season_id
+        };
+        let episode_id = upsert_episode(
+            pool,
+            series_id,
+            season_id,
+            season_number,
+            episode_number,
+            file.absolute_episode_number,
+        )
+        .await?;
+        if let Some(title) = file
+            .episode_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            update_episode_title_if_missing(pool, episode_id, title).await?;
+        }
+
+        let media_file = if let Some(media_file) = media_files_by_path.get(&descriptor.path) {
+            media_file.clone()
+        } else {
+            let media_file =
+                upsert_media_file(pool, series_id, None, &descriptor, None, false).await?;
+            media_files_by_path.insert(descriptor.path.clone(), media_file.clone());
+            media_file
+        };
+        link_episode_file(pool, episode_id, media_file.id).await?;
+        mark_episode_has_file(pool, episode_id).await?;
+        if let Some(duration) = media_file.duration_seconds {
+            update_episode_runtime_if_missing(pool, episode_id, duration).await?;
+        }
+        linked_any = true;
+    }
+
+    if !linked_any {
+        return Ok(None);
+    }
+
+    if let Some(artwork_service) = artwork {
+        sync_series_artwork(
+            pool,
+            artwork_service,
+            series_id,
+            meta.as_ref(),
+            &series_ids,
+            media_type == MediaType::Anime,
+            linkers,
+            &season_ids,
+            metadata.map(|service| service.ttl_seconds()).unwrap_or(0),
+            false,
+        )
+        .await?;
+    }
+    store
+        .mark_managed_ingest_intent_matched(intent.intent_id)
+        .await?;
+    refresh_episode_file_state(pool).await?;
+
+    Ok(Some(series_id))
+}
+
+async fn descriptor_from_managed_import_file(
+    file: &ManagedImportFile,
+) -> Result<Option<FileDescriptor>> {
+    let path = file.path.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let file_metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(None),
+    };
+    Ok(Some(FileDescriptor {
+        path: path.to_string(),
+        size_bytes: Some(file_metadata.len() as i64).or(file.size_bytes),
+        hash: None,
+        container: file.container.clone().or_else(|| {
+            Path::new(path)
+                .extension()
+                .map(|value| value.to_string_lossy().to_string())
+        }),
+        video_codec: file.video_codec.clone(),
+        audio_codec: file.audio_codec.clone(),
+    }))
 }
 
 pub async fn run_full_scan_with_metadata(
@@ -129,19 +709,17 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 
     for mut candidate in merged {
         let mut merged_ids = candidate.identity.external_ids.clone();
-        let matched_intent = if let Some(intent) =
-            match_managed_ingest_intent(&candidate.identity, &merged_ids, &managed_ingest_intents)
+        if let Some(identity_lock) =
+            load_managed_identity_lock_for_files(pool, &candidate.files).await?
         {
-            if let Some(intent_ids) = intent.external_ids.clone() {
-                merged_ids = merge_external_ids(&merged_ids, Some(intent_ids));
-            }
-            candidate.identity.r#type =
-                merge_media_type_with_intent(candidate.identity.r#type, intent.media_type);
-            matched_managed_intent_ids.insert(intent.intent_id);
-            Some(intent.clone())
-        } else {
-            None
-        };
+            apply_managed_identity_lock(&mut candidate.identity, &mut merged_ids, identity_lock);
+        }
+        let mut matched_intent = match_and_merge_managed_ingest_intent(
+            &mut candidate,
+            &mut merged_ids,
+            &managed_ingest_intents,
+            &mut matched_managed_intent_ids,
+        );
         if let Some(tombstone) = match_managed_media_tombstone(
             &candidate.identity,
             &merged_ids,
@@ -167,6 +745,14 @@ pub async fn run_full_scan_with_metadata_and_linkers(
         ) = classify_candidate_files(pool, &classifier, &candidate, &merged_ids, force_reclassify)
             .await?;
         merged_ids = classified_ids;
+        if matched_intent.is_none() {
+            matched_intent = match_and_merge_managed_ingest_intent(
+                &mut candidate,
+                &mut merged_ids,
+                &managed_ingest_intents,
+                &mut matched_managed_intent_ids,
+            );
+        }
 
         let mut anizip_mappings: HashMap<i32, AniZipMapping> = HashMap::new();
         let mut bridge_result = AnimeBridgeResult::default();
@@ -311,7 +897,33 @@ pub async fn run_full_scan_with_metadata_and_linkers(
         identity_for_meta.season = None;
         identity_for_meta.episode = None;
         identity_for_meta.external_ids = merged_ids.clone();
-        let meta = if let Some(service) = metadata {
+        let mut movie_tvdb_meta = None;
+        let meta = if identity_for_meta.r#type == MediaType::Movie {
+            let should_refresh = if let Some(service) = metadata {
+                should_refresh_metadata(
+                    pool,
+                    &identity_for_meta,
+                    service.ttl_seconds(),
+                    force_metadata,
+                )
+                .await?
+            } else {
+                force_metadata
+            };
+            if should_refresh {
+                let hydration = fetch_movie_metadata_for_identity(
+                    metadata,
+                    linkers,
+                    &identity_for_meta,
+                    "library scan",
+                )
+                .await;
+                movie_tvdb_meta = hydration.tvdb_movie_meta;
+                hydration.meta
+            } else {
+                None
+            }
+        } else if let Some(service) = metadata {
             let should_refresh = should_refresh_metadata(
                 pool,
                 &identity_for_meta,
@@ -320,11 +932,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             )
             .await?;
             if should_refresh {
-                service
-                    .fetch_metadata(&identity_for_meta)
-                    .await
-                    .ok()
-                    .flatten()
+                fetch_metadata_for_identity(service, &identity_for_meta, "library scan").await
             } else {
                 None
             }
@@ -334,6 +942,14 @@ pub async fn run_full_scan_with_metadata_and_linkers(
 
         if let Some(meta_ids) = meta.as_ref().and_then(|m| m.external_ids.clone()) {
             merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
+        }
+        if matched_intent.is_none() {
+            matched_intent = match_and_merge_managed_ingest_intent(
+                &mut candidate,
+                &mut merged_ids,
+                &managed_ingest_intents,
+                &mut matched_managed_intent_ids,
+            );
         }
 
         let has_anime_ids = merged_ids.anilist.is_some()
@@ -348,6 +964,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             MediaType::Movie => {
                 let movie_id =
                     upsert_movie(pool, &candidate.identity, &merged_ids, meta.as_ref()).await?;
+                persist_movie_external_ids(pool, movie_id, &merged_ids, "library_scan").await?;
                 upsert_legacy_media_item(
                     pool,
                     movie_id,
@@ -378,7 +995,14 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                         .await?;
                 }
                 if let Some(artwork_service) = artwork {
-                    sync_movie_artwork(pool, artwork_service, movie_id, meta.as_ref()).await?;
+                    sync_movie_artwork(
+                        pool,
+                        artwork_service,
+                        movie_id,
+                        meta.as_ref(),
+                        movie_tvdb_meta.as_ref(),
+                    )
+                    .await?;
                 }
                 for file in candidate.files {
                     seen_paths.insert(file.descriptor.path.clone());
@@ -868,6 +1492,68 @@ fn merge_media_type_with_intent(current: MediaType, intent: MediaType) -> MediaT
         }
         MediaType::Movie => MediaType::Movie,
     }
+}
+
+fn match_and_merge_managed_ingest_intent(
+    candidate: &mut AggregatedCandidate,
+    merged_ids: &mut ExternalIds,
+    intents: &[ManagedIngestIntent],
+    matched_intent_ids: &mut HashSet<Uuid>,
+) -> Option<ManagedIngestIntent> {
+    let intent = match_managed_ingest_intent(&candidate.identity, merged_ids, intents)?.clone();
+    if let Some(intent_ids) = intent.external_ids.clone() {
+        let current_ids = merged_ids.clone();
+        *merged_ids = merge_external_ids(&current_ids, Some(intent_ids));
+    }
+    candidate.identity.r#type =
+        merge_media_type_with_intent(candidate.identity.r#type, intent.media_type);
+    if !intent.title.trim().is_empty() {
+        candidate.identity.title = intent.title.clone();
+    }
+    if intent.year.is_some() {
+        candidate.identity.year = intent.year;
+    }
+    candidate.identity.external_ids = merged_ids.clone();
+    matched_intent_ids.insert(intent.intent_id);
+    Some(intent)
+}
+
+async fn load_managed_identity_lock_for_files(
+    pool: &AnyPool,
+    files: &[AggregatedFile],
+) -> Result<Option<ManagedIdentityLock>> {
+    for file in files {
+        let media_item_id: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT mf.media_item_id
+             FROM media_files mf
+             JOIN managed_library_provenance mlp ON mlp.media_item_id = mf.media_item_id
+             WHERE mf.path = ?
+             LIMIT 1",
+        )
+        .bind(&file.descriptor.path)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(media_item_id) = media_item_id {
+            if let Some(lock) = load_managed_identity_lock(pool, &media_item_id).await? {
+                return Ok(Some(lock));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn apply_managed_identity_lock(
+    identity: &mut MediaIdentity,
+    merged_ids: &mut ExternalIds,
+    lock: ManagedIdentityLock,
+) {
+    identity.r#type = lock.media_type;
+    identity.title = lock.title;
+    identity.year = lock.year;
+    if let Some(locked_ids) = lock.external_ids {
+        *merged_ids = merge_external_ids(&locked_ids, Some(merged_ids.clone()));
+    }
+    identity.external_ids = merged_ids.clone();
 }
 
 pub(crate) fn match_managed_ingest_intent<'a>(
@@ -2605,30 +3291,55 @@ async fn should_refresh_metadata(
 
     let existing = match identity.r#type {
         MediaType::Movie => {
+            let mut existing = None;
             if let Some(imdb) = identity.external_ids.imdb.as_ref() {
-                sqlx::query::<sqlx::Any>(
+                existing = sqlx::query::<sqlx::Any>(
                     "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_imdb = ? LIMIT 1",
                 )
                 .bind(imdb)
                 .fetch_optional(pool)
-                .await?
-            } else if let Some(tmdb) = identity.external_ids.tmdb.as_ref() {
-                sqlx::query::<sqlx::Any>(
+                .await?;
+            }
+            if existing.is_none() {
+                if let Some(tvdb) = identity
+                    .external_ids
+                    .tvdb_movie
+                    .as_ref()
+                    .or(identity.external_ids.tvdb.as_ref())
+                {
+                    existing = sqlx::query::<sqlx::Any>(
+                        "SELECT m.metadata_json, CAST(m.updated_at AS TEXT) as updated_at
+                     FROM movies m
+                     JOIN movie_external_ids mei ON mei.movie_id = m.id
+                     WHERE mei.provider = 'tvdb' AND mei.external_id = ?
+                     LIMIT 1",
+                    )
+                    .bind(tvdb)
+                    .fetch_optional(pool)
+                    .await?;
+                }
+            }
+            if existing.is_none() {
+                if let Some(tmdb) = identity.external_ids.tmdb.as_ref() {
+                    existing = sqlx::query::<sqlx::Any>(
                     "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_tmdb = ? LIMIT 1",
                 )
                 .bind(tmdb)
                 .fetch_optional(pool)
-                .await?
-            } else {
-                sqlx::query::<sqlx::Any>(
+                    .await?;
+                }
+            }
+            if existing.is_none() {
+                existing = sqlx::query::<sqlx::Any>(
                     "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
                 )
                 .bind(&identity.title)
                 .bind(identity.year)
                 .bind(identity.year)
                 .fetch_optional(pool)
-                .await?
+                    .await?;
             }
+            existing
         }
         MediaType::Series | MediaType::Anime => {
             let library_type = identity.r#type.as_str();
@@ -2734,40 +3445,66 @@ async fn upsert_movie(
     merged_ids: &ExternalIds,
     meta: Option<&MetadataResult>,
 ) -> Result<Uuid> {
-    let existing = if let Some(imdb) = merged_ids.imdb.as_ref() {
-        sqlx::query_scalar::<sqlx::Any, String>(
+    let mut existing = None;
+    if let Some(imdb) = merged_ids.imdb.as_ref() {
+        existing = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT id FROM movies WHERE external_imdb = ? LIMIT 1",
         )
         .bind(imdb)
         .fetch_optional(pool)
-        .await?
-    } else if let Some(tmdb) = merged_ids.tmdb.as_ref() {
-        sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM movies WHERE external_tmdb = ? LIMIT 1",
+        .await?;
+    }
+    if existing.is_none() {
+        if let Some(tvdb) = merged_ids.tvdb_movie.as_ref().or(merged_ids.tvdb.as_ref()) {
+            existing = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT movie_id FROM movie_external_ids WHERE provider = 'tvdb' AND external_id = ? LIMIT 1",
         )
-        .bind(tmdb)
+        .bind(tvdb)
         .fetch_optional(pool)
-        .await?
-    } else {
-        sqlx::query_scalar::<sqlx::Any, String>(
+            .await?;
+        }
+    }
+    if existing.is_none() {
+        if let Some(tmdb) = merged_ids.tmdb.as_ref() {
+            existing = sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT id FROM movies WHERE external_tmdb = ? LIMIT 1",
+            )
+            .bind(tmdb)
+            .fetch_optional(pool)
+            .await?;
+        }
+    }
+    if existing.is_none() {
+        existing = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT id FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
         )
         .bind(&identity.title)
         .bind(identity.year)
         .bind(identity.year)
         .fetch_optional(pool)
-        .await?
-    };
+        .await?;
+    }
 
     if let Some(id_str) = existing {
         let id = Uuid::parse_str(&id_str)?;
+        let identity_lock = load_managed_identity_lock(pool, &id_str).await?;
+        let mut title = identity.title.clone();
+        let mut year = identity.year;
+        let mut ids = merged_ids.clone();
+        if let Some(lock) = identity_lock {
+            title = lock.title;
+            year = lock.year;
+            if let Some(locked_ids) = lock.external_ids {
+                ids = merge_external_ids(&locked_ids, Some(ids));
+            }
+        }
         sqlx::query::<sqlx::Any>(
             "UPDATE movies SET title = ?, year = ?, external_imdb = ?, external_tmdb = ?, metadata_json = COALESCE(?, metadata_json), runtime_seconds = COALESCE(?, runtime_seconds), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
-        .bind(&identity.title)
-        .bind(identity.year)
-        .bind(merged_ids.imdb.as_ref())
-        .bind(merged_ids.tmdb.as_ref())
+        .bind(&title)
+        .bind(year)
+        .bind(ids.imdb.as_ref())
+        .bind(ids.tmdb.as_ref())
         .bind(meta.and_then(|m| serde_json::to_string(&m.metadata_json).ok()))
         .bind(meta.and_then(|m| m.runtime_seconds))
         .bind(id_str)
@@ -2855,15 +3592,30 @@ async fn upsert_series(
 
     if let Some(id_str) = existing {
         let id = Uuid::parse_str(&id_str)?;
+        let identity_lock = load_managed_identity_lock(pool, &id_str).await?;
+        let mut title = identity.title.clone();
+        let mut year = identity.year;
+        let mut media_type = identity.r#type;
+        let mut ids = merged_ids.clone();
+        if let Some(lock) = identity_lock {
+            title = lock.title;
+            year = lock.year;
+            if matches!(lock.media_type, MediaType::Series | MediaType::Anime) {
+                media_type = lock.media_type;
+            }
+            if let Some(locked_ids) = lock.external_ids {
+                ids = merge_external_ids(&locked_ids, Some(ids));
+            }
+        }
         sqlx::query::<sqlx::Any>(
             "UPDATE series SET title = ?, year = ?, library_type = ?, external_imdb = ?, external_tvdb_series = ?, external_anilist = ?, metadata_json = COALESCE(?, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
-        .bind(&identity.title)
-        .bind(identity.year)
-        .bind(identity.r#type.as_str())
-        .bind(merged_ids.imdb.as_ref())
-        .bind(merged_ids.tvdb_series.as_ref().or(merged_ids.tvdb.as_ref()))
-        .bind(merged_ids.anilist.as_ref())
+        .bind(&title)
+        .bind(year)
+        .bind(media_type.as_str())
+        .bind(ids.imdb.as_ref())
+        .bind(ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()))
+        .bind(ids.anilist.as_ref())
         .bind(meta.and_then(|m| serde_json::to_string(&m.metadata_json).ok()))
         .bind(&id_str)
         .execute(pool)
@@ -3005,6 +3757,7 @@ async fn upsert_legacy_media_item(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
 struct MediaFileUpsert {
     id: Uuid,
     duration_seconds: Option<i32>,
@@ -3989,6 +4742,8 @@ fn is_season_folder_name(name: &str) -> bool {
 async fn link_movie_file(pool: &AnyPool, movie_id: Uuid, media_file_id: Uuid) -> Result<()> {
     let media_file_id_str = media_file_id.to_string();
     unlink_episode_links_for_media_file(pool, &media_file_id_str).await?;
+    unlink_stale_movie_links_for_media_file(pool, &media_file_id_str, &movie_id.to_string())
+        .await?;
     sqlx::query::<sqlx::Any>(
         "INSERT INTO movie_files (movie_id, media_file_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
     )
@@ -3996,6 +4751,37 @@ async fn link_movie_file(pool: &AnyPool, movie_id: Uuid, media_file_id: Uuid) ->
     .bind(media_file_id_str)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn unlink_stale_movie_links_for_media_file(
+    pool: &AnyPool,
+    media_file_id: &str,
+    keep_movie_id: &str,
+) -> Result<()> {
+    let stale_movie_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT movie_id FROM movie_files WHERE media_file_id = ? AND movie_id != ?",
+    )
+    .bind(media_file_id)
+    .bind(keep_movie_id)
+    .fetch_all(pool)
+    .await?;
+    if stale_movie_ids.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        media_file_id = %media_file_id,
+        stale_movie_count = stale_movie_ids.len(),
+        "removing stale movie links for reclassified file"
+    );
+    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = ? AND movie_id != ?")
+        .bind(media_file_id)
+        .bind(keep_movie_id)
+        .execute(pool)
+        .await?;
+    for movie_id in stale_movie_ids {
+        cleanup_orphan_movie(pool, &movie_id).await?;
+    }
     Ok(())
 }
 
@@ -4129,6 +4915,21 @@ async fn update_episode_runtime_if_missing(
         "UPDATE episodes SET runtime_seconds = COALESCE(runtime_seconds, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
     .bind(duration_seconds)
+    .bind(episode_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn update_episode_title_if_missing(
+    pool: &AnyPool,
+    episode_id: Uuid,
+    title: &str,
+) -> Result<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE episodes SET title = COALESCE(title, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(title)
     .bind(episode_id.to_string())
     .execute(pool)
     .await?;
@@ -4646,17 +5447,34 @@ async fn sync_movie_artwork(
     artwork: &ArtworkService,
     movie_id: Uuid,
     meta: Option<&MetadataResult>,
+    tvdb_movie_meta: Option<&serde_json::Value>,
 ) -> Result<()> {
-    let Some(meta) = meta else {
-        return Ok(());
-    };
     let mut refs = Vec::new();
-    refs.extend(extract_cinemeta_artwork(&meta.metadata_json));
+    if let Some(tvdb_movie_meta) = tvdb_movie_meta {
+        refs.extend(extract_tvdb_entity_artwork(tvdb_movie_meta));
+        for entry in extract_tvdb_artworks(tvdb_movie_meta) {
+            refs.push(ArtworkCandidate {
+                kind: entry.kind,
+                url: entry.url,
+                language: entry.language,
+                width: None,
+                height: None,
+                provider: Some("tvdb".to_string()),
+                score: entry.score,
+                metadata_json: None,
+            });
+        }
+    }
+    if let Some(meta) = meta {
+        refs.extend(extract_cinemeta_artwork(&meta.metadata_json));
+    }
     if refs.is_empty() {
         return Ok(());
     }
     let stored = artwork.upsert_refs(pool, "movie", movie_id, &refs).await?;
-    artwork.cache_primary(pool, &stored, &["cinemeta"]).await?;
+    artwork
+        .cache_primary(pool, &stored, &["tvdb", "cinemeta"])
+        .await?;
     Ok(())
 }
 
@@ -5093,22 +5911,82 @@ fn minutes_to_seconds(runtime_minutes: Option<i32>) -> Option<i32> {
     runtime_minutes.and_then(|m| if m > 0 { Some(m * 60) } else { None })
 }
 
+#[derive(Debug)]
+struct ManagedIdentityLock {
+    media_type: MediaType,
+    title: String,
+    year: Option<i32>,
+    external_ids: Option<ExternalIds>,
+}
+
+async fn load_managed_identity_lock(
+    pool: &AnyPool,
+    media_item_id: &str,
+) -> Result<Option<ManagedIdentityLock>> {
+    let Some(row) = sqlx::query(
+        "SELECT media_type, title, year, CAST(external_ids_json AS TEXT) AS external_ids_json
+         FROM managed_library_provenance
+         WHERE media_item_id = ?
+         LIMIT 1",
+    )
+    .bind(media_item_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let media_type_raw: String = row.try_get("media_type")?;
+    let media_type = match media_type_raw.trim().to_ascii_lowercase().as_str() {
+        "movie" => MediaType::Movie,
+        "series" => MediaType::Series,
+        "anime" => MediaType::Anime,
+        _ => MediaType::Series,
+    };
+    let external_ids = row
+        .try_get::<Option<String>, _>("external_ids_json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<ExternalIds>(&raw).ok());
+    let year = row.try_get::<Option<i64>, _>("year").ok().flatten();
+
+    Ok(Some(ManagedIdentityLock {
+        media_type,
+        title: row.try_get("title")?,
+        year: year.map(|value| value as i32),
+        external_ids,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        config::DatabaseConfig,
+        config::{ClassifierConfig, DatabaseConfig, MetadataConfig},
         db::Database,
         db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality},
         extensions::{
             ExternalIds as ExtIds, FileDescriptor as FD, MediaIdentity,
             store::{
-                ExtensionStore, NewExtension, NewExtensionInstance, NewManagedIngestIntent,
-                NewManagedMediaTombstone, NewProvider,
+                ExtensionStore, ManagedImportFile, NewExtension, NewExtensionInstance,
+                NewManagedImportEvent, NewManagedIngestIntent, NewManagedMediaTombstone,
+                NewProvider,
             },
         },
     };
+    use axum::{
+        Json, Router,
+        body::Body,
+        extract::Path as AxumPath,
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use serde_json::Value;
     use std::collections::HashMap;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use uuid::Uuid;
 
     fn sample_identity() -> MediaIdentity {
@@ -5123,6 +6001,160 @@ mod tests {
             season: None,
             episode: None,
         }
+    }
+
+    async fn start_mock_cinemeta_server() -> Result<(String, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let metadata_base_url = base_url.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let app = Router::new()
+            .route(
+                "/meta/movie/tt0381061.json",
+                get(move || {
+                    let metadata_base_url = metadata_base_url.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "meta": {
+                                "imdb_id": "tt0381061",
+                                "runtime": "144 min",
+                                "description": "A managed Casino Royale description.",
+                                "genre": ["Action", "Thriller"],
+                                "genres": ["Action", "Thriller"],
+                                "poster": format!("{metadata_base_url}/poster.jpg"),
+                                "background": format!("{metadata_base_url}/backdrop.jpg")
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/poster.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            )
+            .route(
+                "/backdrop.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok((base_url, shutdown_tx))
+    }
+
+    async fn start_mock_tvdb_movie_server() -> Result<(String, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let movie_base_url = base_url.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let app = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(serde_json::json!({ "data": { "token": "test-token" } })) }),
+            )
+            .route(
+                "/search/remoteid/:imdb",
+                get(|AxumPath(imdb): AxumPath<String>| async move {
+                    let data = if imdb == "tt0381061" {
+                        serde_json::json!([
+                            {
+                                "id": 76543,
+                                "type": "series",
+                                "series": { "id": 76543 }
+                            },
+                            {
+                                "id": 12345,
+                                "type": "movie",
+                                "movie": { "id": 12345 }
+                            }
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    Json(serde_json::json!({ "data": data }))
+                }),
+            )
+            .route(
+                "/movies/:id/extended",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let movie_base_url = movie_base_url.clone();
+                    async move {
+                        let data = if id == "12345" {
+                            serde_json::json!({
+                                "id": 12345,
+                                "name": "Casino Royale",
+                                "year": "2006",
+                                "runtime": 144,
+                                "overview": "TVDB Casino Royale description.",
+                                "image": format!("{movie_base_url}/tvdb-poster.jpg"),
+                                "remoteIds": [
+                                    { "sourceName": "IMDB", "id": "tt0381061" },
+                                    { "sourceName": "TheMovieDB.com", "id": "36557" }
+                                ],
+                                "genres": [
+                                    { "name": "Action" },
+                                    { "name": "Thriller" }
+                                ],
+                                "artworks": [
+                                    {
+                                        "image": format!("{movie_base_url}/tvdb-poster.jpg"),
+                                        "width": 680,
+                                        "height": 1000,
+                                        "score": 9.1,
+                                        "language": "eng"
+                                    },
+                                    {
+                                        "image": format!("{movie_base_url}/tvdb-backdrop.jpg"),
+                                        "width": 1920,
+                                        "height": 1080,
+                                        "score": 8.7,
+                                        "language": "eng"
+                                    }
+                                ]
+                            })
+                        } else {
+                            serde_json::json!(null)
+                        };
+                        Json(serde_json::json!({ "data": data }))
+                    }
+                }),
+            )
+            .route(
+                "/tvdb-poster.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            )
+            .route(
+                "/tvdb-backdrop.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok((base_url, shutdown_tx))
     }
 
     #[tokio::test]
@@ -5174,6 +6206,77 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await?;
         assert_eq!(count_missing, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrected_movie_identity_relinks_existing_file() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let path = "/media/movies/Casino Royale (2006)/Casino Royale 2006 BluRay 1080p DDP 5 1 x264-hallowed.mkv";
+
+        let first_scan = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds::default(),
+                title: "Casino Royale DDP 5 1 hallowed".to_string(),
+                year: None,
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: path.to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, first_scan, false).await?;
+
+        let corrected_scan = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds::default(),
+                title: "Casino Royale".to_string(),
+                year: Some(2006),
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: path.to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, corrected_scan, false).await?;
+
+        let (movie_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movies")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(movie_count, 1);
+        let (link_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movie_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(link_count, 1);
+        let title: String = sqlx::query_scalar("SELECT title FROM movies LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(title, "Casino Royale");
 
         Ok(())
     }
@@ -5461,6 +6564,527 @@ mod tests {
         assert_eq!(stored_provider_id, provider_id.to_string());
         assert_eq!(stored_manager_item_id.as_deref(), Some("movie-123"));
         assert_eq!(stored_implementation.as_deref(), Some("radarr"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_movie_import_uses_intent_identity_and_resists_scan_override() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let provider_id = Uuid::new_v4();
+        let file_dir = tempdir()?;
+        let file_path = file_dir
+            .path()
+            .join("Casino Royale 2006 BluRay 1080p DDP 5 1 x264-hallowed.mkv");
+        std::fs::write(&file_path, b"dummy")?;
+
+        let external_ids_json = serde_json::json!({
+            "imdb": "tt0381061",
+            "tmdb": "36557"
+        });
+        sqlx::query(
+            "INSERT INTO managed_ingest_intents (
+                intent_id, media_type, title, normalized_title, year, external_ids_json,
+                manager_provider_id, manager_item_id, manager_label, source, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind("movie")
+        .bind("Casino Royale")
+        .bind(normalize_managed_intent_title("Casino Royale"))
+        .bind(2006)
+        .bind(serde_json::to_string(&external_ids_json)?)
+        .bind(provider_id.to_string())
+        .bind("1")
+        .bind("default (radarr)")
+        .bind("find_media_add")
+        .execute(&database.pool)
+        .await?;
+
+        let store = ExtensionStore::new(&database.pool);
+        let intent = store
+            .list_active_managed_ingest_intents()
+            .await?
+            .into_iter()
+            .next()
+            .expect("managed intent");
+        ingest_managed_movie_import(
+            &database.pool,
+            None,
+            None,
+            &intent,
+            &file_path.to_string_lossy(),
+        )
+        .await?;
+
+        let row =
+            sqlx::query("SELECT title, year, external_imdb, external_tmdb FROM movies LIMIT 1")
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(row.get::<String, _>("title"), "Casino Royale");
+        assert_eq!(row.get::<i32, _>("year"), 2006);
+        assert_eq!(
+            row.try_get::<String, _>("external_imdb").ok().as_deref(),
+            Some("tt0381061")
+        );
+        assert_eq!(
+            row.try_get::<String, _>("external_tmdb").ok().as_deref(),
+            Some("36557")
+        );
+        let matched: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(last_matched_at AS TEXT) FROM managed_ingest_intents LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(matched.as_deref().is_some_and(|value| !value.is_empty()));
+        let (provenance_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM managed_library_provenance")
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(provenance_count, 1);
+
+        let noisy_scan = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds::default(),
+                title: "Casino Royale DDP 5 1 hallowed".to_string(),
+                year: None,
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: file_path.to_string_lossy().to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, noisy_scan, false).await?;
+
+        let (movie_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM movies")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(movie_count, 1);
+        let row = sqlx::query("SELECT title, year FROM movies LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("title"), "Casino Royale");
+        assert_eq!(row.get::<i32, _>("year"), 2006);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_import_event_hydrates_movie_metadata_and_artwork() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let provider_id = Uuid::new_v4();
+        let file_dir = tempdir()?;
+        let file_path = file_dir
+            .path()
+            .join("Casino Royale 2006 BluRay 1080p DDP 5 1 x264-hallowed.mkv");
+        std::fs::write(&file_path, b"dummy")?;
+        let artwork_dir = tempdir()?;
+        let (cinemeta_base_url, shutdown_tx) = start_mock_cinemeta_server().await?;
+
+        let mut metadata_config = MetadataConfig::default();
+        metadata_config.cinemeta_base_url = cinemeta_base_url;
+        metadata_config.request_timeout_seconds = 2;
+        let metadata = MetadataService::new(metadata_config)?;
+        let artwork = ArtworkService::new(artwork_dir.path(), 2)?;
+
+        let intent_id = store
+            .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+                media_type: MediaType::Movie,
+                title: "Casino Royale".to_string(),
+                normalized_title: normalize_managed_intent_title("Casino Royale"),
+                year: Some(2006),
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt0381061".to_string()),
+                    tmdb: Some("36557".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("1".to_string()),
+                manager_label: Some("default (radarr)".to_string()),
+                source: "find_media_add".to_string(),
+            })
+            .await?;
+        let intent = store
+            .list_active_managed_ingest_intents()
+            .await?
+            .into_iter()
+            .find(|intent| intent.intent_id == intent_id)
+            .expect("managed intent");
+        let event = store
+            .upsert_managed_import_event(&NewManagedImportEvent {
+                event_key: "test-radarr-movie-metadata-event".to_string(),
+                intent_id,
+                media_type: MediaType::Movie,
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt0381061".to_string()),
+                    tmdb: Some("36557".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("1".to_string()),
+                manager_label: Some("default (radarr)".to_string()),
+                manager_implementation: Some("radarr".to_string()),
+                imported_files: vec![ManagedImportFile {
+                    path: file_path.to_string_lossy().to_string(),
+                    season_number: None,
+                    episode_number: None,
+                    absolute_episode_number: None,
+                    episode_title: None,
+                    size_bytes: None,
+                    container: Some("mkv".to_string()),
+                    video_codec: Some("h264".to_string()),
+                    audio_codec: Some("aac".to_string()),
+                }],
+                raw_manager_payload: None,
+                imported_at: Some(Utc::now()),
+            })
+            .await?;
+
+        let linked = ingest_managed_import_event(
+            &database.pool,
+            Some(&metadata),
+            None,
+            Some(&artwork),
+            &intent,
+            &event,
+        )
+        .await?;
+        let _ = shutdown_tx.send(());
+        assert!(linked.is_some());
+
+        let row = sqlx::query("SELECT metadata_json, runtime_seconds FROM movies LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        let metadata_json: String = row.get("metadata_json");
+        let metadata_json: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(
+            metadata_json.get("description").and_then(Value::as_str),
+            Some("A managed Casino Royale description.")
+        );
+        assert_eq!(row.get::<i32, _>("runtime_seconds"), 144 * 60);
+
+        let artwork_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = ?",
+        )
+        .bind(linked.expect("linked movie").to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(artwork_count, 2);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM managed_import_events LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(status, "linked");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_import_event_prefers_tvdb_movie_metadata_and_artwork() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let provider_id = Uuid::new_v4();
+        let file_dir = tempdir()?;
+        let file_path = file_dir
+            .path()
+            .join("Casino Royale 2006 BluRay 1080p DDP 5 1 x264-hallowed.mkv");
+        std::fs::write(&file_path, b"dummy")?;
+        let artwork_dir = tempdir()?;
+        let (cinemeta_base_url, cinemeta_shutdown_tx) = start_mock_cinemeta_server().await?;
+        let (tvdb_base_url, tvdb_shutdown_tx) = start_mock_tvdb_movie_server().await?;
+
+        let mut metadata_config = MetadataConfig::default();
+        metadata_config.cinemeta_base_url = cinemeta_base_url;
+        metadata_config.request_timeout_seconds = 2;
+        let metadata = MetadataService::new(metadata_config)?;
+        let mut classifier_config = ClassifierConfig::default();
+        classifier_config.tvdb_base_url = tvdb_base_url;
+        classifier_config.tvdb_api_key = Some("test-key".to_string());
+        classifier_config.request_timeout_seconds = 2;
+        let linkers = LinkerService::new(classifier_config)?;
+        let artwork = ArtworkService::new(artwork_dir.path(), 2)?;
+
+        let intent_id = store
+            .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+                media_type: MediaType::Movie,
+                title: "Casino Royale".to_string(),
+                normalized_title: normalize_managed_intent_title("Casino Royale"),
+                year: Some(2006),
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt0381061".to_string()),
+                    tmdb: Some("36557".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("1".to_string()),
+                manager_label: Some("default (radarr)".to_string()),
+                source: "find_media_add".to_string(),
+            })
+            .await?;
+        let intent = store
+            .list_active_managed_ingest_intents()
+            .await?
+            .into_iter()
+            .find(|intent| intent.intent_id == intent_id)
+            .expect("managed intent");
+        let event = store
+            .upsert_managed_import_event(&NewManagedImportEvent {
+                event_key: "test-radarr-movie-tvdb-metadata-event".to_string(),
+                intent_id,
+                media_type: MediaType::Movie,
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt0381061".to_string()),
+                    tmdb: Some("36557".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("1".to_string()),
+                manager_label: Some("default (radarr)".to_string()),
+                manager_implementation: Some("radarr".to_string()),
+                imported_files: vec![ManagedImportFile {
+                    path: file_path.to_string_lossy().to_string(),
+                    season_number: None,
+                    episode_number: None,
+                    absolute_episode_number: None,
+                    episode_title: None,
+                    size_bytes: None,
+                    container: Some("mkv".to_string()),
+                    video_codec: Some("h264".to_string()),
+                    audio_codec: Some("aac".to_string()),
+                }],
+                raw_manager_payload: None,
+                imported_at: Some(Utc::now()),
+            })
+            .await?;
+
+        let linked = ingest_managed_import_event(
+            &database.pool,
+            Some(&metadata),
+            Some(&linkers),
+            Some(&artwork),
+            &intent,
+            &event,
+        )
+        .await?;
+        let _ = cinemeta_shutdown_tx.send(());
+        let _ = tvdb_shutdown_tx.send(());
+        let movie_id = linked.expect("linked movie");
+
+        let row = sqlx::query(
+            "SELECT external_imdb, external_tmdb, metadata_json, runtime_seconds FROM movies LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            row.try_get::<String, _>("external_imdb").ok().as_deref(),
+            Some("tt0381061")
+        );
+        assert_eq!(
+            row.try_get::<String, _>("external_tmdb").ok().as_deref(),
+            Some("36557")
+        );
+        assert_eq!(row.get::<i32, _>("runtime_seconds"), 144 * 60);
+        let metadata_json: String = row.get("metadata_json");
+        let metadata_json: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(
+            metadata_json.get("overview").and_then(Value::as_str),
+            Some("TVDB Casino Royale description.")
+        );
+
+        let tvdb_movie_id: String = sqlx::query_scalar(
+            "SELECT external_id FROM movie_external_ids WHERE movie_id = ? AND provider = 'tvdb' LIMIT 1",
+        )
+        .bind(movie_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(tvdb_movie_id, "12345");
+
+        let tvdb_artwork_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = ? AND provider = 'tvdb'",
+        )
+        .bind(movie_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(tvdb_artwork_count, 2);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM managed_import_events LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(status, "linked");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_series_import_event_links_episode_from_intent_identity() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let provider_id = Uuid::new_v4();
+        let file_dir = tempdir()?;
+        let file_path = file_dir.path().join("Bad.Release.Name.S01E02.mkv");
+        std::fs::write(&file_path, b"dummy")?;
+
+        let intent_id = store
+            .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+                media_type: MediaType::Series,
+                title: "Example Show".to_string(),
+                normalized_title: normalize_managed_intent_title("Example Show"),
+                year: Some(2024),
+                external_ids: Some(ExtIds {
+                    imdb: Some("tt1234567".to_string()),
+                    tvdb: Some("321".to_string()),
+                    tvdb_series: Some("321".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("42".to_string()),
+                manager_label: Some("default (sonarr)".to_string()),
+                source: "find_media_add".to_string(),
+            })
+            .await?;
+        let intent = store
+            .list_active_managed_ingest_intents()
+            .await?
+            .into_iter()
+            .find(|intent| intent.intent_id == intent_id)
+            .expect("managed intent");
+        let event = store
+            .upsert_managed_import_event(&NewManagedImportEvent {
+                event_key: "test-sonarr-series-event".to_string(),
+                intent_id,
+                media_type: MediaType::Series,
+                external_ids: Some(ExtIds {
+                    tvdb: Some("321".to_string()),
+                    tvdb_series: Some("321".to_string()),
+                    ..Default::default()
+                }),
+                manager_provider_id: provider_id,
+                manager_item_id: Some("42".to_string()),
+                manager_label: Some("default (sonarr)".to_string()),
+                manager_implementation: Some("sonarr".to_string()),
+                imported_files: vec![ManagedImportFile {
+                    path: file_path.to_string_lossy().to_string(),
+                    season_number: Some(1),
+                    episode_number: Some(2),
+                    absolute_episode_number: None,
+                    episode_title: Some("Second Episode".to_string()),
+                    size_bytes: None,
+                    container: Some("mkv".to_string()),
+                    video_codec: Some("h264".to_string()),
+                    audio_codec: Some("aac".to_string()),
+                }],
+                raw_manager_payload: None,
+                imported_at: Some(Utc::now()),
+            })
+            .await?;
+
+        ingest_managed_import_event(&database.pool, None, None, None, &intent, &event).await?;
+
+        let row = sqlx::query(
+            "SELECT title, year, external_imdb, external_tvdb_series FROM series LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(row.get::<String, _>("title"), "Example Show");
+        assert_eq!(row.get::<i32, _>("year"), 2024);
+        assert_eq!(
+            row.try_get::<String, _>("external_imdb").ok().as_deref(),
+            Some("tt1234567")
+        );
+        assert_eq!(
+            row.try_get::<String, _>("external_tvdb_series")
+                .ok()
+                .as_deref(),
+            Some("321")
+        );
+        let episode = sqlx::query(
+            "SELECT season_number, episode_number, title, CAST(has_file AS INTEGER) AS has_file FROM episodes LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(episode.get::<i32, _>("season_number"), 1);
+        assert_eq!(episode.get::<i32, _>("episode_number"), 2);
+        assert_eq!(
+            episode.try_get::<String, _>("title").ok().as_deref(),
+            Some("Second Episode")
+        );
+        assert_eq!(episode.get::<i32, _>("has_file"), 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM managed_import_events LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(status, "linked");
+        let matched: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(last_matched_at AS TEXT) FROM managed_ingest_intents LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(matched.as_deref().is_some_and(|value| !value.is_empty()));
+
+        let noisy_scan = vec![MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Series,
+                external_ids: ExtIds::default(),
+                title: "Bad Release Name".to_string(),
+                year: None,
+                season: Some(1),
+                episode: Some(2),
+            },
+            files: vec![FD {
+                path: file_path.to_string_lossy().to_string(),
+                size_bytes: Some(2048),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        }];
+        run_full_scan(&database.pool, noisy_scan, false).await?;
+
+        let (series_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM series")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(series_count, 1);
+        let title: String = sqlx::query_scalar("SELECT title FROM series LIMIT 1")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(title, "Example Show");
 
         Ok(())
     }

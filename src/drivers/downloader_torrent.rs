@@ -1571,14 +1571,14 @@ WebUI\\ServerDomains=*
         );
         prefs.insert(
             "temp_path".to_string(),
-            Value::String("/runtime/incomplete".to_string()),
+            Value::String("/downloads/.incomplete".to_string()),
         );
         prefs.insert("temp_path_enabled".to_string(), Value::Bool(true));
         prefs.insert("queueing_enabled".to_string(), Value::Bool(true));
 
         let existing = serde_json::json!({
             "save_path": "/downloads",
-            "temp_path": "/runtime/incomplete",
+            "temp_path": "/downloads/.incomplete",
             "temp_path_enabled": true,
             "queueing_enabled": false
         });
@@ -1609,7 +1609,7 @@ WebUI\\ServerDomains=*
         async fn preferences() -> Json<Value> {
             Json(serde_json::json!({
                 "save_path": "/downloads",
-                "temp_path": "/runtime/incomplete",
+                "temp_path": "/downloads/.incomplete",
                 "temp_path_enabled": true,
                 "queueing_enabled": true,
                 "max_active_downloads": 6
@@ -1667,7 +1667,7 @@ WebUI\\ServerDomains=*
                 crate::drivers::DriverPatch::DownloaderTorrent(
                     crate::drivers::DownloaderTorrentPatch::SetPreferences {
                         default_save_path: Some("/downloads".to_string()),
-                        incomplete_path: Some("/runtime/incomplete".to_string()),
+                        incomplete_path: Some("/downloads/.incomplete".to_string()),
                         use_incomplete: Some(true),
                         max_connections: None,
                         max_connections_per_torrent: None,

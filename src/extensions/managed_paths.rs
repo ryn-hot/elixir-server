@@ -3,7 +3,7 @@ pub const DOWNLOADS_TV_DIR: &str = "/downloads/tv";
 pub const DOWNLOADS_ANIME_DIR: &str = "/downloads/anime";
 pub const DOWNLOADS_MOVIES_DIR: &str = "/downloads/movies";
 
-pub const QBITTORRENT_INCOMPLETE_DIR: &str = "/runtime/incomplete";
+pub const QBITTORRENT_INCOMPLETE_DIR: &str = "/downloads/.incomplete";
 
 pub const NZBGET_MAIN_DIR: &str = "/config";
 pub const NZBGET_INCOMPLETE_DIR: &str = "/runtime/incomplete";

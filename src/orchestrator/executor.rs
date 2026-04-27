@@ -1972,8 +1972,8 @@ impl<'a> Executor<'a> {
     }
 }
 
-const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v1";
-const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v1";
+const BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v2";
+const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v2";
 const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v4";
 const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v4";
 
@@ -4104,10 +4104,9 @@ fn nzbget_profile_version_matches(
 
 fn matches_profile_version(current: Option<&str>, selected: DownloaderPerformanceProfile) -> bool {
     match selected {
-        DownloaderPerformanceProfile::Balanced => matches!(
-            current,
-            Some("v1") | Some(BALANCED_PERFORMANCE_PROFILE_VERSION)
-        ),
+        DownloaderPerformanceProfile::Balanced => {
+            matches!(current, Some(BALANCED_PERFORMANCE_PROFILE_VERSION))
+        }
         DownloaderPerformanceProfile::Aggressive => {
             matches!(current, Some(AGGRESSIVE_PERFORMANCE_PROFILE_VERSION))
         }
@@ -4303,7 +4302,7 @@ fn extension_uses_managed_config_volume(extension_id: &str) -> bool {
 }
 
 fn extension_requires_runtime_volume(extension_id: &str) -> bool {
-    is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
+    is_nzbget_extension_id(extension_id)
 }
 
 fn config_volume_name(instance_id: Uuid) -> String {
@@ -4324,23 +4323,26 @@ fn required_named_runtime_directories(extension_id: &str, volumes: &[VolumeMount
         volume.container_path == "/runtime"
             && volume.source_kind == VolumeMountSourceKind::NamedVolume
     });
+    let has_downloads = volumes
+        .iter()
+        .any(|volume| volume.container_path == DOWNLOADS_ROOT);
 
     if is_nzbget_extension_id(extension_id) {
         if has_named_config {
-            directories.push("/config/scripts".to_string());
+            directories.push(NZBGET_SCRIPT_DIR.to_string());
         }
         if has_named_runtime {
             directories.extend([
-                "/runtime/incomplete".to_string(),
-                "/runtime/nzb".to_string(),
-                "/runtime/queue".to_string(),
-                "/runtime/tmp".to_string(),
+                NZBGET_INCOMPLETE_DIR.to_string(),
+                NZBGET_NZB_DIR.to_string(),
+                NZBGET_QUEUE_DIR.to_string(),
+                NZBGET_TEMP_DIR.to_string(),
             ]);
         }
     }
 
-    if is_qbittorrent_extension_id(extension_id) && has_named_runtime {
-        directories.push("/runtime/incomplete".to_string());
+    if is_qbittorrent_extension_id(extension_id) && has_downloads {
+        directories.push(QBITTORRENT_INCOMPLETE_DIR.to_string());
     }
 
     directories
@@ -8348,6 +8350,44 @@ PersistentKeepalive = 25
     }
 
     #[test]
+    fn prepare_runtime_volumes_keeps_qbittorrent_incomplete_on_downloads_mount() -> Result<()> {
+        let paths = RuntimePaths {
+            data_root: "/tmp/elixir/data".to_string(),
+            extensions_root: "/tmp/elixir/data/extensions".to_string(),
+            downloads_root: "/tmp/elixir/downloads".to_string(),
+            media_root: "/tmp/elixir/media".to_string(),
+        };
+        let instance_id =
+            Uuid::parse_str("e88bc8bb-cd98-4742-8d21-c1c13e28f1e5").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+
+        assert!(
+            prepared
+                .volumes
+                .iter()
+                .any(|volume| volume.container_path == "/config"
+                    && volume.source_kind == VolumeMountSourceKind::NamedVolume)
+        );
+        assert!(
+            !prepared
+                .volumes
+                .iter()
+                .any(|volume| volume.container_path == "/runtime"),
+            "qBittorrent should complete from an incomplete directory on the downloads mount"
+        );
+        assert_eq!(
+            required_named_runtime_directories("elixir.modules.qbittorrent", &prepared.volumes),
+            vec![QBITTORRENT_INCOMPLETE_DIR.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn merge_runtime_config_rewrites_named_config_storage_metadata() -> Result<()> {
         let updated = merge_runtime_config(
             Some(json!({
@@ -8395,8 +8435,8 @@ PersistentKeepalive = 25
     }
 
     #[test]
-    fn downloader_runtime_paths_are_always_runtime_volume_backed() {
-        assert_eq!(qbittorrent_incomplete_path(), "/runtime/incomplete");
+    fn downloader_managed_paths_keep_qbittorrent_completion_on_downloads_mount() {
+        assert_eq!(qbittorrent_incomplete_path(), "/downloads/.incomplete");
         assert_eq!(nzbget_incomplete_path(), "/runtime/incomplete");
         assert_eq!(nzbget_nzb_dir(), "/runtime/nzb");
         assert_eq!(nzbget_queue_dir(), "/runtime/queue");

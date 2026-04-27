@@ -18,8 +18,10 @@ use crate::{
             ProviderContext, extract_arr_queue_records, load_provider_contexts,
             manager_queue_paths, queue_entry_download_id, queue_entry_downloader_label,
             queue_entry_matches_manager_item, remove_nzbget_download_by_download_id,
-            request_arr_json_with_query, request_arr_search_item, request_arr_write,
-            resolve_arr_api_key, resolve_provider_transport_base_url, select_nzbget_provider,
+            remove_qbittorrent_download_by_download_id, request_arr_json_with_query,
+            request_arr_search_item, request_arr_write, resolve_arr_api_key,
+            resolve_provider_transport_base_url, select_nzbget_provider,
+            select_qbittorrent_provider,
         },
         extensions::request_instance_service_json,
     },
@@ -38,6 +40,8 @@ const AUTO_RECOVERY_EARLY_DEAD_MAX_DOWNLOADED_BYTES: u64 = 16 * 1024 * 1024;
 const AUTO_RECOVERY_EARLY_DEAD_MAX_SUCCESS_RATIO: f64 = 0.0;
 const AUTO_RECOVERY_EARLY_DEAD_LOG_WINDOW_ENTRIES: u64 = 200;
 const AUTO_RECOVERY_EARLY_DEAD_LOG_CONFIRMATION_HITS: usize = 3;
+const AUTO_RECOVERY_TORRENT_METADATA_TIMEOUT_SECONDS: i64 = 10 * 60;
+const AUTO_RECOVERY_TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IntentRecoveryView {
@@ -78,6 +82,13 @@ struct ArrHistoryEntry {
 struct ReleaseRecoveryTarget {
     history_id: i64,
     download_id: String,
+    downloader: ReleaseRecoveryDownloader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseRecoveryDownloader {
+    Nzbget,
+    Qbittorrent,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,6 +102,19 @@ struct NzbgetRecoveryGroup {
     downloaded_size_bytes: Option<u64>,
     download_time_sec: Option<u64>,
     message_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QbittorrentRecoveryTorrent {
+    state: String,
+    progress: Option<f64>,
+    downloaded: Option<u64>,
+    amount_left: Option<u64>,
+    download_rate_bps: Option<u64>,
+    connected_seeds: Option<u64>,
+    connected_peers: Option<u64>,
+    completion_on: Option<DateTime<Utc>>,
+    added_on: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +157,30 @@ struct NzbgetRpcGroupParameter {
 struct NzbgetRpcLogEntry {
     #[serde(rename = "Text", default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QbittorrentRecoveryTorrentInfo {
+    #[serde(default)]
+    hash: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    progress: Option<f64>,
+    #[serde(default)]
+    downloaded: Option<u64>,
+    #[serde(default)]
+    amount_left: Option<u64>,
+    #[serde(default)]
+    dlspeed: Option<u64>,
+    #[serde(default)]
+    num_seeds: Option<u64>,
+    #[serde(default)]
+    num_leechs: Option<u64>,
+    #[serde(default)]
+    completion_on: Option<i64>,
+    #[serde(default)]
+    added_on: Option<i64>,
 }
 
 pub async fn start_acquisition_recovery_loop(state: AppState) {
@@ -211,10 +259,12 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
         .map(|provider| (provider.detail.provider.provider_id, provider))
         .collect();
     let nzbget_provider = select_nzbget_provider(&contexts);
+    let qbittorrent_provider = select_qbittorrent_provider(&contexts);
 
     let mut queue_cache = HashMap::<Uuid, Value>::new();
     let mut history_cache = HashMap::<Uuid, Value>::new();
     let mut nzbget_groups_cache = None::<HashMap<String, NzbgetRecoveryGroup>>;
+    let mut qbittorrent_torrents_cache = None::<HashMap<String, QbittorrentRecoveryTorrent>>;
     let mut state_doc = load_recovery_state(&store).await?;
     let mut changed = false;
     let now = Utc::now();
@@ -304,7 +354,31 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
         )
         .await
         {
-            Ok(value) => value,
+            Ok(Some(value)) => Some(value),
+            Ok(None) => match find_qbittorrent_recovery_target(
+                state,
+                &store,
+                provider,
+                &implementation,
+                &intent,
+                qbittorrent_provider,
+                &mut queue_cache,
+                &mut history_cache,
+                &mut qbittorrent_torrents_cache,
+                true,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        manager_provider_id = %intent.manager_provider_id,
+                        "skipping acquisition recovery target detection: {err}"
+                    );
+                    continue;
+                }
+            },
             Err(err) => {
                 warn!(
                     intent_id = %intent.intent_id,
@@ -329,39 +403,16 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
         )
         .await
         {
-            Ok(()) => {
-                let removed_dead_job = if let Some(nzbget_provider) = nzbget_provider {
-                    match remove_nzbget_download_by_download_id(
-                        state,
-                        &store,
-                        nzbget_provider,
-                        &target.download_id,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            warn!(
-                                intent_id = %intent.intent_id,
-                                manager_provider_id = %intent.manager_provider_id,
-                                history_id = target.history_id,
-                                download_id = %target.download_id,
-                                "auto recovery failed to remove dead NZBGet job after manager failover: {err}"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                Ok(if removed_dead_job {
-                    "Auto recovery blacklisted the dead NZBGet release in the manager, removed the dead NZBGet job, and requested another release."
-                        .to_string()
-                } else {
-                    "Auto recovery blacklisted the dead NZBGet release in the manager and requested another release."
-                        .to_string()
-                })
-            }
+            Ok(()) => Ok(cleanup_failed_release_download(
+                state,
+                &store,
+                &intent,
+                nzbget_provider,
+                qbittorrent_provider,
+                &target,
+                true,
+            )
+            .await),
             Err(err) => Err(err),
         };
 
@@ -438,6 +489,9 @@ async fn execute_release_recovery(
     let mut queue_cache = HashMap::<Uuid, Value>::new();
     let mut history_cache = HashMap::<Uuid, Value>::new();
     let mut nzbget_groups_cache = None::<HashMap<String, NzbgetRecoveryGroup>>;
+    let mut qbittorrent_torrents_cache = None::<HashMap<String, QbittorrentRecoveryTorrent>>;
+    let nzbget_provider = select_nzbget_provider(contexts);
+    let qbittorrent_provider = select_qbittorrent_provider(contexts);
 
     if let Some(target) = find_nzbget_recovery_target(
         state,
@@ -445,7 +499,7 @@ async fn execute_release_recovery(
         provider,
         &implementation,
         intent,
-        select_nzbget_provider(contexts),
+        nzbget_provider,
         &mut queue_cache,
         &mut history_cache,
         &mut nzbget_groups_cache,
@@ -455,25 +509,44 @@ async fn execute_release_recovery(
     {
         request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
             .await?;
-        let removed_failed_download =
-            if let Some(nzbget_provider) = select_nzbget_provider(contexts) {
-                remove_nzbget_download_by_download_id(
-                    state,
-                    store,
-                    nzbget_provider,
-                    &target.download_id,
-                )
-                .await?
-            } else {
-                false
-            };
-        return Ok(if removed_failed_download {
-            "Blacklisted the dead NZBGet release in the manager, removed the dead NZBGet job, and requested another release."
-                    .to_string()
-        } else {
-            "Blacklisted the dead NZBGet release in the manager and requested another release."
-                .to_string()
-        });
+        return Ok(cleanup_failed_release_download(
+            state,
+            store,
+            intent,
+            nzbget_provider,
+            qbittorrent_provider,
+            &target,
+            true,
+        )
+        .await);
+    }
+
+    if let Some(target) = find_qbittorrent_recovery_target(
+        state,
+        store,
+        provider,
+        &implementation,
+        intent,
+        qbittorrent_provider,
+        &mut queue_cache,
+        &mut history_cache,
+        &mut qbittorrent_torrents_cache,
+        true,
+    )
+    .await?
+    {
+        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
+            .await?;
+        return Ok(cleanup_failed_release_download(
+            state,
+            store,
+            intent,
+            nzbget_provider,
+            qbittorrent_provider,
+            &target,
+            true,
+        )
+        .await);
     }
 
     if let Some(target) = find_nzbget_recovery_target(
@@ -482,7 +555,7 @@ async fn execute_release_recovery(
         provider,
         &implementation,
         intent,
-        select_nzbget_provider(contexts),
+        nzbget_provider,
         &mut queue_cache,
         &mut history_cache,
         &mut nzbget_groups_cache,
@@ -492,25 +565,44 @@ async fn execute_release_recovery(
     {
         request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
             .await?;
-        let removed_failed_download =
-            if let Some(nzbget_provider) = select_nzbget_provider(contexts) {
-                remove_nzbget_download_by_download_id(
-                    state,
-                    store,
-                    nzbget_provider,
-                    &target.download_id,
-                )
-                .await?
-            } else {
-                false
-            };
-        return Ok(if removed_failed_download {
-            "Marked the current manager release as failed, removed the dead NZBGet job, and requested another release."
-                    .to_string()
-        } else {
-            "Marked the current manager release as failed and requested another release."
-                .to_string()
-        });
+        return Ok(cleanup_failed_release_download(
+            state,
+            store,
+            intent,
+            nzbget_provider,
+            qbittorrent_provider,
+            &target,
+            false,
+        )
+        .await);
+    }
+
+    if let Some(target) = find_qbittorrent_recovery_target(
+        state,
+        store,
+        provider,
+        &implementation,
+        intent,
+        qbittorrent_provider,
+        &mut queue_cache,
+        &mut history_cache,
+        &mut qbittorrent_torrents_cache,
+        false,
+    )
+    .await?
+    {
+        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
+            .await?;
+        return Ok(cleanup_failed_release_download(
+            state,
+            store,
+            intent,
+            nzbget_provider,
+            qbittorrent_provider,
+            &target,
+            false,
+        )
+        .await);
     }
 
     let history_value = load_arr_history_page(state, store, provider, &implementation).await?;
@@ -547,16 +639,43 @@ async fn execute_release_recovery(
         .find(|entry| queue_entry_matches_manager_item(entry, &implementation, manager_item_id));
 
     let mut removed_failed_download = false;
+    let mut removed_downloader_label = None::<&'static str>;
     if let Some(entry) = queue_entry.as_ref()
         && let Some(download_id) = queue_entry_download_id(entry)
         && queue_entry_downloader_label(entry)
             .map(|value| value.to_ascii_lowercase().contains("nzbget"))
             .unwrap_or(false)
-        && let Some(nzbget_provider) = select_nzbget_provider(contexts)
+        && let Some(nzbget_provider) = nzbget_provider
     {
         removed_failed_download =
             remove_nzbget_download_by_download_id(state, store, nzbget_provider, &download_id)
                 .await?;
+        removed_downloader_label = Some("NZBGet job");
+    } else if let Some(entry) = queue_entry.as_ref()
+        && let Some(download_id) = queue_entry_download_id(entry)
+        && queue_entry_downloader_label(entry)
+            .map(|value| value.to_ascii_lowercase().contains("qbittorrent"))
+            .unwrap_or(false)
+        && let Some(qbittorrent_provider) = qbittorrent_provider
+    {
+        if qbittorrent_torrents_cache.is_none() {
+            qbittorrent_torrents_cache =
+                Some(load_qbittorrent_torrent_index(state, store, qbittorrent_provider).await?);
+        }
+        if qbittorrent_torrent_index_has_local_payload(&qbittorrent_torrents_cache, &download_id) {
+            return Ok(
+                "qBittorrent reports local payload data for the current torrent. Elixir left it alone; import the recovered files or clear the torrent manually before searching again."
+                    .to_string(),
+            );
+        }
+        removed_failed_download = remove_qbittorrent_download_by_download_id(
+            state,
+            store,
+            qbittorrent_provider,
+            &download_id,
+        )
+        .await?;
+        removed_downloader_label = Some("qBittorrent torrent");
     }
 
     request_arr_search_item(
@@ -568,10 +687,104 @@ async fn execute_release_recovery(
     .await?;
 
     Ok(if removed_failed_download {
-        "Removed the failed NZBGet job and started a fresh search for another release.".to_string()
+        format!(
+            "Removed the failed {} and started a fresh search for another release.",
+            removed_downloader_label.unwrap_or("download")
+        )
     } else {
         "Started a fresh search for another release.".to_string()
     })
+}
+
+async fn cleanup_failed_release_download(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    intent: &ManagedIngestIntent,
+    nzbget_provider: Option<&ProviderContext>,
+    qbittorrent_provider: Option<&ProviderContext>,
+    target: &ReleaseRecoveryTarget,
+    auto_recovery: bool,
+) -> String {
+    let removed_failed_download = match target.downloader {
+        ReleaseRecoveryDownloader::Nzbget => {
+            if let Some(nzbget_provider) = nzbget_provider {
+                match remove_nzbget_download_by_download_id(
+                    state,
+                    store,
+                    nzbget_provider,
+                    &target.download_id,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            manager_provider_id = %intent.manager_provider_id,
+                            history_id = target.history_id,
+                            download_id = %target.download_id,
+                            "failed to remove dead NZBGet job after manager failover: {err}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        }
+        ReleaseRecoveryDownloader::Qbittorrent => {
+            if let Some(qbittorrent_provider) = qbittorrent_provider {
+                match remove_qbittorrent_download_by_download_id(
+                    state,
+                    store,
+                    qbittorrent_provider,
+                    &target.download_id,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            manager_provider_id = %intent.manager_provider_id,
+                            history_id = target.history_id,
+                            download_id = %target.download_id,
+                            "failed to remove dead qBittorrent torrent after manager failover: {err}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        }
+    };
+
+    let prefix = match (auto_recovery, target.downloader) {
+        (true, ReleaseRecoveryDownloader::Nzbget) => {
+            "Auto recovery blacklisted the dead NZBGet release in the manager"
+        }
+        (true, ReleaseRecoveryDownloader::Qbittorrent) => {
+            "Auto recovery blacklisted the dead torrent release in the manager"
+        }
+        (false, ReleaseRecoveryDownloader::Nzbget) => {
+            "Marked the current manager release as failed"
+        }
+        (false, ReleaseRecoveryDownloader::Qbittorrent) => {
+            "Marked the current torrent release as failed"
+        }
+    };
+
+    let removed_phrase = match target.downloader {
+        ReleaseRecoveryDownloader::Nzbget => "removed the dead NZBGet job",
+        ReleaseRecoveryDownloader::Qbittorrent => "removed the dead qBittorrent torrent",
+    };
+
+    if removed_failed_download {
+        format!("{prefix}, {removed_phrase}, and requested another release.")
+    } else {
+        format!("{prefix} and requested another release.")
+    }
 }
 
 struct ArrTransport {
@@ -690,6 +903,107 @@ async fn find_nzbget_recovery_target(
     Ok(Some(ReleaseRecoveryTarget {
         history_id: history_entry.history_id,
         download_id,
+        downloader: ReleaseRecoveryDownloader::Nzbget,
+    }))
+}
+
+async fn find_qbittorrent_recovery_target(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &ProviderContext,
+    implementation: &str,
+    intent: &ManagedIngestIntent,
+    qbittorrent_provider: Option<&ProviderContext>,
+    queue_cache: &mut HashMap<Uuid, Value>,
+    history_cache: &mut HashMap<Uuid, Value>,
+    qbittorrent_torrents_cache: &mut Option<HashMap<String, QbittorrentRecoveryTorrent>>,
+    require_dead_qbittorrent: bool,
+) -> AnyResult<Option<ReleaseRecoveryTarget>> {
+    let manager_item_id = match intent.manager_item_id.as_deref() {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return Ok(None),
+    };
+
+    let transport = resolve_arr_transport(state, store, provider, implementation).await?;
+    let queue_value = match queue_cache.get(&intent.manager_provider_id) {
+        Some(value) => value.clone(),
+        None => {
+            let value =
+                load_arr_queue_page(&transport.base_url, &transport.api_key, implementation)
+                    .await?;
+            queue_cache.insert(intent.manager_provider_id, value.clone());
+            value
+        }
+    };
+
+    let queue_entry = extract_arr_queue_records(&queue_value)
+        .into_iter()
+        .find(|entry| {
+            queue_entry_matches_manager_item(entry, implementation, manager_item_id)
+                && queue_entry_downloader_label(entry)
+                    .map(|value| value.to_ascii_lowercase().contains("qbittorrent"))
+                    .unwrap_or(false)
+                && queue_entry_download_id(entry).is_some()
+        });
+    let Some(queue_entry) = queue_entry else {
+        return Ok(None);
+    };
+    let Some(download_id) = queue_entry_download_id(&queue_entry)
+        .as_deref()
+        .map(normalize_download_id)
+    else {
+        return Ok(None);
+    };
+
+    if let Some(qbittorrent_provider) = qbittorrent_provider {
+        if qbittorrent_torrents_cache.is_none() {
+            *qbittorrent_torrents_cache =
+                Some(load_qbittorrent_torrent_index(state, store, qbittorrent_provider).await?);
+        }
+
+        let Some(torrent) = qbittorrent_torrents_cache
+            .as_ref()
+            .and_then(|torrents| torrents.get(&download_id))
+        else {
+            if require_dead_qbittorrent {
+                return Ok(None);
+            }
+            return Ok(None);
+        };
+
+        if qbittorrent_torrent_has_local_payload(torrent) {
+            return Ok(None);
+        }
+
+        if require_dead_qbittorrent && !qbittorrent_torrent_is_auto_recovery_candidate(torrent) {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    }
+
+    let history_value = match history_cache.get(&intent.manager_provider_id) {
+        Some(value) => value.clone(),
+        None => {
+            let value = load_arr_history_page(state, store, provider, implementation).await?;
+            history_cache.insert(intent.manager_provider_id, value.clone());
+            value
+        }
+    };
+    let Some(history_entry) = find_latest_history_entry_for_download(
+        &history_value,
+        implementation,
+        manager_item_id,
+        &download_id,
+        &["grabbed", "downloadfailed"],
+    ) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ReleaseRecoveryTarget {
+        history_id: history_entry.history_id,
+        download_id,
+        downloader: ReleaseRecoveryDownloader::Qbittorrent,
     }))
 }
 
@@ -726,6 +1040,59 @@ async fn load_arr_history_page(
         ],
     )
     .await
+}
+
+async fn load_qbittorrent_torrent_index(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &ProviderContext,
+) -> AnyResult<HashMap<String, QbittorrentRecoveryTorrent>> {
+    let value = request_instance_service_json(
+        state,
+        store,
+        provider.detail.provider.instance_id,
+        ReqwestMethod::GET,
+        "api/v2/torrents/info",
+        None,
+    )
+    .await?;
+    let torrents: Vec<QbittorrentRecoveryTorrentInfo> =
+        serde_json::from_value(value).context("parsing qbittorrent recovery queue")?;
+
+    let mut index = HashMap::new();
+    for torrent in torrents {
+        let hash = normalize_download_id(&torrent.hash);
+        if hash.is_empty() {
+            continue;
+        }
+
+        index.insert(
+            hash,
+            QbittorrentRecoveryTorrent {
+                state: torrent
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                progress: torrent.progress,
+                downloaded: torrent.downloaded,
+                amount_left: torrent.amount_left,
+                download_rate_bps: torrent.dlspeed,
+                connected_seeds: torrent.num_seeds,
+                connected_peers: torrent.num_leechs,
+                completion_on: torrent
+                    .completion_on
+                    .filter(|timestamp| *timestamp > 0)
+                    .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0)),
+                added_on: torrent
+                    .added_on
+                    .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0)),
+            },
+        );
+    }
+
+    Ok(index)
 }
 
 async fn load_nzbget_group_index(
@@ -953,6 +1320,59 @@ fn nzbget_log_entry_reports_full_file_failure(text: &str) -> bool {
     };
 
     total > 0 && failed == total
+}
+
+fn qbittorrent_torrent_is_auto_recovery_candidate(torrent: &QbittorrentRecoveryTorrent) -> bool {
+    if qbittorrent_torrent_has_local_payload(torrent) {
+        return false;
+    }
+
+    if matches!(torrent.state.as_str(), "error" | "missingfiles") {
+        return true;
+    }
+
+    let Some(added_on) = torrent.added_on else {
+        return false;
+    };
+    let age_seconds = (Utc::now() - added_on).num_seconds();
+    let connected_seeds = torrent.connected_seeds.unwrap_or(0);
+    let connected_peers = torrent.connected_peers.unwrap_or(0);
+    let no_connections = connected_seeds == 0 && connected_peers == 0;
+    let download_rate = torrent.download_rate_bps.unwrap_or(0);
+
+    if matches!(torrent.state.as_str(), "metadl" | "forcedmetadl")
+        && age_seconds >= AUTO_RECOVERY_TORRENT_METADATA_TIMEOUT_SECONDS
+        && no_connections
+        && download_rate == 0
+    {
+        return true;
+    }
+
+    matches!(
+        torrent.state.as_str(),
+        "downloading" | "stalleddl" | "forceddl"
+    ) && age_seconds >= AUTO_RECOVERY_TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS
+        && no_connections
+        && download_rate == 0
+}
+
+fn qbittorrent_torrent_index_has_local_payload(
+    torrents: &Option<HashMap<String, QbittorrentRecoveryTorrent>>,
+    download_id: &str,
+) -> bool {
+    let download_id = normalize_download_id(download_id);
+    torrents
+        .as_ref()
+        .and_then(|torrents| torrents.get(&download_id))
+        .map(qbittorrent_torrent_has_local_payload)
+        .unwrap_or(false)
+}
+
+fn qbittorrent_torrent_has_local_payload(torrent: &QbittorrentRecoveryTorrent) -> bool {
+    torrent.progress.unwrap_or(0.0) > 0.0
+        || torrent.downloaded.unwrap_or(0) > 0
+        || torrent.amount_left == Some(0)
+        || torrent.completion_on.is_some()
 }
 
 fn normalize_download_id(value: &str) -> String {
@@ -1256,5 +1676,73 @@ mod tests {
         ];
 
         assert!(!nzbget_log_confirms_dead_release(&entries));
+    }
+
+    #[test]
+    fn qbittorrent_torrent_is_auto_recovery_candidate_for_metadata_stall() {
+        let torrent = QbittorrentRecoveryTorrent {
+            state: "metadl".to_string(),
+            download_rate_bps: Some(0),
+            connected_seeds: Some(0),
+            connected_peers: Some(0),
+            added_on: Some(
+                Utc::now()
+                    - chrono::Duration::seconds(AUTO_RECOVERY_TORRENT_METADATA_TIMEOUT_SECONDS),
+            ),
+            ..Default::default()
+        };
+
+        assert!(qbittorrent_torrent_is_auto_recovery_candidate(&torrent));
+    }
+
+    #[test]
+    fn qbittorrent_torrent_is_auto_recovery_candidate_rejects_slow_but_connected_swarm() {
+        let torrent = QbittorrentRecoveryTorrent {
+            state: "metadl".to_string(),
+            download_rate_bps: Some(0),
+            connected_seeds: Some(0),
+            connected_peers: Some(1),
+            added_on: Some(
+                Utc::now()
+                    - chrono::Duration::seconds(AUTO_RECOVERY_TORRENT_METADATA_TIMEOUT_SECONDS),
+            ),
+            ..Default::default()
+        };
+
+        assert!(!qbittorrent_torrent_is_auto_recovery_candidate(&torrent));
+    }
+
+    #[test]
+    fn qbittorrent_torrent_is_auto_recovery_candidate_for_hard_failure() {
+        let torrent = QbittorrentRecoveryTorrent {
+            state: "error".to_string(),
+            ..Default::default()
+        };
+
+        assert!(qbittorrent_torrent_is_auto_recovery_candidate(&torrent));
+    }
+
+    #[test]
+    fn qbittorrent_torrent_is_auto_recovery_candidate_rejects_hard_failure_with_payload() {
+        let torrent = QbittorrentRecoveryTorrent {
+            state: "missingfiles".to_string(),
+            downloaded: Some(1),
+            ..Default::default()
+        };
+
+        assert!(!qbittorrent_torrent_is_auto_recovery_candidate(&torrent));
+    }
+
+    #[test]
+    fn qbittorrent_torrent_is_auto_recovery_candidate_rejects_completed_payload() {
+        let torrent = QbittorrentRecoveryTorrent {
+            state: "error".to_string(),
+            progress: Some(1.0),
+            amount_left: Some(0),
+            completion_on: Some(Utc::now()),
+            ..Default::default()
+        };
+
+        assert!(!qbittorrent_torrent_is_auto_recovery_candidate(&torrent));
     }
 }

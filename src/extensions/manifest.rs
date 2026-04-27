@@ -1984,7 +1984,7 @@ control_surface:
     }
 
     #[test]
-    fn repair_builtin_manifest_updates_qbittorrent_defaults_to_runtime_paths() {
+    fn repair_builtin_manifest_updates_qbittorrent_defaults_to_downloads_incomplete_path() {
         let mut raw = json!({
             "id": "elixir.connectors.qbittorrent_defaults",
             "actions": [
@@ -2000,7 +2000,7 @@ control_surface:
                     "patch": {
                         "op": "set_preferences",
                         "default_save_path": "/downloads",
-                        "incomplete_path": "/downloads/.incomplete",
+                        "incomplete_path": "/runtime/incomplete",
                         "use_incomplete": true
                     }
                 }
@@ -2011,7 +2011,7 @@ control_surface:
         assert_eq!(
             raw.pointer("/actions/1/patch/incomplete_path")
                 .and_then(serde_json::Value::as_str),
-            Some("/runtime/incomplete")
+            Some("/downloads/.incomplete")
         );
     }
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{AnyPool, QueryBuilder, Row, TypeInfo, Value, ValueRef, any::AnyRow};
 use std::time::Duration;
 use uuid::Uuid;
@@ -108,6 +109,64 @@ pub struct ManagedIngestIntent {
     pub source: String,
     pub active: bool,
     pub last_matched_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedImportFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_number: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_number: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_episode_number: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManagedImportEvent {
+    pub event_key: String,
+    pub intent_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub imported_files: Vec<ManagedImportFile>,
+    pub raw_manager_payload: Option<serde_json::Value>,
+    pub imported_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedImportEvent {
+    pub event_id: Uuid,
+    pub event_key: String,
+    pub intent_id: Uuid,
+    pub media_type: crate::db::models::MediaType,
+    pub external_ids: Option<ExternalIds>,
+    pub manager_provider_id: Uuid,
+    pub manager_item_id: Option<String>,
+    pub manager_label: Option<String>,
+    pub manager_implementation: Option<String>,
+    pub imported_files: Vec<ManagedImportFile>,
+    pub raw_manager_payload: Option<serde_json::Value>,
+    pub status: String,
+    pub linked_media_item_id: Option<Uuid>,
+    pub last_error: Option<String>,
+    pub imported_at: Option<DateTime<Utc>>,
+    pub processed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1008,6 +1067,189 @@ impl<'a> ExtensionStore<'a> {
              WHERE intent_id = ?",
         )
         .bind(intent_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_managed_import_event(
+        &self,
+        data: &NewManagedImportEvent,
+    ) -> Result<ManagedImportEvent> {
+        let external_ids_json = match data.external_ids.as_ref() {
+            Some(ids) => Some(
+                serde_json::to_value(ids)
+                    .context("serializing managed import event external ids")?,
+            ),
+            None => None,
+        };
+        let external_ids_json = json_to_string(external_ids_json.as_ref())?;
+        let imported_files_json = serde_json::to_string(&data.imported_files)
+            .context("serializing managed import event files")?;
+        let raw_manager_payload_json = json_to_string(data.raw_manager_payload.as_ref())?;
+        let imported_at = data.imported_at.map(db_datetime_string);
+
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_import_events (
+                event_id,
+                event_key,
+                intent_id,
+                media_type,
+                external_ids_json,
+                manager_provider_id,
+                manager_item_id,
+                manager_label,
+                manager_implementation,
+                imported_files_json,
+                raw_manager_payload_json,
+                status,
+                imported_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ON CONFLICT(event_key) DO UPDATE SET
+                intent_id = excluded.intent_id,
+                media_type = excluded.media_type,
+                external_ids_json = COALESCE(excluded.external_ids_json, managed_import_events.external_ids_json),
+                manager_provider_id = excluded.manager_provider_id,
+                manager_item_id = excluded.manager_item_id,
+                manager_label = excluded.manager_label,
+                manager_implementation = excluded.manager_implementation,
+                imported_files_json = excluded.imported_files_json,
+                raw_manager_payload_json = COALESCE(excluded.raw_manager_payload_json, managed_import_events.raw_manager_payload_json),
+                status = CASE
+                    WHEN managed_import_events.status = 'linked' THEN 'linked'
+                    ELSE 'pending'
+                END,
+                last_error = CASE
+                    WHEN managed_import_events.status = 'linked' THEN managed_import_events.last_error
+                    ELSE NULL
+                END,
+                imported_at = COALESCE(excluded.imported_at, managed_import_events.imported_at),
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&data.event_key)
+        .bind(data.intent_id.to_string())
+        .bind(data.media_type.as_str())
+        .bind(external_ids_json.as_deref())
+        .bind(data.manager_provider_id.to_string())
+        .bind(data.manager_item_id.as_deref())
+        .bind(data.manager_label.as_deref())
+        .bind(data.manager_implementation.as_deref())
+        .bind(&imported_files_json)
+        .bind(raw_manager_payload_json.as_deref())
+        .bind(imported_at.as_deref())
+        .execute(self.pool)
+        .await?;
+
+        self.get_managed_import_event_by_key(&data.event_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("managed import event was not persisted"))
+    }
+
+    pub async fn list_pending_managed_import_events(&self) -> Result<Vec<ManagedImportEvent>> {
+        let rows = sqlx::query(
+            "SELECT
+                event_id,
+                event_key,
+                intent_id,
+                media_type,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                manager_provider_id,
+                CAST(manager_item_id AS TEXT) AS manager_item_id,
+                CAST(manager_label AS TEXT) AS manager_label,
+                CAST(manager_implementation AS TEXT) AS manager_implementation,
+                CAST(imported_files_json AS TEXT) AS imported_files_json,
+                CAST(raw_manager_payload_json AS TEXT) AS raw_manager_payload_json,
+                status,
+                CAST(linked_media_item_id AS TEXT) AS linked_media_item_id,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(imported_at AS TEXT) AS imported_at,
+                CAST(processed_at AS TEXT) AS processed_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM managed_import_events
+             WHERE status = 'pending'
+             ORDER BY updated_at ASC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(map_managed_import_event(&row)?);
+        }
+        Ok(items)
+    }
+
+    pub async fn get_managed_import_event_by_key(
+        &self,
+        event_key: &str,
+    ) -> Result<Option<ManagedImportEvent>> {
+        let row = sqlx::query(
+            "SELECT
+                event_id,
+                event_key,
+                intent_id,
+                media_type,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                manager_provider_id,
+                CAST(manager_item_id AS TEXT) AS manager_item_id,
+                CAST(manager_label AS TEXT) AS manager_label,
+                CAST(manager_implementation AS TEXT) AS manager_implementation,
+                CAST(imported_files_json AS TEXT) AS imported_files_json,
+                CAST(raw_manager_payload_json AS TEXT) AS raw_manager_payload_json,
+                status,
+                CAST(linked_media_item_id AS TEXT) AS linked_media_item_id,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(imported_at AS TEXT) AS imported_at,
+                CAST(processed_at AS TEXT) AS processed_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM managed_import_events
+             WHERE event_key = ?
+             LIMIT 1",
+        )
+        .bind(event_key)
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| map_managed_import_event(&row)).transpose()
+    }
+
+    pub async fn mark_managed_import_event_linked(
+        &self,
+        event_id: Uuid,
+        linked_media_item_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_import_events
+             SET status = 'linked',
+                 linked_media_item_id = ?,
+                 last_error = NULL,
+                 processed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE event_id = ?",
+        )
+        .bind(linked_media_item_id.to_string())
+        .bind(event_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_managed_import_event_failed(
+        &self,
+        event_id: Uuid,
+        error: &str,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE managed_import_events
+             SET status = 'failed',
+                 last_error = ?,
+                 processed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE event_id = ?",
+        )
+        .bind(error)
+        .bind(event_id.to_string())
         .execute(self.pool)
         .await?;
         Ok(())
@@ -2238,6 +2480,69 @@ fn map_managed_ingest_intent(row: &AnyRow) -> Result<ManagedIngestIntent> {
     })
 }
 
+fn map_managed_import_event(row: &AnyRow) -> Result<ManagedImportEvent> {
+    let event_id_raw: String = row.try_get("event_id")?;
+    let intent_id_raw: String = row.try_get("intent_id")?;
+    let media_type_raw: String = row.try_get("media_type")?;
+    let manager_provider_id_raw: String = row.try_get("manager_provider_id")?;
+    let linked_media_item_id_raw: Option<String> = row_get_opt_string(row, "linked_media_item_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    let external_ids = parse_json_opt(
+        row_get_opt_string(row, "external_ids_json")?,
+        "managed_import_events.external_ids_json",
+    )?
+    .map(serde_json::from_value::<ExternalIds>)
+    .transpose()
+    .context("parsing managed import event external ids")?;
+    let imported_files = parse_json(
+        &row.try_get::<String, _>("imported_files_json")?,
+        "managed_import_events.imported_files_json",
+    )
+    .and_then(|value| {
+        serde_json::from_value::<Vec<ManagedImportFile>>(value)
+            .context("parsing managed import event files")
+    })?;
+    let raw_manager_payload = parse_json_opt(
+        row_get_opt_string(row, "raw_manager_payload_json")?,
+        "managed_import_events.raw_manager_payload_json",
+    )?;
+
+    Ok(ManagedImportEvent {
+        event_id: parse_uuid(&event_id_raw, "managed_import_events.event_id")?,
+        event_key: row.try_get("event_key")?,
+        intent_id: parse_uuid(&intent_id_raw, "managed_import_events.intent_id")?,
+        media_type: parse_media_type(&media_type_raw, "managed_import_events.media_type")?,
+        external_ids,
+        manager_provider_id: parse_uuid(
+            &manager_provider_id_raw,
+            "managed_import_events.manager_provider_id",
+        )?,
+        manager_item_id: row_get_opt_string(row, "manager_item_id")?,
+        manager_label: row_get_opt_string(row, "manager_label")?,
+        manager_implementation: row_get_opt_string(row, "manager_implementation")?,
+        imported_files,
+        raw_manager_payload,
+        status: row.try_get("status")?,
+        linked_media_item_id: linked_media_item_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "managed_import_events.linked_media_item_id"))
+            .transpose()?,
+        last_error: row_get_opt_string(row, "last_error")?,
+        imported_at: parse_datetime_opt(
+            row_get_opt_string(row, "imported_at")?,
+            "managed_import_events.imported_at",
+        )?,
+        processed_at: parse_datetime_opt(
+            row_get_opt_string(row, "processed_at")?,
+            "managed_import_events.processed_at",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "managed_import_events.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "managed_import_events.updated_at")?,
+    })
+}
+
 fn map_managed_library_provenance(row: &AnyRow) -> Result<ManagedLibraryProvenance> {
     let media_item_id_raw: String = row.try_get("media_item_id")?;
     let media_type_raw: String = row.try_get("media_type")?;
@@ -2505,6 +2810,10 @@ fn parse_datetime_opt(value: Option<String>, field: &str) -> Result<Option<DateT
         Some(value) => Ok(Some(parse_datetime(&value, field)?)),
         None => Ok(None),
     }
+}
+
+fn db_datetime_string(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn parse_json(value: &str, field: &str) -> Result<serde_json::Value> {

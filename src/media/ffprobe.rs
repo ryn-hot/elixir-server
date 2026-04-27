@@ -1,9 +1,13 @@
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::process::Command;
+use tokio::time::timeout;
+
+const PACKET_DURATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FfprobeStreams {
@@ -123,20 +127,41 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
     }
 
     if stream_duration_seconds.is_none() {
-        if let Ok(packet_duration) = probe_video_duration_by_packets(path).await {
-            let packet_seconds = packet_duration.round() as i32;
-            if packet_seconds > 0 {
-                match format_duration_seconds {
-                    Some(format_seconds)
-                        if format_seconds as f64 > (packet_seconds as f64 * 1.1) =>
-                    {
-                        meta.duration_seconds = Some(packet_seconds);
+        match timeout(
+            PACKET_DURATION_PROBE_TIMEOUT,
+            probe_video_duration_by_packets(path),
+        )
+        .await
+        {
+            Ok(Ok(packet_duration)) => {
+                let packet_seconds = packet_duration.round() as i32;
+                if packet_seconds > 0 {
+                    match format_duration_seconds {
+                        Some(format_seconds)
+                            if format_seconds as f64 > (packet_seconds as f64 * 1.1) =>
+                        {
+                            meta.duration_seconds = Some(packet_seconds);
+                        }
+                        None => {
+                            meta.duration_seconds = Some(packet_seconds);
+                        }
+                        _ => {}
                     }
-                    None => {
-                        meta.duration_seconds = Some(packet_seconds);
-                    }
-                    _ => {}
                 }
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    path,
+                    error = %err,
+                    "ffprobe packet duration probe failed; using format duration"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    path,
+                    timeout_seconds = PACKET_DURATION_PROBE_TIMEOUT.as_secs(),
+                    "ffprobe packet duration probe timed out; using format duration"
+                );
             }
         }
     }
@@ -145,7 +170,9 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
 }
 
 async fn probe_video_duration_by_packets(path: &str) -> anyhow::Result<f32> {
-    let output = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command.kill_on_drop(true);
+    let output = command
         .arg("-v")
         .arg("error")
         .arg("-select_streams")

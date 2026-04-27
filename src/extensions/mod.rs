@@ -270,8 +270,14 @@ async fn build_candidate_from_path(path: &Path, hash_files: bool) -> Option<Medi
     } else {
         MediaType::Movie
     };
-    let cleaned_title =
+    let mut cleaned_title =
         derive_clean_title(&file_name, media_type).unwrap_or_else(|| title.trim().to_string());
+    if media_type == MediaType::Movie {
+        if let Some((folder_title, folder_year)) = movie_folder_identity_from_parent(path) {
+            cleaned_title = folder_title;
+            year = folder_year.or(year);
+        }
+    }
 
     let identity = MediaIdentity {
         r#type: media_type,
@@ -322,6 +328,16 @@ fn strip_year_suffix(title: &str) -> String {
         return title[..idx].trim().to_string();
     }
     title.to_string()
+}
+
+fn movie_folder_identity_from_parent(path: &Path) -> Option<(String, Option<i32>)> {
+    let folder = path.parent()?.file_name()?.to_string_lossy();
+    let year = extract_year(&folder)?;
+    let title = strip_year_suffix(&folder);
+    if title.trim().is_empty() {
+        return None;
+    }
+    Some((title, Some(year)))
 }
 
 fn parse_season_episode(name: &str) -> (Option<i32>, Option<i32>) {
@@ -563,6 +579,29 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].identity.title, "Example");
         assert_eq!(items[0].identity.year, Some(2024));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_folder_prefers_movie_folder_identity_for_release_names() -> Result<()> {
+        let dir = tempdir()?;
+        let movie_dir = dir.path().join("Casino Royale (2006)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let file_path = movie_dir.join("Casino Royale 2006 BluRay 1080p DDP 5 1 x264-hallowed.mkv");
+        let mut f = File::create(&file_path).await?;
+        f.write_all(b"dummy").await?;
+
+        let source = LocalFolderSource {
+            root_path: dir.path().to_string_lossy().to_string(),
+            hash_files: false,
+        };
+
+        let items = source.scan(None).await?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].identity.r#type, MediaType::Movie);
+        assert_eq!(items[0].identity.title, "Casino Royale");
+        assert_eq!(items[0].identity.year, Some(2006));
 
         Ok(())
     }

@@ -10,7 +10,7 @@ use crate::{
 
 pub mod cinemeta {
     use super::*;
-    use serde::Deserialize;
+    use serde::{Deserialize, Deserializer, de};
 
     #[derive(Debug, Deserialize)]
     struct CineMetaResponse {
@@ -21,9 +21,19 @@ pub mod cinemeta {
     pub struct CineMetaItem {
         #[serde(rename = "imdb_id")]
         pub imdb_id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_runtime_minutes")]
         pub runtime: Option<i32>, // minutes
         pub description: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_string_vec")]
         pub genres: Option<Vec<String>>,
+        #[serde(
+            default,
+            rename = "genre",
+            deserialize_with = "deserialize_string_vec",
+            skip_serializing
+        )]
+        genre_alias: Option<Vec<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_i32")]
         pub year: Option<i32>,
         #[serde(flatten)]
         pub rest: serde_json::Value,
@@ -46,24 +56,24 @@ pub mod cinemeta {
         // Try by imdb id if present.
         if let Some(imdb) = identity.external_ids.imdb.as_ref() {
             let url = format!("{}/meta/{}/{}.json", base_url, media_kind, imdb);
-            if let Ok(res) = client.get(&url).send().await {
-                if res.status().is_success() {
-                    if let Ok(body) = res.json::<CineMetaResponse>().await {
-                        if let Some(meta) = body.meta {
-                            let runtime_seconds = meta.runtime.map(|m| m * 60);
-                            let mut external_ids = ExternalIds::default();
-                            external_ids.imdb = meta.imdb_id.clone();
-                            let json = serde_json::to_value(&meta)?;
-                            return Ok(Some(MetadataResult {
-                                metadata_json: json,
-                                runtime_seconds,
-                                external_ids: Some(external_ids),
-                                description: meta.description.clone(),
-                                genres: meta.genres.clone(),
-                            }));
-                        }
-                    }
-                }
+            let res = client.get(&url).send().await?;
+            if !res.status().is_success() {
+                return Ok(None);
+            }
+            let body = res.json::<CineMetaResponse>().await?;
+            if let Some(meta) = body.meta {
+                let runtime_seconds = meta.runtime.map(|m| m * 60);
+                let mut external_ids = ExternalIds::default();
+                external_ids.imdb = meta.imdb_id.clone();
+                let genres = meta.genres();
+                let json = serde_json::to_value(&meta)?;
+                return Ok(Some(MetadataResult {
+                    metadata_json: json,
+                    runtime_seconds,
+                    external_ids: Some(external_ids),
+                    description: meta.description.clone(),
+                    genres,
+                }));
             }
             return Ok(None);
         }
@@ -82,6 +92,7 @@ pub mod cinemeta {
         let body: SearchResp = res.json().await?;
         if let Some(first) = body.metas.and_then(|mut m| m.pop()) {
             let runtime_seconds = first.runtime.map(|m| m * 60);
+            let genres = first.genres();
             let json = serde_json::to_value(&first)?;
             let external_ids = first.imdb_id.clone().map(|imdb| ExternalIds {
                 imdb: Some(imdb),
@@ -92,7 +103,7 @@ pub mod cinemeta {
                 runtime_seconds,
                 external_ids,
                 description: first.description.clone(),
-                genres: first.genres.clone(),
+                genres,
             }));
         }
         Ok(None)
@@ -126,6 +137,186 @@ pub mod cinemeta {
         base_url.trim().trim_end_matches('/').to_string()
     }
 
+    impl CineMetaItem {
+        fn genres(&self) -> Option<Vec<String>> {
+            self.genres
+                .clone()
+                .filter(|values| !values.is_empty())
+                .or_else(|| self.genre_alias.clone().filter(|values| !values.is_empty()))
+        }
+    }
+
+    fn deserialize_runtime_minutes<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<i32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        Ok(value.as_ref().and_then(parse_runtime_minutes))
+    }
+
+    fn parse_runtime_minutes(value: &serde_json::Value) -> Option<i32> {
+        match value {
+            serde_json::Value::Null => None,
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .and_then(|minutes| positive_i64_to_i32(minutes)),
+            serde_json::Value::String(value) => parse_runtime_minutes_str(value),
+            _ => None,
+        }
+    }
+
+    fn parse_runtime_minutes_str(value: &str) -> Option<i32> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if let Ok(minutes) = value.parse::<i64>() {
+            return positive_i64_to_i32(minutes);
+        }
+        if value.contains(':') {
+            return parse_colon_duration_minutes(value);
+        }
+
+        let lower = value.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let mut total_minutes = 0i64;
+        let mut matched_unit = false;
+        for (index, token) in tokens.iter().enumerate() {
+            let Some((amount, suffix)) = parse_numeric_token(token) else {
+                continue;
+            };
+            let unit = if suffix.is_empty() {
+                tokens.get(index + 1).copied().unwrap_or_default()
+            } else {
+                suffix
+            };
+            if unit.starts_with('h') {
+                total_minutes += amount * 60;
+                matched_unit = true;
+            } else if unit.starts_with('m') {
+                total_minutes += amount;
+                matched_unit = true;
+            } else if unit.starts_with('s') {
+                total_minutes += (amount + 59) / 60;
+                matched_unit = true;
+            }
+        }
+        if matched_unit {
+            return positive_i64_to_i32(total_minutes);
+        }
+
+        lower
+            .split(|ch: char| !ch.is_ascii_digit())
+            .find_map(|part| {
+                if part.is_empty() {
+                    None
+                } else {
+                    part.parse::<i64>().ok().and_then(positive_i64_to_i32)
+                }
+            })
+    }
+
+    fn parse_colon_duration_minutes(value: &str) -> Option<i32> {
+        let parts: Vec<i64> = value
+            .split(':')
+            .map(str::trim)
+            .map(str::parse::<i64>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        let seconds = match parts.as_slice() {
+            [minutes, seconds] => minutes.checked_mul(60)?.checked_add(*seconds)?,
+            [hours, minutes, seconds] => hours
+                .checked_mul(3600)?
+                .checked_add(minutes.checked_mul(60)?)?
+                .checked_add(*seconds)?,
+            _ => return None,
+        };
+        positive_i64_to_i32((seconds + 30) / 60)
+    }
+
+    fn parse_numeric_token(token: &str) -> Option<(i64, &str)> {
+        let digit_len = token
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_digit())
+            .last()
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        if digit_len == 0 {
+            return None;
+        }
+        let amount = token[..digit_len].parse::<i64>().ok()?;
+        Some((amount, &token[digit_len..]))
+    }
+
+    fn positive_i64_to_i32(value: i64) -> Option<i32> {
+        if value > 0 && value <= i32::MAX as i64 {
+            Some(value as i32)
+        } else {
+            None
+        }
+    }
+
+    fn deserialize_string_vec<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Vec<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                let values: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                Ok((!values.is_empty()).then_some(values))
+            }
+            Some(serde_json::Value::Array(values)) => {
+                let values: Vec<String> = values
+                    .into_iter()
+                    .filter_map(|value| match value {
+                        serde_json::Value::String(value) => {
+                            let value = value.trim().to_string();
+                            (!value.is_empty()).then_some(value)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Ok((!values.is_empty()).then_some(values))
+            }
+            Some(other) => Err(de::Error::custom(format!(
+                "expected string or string array, got {other}"
+            ))),
+        }
+    }
+
+    fn deserialize_optional_i32<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<i32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        Ok(value.as_ref().and_then(parse_optional_i32))
+    }
+
+    fn parse_optional_i32(value: &serde_json::Value) -> Option<i32> {
+        match value {
+            serde_json::Value::Null => None,
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .filter(|value| *value >= i32::MIN as i64 && *value <= i32::MAX as i64)
+                .map(|value| value as i32),
+            serde_json::Value::String(value) => value.trim().parse::<i32>().ok(),
+            _ => None,
+        }
+    }
+
     pub fn extract_poster_url(rest: &serde_json::Value) -> Option<String> {
         rest.get("poster")
             .or_else(|| rest.get("posterUrl"))
@@ -150,6 +341,55 @@ pub mod cinemeta {
             return Some(number);
         }
         value.as_str()?.trim().parse::<f64>().ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn deserializes_real_cinemeta_runtime_and_genres() {
+            let response: CineMetaResponse = serde_json::from_value(json!({
+                "meta": {
+                    "imdb_id": "tt0381061",
+                    "runtime": "144 min",
+                    "genre": ["Action", "Adventure", "Thriller"],
+                    "genres": ["Action", "Adventure", "Thriller"],
+                    "year": "2006",
+                    "poster": "https://images.metahub.space/poster/small/tt0381061/img",
+                    "background": "https://images.metahub.space/background/medium/tt0381061/img",
+                    "description": "Casino Royale metadata"
+                }
+            }))
+            .expect("cinemeta response");
+
+            let meta = response.meta.expect("meta");
+            assert_eq!(meta.runtime, Some(144));
+            assert_eq!(meta.year, Some(2006));
+            assert_eq!(
+                meta.genres(),
+                Some(vec![
+                    "Action".to_string(),
+                    "Adventure".to_string(),
+                    "Thriller".to_string()
+                ])
+            );
+
+            let serialized = serde_json::to_value(&meta).expect("serialized meta");
+            assert_eq!(
+                serialized.get("poster").and_then(serde_json::Value::as_str),
+                Some("https://images.metahub.space/poster/small/tt0381061/img")
+            );
+            assert!(serialized.get("genre").is_none());
+        }
+
+        #[test]
+        fn deserializes_runtime_variants() {
+            assert_eq!(parse_runtime_minutes_str("2h 24m"), Some(144));
+            assert_eq!(parse_runtime_minutes_str("02:24:00"), Some(144));
+            assert_eq!(parse_runtime_minutes_str("144"), Some(144));
+        }
     }
 }
 

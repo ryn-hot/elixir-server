@@ -56,6 +56,79 @@ impl LinkerService {
             if let Some(series) = result.series {
                 return Ok(Some(series.id.to_string()));
             }
+            if result
+                .entity_type
+                .as_deref()
+                .is_some_and(|value| tvdb_entity_type_matches(value, "series"))
+            {
+                if let Some(id) = result.id {
+                    return Ok(Some(id.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn link_tvdb_movie_by_imdb(&self, imdb_id: &str) -> Result<Option<String>> {
+        if imdb_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let resp: Option<TvdbRemoteIdResponse> = self
+            .tvdb_get_json(&format!("/search/remoteid/{}", imdb_id), &[])
+            .await?;
+        if let Some(resp) = resp {
+            if let Some(results) = resp.data {
+                for result in results {
+                    if let Some(movie) = result.movie {
+                        return Ok(Some(movie.id.to_string()));
+                    }
+                    if result
+                        .entity_type
+                        .as_deref()
+                        .is_some_and(|value| tvdb_entity_type_matches(value, "movie"))
+                    {
+                        if let Some(id) = result.id {
+                            return Ok(Some(id.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let resp: Option<serde_json::Value> = self
+            .tvdb_get_json(
+                "/search",
+                &[
+                    ("remote_id", imdb_id.trim().to_string()),
+                    ("type", "movie".to_string()),
+                    ("limit", "5".to_string()),
+                ],
+            )
+            .await?;
+        Ok(resp.as_ref().and_then(first_tvdb_movie_search_id))
+    }
+
+    pub async fn fetch_tvdb_movie(&self, tvdb_movie_id: &str) -> Result<Option<serde_json::Value>> {
+        if tvdb_movie_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let resp: Option<serde_json::Value> = self
+            .tvdb_get_json(
+                &format!("/movies/{}/extended", tvdb_movie_id),
+                &[
+                    ("meta", "translations".to_string()),
+                    ("short", "false".to_string()),
+                ],
+            )
+            .await?;
+        if let Some(value) = resp {
+            if let Some(data) = value.get("data") {
+                if data.is_null() {
+                    return Ok(None);
+                }
+                return Ok(Some(data.clone()));
+            }
+            return Ok(Some(value));
         }
         Ok(None)
     }
@@ -337,6 +410,57 @@ impl LinkerService {
     }
 }
 
+fn tvdb_entity_type_matches(value: &str, expected: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    match expected {
+        "movie" => value.contains("movie"),
+        "series" => value.contains("series") || value.contains("show") || value.contains("tv"),
+        _ => false,
+    }
+}
+
+fn first_tvdb_movie_search_id(value: &serde_json::Value) -> Option<String> {
+    let items = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+    for item in items {
+        let type_matches = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| tvdb_entity_type_matches(value, "movie"))
+            .unwrap_or(true);
+        if !type_matches {
+            continue;
+        }
+        if let Some(id) = json_id_string(
+            item.get("tvdb_id")
+                .or_else(|| item.get("tvdbId"))
+                .or_else(|| item.get("id")),
+        ) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn json_id_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number.to_string());
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct TvdbEpisodeRecord {
     pub tvdb_episode_id: Option<String>,
@@ -397,10 +521,19 @@ struct TvdbRemoteIdResponse {
 #[derive(Debug, Deserialize)]
 struct TvdbRemoteIdResult {
     series: Option<TvdbSeriesBaseRecord>,
+    movie: Option<TvdbMovieBaseRecord>,
+    id: Option<i64>,
+    #[serde(rename = "type")]
+    entity_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TvdbSeriesBaseRecord {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvdbMovieBaseRecord {
     id: i64,
 }
 

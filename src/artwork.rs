@@ -406,7 +406,7 @@ pub fn extract_cinemeta_artwork(meta: &Value) -> Vec<ArtworkCandidate> {
     refs
 }
 
-pub fn extract_tvdb_series_artwork(meta: &Value) -> Vec<ArtworkCandidate> {
+pub fn extract_tvdb_entity_artwork(meta: &Value) -> Vec<ArtworkCandidate> {
     let mut refs = Vec::new();
     if let Some(url) = meta.get("image").and_then(Value::as_str) {
         refs.push(ArtworkCandidate {
@@ -433,6 +433,10 @@ pub fn extract_tvdb_series_artwork(meta: &Value) -> Vec<ArtworkCandidate> {
         });
     }
     refs
+}
+
+pub fn extract_tvdb_series_artwork(meta: &Value) -> Vec<ArtworkCandidate> {
+    extract_tvdb_entity_artwork(meta)
 }
 
 #[derive(Debug, Clone)]
@@ -475,12 +479,7 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
         let Some(url) = url else {
             continue;
         };
-        let kind = item
-            .get("type")
-            .or_else(|| item.get("typeName"))
-            .or_else(|| item.get("imageType"))
-            .and_then(Value::as_str)
-            .and_then(map_tvdb_kind);
+        let kind = tvdb_artwork_kind(item);
         let Some(kind) = kind else {
             continue;
         };
@@ -509,6 +508,34 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
     }
 
     refs
+}
+
+fn tvdb_artwork_kind(item: &Value) -> Option<ArtworkKind> {
+    item.get("typeName")
+        .or_else(|| item.get("imageType"))
+        .or_else(|| item.get("keyType"))
+        .or_else(|| item.get("type"))
+        .and_then(Value::as_str)
+        .and_then(map_tvdb_kind)
+        .or_else(|| infer_tvdb_artwork_kind_from_dimensions(item))
+}
+
+fn infer_tvdb_artwork_kind_from_dimensions(item: &Value) -> Option<ArtworkKind> {
+    let width = item.get("width").and_then(Value::as_f64)?;
+    let height = item.get("height").and_then(Value::as_f64)?;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let ratio = width / height;
+    if ratio >= 4.0 {
+        Some(ArtworkKind::Banner)
+    } else if ratio >= 1.35 {
+        Some(ArtworkKind::Backdrop)
+    } else if ratio < 1.0 {
+        Some(ArtworkKind::Poster)
+    } else {
+        None
+    }
 }
 
 fn map_tvdb_kind(value: &str) -> Option<ArtworkKind> {

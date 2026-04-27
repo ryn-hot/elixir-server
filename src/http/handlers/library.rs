@@ -83,7 +83,7 @@ pub async fn list_items(
         &movie_ids,
         "poster",
         &preferred_languages,
-        &["cinemeta", "tvdb"],
+        &["tvdb", "cinemeta"],
     )
     .await?;
     let movie_backdrops = load_primary_artwork(
@@ -92,7 +92,7 @@ pub async fn list_items(
         &movie_ids,
         "backdrop",
         &preferred_languages,
-        &["cinemeta", "tvdb"],
+        &["tvdb", "cinemeta"],
     )
     .await?;
     let series_posters = load_primary_artwork(
@@ -817,7 +817,7 @@ pub async fn detail(
     let provider_priority: &[&str] = if item_type == "anime" {
         &["anilist", "tvdb", "cinemeta"]
     } else if item_type == "movie" {
-        &["cinemeta", "tvdb"]
+        &["tvdb", "cinemeta"]
     } else {
         &["tvdb", "cinemeta"]
     };

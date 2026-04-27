@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path as StdPath,
+};
 
 use anyhow::{Context, Result as AnyResult, bail};
 use axum::{
@@ -12,6 +15,7 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::net::lookup_host;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -26,13 +30,13 @@ use crate::{
     extensions::{
         ExternalIds,
         manifest::ExtensionManifest,
-        store::{ExtensionStore, NewManagedIngestIntent},
+        store::{ExtensionStore, ManagedImportFile, NewManagedImportEvent, NewManagedIngestIntent},
     },
     http::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
-    library::managed_episode_tombstone_matches_series,
+    library::{ingest_managed_import_event, managed_episode_tombstone_matches_series},
     metadata::DiscoveryResult,
     orchestrator::model::ProviderEndpoint,
     state::AppState,
@@ -43,6 +47,8 @@ const MANAGER_PREF_SERIES: &str = "manager_preference.series";
 const MANAGER_PREF_ANIME: &str = "manager_preference.anime";
 const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.instance.";
 const NZBGET_DRONE_DOWNLOAD_ID_PARAM: &str = "drone";
+const TORRENT_METADATA_STALL_TIMEOUT_SECONDS: i64 = 10 * 60;
+const TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -538,7 +544,13 @@ struct AcquisitionQbittorrentTorrent {
     #[serde(default)]
     hash: String,
     #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
     progress: Option<f64>,
+    #[serde(default)]
+    downloaded: Option<u64>,
+    #[serde(default)]
+    dlspeed: Option<u64>,
     #[serde(default)]
     total_size: Option<u64>,
     #[serde(default)]
@@ -547,6 +559,16 @@ struct AcquisitionQbittorrentTorrent {
     amount_left: Option<u64>,
     #[serde(default)]
     eta: Option<i64>,
+    #[serde(default)]
+    num_seeds: Option<u64>,
+    #[serde(default)]
+    num_complete: Option<u64>,
+    #[serde(default)]
+    num_leechs: Option<u64>,
+    #[serde(default)]
+    num_incomplete: Option<u64>,
+    #[serde(default)]
+    added_on: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1196,8 +1218,25 @@ async fn resolve_acquisition_item_state(
     downloader_progress: &AcquisitionDownloaderProgressIndex,
     intent: &crate::extensions::store::ManagedIngestIntent,
 ) -> AnyResult<AcquisitionItemState> {
-    let library_matched = intent.last_matched_at.is_some();
-    if library_matched && !matches!(intent.media_type, MediaType::Series | MediaType::Anime) {
+    let mut library_matched = intent.last_matched_at.is_some();
+    let library_needs_hydration = if library_matched {
+        match managed_library_needs_hydration(&state.db_pool, intent).await {
+            Ok(needs_hydration) => needs_hydration,
+            Err(err) => {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    "failed to inspect managed library hydration state: {err}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if library_matched
+        && !library_needs_hydration
+        && !matches!(intent.media_type, MediaType::Series | MediaType::Anime)
+    {
         return Ok(completed_acquisition_state());
     }
 
@@ -1317,6 +1356,32 @@ async fn resolve_acquisition_item_state(
         }
     };
 
+    if !library_matched || library_needs_hydration {
+        match detect_and_ingest_managed_import_events(
+            state,
+            store,
+            intent,
+            &implementation,
+            &item_value,
+            &base_url,
+            &api_key,
+        )
+        .await
+        {
+            Ok(true) => {
+                library_matched = true;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    implementation,
+                    "failed to process managed import events: {err}"
+                );
+            }
+        }
+    }
+
     let queue_value = request_arr_json_with_query(
         &base_url,
         &api_key,
@@ -1363,6 +1428,64 @@ async fn resolve_acquisition_item_state(
         downloader_progress,
         sonarr_episode_index.as_ref(),
     ))
+}
+
+async fn managed_library_needs_hydration(
+    pool: &sqlx::AnyPool,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+) -> AnyResult<bool> {
+    let row = sqlx::query(
+        "SELECT media_item_id, media_type
+         FROM managed_library_provenance
+         WHERE intent_id = ?
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind(intent.intent_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(true);
+    };
+    let media_item_id = row.get::<String, _>("media_item_id");
+    let media_type_raw = row.get::<String, _>("media_type");
+    let owner_type = if media_type_raw == "movie" {
+        "movie"
+    } else {
+        "series"
+    };
+    let metadata_json: Option<String> = if owner_type == "movie" {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM movies WHERE id = ? LIMIT 1",
+        )
+        .bind(&media_item_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = ? LIMIT 1",
+        )
+        .bind(&media_item_id)
+        .fetch_optional(pool)
+        .await?
+    };
+    let has_metadata = metadata_json
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let artwork_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM artwork_refs
+         WHERE owner_type = ?
+           AND owner_id = ?
+           AND kind IN ('poster', 'backdrop', 'banner')",
+    )
+    .bind(owner_type)
+    .bind(&media_item_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(!has_metadata || artwork_count == 0)
 }
 
 async fn execute_find_another_release(
@@ -1439,6 +1562,22 @@ pub(crate) fn select_nzbget_provider(providers: &[ProviderContext]) -> Option<&P
     })
 }
 
+pub(crate) fn select_qbittorrent_provider(
+    providers: &[ProviderContext],
+) -> Option<&ProviderContext> {
+    providers.iter().find(|provider| {
+        provider.detail.provider.capability == "downloader.torrent"
+            && provider
+                .detail
+                .provider
+                .implementation
+                .as_deref()
+                .map(|value| value.trim().eq_ignore_ascii_case("qbittorrent"))
+                .unwrap_or(false)
+            && provider.detail.provider.health_state != ProviderHealthState::Unhealthy
+    })
+}
+
 pub(crate) async fn remove_nzbget_download_by_download_id(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -1509,6 +1648,31 @@ pub(crate) async fn remove_nzbget_download_by_download_id(
     if !success {
         bail!("nzbget editqueue GroupDelete did not report success");
     }
+    Ok(true)
+}
+
+pub(crate) async fn remove_qbittorrent_download_by_download_id(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &ProviderContext,
+    download_id: &str,
+) -> AnyResult<bool> {
+    let hash = normalize_download_id(download_id);
+    if hash.is_empty() {
+        return Ok(false);
+    }
+
+    let mut fields = HashMap::new();
+    fields.insert("hashes".to_string(), hash);
+    fields.insert("deleteFiles".to_string(), "false".to_string());
+    super::extensions::request_instance_service_form(
+        state,
+        store,
+        provider.detail.provider.instance_id,
+        "api/v2/torrents/delete",
+        &fields,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -1771,6 +1935,258 @@ pub(crate) fn manager_queue_paths(implementation: &str) -> [&str; 2] {
     }
 }
 
+async fn detect_and_ingest_managed_import_events(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    implementation: &str,
+    item_value: &Value,
+    base_url: &str,
+    api_key: &str,
+) -> AnyResult<bool> {
+    let events =
+        detect_managed_import_events(state, intent, implementation, item_value, base_url, api_key)
+            .await?;
+    let mut linked = false;
+
+    for event in events {
+        let persisted = store.upsert_managed_import_event(&event).await?;
+        match ingest_managed_import_event(
+            &state.db_pool,
+            Some(state.metadata.as_ref()),
+            Some(state.linkers.as_ref()),
+            Some(state.artwork.as_ref()),
+            intent,
+            &persisted,
+        )
+        .await
+        {
+            Ok(Some(_)) => linked = true,
+            Ok(None) => {
+                debug!(
+                    intent_id = %intent.intent_id,
+                    event_key = %persisted.event_key,
+                    "managed import event files are not visible to elixir yet"
+                );
+            }
+            Err(err) => {
+                let detail = err.to_string();
+                store
+                    .mark_managed_import_event_failed(persisted.event_id, &detail)
+                    .await?;
+                warn!(
+                    intent_id = %intent.intent_id,
+                    event_key = %persisted.event_key,
+                    "failed to link managed import event: {detail}"
+                );
+            }
+        }
+    }
+
+    Ok(linked)
+}
+
+async fn detect_managed_import_events(
+    state: &AppState,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    implementation: &str,
+    item_value: &Value,
+    base_url: &str,
+    api_key: &str,
+) -> AnyResult<Vec<NewManagedImportEvent>> {
+    match implementation {
+        "radarr" => Ok(
+            detect_radarr_managed_import_event(state, intent, item_value)
+                .into_iter()
+                .collect(),
+        ),
+        "sonarr" => {
+            detect_sonarr_managed_import_events(state, intent, item_value, base_url, api_key).await
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn detect_radarr_managed_import_event(
+    state: &AppState,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    item_value: &Value,
+) -> Option<NewManagedImportEvent> {
+    let manager_path = radarr_imported_file_path(item_value)?;
+    let library_path = resolve_manager_imported_file_path(
+        &state.settings.library.local_root,
+        &manager_path,
+        MediaType::Movie,
+    )?;
+    let file = ManagedImportFile {
+        path: library_path,
+        season_number: None,
+        episode_number: None,
+        absolute_episode_number: None,
+        episode_title: None,
+        size_bytes: item_value
+            .get("movieFile")
+            .and_then(|file| file.get("size"))
+            .and_then(Value::as_i64),
+        container: StdPath::new(&manager_path)
+            .extension()
+            .map(|value| value.to_string_lossy().to_string()),
+        video_codec: None,
+        audio_codec: None,
+    };
+    let event_key = managed_import_event_key(
+        intent,
+        "radarr",
+        &[format!("movie:{}", file.path.to_ascii_lowercase())],
+    );
+
+    Some(NewManagedImportEvent {
+        event_key,
+        intent_id: intent.intent_id,
+        media_type: MediaType::Movie,
+        external_ids: Some(merge_external_ids_for_event(
+            intent.external_ids.clone().unwrap_or_default(),
+            radarr_external_ids_from_item(item_value),
+        )),
+        manager_provider_id: intent.manager_provider_id,
+        manager_item_id: intent.manager_item_id.clone(),
+        manager_label: intent.manager_label.clone(),
+        manager_implementation: Some("radarr".to_string()),
+        imported_files: vec![file],
+        raw_manager_payload: Some(item_value.clone()),
+        imported_at: Some(Utc::now()),
+    })
+}
+
+async fn detect_sonarr_managed_import_events(
+    state: &AppState,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    item_value: &Value,
+    base_url: &str,
+    api_key: &str,
+) -> AnyResult<Vec<NewManagedImportEvent>> {
+    let Some(manager_item_id) = intent.manager_item_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if !sonarr_item_has_files(item_value) {
+        return Ok(Vec::new());
+    }
+
+    let episode_value = request_arr_json_with_query(
+        base_url,
+        api_key,
+        &["api/v3/episode", "api/v4/episode"],
+        &[("seriesId", manager_item_id.to_string())],
+    )
+    .await?;
+    let episode_file_value = request_arr_json_with_query(
+        base_url,
+        api_key,
+        &["api/v3/episodefile", "api/v4/episodefile"],
+        &[("seriesId", manager_item_id.to_string())],
+    )
+    .await?;
+    let episodes = arr_records(episode_value);
+    let episode_files = arr_records(episode_file_value);
+    let file_map: HashMap<i64, Value> = episode_files
+        .into_iter()
+        .filter_map(|file| {
+            let id = file.get("id").and_then(Value::as_i64)?;
+            Some((id, file))
+        })
+        .collect();
+
+    let mut events = Vec::new();
+    for episode in episodes {
+        let Some(file_id) = episode.get("episodeFileId").and_then(Value::as_i64) else {
+            continue;
+        };
+        if file_id <= 0 {
+            continue;
+        }
+        let Some(file_value) = file_map.get(&file_id) else {
+            continue;
+        };
+        let Some(manager_path) = sonarr_episode_file_path(item_value, file_value) else {
+            continue;
+        };
+        let Some(library_path) = resolve_manager_imported_file_path(
+            &state.settings.library.local_root,
+            &manager_path,
+            intent.media_type,
+        ) else {
+            warn!(
+                intent_id = %intent.intent_id,
+                manager_path = %manager_path,
+                "sonarr imported file path is outside the managed tv root"
+            );
+            continue;
+        };
+        let season_number = episode
+            .get("seasonNumber")
+            .and_then(Value::as_i64)
+            .map(|value| value as i32);
+        let episode_number = episode
+            .get("episodeNumber")
+            .and_then(Value::as_i64)
+            .map(|value| value as i32);
+        let file = ManagedImportFile {
+            path: library_path,
+            season_number,
+            episode_number,
+            absolute_episode_number: episode
+                .get("absoluteEpisodeNumber")
+                .and_then(Value::as_i64)
+                .map(|value| value as i32),
+            episode_title: json_nonempty_string(episode.get("title")),
+            size_bytes: file_value.get("size").and_then(Value::as_i64),
+            container: StdPath::new(&manager_path)
+                .extension()
+                .map(|value| value.to_string_lossy().to_string()),
+            video_codec: file_value
+                .get("mediaInfo")
+                .and_then(|info| json_nonempty_string(info.get("videoCodec")))
+                .map(|value| value.to_ascii_lowercase()),
+            audio_codec: file_value
+                .get("mediaInfo")
+                .and_then(|info| json_nonempty_string(info.get("audioCodec")))
+                .map(|value| value.to_ascii_lowercase()),
+        };
+        let event_key = managed_import_event_key(
+            intent,
+            "sonarr",
+            &[format!(
+                "episode:{}:s{}e{}",
+                file.path.to_ascii_lowercase(),
+                file.season_number.unwrap_or_default(),
+                file.episode_number.unwrap_or_default()
+            )],
+        );
+        events.push(NewManagedImportEvent {
+            event_key,
+            intent_id: intent.intent_id,
+            media_type: intent.media_type,
+            external_ids: Some(merge_external_ids_for_event(
+                intent.external_ids.clone().unwrap_or_default(),
+                sonarr_external_ids_from_item(item_value),
+            )),
+            manager_provider_id: intent.manager_provider_id,
+            manager_item_id: intent.manager_item_id.clone(),
+            manager_label: intent.manager_label.clone(),
+            manager_implementation: Some("sonarr".to_string()),
+            imported_files: vec![file],
+            raw_manager_payload: Some(json!({
+                "series": item_value,
+                "episode": episode,
+                "episodeFile": file_value
+            })),
+            imported_at: Some(Utc::now()),
+        });
+    }
+
+    Ok(events)
+}
+
 fn derive_arr_acquisition_state(
     implementation: &str,
     manager_item_id: &str,
@@ -1815,22 +2231,56 @@ fn derive_arr_acquisition_state(
     let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
     let protocol = queue_entries.first().and_then(queue_entry_protocol);
 
-    if has_file {
+    if has_file && library_matched {
+        let mut evidence = base_acquisition_evidence(
+            true,
+            !queue_entries.is_empty(),
+            true,
+            queue_entry_count,
+            downloader_label.as_deref(),
+            protocol.as_deref(),
+        );
+        evidence.push(acquisition_evidence(
+            "Elixir linked",
+            "Yes",
+            Some("success"),
+        ));
         return AcquisitionItemState {
             phase: AcquisitionPhase::Importing,
-            headline: "Imported in manager.".to_string(),
+            headline: "Imported files linked in Elixir.".to_string(),
             detail: Some(
-                "Manager has imported files. Waiting for the Elixir library scan.".to_string(),
+                "The manager has imported files and Elixir linked them to the managed request. Waiting for remaining monitored media."
+                    .to_string(),
             ),
             blocker: None,
-            evidence: base_acquisition_evidence(
-                true,
-                !queue_entries.is_empty(),
-                true,
-                queue_entry_count,
-                downloader_label.as_deref(),
-                protocol.as_deref(),
+            evidence,
+            actions: Vec::new(),
+            progress_percent: Some(100.0),
+            eta_seconds: None,
+            downloader_label,
+            protocol,
+            children: Vec::new(),
+        };
+    }
+
+    if has_file {
+        let mut evidence = base_acquisition_evidence(
+            true,
+            !queue_entries.is_empty(),
+            true,
+            queue_entry_count,
+            downloader_label.as_deref(),
+            protocol.as_deref(),
+        );
+        evidence.push(acquisition_evidence("Elixir linked", "No", Some("warning")));
+        return AcquisitionItemState {
+            phase: AcquisitionPhase::Importing,
+            headline: "Imported in manager, not linked in Elixir.".to_string(),
+            detail: Some(
+                "The manager reports imported files, but Elixir has not linked the import to the managed request yet.".to_string(),
             ),
+            blocker: None,
+            evidence,
             actions: Vec::new(),
             progress_percent: Some(100.0),
             eta_seconds: None,
@@ -1888,6 +2338,7 @@ fn derive_arr_queue_entry_state(
     let eta_seconds = downloader_progress.and_then(|item| item.eta_seconds);
     let downloader_label = queue_entry_downloader_label(entry);
     let protocol = queue_entry_protocol(entry);
+    let status_message = queue_entry_status_message(entry);
 
     if let Some(message) = queue_entry_error_message(entry) {
         return acquisition_attention(
@@ -1906,22 +2357,28 @@ fn derive_arr_queue_entry_state(
     }
 
     if let Some(issue) = downloader_progress.and_then(|item| item.issue.clone()) {
-        if matches!(
-            issue.code.as_str(),
-            "nzbget_release_failed" | "nzbget_release_unrecoverable"
-        ) {
+        if issue.code.starts_with("nzbget_release_")
+            || issue.code.starts_with("qbittorrent_release_")
+        {
+            let protected_payload = issue.code == "qbittorrent_release_failed_with_payload";
+            let headline = if protected_payload {
+                "Torrent needs manual recovery."
+            } else {
+                "Dead release detected."
+            };
+            let title = if protected_payload {
+                issue.title.clone()
+            } else {
+                "Dead release detected".to_string()
+            };
             return AcquisitionItemState {
                 phase: AcquisitionPhase::NeedsAttention,
-                headline: "Dead release detected.".to_string(),
-                detail: Some(
-                    "NZBGet marked the current release as damaged or unrecoverable. Elixir will clear it and ask the manager for another release."
-                        .to_string(),
-                ),
+                headline: headline.to_string(),
+                detail: Some(issue.detail.clone()),
                 blocker: Some(FindMediaAcquisitionBlocker {
                     code: issue.code,
-                    title: "Dead release detected".to_string(),
-                    detail: "The current NZBGet release is damaged or unrecoverable. Elixir is clearing it and will ask the manager for another release."
-                        .to_string(),
+                    title,
+                    detail: issue.detail,
                     severity: "warning".to_string(),
                 }),
                 evidence: base_acquisition_evidence(
@@ -1985,48 +2442,55 @@ fn derive_arr_queue_entry_state(
         AcquisitionPhase::QueuedInDownloader
     };
 
-    let (headline, detail) = match phase {
-        AcquisitionPhase::Downloading => {
-            if let Some(label) = downloader_label.as_deref() {
-                (
-                    format!("Downloading via {label}."),
-                    Some("Transfer is active in the downloader.".to_string()),
-                )
-            } else {
-                (
-                    "Download in progress.".to_string(),
-                    Some("Transfer is active in the downloader.".to_string()),
-                )
+    let (headline, detail) =
+        match phase {
+            AcquisitionPhase::Downloading => {
+                if let Some(label) = downloader_label.as_deref() {
+                    (
+                        format!("Downloading via {label}."),
+                        Some(status_message.clone().unwrap_or_else(|| {
+                            "Transfer is active in the downloader.".to_string()
+                        })),
+                    )
+                } else {
+                    (
+                        "Download in progress.".to_string(),
+                        Some(status_message.clone().unwrap_or_else(|| {
+                            "Transfer is active in the downloader.".to_string()
+                        })),
+                    )
+                }
             }
-        }
-        AcquisitionPhase::PostProcessing => (
-            "Download finished.".to_string(),
-            Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
-        ),
-        AcquisitionPhase::Importing => (
-            "Manager is importing the completed download.".to_string(),
-            Some("The downloader finished and the manager is finishing the import.".to_string()),
-        ),
-        _ => {
-            if let Some(label) = downloader_label.as_deref() {
-                (
+            AcquisitionPhase::PostProcessing => (
+                "Download finished.".to_string(),
+                Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
+            ),
+            AcquisitionPhase::Importing => (
+                "Manager is importing the completed download.".to_string(),
+                Some(
+                    "The downloader finished and the manager is finishing the import.".to_string(),
+                ),
+            ),
+            _ => {
+                if let Some(label) = downloader_label.as_deref() {
+                    (
                     format!("Queued with {label}."),
-                    Some(
+                    Some(status_message.clone().unwrap_or_else(|| {
                         "Manager handed the item to the downloader. Waiting for transfer to start."
-                            .to_string(),
-                    ),
+                            .to_string()
+                    })),
                 )
-            } else {
-                (
+                } else {
+                    (
                     "Waiting in the download queue.".to_string(),
-                    Some(
+                    Some(status_message.unwrap_or_else(|| {
                         "Manager handed the item to the downloader. Waiting for transfer to start."
-                            .to_string(),
-                    ),
+                            .to_string()
+                    })),
                 )
+                }
             }
-        }
-    };
+        };
 
     AcquisitionItemState {
         phase,
@@ -2507,6 +2971,151 @@ fn radarr_item_has_file(value: &Value) -> bool {
             .unwrap_or(false)
 }
 
+fn radarr_imported_file_path(value: &Value) -> Option<String> {
+    let movie_file = value.get("movieFile")?;
+    json_nonempty_string(movie_file.get("path"))
+        .or_else(|| {
+            let movie_path = json_nonempty_string(value.get("path"))?;
+            let relative_path = json_nonempty_string(movie_file.get("relativePath"))?;
+            Some(join_arr_path(&movie_path, &relative_path))
+        })
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn sonarr_episode_file_path(series: &Value, file: &Value) -> Option<String> {
+    json_nonempty_string(file.get("path"))
+        .or_else(|| {
+            let series_path = json_nonempty_string(series.get("path"))?;
+            let relative_path = json_nonempty_string(file.get("relativePath"))?;
+            Some(join_arr_path(&series_path, &relative_path))
+        })
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn resolve_manager_imported_file_path(
+    local_root: &str,
+    manager_path: &str,
+    media_type: MediaType,
+) -> Option<String> {
+    let manager_path = manager_path.trim();
+    if manager_path.is_empty() {
+        return None;
+    }
+    let local_root_path = StdPath::new(local_root);
+    let manager_path_obj = StdPath::new(manager_path);
+    if manager_path_obj.starts_with(local_root_path) {
+        return Some(manager_path_obj.to_string_lossy().to_string());
+    }
+    let managed_root = match media_type {
+        MediaType::Movie => "movies",
+        MediaType::Series | MediaType::Anime => "tv",
+    };
+    let absolute_prefix = format!("/{managed_root}/");
+    let relative = manager_path
+        .strip_prefix(&absolute_prefix)
+        .or_else(|| manager_path.strip_prefix(&format!("{managed_root}/")))?;
+    Some(
+        local_root_path
+            .join(managed_root)
+            .join(relative)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+fn arr_records(value: Value) -> Vec<Value> {
+    if let Some(items) = value.as_array() {
+        return items.clone();
+    }
+    value
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn managed_import_event_key(
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    implementation: &str,
+    parts: &[String],
+) -> String {
+    let mut parts = parts.to_vec();
+    parts.sort();
+    format!(
+        "{}:{}:{}:{}",
+        intent.intent_id,
+        implementation,
+        intent.manager_item_id.as_deref().unwrap_or("unassigned"),
+        parts.join("|")
+    )
+}
+
+fn merge_external_ids_for_event(mut base: ExternalIds, incoming: ExternalIds) -> ExternalIds {
+    base.imdb = base.imdb.or(incoming.imdb);
+    base.tmdb = base.tmdb.or(incoming.tmdb);
+    base.tvdb = base.tvdb.or(incoming.tvdb);
+    base.tvdb_series = base.tvdb_series.or(incoming.tvdb_series);
+    base.tvdb_movie = base.tvdb_movie.or(incoming.tvdb_movie);
+    base.anilist = base.anilist.or(incoming.anilist);
+    base.anidb = base.anidb.or(incoming.anidb);
+    base.mal = base.mal.or(incoming.mal);
+    base.kitsu = base.kitsu.or(incoming.kitsu);
+    base
+}
+
+fn radarr_external_ids_from_item(value: &Value) -> ExternalIds {
+    ExternalIds {
+        imdb: json_nonempty_string(value.get("imdbId")),
+        tmdb: value
+            .get("tmdbId")
+            .and_then(Value::as_i64)
+            .map(|value| value.to_string())
+            .or_else(|| json_nonempty_string(value.get("tmdbId"))),
+        tvdb: json_nonempty_string(value.get("tvdbId")),
+        tvdb_series: None,
+        tvdb_movie: json_nonempty_string(value.get("tvdbId")),
+        anilist: None,
+        anidb: None,
+        mal: None,
+        kitsu: None,
+    }
+}
+
+fn sonarr_external_ids_from_item(value: &Value) -> ExternalIds {
+    let tvdb = value
+        .get("tvdbId")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .or_else(|| json_nonempty_string(value.get("tvdbId")));
+    ExternalIds {
+        imdb: json_nonempty_string(value.get("imdbId")),
+        tmdb: None,
+        tvdb: tvdb.clone(),
+        tvdb_series: tvdb,
+        tvdb_movie: None,
+        anilist: None,
+        anidb: None,
+        mal: None,
+        kitsu: None,
+    }
+}
+
+fn json_nonempty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn join_arr_path(root: &str, relative: &str) -> String {
+    format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        relative.trim_start_matches('/')
+    )
+}
+
 fn queue_entry_state(entry: &Value) -> String {
     let mut parts = Vec::new();
     for key in ["trackedDownloadState", "trackedDownloadStatus", "status"] {
@@ -2520,20 +3129,38 @@ fn queue_entry_state(entry: &Value) -> String {
     parts.join(" ")
 }
 
+fn queue_entry_status_message(entry: &Value) -> Option<String> {
+    let message = entry
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let tracked_status = entry
+        .get("trackedDownloadStatus")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    tracked_status.eq("ok").then(|| message.to_string())
+}
+
 fn queue_entry_error_message(entry: &Value) -> Option<String> {
-    if let Some(value) = entry.get("errorMessage").and_then(Value::as_str) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
+    let error_message = entry
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let status = entry
         .get("status")
         .and_then(Value::as_str)
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
     if status.contains("downloadclientunavailable") {
-        return Some("Manager could not hand this release to a download client.".to_string());
+        return Some(error_message.unwrap_or_else(|| {
+            "Manager could not hand this release to a download client.".to_string()
+        }));
     }
     let tracked_status = entry
         .get("trackedDownloadStatus")
@@ -2544,7 +3171,10 @@ fn queue_entry_error_message(entry: &Value) -> Option<String> {
         || tracked_status.contains("error")
         || tracked_status.contains("unavailable")
     {
-        return Some("Downloader reported a problem for this item.".to_string());
+        return Some(
+            error_message
+                .unwrap_or_else(|| "Downloader reported a problem for this item.".to_string()),
+        );
     }
     None
 }
@@ -2614,11 +3244,100 @@ fn qbittorrent_acquisition_progress(
                     .clamp(0.0, 100.0),
             )
         });
+    let issue = qbittorrent_torrent_issue(torrent, progress_percent);
     Some(AcquisitionDownloaderProgress {
         progress_percent,
         eta_seconds: torrent.eta.filter(|value| *value > 0),
-        issue: None,
+        issue,
     })
+}
+
+fn qbittorrent_torrent_issue(
+    torrent: &AcquisitionQbittorrentTorrent,
+    progress_percent: Option<f64>,
+) -> Option<AcquisitionDownloaderIssue> {
+    let state = torrent
+        .state
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if state.is_empty() {
+        return None;
+    }
+
+    let downloaded = torrent.downloaded.unwrap_or(0);
+    let has_progress = progress_percent.unwrap_or(0.0) > 0.0 || downloaded > 0;
+    let has_local_payload = has_progress
+        || progress_percent.map(|value| value >= 99.5).unwrap_or(false)
+        || torrent.amount_left == Some(0);
+
+    if matches!(state.as_str(), "error" | "missingfiles") {
+        if has_local_payload {
+            return Some(AcquisitionDownloaderIssue {
+                code: "qbittorrent_release_failed_with_payload".to_string(),
+                title: "Torrent needs manual recovery".to_string(),
+                detail: "qBittorrent marked the current torrent as failed or missing, but local payload data is present. Elixir will not auto-remove it; inspect the downloader or manually import the recovered files."
+                    .to_string(),
+            });
+        }
+        return Some(AcquisitionDownloaderIssue {
+            code: "qbittorrent_release_failed".to_string(),
+            title: "Release failed in qBittorrent".to_string(),
+            detail: "qBittorrent marked the current torrent as failed or missing. Elixir will remove it and ask the manager for another release."
+                .to_string(),
+        });
+    }
+
+    let added_on = torrent.added_on.and_then(timestamp_to_datetime)?;
+    let age_seconds = (Utc::now() - added_on).num_seconds();
+    let connected_seeds = torrent.num_seeds.unwrap_or(0);
+    let connected_peers = torrent.num_leechs.unwrap_or(0);
+    let known_seeds = torrent.num_complete.unwrap_or(0);
+    let known_peers = torrent.num_incomplete.unwrap_or(0);
+    let download_rate = torrent.dlspeed.unwrap_or(0);
+    let no_connections = connected_seeds == 0 && connected_peers == 0;
+
+    if matches!(state.as_str(), "metadl" | "forcedmetadl")
+        && age_seconds >= TORRENT_METADATA_STALL_TIMEOUT_SECONDS
+        && no_connections
+        && download_rate == 0
+    {
+        return Some(AcquisitionDownloaderIssue {
+            code: "qbittorrent_release_metadata_stalled".to_string(),
+            title: "Torrent metadata never resolved".to_string(),
+            detail: format!(
+                "qBittorrent has been waiting on torrent metadata for over {} minutes with no connected peers. Elixir will remove it and ask the manager for another release. Known swarm: {} seeders, {} peers.",
+                TORRENT_METADATA_STALL_TIMEOUT_SECONDS / 60,
+                known_seeds,
+                known_peers
+            ),
+        });
+    }
+
+    if matches!(state.as_str(), "downloading" | "stalleddl" | "forceddl")
+        && age_seconds >= TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS
+        && !has_progress
+        && no_connections
+        && download_rate == 0
+    {
+        return Some(AcquisitionDownloaderIssue {
+            code: "qbittorrent_release_zero_progress".to_string(),
+            title: "Torrent never became reachable".to_string(),
+            detail: format!(
+                "qBittorrent has had this torrent for over {} minutes with no progress, no connected peers, and no download speed. Elixir will remove it and ask the manager for another release. Known swarm: {} seeders, {} peers.",
+                TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS / 60,
+                known_seeds,
+                known_peers
+            ),
+        });
+    }
+
+    None
+}
+
+fn timestamp_to_datetime(timestamp: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
 }
 
 fn nzbget_acquisition_progress(
@@ -4404,6 +5123,7 @@ async fn search_radarr(
         }
         let tmdb = item.get("tmdbId").and_then(as_id_string);
         let imdb = item.get("imdbId").and_then(as_id_string);
+        let tvdb_movie = item.get("tvdbId").and_then(as_id_string);
         let year = item
             .get("year")
             .and_then(Value::as_i64)
@@ -4422,6 +5142,7 @@ async fn search_radarr(
             external_ids: Some(ExternalIds {
                 imdb,
                 tmdb,
+                tvdb_movie,
                 ..Default::default()
             }),
             description,
@@ -4797,9 +5518,48 @@ mod tests {
             None,
         );
         assert_eq!(state.phase, AcquisitionPhase::Importing);
+        assert_eq!(state.headline, "Imported in manager, not linked in Elixir.");
         assert_eq!(
             state.detail.as_deref(),
-            Some("Manager has imported files. Waiting for the Elixir library scan.")
+            Some(
+                "The manager reports imported files, but Elixir has not linked the import to the managed request yet."
+            )
+        );
+        assert!(
+            state
+                .evidence
+                .iter()
+                .any(|item| item.label == "Elixir linked" && item.value == "No")
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_does_not_report_unlinked_when_partial_series_linked() {
+        let item = json!({
+            "statistics": {
+                "episodeFileCount": 3,
+                "episodeCount": 10,
+                "sizeOnDisk": 12345
+            }
+        });
+
+        let state = derive_arr_acquisition_state(
+            "sonarr",
+            "9",
+            &item,
+            None,
+            true,
+            None,
+            &AcquisitionDownloaderProgressIndex::default(),
+            None,
+        );
+        assert_eq!(state.phase, AcquisitionPhase::Importing);
+        assert_eq!(state.headline, "Imported files linked in Elixir.");
+        assert!(
+            state
+                .evidence
+                .iter()
+                .any(|item| item.label == "Elixir linked" && item.value == "Yes")
         );
     }
 
@@ -4811,6 +5571,7 @@ mod tests {
         let queue = json!([
             {
                 "movieId": 77,
+                "trackedDownloadStatus": "warning",
                 "errorMessage": "Release was rejected"
             }
         ]);
@@ -4829,6 +5590,48 @@ mod tests {
         assert_eq!(
             state.blocker.as_ref().map(|item| item.detail.as_str()),
             Some("Release was rejected")
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_keeps_metadata_fetch_as_downloading() {
+        let item = json!({
+            "hasFile": false
+        });
+        let queue = json!([
+            {
+                "movieId": 77,
+                "status": "queued",
+                "trackedDownloadState": "downloading",
+                "trackedDownloadStatus": "ok",
+                "errorMessage": "qBittorrent is downloading metadata",
+                "downloadClient": "qBittorrent",
+                "protocol": "torrent"
+            }
+        ]);
+
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "77",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &AcquisitionDownloaderProgressIndex::default(),
+            None,
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::Downloading);
+        assert!(state.blocker.is_none());
+        assert_eq!(
+            state.detail.as_deref(),
+            Some("qBittorrent is downloading metadata")
+        );
+        assert!(
+            state
+                .evidence
+                .iter()
+                .any(|item| item.label == "Downloader accepted" && item.value == "Yes")
         );
     }
 
@@ -5002,6 +5805,110 @@ mod tests {
         );
         assert!(state.actions.is_empty());
         assert_eq!(state.headline, "Dead release detected.");
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_dead_qbittorrent_release_as_needing_attention() {
+        let item = json!({
+            "hasFile": false,
+            "sizeOnDisk": 0
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "movieId": 42,
+                    "downloadId": "deadbeef",
+                    "downloadClient": "qBittorrent",
+                    "protocol": "torrent",
+                    "trackedDownloadState": "downloading"
+                }
+            ]
+        });
+        let mut downloader_progress = AcquisitionDownloaderProgressIndex::default();
+        downloader_progress.insert(
+            "deadbeef",
+            AcquisitionDownloaderProgress {
+                progress_percent: Some(0.0),
+                eta_seconds: None,
+                issue: Some(AcquisitionDownloaderIssue {
+                    code: "qbittorrent_release_metadata_stalled".to_string(),
+                    title: "Torrent metadata never resolved".to_string(),
+                    detail: "qBittorrent has not reached any peers for this torrent.".to_string(),
+                }),
+            },
+        );
+
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "42",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &downloader_progress,
+            None,
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::NeedsAttention);
+        assert_eq!(
+            state.blocker.as_ref().map(|item| item.code.as_str()),
+            Some("qbittorrent_release_metadata_stalled")
+        );
+        assert_eq!(state.headline, "Dead release detected.");
+        assert_eq!(
+            state.detail.as_deref(),
+            Some("qBittorrent has not reached any peers for this torrent.")
+        );
+    }
+
+    #[test]
+    fn derive_arr_acquisition_state_marks_qbittorrent_payload_issue_as_manual_recovery() {
+        let item = json!({
+            "hasFile": false,
+            "sizeOnDisk": 0
+        });
+        let queue = json!({
+            "records": [
+                {
+                    "movieId": 42,
+                    "downloadId": "deadbeef",
+                    "downloadClient": "qBittorrent",
+                    "protocol": "torrent",
+                    "trackedDownloadState": "downloading"
+                }
+            ]
+        });
+        let mut downloader_progress = AcquisitionDownloaderProgressIndex::default();
+        downloader_progress.insert(
+            "deadbeef",
+            AcquisitionDownloaderProgress {
+                progress_percent: Some(100.0),
+                eta_seconds: None,
+                issue: Some(AcquisitionDownloaderIssue {
+                    code: "qbittorrent_release_failed_with_payload".to_string(),
+                    title: "Torrent needs manual recovery".to_string(),
+                    detail: "qBittorrent has local payload data.".to_string(),
+                }),
+            },
+        );
+
+        let state = derive_arr_acquisition_state(
+            "radarr",
+            "42",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &downloader_progress,
+            None,
+        );
+
+        assert_eq!(state.phase, AcquisitionPhase::NeedsAttention);
+        assert_eq!(state.headline, "Torrent needs manual recovery.");
+        assert_eq!(
+            state.blocker.as_ref().map(|item| item.title.as_str()),
+            Some("Torrent needs manual recovery")
+        );
     }
 
     #[test]
