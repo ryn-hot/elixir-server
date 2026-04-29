@@ -320,6 +320,12 @@ pub struct FindMediaAcquisitionChildItem {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     pub phase: String,
     pub phase_label: String,
     pub headline: String,
@@ -333,6 +339,28 @@ pub struct FindMediaAcquisitionChildItem {
     pub downloader_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_rate_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_rate_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_seeds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_seeds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seen_complete_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,10 +553,24 @@ impl AcquisitionDownloaderProgressIndex {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AcquisitionDownloaderProgress {
+    release_title: Option<String>,
+    status: Option<String>,
+    category: Option<String>,
     progress_percent: Option<f64>,
     eta_seconds: Option<i64>,
+    size_bytes: Option<u64>,
+    downloaded_bytes: Option<u64>,
+    remaining_bytes: Option<u64>,
+    download_rate_bps: Option<u64>,
+    upload_rate_bps: Option<u64>,
+    connected_seeds: Option<u64>,
+    connected_peers: Option<u64>,
+    known_seeds: Option<u64>,
+    known_peers: Option<u64>,
+    availability: Option<f64>,
+    seen_complete_at: Option<DateTime<Utc>>,
     issue: Option<AcquisitionDownloaderIssue>,
 }
 
@@ -544,13 +586,19 @@ struct AcquisitionQbittorrentTorrent {
     #[serde(default)]
     hash: String,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
     #[serde(default)]
     progress: Option<f64>,
     #[serde(default)]
     downloaded: Option<u64>,
     #[serde(default)]
     dlspeed: Option<u64>,
+    #[serde(default)]
+    upspeed: Option<u64>,
     #[serde(default)]
     total_size: Option<u64>,
     #[serde(default)]
@@ -568,6 +616,10 @@ struct AcquisitionQbittorrentTorrent {
     #[serde(default)]
     num_incomplete: Option<u64>,
     #[serde(default)]
+    availability: Option<f64>,
+    #[serde(default)]
+    seen_complete: Option<i64>,
+    #[serde(default)]
     added_on: Option<i64>,
 }
 
@@ -575,6 +627,12 @@ struct AcquisitionQbittorrentTorrent {
 struct AcquisitionNzbgetGroup {
     #[serde(rename = "NZBID", default)]
     nzb_id: i64,
+    #[serde(rename = "NZBName", default)]
+    nzb_name: Option<String>,
+    #[serde(rename = "NZBFilename", default)]
+    nzb_filename: Option<String>,
+    #[serde(rename = "Category", default)]
+    category: Option<String>,
     #[serde(rename = "Status", default)]
     status: Option<String>,
     #[serde(rename = "FileSizeLo", default)]
@@ -2221,7 +2279,13 @@ fn derive_arr_acquisition_state(
     }
 
     if let Some(entry) = queue_entries.first() {
-        return derive_arr_queue_entry_state(entry, queue_entry_count, downloader_progress);
+        let mut state = derive_arr_queue_entry_state(entry, queue_entry_count, downloader_progress);
+        state.children = vec![build_download_attempt_child(
+            entry,
+            sonarr_episode_index,
+            downloader_progress,
+        )];
+        return state;
     }
 
     if acquisition_is_completed(implementation, item_value, library_matched) {
@@ -2522,7 +2586,7 @@ fn derive_sonarr_batch_acquisition_state(
 ) -> AcquisitionItemState {
     let mut children = queue_entries
         .iter()
-        .map(|entry| build_sonarr_batch_child(entry, sonarr_episode_index, downloader_progress))
+        .map(|entry| build_download_attempt_child(entry, sonarr_episode_index, downloader_progress))
         .collect::<Vec<_>>();
     let counts = summarize_sonarr_batch_children(&children);
     let stats = sonarr_series_stats(item_value);
@@ -2539,41 +2603,41 @@ fn derive_sonarr_batch_acquisition_state(
         protocol.as_deref(),
     );
     evidence.push(acquisition_evidence(
-        "Episodes queued",
+        "Transfers queued",
         counts.queued.to_string(),
         Some("neutral"),
     ));
     if counts.downloading > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes downloading",
+            "Transfers downloading",
             counts.downloading.to_string(),
             Some("success"),
         ));
     }
     if counts.post_processing > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes post-processing",
+            "Transfers post-processing",
             counts.post_processing.to_string(),
             Some("neutral"),
         ));
     }
     if counts.importing > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes importing",
+            "Transfers importing",
             counts.importing.to_string(),
             Some("neutral"),
         ));
     }
     if counts.needs_attention + counts.failed > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes needing attention",
+            "Transfers needing attention",
             (counts.needs_attention + counts.failed).to_string(),
             Some("warning"),
         ));
     }
     if stats.episode_count > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes imported",
+            "Files imported",
             format!("{} / {}", stats.episode_file_count, stats.episode_count),
             Some(if stats.episode_file_count > 0 {
                 "success"
@@ -2583,7 +2647,7 @@ fn derive_sonarr_batch_acquisition_state(
         ));
     } else if stats.episode_file_count > 0 {
         evidence.push(acquisition_evidence(
-            "Episodes imported",
+            "Files imported",
             stats.episode_file_count.to_string(),
             Some("success"),
         ));
@@ -2617,14 +2681,19 @@ fn derive_sonarr_batch_acquisition_state(
     }
 }
 
-fn build_sonarr_batch_child(
+fn build_download_attempt_child(
     entry: &Value,
     sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
 ) -> FindMediaAcquisitionChildItem {
     let state = derive_arr_queue_entry_state(entry, 1, downloader_progress);
-    let (title, subtitle) = sonarr_batch_child_title(entry, sonarr_episode_index);
-    let id = queue_entry_download_id(entry)
+    let download_id = queue_entry_download_id(entry);
+    let progress = download_id
+        .as_deref()
+        .and_then(|download_id| downloader_progress.get(download_id));
+    let (title, subtitle) = download_attempt_title(entry, progress, sonarr_episode_index);
+    let id = download_id
+        .clone()
         .or_else(|| as_id_string(entry.get("episodeId").unwrap_or(&Value::Null)))
         .or_else(|| as_id_string(entry.get("id").unwrap_or(&Value::Null)))
         .unwrap_or_else(|| title.clone());
@@ -2633,6 +2702,11 @@ fn build_sonarr_batch_child(
         id,
         title,
         subtitle,
+        download_id,
+        status: progress
+            .and_then(|item| item.status.clone())
+            .or_else(|| Some(queue_entry_state(entry)).filter(|value| !value.trim().is_empty())),
+        category: progress.and_then(|item| item.category.clone()),
         phase: state.phase.as_str().to_string(),
         phase_label: state.phase.label().to_string(),
         headline: state.headline,
@@ -2642,11 +2716,23 @@ fn build_sonarr_batch_child(
         eta_seconds: state.eta_seconds,
         downloader_label: state.downloader_label,
         protocol: state.protocol,
+        size_bytes: progress.and_then(|item| item.size_bytes),
+        downloaded_bytes: progress.and_then(|item| item.downloaded_bytes),
+        remaining_bytes: progress.and_then(|item| item.remaining_bytes),
+        download_rate_bps: progress.and_then(|item| item.download_rate_bps),
+        upload_rate_bps: progress.and_then(|item| item.upload_rate_bps),
+        connected_seeds: progress.and_then(|item| item.connected_seeds),
+        connected_peers: progress.and_then(|item| item.connected_peers),
+        known_seeds: progress.and_then(|item| item.known_seeds),
+        known_peers: progress.and_then(|item| item.known_peers),
+        availability: progress.and_then(|item| item.availability),
+        seen_complete_at: progress.and_then(|item| item.seen_complete_at),
     }
 }
 
-fn sonarr_batch_child_title(
+fn download_attempt_title(
     entry: &Value,
+    downloader_progress: Option<&AcquisitionDownloaderProgress>,
     sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
 ) -> (String, Option<String>) {
     let release_title = entry
@@ -2655,35 +2741,28 @@ fn sonarr_batch_child_title(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let title = downloader_progress
+        .and_then(|item| item.release_title.clone())
+        .or(release_title.clone())
+        .unwrap_or_else(|| "Download".to_string());
 
     let Some(episode_id) = entry.get("episodeId").and_then(Value::as_i64) else {
-        return (
-            release_title
-                .clone()
-                .unwrap_or_else(|| "Episode".to_string()),
-            None,
-        );
+        return (title, None);
     };
     let Some(episode) = sonarr_episode_index.and_then(|index| index.get(&episode_id)) else {
-        return (
-            release_title
-                .clone()
-                .unwrap_or_else(|| "Episode".to_string()),
-            None,
-        );
+        return (title, None);
     };
 
     let code = format!(
         "S{:02}E{:02}",
         episode.season_number, episode.episode_number
     );
-    let title = if episode.title.trim().is_empty() {
+    let destination = if episode.title.trim().is_empty() {
         code
     } else {
         format!("{code} • {}", episode.title.trim())
     };
-    let subtitle = release_title.filter(|value| value.trim() != title);
-    (title, subtitle)
+    (title, Some(destination))
 }
 
 fn summarize_sonarr_batch_children(
@@ -2723,33 +2802,33 @@ fn format_sonarr_batch_headline(counts: SonarrBatchCounts) -> String {
     if counts.needs_attention > 0 || counts.failed > 0 {
         parts.push(format!(
             "{} need attention",
-            format_episode_count(counts.needs_attention + counts.failed)
+            format_transfer_count(counts.needs_attention + counts.failed)
         ));
     }
     if counts.downloading > 0 {
         parts.push(format!(
             "{} downloading",
-            format_episode_count(counts.downloading)
+            format_transfer_count(counts.downloading)
         ));
     }
     if counts.post_processing > 0 {
         parts.push(format!(
             "{} post-processing",
-            format_episode_count(counts.post_processing)
+            format_transfer_count(counts.post_processing)
         ));
     }
     if counts.importing > 0 {
         parts.push(format!(
             "{} importing",
-            format_episode_count(counts.importing)
+            format_transfer_count(counts.importing)
         ));
     }
     if counts.queued > 0 {
-        parts.push(format!("{} queued", format_episode_count(counts.queued)));
+        parts.push(format!("{} queued", format_transfer_count(counts.queued)));
     }
 
     if parts.is_empty() {
-        "Waiting for episode activity.".to_string()
+        "Waiting for download activity.".to_string()
     } else {
         format!("{}.", parts.join(", "))
     }
@@ -2758,16 +2837,16 @@ fn format_sonarr_batch_headline(counts: SonarrBatchCounts) -> String {
 fn format_sonarr_batch_detail(stats: SonarrSeriesStats) -> String {
     if stats.episode_count > 0 {
         format!(
-            "Sonarr is handling this series as a batch. {} of {} episode files are imported so far.",
+            "Sonarr is handling this series as release downloads. {} of {} episode files are imported so far.",
             stats.episode_file_count, stats.episode_count
         )
     } else if stats.episode_file_count > 0 {
         format!(
-            "Sonarr is handling this series as a batch. {} episode files are already imported.",
+            "Sonarr is handling this series as release downloads. {} episode files are already imported.",
             stats.episode_file_count
         )
     } else {
-        "Sonarr is handling this series as a batch of episode downloads.".to_string()
+        "Sonarr is handling this series as one or more release downloads.".to_string()
     }
 }
 
@@ -2775,10 +2854,10 @@ fn build_sonarr_batch_blocker(counts: SonarrBatchCounts) -> Option<FindMediaAcqu
     let attention = counts.needs_attention + counts.failed;
     (attention > 0).then(|| FindMediaAcquisitionBlocker {
         code: "series_batch_attention".to_string(),
-        title: "Episodes need attention".to_string(),
+        title: "Downloads need attention".to_string(),
         detail: format!(
             "{} in this series currently need attention.",
-            format_episode_count(attention)
+            format_transfer_count(attention)
         ),
         severity: "warning".to_string(),
     })
@@ -2820,11 +2899,11 @@ fn acquisition_is_completed(
     }
 }
 
-fn format_episode_count(count: usize) -> String {
+fn format_transfer_count(count: usize) -> String {
     if count == 1 {
-        "1 episode".to_string()
+        "1 transfer".to_string()
     } else {
-        format!("{count} episodes")
+        format!("{count} transfers")
     }
 }
 
@@ -3246,8 +3325,37 @@ fn qbittorrent_acquisition_progress(
         });
     let issue = qbittorrent_torrent_issue(torrent, progress_percent);
     Some(AcquisitionDownloaderProgress {
+        release_title: torrent
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        status: torrent
+            .state
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        category: torrent
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         progress_percent,
         eta_seconds: torrent.eta.filter(|value| *value > 0),
+        size_bytes: total_size,
+        downloaded_bytes: torrent.downloaded,
+        remaining_bytes: torrent.amount_left,
+        download_rate_bps: torrent.dlspeed,
+        upload_rate_bps: torrent.upspeed,
+        connected_seeds: torrent.num_seeds,
+        connected_peers: torrent.num_leechs,
+        known_seeds: torrent.num_complete,
+        known_peers: torrent.num_incomplete,
+        availability: torrent.availability.filter(|value| *value >= 0.0),
+        seen_complete_at: torrent.seen_complete.and_then(timestamp_to_datetime),
         issue,
     })
 }
@@ -3353,11 +3461,51 @@ fn nzbget_acquisition_progress(
     Some((
         download_id,
         AcquisitionDownloaderProgress {
+            release_title: nzbget_group_title(group),
+            status: group
+                .status
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            category: group
+                .category
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             progress_percent,
             eta_seconds: None,
+            size_bytes: total_size,
+            downloaded_bytes: downloaded_size,
+            remaining_bytes: remaining_size,
+            download_rate_bps: None,
+            upload_rate_bps: None,
+            connected_seeds: None,
+            connected_peers: None,
+            known_seeds: None,
+            known_peers: None,
+            availability: None,
+            seen_complete_at: None,
             issue: nzbget_group_issue(group),
         },
     ))
+}
+
+fn nzbget_group_title(group: &AcquisitionNzbgetGroup) -> Option<String> {
+    group
+        .nzb_name
+        .as_deref()
+        .or(group.nzb_filename.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .strip_suffix(".nzb")
+                .or_else(|| value.strip_suffix(".NZB"))
+                .unwrap_or(value)
+                .to_string()
+        })
 }
 
 fn nzbget_group_issue(group: &AcquisitionNzbgetGroup) -> Option<AcquisitionDownloaderIssue> {
@@ -5733,6 +5881,7 @@ mod tests {
                 progress_percent: Some(77.0),
                 eta_seconds: Some(321),
                 issue: None,
+                ..Default::default()
             },
         );
 
@@ -5782,6 +5931,7 @@ mod tests {
                     title: "Release is damaged".to_string(),
                     detail: "NZBGet reports this release is damaged or unrecoverable.".to_string(),
                 }),
+                ..Default::default()
             },
         );
 
@@ -5835,6 +5985,7 @@ mod tests {
                     title: "Torrent metadata never resolved".to_string(),
                     detail: "qBittorrent has not reached any peers for this torrent.".to_string(),
                 }),
+                ..Default::default()
             },
         );
 
@@ -5889,6 +6040,7 @@ mod tests {
                     title: "Torrent needs manual recovery".to_string(),
                     detail: "qBittorrent has local payload data.".to_string(),
                 }),
+                ..Default::default()
             },
         );
 
@@ -5996,9 +6148,14 @@ mod tests {
         downloader_progress.insert(
             "child-a",
             AcquisitionDownloaderProgress {
+                release_title: Some("Firefly.S01E12.Release".to_string()),
                 progress_percent: Some(52.0),
                 eta_seconds: Some(600),
                 issue: None,
+                size_bytes: Some(1_000_000_000),
+                downloaded_bytes: Some(520_000_000),
+                download_rate_bps: Some(2_000_000),
+                ..Default::default()
             },
         );
 
@@ -6016,24 +6173,27 @@ mod tests {
         assert_eq!(state.phase, AcquisitionPhase::Downloading);
         assert_eq!(state.progress_percent, None);
         assert_eq!(state.children.len(), 2);
-        assert_eq!(state.children[0].title, "S01E12 • The Message");
+        assert_eq!(state.children[0].title, "Firefly.S01E12.Release");
         assert_eq!(
             state.children[0].subtitle.as_deref(),
-            Some("Firefly.S01E12.Release")
+            Some("S01E12 • The Message")
         );
         assert_eq!(state.children[0].progress_percent, Some(52.0));
+        assert_eq!(state.children[0].size_bytes, Some(1_000_000_000));
+        assert_eq!(state.children[0].downloaded_bytes, Some(520_000_000));
+        assert_eq!(state.children[0].download_rate_bps, Some(2_000_000));
         assert_eq!(state.children[1].phase, "queued_in_downloader");
         assert!(
             state
                 .evidence
                 .iter()
-                .any(|item| item.label == "Episodes downloading" && item.value == "1")
+                .any(|item| item.label == "Transfers downloading" && item.value == "1")
         );
         assert!(
             state
                 .evidence
                 .iter()
-                .any(|item| item.label == "Episodes queued" && item.value == "1")
+                .any(|item| item.label == "Transfers queued" && item.value == "1")
         );
     }
 
@@ -6085,7 +6245,7 @@ mod tests {
         assert_eq!(
             state.detail.as_deref(),
             Some(
-                "Sonarr is handling this series as a batch. 3 of 14 episode files are imported so far."
+                "Sonarr is handling this series as release downloads. 3 of 14 episode files are imported so far."
             )
         );
     }
@@ -6128,6 +6288,7 @@ mod tests {
                 progress_percent: Some(25.0),
                 eta_seconds: Some(1200),
                 issue: None,
+                ..Default::default()
             },
         );
 
@@ -6147,7 +6308,7 @@ mod tests {
         assert_eq!(
             state.detail.as_deref(),
             Some(
-                "Sonarr is handling this series as a batch. 1 of 14 episode files are imported so far."
+                "Sonarr is handling this series as release downloads. 1 of 14 episode files are imported so far."
             )
         );
     }
@@ -6184,6 +6345,9 @@ mod tests {
     fn nzbget_acquisition_progress_uses_drone_download_id_and_actual_downloaded_bytes() {
         let group = AcquisitionNzbgetGroup {
             nzb_id: 6,
+            nzb_name: Some("Firefly.S01E12.Release".to_string()),
+            nzb_filename: None,
+            category: Some("tv".to_string()),
             status: Some("DOWNLOADING".to_string()),
             file_size_lo: Some(1000),
             file_size_hi: Some(0),
@@ -6203,7 +6367,15 @@ mod tests {
         let (download_id, progress) = nzbget_acquisition_progress(&group).expect("nzbget progress");
 
         assert_eq!(download_id, "838cfa292491470a93b2c777b1a6d0b1");
+        assert_eq!(
+            progress.release_title.as_deref(),
+            Some("Firefly.S01E12.Release")
+        );
+        assert_eq!(progress.category.as_deref(), Some("tv"));
         assert_eq!(progress.progress_percent, Some(1.0));
+        assert_eq!(progress.size_bytes, Some(1000));
+        assert_eq!(progress.downloaded_bytes, Some(10));
+        assert_eq!(progress.remaining_bytes, Some(250));
         assert_eq!(progress.eta_seconds, None);
         assert!(progress.issue.is_none());
     }
@@ -6212,6 +6384,9 @@ mod tests {
     fn nzbget_group_issue_marks_unrecoverable_release() {
         let group = AcquisitionNzbgetGroup {
             nzb_id: 6,
+            nzb_name: None,
+            nzb_filename: None,
+            category: None,
             status: Some("DOWNLOADING".to_string()),
             file_size_lo: None,
             file_size_hi: None,
