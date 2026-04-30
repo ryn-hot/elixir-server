@@ -1,8 +1,9 @@
 use std::{
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+const DEFAULT_PUBLIC_IP_URL: &str = "https://icanhazip.com";
 
 #[derive(Debug, Clone)]
 pub struct ProbeConfig {
@@ -58,7 +61,7 @@ impl ProbeConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProbeResult {
     pub ok: bool,
     pub latency_ms: Option<u64>,
@@ -109,6 +112,56 @@ impl NetworkProbe {
         self.run_probe(&["http", url]).await
     }
 
+    pub async fn probe_host_public_ip(&self) -> Result<ProbeResult> {
+        let start = Instant::now();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("building host public-ip client")?;
+        let body = timeout(Duration::from_secs(12), async {
+            client
+                .get(DEFAULT_PUBLIC_IP_URL)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })
+        .await
+        .context("host public-ip probe timed out")?
+        .context("host public-ip request failed")?;
+        let ip = extract_public_ip_from_body(&body)?;
+        Ok(ProbeResult {
+            ok: true,
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+            details: Some(serde_json::json!({
+                "ip": ip,
+                "url": DEFAULT_PUBLIC_IP_URL,
+                "mode": "host"
+            })),
+        })
+    }
+
+    pub async fn probe_public_ip_in_container_namespace(
+        &self,
+        container_name: &str,
+    ) -> Result<ProbeResult> {
+        self.run_probe_in_network(
+            &format!("container:{container_name}"),
+            &["public-ip", DEFAULT_PUBLIC_IP_URL],
+        )
+        .await
+    }
+
+    pub async fn probe_dns_in_container_namespace(
+        &self,
+        container_name: &str,
+        name: &str,
+    ) -> Result<ProbeResult> {
+        self.run_probe_in_network(&format!("container:{container_name}"), &["dns", name])
+            .await
+    }
+
     pub async fn assert_reachable(&self, host: &str, port: u16, url: Option<&str>) -> Result<()> {
         <Self as ProbeRunner>::assert_reachable(self, host, port, url).await
     }
@@ -118,9 +171,13 @@ impl NetworkProbe {
     }
 
     async fn run_probe(&self, args: &[&str]) -> Result<ProbeResult> {
+        self.run_probe_in_network(&self.config.network, args).await
+    }
+
+    async fn run_probe_in_network(&self, network: &str, args: &[&str]) -> Result<ProbeResult> {
         if !self.binary_disabled.load(Ordering::Relaxed) {
             match self.ensure_probe_binary_ready().await {
-                Ok(()) => return self.run_binary_probe(args).await,
+                Ok(()) => return self.run_binary_probe(network, args).await,
                 Err(err) if self.config.allow_utility_fallback => {
                     self.binary_disabled.store(true, Ordering::Relaxed);
                     tracing::warn!(
@@ -133,7 +190,7 @@ impl NetworkProbe {
             }
         }
         if self.config.allow_utility_fallback {
-            return self.run_utility_probe(args).await;
+            return self.run_utility_probe(network, args).await;
         }
         self.ensure_probe_binary()?;
         unreachable!("ensure_probe_binary always returns an error when binary is missing")
@@ -166,15 +223,11 @@ impl NetworkProbe {
         }
     }
 
-    async fn run_binary_probe(&self, args: &[&str]) -> Result<ProbeResult> {
+    async fn run_binary_probe(&self, network: &str, args: &[&str]) -> Result<ProbeResult> {
         let mut cmd = Command::new(&self.config.docker_bin);
-        cmd.arg("run")
-            .arg("--rm")
-            .arg("--network")
-            .arg(&self.config.network)
-            .arg("--add-host")
-            .arg("host.docker.internal:host-gateway")
-            .arg("-v")
+        cmd.arg("run").arg("--rm").arg("--network").arg(network);
+        add_host_gateway_if_supported(&mut cmd, network);
+        cmd.arg("-v")
             .arg(format!(
                 "{}:/probe:ro",
                 self.config.probe_binary_path.display()
@@ -204,7 +257,7 @@ impl NetworkProbe {
                 "probe binary failed compatibility checks; switching to utility fallback: {}",
                 stderr_trimmed
             );
-            return self.run_utility_probe(args).await;
+            return self.run_utility_probe(network, args).await;
         }
 
         if stdout.trim().is_empty() {
@@ -212,6 +265,18 @@ impl NetworkProbe {
         }
 
         let parsed: ProbeResult = serde_json::from_str(&stdout).context("parsing probe output")?;
+
+        if !output.status.success()
+            && self.config.allow_utility_fallback
+            && should_fallback_from_binary_probe_result(&parsed)
+        {
+            self.binary_disabled.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                "probe binary does not support this probe command; switching to utility fallback: {}",
+                stderr_trimmed
+            );
+            return self.run_utility_probe(network, args).await;
+        }
 
         if !output.status.success() && parsed.ok {
             bail!("probe exited with error: {}", stderr.trim());
@@ -315,7 +380,7 @@ impl NetworkProbe {
         Ok(())
     }
 
-    async fn run_utility_probe(&self, args: &[&str]) -> Result<ProbeResult> {
+    async fn run_utility_probe(&self, network: &str, args: &[&str]) -> Result<ProbeResult> {
         let (entrypoint, utility_args): (&str, Vec<String>) = match args {
             ["dns", name] => ("nslookup", vec![(*name).to_string()]),
             ["tcp", host, port] => (
@@ -339,17 +404,24 @@ impl NetworkProbe {
                     (*url).to_string(),
                 ],
             ),
+            ["public-ip", url] => (
+                "wget",
+                vec![
+                    "-q".to_string(),
+                    "-T".to_string(),
+                    "5".to_string(),
+                    "-O".to_string(),
+                    "-".to_string(),
+                    (*url).to_string(),
+                ],
+            ),
             _ => bail!("invalid probe invocation arguments: {:?}", args),
         };
 
         let mut cmd = Command::new(&self.config.docker_bin);
-        cmd.arg("run")
-            .arg("--rm")
-            .arg("--network")
-            .arg(&self.config.network)
-            .arg("--add-host")
-            .arg("host.docker.internal:host-gateway")
-            .arg("--entrypoint")
+        cmd.arg("run").arg("--rm").arg("--network").arg(network);
+        add_host_gateway_if_supported(&mut cmd, network);
+        cmd.arg("--entrypoint")
             .arg(entrypoint)
             .arg(&self.config.image)
             .args(&utility_args);
@@ -363,6 +435,18 @@ impl NetworkProbe {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         if output.status.success() {
+            if matches!(args, ["public-ip", _]) {
+                let ip = extract_public_ip_from_body(&stdout)?;
+                return Ok(ProbeResult {
+                    ok: true,
+                    latency_ms: None,
+                    details: Some(serde_json::json!({
+                        "mode": "utility_fallback",
+                        "entrypoint": entrypoint,
+                        "ip": ip
+                    })),
+                });
+            }
             return Ok(ProbeResult {
                 ok: true,
                 latency_ms: None,
@@ -486,6 +570,17 @@ fn ensure_ok(result: ProbeResult, stage: &str) -> Result<()> {
     bail!("probe {stage} failed: {details}");
 }
 
+fn add_host_gateway_if_supported(cmd: &mut Command, network: &str) {
+    if docker_network_mode_allows_add_host(network) {
+        cmd.arg("--add-host")
+            .arg("host.docker.internal:host-gateway");
+    }
+}
+
+fn docker_network_mode_allows_add_host(network: &str) -> bool {
+    !network.trim().starts_with("container:")
+}
+
 fn http_probe_reached_service(result: &ProbeResult) -> bool {
     let Some(details) = result.details.as_ref() else {
         return false;
@@ -526,6 +621,48 @@ fn should_fallback_from_binary_error(stderr: &str) -> bool {
         || lowered.contains("invalid mount config for type")
         || lowered.contains("mount path must be absolute")
         || lowered.contains("includes invalid characters for a local volume name")
+}
+
+fn should_fallback_from_binary_probe_result(result: &ProbeResult) -> bool {
+    let Some(details) = result.details.as_ref() else {
+        return false;
+    };
+    details_contains_text(details, "unknown probe command")
+}
+
+fn details_contains_text(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase()),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|value| details_contains_text(value, needle)),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| details_contains_text(value, needle)),
+        _ => false,
+    }
+}
+
+fn extract_public_ip_from_body(body: &str) -> Result<String> {
+    let trimmed = body.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(ip) = value
+            .get("ip")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ip.parse::<IpAddr>()
+                .with_context(|| format!("invalid public IP '{ip}'"))?;
+            return Ok(ip.to_string());
+        }
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid public IP response '{trimmed}'"))?;
+    Ok(trimmed.to_string())
 }
 
 fn absolutize_path(raw: &str) -> PathBuf {
@@ -631,8 +768,10 @@ fn read_probe_magic(path: &Path) -> Result<ProbeBinaryMagic> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NetworkProbe, ProbeBinaryMagic, ProbeConfig, ProbeResult, bundled_probe_binary_path,
-        ensure_ok, linux_musl_target_for_arch, read_probe_magic, should_fallback_from_binary_error,
+        DEFAULT_PUBLIC_IP_URL, NetworkProbe, ProbeBinaryMagic, ProbeConfig, ProbeResult,
+        bundled_probe_binary_path, docker_network_mode_allows_add_host, ensure_ok,
+        extract_public_ip_from_body, linux_musl_target_for_arch, read_probe_magic,
+        should_fallback_from_binary_error, should_fallback_from_binary_probe_result,
     };
     use serde_json::json;
     use std::fs;
@@ -659,6 +798,48 @@ mod tests {
         assert!(!should_fallback_from_binary_error(
             "http probe failed with status 401"
         ));
+    }
+
+    #[test]
+    fn omits_host_gateway_for_container_namespace_probes() {
+        assert!(!docker_network_mode_allows_add_host(
+            "container:elx-ba4bf0-vpn"
+        ));
+        assert!(!docker_network_mode_allows_add_host(
+            "container:bcb7b296654532afba9fb825f44689f707bd5bd30bb6977404008072242cedde"
+        ));
+        assert!(docker_network_mode_allows_add_host("elixir_net"));
+        assert!(docker_network_mode_allows_add_host("bridge"));
+    }
+
+    #[test]
+    fn parses_public_ip_response_bodies() {
+        assert_eq!(
+            extract_public_ip_from_body(r#"{"ip":"203.0.113.10"}"#).expect("json ip"),
+            "203.0.113.10"
+        );
+        assert_eq!(
+            extract_public_ip_from_body("198.51.100.22\n").expect("plain ip"),
+            "198.51.100.22"
+        );
+        assert!(extract_public_ip_from_body("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn default_public_ip_probe_url_is_plain_text_for_busybox_wget() {
+        assert_eq!(DEFAULT_PUBLIC_IP_URL, "https://icanhazip.com");
+    }
+
+    #[test]
+    fn falls_back_when_old_probe_binary_lacks_public_ip_command() {
+        let result = ProbeResult {
+            ok: false,
+            latency_ms: Some(1),
+            details: Some(json!({
+                "error": "unknown probe command 'public-ip'"
+            })),
+        };
+        assert!(should_fallback_from_binary_probe_result(&result));
     }
 
     #[test]

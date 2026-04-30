@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
@@ -12,10 +12,20 @@ use uuid::Uuid;
 use crate::config::DownloaderPerformanceProfile;
 use crate::db::models::{ExtensionInstance, Provider};
 use crate::drivers::DriverRegistry;
-use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::auto_managed::{is_nzbget_extension_id, is_qbittorrent_extension_id};
+use crate::extensions::manifest::{ExtensionManifest, ManifestRuntimeEgress};
 use crate::extensions::store::ExtensionStore;
+use crate::network::protection::{
+    ActiveManagedDownloaderRuntime, DownloadNetworkProfileKind, DownloadProtectionCheckStatus,
+    DownloadProtectionProbeEvidence, DownloadProtectionRuntimeEvidence,
+    active_managed_downloader_runtime, mark_cloudflare_warp_runtime_ready,
+    mark_cloudflare_warp_runtime_unavailable,
+};
 use crate::orchestrator::executor::{
-    Executor, ExecutorAction, build_driver_ctx_for_provider, resolve_runtime_volume_mounts,
+    Executor, ExecutorAction, build_driver_ctx_for_provider, describe_volume_mount_identity,
+    downloader_network_mode_requires_rehome, downloader_preserved_mounts, normalized_network_mode,
+    resolve_runtime_volume_mounts, validate_downloader_volume_preservation,
+    volume_mounts_from_runtime_state,
 };
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::naming::{build_aliases, container_name};
@@ -29,8 +39,8 @@ use crate::runtime::health::{
     DockerRuntimeSupervisor, PersistedDockerRuntimeHealthState,
     detect_docker_desktop_filesharing_warning, runtime_health_poll_interval,
 };
-use crate::runtime::model::VolumeMountSourceKind;
-use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeRunner};
+use crate::runtime::model::{ContainerPublishedPort, VolumeMount, VolumeMountSourceKind};
+use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeResult, ProbeRunner};
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
 
@@ -47,6 +57,78 @@ pub struct RuntimeResetOutcome {
     pub reboot_recommended: bool,
     pub removed_containers: Vec<String>,
     pub recreated_networks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadNetworkPreflightStatus {
+    Safe,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadNetworkPreflightCheckStatus {
+    Pass,
+    Warn,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadNetworkPreflightCheck {
+    pub id: String,
+    pub status: DownloadNetworkPreflightCheckStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadNetworkPreflightMount {
+    pub container_path: String,
+    pub source_kind: String,
+    pub source: String,
+    pub read_only: bool,
+    pub preserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloaderNetworkPreflightItem {
+    pub instance_id: Uuid,
+    pub extension_id: String,
+    pub instance_name: String,
+    pub container_name: String,
+    pub container_present: bool,
+    pub current_network_mode: Option<String>,
+    pub desired_network_mode: Option<String>,
+    pub desired_profile_id: Option<String>,
+    pub desired_profile_kind: String,
+    pub requires_rehome: bool,
+    pub current_mounts: Vec<DownloadNetworkPreflightMount>,
+    pub desired_mounts: Vec<DownloadNetworkPreflightMount>,
+    #[serde(default)]
+    pub published_ports: Vec<ContainerPublishedPort>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub checks: Vec<DownloadNetworkPreflightCheck>,
+    pub blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadNetworkPreflightReport {
+    pub status: DownloadNetworkPreflightStatus,
+    pub active_runtime_kind: String,
+    pub active_profile_id: Option<String>,
+    pub managed_downloader_count: usize,
+    pub safe_to_apply: bool,
+    #[serde(default)]
+    pub checks: Vec<DownloadNetworkPreflightCheck>,
+    #[serde(default)]
+    pub downloaders: Vec<DownloaderNetworkPreflightItem>,
+    pub blocker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +237,610 @@ impl OrchestratorService {
 
     pub async fn apply_actions(&self, actions: Vec<ExecutorAction>) -> Result<()> {
         self.apply_actions_with_notes(actions).await.map(|_| ())
+    }
+
+    pub async fn apply_active_download_profile_to_managed_downloaders(
+        &self,
+    ) -> Result<Vec<String>> {
+        let store = ExtensionStore::new(&self.pool);
+        let extensions = store
+            .list_extensions()
+            .await?
+            .into_iter()
+            .map(|extension| (extension.extension_id.clone(), extension))
+            .collect::<std::collections::HashMap<_, _>>();
+        let instances = store.list_instances(None).await?;
+        let mut actions = Vec::new();
+
+        for instance in instances.into_iter().filter(|instance| instance.enabled) {
+            if !is_qbittorrent_extension_id(&instance.extension_id)
+                && !is_nzbget_extension_id(&instance.extension_id)
+            {
+                continue;
+            }
+            let Some(extension) = extensions.get(&instance.extension_id) else {
+                continue;
+            };
+            if !extension.enabled {
+                continue;
+            }
+            let manifest: ExtensionManifest =
+                serde_json::from_value(extension.manifest_json.clone()).with_context(|| {
+                    format!(
+                        "parsing managed downloader manifest '{}'",
+                        extension.extension_id
+                    )
+                })?;
+            manifest.validate()?;
+            let Some(runtime) = manifest.runtime.clone() else {
+                continue;
+            };
+            let (aliases, _) = build_aliases(
+                &extension.extension_id,
+                &instance.instance_name,
+                instance.instance_id,
+                runtime.service_name.clone(),
+            );
+            actions.push(ExecutorAction::EnsureRuntimeRunning {
+                instance_id: instance.instance_id,
+                extension_id: extension.extension_id.clone(),
+                instance_name: instance.instance_name.clone(),
+                runtime,
+                networking: manifest.networking.clone(),
+                aliases,
+            });
+        }
+
+        self.apply_actions_with_notes(actions).await
+    }
+
+    pub async fn preflight_active_download_profile_rehome(
+        &self,
+    ) -> Result<DownloadNetworkPreflightReport> {
+        let mut checks = Vec::new();
+        let mut blocker = None;
+
+        match self.runtime.server_version().await {
+            Ok(version) => checks.push(preflight_check(
+                "docker_daemon",
+                DownloadNetworkPreflightCheckStatus::Pass,
+                format!("Docker daemon is reachable (server version {version})."),
+            )),
+            Err(err) => {
+                let detail = format!("Docker daemon is unavailable for read-only preflight: {err}");
+                checks.push(preflight_check(
+                    "docker_daemon",
+                    DownloadNetworkPreflightCheckStatus::Blocked,
+                    detail.clone(),
+                ));
+                blocker = Some(detail);
+            }
+        }
+
+        let active_runtime = match active_managed_downloader_runtime(&self.pool).await {
+            Ok(runtime) => {
+                let (kind, profile_id) = active_runtime_identity(&runtime);
+                checks.push(preflight_check(
+                    "active_download_profile",
+                    DownloadNetworkPreflightCheckStatus::Pass,
+                    format!("Active managed downloader runtime resolves to '{kind}'."),
+                ));
+                Some((runtime, kind, profile_id))
+            }
+            Err(err) => {
+                let detail = format!("Active managed downloader runtime is not executable: {err}");
+                checks.push(preflight_check(
+                    "active_download_profile",
+                    DownloadNetworkPreflightCheckStatus::Blocked,
+                    detail.clone(),
+                ));
+                blocker.get_or_insert(detail);
+                None
+            }
+        };
+
+        let active_runtime_kind = active_runtime
+            .as_ref()
+            .map(|(_, kind, _)| kind.clone())
+            .unwrap_or_else(|| "unresolved".to_string());
+        let active_profile_id = active_runtime
+            .as_ref()
+            .and_then(|(_, _, profile_id)| profile_id.clone());
+
+        let store = ExtensionStore::new(&self.pool);
+        let extensions = store
+            .list_extensions()
+            .await?
+            .into_iter()
+            .map(|extension| (extension.extension_id.clone(), extension))
+            .collect::<HashMap<_, _>>();
+        let instances = store.list_instances(None).await?;
+        let managed_instances = instances
+            .into_iter()
+            .filter(|instance| {
+                instance.enabled
+                    && (is_qbittorrent_extension_id(&instance.extension_id)
+                        || is_nzbget_extension_id(&instance.extension_id))
+            })
+            .collect::<Vec<_>>();
+
+        let mut downloaders = Vec::new();
+        for instance in managed_instances {
+            let item = self
+                .preflight_managed_downloader(
+                    &extensions,
+                    &instance,
+                    active_runtime.as_ref().map(|(runtime, _, _)| runtime),
+                )
+                .await?;
+            if let Some(item_blocker) = item.blocker.clone() {
+                blocker.get_or_insert(item_blocker);
+            }
+            downloaders.push(item);
+        }
+
+        if downloaders.is_empty() {
+            let detail =
+                "No enabled managed qBittorrent or NZBGet instances were found.".to_string();
+            checks.push(preflight_check(
+                "managed_downloaders",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                detail.clone(),
+            ));
+            blocker.get_or_insert(detail);
+        } else {
+            checks.push(preflight_check(
+                "managed_downloaders",
+                DownloadNetworkPreflightCheckStatus::Pass,
+                format!(
+                    "Found {} enabled managed downloader instance(s).",
+                    downloaders.len()
+                ),
+            ));
+        }
+
+        let status = if blocker.is_some() {
+            DownloadNetworkPreflightStatus::Blocked
+        } else {
+            DownloadNetworkPreflightStatus::Safe
+        };
+
+        Ok(DownloadNetworkPreflightReport {
+            safe_to_apply: status == DownloadNetworkPreflightStatus::Safe,
+            status,
+            active_runtime_kind,
+            active_profile_id,
+            managed_downloader_count: downloaders.len(),
+            checks,
+            downloaders,
+            blocker,
+        })
+    }
+
+    async fn preflight_managed_downloader(
+        &self,
+        extensions: &HashMap<String, crate::db::models::Extension>,
+        instance: &ExtensionInstance,
+        active_runtime: Option<&ActiveManagedDownloaderRuntime>,
+    ) -> Result<DownloaderNetworkPreflightItem> {
+        let container_name = container_name(instance.instance_id);
+        let mut checks = Vec::new();
+        let mut blocker = None;
+
+        let Some(extension) = extensions.get(&instance.extension_id) else {
+            let detail = format!(
+                "Extension '{}' for downloader instance {} is missing.",
+                instance.extension_id, instance.instance_id
+            );
+            checks.push(preflight_check(
+                "extension_manifest",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                detail.clone(),
+            ));
+            return Ok(empty_downloader_preflight_item(
+                instance,
+                container_name,
+                checks,
+                detail,
+            ));
+        };
+
+        if !extension.enabled {
+            let detail = format!(
+                "Extension '{}' for downloader instance {} is disabled.",
+                instance.extension_id, instance.instance_id
+            );
+            checks.push(preflight_check(
+                "extension_manifest",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                detail.clone(),
+            ));
+            return Ok(empty_downloader_preflight_item(
+                instance,
+                container_name,
+                checks,
+                detail,
+            ));
+        }
+
+        let manifest: ExtensionManifest = serde_json::from_value(extension.manifest_json.clone())
+            .with_context(|| {
+            format!(
+                "parsing managed downloader manifest '{}'",
+                extension.extension_id
+            )
+        })?;
+        manifest.validate()?;
+        let Some(runtime) = manifest.runtime.clone() else {
+            let detail = format!(
+                "Downloader extension '{}' has no container runtime.",
+                instance.extension_id
+            );
+            checks.push(preflight_check(
+                "extension_manifest",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                detail.clone(),
+            ));
+            return Ok(empty_downloader_preflight_item(
+                instance,
+                container_name,
+                checks,
+                detail,
+            ));
+        };
+
+        let desired_volumes = resolve_runtime_volume_mounts(
+            &instance.extension_id,
+            instance.instance_id,
+            &runtime.volumes,
+            &self.runtime_paths,
+        )?;
+        let desired_network = desired_downloader_network_mode(
+            &instance.extension_id,
+            runtime.egress.as_ref(),
+            active_runtime,
+            self.default_wireguard_config_secret.as_deref(),
+            &container_name,
+        );
+        if let Some(desired_blocker) = desired_network.blocker.clone() {
+            checks.push(preflight_check(
+                "desired_network_profile",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                desired_blocker.clone(),
+            ));
+            blocker.get_or_insert(desired_blocker);
+        } else {
+            checks.push(preflight_check(
+                "desired_network_profile",
+                DownloadNetworkPreflightCheckStatus::Pass,
+                format!(
+                    "Desired downloader egress resolves to '{}'.",
+                    desired_network.profile_kind
+                ),
+            ));
+        }
+
+        let runtime_state = self
+            .runtime
+            .describe_container_runtime_state(&container_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "inspecting current downloader runtime state for instance {}",
+                    instance.instance_id
+                )
+            })?;
+
+        let (
+            container_present,
+            current_network_mode,
+            current_volumes,
+            current_mounts,
+            published_ports,
+            labels,
+        ) = if let Some(state) = runtime_state.as_ref() {
+            let volumes = volume_mounts_from_runtime_state(state);
+            checks.push(preflight_check(
+                "container_runtime",
+                DownloadNetworkPreflightCheckStatus::Pass,
+                format!(
+                    "Container '{}' is present for read-only preflight.",
+                    container_name
+                ),
+            ));
+            (
+                true,
+                normalized_network_mode(state.network_mode.as_deref()),
+                volumes.clone(),
+                preflight_mounts_for_instance(&instance.extension_id, &volumes),
+                state.published_ports.clone(),
+                state.labels.clone(),
+            )
+        } else {
+            let detail = format!(
+                "Container '{}' is missing; live downloader volume preservation cannot be proved.",
+                container_name
+            );
+            checks.push(preflight_check(
+                "container_runtime",
+                DownloadNetworkPreflightCheckStatus::Blocked,
+                detail.clone(),
+            ));
+            blocker.get_or_insert(detail);
+            (
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+            )
+        };
+
+        let desired_mounts =
+            preflight_mounts_for_instance(&instance.extension_id, &desired_volumes);
+        if container_present {
+            match validate_downloader_volume_preservation(
+                &instance.extension_id,
+                &current_volumes,
+                &desired_volumes,
+            ) {
+                Ok(()) => checks.push(preflight_check(
+                    "volume_preservation",
+                    DownloadNetworkPreflightCheckStatus::Pass,
+                    format!(
+                        "Preserved mounts remain unchanged: {}.",
+                        preserved_mount_identity_list(&instance.extension_id, &desired_volumes)
+                    ),
+                )),
+                Err(err) => {
+                    let detail = err.to_string();
+                    checks.push(preflight_check(
+                        "volume_preservation",
+                        DownloadNetworkPreflightCheckStatus::Blocked,
+                        detail.clone(),
+                    ));
+                    blocker.get_or_insert(detail);
+                }
+            }
+        }
+
+        let requires_rehome = downloader_network_mode_requires_rehome(
+            current_network_mode.as_deref(),
+            desired_network.network_mode.as_deref(),
+        );
+        checks.push(preflight_check(
+            "network_rehome",
+            DownloadNetworkPreflightCheckStatus::Pass,
+            if requires_rehome {
+                format!(
+                    "Downloader would be rehomed from {:?} to {:?}.",
+                    current_network_mode, desired_network.network_mode
+                )
+            } else {
+                "Downloader network mode already matches the desired profile.".to_string()
+            },
+        ));
+
+        Ok(DownloaderNetworkPreflightItem {
+            instance_id: instance.instance_id,
+            extension_id: instance.extension_id.clone(),
+            instance_name: instance.instance_name.clone(),
+            container_name,
+            container_present,
+            current_network_mode,
+            desired_network_mode: desired_network.network_mode,
+            desired_profile_id: desired_network.profile_id,
+            desired_profile_kind: desired_network.profile_kind,
+            requires_rehome,
+            current_mounts,
+            desired_mounts,
+            published_ports,
+            labels,
+            checks,
+            blocker,
+        })
+    }
+
+    pub async fn refresh_active_download_profile_runtime_status(&self) -> Result<()> {
+        let active_runtime = match active_managed_downloader_runtime(&self.pool).await {
+            Ok(active_runtime) => active_runtime,
+            Err(err) => {
+                tracing::debug!(
+                    "skipping active download profile runtime refresh because active profile cannot compile: {}",
+                    err
+                );
+                return Ok(());
+            }
+        };
+        let ActiveManagedDownloaderRuntime::CloudflareWarp { profile_id, .. } = active_runtime
+        else {
+            return Ok(());
+        };
+
+        let store = ExtensionStore::new(&self.pool);
+        let instances = store.list_instances(None).await?;
+        let managed_downloaders = instances
+            .into_iter()
+            .filter(|instance| {
+                instance.enabled
+                    && (is_qbittorrent_extension_id(&instance.extension_id)
+                        || is_nzbget_extension_id(&instance.extension_id))
+            })
+            .collect::<Vec<_>>();
+        if managed_downloaders.is_empty() {
+            return Ok(());
+        }
+
+        for instance in managed_downloaders {
+            let app_name = container_name(instance.instance_id);
+            let gateway_name = format!("{app_name}-vpn");
+            let Some(handle) = self.runtime.get_container_handle(&gateway_name).await? else {
+                mark_cloudflare_warp_runtime_unavailable(
+                    &self.pool,
+                    &profile_id,
+                    &format!("Cloudflare WARP gateway container '{gateway_name}' is missing."),
+                )
+                .await?;
+                return Ok(());
+            };
+            let state = self.runtime.inspect(&handle).await.with_context(|| {
+                format!("inspecting Cloudflare WARP gateway container '{gateway_name}'")
+            })?;
+            if !state.running {
+                mark_cloudflare_warp_runtime_unavailable(
+                    &self.pool,
+                    &profile_id,
+                    &format!("Cloudflare WARP gateway container '{gateway_name}' is stopped."),
+                )
+                .await?;
+                return Ok(());
+            }
+            if state.health.as_deref() == Some("unhealthy") {
+                mark_cloudflare_warp_runtime_unavailable(
+                    &self.pool,
+                    &profile_id,
+                    &format!("Cloudflare WARP gateway container '{gateway_name}' is unhealthy."),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        mark_cloudflare_warp_runtime_ready(&self.pool, &profile_id).await?;
+        Ok(())
+    }
+
+    pub async fn download_protection_runtime_evidence(
+        &self,
+    ) -> Result<DownloadProtectionRuntimeEvidence> {
+        let mut evidence = DownloadProtectionRuntimeEvidence {
+            server_public_ip: Some(probe_observation(
+                self.probe.probe_host_public_ip().await,
+                "Server public IP was observed from the Elixir host network.",
+                "Server public-IP probe failed",
+            )),
+            ..DownloadProtectionRuntimeEvidence::default()
+        };
+
+        let active_runtime = active_managed_downloader_runtime(&self.pool).await.ok();
+        let protected_runtime = matches!(
+            active_runtime,
+            Some(
+                ActiveManagedDownloaderRuntime::WireguardConfig { .. }
+                    | ActiveManagedDownloaderRuntime::OpenvpnConfig { .. }
+                    | ActiveManagedDownloaderRuntime::CloudflareWarp { .. }
+                    | ActiveManagedDownloaderRuntime::UnsupportedProtected { .. }
+            )
+        );
+
+        let store = ExtensionStore::new(&self.pool);
+        let instances = store.list_instances(None).await?;
+        let Some(instance) = instances.into_iter().find(|instance| {
+            instance.enabled
+                && (is_qbittorrent_extension_id(&instance.extension_id)
+                    || is_nzbget_extension_id(&instance.extension_id))
+        }) else {
+            return Ok(evidence);
+        };
+
+        let app_name = container_name(instance.instance_id);
+        evidence.downloader_public_ip = Some(probe_observation(
+            self.probe
+                .probe_public_ip_in_container_namespace(&app_name)
+                .await,
+            &format!("Downloader public IP was observed from container namespace '{app_name}'."),
+            "Downloader public-IP probe failed",
+        ));
+        evidence.downloader_dns = Some(probe_observation(
+            self.probe
+                .probe_dns_in_container_namespace(&app_name, "cloudflare.com")
+                .await,
+            &format!("Downloader DNS resolved from container namespace '{app_name}'."),
+            "Downloader DNS probe failed",
+        ));
+
+        if protected_runtime {
+            let gateway_name = format!("{app_name}-vpn");
+            evidence.gateway_public_ip = Some(probe_observation(
+                self.probe
+                    .probe_public_ip_in_container_namespace(&gateway_name)
+                    .await,
+                &format!("Gateway public IP was observed from namespace '{gateway_name}'."),
+                "Gateway public-IP probe failed",
+            ));
+            evidence.gateway_dns = Some(probe_observation(
+                self.probe
+                    .probe_dns_in_container_namespace(&gateway_name, "cloudflare.com")
+                    .await,
+                &format!("Gateway DNS resolved from namespace '{gateway_name}'."),
+                "Gateway DNS probe failed",
+            ));
+            evidence.kill_switch = Some(
+                self.observe_downloader_kill_switch_namespace(&app_name, &gateway_name)
+                    .await,
+            );
+        }
+
+        Ok(evidence)
+    }
+
+    async fn observe_downloader_kill_switch_namespace(
+        &self,
+        app_name: &str,
+        gateway_name: &str,
+    ) -> DownloadProtectionProbeEvidence {
+        match self
+            .runtime
+            .describe_container_runtime_state(app_name)
+            .await
+        {
+            Ok(Some(state)) => {
+                let actual = normalized_network_mode(state.network_mode.as_deref());
+                let expected_by_name = format!("container:{gateway_name}");
+                let gateway_id = self
+                    .runtime
+                    .get_container_handle(gateway_name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|handle| handle.id);
+                let matched = docker_container_namespace_matches(
+                    actual.as_deref(),
+                    gateway_name,
+                    gateway_id.as_deref(),
+                );
+                if matched {
+                    runtime_probe_evidence(
+                        DownloadProtectionCheckStatus::Pass,
+                        actual.or(Some(expected_by_name)),
+                        &format!(
+                            "Downloader '{app_name}' is joined to gateway namespace '{gateway_name}', so it has no independent Docker egress namespace."
+                        ),
+                    )
+                } else {
+                    runtime_probe_evidence(
+                        DownloadProtectionCheckStatus::Fail,
+                        actual,
+                        &format!(
+                            "Downloader '{app_name}' is not joined to gateway namespace '{gateway_name}'."
+                        ),
+                    )
+                }
+            }
+            Ok(None) => runtime_probe_evidence(
+                DownloadProtectionCheckStatus::Fail,
+                None,
+                &format!("Downloader container '{app_name}' is missing."),
+            ),
+            Err(err) => runtime_probe_evidence(
+                DownloadProtectionCheckStatus::Fail,
+                None,
+                &format!(
+                    "Inspecting downloader '{app_name}' for kill-switch evidence failed: {err}"
+                ),
+            ),
+        }
     }
 
     pub(crate) async fn apply_actions_with_notes(
@@ -1363,6 +2049,307 @@ fn backup_helper_image(manifest: &ExtensionManifest) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("module runtime image is missing"))
 }
 
+#[derive(Debug, Clone)]
+struct DesiredDownloaderNetworkMode {
+    network_mode: Option<String>,
+    profile_id: Option<String>,
+    profile_kind: String,
+    blocker: Option<String>,
+}
+
+fn docker_container_namespace_matches(
+    actual_network_mode: Option<&str>,
+    gateway_name: &str,
+    gateway_id: Option<&str>,
+) -> bool {
+    let Some(actual_network_mode) = actual_network_mode else {
+        return false;
+    };
+    let Some(actual_container) = actual_network_mode.strip_prefix("container:") else {
+        return false;
+    };
+    if actual_container == gateway_name {
+        return true;
+    }
+    if let Some(gateway_id) = gateway_id {
+        return actual_container == gateway_id
+            || actual_container.starts_with(gateway_id)
+            || gateway_id.starts_with(actual_container);
+    }
+    false
+}
+
+fn desired_downloader_network_mode(
+    extension_id: &str,
+    explicit_egress: Option<&ManifestRuntimeEgress>,
+    active_runtime: Option<&ActiveManagedDownloaderRuntime>,
+    default_wireguard_config_secret: Option<&str>,
+    container_name: &str,
+) -> DesiredDownloaderNetworkMode {
+    if let Some(egress) = explicit_egress {
+        if egress.mode_is_wireguard() {
+            return DesiredDownloaderNetworkMode {
+                network_mode: Some(format!("container:{container_name}-vpn")),
+                profile_id: None,
+                profile_kind: "manifest_wireguard".to_string(),
+                blocker: None,
+            };
+        }
+        return DesiredDownloaderNetworkMode {
+            network_mode: None,
+            profile_id: None,
+            profile_kind: "manifest_direct".to_string(),
+            blocker: None,
+        };
+    }
+
+    if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+        return DesiredDownloaderNetworkMode {
+            network_mode: None,
+            profile_id: None,
+            profile_kind: "not_managed_downloader".to_string(),
+            blocker: None,
+        };
+    }
+
+    match active_runtime {
+        Some(ActiveManagedDownloaderRuntime::NoStoredProfile) => {
+            if default_wireguard_config_secret
+                .map(str::trim)
+                .is_some_and(|secret| !secret.is_empty())
+            {
+                DesiredDownloaderNetworkMode {
+                    network_mode: Some(format!("container:{container_name}-vpn")),
+                    profile_id: None,
+                    profile_kind: "legacy_default_wireguard".to_string(),
+                    blocker: None,
+                }
+            } else {
+                DesiredDownloaderNetworkMode {
+                    network_mode: None,
+                    profile_id: None,
+                    profile_kind: "no_stored_profile_direct".to_string(),
+                    blocker: None,
+                }
+            }
+        }
+        Some(ActiveManagedDownloaderRuntime::Direct) => DesiredDownloaderNetworkMode {
+            network_mode: None,
+            profile_id: None,
+            profile_kind: "direct".to_string(),
+            blocker: None,
+        },
+        Some(ActiveManagedDownloaderRuntime::WireguardConfig { profile_id, .. }) => {
+            DesiredDownloaderNetworkMode {
+                network_mode: Some(format!("container:{container_name}-vpn")),
+                profile_id: Some(profile_id.clone()),
+                profile_kind: "wireguard_config".to_string(),
+                blocker: None,
+            }
+        }
+        Some(ActiveManagedDownloaderRuntime::OpenvpnConfig { profile_id, .. }) => {
+            DesiredDownloaderNetworkMode {
+                network_mode: Some(format!("container:{container_name}-vpn")),
+                profile_id: Some(profile_id.clone()),
+                profile_kind: "openvpn_config".to_string(),
+                blocker: None,
+            }
+        }
+        Some(ActiveManagedDownloaderRuntime::CloudflareWarp { profile_id, .. }) => {
+            DesiredDownloaderNetworkMode {
+                network_mode: Some(format!("container:{container_name}-vpn")),
+                profile_id: Some(profile_id.clone()),
+                profile_kind: "cloudflare_warp".to_string(),
+                blocker: None,
+            }
+        }
+        Some(ActiveManagedDownloaderRuntime::UnsupportedProtected { profile_id, kind }) => {
+            DesiredDownloaderNetworkMode {
+                network_mode: None,
+                profile_id: Some(profile_id.clone()),
+                profile_kind: download_network_profile_kind_label(kind).to_string(),
+                blocker: Some(format!(
+                    "Active download profile '{}' has unsupported runtime kind '{}'.",
+                    profile_id,
+                    download_network_profile_kind_label(kind)
+                )),
+            }
+        }
+        None => DesiredDownloaderNetworkMode {
+            network_mode: None,
+            profile_id: None,
+            profile_kind: "unresolved".to_string(),
+            blocker: Some(
+                "Desired downloader network mode cannot be resolved until the active profile is executable."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn active_runtime_identity(runtime: &ActiveManagedDownloaderRuntime) -> (String, Option<String>) {
+    match runtime {
+        ActiveManagedDownloaderRuntime::NoStoredProfile => ("no_stored_profile".to_string(), None),
+        ActiveManagedDownloaderRuntime::Direct => ("direct".to_string(), None),
+        ActiveManagedDownloaderRuntime::WireguardConfig { profile_id, .. } => {
+            ("wireguard_config".to_string(), Some(profile_id.clone()))
+        }
+        ActiveManagedDownloaderRuntime::OpenvpnConfig { profile_id, .. } => {
+            ("openvpn_config".to_string(), Some(profile_id.clone()))
+        }
+        ActiveManagedDownloaderRuntime::CloudflareWarp { profile_id, .. } => {
+            ("cloudflare_warp".to_string(), Some(profile_id.clone()))
+        }
+        ActiveManagedDownloaderRuntime::UnsupportedProtected { profile_id, kind } => (
+            download_network_profile_kind_label(kind).to_string(),
+            Some(profile_id.clone()),
+        ),
+    }
+}
+
+fn download_network_profile_kind_label(kind: &DownloadNetworkProfileKind) -> &'static str {
+    match kind {
+        DownloadNetworkProfileKind::ExternalOnly => "external_only",
+        DownloadNetworkProfileKind::Direct => "direct",
+        DownloadNetworkProfileKind::CloudflareWarp => "cloudflare_warp",
+        DownloadNetworkProfileKind::WireguardConfig => "wireguard_config",
+        DownloadNetworkProfileKind::OpenvpnConfig => "openvpn_config",
+        DownloadNetworkProfileKind::ProviderPreset => "provider_preset",
+        DownloadNetworkProfileKind::DebridOnly => "debrid_only",
+    }
+}
+
+fn preflight_check(
+    id: impl Into<String>,
+    status: DownloadNetworkPreflightCheckStatus,
+    detail: impl Into<String>,
+) -> DownloadNetworkPreflightCheck {
+    DownloadNetworkPreflightCheck {
+        id: id.into(),
+        status,
+        detail: detail.into(),
+    }
+}
+
+fn preflight_mounts_for_instance(
+    extension_id: &str,
+    volumes: &[VolumeMount],
+) -> Vec<DownloadNetworkPreflightMount> {
+    let preserved = downloader_preserved_mounts(extension_id);
+    volumes
+        .iter()
+        .map(|volume| DownloadNetworkPreflightMount {
+            container_path: volume.container_path.clone(),
+            source_kind: backup_source_kind_label(volume.source_kind).to_string(),
+            source: volume.host_path.clone(),
+            read_only: volume.read_only,
+            preserved: preserved.contains(&volume.container_path.as_str()),
+        })
+        .collect()
+}
+
+fn preserved_mount_identity_list(extension_id: &str, volumes: &[VolumeMount]) -> String {
+    downloader_preserved_mounts(extension_id)
+        .iter()
+        .filter_map(|container_path| {
+            volumes
+                .iter()
+                .find(|volume| volume.container_path == *container_path)
+                .map(describe_volume_mount_identity)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn empty_downloader_preflight_item(
+    instance: &ExtensionInstance,
+    container_name: String,
+    checks: Vec<DownloadNetworkPreflightCheck>,
+    blocker: String,
+) -> DownloaderNetworkPreflightItem {
+    DownloaderNetworkPreflightItem {
+        instance_id: instance.instance_id,
+        extension_id: instance.extension_id.clone(),
+        instance_name: instance.instance_name.clone(),
+        container_name,
+        container_present: false,
+        current_network_mode: None,
+        desired_network_mode: None,
+        desired_profile_id: None,
+        desired_profile_kind: "unresolved".to_string(),
+        requires_rehome: false,
+        current_mounts: Vec::new(),
+        desired_mounts: Vec::new(),
+        published_ports: Vec::new(),
+        labels: HashMap::new(),
+        checks,
+        blocker: Some(blocker),
+    }
+}
+
+fn probe_observation(
+    result: Result<ProbeResult>,
+    success_detail: &str,
+    failure_prefix: &str,
+) -> DownloadProtectionProbeEvidence {
+    match result {
+        Ok(result) if result.ok => runtime_probe_evidence(
+            DownloadProtectionCheckStatus::Pass,
+            probe_result_value(&result),
+            success_detail,
+        ),
+        Ok(result) => runtime_probe_evidence(
+            DownloadProtectionCheckStatus::Fail,
+            probe_result_value(&result),
+            &format!(
+                "{}: {}",
+                failure_prefix,
+                result
+                    .details
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "probe returned ok=false".to_string())
+            ),
+        ),
+        Err(err) => runtime_probe_evidence(
+            DownloadProtectionCheckStatus::Fail,
+            None,
+            &format!("{failure_prefix}: {err}"),
+        ),
+    }
+}
+
+fn runtime_probe_evidence(
+    status: DownloadProtectionCheckStatus,
+    value: Option<String>,
+    detail: &str,
+) -> DownloadProtectionProbeEvidence {
+    DownloadProtectionProbeEvidence {
+        status,
+        value,
+        detail: detail.to_string(),
+        checked_at: Utc::now(),
+    }
+}
+
+fn probe_result_value(result: &ProbeResult) -> Option<String> {
+    let details = result.details.as_ref()?;
+    for key in ["ip", "addr", "status"] {
+        if let Some(value) = details.get(key) {
+            if let Some(raw) = value.as_str() {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            if let Some(raw) = value.as_u64() {
+                return Some(raw.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn backup_source_kind_label(kind: VolumeMountSourceKind) -> &'static str {
     match kind {
         VolumeMountSourceKind::Bind => "bind",
@@ -1658,6 +2645,80 @@ mod tests {
                 details: None,
             })
         }
+    }
+
+    #[test]
+    fn preflight_desired_network_mode_uses_active_warp_namespace() {
+        let runtime = ActiveManagedDownloaderRuntime::CloudflareWarp {
+            profile_id: "warp-main".to_string(),
+            enrollment_id: "enrollment-1".to_string(),
+            identity_secret_ref: "profile:warp_identity".to_string(),
+            gateway_image: "caomingjun/warp:latest".to_string(),
+            state_volume_name: "elixir_warp_warp-main".to_string(),
+        };
+
+        let desired = desired_downloader_network_mode(
+            "elixir.modules.qbittorrent",
+            None,
+            Some(&runtime),
+            None,
+            "elx-abc123",
+        );
+
+        assert_eq!(
+            desired.network_mode.as_deref(),
+            Some("container:elx-abc123-vpn")
+        );
+        assert_eq!(desired.profile_id.as_deref(), Some("warp-main"));
+        assert_eq!(desired.profile_kind, "cloudflare_warp");
+        assert!(desired.blocker.is_none());
+    }
+
+    #[test]
+    fn preflight_desired_network_mode_blocks_unsupported_profile() {
+        let runtime = ActiveManagedDownloaderRuntime::UnsupportedProtected {
+            profile_id: "preset-1".to_string(),
+            kind: DownloadNetworkProfileKind::ProviderPreset,
+        };
+
+        let desired = desired_downloader_network_mode(
+            "elixir.modules.nzbget",
+            None,
+            Some(&runtime),
+            None,
+            "elx-def456",
+        );
+
+        assert_eq!(desired.network_mode, None);
+        assert_eq!(desired.profile_id.as_deref(), Some("preset-1"));
+        assert_eq!(desired.profile_kind, "provider_preset");
+        assert!(desired.blocker.is_some());
+    }
+
+    #[test]
+    fn docker_container_namespace_match_accepts_name_full_id_and_short_id() {
+        let gateway_id = "bcb7b296654532afba9fb825f44689f707bd5bd30bb6977404008072242cedde";
+
+        assert!(docker_container_namespace_matches(
+            Some("container:elx-ba4bf0-vpn"),
+            "elx-ba4bf0-vpn",
+            Some(gateway_id),
+        ));
+        assert!(docker_container_namespace_matches(
+            Some("container:bcb7b296654532afba9fb825f44689f707bd5bd30bb6977404008072242cedde"),
+            "elx-ba4bf0-vpn",
+            Some("bcb7b2966545"),
+        ));
+        assert!(docker_container_namespace_matches(
+            Some("container:bcb7b2966545"),
+            "elx-ba4bf0-vpn",
+            Some(gateway_id),
+        ));
+        assert!(!docker_container_namespace_matches(
+            Some("bridge"),
+            "elx-ba4bf0-vpn",
+            Some(gateway_id),
+        ));
     }
 
     #[tokio::test]

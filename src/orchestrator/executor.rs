@@ -22,8 +22,10 @@ use crate::db::models::{
     SlotCardinality,
 };
 use crate::drivers::{
-    ApplyStatus, DriftStatus, DriverCtx, DriverPatch, DriverRegistry, PatchApplyPolicy,
-    bootstrap_qbittorrent_session_cookie, render_nzbget_config_patch,
+    ApplyStatus, DriftStatus, DriverCtx, DriverPatch, DriverRegistry, NzbgetPauseSnapshot,
+    PatchApplyPolicy, QbittorrentPauseSnapshot, bootstrap_qbittorrent_session_cookie,
+    pause_nzbget_for_rehome, pause_qbittorrent_for_rehome, render_nzbget_config_patch,
+    resume_nzbget_after_rehome, resume_qbittorrent_after_rehome,
 };
 use crate::drivers::{
     DownloaderNzbPatch, DownloaderSpec, DownloaderTorrentPatch, IndexerCredentialField,
@@ -45,10 +47,23 @@ use crate::extensions::required_secrets::{
 use crate::extensions::store::{
     ExtensionStore, NewBinding, NewExtensionInstance, NewProvider, NewSecret, ProviderDetails,
 };
+use crate::network::protection::{
+    ActiveManagedDownloaderRuntime, CloudflareWarpGatewayRuntime,
+    CompiledDownloadProtectionProfile, DOWNLOAD_NETWORK_EXPOSED_PORTS_LABEL,
+    DOWNLOAD_NETWORK_PROFILE_ID_LABEL, DOWNLOAD_NETWORK_PROFILE_KIND_LABEL,
+    DOWNLOAD_NETWORK_RUNTIME_KIND_LABEL, DownloadNetworkProfileKind,
+    DownloadProtectionCompileInput, DownloadProtectionProfile, GluetunOpenvpnGatewayRuntime,
+    GluetunWireguardGatewayRuntime, active_download_network_profile_identity,
+    active_managed_downloader_runtime, exposed_container_ports_label,
+    mark_cloudflare_warp_runtime_ready, mark_cloudflare_warp_runtime_unavailable,
+    profile_kind_as_str,
+};
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::runtime::model::{
-    ContainerHandle, ContainerSpec, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
+    CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerRuntimeMount, ContainerRuntimeState,
+    ContainerSpec, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
+    apply_container_spec_fingerprint,
 };
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
@@ -119,6 +134,7 @@ pub enum ExecutorAction {
 }
 
 pub struct Executor<'a> {
+    pool: &'a AnyPool,
     store: ExtensionStore<'a>,
     probe: &'a dyn ProbeRunner,
     drivers: &'a DriverRegistry,
@@ -132,6 +148,51 @@ pub struct Executor<'a> {
 
 struct PreparedRuntimeVolumes {
     volumes: Vec<VolumeMount>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloaderRehomePreflight {
+    requires_rehome: bool,
+    previous_network_mode: Option<String>,
+    desired_network_mode: Option<String>,
+}
+
+impl DownloaderRehomePreflight {
+    fn unchanged() -> Self {
+        Self {
+            requires_rehome: false,
+            previous_network_mode: None,
+            desired_network_mode: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DownloaderRehomePause {
+    Qbittorrent {
+        provider_id: Uuid,
+        snapshot: QbittorrentPauseSnapshot,
+    },
+    Nzbget {
+        provider_id: Uuid,
+        snapshot: NzbgetPauseSnapshot,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedDownloadEgress {
+    Wireguard(ManifestRuntimeEgress),
+    Openvpn {
+        profile_id: String,
+        config_secret_ref: String,
+        username_secret_ref: Option<String>,
+        password_secret_ref: Option<String>,
+        gateway_image: Option<String>,
+    },
+    CloudflareWarp {
+        profile_id: String,
+        runtime: CloudflareWarpGatewayRuntime,
+    },
 }
 
 #[derive(Debug)]
@@ -169,6 +230,7 @@ impl<'a> Executor<'a> {
         secrets: &'a SecretsManager,
     ) -> Self {
         Self {
+            pool,
             store: ExtensionStore::new(pool),
             probe,
             drivers,
@@ -384,6 +446,110 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    async fn resolve_default_download_egress(
+        &self,
+        extension_id: &str,
+        explicit_egress: Option<ManifestRuntimeEgress>,
+    ) -> Result<Option<ResolvedDownloadEgress>> {
+        if let Some(explicit_egress) = explicit_egress {
+            return if explicit_egress.mode_is_wireguard() {
+                Ok(Some(ResolvedDownloadEgress::Wireguard(explicit_egress)))
+            } else {
+                Ok(None)
+            };
+        }
+        if !is_default_wireguard_downloader_extension_id(extension_id) {
+            return Ok(None);
+        }
+
+        match active_managed_downloader_runtime(self.pool).await? {
+            ActiveManagedDownloaderRuntime::NoStoredProfile => Ok(self
+                .default_wireguard_config_secret
+                .as_ref()
+                .map(|secret| ManifestRuntimeEgress {
+                    mode: "wireguard".to_string(),
+                    strict: true,
+                    wireguard_config_secret: Some(secret.clone()),
+                    wireguard_gateway_image: None,
+                })
+                .map(ResolvedDownloadEgress::Wireguard)),
+            ActiveManagedDownloaderRuntime::Direct => Ok(None),
+            ActiveManagedDownloaderRuntime::WireguardConfig {
+                profile_id: _,
+                secret_ref,
+                gateway_image,
+            } => Ok(Some(ResolvedDownloadEgress::Wireguard(
+                ManifestRuntimeEgress {
+                    mode: "wireguard".to_string(),
+                    strict: true,
+                    wireguard_config_secret: Some(secret_ref),
+                    wireguard_gateway_image: gateway_image,
+                },
+            ))),
+            ActiveManagedDownloaderRuntime::OpenvpnConfig {
+                profile_id,
+                config_secret_ref,
+                username_secret_ref,
+                password_secret_ref,
+                gateway_image,
+            } => Ok(Some(ResolvedDownloadEgress::Openvpn {
+                profile_id,
+                config_secret_ref,
+                username_secret_ref,
+                password_secret_ref,
+                gateway_image,
+            })),
+            ActiveManagedDownloaderRuntime::CloudflareWarp {
+                profile_id,
+                enrollment_id,
+                identity_secret_ref,
+                gateway_image,
+                state_volume_name,
+            } => Ok(Some(ResolvedDownloadEgress::CloudflareWarp {
+                profile_id: profile_id.clone(),
+                runtime: CloudflareWarpGatewayRuntime {
+                    image: gateway_image,
+                    state_volume_name,
+                    enrollment_id,
+                    identity_secret_ref,
+                },
+            })),
+            ActiveManagedDownloaderRuntime::UnsupportedProtected { profile_id, kind } => {
+                bail!(
+                    "active download network profile '{}' uses unsupported protected runtime '{:?}' for managed downloader '{}'",
+                    profile_id,
+                    kind,
+                    extension_id
+                )
+            }
+        }
+    }
+
+    fn stamp_direct_downloader_network_labels(
+        spec: &mut ContainerSpec,
+        profile_id: &str,
+        profile_kind: &DownloadNetworkProfileKind,
+    ) {
+        let exposed_ports = exposed_container_ports_label(spec);
+        spec.labels.insert(
+            DOWNLOAD_NETWORK_PROFILE_ID_LABEL.to_string(),
+            profile_id.to_string(),
+        );
+        spec.labels.insert(
+            DOWNLOAD_NETWORK_PROFILE_KIND_LABEL.to_string(),
+            profile_kind_as_str(profile_kind).to_string(),
+        );
+        spec.labels.insert(
+            DOWNLOAD_NETWORK_RUNTIME_KIND_LABEL.to_string(),
+            "direct".to_string(),
+        );
+        spec.labels.insert(
+            DOWNLOAD_NETWORK_EXPOSED_PORTS_LABEL.to_string(),
+            exposed_ports,
+        );
+        apply_container_spec_fingerprint(spec);
+    }
+
     async fn ensure_instance_installed(
         &self,
         instance_id: Uuid,
@@ -517,51 +683,117 @@ impl<'a> Executor<'a> {
             sysctls: HashMap::new(),
         };
 
-        let resolved_egress = runtime.egress.clone().or_else(|| {
-            if is_default_wireguard_downloader_extension_id(&extension_id) {
-                self.default_wireguard_config_secret
-                    .as_ref()
-                    .map(|secret| ManifestRuntimeEgress {
-                        mode: "wireguard".to_string(),
-                        strict: true,
-                        wireguard_config_secret: Some(secret.clone()),
-                        wireguard_gateway_image: None,
-                    })
-            } else {
-                None
-            }
-        });
+        let resolved_egress = self
+            .resolve_default_download_egress(&extension_id, runtime.egress.clone())
+            .await?;
 
         if let Some(egress) = resolved_egress {
-            if egress.mode_is_wireguard() {
-                match self
-                    .ensure_wireguard_gateway(
-                        instance_id,
-                        &extension_id,
-                        &name,
-                        &spec,
-                        &egress,
-                        &labels,
-                    )
-                    .await
-                {
-                    Ok(gateway_name) => {
-                        spec.network_mode = Some(format!("container:{gateway_name}"));
-                        spec.aliases.clear();
-                        spec.ports.clear();
-                    }
-                    Err(err) if !egress.strict => {
-                        tracing::warn!(
-                            "wireguard gateway setup failed for extension {} instance {} (strict=false), falling back to direct egress: {}",
-                            extension_id,
+            match egress {
+                ResolvedDownloadEgress::Wireguard(egress) => {
+                    match self
+                        .apply_download_protection_profile(
                             instance_id,
-                            err
-                        );
+                            &extension_id,
+                            &name,
+                            &spec,
+                            &egress,
+                            &labels,
+                        )
+                        .await
+                    {
+                        Ok(protected_spec) => spec = protected_spec,
+                        Err(err) if !egress.strict => {
+                            tracing::warn!(
+                                "download protection gateway setup failed for extension {} instance {} (strict=false), falling back to direct egress: {}",
+                                extension_id,
+                                instance_id,
+                                err
+                            );
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
+                }
+                ResolvedDownloadEgress::Openvpn {
+                    profile_id,
+                    config_secret_ref,
+                    username_secret_ref,
+                    password_secret_ref,
+                    gateway_image,
+                } => {
+                    spec = self
+                        .apply_openvpn_profile(
+                            instance_id,
+                            &extension_id,
+                            &name,
+                            &spec,
+                            &profile_id,
+                            &config_secret_ref,
+                            username_secret_ref.as_deref(),
+                            password_secret_ref.as_deref(),
+                            gateway_image.as_deref(),
+                            &labels,
+                        )
+                        .await?;
+                }
+                ResolvedDownloadEgress::CloudflareWarp {
+                    profile_id,
+                    runtime,
+                } => {
+                    spec = self
+                        .apply_cloudflare_warp_profile(
+                            instance_id,
+                            &extension_id,
+                            &name,
+                            &spec,
+                            &profile_id,
+                            runtime,
+                            &labels,
+                        )
+                        .await?;
                 }
             }
         }
+        if spec.network_mode.is_none()
+            && (is_qbittorrent_extension_id(&extension_id) || is_nzbget_extension_id(&extension_id))
+        {
+            let (profile_id, profile_kind) = active_download_network_profile_identity(self.pool)
+                .await?
+                .unwrap_or_else(|| {
+                    (
+                        "legacy-direct".to_string(),
+                        DownloadNetworkProfileKind::Direct,
+                    )
+                });
+            Self::stamp_direct_downloader_network_labels(&mut spec, &profile_id, &profile_kind);
+        }
+
+        let rehome_preflight = self
+            .preflight_downloader_rehome(
+                instance_id,
+                &extension_id,
+                &name,
+                &spec,
+                &runtime_volumes,
+                instance.config_json.as_ref(),
+            )
+            .await?;
+        if rehome_preflight.requires_rehome {
+            tracing::info!(
+                "downloader rehome preflight passed for extension {} instance {}: {:?} -> {:?}",
+                extension_id,
+                instance_id,
+                rehome_preflight.previous_network_mode,
+                rehome_preflight.desired_network_mode
+            );
+        }
+        let keep_paused_after_rehome =
+            keep_downloader_paused_after_rehome(instance.config_json.as_ref());
+        let rehome_pause = if rehome_preflight.requires_rehome {
+            self.pause_downloader_for_rehome(instance_id, &extension_id, &instance)
+                .await?
+        } else {
+            None
+        };
 
         if spec.network_mode.is_none() {
             self.runtime.ensure_network(&spec.network).await?;
@@ -617,6 +849,12 @@ impl<'a> Executor<'a> {
                             .await;
                     }
                 }
+                self.try_resume_downloader_after_rehome(
+                    &rehome_pause,
+                    keep_paused_after_rehome,
+                    "container ensure failed",
+                )
+                .await;
                 return Err(err);
             } else {
                 self.runtime
@@ -658,7 +896,55 @@ impl<'a> Executor<'a> {
                             .await;
                     }
                 }
+                self.try_resume_downloader_after_rehome(
+                    &rehome_pause,
+                    keep_paused_after_rehome,
+                    "storage finalize failed",
+                )
+                .await;
                 return Err(err);
+            }
+            if rehome_preflight.requires_rehome {
+                if let Err(err) = self
+                    .verify_downloader_rehome(instance_id, &extension_id)
+                    .await
+                {
+                    if let Some(handle) = self.runtime.get_container_handle(&name).await? {
+                        let _ = self.runtime.remove_container(&handle).await;
+                    }
+                    if backup_created {
+                        let rollback_handle = ContainerHandle {
+                            id: rollback_name.clone(),
+                            name: rollback_name.clone(),
+                        };
+                        if let Err(rename_err) =
+                            self.runtime.rename_container(&rollback_handle, &name).await
+                        {
+                            tracing::warn!(
+                                "upgrade: failed to restore rollback container {} after downloader rehome verification error: {}",
+                                rollback_name,
+                                rename_err
+                            );
+                        } else {
+                            let _ = self
+                                .runtime
+                                .start_container(&ContainerHandle {
+                                    id: name.clone(),
+                                    name: name.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                    self.try_resume_downloader_after_rehome(
+                        &rehome_pause,
+                        keep_paused_after_rehome,
+                        "downloader verification failed",
+                    )
+                    .await;
+                    return Err(err);
+                }
+                self.resume_downloader_after_rehome(&rehome_pause, keep_paused_after_rehome)
+                    .await?;
             }
             persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
             let next_rollback = if backup_created {
@@ -669,6 +955,42 @@ impl<'a> Executor<'a> {
             self.store
                 .update_instance_runtime_version(instance_id, &desired_version, next_rollback)
                 .await?;
+            self.cleanup_stale_downloader_gateway_if_unneeded(
+                &extension_id,
+                &name,
+                spec.network_mode.as_deref(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if rehome_preflight.requires_rehome {
+            self.ensure_rehomed_runtime_with_rollback(
+                instance_id,
+                &extension_id,
+                &name,
+                &spec,
+                &runtime_volumes,
+                rehome_pause,
+                keep_paused_after_rehome,
+            )
+            .await?;
+            persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
+            if current_version.is_none() {
+                self.store
+                    .update_instance_runtime_version(
+                        instance_id,
+                        &desired_version,
+                        rollback_version.as_deref(),
+                    )
+                    .await?;
+            }
+            self.cleanup_stale_downloader_gateway_if_unneeded(
+                &extension_id,
+                &name,
+                spec.network_mode.as_deref(),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -685,10 +1007,16 @@ impl<'a> Executor<'a> {
                 )
                 .await?;
         }
+        self.cleanup_stale_downloader_gateway_if_unneeded(
+            &extension_id,
+            &name,
+            spec.network_mode.as_deref(),
+        )
+        .await?;
         Ok(())
     }
 
-    async fn ensure_wireguard_gateway(
+    async fn apply_download_protection_profile(
         &self,
         instance_id: Uuid,
         extension_id: &str,
@@ -696,7 +1024,662 @@ impl<'a> Executor<'a> {
         app_spec: &ContainerSpec,
         egress: &ManifestRuntimeEgress,
         base_labels: &HashMap<String, String>,
-    ) -> Result<String> {
+    ) -> Result<ContainerSpec> {
+        let compiled = self
+            .compile_download_protection_profile(
+                instance_id,
+                container_name,
+                app_spec,
+                egress,
+                base_labels,
+            )
+            .await?;
+        if let Some(gateway_spec) = compiled.gateway_spec.as_ref() {
+            self.runtime.ensure_network(&gateway_spec.network).await?;
+            self.runtime
+                .ensure_container(gateway_spec)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensuring download protection gateway container '{}' for extension '{}'",
+                        gateway_spec.name, extension_id
+                    )
+                })?;
+        }
+        Ok(compiled.protected_app_spec)
+    }
+
+    async fn apply_cloudflare_warp_profile(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        container_name: &str,
+        app_spec: &ContainerSpec,
+        profile_id: &str,
+        runtime: CloudflareWarpGatewayRuntime,
+        base_labels: &HashMap<String, String>,
+    ) -> Result<ContainerSpec> {
+        let profile = DownloadProtectionProfile::cloudflare_warp(
+            profile_id,
+            "Cloudflare WARP",
+            true,
+            runtime,
+        );
+        let compiled = profile.compile(DownloadProtectionCompileInput {
+            app_container_name: container_name,
+            app_spec,
+            base_labels,
+        })?;
+        let result = async {
+            if let Some(gateway_spec) = compiled.gateway_spec.as_ref() {
+                self.runtime.ensure_network(&gateway_spec.network).await?;
+                self.runtime
+                    .ensure_container(gateway_spec)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensuring Cloudflare WARP gateway container '{}' for extension '{}'",
+                            gateway_spec.name, extension_id
+                        )
+                    })?;
+            }
+            mark_cloudflare_warp_runtime_ready(self.pool, profile_id).await?;
+            Ok::<ContainerSpec, anyhow::Error>(compiled.protected_app_spec)
+        }
+        .await;
+
+        if let Err(err) = result.as_ref() {
+            let detail = format!(
+                "Cloudflare WARP gateway apply failed for extension '{}' instance {}: {}",
+                extension_id, instance_id, err
+            );
+            let _ = mark_cloudflare_warp_runtime_unavailable(self.pool, profile_id, &detail).await;
+        }
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_openvpn_profile(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        container_name: &str,
+        app_spec: &ContainerSpec,
+        profile_id: &str,
+        config_secret_ref: &str,
+        username_secret_ref: Option<&str>,
+        password_secret_ref: Option<&str>,
+        gateway_image: Option<&str>,
+        base_labels: &HashMap<String, String>,
+    ) -> Result<ContainerSpec> {
+        let config_value =
+            resolve_secret_value(&self.store, self.secrets, instance_id, config_secret_ref)
+                .await
+                .with_context(|| {
+                    format!(
+                        "resolving OpenVPN config secret '{}' for instance {}",
+                        config_secret_ref, instance_id
+                    )
+                })?;
+        if config_value.trim().is_empty() {
+            bail!(
+                "OpenVPN config secret '{}' resolved to empty value",
+                config_secret_ref
+            );
+        }
+
+        let username = match username_secret_ref {
+            Some(secret_ref) => Some(
+                resolve_secret_value(&self.store, self.secrets, instance_id, secret_ref)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolving OpenVPN username secret '{}' for instance {}",
+                            secret_ref, instance_id
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let password = match password_secret_ref {
+            Some(secret_ref) => Some(
+                resolve_secret_value(&self.store, self.secrets, instance_id, secret_ref)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolving OpenVPN password secret '{}' for instance {}",
+                            secret_ref, instance_id
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        if username.is_some() != password.is_some() {
+            bail!(
+                "OpenVPN profile '{}' has incomplete credentials",
+                profile_id
+            );
+        }
+
+        let (config_path, auth_path) = self
+            .write_openvpn_config(
+                instance_id,
+                &config_value,
+                username.as_deref(),
+                password.as_deref(),
+            )
+            .await
+            .context("writing OpenVPN config")?;
+        let image = gateway_image
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.wireguard_gateway_image.as_str())
+            .to_string();
+        let profile = DownloadProtectionProfile::openvpn_config(
+            profile_id,
+            "Imported OpenVPN",
+            true,
+            GluetunOpenvpnGatewayRuntime {
+                image,
+                config_host_path: config_path,
+                auth_host_path: auth_path,
+            },
+        );
+        let compiled = profile.compile(DownloadProtectionCompileInput {
+            app_container_name: container_name,
+            app_spec,
+            base_labels,
+        })?;
+        if let Some(gateway_spec) = compiled.gateway_spec.as_ref() {
+            self.runtime.ensure_network(&gateway_spec.network).await?;
+            self.runtime
+                .ensure_container(gateway_spec)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensuring OpenVPN gateway container '{}' for extension '{}'",
+                        gateway_spec.name, extension_id
+                    )
+                })?;
+        }
+        Ok(compiled.protected_app_spec)
+    }
+
+    async fn preflight_downloader_rehome(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        container_name: &str,
+        desired_spec: &ContainerSpec,
+        desired_volumes: &[VolumeMount],
+        instance_config: Option<&serde_json::Value>,
+    ) -> Result<DownloaderRehomePreflight> {
+        if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+            return Ok(DownloaderRehomePreflight::unchanged());
+        }
+
+        if self
+            .runtime
+            .get_container_handle(container_name)
+            .await?
+            .is_none()
+        {
+            return Ok(DownloaderRehomePreflight::unchanged());
+        }
+
+        let runtime_state = self
+            .runtime
+            .describe_container_runtime_state(container_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "inspecting current downloader runtime state for instance {}",
+                    instance_id
+                )
+            })?;
+        let current_network_mode = runtime_state
+            .as_ref()
+            .and_then(|state| normalized_network_mode(state.network_mode.as_deref()));
+        let desired_network_mode = normalized_network_mode(desired_spec.network_mode.as_deref());
+
+        let network_mode_requires_rehome = downloader_network_mode_requires_rehome(
+            current_network_mode.as_deref(),
+            desired_network_mode.as_deref(),
+        );
+        let spec_fingerprint_requires_rehome = runtime_state.as_ref().is_some_and(|state| {
+            desired_spec
+                .labels
+                .get(CONTAINER_SPEC_HASH_LABEL)
+                .zip(state.labels.get(CONTAINER_SPEC_HASH_LABEL))
+                .is_some_and(|(desired, actual)| desired != actual)
+        });
+
+        if !network_mode_requires_rehome && !spec_fingerprint_requires_rehome {
+            return Ok(DownloaderRehomePreflight::unchanged());
+        }
+
+        let existing_volumes = if let Some(state) = runtime_state.as_ref() {
+            volume_mounts_from_runtime_state(state)
+        } else {
+            persisted_runtime_volumes(instance_config)?.ok_or_else(|| {
+                anyhow!(
+                    "downloader migration preflight failed: current runtime state for instance {} is unavailable and no persisted runtime volumes exist",
+                    instance_id
+                )
+            })?
+        };
+
+        let rehome_context =
+            format!("validating downloader rehome volume preservation for instance {instance_id}");
+        validate_downloader_volume_preservation(extension_id, &existing_volumes, desired_volumes)
+            .context(rehome_context)?;
+
+        Ok(DownloaderRehomePreflight {
+            requires_rehome: true,
+            previous_network_mode: current_network_mode,
+            desired_network_mode,
+        })
+    }
+
+    async fn ensure_rehomed_runtime_with_rollback(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        container_name: &str,
+        spec: &ContainerSpec,
+        runtime_volumes: &[VolumeMount],
+        rehome_pause: Option<DownloaderRehomePause>,
+        keep_paused_after_rehome: bool,
+    ) -> Result<()> {
+        let rollback_name = format!("{container_name}-network-rollback");
+        if let Some(handle) = self.runtime.get_container_handle(&rollback_name).await? {
+            let _ = self.runtime.stop_container(&handle).await;
+            let _ = self.runtime.remove_container(&handle).await;
+        }
+
+        let mut backup_created = false;
+        if let Some(handle) = self.runtime.get_container_handle(container_name).await? {
+            let _ = self.runtime.stop_container(&handle).await;
+            match self.runtime.rename_container(&handle, &rollback_name).await {
+                Ok(_) => backup_created = true,
+                Err(err) => {
+                    tracing::warn!(
+                        "downloader rehome: failed to rename container {} -> {}: {}",
+                        handle.name,
+                        rollback_name,
+                        err
+                    );
+                }
+            }
+        }
+
+        let handle = match self.runtime.ensure_container(spec).await {
+            Ok(_) => self
+                .runtime
+                .get_container_handle(container_name)
+                .await?
+                .unwrap_or(ContainerHandle {
+                    id: container_name.to_string(),
+                    name: container_name.to_string(),
+                }),
+            Err(err) => {
+                self.restore_rehome_rollback(container_name, &rollback_name, backup_created)
+                    .await;
+                self.try_resume_downloader_after_rehome(
+                    &rehome_pause,
+                    keep_paused_after_rehome,
+                    "container ensure failed",
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = self
+            .finalize_runtime_storage(instance_id, extension_id, &handle, runtime_volumes)
+            .await
+        {
+            self.restore_rehome_rollback(container_name, &rollback_name, backup_created)
+                .await;
+            self.try_resume_downloader_after_rehome(
+                &rehome_pause,
+                keep_paused_after_rehome,
+                "storage finalize failed",
+            )
+            .await;
+            return Err(err);
+        }
+
+        if let Err(err) = self
+            .verify_downloader_rehome(instance_id, extension_id)
+            .await
+        {
+            self.restore_rehome_rollback(container_name, &rollback_name, backup_created)
+                .await;
+            self.try_resume_downloader_after_rehome(
+                &rehome_pause,
+                keep_paused_after_rehome,
+                "downloader verification failed",
+            )
+            .await;
+            return Err(err);
+        }
+
+        self.resume_downloader_after_rehome(&rehome_pause, keep_paused_after_rehome)
+            .await?;
+
+        if backup_created {
+            let rollback_handle = ContainerHandle {
+                id: rollback_name.clone(),
+                name: rollback_name,
+            };
+            if let Err(err) = self.runtime.remove_container(&rollback_handle).await {
+                tracing::warn!(
+                    "downloader rehome: failed to remove successful rollback backup {}: {}",
+                    rollback_handle.name,
+                    err
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_stale_downloader_gateway_if_unneeded(
+        &self,
+        extension_id: &str,
+        container_name: &str,
+        desired_network_mode: Option<&str>,
+    ) -> Result<()> {
+        if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+            return Ok(());
+        }
+
+        let gateway_name = format!("{container_name}-vpn");
+        let desired_gateway_mode = format!("container:{gateway_name}");
+        if desired_network_mode == Some(desired_gateway_mode.as_str()) {
+            return Ok(());
+        }
+
+        let Some(gateway_handle) = self.runtime.get_container_handle(&gateway_name).await? else {
+            return Ok(());
+        };
+
+        if let Some(app_state) = self
+            .runtime
+            .describe_container_runtime_state(container_name)
+            .await?
+        {
+            if app_state.network_mode.as_deref().is_some_and(|mode| {
+                downloader_uses_gateway_namespace(mode, &gateway_name, &gateway_handle.id)
+            }) {
+                bail!(
+                    "refusing to remove stale downloader gateway '{}' because app container '{}' still uses its network namespace",
+                    gateway_name,
+                    container_name
+                );
+            }
+        }
+
+        tracing::info!(
+            "removing stale downloader gateway '{}' after '{}' was rehomed away from it",
+            gateway_name,
+            container_name
+        );
+        let _ = self.runtime.stop_container(&gateway_handle).await;
+        self.runtime.remove_container(&gateway_handle).await?;
+        Ok(())
+    }
+
+    async fn pause_downloader_for_rehome(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+        instance: &crate::db::models::ExtensionInstance,
+    ) -> Result<Option<DownloaderRehomePause>> {
+        let Some(provider) = self
+            .rehome_downloader_provider(instance_id, extension_id)
+            .await?
+        else {
+            tracing::debug!(
+                "downloader rehome: no downloader provider exists for extension {} instance {}; skipping API pause",
+                extension_id,
+                instance_id
+            );
+            return Ok(None);
+        };
+        let app_container_name = container_name(instance_id);
+        if self
+            .runtime
+            .get_container_handle(&app_container_name)
+            .await?
+            .is_none()
+        {
+            tracing::info!(
+                "downloader rehome: app container {} is not present for extension {} instance {}; skipping API pause and recreating from persisted storage",
+                app_container_name,
+                extension_id,
+                instance_id
+            );
+            return Ok(None);
+        }
+        let ctx = build_driver_ctx_for_provider(
+            &self.store,
+            self.secrets,
+            self.runtime,
+            &provider,
+            instance,
+        )
+        .await?;
+
+        if is_qbittorrent_extension_id(extension_id) {
+            let snapshot = pause_qbittorrent_for_rehome(ctx).await.with_context(|| {
+                format!("pausing qBittorrent before network rehome for instance {instance_id}")
+            })?;
+            return Ok(Some(DownloaderRehomePause::Qbittorrent {
+                provider_id: provider.provider_id,
+                snapshot,
+            }));
+        }
+
+        if is_nzbget_extension_id(extension_id) {
+            let snapshot = pause_nzbget_for_rehome(ctx).await.with_context(|| {
+                format!("pausing NZBGet before network rehome for instance {instance_id}")
+            })?;
+            return Ok(Some(DownloaderRehomePause::Nzbget {
+                provider_id: provider.provider_id,
+                snapshot,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn resume_downloader_after_rehome(
+        &self,
+        rehome_pause: &Option<DownloaderRehomePause>,
+        keep_paused_after_rehome: bool,
+    ) -> Result<()> {
+        let Some(rehome_pause) = rehome_pause else {
+            return Ok(());
+        };
+        if keep_paused_after_rehome {
+            tracing::info!(
+                "downloader rehome: leaving downloader paused because instance config requested it"
+            );
+            return Ok(());
+        }
+
+        match rehome_pause {
+            DownloaderRehomePause::Qbittorrent {
+                provider_id,
+                snapshot,
+            } => {
+                let (provider, instance) = self.provider_and_instance(*provider_id).await?;
+                let ctx = build_driver_ctx_for_provider(
+                    &self.store,
+                    self.secrets,
+                    self.runtime,
+                    &provider,
+                    &instance,
+                )
+                .await?;
+                resume_qbittorrent_after_rehome(ctx, snapshot)
+                    .await
+                    .context("resuming qBittorrent after network rehome")?;
+            }
+            DownloaderRehomePause::Nzbget {
+                provider_id,
+                snapshot,
+            } => {
+                let (provider, instance) = self.provider_and_instance(*provider_id).await?;
+                let ctx = build_driver_ctx_for_provider(
+                    &self.store,
+                    self.secrets,
+                    self.runtime,
+                    &provider,
+                    &instance,
+                )
+                .await?;
+                resume_nzbget_after_rehome(ctx, snapshot)
+                    .await
+                    .context("resuming NZBGet after network rehome")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn try_resume_downloader_after_rehome(
+        &self,
+        rehome_pause: &Option<DownloaderRehomePause>,
+        keep_paused_after_rehome: bool,
+        reason: &str,
+    ) {
+        if let Err(err) = self
+            .resume_downloader_after_rehome(rehome_pause, keep_paused_after_rehome)
+            .await
+        {
+            tracing::warn!(
+                "downloader rehome: failed to resume downloader after rollback ({reason}): {err}"
+            );
+        }
+    }
+
+    async fn rehome_downloader_provider(
+        &self,
+        instance_id: Uuid,
+        extension_id: &str,
+    ) -> Result<Option<Provider>> {
+        let providers = self.store.list_providers(Some(instance_id)).await?;
+        let provider = providers.into_iter().find(|provider| {
+            provider.capability == "downloader.torrent"
+                && provider.implementation.as_deref() == Some("qbittorrent")
+                && is_qbittorrent_extension_id(extension_id)
+                || provider.capability == "downloader.nzb"
+                    && provider.implementation.as_deref() == Some("nzbget")
+                    && is_nzbget_extension_id(extension_id)
+        });
+        Ok(provider)
+    }
+
+    async fn provider_and_instance(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<(Provider, crate::db::models::ExtensionInstance)> {
+        let provider = self
+            .store
+            .get_provider(provider_id)
+            .await?
+            .ok_or_else(|| anyhow!("provider {} not found", provider_id))?;
+        let instance = self
+            .store
+            .get_instance(provider.instance_id)
+            .await?
+            .ok_or_else(|| anyhow!("instance {} not found", provider.instance_id))?;
+        Ok((provider, instance))
+    }
+
+    async fn restore_rehome_rollback(
+        &self,
+        container_name: &str,
+        rollback_name: &str,
+        backup_created: bool,
+    ) {
+        if let Ok(Some(handle)) = self.runtime.get_container_handle(container_name).await {
+            let _ = self.runtime.stop_container(&handle).await;
+            let _ = self.runtime.remove_container(&handle).await;
+        }
+        if !backup_created {
+            return;
+        }
+
+        let rollback_handle = ContainerHandle {
+            id: rollback_name.to_string(),
+            name: rollback_name.to_string(),
+        };
+        match self
+            .runtime
+            .rename_container(&rollback_handle, container_name)
+            .await
+        {
+            Ok(restored) => {
+                let _ = self.runtime.start_container(&restored).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "downloader rehome: failed to restore rollback container {}: {}",
+                    rollback_name,
+                    err
+                );
+            }
+        }
+    }
+
+    async fn verify_downloader_rehome(&self, instance_id: Uuid, extension_id: &str) -> Result<()> {
+        if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+            return Ok(());
+        }
+
+        let instance = self
+            .store
+            .get_instance(instance_id)
+            .await?
+            .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
+        let providers = self.store.list_providers(Some(instance_id)).await?;
+        for provider in providers {
+            let is_matching_downloader = provider.capability == "downloader.torrent"
+                && provider.implementation.as_deref() == Some("qbittorrent")
+                && is_qbittorrent_extension_id(extension_id)
+                || provider.capability == "downloader.nzb"
+                    && provider.implementation.as_deref() == Some("nzbget")
+                    && is_nzbget_extension_id(extension_id);
+            if !is_matching_downloader {
+                continue;
+            }
+
+            self.ensure_provider_driver_ready(&provider, &instance)
+                .await
+                .with_context(|| {
+                    format!(
+                        "verifying downloader API after network rehome for provider {}",
+                        provider.provider_id
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn compile_download_protection_profile(
+        &self,
+        instance_id: Uuid,
+        container_name: &str,
+        app_spec: &ContainerSpec,
+        egress: &ManifestRuntimeEgress,
+        base_labels: &HashMap<String, String>,
+    ) -> Result<CompiledDownloadProtectionProfile> {
         let config_secret = egress
             .wireguard_config_secret
             .as_deref()
@@ -717,23 +1700,10 @@ impl<'a> Executor<'a> {
             );
         }
 
-        let gateway_name = format!("{container_name}-vpn");
         let config_path = self
             .write_wireguard_config(instance_id, &config_value)
             .await
             .context("writing wireguard config")?;
-
-        let mut labels = base_labels.clone();
-        labels.insert(
-            "elixir.network_role".to_string(),
-            "wireguard_gateway".to_string(),
-        );
-
-        let mut sysctls = HashMap::new();
-        sysctls.insert(
-            "net.ipv4.conf.all.src_valid_mark".to_string(),
-            "1".to_string(),
-        );
 
         let gateway_image = egress
             .wireguard_gateway_image
@@ -742,70 +1712,20 @@ impl<'a> Executor<'a> {
             .unwrap_or(self.wireguard_gateway_image.as_str())
             .to_string();
 
-        let input_ports = app_spec
-            .ports
-            .iter()
-            .map(|port| port.container_port.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut gateway_env = vec![
-            EnvVar {
-                name: "VPN_SERVICE_PROVIDER".to_string(),
-                value: "custom".to_string(),
+        let profile = DownloadProtectionProfile::wireguard_config(
+            "legacy-wireguard",
+            "Legacy WireGuard",
+            egress.strict,
+            GluetunWireguardGatewayRuntime {
+                image: gateway_image,
+                config_host_path: config_path,
             },
-            EnvVar {
-                name: "VPN_TYPE".to_string(),
-                value: "wireguard".to_string(),
-            },
-            EnvVar {
-                name: "WIREGUARD_CONF_FILE".to_string(),
-                value: "wg0.conf".to_string(),
-            },
-            EnvVar {
-                name: "FIREWALL_OUTBOUND_SUBNETS".to_string(),
-                value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".to_string(),
-            },
-        ];
-        if !input_ports.is_empty() {
-            gateway_env.push(EnvVar {
-                name: "FIREWALL_INPUT_PORTS".to_string(),
-                value: input_ports,
-            });
-        }
-
-        let gateway_spec = ContainerSpec {
-            name: gateway_name.clone(),
-            image: gateway_image,
-            network: app_spec.network.clone(),
-            network_mode: None,
-            aliases: app_spec.aliases.clone(),
-            env: gateway_env,
-            volumes: vec![VolumeMount {
-                source_kind: VolumeMountSourceKind::Bind,
-                host_path: config_path,
-                container_path: "/gluetun/wireguard/wg0.conf".to_string(),
-                read_only: true,
-            }],
-            ports: app_spec.ports.clone(),
-            labels,
-            command: Vec::new(),
-            cap_add: vec!["NET_ADMIN".to_string()],
-            devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
-            sysctls,
-        };
-
-        self.runtime.ensure_network(&gateway_spec.network).await?;
-        self.runtime
-            .ensure_container(&gateway_spec)
-            .await
-            .with_context(|| {
-                format!(
-                    "ensuring wireguard gateway container '{}' for extension '{}'",
-                    gateway_name, extension_id
-                )
-            })?;
-        Ok(gateway_name)
+        );
+        profile.compile(DownloadProtectionCompileInput {
+            app_container_name: container_name,
+            app_spec,
+            base_labels,
+        })
     }
 
     async fn write_wireguard_config(&self, instance_id: Uuid, config: &str) -> Result<String> {
@@ -823,6 +1743,38 @@ impl<'a> Executor<'a> {
             fs::set_permissions(&path, permissions).await?;
         }
         Ok(path.to_string_lossy().to_string())
+    }
+
+    async fn write_openvpn_config(
+        &self,
+        instance_id: Uuid,
+        config: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let root = Path::new(&self.runtime_paths.data_root)
+            .join("extensions")
+            .join("openvpn")
+            .join(instance_id.to_string());
+        fs::create_dir_all(&root).await?;
+
+        let auth_path = if let (Some(username), Some(password)) = (username, password) {
+            let path = root.join("auth.txt");
+            fs::write(&path, format!("{}\n{}\n", username.trim(), password.trim())).await?;
+            set_private_file_permissions(&path).await?;
+            Some(path)
+        } else {
+            None
+        };
+
+        let rendered_config = render_openvpn_config(config, auth_path.is_some());
+        let config_path = root.join("custom.conf");
+        fs::write(&config_path, rendered_config).await?;
+        set_private_file_permissions(&config_path).await?;
+        Ok((
+            config_path.to_string_lossy().to_string(),
+            auth_path.map(|path| path.to_string_lossy().to_string()),
+        ))
     }
 
     async fn rollback_runtime(&self, instance_id: Uuid) -> Result<()> {
@@ -2542,6 +3494,20 @@ fn is_default_wireguard_downloader_extension_id(extension_id: &str) -> bool {
     is_qbittorrent_extension_id(extension_id) || is_nzbget_extension_id(extension_id)
 }
 
+fn downloader_uses_gateway_namespace(
+    actual_network_mode: &str,
+    gateway_name: &str,
+    gateway_id: &str,
+) -> bool {
+    let Some(actual_container) = actual_network_mode.strip_prefix("container:") else {
+        return false;
+    };
+    actual_container == gateway_name
+        || actual_container == gateway_id
+        || actual_container.starts_with(gateway_id)
+        || gateway_id.starts_with(actual_container)
+}
+
 async fn resolve_indexer_apps(
     store: &ExtensionStore<'_>,
     secrets: &SecretsManager,
@@ -3504,7 +4470,12 @@ async fn lookup_docker_published_port(
     instance_id: Uuid,
     container_port: u16,
 ) -> Result<Option<u16>> {
-    let mut candidates = docker_transport_container_candidates(instance_id);
+    let app_container_name = container_name(instance_id);
+    if !docker_container_exists(&app_container_name).await? {
+        return Ok(None);
+    }
+
+    let mut candidates = vec![app_container_name];
     candidates.extend(list_docker_container_names(instance_id, true).await?);
     candidates.extend(list_docker_container_names(instance_id, false).await?);
 
@@ -3519,6 +4490,20 @@ async fn lookup_docker_published_port(
     }
 
     Ok(None)
+}
+
+async fn docker_container_exists(container_name: &str) -> Result<bool> {
+    let inspect_args = vec![
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.Name}}".to_string(),
+        container_name.to_string(),
+    ];
+    match run_docker_stdout(&inspect_args).await {
+        Ok(_) => Ok(true),
+        Err(err) if docker_container_missing_error(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 async fn run_docker_stdout(args: &[String]) -> Result<String> {
@@ -3551,10 +4536,6 @@ fn driver_transport_base_url(endpoint: &ProviderEndpoint, host_port: u16) -> Str
         "{}://127.0.0.1:{host_port}{}",
         endpoint.scheme, endpoint.base_path
     )
-}
-
-fn docker_transport_container_candidates(instance_id: Uuid) -> Vec<String> {
-    vec![container_name(instance_id)]
 }
 
 async fn list_docker_container_names(instance_id: Uuid, running_only: bool) -> Result<Vec<String>> {
@@ -4160,6 +5141,41 @@ async fn resolve_secret_value(
         .with_context(|| format!("decrypting secret '{}'", reference.key))
 }
 
+fn render_openvpn_config(config: &str, has_auth_file: bool) -> String {
+    if !has_auth_file {
+        return config.to_string();
+    }
+
+    let mut replaced_auth = false;
+    let mut rendered = Vec::new();
+    for line in config.lines() {
+        if line.trim_start().starts_with("auth-user-pass") {
+            rendered.push("auth-user-pass /gluetun/auth.txt".to_string());
+            replaced_auth = true;
+        } else {
+            rendered.push(line.to_string());
+        }
+    }
+    if !replaced_auth {
+        rendered.push("auth-user-pass /gluetun/auth.txt".to_string());
+    }
+    rendered.join("\n") + "\n"
+}
+
+async fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 struct SecretReference {
     scope: SecretScope,
     scope_id: Option<Uuid>,
@@ -4289,6 +5305,217 @@ fn prepare_runtime_volumes(
     Ok(PreparedRuntimeVolumes { volumes })
 }
 
+pub(crate) fn normalized_network_mode(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn downloader_network_mode_requires_rehome(
+    current: Option<&str>,
+    desired: Option<&str>,
+) -> bool {
+    if current == desired {
+        return false;
+    }
+
+    is_explicit_container_network_namespace(current)
+        || is_explicit_container_network_namespace(desired)
+        || desired.is_some()
+}
+
+fn is_explicit_container_network_namespace(value: Option<&str>) -> bool {
+    value.is_some_and(|mode| mode.trim().starts_with("container:"))
+}
+
+pub(crate) fn volume_mounts_from_runtime_state(state: &ContainerRuntimeState) -> Vec<VolumeMount> {
+    state
+        .mounts
+        .iter()
+        .filter_map(volume_mount_from_runtime_mount)
+        .collect()
+}
+
+fn volume_mount_from_runtime_mount(mount: &ContainerRuntimeMount) -> Option<VolumeMount> {
+    let source_kind = match mount.mount_type.as_str() {
+        "bind" => VolumeMountSourceKind::Bind,
+        "volume" => VolumeMountSourceKind::NamedVolume,
+        _ => return None,
+    };
+    let host_path = match source_kind {
+        VolumeMountSourceKind::Bind => mount.source.clone(),
+        VolumeMountSourceKind::NamedVolume => mount.name.clone().or_else(|| mount.source.clone()),
+    }?;
+
+    Some(VolumeMount {
+        source_kind,
+        host_path,
+        container_path: mount.destination.clone(),
+        read_only: mount.read_only,
+    })
+}
+
+fn persisted_runtime_volumes(
+    instance_config: Option<&serde_json::Value>,
+) -> Result<Option<Vec<VolumeMount>>> {
+    let Some(volumes) = instance_config
+        .and_then(|config| config.get("runtime"))
+        .and_then(|runtime| runtime.get("volumes"))
+    else {
+        return Ok(None);
+    };
+
+    let parsed = serde_json::from_value(volumes.clone())
+        .context("parsing persisted runtime volume metadata")?;
+    Ok(Some(parsed))
+}
+
+fn keep_downloader_paused_after_rehome(instance_config: Option<&serde_json::Value>) -> bool {
+    let Some(config) = instance_config else {
+        return false;
+    };
+    config
+        .get("network")
+        .and_then(|network| network.get("keep_downloads_paused_after_rehome"))
+        .or_else(|| {
+            config
+                .get("runtime")
+                .and_then(|runtime| runtime.get("keep_downloads_paused_after_rehome"))
+        })
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+// Downloader containers may need to be recreated to change image, labels, ports,
+// or network namespace. Their durable state must remain on the same config,
+// runtime, and downloads mounts so credentials, queues, fastresume files, and
+// paused transfers survive that recreation.
+pub(crate) fn validate_downloader_volume_preservation(
+    extension_id: &str,
+    existing: &[VolumeMount],
+    next: &[VolumeMount],
+) -> Result<()> {
+    for container_path in downloader_preserved_mounts(extension_id) {
+        let existing_mount = existing
+            .iter()
+            .find(|volume| volume.container_path == *container_path)
+            .ok_or_else(|| {
+                anyhow!(
+                    "downloader migration preflight failed: existing {} mount is missing",
+                    container_path
+                )
+            })?;
+        let next_mount = next
+            .iter()
+            .find(|volume| volume.container_path == *container_path)
+            .ok_or_else(|| {
+                anyhow!(
+                    "downloader migration preflight failed: desired {} mount is missing",
+                    container_path
+                )
+            })?;
+
+        if !volume_mount_identity_matches(existing_mount, next_mount) {
+            bail!(
+                "downloader migration preflight failed: {} mount would change from {} to {}",
+                container_path,
+                describe_volume_mount_identity(existing_mount),
+                describe_volume_mount_identity(next_mount)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn downloader_preserved_mounts(extension_id: &str) -> &'static [&'static str] {
+    if is_qbittorrent_extension_id(extension_id) {
+        &["/config", DOWNLOADS_ROOT]
+    } else if is_nzbget_extension_id(extension_id) {
+        &["/config", "/runtime", DOWNLOADS_ROOT]
+    } else {
+        &[]
+    }
+}
+
+#[allow(dead_code)]
+fn volume_mount_identity_matches(left: &VolumeMount, right: &VolumeMount) -> bool {
+    left.source_kind == right.source_kind
+        && left.container_path == right.container_path
+        && left.read_only == right.read_only
+        && match left.source_kind {
+            VolumeMountSourceKind::Bind => {
+                bind_mount_source_identity_matches(&left.host_path, &right.host_path)
+            }
+            VolumeMountSourceKind::NamedVolume => left.host_path == right.host_path,
+        }
+}
+
+fn bind_mount_source_identity_matches(left: &str, right: &str) -> bool {
+    let left_sources = normalized_bind_mount_sources(left);
+    let right_sources = normalized_bind_mount_sources(right);
+    !left_sources.is_empty()
+        && !right_sources.is_empty()
+        && left_sources
+            .iter()
+            .any(|candidate| right_sources.contains(candidate))
+}
+
+fn normalized_bind_mount_sources(path: &str) -> HashSet<String> {
+    let mut candidates = HashSet::new();
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return candidates;
+    }
+
+    candidates.insert(trimmed.to_string());
+
+    if let Some(stripped) = trimmed.strip_prefix("/host_mnt") {
+        let normalized = if stripped.is_empty() { "/" } else { stripped };
+        candidates.insert(normalized.to_string());
+    }
+
+    if !trimmed.starts_with("/host_mnt") && trimmed.starts_with('/') {
+        candidates.insert(format!("/host_mnt{trimmed}"));
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("/private") {
+        let normalized = if stripped.is_empty() { "/" } else { stripped };
+        candidates.insert(normalized.to_string());
+    }
+
+    if !trimmed.starts_with("/private/")
+        && (trimmed == "/tmp"
+            || trimmed.starts_with("/tmp/")
+            || trimmed == "/var"
+            || trimmed.starts_with("/var/"))
+    {
+        candidates.insert(format!("/private{trimmed}"));
+    }
+
+    let current = candidates.iter().cloned().collect::<Vec<_>>();
+    for candidate in current {
+        if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+            candidates.insert(canonical.to_string_lossy().to_string());
+        }
+    }
+
+    candidates
+}
+
+#[allow(dead_code)]
+pub(crate) fn describe_volume_mount_identity(volume: &VolumeMount) -> String {
+    format!(
+        "{:?}:{}:{}{}",
+        volume.source_kind,
+        volume.host_path,
+        volume.container_path,
+        if volume.read_only { ":ro" } else { "" }
+    )
+}
+
 fn extension_uses_managed_config_volume(extension_id: &str) -> bool {
     matches!(
         extension_id,
@@ -4409,13 +5636,17 @@ mod tests {
     use crate::db::models::{
         ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
     };
+    use crate::download_broker::{TORRENT_DEFAULT_LOGICAL_ID, list_logical_downloaders};
     use crate::extensions::managed_paths::NZBGET_LOCK_FILE;
     use crate::extensions::manifest::ManifestRuntimePort;
     use crate::extensions::store::{
         ExtensionStore, NewExtension, NewExtensionInstance, NewProvider,
     };
     use crate::orchestrator::naming::container_name;
-    use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
+    use crate::runtime::model::{
+        ContainerHandle, ContainerRuntimeMount, ContainerRuntimeState, ContainerSpec,
+        ContainerState,
+    };
     use crate::secrets::SecretsManager;
 
     #[test]
@@ -4432,26 +5663,6 @@ mod tests {
             "authenticationMethod": "forms",
             "authenticationRequired": "disabledForLocalAddresses"
         })));
-    }
-
-    #[test]
-    fn docker_transport_candidates_start_with_runtime_container() {
-        let instance_id =
-            Uuid::parse_str("c1eaaec2-3dcf-40e4-85aa-adea48e4b221").expect("instance id");
-        let mut candidates = docker_transport_container_candidates(instance_id);
-        candidates.extend(parse_docker_container_names("elx-c1eaae-vpn\nelx-shadow\n"));
-        candidates.extend(parse_docker_container_names("elx-c1eaae\nelx-old\n"));
-
-        let mut seen = HashSet::new();
-        let ordered = candidates
-            .into_iter()
-            .filter(|name| seen.insert(name.clone()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordered[0], container_name(instance_id));
-        assert_eq!(ordered[1], "elx-c1eaae-vpn");
-        assert_eq!(ordered[2], "elx-shadow");
-        assert_eq!(ordered[3], "elx-old");
     }
 
     #[test]
@@ -4752,7 +5963,7 @@ mod tests {
             _handle: &ContainerHandle,
             _path: &str,
         ) -> Result<Option<Vec<u8>>> {
-            bail!("unexpected runtime call")
+            Ok(None)
         }
 
         async fn copy_host_path_to_container(
@@ -4778,7 +5989,7 @@ mod tests {
             _reference_path: &str,
             _paths: &[String],
         ) -> Result<bool> {
-            bail!("unexpected runtime call")
+            Ok(false)
         }
     }
 
@@ -4808,13 +6019,116 @@ mod tests {
         Ok((host, port))
     }
 
+    async fn start_mock_qbittorrent_rehome_server() -> Result<(String, u16, Arc<Mutex<Vec<String>>>)>
+    {
+        type Calls = Arc<Mutex<Vec<String>>>;
+
+        async fn login(
+            axum::extract::State(calls): axum::extract::State<Calls>,
+        ) -> impl axum::response::IntoResponse {
+            calls
+                .lock()
+                .expect("qbittorrent rehome mock calls lock")
+                .push("login".to_string());
+            (
+                [(
+                    axum::http::header::SET_COOKIE,
+                    axum::http::HeaderValue::from_static("SID=test; HttpOnly"),
+                )],
+                "Ok.",
+            )
+        }
+
+        async fn transfer_info(
+            axum::extract::State(calls): axum::extract::State<Calls>,
+        ) -> impl axum::response::IntoResponse {
+            calls
+                .lock()
+                .expect("qbittorrent rehome mock calls lock")
+                .push("transfer_info".to_string());
+            axum::Json(json!({
+                "connection_status": "connected",
+                "dl_info_speed": 0,
+                "up_info_speed": 0,
+                "dl_info_data": 0,
+                "up_info_data": 0
+            }))
+        }
+
+        async fn torrents_info(
+            axum::extract::State(calls): axum::extract::State<Calls>,
+        ) -> impl axum::response::IntoResponse {
+            calls
+                .lock()
+                .expect("qbittorrent rehome mock calls lock")
+                .push("torrents_info".to_string());
+            axum::Json(json!([
+                { "hash": "activehash", "state": "downloading" },
+                { "hash": "pausedhash", "state": "pausedDL" }
+            ]))
+        }
+
+        async fn pause_all(
+            axum::extract::State(calls): axum::extract::State<Calls>,
+        ) -> impl axum::response::IntoResponse {
+            calls
+                .lock()
+                .expect("qbittorrent rehome mock calls lock")
+                .push("pause_all".to_string());
+            axum::http::StatusCode::OK
+        }
+
+        async fn resume(
+            axum::extract::State(calls): axum::extract::State<Calls>,
+            axum::extract::Form(fields): axum::extract::Form<HashMap<String, String>>,
+        ) -> impl axum::response::IntoResponse {
+            let hashes = fields.get("hashes").cloned().unwrap_or_default();
+            calls
+                .lock()
+                .expect("qbittorrent rehome mock calls lock")
+                .push(format!("resume:{hashes}"));
+            axum::http::StatusCode::OK
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/api/v2/auth/login", axum::routing::post(login))
+            .route("/api/v2/transfer/info", axum::routing::get(transfer_info))
+            .route("/api/v2/torrents/info", axum::routing::get(torrents_info))
+            .route("/api/v2/transfer/pauseAll", axum::routing::post(pause_all))
+            .route("/api/v2/torrents/resume", axum::routing::post(resume))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let port = listener.local_addr()?.port();
+        let host = match local_ip_address::local_ip()? {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() => ip.to_string(),
+            ip => bail!("expected non-loopback IPv4 address for qBittorrent test server, got {ip}"),
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock qbittorrent rehome server");
+        });
+        Ok((host, port, calls))
+    }
+
     #[derive(Default)]
     struct CaptureRuntime {
         specs: Mutex<Vec<ContainerSpec>>,
         networks: Mutex<Vec<String>>,
+        runtime_states: Mutex<HashMap<String, ContainerRuntimeState>>,
+        renames: Mutex<Vec<(String, String)>>,
+        removals: Mutex<Vec<String>>,
     }
 
     impl CaptureRuntime {
+        fn set_runtime_state(&self, state: ContainerRuntimeState) {
+            self.runtime_states
+                .lock()
+                .expect("capture runtime lock")
+                .insert(state.name.clone(), state);
+        }
+
         fn last_spec(&self) -> Option<ContainerSpec> {
             self.specs
                 .lock()
@@ -4829,6 +6143,49 @@ mod tests {
 
         fn networks(&self) -> Vec<String> {
             self.networks.lock().expect("capture runtime lock").clone()
+        }
+
+        fn renames(&self) -> Vec<(String, String)> {
+            self.renames.lock().expect("capture runtime lock").clone()
+        }
+
+        fn removals(&self) -> Vec<String> {
+            self.removals.lock().expect("capture runtime lock").clone()
+        }
+    }
+
+    fn runtime_state_from_container_spec(
+        spec: &ContainerSpec,
+        network_mode: Option<String>,
+    ) -> ContainerRuntimeState {
+        runtime_state_from_volumes(&spec.name, network_mode, &spec.labels, &spec.volumes)
+    }
+
+    fn runtime_state_from_volumes(
+        name: &str,
+        network_mode: Option<String>,
+        labels: &HashMap<String, String>,
+        volumes: &[VolumeMount],
+    ) -> ContainerRuntimeState {
+        ContainerRuntimeState {
+            name: name.to_string(),
+            network_mode,
+            labels: labels.clone(),
+            mounts: volumes
+                .iter()
+                .map(|volume| ContainerRuntimeMount {
+                    mount_type: match volume.source_kind {
+                        VolumeMountSourceKind::Bind => "bind".to_string(),
+                        VolumeMountSourceKind::NamedVolume => "volume".to_string(),
+                    },
+                    source: Some(volume.host_path.clone()),
+                    name: (volume.source_kind == VolumeMountSourceKind::NamedVolume)
+                        .then(|| volume.host_path.clone()),
+                    destination: volume.container_path.clone(),
+                    read_only: volume.read_only,
+                })
+                .collect(),
+            published_ports: Vec::new(),
         }
     }
 
@@ -4847,34 +6204,74 @@ mod tests {
                 .lock()
                 .expect("capture runtime lock")
                 .push(spec.clone());
+            self.runtime_states
+                .lock()
+                .expect("capture runtime lock")
+                .insert(
+                    spec.name.clone(),
+                    runtime_state_from_container_spec(spec, spec.network_mode.clone()),
+                );
             Ok(ContainerHandle {
                 id: "capture".to_string(),
                 name: spec.name.clone(),
             })
         }
 
-        async fn get_container_handle(&self, _name: &str) -> Result<Option<ContainerHandle>> {
-            Ok(None)
+        async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
+            if self
+                .runtime_states
+                .lock()
+                .expect("capture runtime lock")
+                .contains_key(name)
+            {
+                Ok(Some(ContainerHandle {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                }))
+            } else {
+                Ok(None)
+            }
         }
 
         async fn start_container(&self, _handle: &ContainerHandle) -> Result<()> {
-            bail!("unexpected runtime call")
+            Ok(())
         }
 
         async fn stop_container(&self, _handle: &ContainerHandle) -> Result<()> {
-            bail!("unexpected runtime call")
+            Ok(())
         }
 
         async fn rename_container(
             &self,
-            _handle: &ContainerHandle,
-            _new_name: &str,
+            handle: &ContainerHandle,
+            new_name: &str,
         ) -> Result<ContainerHandle> {
-            bail!("unexpected runtime call")
+            let mut states = self.runtime_states.lock().expect("capture runtime lock");
+            if let Some(mut state) = states.remove(&handle.name) {
+                state.name = new_name.to_string();
+                states.insert(new_name.to_string(), state);
+            }
+            drop(states);
+            self.renames
+                .lock()
+                .expect("capture runtime lock")
+                .push((handle.name.clone(), new_name.to_string()));
+            Ok(ContainerHandle {
+                id: new_name.to_string(),
+                name: new_name.to_string(),
+            })
         }
 
-        async fn remove_container(&self, _handle: &ContainerHandle) -> Result<()> {
-            bail!("unexpected runtime call")
+        async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
+            self.runtime_states
+                .lock()
+                .expect("capture runtime lock")
+                .remove(&handle.name);
+            self.removals
+                .lock()
+                .expect("capture runtime lock")
+                .push(handle.name.clone());
+            Ok(())
         }
 
         async fn container_logs(
@@ -4889,12 +6286,24 @@ mod tests {
             bail!("unexpected runtime call")
         }
 
+        async fn describe_container_runtime_state(
+            &self,
+            container_name: &str,
+        ) -> Result<Option<ContainerRuntimeState>> {
+            Ok(self
+                .runtime_states
+                .lock()
+                .expect("capture runtime lock")
+                .get(container_name)
+                .cloned())
+        }
+
         async fn read_container_file(
             &self,
             _handle: &ContainerHandle,
             _path: &str,
         ) -> Result<Option<Vec<u8>>> {
-            bail!("unexpected runtime call")
+            Ok(None)
         }
 
         async fn copy_host_path_to_container(
@@ -4920,7 +6329,7 @@ mod tests {
             _reference_path: &str,
             _paths: &[String],
         ) -> Result<bool> {
-            bail!("unexpected runtime call")
+            Ok(false)
         }
     }
 
@@ -6367,6 +7776,867 @@ mod tests {
             "expected default wireguard wrapping for qbittorrent"
         );
         assert!(specs[1].network_mode.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_rehome_preserves_qbittorrent_mounts_when_enabling_wireguard() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([1u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let prepared_volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &runtime_paths,
+        )?
+        .volumes;
+        let app_name = container_name(instance_id);
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &app_name,
+            Some("elixir_net".to_string()),
+            &HashMap::new(),
+            &prepared_volumes,
+        ));
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 2, "expected gateway + rehomed app specs");
+        let app = specs
+            .iter()
+            .find(|spec| spec.name == app_name)
+            .expect("app spec");
+        assert!(
+            app.network_mode
+                .as_deref()
+                .is_some_and(|mode| { mode.starts_with("container:") })
+        );
+        validate_downloader_volume_preservation(
+            "elixir.modules.qbittorrent",
+            &prepared_volumes,
+            &app.volumes,
+        )?;
+
+        let rollback_name = format!("{app_name}-network-rollback");
+        assert!(
+            runtime
+                .renames()
+                .iter()
+                .any(|(from, to)| from == &app_name && to == &rollback_name),
+            "expected existing downloader container to be renamed before rehome"
+        );
+        assert!(
+            runtime.removals().iter().any(|name| name == &rollback_name),
+            "successful rehome should remove the stopped rollback container"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_rehome_to_direct_removes_stale_gateway_after_app_moves_off_namespace()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([33u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let prepared_volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &runtime_paths,
+        )?
+        .volumes;
+        let app_name = container_name(instance_id);
+        let gateway_name = format!("{app_name}-vpn");
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &app_name,
+            Some(format!("container:{gateway_name}")),
+            &HashMap::new(),
+            &prepared_volumes,
+        ));
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &gateway_name,
+            None,
+            &HashMap::new(),
+            &[],
+        ));
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        assert!(
+            runtime.removals().iter().any(|name| name == &gateway_name),
+            "stale gateway should be removed after direct rehome"
+        );
+        let app_state = runtime
+            .describe_container_runtime_state(&app_name)
+            .await?
+            .expect("app runtime state");
+        assert_eq!(app_state.network_mode, None);
+        assert!(runtime.get_container_handle(&gateway_name).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_spec_fingerprint_mismatch_uses_rehome_rollback_path() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([46u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let prepared_volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &runtime_paths,
+        )?
+        .volumes;
+        let app_name = container_name(instance_id);
+        let rollback_name = format!("{app_name}-network-rollback");
+        let mut labels = HashMap::new();
+        labels.insert(
+            crate::runtime::model::CONTAINER_SPEC_HASH_LABEL.to_string(),
+            "old-spec-hash".to_string(),
+        );
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &app_name,
+            None,
+            &labels,
+            &prepared_volumes,
+        ));
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        assert!(
+            runtime
+                .renames()
+                .iter()
+                .any(|(from, to)| from == &app_name && to == &rollback_name),
+            "spec fingerprint drift should use the rollback rehome path"
+        );
+        assert!(
+            runtime.removals().iter().any(|name| name == &rollback_name),
+            "successful rehome should remove the rollback backup"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_rehome_pauses_and_resumes_only_active_qbittorrent_torrents() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+        let (host, port, calls) = start_mock_qbittorrent_rehome_server().await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({
+                    "username": "admin",
+                    "password": "adminadmin"
+                })),
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
+
+        let endpoint = ProviderEndpoint::new("http".to_string(), host, port, None, None)?;
+        let provider_id = Uuid::new_v4();
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::with_defaults();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let prepared_volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &runtime_paths,
+        )?
+        .volumes;
+        let app_name = container_name(instance_id);
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &app_name,
+            Some("elixir_net".to_string()),
+            &HashMap::new(),
+            &prepared_volumes,
+        ));
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        let inventory = list_logical_downloaders(&store).await?;
+        let broker_record = inventory
+            .downloaders
+            .iter()
+            .find(|record| {
+                record.logical_id == TORRENT_DEFAULT_LOGICAL_ID && record.provider_id == provider_id
+            })
+            .expect("managed qBittorrent broker record after rehome");
+        assert_eq!(broker_record.instance_id, instance_id);
+        assert_eq!(
+            broker_record.endpoints.progress_path,
+            "/api/v1/download-broker/downloaders.torrent.default/progress"
+        );
+
+        let calls = calls
+            .lock()
+            .expect("qbittorrent rehome mock calls lock")
+            .clone();
+        let pause_index = calls
+            .iter()
+            .position(|call| call == "pause_all")
+            .expect("pause_all call");
+        let resume_index = calls
+            .iter()
+            .position(|call| call.starts_with("resume:"))
+            .expect("resume call");
+        assert!(
+            pause_index < resume_index,
+            "downloads must be paused before resume; calls={calls:?}"
+        );
+        let verify_index = calls
+            .iter()
+            .rposition(|call| call == "transfer_info")
+            .expect("post-rehome driver API verification call");
+        assert!(
+            pause_index < verify_index && verify_index < resume_index,
+            "downloader API must be reachable after rehome before resume; calls={calls:?}"
+        );
+        assert_eq!(calls[resume_index], "resume:activehash");
+        assert!(
+            !calls[resume_index].contains("pausedhash"),
+            "pre-paused torrents must remain paused; calls={calls:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_rehome_rejects_qbittorrent_config_volume_change() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([2u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let mut existing_volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &runtime_paths,
+        )?
+        .volumes;
+        existing_volumes
+            .iter_mut()
+            .find(|volume| volume.container_path == "/config")
+            .expect("config mount")
+            .host_path = "elixir_cfg_recreated".to_string();
+        let app_name = container_name(instance_id);
+        runtime.set_runtime_state(runtime_state_from_volumes(
+            &app_name,
+            Some("elixir_net".to_string()),
+            &HashMap::new(),
+            &existing_volumes,
+        ));
+
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: Vec::new(),
+            egress: None,
+        };
+
+        let err = executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await
+            .unwrap_err();
+        let message = err.root_cause().to_string();
+        assert!(
+            message.contains("/config mount would change"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            runtime.specs().iter().all(|spec| spec.name != app_name),
+            "unsafe rehome must not recreate the downloader app container"
+        );
+        assert!(
+            runtime.renames().is_empty(),
+            "unsafe rehome must not rename the current downloader container"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_direct_egress_bypasses_default_wireguard_wrapping() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let encrypted =
+            secrets.encrypt("[Interface]\nPrivateKey = test\nAddress = 10.64.0.2/32\n")?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Global,
+                scope_id: None,
+                key: "wireguard_config".to_string(),
+                value_encrypted: encrypted,
+                rotatable: false,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        )
+        .with_default_wireguard_config_secret(Some("global:wireguard_config".to_string()));
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: Some(ManifestRuntimeEgress {
+                mode: "direct".to_string(),
+                strict: true,
+                wireguard_config_secret: None,
+                wireguard_gateway_image: None,
+            }),
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 1, "explicit direct should not create gateway");
+        assert_eq!(specs[0].network_mode, None);
+        assert!(specs[0].aliases.iter().any(|alias| alias == "svc-qbit"));
+        assert_eq!(specs[0].ports.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_warp_profile_wraps_managed_qbittorrent_without_user_vpn_config() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.qbittorrent", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.qbittorrent".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("cloudflare-warp")
+        .bind("Cloudflare WARP")
+        .bind("cloudflare_warp")
+        .bind(true)
+        .bind(true)
+        .bind("managed_downloaders")
+        .bind("cloudflare")
+        .bind("warp_gateway")
+        .bind(serde_json::to_string(&json!({
+            "cloudflareWarp": {
+                "gatewayImage": "example/warp-gateway:1",
+                "sharedCredentials": false
+            }
+        }))?)
+        .bind("unknown")
+        .bind(true)
+        .execute(&database.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO download_warp_enrollments (id, profile_id, enrollment_id, identity_secret_ref, status, disclosure_version) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind("cloudflare-warp")
+        .bind("enrollment-1")
+        .bind("global:cloudflare_warp_identity")
+        .bind("pending_runtime")
+        .bind("2026-04-29")
+        .execute(&database.pool)
+        .await?;
+
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/qbittorrent:latest".to_string()),
+            network: None,
+            service_name: Some("elx-qbittorrent".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 8080,
+                host: None,
+            }],
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: None,
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.qbittorrent".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                vec!["svc-qbit".to_string()],
+            )
+            .await?;
+
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 2, "expected WARP gateway + app spec");
+        let gateway = specs
+            .iter()
+            .find(|spec| spec.name.ends_with("-vpn"))
+            .expect("warp gateway spec");
+        assert_eq!(gateway.image, "example/warp-gateway:1");
+        assert_eq!(
+            gateway
+                .labels
+                .get("elixir.network_role")
+                .map(String::as_str),
+            Some("warp_gateway")
+        );
+        assert!(
+            gateway
+                .env
+                .iter()
+                .any(|env| { env.name == "WARP_ENABLE_NAT" && env.value == "1" })
+        );
+        assert!(gateway.env.iter().all(|env| env.name != "WARP_LICENSE_KEY"));
+        assert_eq!(
+            gateway
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/var/lib/cloudflare-warp")
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((
+                &VolumeMountSourceKind::NamedVolume,
+                "elixir_warp_state_cloudflare_warp"
+            ))
+        );
+
+        let app = specs
+            .iter()
+            .find(|spec| spec.name == container_name(instance_id))
+            .expect("qbittorrent app spec");
+        assert_eq!(
+            app.network_mode.as_deref(),
+            Some(format!("container:{}", gateway.name).as_str())
+        );
+        assert!(app.aliases.is_empty());
+        assert!(app.ports.is_empty());
+
+        let status: String = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT status FROM download_warp_enrollments WHERE profile_id = ?",
+        )
+        .bind("cloudflare-warp")
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(status, "ready");
         Ok(())
     }
 
@@ -7960,7 +10230,7 @@ mod tests {
         use super::*;
 
         use std::collections::HashMap;
-        use std::process::Command;
+        use std::process::{Command, Stdio};
         use std::thread;
         use std::time::Duration;
 
@@ -7986,6 +10256,8 @@ mod tests {
                         .arg("rm")
                         .arg("-f")
                         .arg(name)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
                         .status();
                 }
             }
@@ -8155,6 +10427,360 @@ PersistentKeepalive = 25
             Ok(())
         }
 
+        #[tokio::test]
+        #[ignore = "live Docker downloader test; set ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 to run"]
+        async fn live_qbittorrent_rehome_preserves_config_and_download_state() -> Result<()> {
+            if !live_download_network_tests_enabled() {
+                eprintln!(
+                    "skipping live qBittorrent rehome test: ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 is not set"
+                );
+                return Ok(());
+            }
+            ensure_docker_available()?;
+
+            let suffix = short_id();
+            let network_name = format!("elixir_live_net_{suffix}");
+            let _network = NetworkCleanup::new(network_name.clone());
+            let runtime = DockerRuntimeManager::new(None);
+            runtime.ensure_network(&network_name).await?;
+
+            let instance_id = Uuid::new_v4();
+            let app_name = format!("elixir-live-qb-{suffix}");
+            let gateway_name = format!("elixir-live-qb-gateway-{suffix}");
+            let config_volume = format!("elixir_live_qb_config_{suffix}");
+            let host_root = docker_shared_tempdir(&suffix)?;
+            let downloads_dir = host_root.path().join("downloads");
+            std::fs::create_dir_all(&downloads_dir)?;
+
+            let _volumes = VolumeCleanup::new(vec![config_volume.clone()]);
+            let _containers = ContainerCleanup::new(vec![app_name.clone(), gateway_name.clone()]);
+            docker_volume_create(&config_volume)?;
+            seed_qbittorrent_state(&config_volume, &downloads_dir)?;
+
+            let gateway_spec =
+                live_sleeping_container_spec(&gateway_name, vec![], None, &network_name);
+            runtime.ensure_container(&gateway_spec).await?;
+            wait_until_running(&runtime, &gateway_name).await?;
+
+            let direct_spec = live_qbittorrent_spec(
+                &app_name,
+                &config_volume,
+                &downloads_dir,
+                None,
+                instance_id,
+                &network_name,
+            );
+            runtime.ensure_container(&direct_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+            let direct_state = runtime
+                .describe_container_runtime_state(&app_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("direct qBittorrent state missing"))?;
+            let direct_volumes = volume_mounts_from_runtime_state(&direct_state);
+
+            let protected_spec = live_qbittorrent_spec(
+                &app_name,
+                &config_volume,
+                &downloads_dir,
+                Some(&format!("container:{gateway_name}")),
+                instance_id,
+                &network_name,
+            );
+            validate_downloader_volume_preservation(
+                "elixir.modules.qbittorrent",
+                &direct_volumes,
+                &protected_spec.volumes,
+            )?;
+            runtime.ensure_container(&protected_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+            let protected_state = runtime
+                .describe_container_runtime_state(&app_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("protected qBittorrent state missing"))?;
+            let protected_volumes = volume_mounts_from_runtime_state(&protected_state);
+            validate_downloader_volume_preservation(
+                "elixir.modules.qbittorrent",
+                &direct_volumes,
+                &protected_volumes,
+            )?;
+            assert_container_namespace_mode(&runtime, &protected_state, &gateway_name).await?;
+            assert_qbittorrent_state_present(&config_volume, &downloads_dir)?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[ignore = "live Docker downloader test; set ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 to run"]
+        async fn live_nzbget_rehome_preserves_config_runtime_and_download_state() -> Result<()> {
+            if !live_download_network_tests_enabled() {
+                eprintln!(
+                    "skipping live NZBGet rehome test: ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 is not set"
+                );
+                return Ok(());
+            }
+            ensure_docker_available()?;
+
+            let suffix = short_id();
+            let network_name = format!("elixir_live_net_{suffix}");
+            let _network = NetworkCleanup::new(network_name.clone());
+            let runtime = DockerRuntimeManager::new(None);
+            runtime.ensure_network(&network_name).await?;
+
+            let instance_id = Uuid::new_v4();
+            let app_name = format!("elixir-live-nzb-{suffix}");
+            let gateway_name = format!("elixir-live-nzb-gateway-{suffix}");
+            let config_volume = format!("elixir_live_nzb_config_{suffix}");
+            let runtime_volume = format!("elixir_live_nzb_runtime_{suffix}");
+            let host_root = docker_shared_tempdir(&suffix)?;
+            let downloads_dir = host_root.path().join("downloads");
+            std::fs::create_dir_all(&downloads_dir)?;
+
+            let _volumes = VolumeCleanup::new(vec![config_volume.clone(), runtime_volume.clone()]);
+            let _containers = ContainerCleanup::new(vec![app_name.clone(), gateway_name.clone()]);
+            docker_volume_create(&config_volume)?;
+            docker_volume_create(&runtime_volume)?;
+            seed_nzbget_state(&config_volume, &runtime_volume, &downloads_dir)?;
+
+            let gateway_spec =
+                live_sleeping_container_spec(&gateway_name, vec![], None, &network_name);
+            runtime.ensure_container(&gateway_spec).await?;
+            wait_until_running(&runtime, &gateway_name).await?;
+
+            let direct_spec = live_nzbget_spec(
+                &app_name,
+                &config_volume,
+                &runtime_volume,
+                &downloads_dir,
+                None,
+                instance_id,
+                &network_name,
+            );
+            runtime.ensure_container(&direct_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+            let direct_state = runtime
+                .describe_container_runtime_state(&app_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("direct NZBGet state missing"))?;
+            let direct_volumes = volume_mounts_from_runtime_state(&direct_state);
+
+            let protected_spec = live_nzbget_spec(
+                &app_name,
+                &config_volume,
+                &runtime_volume,
+                &downloads_dir,
+                Some(&format!("container:{gateway_name}")),
+                instance_id,
+                &network_name,
+            );
+            validate_downloader_volume_preservation(
+                "elixir.modules.nzbget",
+                &direct_volumes,
+                &protected_spec.volumes,
+            )?;
+            runtime.ensure_container(&protected_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+            let protected_state = runtime
+                .describe_container_runtime_state(&app_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("protected NZBGet state missing"))?;
+            let protected_volumes = volume_mounts_from_runtime_state(&protected_state);
+            validate_downloader_volume_preservation(
+                "elixir.modules.nzbget",
+                &direct_volumes,
+                &protected_volumes,
+            )?;
+            assert_container_namespace_mode(&runtime, &protected_state, &gateway_name).await?;
+            assert_nzbget_state_present(&config_volume, &runtime_volume, &downloads_dir)?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[ignore = "live Docker gateway test; set ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 to run"]
+        async fn live_gateway_namespace_blocks_app_egress_when_gateway_stops() -> Result<()> {
+            if !live_download_network_tests_enabled() {
+                eprintln!(
+                    "skipping live gateway egress-block test: ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 is not set"
+                );
+                return Ok(());
+            }
+            ensure_docker_available()?;
+
+            let suffix = short_id();
+            let network_name = format!("elixir_live_net_{suffix}");
+            let _network = NetworkCleanup::new(network_name.clone());
+            let runtime = DockerRuntimeManager::new(None);
+            runtime.ensure_network(&network_name).await?;
+
+            let target_name = format!("elixir-live-target-{suffix}");
+            let target_alias = format!("svc-live-target-{suffix}");
+            let gateway_name = format!("elixir-live-gateway-{suffix}");
+            let app_name = format!("elixir-live-app-{suffix}");
+            let _cleanup = ContainerCleanup::new(vec![
+                app_name.clone(),
+                gateway_name.clone(),
+                target_name.clone(),
+            ]);
+
+            let target_spec = live_http_echo_spec(&target_name, &target_alias, &network_name);
+            runtime.ensure_container(&target_spec).await?;
+            wait_until_running(&runtime, &target_name).await?;
+
+            let gateway_spec =
+                live_sleeping_container_spec(&gateway_name, vec![], None, &network_name);
+            runtime.ensure_container(&gateway_spec).await?;
+            wait_until_running(&runtime, &gateway_name).await?;
+
+            let app_spec = live_sleeping_container_spec(
+                &app_name,
+                vec![],
+                Some(&format!("container:{gateway_name}")),
+                &network_name,
+            );
+            runtime.ensure_container(&app_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+
+            let body = docker_exec_stdout(
+                &app_name,
+                &["wget", "-qO-", &format!("http://{target_alias}:8080/")],
+            )?;
+            assert!(
+                body.contains("ok"),
+                "unexpected response before gateway stop: {body}"
+            );
+
+            let gateway = runtime
+                .get_container_handle(&gateway_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("gateway container missing"))?;
+            runtime.stop_container(&gateway).await?;
+
+            let blocked = Command::new("docker")
+                .args([
+                    "exec",
+                    &app_name,
+                    "wget",
+                    "-qO-",
+                    &format!("http://{target_alias}:8080/"),
+                ])
+                .output()
+                .context("probing app egress after gateway stop")?;
+            assert!(
+                !blocked.status.success(),
+                "app egress unexpectedly succeeded after gateway stop: {}",
+                String::from_utf8_lossy(&blocked.stdout)
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[ignore = "live Windows Docker Desktop host validation; set ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 to run"]
+        async fn live_windows_docker_desktop_host_validation() -> Result<()> {
+            if !live_download_network_tests_enabled() {
+                eprintln!(
+                    "skipping live Windows Docker Desktop host validation: ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS=1 is not set"
+                );
+                return Ok(());
+            }
+            if std::env::consts::OS != "windows" {
+                eprintln!(
+                    "skipping live Windows Docker Desktop host validation: host OS is {}",
+                    std::env::consts::OS
+                );
+                return Ok(());
+            }
+            ensure_docker_available()?;
+
+            let os_type = docker_info_value("{{.OSType}}")?;
+            assert_eq!(
+                os_type, "linux",
+                "Elixir downloader networking requires Docker Desktop Linux-container mode on Windows; docker OSType was '{os_type}'"
+            );
+            let operating_system = docker_info_value("{{.OperatingSystem}}")?;
+            eprintln!("Windows Docker host reports: {operating_system}");
+
+            let suffix = short_id();
+            let host_root = docker_shared_tempdir(&suffix)?;
+            assert_windows_bind_mount_roundtrip(host_root.path())?;
+            assert_host_docker_internal_resolves()?;
+
+            let network_name = format!("elixir_live_net_win_{suffix}");
+            let bind_name = format!("elixir-live-win-bind-{suffix}");
+            let target_name = format!("elixir-live-win-target-{suffix}");
+            let target_alias = format!("svc-live-win-target-{suffix}");
+            let gateway_name = format!("elixir-live-win-gateway-{suffix}");
+            let app_name = format!("elixir-live-win-app-{suffix}");
+            let _network = NetworkCleanup::new(network_name.clone());
+            let _cleanup = ContainerCleanup::new(vec![
+                bind_name.clone(),
+                app_name.clone(),
+                gateway_name.clone(),
+                target_name.clone(),
+            ]);
+            let runtime = DockerRuntimeManager::new(None);
+            runtime.ensure_network(&network_name).await?;
+
+            assert_windows_runtime_bind_mount_roundtrip(
+                &runtime,
+                &network_name,
+                &bind_name,
+                host_root.path(),
+            )
+            .await?;
+
+            let target_spec = live_http_echo_spec(&target_name, &target_alias, &network_name);
+            runtime.ensure_container(&target_spec).await?;
+            wait_until_running(&runtime, &target_name).await?;
+
+            let gateway_spec =
+                live_sleeping_container_spec(&gateway_name, vec![], None, &network_name);
+            runtime.ensure_container(&gateway_spec).await?;
+            wait_until_running(&runtime, &gateway_name).await?;
+
+            let app_spec = live_sleeping_container_spec(
+                &app_name,
+                vec![],
+                Some(&format!("container:{gateway_name}")),
+                &network_name,
+            );
+            runtime.ensure_container(&app_spec).await?;
+            wait_until_running(&runtime, &app_name).await?;
+
+            let body = docker_exec_stdout(
+                &app_name,
+                &["wget", "-qO-", &format!("http://{target_alias}:8080/")],
+            )?;
+            assert!(
+                body.contains("ok"),
+                "unexpected response before gateway stop: {body}"
+            );
+
+            let gateway = runtime
+                .get_container_handle(&gateway_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("gateway container missing"))?;
+            runtime.stop_container(&gateway).await?;
+
+            let blocked = Command::new("docker")
+                .args([
+                    "exec",
+                    &app_name,
+                    "wget",
+                    "-qO-",
+                    &format!("http://{target_alias}:8080/"),
+                ])
+                .output()
+                .context("probing Windows app egress after gateway stop")?;
+            assert!(
+                !blocked.status.success(),
+                "Windows app egress unexpectedly succeeded after gateway stop: {}",
+                String::from_utf8_lossy(&blocked.stdout)
+            );
+
+            Ok(())
+        }
+
         async fn wait_until_running(runtime: &DockerRuntimeManager, name: &str) -> Result<()> {
             let mut last = None;
             for _ in 0..30 {
@@ -8177,6 +10803,36 @@ PersistentKeepalive = 25
                 name,
                 last.unwrap_or_else(|| "unknown state".to_string())
             );
+        }
+
+        async fn assert_container_namespace_mode(
+            runtime: &DockerRuntimeManager,
+            state: &ContainerRuntimeState,
+            gateway_name: &str,
+        ) -> Result<()> {
+            let gateway = runtime
+                .get_container_handle(gateway_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("gateway container missing"))?;
+            let actual = normalized_network_mode(state.network_mode.as_deref());
+            let expected_by_name = format!("container:{gateway_name}");
+            let expected_by_id = format!("container:{}", gateway.id);
+            let actual_container_ref = actual
+                .as_deref()
+                .and_then(|mode| mode.strip_prefix("container:"));
+            let id_matches = actual_container_ref.is_some_and(|value| {
+                value == gateway.id
+                    || value.starts_with(&gateway.id)
+                    || gateway.id.starts_with(value)
+            });
+            assert!(
+                actual.as_deref() == Some(expected_by_name.as_str()) || id_matches,
+                "unexpected network mode {:?}; expected '{}' or '{}'",
+                actual,
+                expected_by_name,
+                expected_by_id
+            );
+            Ok(())
         }
 
         fn wait_for_gateway_http_probe(gateway_name: &str, target_alias: &str) -> Result<String> {
@@ -8220,6 +10876,528 @@ PersistentKeepalive = 25
                 bail!("gateway probe command failed: {stderr}");
             }
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn docker_info_value(format: &str) -> Result<String> {
+            let output = Command::new("docker")
+                .args(["info", "--format", format])
+                .output()
+                .with_context(|| format!("reading docker info value '{format}'"))?;
+            if !output.status.success() {
+                bail!(
+                    "docker info failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn assert_windows_bind_mount_roundtrip(host_dir: &Path) -> Result<()> {
+            std::fs::write(host_dir.join("host-marker.txt"), "host")
+                .context("writing Windows bind-mount marker")?;
+            let mount = format!(
+                "type=bind,source={},target=/hostcheck",
+                host_dir.to_string_lossy()
+            );
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--mount",
+                    &mount,
+                    "alpine:3.20",
+                    "sh",
+                    "-lc",
+                    "set -e; test -f /hostcheck/host-marker.txt; printf container > /hostcheck/container-marker.txt",
+                ])
+                .output()
+                .context("running Windows bind-mount roundtrip helper")?;
+            if !output.status.success() {
+                bail!(
+                    "Windows bind-mount roundtrip helper failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let marker = std::fs::read_to_string(host_dir.join("container-marker.txt"))
+                .context("reading Windows bind-mount roundtrip marker")?;
+            assert_eq!(marker, "container");
+            Ok(())
+        }
+
+        async fn assert_windows_runtime_bind_mount_roundtrip(
+            runtime: &DockerRuntimeManager,
+            network_name: &str,
+            container_name: &str,
+            host_dir: &Path,
+        ) -> Result<()> {
+            std::fs::write(host_dir.join("runtime-host-marker.txt"), "host")
+                .context("writing Windows runtime bind-mount marker")?;
+            let spec = ContainerSpec {
+                name: container_name.to_string(),
+                image: "alpine:3.20".to_string(),
+                network: network_name.to_string(),
+                network_mode: None,
+                aliases: Vec::new(),
+                env: Vec::new(),
+                volumes: vec![VolumeMount {
+                    source_kind: VolumeMountSourceKind::Bind,
+                    host_path: host_dir.to_string_lossy().to_string(),
+                    container_path: "/hostcheck".to_string(),
+                    read_only: false,
+                }],
+                ports: Vec::new(),
+                labels: live_labels(
+                    Uuid::new_v4(),
+                    container_name,
+                    "elixir.live.windows",
+                    "1.0.0",
+                ),
+                command: vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "set -e; test -f /hostcheck/runtime-host-marker.txt; printf runtime > /hostcheck/runtime-container-marker.txt".to_string(),
+                ],
+                cap_add: Vec::new(),
+                devices: Vec::new(),
+                sysctls: HashMap::new(),
+            };
+
+            runtime.ensure_container(&spec).await?;
+            let exit_code = docker_wait_exit_code(container_name)?;
+            if exit_code != 0 {
+                bail!(
+                    "Windows runtime bind-mount helper exited with {exit_code}: {}",
+                    docker_logs(container_name).unwrap_or_else(|_| String::new())
+                );
+            }
+
+            let marker = std::fs::read_to_string(host_dir.join("runtime-container-marker.txt"))
+                .context("reading Windows runtime bind-mount marker")?;
+            assert_eq!(marker, "runtime");
+
+            let state = runtime
+                .describe_container_runtime_state(container_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("runtime bind-mount helper state missing"))?;
+            assert!(
+                state.mounts.iter().any(|mount| {
+                    mount.mount_type == "bind"
+                        && mount.destination == "/hostcheck"
+                        && !mount.read_only
+                }),
+                "runtime bind-mount helper did not report the expected writable /hostcheck bind mount: {:?}",
+                state.mounts
+            );
+            Ok(())
+        }
+
+        fn assert_host_docker_internal_resolves() -> Result<()> {
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "alpine:3.20",
+                    "sh",
+                    "-lc",
+                    "getent hosts host.docker.internal >/dev/null 2>&1 || nslookup host.docker.internal >/dev/null 2>&1",
+                ])
+                .output()
+                .context("checking host.docker.internal from a Linux container")?;
+            if !output.status.success() {
+                bail!(
+                    "host.docker.internal did not resolve from a Linux container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+
+        fn live_download_network_tests_enabled() -> bool {
+            std::env::var("ELIXIR_LIVE_DOWNLOAD_NETWORK_TESTS")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        }
+
+        fn docker_shared_tempdir(suffix: &str) -> Result<TempDir> {
+            let root = std::env::current_dir()?
+                .join("target")
+                .join("live-docker-tests");
+            std::fs::create_dir_all(&root)?;
+            tempfile::Builder::new()
+                .prefix(&format!("elixir-{suffix}-"))
+                .tempdir_in(root)
+                .context("creating Docker-shared tempdir")
+        }
+
+        struct VolumeCleanup {
+            names: Vec<String>,
+        }
+
+        impl VolumeCleanup {
+            fn new(names: Vec<String>) -> Self {
+                Self { names }
+            }
+        }
+
+        impl Drop for VolumeCleanup {
+            fn drop(&mut self) {
+                for name in &self.names {
+                    let _ = Command::new("docker")
+                        .arg("volume")
+                        .arg("rm")
+                        .arg("-f")
+                        .arg(name)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
+
+        struct NetworkCleanup {
+            name: String,
+        }
+
+        impl NetworkCleanup {
+            fn new(name: String) -> Self {
+                Self { name }
+            }
+        }
+
+        impl Drop for NetworkCleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("docker")
+                    .arg("network")
+                    .arg("rm")
+                    .arg(&self.name)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+
+        fn docker_volume_create(name: &str) -> Result<()> {
+            let output = Command::new("docker")
+                .args(["volume", "create", name])
+                .output()
+                .with_context(|| format!("creating Docker volume '{name}'"))?;
+            if !output.status.success() {
+                bail!(
+                    "docker volume create '{}' failed: {}",
+                    name,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+
+        fn docker_exec_stdout(container: &str, args: &[&str]) -> Result<String> {
+            let mut command = Command::new("docker");
+            command.arg("exec").arg(container).args(args);
+            let output = command
+                .output()
+                .with_context(|| format!("running docker exec in '{container}'"))?;
+            if !output.status.success() {
+                bail!(
+                    "docker exec in '{}' failed: {}",
+                    container,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn docker_wait_exit_code(container: &str) -> Result<i32> {
+            let output = Command::new("docker")
+                .args(["wait", container])
+                .output()
+                .with_context(|| format!("waiting for container '{container}'"))?;
+            if !output.status.success() {
+                bail!(
+                    "docker wait failed for '{}': {}",
+                    container,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i32>()
+                .with_context(|| format!("parsing docker wait exit code for '{container}'"))
+        }
+
+        fn docker_run_alpine_with_mounts(mounts: &[String], script: &str) -> Result<()> {
+            let mut args = vec!["run", "--rm"];
+            for mount in mounts {
+                args.push("-v");
+                args.push(mount.as_str());
+            }
+            args.extend(["alpine:3.20", "sh", "-lc", script]);
+            let output = Command::new("docker")
+                .args(args)
+                .output()
+                .context("running disposable alpine helper")?;
+            if !output.status.success() {
+                bail!(
+                    "disposable alpine helper failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+
+        fn seed_qbittorrent_state(config_volume: &str, downloads_dir: &Path) -> Result<()> {
+            docker_run_alpine_with_mounts(
+                &[
+                    format!("{config_volume}:/config"),
+                    format!("{}:/downloads", downloads_dir.display()),
+                ],
+                "set -e; \
+                 mkdir -p /config/qBittorrent/BT_backup /downloads/.incomplete; \
+                 printf paused-torrent > /config/qBittorrent/BT_backup/paused.torrent; \
+                 printf paused-fastresume > /config/qBittorrent/BT_backup/paused.fastresume; \
+                 printf partial > /downloads/.incomplete/partial.data; \
+                 printf complete > /downloads/completed.data",
+            )
+        }
+
+        fn assert_qbittorrent_state_present(
+            config_volume: &str,
+            downloads_dir: &Path,
+        ) -> Result<()> {
+            docker_run_alpine_with_mounts(
+                &[
+                    format!("{config_volume}:/config:ro"),
+                    format!("{}:/downloads:ro", downloads_dir.display()),
+                ],
+                "set -e; \
+                 test -f /config/qBittorrent/BT_backup/paused.torrent; \
+                 test -f /config/qBittorrent/BT_backup/paused.fastresume; \
+                 test -f /downloads/.incomplete/partial.data; \
+                 test -f /downloads/completed.data",
+            )
+        }
+
+        fn seed_nzbget_state(
+            config_volume: &str,
+            runtime_volume: &str,
+            downloads_dir: &Path,
+        ) -> Result<()> {
+            docker_run_alpine_with_mounts(
+                &[
+                    format!("{config_volume}:/config"),
+                    format!("{runtime_volume}:/runtime"),
+                    format!("{}:/downloads", downloads_dir.display()),
+                ],
+                "set -e; \
+                 mkdir -p /config /runtime/queue /runtime/tmp /downloads/.incomplete; \
+                 printf 'ControlUsername=elixir\\nControlPassword=secret\\n' > /config/nzbget.conf; \
+                 printf queued > /runtime/queue/queue-state; \
+                 printf runtime > /runtime/tmp/runtime-state; \
+                 printf partial > /downloads/.incomplete/partial.nzb; \
+                 printf complete > /downloads/completed.nzb",
+            )
+        }
+
+        fn assert_nzbget_state_present(
+            config_volume: &str,
+            runtime_volume: &str,
+            downloads_dir: &Path,
+        ) -> Result<()> {
+            docker_run_alpine_with_mounts(
+                &[
+                    format!("{config_volume}:/config:ro"),
+                    format!("{runtime_volume}:/runtime:ro"),
+                    format!("{}:/downloads:ro", downloads_dir.display()),
+                ],
+                "set -e; \
+                 grep -q ControlUsername /config/nzbget.conf; \
+                 test -f /runtime/queue/queue-state; \
+                 test -f /runtime/tmp/runtime-state; \
+                 test -f /downloads/.incomplete/partial.nzb; \
+                 test -f /downloads/completed.nzb",
+            )
+        }
+
+        fn live_qbittorrent_spec(
+            name: &str,
+            config_volume: &str,
+            downloads_dir: &Path,
+            network_mode: Option<&str>,
+            instance_id: Uuid,
+            network: &str,
+        ) -> ContainerSpec {
+            let image = std::env::var("ELIXIR_LIVE_QBITTORRENT_IMAGE")
+                .unwrap_or_else(|_| "lscr.io/linuxserver/qbittorrent:latest".to_string());
+            live_downloader_spec(
+                name,
+                image,
+                vec![
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::NamedVolume,
+                        host_path: config_volume.to_string(),
+                        container_path: "/config".to_string(),
+                        read_only: false,
+                    },
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::Bind,
+                        host_path: downloads_dir.to_string_lossy().to_string(),
+                        container_path: "/downloads".to_string(),
+                        read_only: false,
+                    },
+                ],
+                network_mode,
+                instance_id,
+                "elixir.modules.qbittorrent",
+                network,
+            )
+        }
+
+        fn live_nzbget_spec(
+            name: &str,
+            config_volume: &str,
+            runtime_volume: &str,
+            downloads_dir: &Path,
+            network_mode: Option<&str>,
+            instance_id: Uuid,
+            network: &str,
+        ) -> ContainerSpec {
+            let image = std::env::var("ELIXIR_LIVE_NZBGET_IMAGE")
+                .unwrap_or_else(|_| "lscr.io/linuxserver/nzbget:latest".to_string());
+            live_downloader_spec(
+                name,
+                image,
+                vec![
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::NamedVolume,
+                        host_path: config_volume.to_string(),
+                        container_path: "/config".to_string(),
+                        read_only: false,
+                    },
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::NamedVolume,
+                        host_path: runtime_volume.to_string(),
+                        container_path: "/runtime".to_string(),
+                        read_only: false,
+                    },
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::Bind,
+                        host_path: downloads_dir.to_string_lossy().to_string(),
+                        container_path: "/downloads".to_string(),
+                        read_only: false,
+                    },
+                ],
+                network_mode,
+                instance_id,
+                "elixir.modules.nzbget",
+                network,
+            )
+        }
+
+        fn live_downloader_spec(
+            name: &str,
+            image: String,
+            volumes: Vec<VolumeMount>,
+            network_mode: Option<&str>,
+            instance_id: Uuid,
+            extension_id: &str,
+            network: &str,
+        ) -> ContainerSpec {
+            ContainerSpec {
+                name: name.to_string(),
+                image,
+                network: network.to_string(),
+                network_mode: network_mode.map(str::to_string),
+                aliases: if network_mode.is_some() {
+                    Vec::new()
+                } else {
+                    vec![format!("svc-{name}")]
+                },
+                env: vec![
+                    EnvVar {
+                        name: "PUID".to_string(),
+                        value: "1000".to_string(),
+                    },
+                    EnvVar {
+                        name: "PGID".to_string(),
+                        value: "1000".to_string(),
+                    },
+                ],
+                volumes,
+                ports: Vec::new(),
+                labels: live_labels(instance_id, name, extension_id, "1.0.0"),
+                command: Vec::new(),
+                cap_add: Vec::new(),
+                devices: Vec::new(),
+                sysctls: HashMap::new(),
+            }
+        }
+
+        fn live_sleeping_container_spec(
+            name: &str,
+            aliases: Vec<String>,
+            network_mode: Option<&str>,
+            network: &str,
+        ) -> ContainerSpec {
+            ContainerSpec {
+                name: name.to_string(),
+                image: "alpine:3.20".to_string(),
+                network: network.to_string(),
+                network_mode: network_mode.map(str::to_string),
+                aliases,
+                env: Vec::new(),
+                volumes: Vec::new(),
+                ports: Vec::new(),
+                labels: live_labels(Uuid::new_v4(), name, "elixir.live.test", "1.0.0"),
+                command: vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "trap 'exit 0' TERM INT; while true; do sleep 3600; done".to_string(),
+                ],
+                cap_add: Vec::new(),
+                devices: Vec::new(),
+                sysctls: HashMap::new(),
+            }
+        }
+
+        fn live_http_echo_spec(name: &str, alias: &str, network: &str) -> ContainerSpec {
+            ContainerSpec {
+                name: name.to_string(),
+                image: "hashicorp/http-echo:0.2.3".to_string(),
+                network: network.to_string(),
+                network_mode: None,
+                aliases: vec![alias.to_string()],
+                env: Vec::new(),
+                volumes: Vec::new(),
+                ports: Vec::new(),
+                labels: live_labels(Uuid::new_v4(), name, "elixir.live.target", "1.0.0"),
+                command: vec![
+                    "-listen".to_string(),
+                    ":8080".to_string(),
+                    "-text".to_string(),
+                    "ok".to_string(),
+                ],
+                cap_add: Vec::new(),
+                devices: Vec::new(),
+                sysctls: HashMap::new(),
+            }
+        }
+
+        fn live_labels(
+            instance_id: Uuid,
+            instance_name: &str,
+            extension_id: &str,
+            version: &str,
+        ) -> HashMap<String, String> {
+            let mut labels = HashMap::new();
+            labels.insert("elixir.managed".to_string(), "true".to_string());
+            labels.insert("elixir.instance_id".to_string(), instance_id.to_string());
+            labels.insert(
+                "elixir.instance_name".to_string(),
+                instance_name.to_string(),
+            );
+            labels.insert("elixir.extension_id".to_string(), extension_id.to_string());
+            labels.insert("elixir.extension_version".to_string(), version.to_string());
+            labels
         }
 
         fn inspect_network_mode(name: &str) -> Result<String> {
@@ -8280,14 +11458,75 @@ PersistentKeepalive = 25
         Ok(())
     }
 
-    #[test]
-    fn prepare_runtime_volumes_rewrites_first_party_config_storage_to_named_volume() -> Result<()> {
-        let paths = RuntimePaths {
+    fn downloader_volume_test_paths() -> RuntimePaths {
+        RuntimePaths {
             data_root: "/tmp/elixir/data".to_string(),
             extensions_root: "/tmp/elixir/data/extensions".to_string(),
             downloads_root: "/tmp/elixir/downloads".to_string(),
             media_root: "/tmp/elixir/media".to_string(),
-        };
+        }
+    }
+
+    fn downloader_rehome_test_spec(
+        name: &str,
+        volumes: Vec<VolumeMount>,
+        network_mode: Option<&str>,
+    ) -> ContainerSpec {
+        ContainerSpec {
+            name: name.to_string(),
+            image: "example/downloader:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: network_mode.map(str::to_string),
+            aliases: if network_mode.is_some() {
+                Vec::new()
+            } else {
+                vec![format!("svc-{name}")]
+            },
+            env: Vec::new(),
+            volumes,
+            ports: if network_mode.is_some() {
+                Vec::new()
+            } else {
+                vec![PortMapping {
+                    container_port: 8080,
+                    host_port: Some(0),
+                    protocol: None,
+                }]
+            },
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn keep_downloader_paused_after_rehome_reads_network_or_runtime_config() {
+        assert!(!keep_downloader_paused_after_rehome(None));
+        assert!(keep_downloader_paused_after_rehome(Some(&json!({
+            "network": {
+                "keep_downloads_paused_after_rehome": true
+            }
+        }))));
+        assert!(keep_downloader_paused_after_rehome(Some(&json!({
+            "runtime": {
+                "keep_downloads_paused_after_rehome": true
+            }
+        }))));
+        assert!(!keep_downloader_paused_after_rehome(Some(&json!({
+            "network": {
+                "keep_downloads_paused_after_rehome": false
+            },
+            "runtime": {
+                "keep_downloads_paused_after_rehome": true
+            }
+        }))));
+    }
+
+    #[test]
+    fn prepare_runtime_volumes_rewrites_first_party_config_storage_to_named_volume() -> Result<()> {
+        let paths = downloader_volume_test_paths();
         let instance_id =
             Uuid::parse_str("c1eaaec2-3dcf-40e4-85aa-adea48e4b221").expect("instance id");
         let prepared = prepare_runtime_volumes(
@@ -8321,12 +11560,7 @@ PersistentKeepalive = 25
     #[test]
     fn prepare_runtime_volumes_injects_managed_config_mount_when_manifest_omits_config()
     -> Result<()> {
-        let paths = RuntimePaths {
-            data_root: "/tmp/elixir/data".to_string(),
-            extensions_root: "/tmp/elixir/data/extensions".to_string(),
-            downloads_root: "/tmp/elixir/downloads".to_string(),
-            media_root: "/tmp/elixir/media".to_string(),
-        };
+        let paths = downloader_volume_test_paths();
         let instance_id =
             Uuid::parse_str("b71d9e69-0290-5e73-b6c4-c9e771b993a6").expect("instance id");
         let prepared = prepare_runtime_volumes(
@@ -8351,12 +11585,7 @@ PersistentKeepalive = 25
 
     #[test]
     fn prepare_runtime_volumes_keeps_qbittorrent_incomplete_on_downloads_mount() -> Result<()> {
-        let paths = RuntimePaths {
-            data_root: "/tmp/elixir/data".to_string(),
-            extensions_root: "/tmp/elixir/data/extensions".to_string(),
-            downloads_root: "/tmp/elixir/downloads".to_string(),
-            media_root: "/tmp/elixir/media".to_string(),
-        };
+        let paths = downloader_volume_test_paths();
         let instance_id =
             Uuid::parse_str("e88bc8bb-cd98-4742-8d21-c1c13e28f1e5").expect("instance id");
         let prepared = prepare_runtime_volumes(
@@ -8383,6 +11612,232 @@ PersistentKeepalive = 25
         assert_eq!(
             required_named_runtime_directories("elixir.modules.qbittorrent", &prepared.volumes),
             vec![QBITTORRENT_INCOMPLETE_DIR.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_volume_preflight_allows_qbittorrent_network_mode_rehome() -> Result<()> {
+        let paths = downloader_volume_test_paths();
+        let instance_id =
+            Uuid::parse_str("d78f4a2c-95f5-40a9-bf93-e0864b69a401").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+
+        let direct = downloader_rehome_test_spec("qbit", prepared.volumes.clone(), None);
+        let rehomed = downloader_rehome_test_spec(
+            "qbit",
+            prepared.volumes.clone(),
+            Some("container:qbit-vpn"),
+        );
+
+        assert_ne!(direct.network_mode, rehomed.network_mode);
+        validate_downloader_volume_preservation(
+            "elixir.modules.qbittorrent",
+            &direct.volumes,
+            &rehomed.volumes,
+        )?;
+        let config_volume = config_volume_name(instance_id);
+        assert_eq!(
+            rehomed
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/config")
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((&VolumeMountSourceKind::NamedVolume, config_volume.as_str()))
+        );
+        assert_eq!(
+            rehomed
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == DOWNLOADS_ROOT)
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((&VolumeMountSourceKind::Bind, paths.downloads_root.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_volume_preflight_allows_nzbget_network_mode_rehome() -> Result<()> {
+        let paths = downloader_volume_test_paths();
+        let instance_id =
+            Uuid::parse_str("4c5565b5-91d0-4ec4-b4a5-e1471c5342eb").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.nzbget",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+
+        let direct = downloader_rehome_test_spec("nzbget", prepared.volumes.clone(), None);
+        let rehomed = downloader_rehome_test_spec(
+            "nzbget",
+            prepared.volumes.clone(),
+            Some("container:nzbget-vpn"),
+        );
+
+        assert_ne!(direct.network_mode, rehomed.network_mode);
+        validate_downloader_volume_preservation(
+            "elixir.modules.nzbget",
+            &direct.volumes,
+            &rehomed.volumes,
+        )?;
+        let config_volume = config_volume_name(instance_id);
+        let runtime_volume = runtime_volume_name(instance_id);
+        assert_eq!(
+            rehomed
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/config")
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((&VolumeMountSourceKind::NamedVolume, config_volume.as_str()))
+        );
+        assert_eq!(
+            rehomed
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == "/runtime")
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((&VolumeMountSourceKind::NamedVolume, runtime_volume.as_str()))
+        );
+        assert_eq!(
+            rehomed
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == DOWNLOADS_ROOT)
+                .map(|volume| (&volume.source_kind, volume.host_path.as_str())),
+            Some((&VolumeMountSourceKind::Bind, paths.downloads_root.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_volume_preflight_allows_docker_desktop_bind_mount_aliases() -> Result<()> {
+        let existing = vec![
+            VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: "elixir_cfg_existing".to_string(),
+                container_path: "/config".to_string(),
+                read_only: false,
+            },
+            VolumeMount {
+                source_kind: VolumeMountSourceKind::Bind,
+                host_path: "/host_mnt/Users/ryanhotard/elixir/data/downloads".to_string(),
+                container_path: DOWNLOADS_ROOT.to_string(),
+                read_only: false,
+            },
+        ];
+        let next = vec![
+            VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: "elixir_cfg_existing".to_string(),
+                container_path: "/config".to_string(),
+                read_only: false,
+            },
+            VolumeMount {
+                source_kind: VolumeMountSourceKind::Bind,
+                host_path: "/Users/ryanhotard/elixir/data/downloads".to_string(),
+                container_path: DOWNLOADS_ROOT.to_string(),
+                read_only: false,
+            },
+        ];
+
+        validate_downloader_volume_preservation("elixir.modules.qbittorrent", &existing, &next)
+    }
+
+    #[test]
+    fn downloader_volume_preflight_rejects_changed_qbittorrent_config_volume() -> Result<()> {
+        let paths = downloader_volume_test_paths();
+        let instance_id =
+            Uuid::parse_str("e95ee36e-a50a-4783-a45f-c88bb212ce50").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+        let mut changed = prepared.volumes.clone();
+        let config_mount = changed
+            .iter_mut()
+            .find(|volume| volume.container_path == "/config")
+            .expect("config mount");
+        config_mount.host_path = "elixir_cfg_recreated".to_string();
+
+        let err = validate_downloader_volume_preservation(
+            "elixir.modules.qbittorrent",
+            &prepared.volumes,
+            &changed,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("/config mount would change"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_volume_preflight_rejects_changed_nzbget_runtime_volume() -> Result<()> {
+        let paths = downloader_volume_test_paths();
+        let instance_id =
+            Uuid::parse_str("4f7d38c3-d77f-492f-90af-5cc2f672ef71").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.nzbget",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+        let mut changed = prepared.volumes.clone();
+        let runtime_mount = changed
+            .iter_mut()
+            .find(|volume| volume.container_path == "/runtime")
+            .expect("runtime mount");
+        runtime_mount.host_path = "elixir_rt_recreated".to_string();
+
+        let err = validate_downloader_volume_preservation(
+            "elixir.modules.nzbget",
+            &prepared.volumes,
+            &changed,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("/runtime mount would change"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_volume_preflight_rejects_changed_downloads_mount() -> Result<()> {
+        let paths = downloader_volume_test_paths();
+        let instance_id =
+            Uuid::parse_str("92a87c6a-2871-4c3e-8318-0a74d07ecf33").expect("instance id");
+        let prepared = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?;
+        let mut changed = prepared.volumes.clone();
+        let downloads_mount = changed
+            .iter_mut()
+            .find(|volume| volume.container_path == DOWNLOADS_ROOT)
+            .expect("downloads mount");
+        downloads_mount.host_path = "/tmp/elixir/new-downloads".to_string();
+
+        let err = validate_downloader_volume_preservation(
+            "elixir.modules.qbittorrent",
+            &prepared.volumes,
+            &changed,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("/downloads mount would change"),
+            "unexpected error: {err}"
         );
         Ok(())
     }
@@ -8475,5 +11930,18 @@ InterDir=/runtime/incomplete
 Category1.Name=tv
 ";
         assert_eq!(compact_nzbget_config_text(text), text);
+    }
+
+    #[test]
+    fn render_openvpn_config_points_auth_user_pass_at_managed_secret_file() {
+        let rendered = render_openvpn_config(
+            "client\nauth-user-pass old-auth.txt\nremote 203.0.113.10 1194\n",
+            true,
+        );
+        assert!(rendered.contains("auth-user-pass /gluetun/auth.txt"));
+        assert!(!rendered.contains("old-auth.txt"));
+
+        let appended = render_openvpn_config("client\nremote 203.0.113.10 1194\n", true);
+        assert!(appended.ends_with("auth-user-pass /gluetun/auth.txt\n"));
     }
 }

@@ -1499,7 +1499,7 @@ fn nzbget_add_server_action() -> ExtensionControlAction {
         id: "add_server".to_string(),
         label: "Add provider".to_string(),
         description: "Add a Usenet provider to NZBGet.".to_string(),
-        kind: "primary".to_string(),
+        kind: "info".to_string(),
         params: Some(json!({
             "promptTitle": "Add NZBGet provider",
             "promptFields": nzbget_server_prompt_fields(None, "", true)
@@ -2763,7 +2763,7 @@ mod tests {
                 trust: None,
                 permissions: Vec::new(),
                 provides: Vec::new(),
-                requires: Vec::new(),
+                requires: Default::default(),
                 conflicts: Vec::new(),
                 runtime: None,
                 backup: None,
@@ -2889,6 +2889,15 @@ mod tests {
         };
 
         assert!(!nzbget_server_is_upstream_sample(&server));
+    }
+
+    #[test]
+    fn nzbget_add_provider_action_uses_setup_info_kind() {
+        let action = nzbget_add_server_action();
+
+        assert_eq!(action.id, "add_server");
+        assert_eq!(action.label, "Add provider");
+        assert_eq!(action.kind, "info");
     }
 
     #[test]
@@ -3731,25 +3740,17 @@ async fn qbittorrent_run_global_action(
 ) -> anyhow::Result<String> {
     match action_id {
         "pause_all" => {
-            request_downloader_empty(
-                state,
-                store,
-                context,
-                ReqwestMethod::POST,
-                "api/v2/transfer/pauseAll",
-            )
-            .await?;
+            let mut fields = HashMap::new();
+            fields.insert("hashes".to_string(), "all".to_string());
+            request_downloader_form(state, store, context, "api/v2/torrents/pause", &fields)
+                .await?;
             Ok("Paused all qBittorrent torrents.".to_string())
         }
         "resume_all" => {
-            request_downloader_empty(
-                state,
-                store,
-                context,
-                ReqwestMethod::POST,
-                "api/v2/transfer/resumeAll",
-            )
-            .await?;
+            let mut fields = HashMap::new();
+            fields.insert("hashes".to_string(), "all".to_string());
+            request_downloader_form(state, store, context, "api/v2/torrents/resume", &fields)
+                .await?;
             Ok("Resumed all qBittorrent torrents.".to_string())
         }
         _ => anyhow::bail!("unsupported qBittorrent action '{action_id}'"),

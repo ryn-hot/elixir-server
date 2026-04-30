@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::runtime::RuntimeManager;
 use crate::runtime::model::{
-    ContainerHandle, ContainerSpec, ContainerState, PortMapping, VolumeMount, VolumeMountSourceKind,
+    CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerPublishedPort, ContainerRuntimeMount,
+    ContainerRuntimeState, ContainerSpec, ContainerState, PortMapping, VolumeMount,
+    VolumeMountSourceKind,
 };
 
 const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"];
@@ -554,6 +556,93 @@ impl DockerRuntimeManager {
             .unwrap_or_default()
     }
 
+    fn extract_published_ports(value: &Value) -> Vec<ContainerPublishedPort> {
+        let mut published = value
+            .pointer("/NetworkSettings/Ports")
+            .and_then(Value::as_object)
+            .map(|ports| {
+                ports
+                    .iter()
+                    .flat_map(|(key, bindings)| {
+                        let Some((container_port, protocol)) = key.split_once('/') else {
+                            return Vec::new();
+                        };
+                        let Ok(container_port) = container_port.parse::<u16>() else {
+                            return Vec::new();
+                        };
+                        bindings
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(move |binding| {
+                                let host_port = binding
+                                    .get("HostPort")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .parse::<u16>()
+                                    .ok()
+                                    .filter(|port| *port > 0)?;
+                                let host_ip = binding
+                                    .get("HostIp")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_string);
+                                Some(ContainerPublishedPort {
+                                    container_port,
+                                    host_port,
+                                    protocol: protocol.to_string(),
+                                    host_ip,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        published.sort_by(|left, right| {
+            left.container_port
+                .cmp(&right.container_port)
+                .then_with(|| left.protocol.cmp(&right.protocol))
+                .then_with(|| left.host_port.cmp(&right.host_port))
+        });
+        published
+    }
+
+    fn extract_runtime_state(value: &Value) -> ContainerRuntimeState {
+        let name = value
+            .get("Name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string();
+        let network_mode = value
+            .pointer("/HostConfig/NetworkMode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let mounts = Self::extract_mounts(value)
+            .into_iter()
+            .map(|mount| ContainerRuntimeMount {
+                mount_type: mount.mount_type,
+                source: mount.source,
+                name: mount.name,
+                destination: mount.destination,
+                read_only: mount.read_only,
+            })
+            .collect();
+
+        ContainerRuntimeState {
+            name,
+            network_mode,
+            labels: Self::extract_labels(value),
+            mounts,
+            published_ports: Self::extract_published_ports(value),
+        }
+    }
+
     fn mount_matches(desired: &VolumeMount, actual: &ContainerMount) -> bool {
         if actual.destination != desired.container_path || actual.read_only != desired.read_only {
             return false;
@@ -581,11 +670,18 @@ impl DockerRuntimeManager {
         }
 
         candidates.insert(trimmed.to_string());
+        let slash_normalized = trimmed.replace('\\', "/");
+        candidates.insert(slash_normalized.clone());
 
         if let Some(stripped) = trimmed.strip_prefix("/host_mnt") {
             let normalized = if stripped.is_empty() { "/" } else { stripped };
             candidates.insert(normalized.to_string());
         }
+        if let Some(stripped) = slash_normalized.strip_prefix("/host_mnt") {
+            let normalized = if stripped.is_empty() { "/" } else { stripped };
+            candidates.insert(normalized.to_string());
+        }
+        add_windows_docker_desktop_bind_mount_candidates(&mut candidates, &slash_normalized);
 
         if let Some(stripped) = trimmed.strip_prefix("/private") {
             let normalized = if stripped.is_empty() { "/" } else { stripped };
@@ -679,6 +775,18 @@ impl DockerRuntimeManager {
         ];
         let stdout = self.run_stdout(&args).await?;
         Ok(parse_published_host_port(&stdout, container_port))
+    }
+
+    pub async fn describe_container_runtime_state(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<ContainerRuntimeState>> {
+        if self.find_container_id(container_name).await?.is_none() {
+            return Ok(None);
+        }
+
+        let inspect = self.inspect_container(container_name).await?;
+        Ok(Some(Self::extract_runtime_state(&inspect)))
     }
 
     pub async fn stop_and_remove_managed_containers(&self) -> Result<Vec<String>> {
@@ -1011,6 +1119,15 @@ impl DockerRuntimeManager {
     }
 
     async fn ensure_container_attached(&self, spec: &ContainerSpec, value: &Value) -> Result<()> {
+        if let Some((actual, desired)) = Self::container_spec_hash_mismatch(spec, value) {
+            bail!(
+                "container '{}' has spec fingerprint '{}' but expected '{}'; recreate to fix",
+                spec.name,
+                actual,
+                desired
+            );
+        }
+
         if let Some(network_mode) = spec.network_mode.as_ref() {
             let current = value
                 .pointer("/HostConfig/NetworkMode")
@@ -1074,6 +1191,16 @@ impl DockerRuntimeManager {
         }
 
         Ok(())
+    }
+
+    fn container_spec_hash_mismatch(
+        spec: &ContainerSpec,
+        value: &Value,
+    ) -> Option<(String, String)> {
+        let desired = spec.labels.get(CONTAINER_SPEC_HASH_LABEL)?;
+        let labels = Self::extract_labels(value);
+        let actual = labels.get(CONTAINER_SPEC_HASH_LABEL)?;
+        (actual != desired).then(|| (actual.clone(), desired.clone()))
     }
 }
 
@@ -1236,6 +1363,13 @@ impl RuntimeManager for DockerRuntimeManager {
     async fn inspect(&self, handle: &ContainerHandle) -> Result<ContainerState> {
         let inspect = self.inspect_container(&handle.name).await?;
         Self::extract_state(&inspect)
+    }
+
+    async fn describe_container_runtime_state(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<ContainerRuntimeState>> {
+        DockerRuntimeManager::describe_container_runtime_state(self, container_name).await
     }
 
     async fn read_container_file(
@@ -1436,6 +1570,73 @@ fn parse_published_host_port(ports_json: &str, container_port: u16) -> Option<u1
         .filter(|port| *port > 0)
 }
 
+fn add_windows_docker_desktop_bind_mount_candidates(
+    candidates: &mut HashSet<String>,
+    slash_path: &str,
+) {
+    if let Some((drive, rest)) = windows_drive_path_parts(slash_path) {
+        insert_windows_bind_mount_candidates(candidates, drive, rest);
+    }
+    if let Some((drive, rest)) = docker_desktop_linux_windows_path_parts(slash_path) {
+        insert_windows_bind_mount_candidates(candidates, drive, rest);
+    }
+}
+
+fn windows_drive_path_parts(path: &str) -> Option<(char, &str)> {
+    let mut chars = path.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    let rest = chars.as_str().trim_start_matches('/');
+    Some((drive.to_ascii_lowercase(), rest))
+}
+
+fn docker_desktop_linux_windows_path_parts(path: &str) -> Option<(char, &str)> {
+    for prefix in ["/host_mnt/", "/run/desktop/mnt/host/", "/"] {
+        let Some(remainder) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        let mut chars = remainder.chars();
+        let drive = chars.next()?;
+        if !drive.is_ascii_alphabetic() {
+            continue;
+        }
+        let rest = chars.as_str();
+        if !rest.is_empty() && !rest.starts_with('/') {
+            continue;
+        }
+        return Some((drive.to_ascii_lowercase(), rest.trim_start_matches('/')));
+    }
+    None
+}
+
+fn insert_windows_bind_mount_candidates(candidates: &mut HashSet<String>, drive: char, rest: &str) {
+    let drive_lower = drive.to_ascii_lowercase();
+    let drive_upper = drive.to_ascii_uppercase();
+    let rest = rest.trim_start_matches('/');
+    let rest_slashes = rest.replace('\\', "/");
+    let rest_backslashes = rest_slashes.replace('/', "\\");
+
+    let suffix = if rest_slashes.is_empty() {
+        String::new()
+    } else {
+        format!("/{rest_slashes}")
+    };
+    candidates.insert(format!("{drive_upper}:{suffix}"));
+    candidates.insert(format!("{drive_lower}:{suffix}"));
+    if rest_backslashes.is_empty() {
+        candidates.insert(format!("{drive_upper}:\\"));
+        candidates.insert(format!("{drive_lower}:\\"));
+    } else {
+        candidates.insert(format!("{drive_upper}:\\{rest_backslashes}"));
+        candidates.insert(format!("{drive_lower}:\\{rest_backslashes}"));
+    }
+    candidates.insert(format!("/{drive_lower}{suffix}"));
+    candidates.insert(format!("/host_mnt/{drive_lower}{suffix}"));
+    candidates.insert(format!("/run/desktop/mnt/host/{drive_lower}{suffix}"));
+}
+
 fn docker_start_attempts() -> Vec<DockerStartAttempt> {
     #[cfg(target_os = "macos")]
     {
@@ -1623,6 +1824,102 @@ mod tests {
     }
 
     #[test]
+    fn bind_mount_matching_normalizes_windows_drive_to_docker_desktop_prefixes() {
+        let desired = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: r"C:\Users\tester\elixir\data\downloads".to_string(),
+            container_path: "/downloads".to_string(),
+            read_only: false,
+        };
+        for source in [
+            "/host_mnt/c/Users/tester/elixir/data/downloads",
+            "/run/desktop/mnt/host/c/Users/tester/elixir/data/downloads",
+            "/c/Users/tester/elixir/data/downloads",
+        ] {
+            let actual = ContainerMount {
+                mount_type: "bind".to_string(),
+                source: Some(source.to_string()),
+                name: None,
+                destination: "/downloads".to_string(),
+                read_only: false,
+            };
+            assert!(
+                DockerRuntimeManager::mount_matches(&desired, &actual),
+                "expected Windows path to match Docker Desktop source {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_state_extracts_mounts_network_mode_labels_and_published_ports() {
+        let inspect = json!({
+            "Name": "/elx-qbittorrent",
+            "Config": {
+                "Labels": {
+                    "elixir.instance_id": "abc",
+                    "elixir.extension_id": "elixir.modules.qbittorrent"
+                }
+            },
+            "HostConfig": {
+                "NetworkMode": "container:elx-qbittorrent-vpn"
+            },
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": "elixir_cfg_abc",
+                    "Source": "/var/lib/docker/volumes/elixir_cfg_abc/_data",
+                    "Destination": "/config",
+                    "RW": true
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/host_mnt/Users/tester/elixir/data/downloads",
+                    "Destination": "/downloads",
+                    "RW": true
+                }
+            ],
+            "NetworkSettings": {
+                "Ports": {
+                    "8080/tcp": [
+                        { "HostIp": "127.0.0.1", "HostPort": "49152" }
+                    ],
+                    "6881/udp": null
+                }
+            }
+        });
+
+        let state = DockerRuntimeManager::extract_runtime_state(&inspect);
+        assert_eq!(state.name, "elx-qbittorrent");
+        assert_eq!(
+            state.network_mode.as_deref(),
+            Some("container:elx-qbittorrent-vpn")
+        );
+        assert_eq!(
+            state.labels.get("elixir.extension_id").map(String::as_str),
+            Some("elixir.modules.qbittorrent")
+        );
+        assert!(state.mounts.iter().any(|mount| {
+            mount.mount_type == "volume"
+                && mount.name.as_deref() == Some("elixir_cfg_abc")
+                && mount.destination == "/config"
+        }));
+        assert!(state.mounts.iter().any(|mount| {
+            mount.mount_type == "bind"
+                && mount.source.as_deref() == Some("/host_mnt/Users/tester/elixir/data/downloads")
+                && mount.destination == "/downloads"
+        }));
+        assert_eq!(
+            state.published_ports,
+            vec![ContainerPublishedPort {
+                container_port: 8080,
+                host_port: 49152,
+                protocol: "tcp".to_string(),
+                host_ip: Some("127.0.0.1".to_string()),
+            }]
+        );
+    }
+
+    #[test]
     fn required_labels_enforced() {
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), "id".to_string());
@@ -1739,6 +2036,69 @@ mod tests {
             }
         });
         assert!(!DockerRuntimeManager::aliases_conflict(&spec, &inspect));
+    }
+
+    #[test]
+    fn spec_fingerprint_mismatch_is_detected_when_actual_carries_hash() {
+        let mut spec = ContainerSpec {
+            name: "elx-new".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: vec!["svc-elixir-modules-prowlarr-default".to_string()],
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        };
+        crate::runtime::model::apply_container_spec_fingerprint(&mut spec);
+        let desired = spec
+            .labels
+            .get(CONTAINER_SPEC_HASH_LABEL)
+            .expect("desired spec hash")
+            .clone();
+        let inspect = json!({
+            "Config": {
+                "Labels": {
+                    "elixir.spec_hash": "old-hash"
+                }
+            }
+        });
+
+        assert_eq!(
+            DockerRuntimeManager::container_spec_hash_mismatch(&spec, &inspect),
+            Some(("old-hash".to_string(), desired))
+        );
+    }
+
+    #[test]
+    fn missing_actual_spec_fingerprint_is_legacy_compatible() {
+        let mut spec = ContainerSpec {
+            name: "elx-new".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: Vec::new(),
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        };
+        crate::runtime::model::apply_container_spec_fingerprint(&mut spec);
+        let inspect = json!({ "Config": { "Labels": {} } });
+
+        assert_eq!(
+            DockerRuntimeManager::container_spec_hash_mismatch(&spec, &inspect),
+            None
+        );
     }
 
     #[test]

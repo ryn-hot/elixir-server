@@ -27,6 +27,79 @@ impl DownloaderTorrentDriver {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct QbittorrentPauseSnapshot {
+    resume_hashes: Vec<String>,
+}
+
+pub(crate) async fn pause_qbittorrent_for_rehome(
+    ctx: DriverCtx,
+) -> Result<QbittorrentPauseSnapshot> {
+    let client = qbittorrent_client_from_ctx(&ctx).await?;
+    let torrents = client.torrents_info().await?;
+    let resume_hashes = torrents
+        .iter()
+        .filter_map(|torrent| {
+            let hash = torrent.hash.as_deref()?.trim();
+            if hash.is_empty() {
+                return None;
+            }
+            let state = torrent
+                .state
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            (!state.starts_with("paused")).then(|| hash.to_string())
+        })
+        .collect::<Vec<_>>();
+    client.pause_all_torrents().await?;
+    Ok(QbittorrentPauseSnapshot { resume_hashes })
+}
+
+pub(crate) async fn resume_qbittorrent_after_rehome(
+    ctx: DriverCtx,
+    snapshot: &QbittorrentPauseSnapshot,
+) -> Result<()> {
+    if snapshot.resume_hashes.is_empty() {
+        return Ok(());
+    }
+    let client = qbittorrent_client_from_ctx(&ctx).await?;
+    let mut fields = HashMap::new();
+    fields.insert("hashes".to_string(), snapshot.resume_hashes.join("|"));
+    client.request_form("torrents/resume", &fields).await
+}
+
+async fn qbittorrent_client_from_ctx(ctx: &DriverCtx) -> Result<QbittorrentClient> {
+    let implementation = ctx
+        .implementation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+    if !implementation.eq_ignore_ascii_case("qbittorrent") {
+        bail!(
+            "downloader.torrent implementation '{}' is not supported",
+            implementation
+        );
+    }
+
+    let config = QbittorrentDriverConfig::from_ctx(ctx)?;
+    let endpoint_url = ctx.endpoint.canonical_url()?;
+    let transport_url = ctx.canonical_url()?;
+    let transport_override = if transport_url != endpoint_url {
+        Some(transport_url)
+    } else {
+        None
+    };
+    QbittorrentClient::from_config(
+        config,
+        endpoint_url,
+        transport_override,
+        ctx.instance_id,
+        false,
+    )
+    .await
+}
+
 #[async_trait]
 impl CapabilityDriver for DownloaderTorrentDriver {
     fn capability(&self) -> &'static str {
@@ -295,6 +368,8 @@ struct QbittorrentTransferInfo {
 #[derive(Debug, Deserialize)]
 struct QbittorrentTorrentInfo {
     #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
     state: Option<String>,
 }
 
@@ -511,7 +586,9 @@ impl QbittorrentClient {
             return Ok(());
         }
         let container_port = self.endpoint_root.port_or_known_default().unwrap_or(80);
-        let Some(container_name) = find_container_name_for_instance(instance_id).await? else {
+        let Some(container_name) =
+            find_qbittorrent_container_name_for_instance(instance_id).await?
+        else {
             return Ok(());
         };
         let Some(host_port) = lookup_container_host_port(&container_name, container_port).await?
@@ -628,7 +705,11 @@ impl QbittorrentClient {
             .with_context(|| format!("parsing {} {path} response", method.as_str()))
     }
 
-    async fn request_form(&self, path: &str, fields: &HashMap<String, String>) -> Result<()> {
+    async fn request_form_response(
+        &self,
+        path: &str,
+        fields: &HashMap<String, String>,
+    ) -> Result<(StatusCode, Vec<u8>)> {
         let request = self.authed_request(Method::POST, path)?;
         let resp = request
             .form(fields)
@@ -640,6 +721,15 @@ impl QbittorrentClient {
             .bytes()
             .await
             .with_context(|| format!("reading POST {path} response"))?;
+        Ok((status, body.to_vec()))
+    }
+
+    async fn request_form(&self, path: &str, fields: &HashMap<String, String>) -> Result<()> {
+        let (status, body) = self.request_form_response(path, fields).await?;
+        Self::ensure_form_success(path, status, &body)
+    }
+
+    fn ensure_form_success(path: &str, status: StatusCode, body: &[u8]) -> Result<()> {
         if !status.is_success() {
             let detail = describe_error_body(&body);
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -648,6 +738,23 @@ impl QbittorrentClient {
             bail!("qbittorrent POST {path} failed ({status}): {detail}");
         }
         Ok(())
+    }
+
+    async fn pause_all_torrents(&self) -> Result<()> {
+        let fields = HashMap::new();
+        let (status, body) = self
+            .request_form_response("transfer/pauseAll", &fields)
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if status != StatusCode::NOT_FOUND {
+            return Self::ensure_form_success("transfer/pauseAll", status, &body);
+        }
+
+        let mut fields = HashMap::new();
+        fields.insert("hashes".to_string(), "all".to_string());
+        self.request_form("torrents/pause", &fields).await
     }
 
     async fn get_categories(&self) -> Result<Value> {
@@ -918,7 +1025,8 @@ impl HostHeaderExt for reqwest::RequestBuilder {
 }
 
 async fn lookup_qbittorrent_temporary_password(instance_id: Uuid) -> Result<Option<String>> {
-    let Some(container_name) = find_container_name_for_instance(instance_id).await? else {
+    let Some(container_name) = find_qbittorrent_container_name_for_instance(instance_id).await?
+    else {
         return Ok(None);
     };
 
@@ -990,7 +1098,7 @@ fn extract_qbittorrent_temporary_password(logs: &str) -> Option<String> {
 }
 
 async fn reset_qbittorrent_webui_auth(instance_id: Uuid) -> Result<()> {
-    let container_name = find_container_name_for_instance(instance_id)
+    let container_name = find_qbittorrent_container_name_for_instance(instance_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("qbittorrent container not found for instance"))?;
 
@@ -1111,23 +1219,61 @@ fn docker_cp_missing_file(err: &anyhow::Error) -> bool {
     lower.contains("could not find the file") || lower.contains("no such file or directory")
 }
 
-async fn find_container_name_for_instance(instance_id: Uuid) -> Result<Option<String>> {
+async fn find_qbittorrent_container_name_for_instance(instance_id: Uuid) -> Result<Option<String>> {
+    let preferred_name = qbittorrent_container_name(instance_id);
+    let preferred_output = run_docker_command(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("name=^/{preferred_name}$"),
+        "--filter",
+        &format!("label=elixir.instance_id={instance_id}"),
+        "--filter",
+        "label=elixir.extension_id=elixir.modules.qbittorrent",
+        "--format",
+        "{{.Names}}\t{{.Label \"elixir.network_role\"}}",
+    ])
+    .await?;
+    if let Some(name) = parse_qbittorrent_app_container_name(&preferred_output.stdout) {
+        return Ok(Some(name));
+    }
+
     let ps_output = run_docker_command(&[
         "ps",
         "-a",
         "--filter",
         &format!("label=elixir.instance_id={instance_id}"),
+        "--filter",
+        "label=elixir.extension_id=elixir.modules.qbittorrent",
         "--format",
-        "{{.Names}}",
+        "{{.Names}}\t{{.Label \"elixir.network_role\"}}",
     ])
     .await?;
-    let container = ps_output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string);
-    Ok(container)
+    Ok(parse_qbittorrent_app_container_name(&ps_output.stdout))
+}
+
+fn qbittorrent_container_name(instance_id: Uuid) -> String {
+    let raw = instance_id.simple().to_string();
+    let short_id = raw.chars().take(6).collect::<String>();
+    format!("elx-{short_id}")
+}
+
+fn parse_qbittorrent_app_container_name(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut parts = line.splitn(2, '\t');
+        let name = parts.next()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let network_role = parts.next().unwrap_or_default().trim();
+        if !network_role.is_empty() {
+            return None;
+        }
+        if name.ends_with("-vpn") || name.ends_with("-network-rollback") {
+            return None;
+        }
+        Some(name.to_string())
+    })
 }
 
 async fn lookup_container_host_port(
@@ -1135,7 +1281,12 @@ async fn lookup_container_host_port(
     container_port: u16,
 ) -> Result<Option<u16>> {
     let port_output =
-        run_docker_command(&["port", container_name, &format!("{container_port}/tcp")]).await?;
+        match run_docker_command(&["port", container_name, &format!("{container_port}/tcp")]).await
+        {
+            Ok(output) => output,
+            Err(err) if docker_port_lookup_missing(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
     let value = port_output
         .stdout
         .lines()
@@ -1149,6 +1300,13 @@ async fn lookup_container_host_port(
         .next()
         .and_then(|raw| raw.trim().parse::<u16>().ok());
     Ok(host_port)
+}
+
+fn docker_port_lookup_missing(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("no public port")
+        || lower.contains("no such container")
+        || lower.contains("no such object")
 }
 
 fn strip_qbittorrent_webui_auth_fields(content: &str) -> (String, bool) {
@@ -1430,6 +1588,28 @@ The WebUI administrator password was not set. A temporary password is provided f
     }
 
     #[test]
+    fn qbittorrent_container_lookup_ignores_gateway_containers() {
+        let output = "elx-ba4bf0-vpn\twarp_gateway\nelx-ba4bf0\t\n";
+        let name = parse_qbittorrent_app_container_name(output);
+        assert_eq!(name.as_deref(), Some("elx-ba4bf0"));
+    }
+
+    #[test]
+    fn qbittorrent_container_lookup_rejects_gateway_only_state() {
+        let output = "elx-ba4bf0-vpn\twarp_gateway\n";
+        let name = parse_qbittorrent_app_container_name(output);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn docker_port_lookup_missing_treats_unpublished_ports_as_absent() {
+        let err = anyhow::anyhow!(
+            "docker port elx-ba4bf0 8080/tcp failed with status Some(1): Error: No public port '8080/tcp' published for elx-ba4bf0"
+        );
+        assert!(docker_port_lookup_missing(&err));
+    }
+
+    #[test]
     fn detects_qbittorrent_auth_errors_from_error_chain() {
         let err = anyhow::anyhow!("qbittorrent auth rejected for configured credentials");
         assert!(is_qbittorrent_auth_error(&err));
@@ -1558,6 +1738,74 @@ WebUI\\ServerDomains=*
         assert_eq!(
             snapshot.summary.as_deref(),
             Some("connected · 2 active · 1 issue")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pause_all_torrents_falls_back_to_torrents_pause() -> Result<()> {
+        #[derive(Clone, Default)]
+        struct PauseCalls {
+            hashes: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn login() -> Response {
+            (
+                [(SET_COOKIE, HeaderValue::from_static("SID=test; HttpOnly"))],
+                "Ok.",
+            )
+                .into_response()
+        }
+
+        async fn removed_pause_all() -> impl IntoResponse {
+            (axum::http::StatusCode::NOT_FOUND, "Not Found")
+        }
+
+        async fn pause(
+            axum::extract::State(calls): axum::extract::State<PauseCalls>,
+            axum::extract::Form(fields): axum::extract::Form<HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            calls
+                .hashes
+                .lock()
+                .expect("pause hashes lock")
+                .push(fields.get("hashes").cloned().unwrap_or_default());
+            axum::http::StatusCode::OK
+        }
+
+        let calls = PauseCalls::default();
+        let app = Router::new()
+            .route("/api/v2/auth/login", post(login))
+            .route("/api/v2/transfer/pauseAll", post(removed_pause_all))
+            .route("/api/v2/torrents/pause", post(pause))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock qbittorrent server");
+        });
+
+        let client = QbittorrentClient::from_config(
+            QbittorrentDriverConfig {
+                username: Some("admin".to_string()),
+                password: Some("adminadmin".to_string()),
+                base_url: None,
+                api_version: Some("v2".to_string()),
+            },
+            format!("http://127.0.0.1:{}", addr.port()),
+            None,
+            Uuid::new_v4(),
+            false,
+        )
+        .await?;
+
+        client.pause_all_torrents().await?;
+
+        assert_eq!(
+            calls.hashes.lock().expect("pause hashes lock").as_slice(),
+            ["all"]
         );
         Ok(())
     }

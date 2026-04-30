@@ -3,6 +3,7 @@ mod artwork;
 mod auth;
 mod config;
 mod db;
+mod download_broker;
 mod drivers;
 mod extensions;
 mod http;

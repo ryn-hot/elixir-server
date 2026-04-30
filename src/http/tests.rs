@@ -1461,9 +1461,102 @@ async fn seed_nzbget_control_extension(
     Ok(instance_id)
 }
 
+async fn setup_download_broker_test_app() -> Result<(Router, sqlx::AnyPool, String)> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let token = state.auth_service.issue_access_token(Uuid::new_v4())?.token;
+    let app = router(state);
+    Ok((app, db_pool, token))
+}
+
+async fn seed_download_broker_provider(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    capability: &str,
+    implementation: &str,
+    host: &str,
+    provider_kind: Option<&str>,
+    health_state: ProviderHealthState,
+) -> Result<Uuid> {
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: extension_id.to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({ "id": extension_id, "version": "1.0.0" }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    let endpoint = ProviderEndpoint::new(
+        "http".to_string(),
+        host.to_string(),
+        if capability == "downloader.nzb" {
+            6789
+        } else {
+            8080
+        },
+        None,
+        Some("elixir_net".to_string()),
+    )?;
+    let scope_json = provider_kind.map(|kind| {
+        json!({
+            "download_broker": {
+                "provider_kind": kind
+            }
+        })
+    });
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: capability.to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some(implementation.to_string()),
+            scope_json,
+            endpoint_json: Some(serde_json::to_value(endpoint)?),
+            health_state,
+        })
+        .await?;
+    Ok(provider_id)
+}
+
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
-    let mut settings = test_settings_with_db();
+    let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
     let auth_service = AuthService::new(settings.auth.clone())?;
@@ -1518,6 +1611,281 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         Some("sqlite")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_protection_status_reports_default_external_only() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/network/protection/status").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("mode").and_then(Value::as_str),
+        Some("external_only")
+    );
+    assert_eq!(json.get("state").and_then(Value::as_str), Some("unknown"));
+    assert!(json.get("blocker").is_none_or(Value::is_null));
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_protection_first_run_existing_stack_sets_external_routes() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/network/protection/first-run")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"choice":"existing_stack","apply":true}"#))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(json.get("completed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        json.pointer("/profile/kind").and_then(Value::as_str),
+        Some("external_only")
+    );
+    let routes = json
+        .pointer("/routes/routes")
+        .and_then(Value::as_array)
+        .context("routes array")?;
+    for logical_id in ["downloaders.torrent.default", "downloaders.usenet.default"] {
+        let route = routes
+            .iter()
+            .find(|route| {
+                route
+                    .get("logicalId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == logical_id)
+                    && route
+                        .get("ownerId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == "default")
+            })
+            .with_context(|| format!("missing first-run route '{logical_id}'"))?;
+        assert_eq!(
+            route.get("bindingKind").and_then(Value::as_str),
+            Some("external")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_protection_status_blocks_missing_legacy_wireguard_secret() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.network.vpn.enabled = true;
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            name: "qBittorrent".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id: Uuid::new_v4(),
+            extension_id: "elixir.modules.qbittorrent".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/network/protection/status").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("mode").and_then(Value::as_str),
+        Some("wireguard_config")
+    );
+    assert_eq!(json.get("state").and_then(Value::as_str), Some("blocked"));
+    assert_eq!(
+        json.pointer("/blocker/code").and_then(Value::as_str),
+        Some("wireguard_config_secret_missing")
+    );
+    assert_eq!(
+        json.get("protected_apps")
+            .and_then(Value::as_array)
+            .and_then(|apps| apps.first())
+            .and_then(Value::as_str),
+        Some("qbittorrent")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn download_broker_inventory_exposes_stable_paths_without_raw_endpoints() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_download_broker_provider(
+        &store,
+        "elixir.modules.qbittorrent",
+        "downloader.torrent",
+        "qbittorrent",
+        "svc-qbittorrent",
+        None,
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/download-broker/downloaders")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let downloader = json
+        .get("downloaders")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("broker downloader");
+    assert_eq!(
+        downloader.get("logicalId").and_then(Value::as_str),
+        Some("downloaders.torrent.default")
+    );
+    assert_eq!(
+        downloader
+            .pointer("/endpoints/submitPath")
+            .and_then(Value::as_str),
+        Some("/api/v1/download-broker/downloaders.torrent.default/submit")
+    );
+    assert!(downloader.get("endpoint").is_none());
+    assert!(downloader.get("brokerPath").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn download_broker_route_can_select_external_provider() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_download_broker_provider(
+        &store,
+        "elixir.modules.qbittorrent",
+        "downloader.torrent",
+        "qbittorrent",
+        "svc-qbittorrent",
+        None,
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+    let external_id = seed_download_broker_provider(
+        &store,
+        "external.stack.qbit",
+        "downloader.torrent",
+        "qbittorrent",
+        "external-qbit",
+        Some("external"),
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/download-broker/routes/downloaders.torrent.default")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(r#"{"bindingKind":"external"}"#))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("bindingKind").and_then(Value::as_str),
+        Some("external")
+    );
+    let external_id = external_id.to_string();
+    assert_eq!(
+        json.get("selectedProviderId").and_then(Value::as_str),
+        Some(external_id.as_str())
+    );
+    assert!(json.get("blocker").is_none_or(Value::is_null));
     Ok(())
 }
 

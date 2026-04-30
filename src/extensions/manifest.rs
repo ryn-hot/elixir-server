@@ -27,7 +27,7 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub provides: Vec<ManifestProvide>,
     #[serde(default)]
-    pub requires: Vec<ManifestRequire>,
+    pub requires: ManifestRequires,
     #[serde(default)]
     pub conflicts: Vec<ManifestConflict>,
     #[serde(default)]
@@ -88,10 +88,7 @@ impl ExtensionManifest {
             validate_scope_actions_for_capability(&provide.capability, provide.scope.as_ref())?;
         }
 
-        for require in &self.requires {
-            ensure_non_empty(&require.capability, "requires.capability")?;
-            ensure_non_empty(&require.slot, "requires.slot")?;
-        }
+        self.requires.validate()?;
 
         match self.kind {
             ExtensionKind::Module => {
@@ -302,6 +299,144 @@ pub struct ManifestRequire {
     pub optional: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ManifestRequires {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<ManifestRequire>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downloads: Vec<ManifestDownloadRequire>,
+}
+
+impl ManifestRequires {
+    pub fn iter(&self) -> std::slice::Iter<'_, ManifestRequire> {
+        self.capabilities.iter()
+    }
+
+    fn validate(&self) -> Result<()> {
+        for require in &self.capabilities {
+            ensure_non_empty(&require.capability, "requires.capability")?;
+            ensure_non_empty(&require.slot, "requires.slot")?;
+        }
+
+        let mut logical_ids = std::collections::HashSet::new();
+        for download in &self.downloads {
+            download.validate()?;
+            if !logical_ids.insert(download.resolved_logical_id().to_string()) {
+                bail!(
+                    "requires.downloads logical_id '{}' is declared more than once",
+                    download.resolved_logical_id()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestRequires {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawRequires {
+            Capabilities(Vec<ManifestRequire>),
+            Structured {
+                #[serde(default)]
+                capabilities: Vec<ManifestRequire>,
+                #[serde(default)]
+                downloads: Vec<ManifestDownloadRequire>,
+            },
+        }
+
+        match RawRequires::deserialize(deserializer)? {
+            RawRequires::Capabilities(capabilities) => Ok(Self {
+                capabilities,
+                downloads: Vec::new(),
+            }),
+            RawRequires::Structured {
+                capabilities,
+                downloads,
+            } => Ok(Self {
+                capabilities,
+                downloads,
+            }),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a ManifestRequires {
+    type Item = &'a ManifestRequire;
+    type IntoIter = std::slice::Iter<'a, ManifestRequire>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.capabilities.iter()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestDownloadKind {
+    Torrent,
+    Usenet,
+    Debrid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestDownloadMode {
+    Broker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestDownloadRequire {
+    pub kind: ManifestDownloadKind,
+    #[serde(default = "default_download_mode")]
+    pub mode: ManifestDownloadMode,
+    #[serde(default)]
+    pub logical_id: Option<String>,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+impl ManifestDownloadRequire {
+    fn validate(&self) -> Result<()> {
+        let expected = self.default_logical_id();
+        if let Some(logical_id) = self.logical_id.as_deref() {
+            ensure_non_empty(logical_id, "requires.downloads.logical_id")?;
+            if logical_id.trim() != expected {
+                bail!(
+                    "requires.downloads logical_id '{}' does not match kind '{:?}'; expected '{}'",
+                    logical_id,
+                    self.kind,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resolved_logical_id(&self) -> &str {
+        self.logical_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.default_logical_id())
+    }
+
+    fn default_logical_id(&self) -> &'static str {
+        match self.kind {
+            ManifestDownloadKind::Torrent => "downloaders.torrent.default",
+            ManifestDownloadKind::Usenet => "downloaders.usenet.default",
+            ManifestDownloadKind::Debrid => "downloaders.debrid.default",
+        }
+    }
+}
+
+fn default_download_mode() -> ManifestDownloadMode {
+    ManifestDownloadMode::Broker
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestConflict {
     pub capability: String,
@@ -352,6 +487,10 @@ pub struct ManifestProviderScope {
     pub requires_account: bool,
     #[serde(default)]
     pub required_fields: Vec<String>,
+    #[serde(default)]
+    pub download_broker: Option<ManifestDownloadBrokerProviderScope>,
+    #[serde(default)]
+    pub broker: Option<ManifestDownloadBrokerProviderScope>,
 }
 
 impl ManifestProviderScope {
@@ -382,6 +521,58 @@ impl ManifestProviderScope {
         }
         if !self.requires_account && !self.required_fields.is_empty() {
             bail!("provides.scope.required_fields requires provides.scope.requires_account=true");
+        }
+        if let Some(scope) = self.download_broker.as_ref() {
+            scope.validate("provides.scope.download_broker")?;
+        }
+        if let Some(scope) = self.broker.as_ref() {
+            scope.validate("provides.scope.broker")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManifestDownloadBrokerProviderScope {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provider_kind: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub logical_id: Option<String>,
+}
+
+impl ManifestDownloadBrokerProviderScope {
+    fn validate(&self, prefix: &str) -> Result<()> {
+        if let Some(provider_kind) = self
+            .provider_kind
+            .as_deref()
+            .or(self.kind.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !matches!(provider_kind, "managed" | "external" | "debrid") {
+                bail!(
+                    "unsupported {prefix}.provider_kind '{}'; expected managed|external|debrid",
+                    provider_kind
+                );
+            }
+        }
+        if let Some(logical_id) = self.logical_id.as_deref() {
+            ensure_non_empty(logical_id, &format!("{prefix}.logical_id"))?;
+            if !matches!(
+                logical_id.trim(),
+                "downloaders.torrent.default"
+                    | "downloaders.usenet.default"
+                    | "downloaders.debrid.default"
+            ) {
+                bail!(
+                    "unsupported {prefix}.logical_id '{}'; expected a known logical downloader id",
+                    logical_id
+                );
+            }
         }
         Ok(())
     }
@@ -1322,6 +1513,21 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
         .unwrap_or_default();
     match extension_id {
         "elixir.blueprints.arr_stack" => false,
+        "elixir.modules.qbittorrent" => repair_downloader_broker_scope(
+            raw_json,
+            "downloader.torrent",
+            "managed",
+            "downloaders.torrent.default",
+        ),
+        "elixir.modules.nzbget" => repair_downloader_broker_scope(
+            raw_json,
+            "downloader.nzb",
+            "managed",
+            "downloaders.usenet.default",
+        ),
+        "elixir.modules.sonarr" | "elixir.modules.radarr" => {
+            repair_manager_download_requirements(raw_json)
+        }
         "elixir.connectors.prowlarr_sonarr_app" | "elixir.connectors.prowlarr_radarr_app" => {
             remove_driver_patch_app_tags(raw_json)
         }
@@ -1361,6 +1567,157 @@ fn repair_nzbget_defaults_manifest(root: &mut serde_json::Value) -> bool {
     repaired |= set_driver_patch_string_field(root, "set_preferences", "temp_dir", NZBGET_TEMP_DIR);
     repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
     repaired
+}
+
+fn repair_downloader_broker_scope(
+    root: &mut serde_json::Value,
+    capability: &str,
+    provider_kind: &str,
+    logical_id: &str,
+) -> bool {
+    let Some(provides) = root
+        .get_mut("provides")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut repaired = false;
+    for provide in provides {
+        if provide
+            .get("capability")
+            .and_then(serde_json::Value::as_str)
+            != Some(capability)
+        {
+            continue;
+        }
+        let Some(scope) = ensure_json_object_field(provide, "scope", &mut repaired) else {
+            continue;
+        };
+        let broker = scope
+            .entry("download_broker".to_string())
+            .or_insert_with(|| {
+                repaired = true;
+                serde_json::Value::Object(serde_json::Map::new())
+            });
+        if !broker.is_object() {
+            *broker = serde_json::Value::Object(serde_json::Map::new());
+            repaired = true;
+        }
+        let Some(broker) = broker.as_object_mut() else {
+            continue;
+        };
+        repaired |= set_json_bool_field(broker, "enabled", true);
+        repaired |= set_json_string_field(broker, "provider_kind", provider_kind);
+        repaired |= set_json_string_field(broker, "logical_id", logical_id);
+    }
+    repaired
+}
+
+fn repair_manager_download_requirements(root: &mut serde_json::Value) -> bool {
+    let desired = [
+        ("torrent", "downloaders.torrent.default"),
+        ("usenet", "downloaders.usenet.default"),
+    ];
+    let Some(root_object) = root.as_object_mut() else {
+        return false;
+    };
+    let mut repaired = false;
+    let requires = root_object
+        .entry("requires".to_string())
+        .or_insert_with(|| {
+            repaired = true;
+            serde_json::Value::Object(serde_json::Map::new())
+        });
+    if requires.is_array() {
+        let legacy = std::mem::replace(requires, serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(object) = requires.as_object_mut() {
+            if legacy
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false)
+            {
+                object.insert("capabilities".to_string(), legacy);
+            }
+        }
+        repaired = true;
+    }
+    if !requires.is_object() {
+        *requires = serde_json::Value::Object(serde_json::Map::new());
+        repaired = true;
+    }
+    let Some(requires) = requires.as_object_mut() else {
+        return repaired;
+    };
+    let downloads = requires.entry("downloads".to_string()).or_insert_with(|| {
+        repaired = true;
+        serde_json::Value::Array(Vec::new())
+    });
+    if !downloads.is_array() {
+        *downloads = serde_json::Value::Array(Vec::new());
+        repaired = true;
+    }
+    let Some(downloads) = downloads.as_array_mut() else {
+        return repaired;
+    };
+    for (kind, logical_id) in desired {
+        if downloads.iter().any(|item| {
+            item.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+                || item.get("logical_id").and_then(serde_json::Value::as_str) == Some(logical_id)
+        }) {
+            continue;
+        }
+        downloads.push(serde_json::json!({
+            "kind": kind,
+            "mode": "broker",
+            "logical_id": logical_id
+        }));
+        repaired = true;
+    }
+    repaired
+}
+
+fn ensure_json_object_field<'a>(
+    value: &'a mut serde_json::Value,
+    key: &str,
+    repaired: &mut bool,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let object = value.as_object_mut()?;
+    let child = object.entry(key.to_string()).or_insert_with(|| {
+        *repaired = true;
+        serde_json::Value::Object(serde_json::Map::new())
+    });
+    if !child.is_object() {
+        *child = serde_json::Value::Object(serde_json::Map::new());
+        *repaired = true;
+    }
+    child.as_object_mut()
+}
+
+fn set_json_string_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    desired: &str,
+) -> bool {
+    if object.get(key).and_then(serde_json::Value::as_str) == Some(desired) {
+        return false;
+    }
+    object.insert(
+        key.to_string(),
+        serde_json::Value::String(desired.to_string()),
+    );
+    true
+}
+
+fn set_json_bool_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    desired: bool,
+) -> bool {
+    if object.get(key).and_then(serde_json::Value::as_bool) == Some(desired) {
+        return false;
+    }
+    object.insert(key.to_string(), serde_json::Value::Bool(desired));
+    true
 }
 
 fn remove_driver_patch_app_tags(root: &mut serde_json::Value) -> bool {
@@ -1807,6 +2164,101 @@ runtime:
             egress.wireguard_config_secret.as_deref(),
             Some("instance:wg_config")
         );
+    }
+
+    #[test]
+    fn manifest_accepts_logical_download_requirements() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Manager
+provides:
+  - capability: media.manager.movies
+    slot: default
+    implementation: test
+    scope:
+      media_types: ["movies"]
+      actions: ["add", "monitor"]
+requires:
+  downloads:
+    - kind: torrent
+      mode: broker
+    - kind: usenet
+      mode: broker
+      logical_id: downloaders.usenet.default
+runtime:
+  type: container
+  image: example/test:1
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        assert_eq!(parsed.manifest.requires.downloads.len(), 2);
+        assert_eq!(
+            parsed.manifest.requires.downloads[0].resolved_logical_id(),
+            "downloaders.torrent.default"
+        );
+        assert_eq!(
+            parsed.manifest.requires.downloads[1].resolved_logical_id(),
+            "downloaders.usenet.default"
+        );
+        assert!(parsed.manifest.requires.capabilities.is_empty());
+    }
+
+    #[test]
+    fn manifest_preserves_legacy_capability_requires() {
+        let yaml = r#"
+id: elixir.connectors.test
+version: 1.0.0
+kind: connector
+name: Test Connector
+targets:
+  - capability: media.manager.movies
+    slot: default
+requires:
+  - capability: downloader.torrent
+    slot: default
+actions:
+  - type: driver_patch
+    target:
+      capability: media.manager.movies
+      slot: default
+    patch:
+      op: noop
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        assert_eq!(parsed.manifest.requires.capabilities.len(), 1);
+        assert_eq!(
+            parsed.manifest.requires.capabilities[0].capability,
+            "downloader.torrent"
+        );
+        assert!(parsed.manifest.requires.downloads.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_download_requirement_with_wrong_logical_id() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Manager
+provides:
+  - capability: media.manager.movies
+    slot: default
+    implementation: test
+    scope:
+      media_types: ["movies"]
+      actions: ["add", "monitor"]
+requires:
+  downloads:
+    - kind: torrent
+      mode: broker
+      logical_id: downloaders.usenet.default
+runtime:
+  type: container
+  image: example/test:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("does not match kind"));
     }
 
     #[test]

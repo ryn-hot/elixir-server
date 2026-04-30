@@ -31,6 +31,55 @@ impl DownloaderNzbDriver {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NzbgetPauseSnapshot {
+    resume_downloads: bool,
+}
+
+pub(crate) async fn pause_nzbget_for_rehome(ctx: DriverCtx) -> Result<NzbgetPauseSnapshot> {
+    let client = nzbget_client_from_ctx(&ctx).await?;
+    let status = client.status().await?;
+    let resume_downloads = !status.download_paused.unwrap_or(false);
+    let result = client
+        .rpc("pausedownload", Value::Array(Vec::new()))
+        .await?;
+    if !rpc_success(&result) {
+        bail!("nzbget pausedownload did not report success");
+    }
+    Ok(NzbgetPauseSnapshot { resume_downloads })
+}
+
+pub(crate) async fn resume_nzbget_after_rehome(
+    ctx: DriverCtx,
+    snapshot: &NzbgetPauseSnapshot,
+) -> Result<()> {
+    if !snapshot.resume_downloads {
+        return Ok(());
+    }
+    let client = nzbget_client_from_ctx(&ctx).await?;
+    let result = client
+        .rpc("resumedownload", Value::Array(Vec::new()))
+        .await?;
+    if !rpc_success(&result) {
+        bail!("nzbget resumedownload did not report success");
+    }
+    Ok(())
+}
+
+async fn nzbget_client_from_ctx(ctx: &DriverCtx) -> Result<NzbgetClient> {
+    let implementation = ctx
+        .implementation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider implementation is required"))?;
+    if !implementation.eq_ignore_ascii_case("nzbget") {
+        bail!(
+            "downloader.nzb implementation '{}' is not supported",
+            implementation
+        );
+    }
+    NzbgetClient::from_config(NzbgetDriverConfig::from_ctx(ctx)?, ctx.canonical_url()?).await
+}
+
 pub(crate) fn render_nzbget_config_patch(
     ctx: &DriverCtx,
     current_text: &str,
@@ -1908,13 +1957,14 @@ mod tests {
     use super::{
         CategorySlot, DownloaderNzbDriver, DriverCtx, NzbgetClient, NzbgetConfigItem,
         NzbgetConfigUpdate, NzbgetDriverConfig, NzbgetDriverRuntimeConfig, category_slots,
-        filter_live_config_updates, parse_category_option, render_nzbget_config_patch, rpc_success,
+        filter_live_config_updates, parse_category_option, pause_nzbget_for_rehome,
+        render_nzbget_config_patch, resume_nzbget_after_rehome, rpc_success,
     };
 
     use crate::drivers::patches::DownloadCategorySpec;
     use crate::drivers::{CapabilityDriver, DownloaderNzbPatch, DriftStatus};
     use anyhow::Result;
-    use axum::{Json, Router, response::IntoResponse, routing::post};
+    use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
@@ -1986,6 +2036,132 @@ mod tests {
         assert!(rpc_success(&serde_json::json!(1)));
         assert!(rpc_success(&serde_json::json!("ok")));
         assert!(!rpc_success(&serde_json::json!(false)));
+    }
+
+    #[derive(Clone)]
+    struct NzbgetPauseMockState {
+        calls: Arc<Mutex<Vec<String>>>,
+        download_paused: bool,
+    }
+
+    async fn start_mock_nzbget_pause_server(
+        download_paused: bool,
+    ) -> Result<(u16, Arc<Mutex<Vec<String>>>)> {
+        async fn rpc(
+            State(state): State<NzbgetPauseMockState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            state
+                .calls
+                .lock()
+                .expect("nzbget pause mock calls lock")
+                .push(method.clone());
+            let result = match method.as_str() {
+                "version" => json!("24.3"),
+                "status" => json!({
+                    "DownloadRate": 0u64,
+                    "DownloadedSizeLo": 0u64,
+                    "DownloadedSizeHi": 0u64,
+                    "PostJobCount": 0u64,
+                    "ServerStandBy": true,
+                    "DownloadPaused": state.download_paused,
+                    "PostPaused": false
+                }),
+                "pausedownload" | "resumedownload" => json!(true),
+                other => json!({ "unexpected": other }),
+            };
+            Json(json!({
+                "version": "1.1",
+                "result": result,
+                "error": Value::Null,
+                "id": 1
+            }))
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = NzbgetPauseMockState {
+            calls: calls.clone(),
+            download_paused,
+        };
+        let app = Router::new().route("/jsonrpc", post(rpc)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock nzbget pause server");
+        });
+        Ok((port, calls))
+    }
+
+    fn nzbget_rehome_ctx(port: u16) -> Result<DriverCtx> {
+        let endpoint = crate::orchestrator::model::ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-nzbget-default".to_string(),
+            port,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        Ok(DriverCtx::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "downloader.nzb".to_string(),
+            endpoint,
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("nzbget".to_string()),
+            Some(json!({
+                "username": "elixir",
+                "password": "secret"
+            })),
+            HashMap::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn pause_resume_nzbget_for_rehome_restores_active_downloads() -> Result<()> {
+        let (port, calls) = start_mock_nzbget_pause_server(false).await?;
+        let ctx = nzbget_rehome_ctx(port)?;
+
+        let snapshot = pause_nzbget_for_rehome(ctx.clone()).await?;
+        resume_nzbget_after_rehome(ctx, &snapshot).await?;
+
+        let calls = calls.lock().expect("nzbget pause mock calls lock").clone();
+        assert_eq!(
+            calls,
+            vec![
+                "version".to_string(),
+                "status".to_string(),
+                "pausedownload".to_string(),
+                "version".to_string(),
+                "resumedownload".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pause_resume_nzbget_for_rehome_preserves_prepaused_downloads() -> Result<()> {
+        let (port, calls) = start_mock_nzbget_pause_server(true).await?;
+        let ctx = nzbget_rehome_ctx(port)?;
+
+        let snapshot = pause_nzbget_for_rehome(ctx.clone()).await?;
+        resume_nzbget_after_rehome(ctx, &snapshot).await?;
+
+        let calls = calls.lock().expect("nzbget pause mock calls lock").clone();
+        assert_eq!(
+            calls,
+            vec![
+                "version".to_string(),
+                "status".to_string(),
+                "pausedownload".to_string(),
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]

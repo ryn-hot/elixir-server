@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::runtime::model::{ContainerHandle, ContainerSpec, ContainerState};
+use crate::runtime::model::{
+    ContainerHandle, ContainerRuntimeState, ContainerSpec, ContainerState,
+};
 
 pub mod docker;
 pub mod health;
@@ -68,6 +70,12 @@ pub trait RuntimeManager: Send + Sync {
         since: Option<DateTime<Utc>>,
     ) -> anyhow::Result<String>;
     async fn inspect(&self, handle: &ContainerHandle) -> anyhow::Result<ContainerState>;
+    async fn describe_container_runtime_state(
+        &self,
+        _container_name: &str,
+    ) -> anyhow::Result<Option<ContainerRuntimeState>> {
+        Ok(None)
+    }
     async fn read_container_file(
         &self,
         handle: &ContainerHandle,

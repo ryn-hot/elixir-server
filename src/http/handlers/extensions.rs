@@ -4986,7 +4986,7 @@ fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest 
                 trust: None,
                 permissions: Vec::new(),
                 provides: Vec::new(),
-                requires: Vec::new(),
+                requires: Default::default(),
                 conflicts: Vec::new(),
                 runtime: None,
                 backup: None,
@@ -7431,6 +7431,7 @@ mod extension_ui_proxy_tests {
         ExtensionUiProxyTarget, ExtensionUiUpstreamAuth,
         build_extension_control_open_service_ui_action, build_extension_ui_proxy_client,
         build_extension_ui_start_html, build_extension_ui_upstream_request,
+        control_transport_container_candidates, parse_control_published_host_port,
         rewrite_extension_ui_initialize_json,
     };
     use crate::db::models::{
@@ -7482,6 +7483,28 @@ mod extension_ui_proxy_tests {
             value.get("apiRoot").and_then(Value::as_str),
             Some("/api/v1/extensions/instances/test-instance/ui/api/v1")
         );
+    }
+
+    #[test]
+    fn control_transport_candidates_try_app_before_warp_gateway() {
+        let candidates = control_transport_container_candidates(
+            "elx-ba4bf0-vpn\nelx-ba4bf0\nelx-ba4bf0-vpn-rollback\n",
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "elx-ba4bf0".to_string(),
+                "elx-ba4bf0-vpn".to_string(),
+                "elx-ba4bf0-vpn-rollback".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_control_published_host_port() {
+        let ports = r#"{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"32801"}]}"#;
+        assert_eq!(parse_control_published_host_port(ports, 8080), Some(32801));
+        assert_eq!(parse_control_published_host_port(ports, 6789), None);
     }
 
     #[test]
@@ -7657,7 +7680,7 @@ mod extension_ui_proxy_tests {
                 trust: None,
                 permissions: Vec::new(),
                 provides: Vec::new(),
-                requires: Vec::new(),
+                requires: Default::default(),
                 conflicts: Vec::new(),
                 runtime: None,
                 backup: None,
@@ -8410,14 +8433,21 @@ async fn lookup_control_docker_published_port(
         "{{.Names}}",
     ])
     .await?;
-    let Some(container_name) = container_names
-        .lines()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
+    for container_name in control_transport_container_candidates(&container_names) {
+        if let Some(host_port) =
+            lookup_control_container_published_port(&container_name, container_port).await?
+        {
+            return Ok(Some(host_port));
+        }
+    }
 
+    Ok(None)
+}
+
+async fn lookup_control_container_published_port(
+    container_name: &str,
+    container_port: u16,
+) -> anyhow::Result<Option<u16>> {
     let ports_json = run_control_docker_stdout(&[
         "inspect",
         "--format",
@@ -8425,22 +8455,46 @@ async fn lookup_control_docker_published_port(
         container_name,
     ])
     .await?;
-    let ports: serde_json::Value = serde_json::from_str(ports_json.trim())?;
+    Ok(parse_control_published_host_port(
+        ports_json.trim(),
+        container_port,
+    ))
+}
+
+fn control_transport_container_candidates(output: &str) -> Vec<String> {
+    let mut names = output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| {
+        control_transport_container_rank(left)
+            .cmp(&control_transport_container_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    names
+}
+
+fn control_transport_container_rank(name: &str) -> u8 {
+    if name.ends_with("-vpn") || name.contains("-vpn-") {
+        1
+    } else {
+        0
+    }
+}
+
+fn parse_control_published_host_port(ports_json: &str, container_port: u16) -> Option<u16> {
+    let ports: serde_json::Value = serde_json::from_str(ports_json.trim()).ok()?;
     let key = format!("{container_port}/tcp");
     let binding = ports
         .get(&key)
         .and_then(serde_json::Value::as_array)
         .and_then(|values| values.first());
-    let Some(binding) = binding else {
-        return Ok(None);
-    };
-    Ok(binding
-        .get("HostPort")
+    binding
+        .and_then(|binding| binding.get("HostPort"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .parse::<u16>()
-        .ok())
+        .and_then(|value| value.trim().parse::<u16>().ok())
 }
 
 async fn run_control_docker_stdout(args: &[&str]) -> anyhow::Result<String> {

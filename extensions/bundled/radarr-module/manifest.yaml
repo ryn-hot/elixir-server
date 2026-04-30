@@ -29,7 +29,14 @@ provides:
       actions: ["search"]
       requires_account: false
       required_fields: []
-requires: []
+requires:
+  downloads:
+    - kind: torrent
+      mode: broker
+      logical_id: downloaders.torrent.default
+    - kind: usenet
+      mode: broker
+      logical_id: downloaders.usenet.default
 conflicts:
   - capability: media.manager.movies
     slot: default

@@ -15,6 +15,11 @@ provides:
     slot: default
     cardinality: one
     implementation: nzbget
+    scope:
+      download_broker:
+        enabled: true
+        provider_kind: managed
+        logical_id: downloaders.usenet.default
 requires: []
 conflicts:
   - capability: downloader.nzb

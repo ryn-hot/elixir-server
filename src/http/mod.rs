@@ -5,7 +5,7 @@ pub mod handlers;
 use axum::{
     Router,
     http::{Method, header},
-    routing::{any, delete, get, patch, post},
+    routing::{any, delete, get, patch, post, put},
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -17,6 +17,98 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(handlers::health::healthcheck))
         .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
+        .route(
+            "/api/v1/network/protection",
+            get(handlers::network_protection::protection),
+        )
+        .route(
+            "/api/v1/network/protection/status",
+            get(handlers::network_protection::protection_status),
+        )
+        .route(
+            "/api/v1/network/protection/preflight",
+            get(handlers::network_protection::preflight),
+        )
+        .route(
+            "/api/v1/network/protection/switch",
+            post(handlers::network_protection::switch_profile),
+        )
+        .route(
+            "/api/v1/network/protection/first-run",
+            post(handlers::network_protection::first_run_setup),
+        )
+        .route(
+            "/api/v1/network/protection/events",
+            get(handlers::network_protection::events),
+        )
+        .route(
+            "/api/v1/network/protection/profiles",
+            get(handlers::network_protection::profiles),
+        )
+        .route(
+            "/api/v1/network/protection/import/wireguard",
+            post(handlers::network_protection::import_wireguard),
+        )
+        .route(
+            "/api/v1/network/protection/import/openvpn",
+            post(handlers::network_protection::import_openvpn),
+        )
+        .route(
+            "/api/v1/network/protection/provider-presets",
+            get(handlers::network_protection::provider_presets),
+        )
+        .route(
+            "/api/v1/network/protection/qbittorrent/listen-port-sync",
+            get(handlers::network_protection::qbittorrent_listen_port_sync),
+        )
+        .route(
+            "/api/v1/network/protection/qbittorrent/listen-port-sync/apply",
+            post(handlers::network_protection::apply_qbittorrent_listen_port_sync),
+        )
+        .route(
+            "/api/v1/network/protection/warp/disclosure",
+            get(handlers::network_protection::warp_disclosure),
+        )
+        .route(
+            "/api/v1/network/protection/warp/profile",
+            post(handlers::network_protection::ensure_warp_profile),
+        )
+        .route(
+            "/api/v1/network/protection/warp/enroll",
+            post(handlers::network_protection::ensure_warp_profile),
+        )
+        .route(
+            "/api/v1/network/protection/warp/reset",
+            post(handlers::network_protection::reset_warp_profile),
+        )
+        .route(
+            "/api/v1/network/protection/warp/diagnostics",
+            get(handlers::network_protection::warp_diagnostics),
+        )
+        .route(
+            "/api/v1/download-broker/downloaders",
+            get(handlers::download_broker::list_downloaders),
+        )
+        .route(
+            "/api/v1/download-broker/routes",
+            get(handlers::download_broker::list_routes),
+        )
+        .route(
+            "/api/v1/download-broker/routes/:logical_id",
+            put(handlers::download_broker::update_route),
+        )
+        .route(
+            "/api/v1/download-broker/:logical_id/progress",
+            get(handlers::download_broker::progress),
+        )
+        .route(
+            "/api/v1/download-broker/:logical_id/submit",
+            post(handlers::download_broker::submit),
+        )
+        .route(
+            "/api/v1/download-broker/:logical_id/items/:download_id",
+            delete(handlers::download_broker::cancel),
+        )
         .route(
             "/api/v1/extensions/catalog",
             get(handlers::extensions::catalog),
