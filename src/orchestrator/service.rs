@@ -22,10 +22,10 @@ use crate::network::protection::{
     mark_cloudflare_warp_runtime_unavailable,
 };
 use crate::orchestrator::executor::{
-    Executor, ExecutorAction, build_driver_ctx_for_provider, describe_volume_mount_identity,
-    downloader_network_mode_requires_rehome, downloader_preserved_mounts, normalized_network_mode,
-    resolve_runtime_volume_mounts, validate_downloader_volume_preservation,
-    volume_mounts_from_runtime_state,
+    Executor, ExecutorAction, build_driver_ctx_for_provider, container_network_namespace_target,
+    describe_volume_mount_identity, downloader_network_mode_requires_rehome_with_gateway_identity,
+    downloader_preserved_mounts, normalized_network_mode, resolve_runtime_volume_mounts,
+    validate_downloader_volume_preservation, volume_mounts_from_runtime_state,
 };
 use crate::orchestrator::lock::APPLY_LOCK_NAME;
 use crate::orchestrator::naming::{build_aliases, container_name};
@@ -605,9 +605,19 @@ impl OrchestratorService {
             }
         }
 
-        let requires_rehome = downloader_network_mode_requires_rehome(
+        let desired_gateway_id =
+            match container_network_namespace_target(desired_network.network_mode.as_deref()) {
+                Some(gateway_name) => self
+                    .runtime
+                    .get_container_handle(gateway_name)
+                    .await?
+                    .map(|handle| handle.id),
+                None => None,
+            };
+        let requires_rehome = downloader_network_mode_requires_rehome_with_gateway_identity(
             current_network_mode.as_deref(),
             desired_network.network_mode.as_deref(),
+            desired_gateway_id.as_deref(),
         );
         checks.push(preflight_check(
             "network_rehome",

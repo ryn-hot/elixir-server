@@ -1242,11 +1242,22 @@ impl<'a> Executor<'a> {
             .as_ref()
             .and_then(|state| normalized_network_mode(state.network_mode.as_deref()));
         let desired_network_mode = normalized_network_mode(desired_spec.network_mode.as_deref());
+        let desired_gateway_id =
+            match container_network_namespace_target(desired_network_mode.as_deref()) {
+                Some(gateway_name) => self
+                    .runtime
+                    .get_container_handle(gateway_name)
+                    .await?
+                    .map(|handle| handle.id),
+                None => None,
+            };
 
-        let network_mode_requires_rehome = downloader_network_mode_requires_rehome(
-            current_network_mode.as_deref(),
-            desired_network_mode.as_deref(),
-        );
+        let network_mode_requires_rehome =
+            downloader_network_mode_requires_rehome_with_gateway_identity(
+                current_network_mode.as_deref(),
+                desired_network_mode.as_deref(),
+                desired_gateway_id.as_deref(),
+            );
         let spec_fingerprint_requires_rehome = runtime_state.as_ref().is_some_and(|state| {
             desired_spec
                 .labels
@@ -3499,13 +3510,7 @@ fn downloader_uses_gateway_namespace(
     gateway_name: &str,
     gateway_id: &str,
 ) -> bool {
-    let Some(actual_container) = actual_network_mode.strip_prefix("container:") else {
-        return false;
-    };
-    actual_container == gateway_name
-        || actual_container == gateway_id
-        || actual_container.starts_with(gateway_id)
-        || gateway_id.starts_with(actual_container)
+    container_network_namespace_matches(actual_network_mode, gateway_name, Some(gateway_id))
 }
 
 async fn resolve_indexer_apps(
@@ -5312,17 +5317,55 @@ pub(crate) fn normalized_network_mode(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn downloader_network_mode_requires_rehome(
+pub(crate) fn downloader_network_mode_requires_rehome_with_gateway_identity(
     current: Option<&str>,
     desired: Option<&str>,
+    desired_gateway_id: Option<&str>,
 ) -> bool {
     if current == desired {
         return false;
     }
 
+    if let Some(desired_gateway_name) = container_network_namespace_target(desired) {
+        if current.is_some_and(|mode| {
+            container_network_namespace_matches(mode, desired_gateway_name, desired_gateway_id)
+        }) {
+            return false;
+        }
+    }
+
     is_explicit_container_network_namespace(current)
         || is_explicit_container_network_namespace(desired)
         || desired.is_some()
+}
+
+pub(crate) fn container_network_namespace_target(value: Option<&str>) -> Option<&str> {
+    value
+        .map(str::trim)
+        .and_then(|mode| mode.strip_prefix("container:"))
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+}
+
+pub(crate) fn container_network_namespace_matches(
+    actual_network_mode: &str,
+    expected_gateway_name: &str,
+    expected_gateway_id: Option<&str>,
+) -> bool {
+    let Some(actual_container) = container_network_namespace_target(Some(actual_network_mode))
+    else {
+        return false;
+    };
+    if actual_container == expected_gateway_name {
+        return true;
+    }
+    if let Some(expected_gateway_id) = expected_gateway_id {
+        actual_container == expected_gateway_id
+            || actual_container.starts_with(expected_gateway_id)
+            || expected_gateway_id.starts_with(actual_container)
+    } else {
+        false
+    }
 }
 
 fn is_explicit_container_network_namespace(value: Option<&str>) -> bool {
@@ -11713,6 +11756,33 @@ PersistentKeepalive = 25
             Some((&VolumeMountSourceKind::Bind, paths.downloads_root.as_str()))
         );
         Ok(())
+    }
+
+    #[test]
+    fn downloader_network_mode_accepts_docker_resolved_gateway_id() {
+        let gateway_id = "bcb7b296654532afba9fb825f44689f707bd5bd30bb6977404008072242cedde";
+
+        assert!(
+            !downloader_network_mode_requires_rehome_with_gateway_identity(
+                Some("container:bcb7b296654532afba9fb825f44689f707bd5bd30bb6977404008072242cedde"),
+                Some("container:elx-ba4bf0-vpn"),
+                Some(gateway_id),
+            )
+        );
+        assert!(
+            !downloader_network_mode_requires_rehome_with_gateway_identity(
+                Some("container:bcb7b2966545"),
+                Some("container:elx-ba4bf0-vpn"),
+                Some(gateway_id),
+            )
+        );
+        assert!(
+            downloader_network_mode_requires_rehome_with_gateway_identity(
+                Some("container:other-vpn"),
+                Some("container:elx-ba4bf0-vpn"),
+                Some(gateway_id),
+            )
+        );
     }
 
     #[test]
