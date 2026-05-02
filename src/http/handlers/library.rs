@@ -40,6 +40,8 @@ pub struct LibraryItemResponse {
     pub updated_at: String,
     pub runtime_seconds: Option<i32>,
     pub metadata: Option<serde_json::Value>,
+    pub description: Option<String>,
+    pub genres: Vec<String>,
     pub poster_url: Option<String>,
     pub banner_url: Option<String>,
     pub backdrop_url: Option<String>,
@@ -155,6 +157,12 @@ pub async fn list_items(
         let id = row.get::<String, _>("id");
         let item_type = row.get::<String, _>("type");
         let lifecycle = resolve_library_item_card_lifecycle(&state, &id).await?;
+        let metadata = row
+            .try_get::<String, _>("metadata_json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let (description, genres) =
+            extract_metadata_fields(metadata.as_ref(), &preferred_languages);
         items.push(LibraryItemResponse {
             id: id.clone(),
             title: row.get::<String, _>("title"),
@@ -166,10 +174,9 @@ pub async fn list_items(
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .map(|v| v as i32),
-            metadata: row
-                .try_get::<String, _>("metadata_json")
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok()),
+            metadata,
+            description,
+            genres,
             poster_url: match item_type.as_str() {
                 "movie" => movie_posters.get(&id).cloned(),
                 "anime" => anime_posters.get(&id).cloned(),
@@ -808,7 +815,8 @@ pub async fn detail(
         })
         .collect();
 
-    let (description, genres) = extract_metadata_fields(metadata_json.as_ref());
+    let (description, genres) =
+        extract_metadata_fields(metadata_json.as_ref(), &preferred_languages);
     let owner_type = if item_type == "movie" {
         "movie"
     } else {
@@ -1831,9 +1839,7 @@ async fn load_external_subtitles(
 }
 
 struct ArtworkRow {
-    owner_id: String,
     id: String,
-    url: String,
     language: Option<String>,
     provider: Option<String>,
     score: Option<f32>,
@@ -1876,13 +1882,15 @@ async fn load_primary_artwork(
     let mut grouped: HashMap<String, Vec<ArtworkRow>> = HashMap::new();
     for row in rows {
         let owner_id = row.get::<String, _>("owner_id");
+        let url = row.get::<String, _>("url");
+        if artwork_url_disallowed_for_kind(kind, &url) {
+            continue;
+        }
         grouped
             .entry(owner_id.clone())
             .or_default()
             .push(ArtworkRow {
-                owner_id,
                 id: row.get::<String, _>("id"),
-                url: row.get::<String, _>("url"),
                 language: row.try_get::<String, _>("language").ok(),
                 provider: row.try_get::<String, _>("provider").ok(),
                 score: row.try_get::<f64, _>("score").ok().map(|v| v as f32),
@@ -1903,20 +1911,33 @@ async fn load_primary_artwork(
     Ok(by_owner)
 }
 
-fn extract_metadata_fields(meta: Option<&Value>) -> (Option<String>, Vec<String>) {
+fn artwork_url_disallowed_for_kind(kind: &str, url: &str) -> bool {
+    let normalized = url.to_ascii_lowercase();
+    if normalized.contains("/actor/") || normalized.contains("/person/") {
+        return true;
+    }
+    if normalized.contains("/clearart/") || normalized.contains("/clearlogo/") {
+        return matches!(kind, "poster" | "backdrop" | "banner");
+    }
+    false
+}
+
+fn extract_metadata_fields(
+    meta: Option<&Value>,
+    preferred_languages: &[String],
+) -> (Option<String>, Vec<String>) {
     let mut description = None;
     let mut genres = Vec::new();
 
     if let Some(value) = meta {
-        let desc_candidate = value
-            .get("description")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("overview").and_then(Value::as_str))
-            .or_else(|| value.get("plot").and_then(Value::as_str))
-            .or_else(|| value.get("summary").and_then(Value::as_str));
+        let desc_candidate = ["description", "overview", "plot", "summary"]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_str))
+            .map(str::to_string)
+            .or_else(|| extract_translated_description(value, preferred_languages));
 
         if let Some(desc) = desc_candidate {
-            let cleaned = clean_description(desc);
+            let cleaned = clean_description(&desc);
             if !cleaned.is_empty() {
                 description = Some(cleaned);
             }
@@ -1944,6 +1965,76 @@ fn extract_metadata_fields(meta: Option<&Value>) -> (Option<String>, Vec<String>
     }
 
     (description, genres)
+}
+
+fn extract_translated_description(value: &Value, preferred_languages: &[String]) -> Option<String> {
+    let translation_arrays = [
+        value
+            .get("translations")
+            .and_then(|translations| translations.get("overviewTranslations")),
+        value.get("overviewTranslations"),
+        value.get("overview_translations"),
+    ];
+
+    for translations in translation_arrays.into_iter().flatten() {
+        let Some(entries) = translations.as_array() else {
+            continue;
+        };
+        if let Some(selected) = select_translated_description(entries, preferred_languages) {
+            return Some(selected);
+        }
+    }
+
+    None
+}
+
+fn select_translated_description(
+    entries: &[Value],
+    preferred_languages: &[String],
+) -> Option<String> {
+    for preferred in preferred_languages {
+        for entry in entries {
+            let language = entry
+                .get("language")
+                .or_else(|| entry.get("languageCode"))
+                .and_then(Value::as_str)
+                .map(normalize_language);
+            if language
+                .as_deref()
+                .is_some_and(|language| language_matches(language, preferred))
+            {
+                if let Some(text) = translated_overview_text(entry) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    for entry in entries {
+        if entry
+            .get("isPrimary")
+            .or_else(|| entry.get("is_primary"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(text) = translated_overview_text(entry) {
+                return Some(text);
+            }
+        }
+    }
+
+    entries.iter().find_map(translated_overview_text)
+}
+
+fn translated_overview_text(entry: &Value) -> Option<String> {
+    entry
+        .get("overview")
+        .or_else(|| entry.get("description"))
+        .or_else(|| entry.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_language_header(headers: &HeaderMap) -> Vec<String> {
@@ -2046,7 +2137,36 @@ fn language_matches(candidate: &str, preferred: &str) -> bool {
 }
 
 fn normalize_language(value: &str) -> String {
-    value.trim().replace('_', "-").to_lowercase()
+    let normalized = value.trim().replace('_', "-").to_lowercase();
+    let (primary, suffix) = normalized
+        .split_once('-')
+        .map(|(primary, suffix)| (primary, Some(suffix)))
+        .unwrap_or((normalized.as_str(), None));
+    let primary = match primary {
+        "eng" => "en",
+        "deu" | "ger" => "de",
+        "fra" | "fre" => "fr",
+        "spa" => "es",
+        "ita" => "it",
+        "por" => "pt",
+        "jpn" => "ja",
+        "zho" | "chi" => "zh",
+        "kor" => "ko",
+        "rus" => "ru",
+        "pol" => "pl",
+        "tur" => "tr",
+        "dan" => "da",
+        "fin" => "fi",
+        "heb" => "he",
+        "hun" => "hu",
+        "est" => "et",
+        other => other,
+    };
+    if let Some(suffix) = suffix {
+        format!("{primary}-{suffix}")
+    } else {
+        primary.to_string()
+    }
 }
 
 fn provider_rank(provider: Option<&str>, priority: &[&str]) -> usize {
@@ -2111,4 +2231,69 @@ fn clean_description(raw: &str) -> String {
 
     let decoded = html_escape::decode_html_entities(&cleaned);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_fields_use_tvdb_primary_overview_translation() {
+        let meta = json!({
+            "translations": {
+                "overviewTranslations": [
+                    { "language": "deu", "overview": "Deutsche Beschreibung" },
+                    {
+                        "isPrimary": true,
+                        "language": "eng",
+                        "overview": "English Casino Royale description."
+                    }
+                ]
+            },
+            "genres": [{ "name": "Action" }]
+        });
+
+        let (description, genres) = extract_metadata_fields(Some(&meta), &["en".to_string()]);
+
+        assert_eq!(
+            description.as_deref(),
+            Some("English Casino Royale description.")
+        );
+        assert_eq!(genres, vec!["Action".to_string()]);
+    }
+
+    #[test]
+    fn metadata_fields_prefer_requested_translation_when_available() {
+        let meta = json!({
+            "overviewTranslations": [
+                {
+                    "isPrimary": true,
+                    "language": "eng",
+                    "overview": "English description."
+                },
+                { "language": "fra", "overview": "Description francaise." }
+            ]
+        });
+
+        let (description, _) = extract_metadata_fields(Some(&meta), &["fr".to_string()]);
+
+        assert_eq!(description.as_deref(), Some("Description francaise."));
+    }
+
+    #[test]
+    fn artwork_selection_rejects_non_backdrop_tvdb_artwork_paths() {
+        assert!(artwork_url_disallowed_for_kind(
+            "backdrop",
+            "https://artworks.thetvdb.com/banners/v4/movie/330/clearart/6124a45419fa7.png"
+        ));
+        assert!(artwork_url_disallowed_for_kind(
+            "poster",
+            "https://artworks.thetvdb.com/banners/v4/actor/525247/photo/6075f14031529.jpg"
+        ));
+        assert!(!artwork_url_disallowed_for_kind(
+            "backdrop",
+            "https://artworks.thetvdb.com/banners/v4/movie/330/backgrounds/664a76d83adf3.jpg"
+        ));
+    }
 }

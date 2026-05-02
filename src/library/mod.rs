@@ -300,7 +300,50 @@ fn extract_tvdb_description(meta: &serde_json::Value) -> Option<String> {
             }
         }
     }
+    extract_tvdb_translated_description(meta)
+}
+
+fn extract_tvdb_translated_description(meta: &serde_json::Value) -> Option<String> {
+    let translation_arrays = [
+        meta.get("translations")
+            .and_then(|translations| translations.get("overviewTranslations")),
+        meta.get("overviewTranslations"),
+        meta.get("overview_translations"),
+    ];
+
+    for translations in translation_arrays.into_iter().flatten() {
+        let Some(entries) = translations.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            if entry
+                .get("isPrimary")
+                .or_else(|| entry.get("is_primary"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                if let Some(value) = tvdb_translation_text(entry) {
+                    return Some(value);
+                }
+            }
+        }
+        if let Some(value) = entries.iter().find_map(tvdb_translation_text) {
+            return Some(value);
+        }
+    }
+
     None
+}
+
+fn tvdb_translation_text(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("overview")
+        .or_else(|| entry.get("description"))
+        .or_else(|| entry.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn extract_tvdb_remote_id(
@@ -5457,8 +5500,8 @@ async fn sync_movie_artwork(
                 kind: entry.kind,
                 url: entry.url,
                 language: entry.language,
-                width: None,
-                height: None,
+                width: entry.width,
+                height: entry.height,
                 provider: Some("tvdb".to_string()),
                 score: entry.score,
                 metadata_json: None,
@@ -5516,8 +5559,8 @@ async fn sync_series_artwork(
                         kind: entry.kind,
                         url: entry.url,
                         language: entry.language,
-                        width: None,
-                        height: None,
+                        width: entry.width,
+                        height: entry.height,
                         provider: Some("tvdb".to_string()),
                         score: entry.score,
                         metadata_json: None,
@@ -6001,6 +6044,27 @@ mod tests {
             season: None,
             episode: None,
         }
+    }
+
+    #[test]
+    fn tvdb_description_uses_primary_translation_when_top_level_overview_is_missing() {
+        let meta = serde_json::json!({
+            "translations": {
+                "overviewTranslations": [
+                    { "language": "deu", "overview": "Deutsche Beschreibung" },
+                    {
+                        "isPrimary": true,
+                        "language": "eng",
+                        "overview": "English TVDB description."
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            extract_tvdb_description(&meta).as_deref(),
+            Some("English TVDB description.")
+        );
     }
 
     async fn start_mock_cinemeta_server() -> Result<(String, oneshot::Sender<()>)> {

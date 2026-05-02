@@ -444,6 +444,8 @@ pub struct TvdbArtworkEntry {
     pub kind: ArtworkKind,
     pub url: String,
     pub language: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     pub score: Option<f32>,
     pub season_number: Option<i32>,
 }
@@ -479,6 +481,9 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
         let Some(url) = url else {
             continue;
         };
+        if is_unsupported_tvdb_artwork_path(url) || is_unsupported_tvdb_artwork_type(item) {
+            continue;
+        }
         let kind = tvdb_artwork_kind(item);
         let Some(kind) = kind else {
             continue;
@@ -492,6 +497,14 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
             .get("score")
             .and_then(Value::as_f64)
             .map(|value| value as f32);
+        let width = item
+            .get("width")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let height = item
+            .get("height")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
         let season_number = item
             .get("seasonNumber")
             .or_else(|| item.get("season"))
@@ -502,6 +515,8 @@ pub fn extract_tvdb_artworks(value: &Value) -> Vec<TvdbArtworkEntry> {
             kind,
             url: url.to_string(),
             language,
+            width,
+            height,
             score,
             season_number,
         });
@@ -517,7 +532,33 @@ fn tvdb_artwork_kind(item: &Value) -> Option<ArtworkKind> {
         .or_else(|| item.get("type"))
         .and_then(Value::as_str)
         .and_then(map_tvdb_kind)
+        .or_else(|| {
+            item.get("type")
+                .and_then(Value::as_i64)
+                .and_then(map_tvdb_numeric_kind)
+        })
         .or_else(|| infer_tvdb_artwork_kind_from_dimensions(item))
+}
+
+fn map_tvdb_numeric_kind(value: i64) -> Option<ArtworkKind> {
+    match value {
+        14 => Some(ArtworkKind::Poster),
+        15 => Some(ArtworkKind::Backdrop),
+        13 | 24 | 25 => None,
+        _ => None,
+    }
+}
+
+fn is_unsupported_tvdb_artwork_path(url: &str) -> bool {
+    let normalized = url.to_ascii_lowercase();
+    normalized.contains("/clearart/")
+        || normalized.contains("/clearlogo/")
+        || normalized.contains("/actor/")
+        || normalized.contains("/person/")
+}
+
+fn is_unsupported_tvdb_artwork_type(item: &Value) -> bool {
+    matches!(item.get("type").and_then(Value::as_i64), Some(13 | 24 | 25))
 }
 
 fn infer_tvdb_artwork_kind_from_dimensions(item: &Value) -> Option<ArtworkKind> {
@@ -550,5 +591,56 @@ fn map_tvdb_kind(value: &str) -> Option<ArtworkKind> {
         Some(ArtworkKind::Thumbnail)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tvdb_artwork_extraction_skips_clearart_clearlogo_and_people_images() {
+        let value = json!({
+            "artworks": [
+                {
+                    "image": "https://artworks.thetvdb.com/banners/v4/movie/330/clearart/6124a45419fa7.png",
+                    "type": 24,
+                    "width": 1000,
+                    "height": 562,
+                    "language": "eng",
+                    "score": 100001
+                },
+                {
+                    "image": "https://artworks.thetvdb.com/banners/v4/movie/330/clearlogo/6124a42d9a938.png",
+                    "type": 25,
+                    "width": 800,
+                    "height": 310,
+                    "language": "eng",
+                    "score": 100001
+                },
+                {
+                    "image": "https://artworks.thetvdb.com/banners/v4/actor/525247/photo/6075f14031529.jpg",
+                    "type": 13,
+                    "width": 300,
+                    "height": 450,
+                    "score": 0
+                },
+                {
+                    "image": "https://artworks.thetvdb.com/banners/v4/movie/330/backgrounds/664a76d83adf3.jpg",
+                    "type": 15,
+                    "width": 1920,
+                    "height": 1080,
+                    "score": 100000
+                }
+            ]
+        });
+
+        let refs = extract_tvdb_artworks(&value);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, ArtworkKind::Backdrop);
+        assert_eq!(refs[0].width, Some(1920));
+        assert_eq!(refs[0].height, Some(1080));
     }
 }
