@@ -36,6 +36,7 @@ use crate::db::models::{
     OrchestratorRunStatus, Provider, ProviderHealthState, ProviderReadiness,
     ProviderReadinessPhase, RuntimeLog, Secret, SecretScope,
 };
+use crate::debrid::{REAL_DEBRID_EXTENSION_ID, REAL_DEBRID_TOKEN_SECRET_KEY};
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::managed_paths::{DOWNLOADS_ROOT, QBITTORRENT_INCOMPLETE_DIR};
@@ -3912,6 +3913,37 @@ async fn summarize_module_extension(
         .await;
     }
 
+    if extension
+        .extension_id
+        .eq_ignore_ascii_case(REAL_DEBRID_EXTENSION_ID)
+    {
+        if let Some(instance) = choose_extension_control_instance(instances) {
+            let has_token = store
+                .get_secret(
+                    SecretScope::Instance,
+                    Some(instance.instance_id),
+                    REAL_DEBRID_TOKEN_SECRET_KEY,
+                )
+                .await?
+                .is_some();
+            if !has_token {
+                return with_module_auto_update_summary(
+                    store,
+                    extension,
+                    attention_extension_status(
+                        extension,
+                        "provider_setup_required",
+                        "Add account",
+                        "Add a Real-Debrid API token to enable debrid downloads.",
+                        "open",
+                        "Add account",
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
     if unhealthy_provider_count == 0
         && degraded_provider_count == 0
         && (bootstrap_ready_count > 0 || transport_ready_count > 0)
@@ -4316,6 +4348,7 @@ pub(super) enum ExtensionControlBinding {
     Prowlarr,
     Qbittorrent,
     Nzbget,
+    RealDebrid,
     GenericManifest,
     Unsupported,
 }
@@ -4351,6 +4384,7 @@ impl ExtensionControlBinding {
             ("indexer.registry", Some("prowlarr")) => Some(Self::Prowlarr),
             ("downloader.torrent", Some("qbittorrent")) => Some(Self::Qbittorrent),
             ("downloader.nzb", Some("nzbget")) => Some(Self::Nzbget),
+            ("debrid.resolver", Some("real_debrid")) => Some(Self::RealDebrid),
             _ => None,
         }
     }

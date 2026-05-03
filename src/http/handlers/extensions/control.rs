@@ -205,6 +205,79 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
     }
 }
 
+struct RealDebridControlAdapter;
+
+#[async_trait::async_trait]
+impl ExtensionControlProvider for RealDebridControlAdapter {
+    async fn build_sections(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+    ) -> anyhow::Result<Vec<ExtensionControlSection>> {
+        GenericManifestControlProvider
+            .build_sections(state, store, context)
+            .await
+    }
+
+    fn build_actions(&self, context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
+        if context.selected_instance.is_some() {
+            vec![build_test_connection_action()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn update_settings(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        values: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        GenericManifestControlProvider
+            .update_settings(state, store, context, values)
+            .await
+    }
+
+    async fn execute_action(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        action_id: &str,
+        _params: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        match action_id {
+            "test_connection" => {
+                let instance = context.selected_instance.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("no active Real-Debrid instance is available")
+                })?;
+                let user =
+                    crate::debrid::test_real_debrid_account(state, store, instance.instance_id)
+                        .await?;
+                if let Some(provider) = context.selected_provider.as_ref() {
+                    store
+                        .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
+                        .await?;
+                    store
+                        .upsert_provider_readiness(
+                            provider.provider_id,
+                            ProviderReadinessPhase::DriverReady,
+                            Some("Real-Debrid account validated."),
+                        )
+                        .await?;
+                }
+                Ok(format!(
+                    "Real-Debrid account '{}' is reachable.",
+                    user.username
+                ))
+            }
+            _ => anyhow::bail!("unsupported control action '{action_id}'"),
+        }
+    }
+}
+
 struct ProwlarrControlAdapter;
 
 #[async_trait::async_trait]
@@ -620,6 +693,7 @@ fn resolve_adapter(context: &ExtensionControlContext) -> Box<dyn ExtensionContro
         ExtensionControlBinding::Qbittorrent | ExtensionControlBinding::Nzbget => {
             Box::new(DownloaderControlAdapter)
         }
+        ExtensionControlBinding::RealDebrid => Box::new(RealDebridControlAdapter),
         ExtensionControlBinding::GenericManifest => Box::new(GenericManifestControlProvider),
         ExtensionControlBinding::Unsupported => Box::new(UnsupportedControlProvider),
     }

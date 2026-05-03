@@ -428,7 +428,7 @@ impl ManifestDownloadRequire {
         match self.kind {
             ManifestDownloadKind::Torrent => "downloaders.torrent.default",
             ManifestDownloadKind::Usenet => "downloaders.usenet.default",
-            ManifestDownloadKind::Debrid => "downloaders.debrid.default",
+            ManifestDownloadKind::Debrid => "acquisition.debrid.default",
         }
     }
 }
@@ -566,7 +566,7 @@ impl ManifestDownloadBrokerProviderScope {
                 logical_id.trim(),
                 "downloaders.torrent.default"
                     | "downloaders.usenet.default"
-                    | "downloaders.debrid.default"
+                    | "acquisition.debrid.default"
             ) {
                 bail!(
                     "unsupported {prefix}.logical_id '{}'; expected a known logical downloader id",

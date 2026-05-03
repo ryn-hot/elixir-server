@@ -1890,6 +1890,99 @@ async fn download_broker_route_can_select_external_provider() -> Result<()> {
 }
 
 #[tokio::test]
+async fn download_broker_debrid_route_exposes_native_provider() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let provider_id = seed_download_broker_provider(
+        &store,
+        "elixir.modules.real_debrid",
+        "debrid.resolver",
+        "real_debrid",
+        "api.real-debrid.com",
+        Some("debrid"),
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/download-broker/routes")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let route = json
+        .get("routes")
+        .and_then(Value::as_array)
+        .and_then(|routes| {
+            routes.iter().find(|route| {
+                route.get("logicalId").and_then(Value::as_str) == Some("acquisition.debrid.default")
+                    && route.get("ownerId").and_then(Value::as_str) == Some("default")
+            })
+        })
+        .context("missing default debrid route")?;
+    assert_eq!(
+        route.get("role").and_then(Value::as_str),
+        Some("debrid_resolver")
+    );
+    let provider_id = provider_id.to_string();
+    assert_eq!(
+        route.get("selectedProviderId").and_then(Value::as_str),
+        Some(provider_id.as_str())
+    );
+    assert_eq!(
+        route.get("selectedProviderKind").and_then(Value::as_str),
+        Some("debrid")
+    );
+    assert!(route.get("blocker").is_none_or(Value::is_null));
+    Ok(())
+}
+
+#[tokio::test]
+async fn download_broker_debrid_submit_without_token_fails_closed() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_download_broker_provider(
+        &store,
+        "elixir.modules.real_debrid",
+        "debrid.resolver",
+        "real_debrid",
+        "api.real-debrid.com",
+        Some("debrid"),
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/download-broker/acquisition.debrid.default/submit")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    r#"{"source":"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567","category":"debrid"}"#,
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(json.get("code").and_then(Value::as_str), Some("conflict"));
+    assert!(
+        json.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn downloader_profile_reports_default_profile_and_telemetry() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;

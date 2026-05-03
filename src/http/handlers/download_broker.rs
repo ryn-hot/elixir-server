@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
+    debrid::{
+        DebridSubmitOptions, cancel_real_debrid_job, debrid_source_kind,
+        is_real_debrid_implementation, load_real_debrid_progress, submit_real_debrid,
+    },
     download_broker::{
         DownloadBrokerBindingKind, DownloadBrokerInventory, DownloadBrokerProviderRecord,
         DownloadBrokerRole, DownloadBrokerRouteInventory, DownloadBrokerRouteRecord,
@@ -167,11 +171,17 @@ pub async fn submit(
         DownloadBrokerRole::Usenet => {
             Some(submit_nzbget(&state, &store, &resolved, source, &request).await?)
         }
-        DownloadBrokerRole::DebridResolver => {
-            return Err(ApiError::conflict(
-                "debrid resolver routes are selectable for acquisition planning, but broker submit is not implemented for debrid providers yet",
-            ));
-        }
+        DownloadBrokerRole::DebridResolver => Some(
+            submit_real_debrid_broker(
+                &state,
+                &store,
+                &resolved,
+                source,
+                &request,
+                query.owner_id.as_deref(),
+            )
+            .await?,
+        ),
     };
 
     Ok(Json(DownloadBrokerSubmitResponse {
@@ -204,9 +214,7 @@ pub async fn progress(
             load_nzbget_progress(&state, &store, &resolved.record).await?
         }
         DownloadBrokerRole::DebridResolver => {
-            return Err(ApiError::conflict(
-                "debrid resolver routes do not expose downloader progress through this broker endpoint yet",
-            ));
+            load_real_debrid_broker_progress(&state, &store, &resolved.record).await?
         }
     };
     Ok(Json(DownloadBrokerProgressResponse {
@@ -246,9 +254,7 @@ pub async fn cancel(
             cancel_nzbget(&state, &store, &resolved.record, &download_id).await?
         }
         DownloadBrokerRole::DebridResolver => {
-            return Err(ApiError::conflict(
-                "debrid resolver routes do not support broker cancel through this endpoint yet",
-            ));
+            cancel_real_debrid_broker(&state, &store, &resolved.record, &download_id).await?
         }
     };
     Ok(Json(DownloadBrokerCancelResponse {
@@ -402,6 +408,49 @@ async fn submit_nzbget(
     Ok(id.to_string())
 }
 
+async fn submit_real_debrid_broker(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    resolved: &ResolvedDownloadBrokerProvider,
+    source: &str,
+    request: &DownloadBrokerSubmitRequest,
+    owner_id: Option<&str>,
+) -> ApiResult<String> {
+    validate_debrid_source(source)?;
+    if !is_real_debrid_implementation(resolved.record.implementation.as_deref()) {
+        return Err(ApiError::conflict(
+            "the selected debrid provider is not supported by the native Real-Debrid broker yet",
+        ));
+    }
+    let category =
+        non_empty(request.category.as_deref()).or_else(|| non_empty(resolved.category.as_deref()));
+    let job_id = submit_real_debrid(
+        state,
+        store,
+        resolved.record.provider_id,
+        resolved.record.instance_id,
+        source,
+        DebridSubmitOptions {
+            owner_id: owner_id.unwrap_or(crate::download_broker::DEFAULT_ROUTE_OWNER_ID),
+            category,
+            name: non_empty(request.name.as_deref()),
+            paused: request.paused.unwrap_or(false),
+        },
+    )
+    .await
+    .map_err(|err| {
+        let message = err.to_string();
+        if message.contains("source must") {
+            ApiError::bad_request(message)
+        } else if message.contains("token") || message.contains("Real-Debrid API") {
+            ApiError::conflict(message)
+        } else {
+            ApiError::from(err)
+        }
+    })?;
+    Ok(job_id.to_string())
+}
+
 async fn load_qbittorrent_progress(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -498,6 +547,36 @@ async fn load_nzbget_progress(
         .collect())
 }
 
+async fn load_real_debrid_broker_progress(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    record: &DownloadBrokerProviderRecord,
+) -> ApiResult<Vec<DownloadBrokerProgressItem>> {
+    if !is_real_debrid_implementation(record.implementation.as_deref()) {
+        return Err(ApiError::conflict(
+            "the selected debrid provider does not expose native Real-Debrid progress",
+        ));
+    }
+    let items = load_real_debrid_progress(state, store, record.provider_id, record.instance_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(items
+        .into_iter()
+        .map(|item| DownloadBrokerProgressItem {
+            id: item.id,
+            name: item.name,
+            state: item.state,
+            category: item.category,
+            progress: item.progress,
+            downloaded_bytes: item.downloaded_bytes,
+            total_bytes: item.total_bytes,
+            remaining_bytes: item.remaining_bytes,
+            download_rate_bps: item.download_rate_bps,
+            upload_rate_bps: None,
+        })
+        .collect())
+}
+
 async fn cancel_qbittorrent(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -579,6 +658,28 @@ async fn cancel_nzbget(
     Ok(true)
 }
 
+async fn cancel_real_debrid_broker(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    record: &DownloadBrokerProviderRecord,
+    download_id: &str,
+) -> ApiResult<bool> {
+    if !is_real_debrid_implementation(record.implementation.as_deref()) {
+        return Err(ApiError::conflict(
+            "the selected debrid provider does not support native Real-Debrid cancel",
+        ));
+    }
+    cancel_real_debrid_job(
+        state,
+        store,
+        record.provider_id,
+        record.instance_id,
+        download_id,
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
 fn resolve_nzbget_group_id(groups: &[Value], download_id: &str) -> Option<i64> {
     if let Ok(group_id) = download_id.parse::<i64>() {
         if groups
@@ -636,6 +737,12 @@ fn validate_nzb_source(source: &str) -> ApiResult<()> {
     Err(ApiError::bad_request(
         "usenet source must be an http or https NZB URL",
     ))
+}
+
+fn validate_debrid_source(source: &str) -> ApiResult<()> {
+    debrid_source_kind(source)
+        .map(|_| ())
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

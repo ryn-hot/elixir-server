@@ -3,6 +3,7 @@ mod artwork;
 mod auth;
 mod config;
 mod db;
+mod debrid;
 mod download_broker;
 mod drivers;
 mod extensions;
@@ -166,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("preinstalled core runtime bootstrap failed: {err}");
         }
     };
+    if let Err(err) = debrid::ensure_real_debrid_builtin(&state).await {
+        tracing::warn!("Real-Debrid provider bootstrap failed: {err}");
+    }
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");
     }
@@ -204,6 +208,11 @@ async fn main() -> anyhow::Result<()> {
     let acquisition_recovery_state = state.clone();
     tokio::spawn(async move {
         acquisition::start_acquisition_recovery_loop(acquisition_recovery_state).await;
+    });
+
+    let debrid_materializer_state = state.clone();
+    tokio::spawn(async move {
+        debrid::start_debrid_materializer_loop(debrid_materializer_state).await;
     });
 
     // Refresh extension registries on an interval.
