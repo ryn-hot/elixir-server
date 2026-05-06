@@ -19,6 +19,7 @@ mod runtime;
 mod secrets;
 mod state;
 mod telemetry;
+mod torrentio;
 
 use crate::artwork::ArtworkService;
 use crate::auth::AuthService;
@@ -170,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = debrid::ensure_real_debrid_builtin(&state).await {
         tracing::warn!("Real-Debrid provider bootstrap failed: {err}");
     }
+    if let Err(err) = torrentio::ensure_torrentio_builtin(&state).await {
+        tracing::warn!("Torrentio source bootstrap failed: {err}");
+    }
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");
     }
@@ -213,6 +217,11 @@ async fn main() -> anyhow::Result<()> {
     let debrid_materializer_state = state.clone();
     tokio::spawn(async move {
         debrid::start_debrid_materializer_loop(debrid_materializer_state).await;
+    });
+
+    let torrentio_acquisition_state = state.clone();
+    tokio::spawn(async move {
+        torrentio::start_torrentio_acquisition_loop(torrentio_acquisition_state).await;
     });
 
     // Refresh extension registries on an interval.

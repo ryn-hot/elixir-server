@@ -57,10 +57,10 @@ pub struct DownloadBrokerRouteQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadBrokerSubmitResponse {
-    logical_id: String,
-    provider_id: Uuid,
-    accepted: bool,
-    download_id: Option<String>,
+    pub logical_id: String,
+    pub provider_id: Uuid,
+    pub accepted: bool,
+    pub download_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,14 +152,42 @@ pub async fn submit(
     Query(query): Query<DownloadBrokerRouteQuery>,
     Json(request): Json<DownloadBrokerSubmitRequest>,
 ) -> ApiResult<Json<DownloadBrokerSubmitResponse>> {
-    let store = ExtensionStore::new(&state.db_pool);
-    let resolved = resolve_broker_provider(
-        &state.db_pool,
-        &store,
-        &logical_id,
-        query.owner_id.as_deref(),
+    submit_download_broker_request(state, &logical_id, query.owner_id.as_deref(), request)
+        .await
+        .map(Json)
+}
+
+pub async fn submit_download_broker_source(
+    state: &AppState,
+    logical_id: &str,
+    owner_id: Option<&str>,
+    source: &str,
+    name: Option<&str>,
+) -> ApiResult<DownloadBrokerSubmitResponse> {
+    submit_download_broker_request(
+        state.clone(),
+        logical_id,
+        owner_id,
+        DownloadBrokerSubmitRequest {
+            source: source.to_string(),
+            category: None,
+            paused: None,
+            name: name.map(str::to_string),
+            priority: None,
+            add_to_top: None,
+        },
     )
-    .await?;
+    .await
+}
+
+async fn submit_download_broker_request(
+    state: AppState,
+    logical_id: &str,
+    owner_id: Option<&str>,
+    request: DownloadBrokerSubmitRequest,
+) -> ApiResult<DownloadBrokerSubmitResponse> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let resolved = resolve_broker_provider(&state.db_pool, &store, logical_id, owner_id).await?;
     ensure_route_allows_submit(&state, &resolved).await?;
     let source = normalized_source(&request.source)?;
 
@@ -172,24 +200,17 @@ pub async fn submit(
             Some(submit_nzbget(&state, &store, &resolved, source, &request).await?)
         }
         DownloadBrokerRole::DebridResolver => Some(
-            submit_real_debrid_broker(
-                &state,
-                &store,
-                &resolved,
-                source,
-                &request,
-                query.owner_id.as_deref(),
-            )
-            .await?,
+            submit_real_debrid_broker(&state, &store, &resolved, source, &request, owner_id)
+                .await?,
         ),
     };
 
-    Ok(Json(DownloadBrokerSubmitResponse {
-        logical_id,
+    Ok(DownloadBrokerSubmitResponse {
+        logical_id: logical_id.to_string(),
         provider_id: resolved.record.provider_id,
         accepted: true,
         download_id,
-    }))
+    })
 }
 
 pub async fn progress(

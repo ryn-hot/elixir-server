@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::Path as StdPath,
+    path::{Path as StdPath, PathBuf},
 };
 
 use anyhow::{Context, Result as AnyResult, bail};
@@ -24,13 +24,17 @@ use uuid::Uuid;
 use crate::{
     acquisition::{AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView, load_intent_recovery_views},
     db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
+    debrid::load_real_debrid_progress,
     drivers::{
         AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
     },
     extensions::{
         ExternalIds,
         manifest::ExtensionManifest,
-        store::{ExtensionStore, ManagedImportFile, NewManagedImportEvent, NewManagedIngestIntent},
+        store::{
+            ExtensionStore, ManagedImportFile, ManagedIngestIntent, NewManagedImportEvent,
+            NewManagedIngestIntent,
+        },
     },
     http::{
         auth::CurrentUser,
@@ -39,7 +43,13 @@ use crate::{
     library::{ingest_managed_import_event, managed_episode_tombstone_matches_series},
     metadata::DiscoveryResult,
     orchestrator::model::ProviderEndpoint,
+    runtime::RuntimePaths,
     state::AppState,
+    torrentio::{
+        TORRENTIO_CANDIDATE_CAPABILITY, TORRENTIO_EXTENSION_ID, TorrentioAcquisitionJobView,
+        list_torrentio_acquisition_jobs_for_intents, mark_torrentio_acquisition_job_import_failed,
+        mark_torrentio_acquisition_job_imported,
+    },
 };
 
 const MANAGER_PREF_MOVIE: &str = "manager_preference.movie";
@@ -49,6 +59,11 @@ const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.insta
 const NZBGET_DRONE_DOWNLOAD_ID_PARAM: &str = "drone";
 const TORRENT_METADATA_STALL_TIMEOUT_SECONDS: i64 = 10 * 60;
 const TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS: i64 = 15 * 60;
+const NATIVE_ACQUISITION_EXTENSION_ID: &str = "elixir.core.acquisition";
+const NATIVE_ACQUISITION_INSTANCE_ID: &str = "eeeeeeee-0000-4000-8000-000000000000";
+const NATIVE_ACQUISITION_MOVIE_PROVIDER_ID: &str = "eeeeeeee-0000-4000-8000-000000000001";
+const NATIVE_ACQUISITION_SERIES_PROVIDER_ID: &str = "eeeeeeee-0000-4000-8000-000000000002";
+const NATIVE_ACQUISITION_ANIME_PROVIDER_ID: &str = "eeeeeeee-0000-4000-8000-000000000003";
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -306,6 +321,8 @@ pub struct FindMediaAcquisitionItem {
     pub eta_seconds: Option<i64>,
     pub downloader_label: Option<String>,
     pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
     pub last_matched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -339,6 +356,24 @@ pub struct FindMediaAcquisitionChildItem {
     pub downloader_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_cached_debrid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_score: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_score_badges: Vec<crate::torrentio::TorrentioScoreBadge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_event_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +593,7 @@ struct AcquisitionDownloaderProgress {
     release_title: Option<String>,
     status: Option<String>,
     category: Option<String>,
+    local_path: Option<String>,
     progress_percent: Option<f64>,
     eta_seconds: Option<i64>,
     size_bytes: Option<u64>,
@@ -591,6 +627,10 @@ struct AcquisitionQbittorrentTorrent {
     state: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    content_path: Option<String>,
+    #[serde(default)]
+    save_path: Option<String>,
     #[serde(default)]
     progress: Option<f64>,
     #[serde(default)]
@@ -842,10 +882,14 @@ pub async fn find_media_targets(
             .map_err(ApiError::from)?;
     let default = resolve_default_manager(preferred, blueprint_preferred, &manager_contexts);
 
-    let manager_candidates: Vec<ProviderSummary> =
+    let native_available = native_acquisition_available(&providers);
+    let mut manager_candidates: Vec<ProviderSummary> =
         manager_contexts.iter().map(provider_summary).collect();
+    append_native_acquisition_provider(&mut manager_candidates, media_type, native_available);
     let search_providers: Vec<ProviderSummary> =
         search_contexts.iter().map(provider_summary).collect();
+    let default =
+        default.or_else(|| native_available.then(|| native_acquisition_provider_id(media_type)));
 
     Ok(Json(FindMediaTargetsResponse {
         media_type: media_type_api_name(media_type).to_string(),
@@ -973,6 +1017,7 @@ pub async fn find_media_add(
         .await
         .map_err(ApiError::from)?;
     let manager_contexts = collect_manager_providers(&providers, media_type);
+    let native_available = native_acquisition_available(&providers);
     let manager_resolution = resolve_manager_for_add(
         &state,
         &store,
@@ -980,40 +1025,48 @@ pub async fn find_media_add(
         &preferences,
         media_type,
         explicit_manager,
+        native_available,
     )
     .await
     .map_err(ApiError::from)?;
 
-    let manager = match manager_resolution {
-        ManagerSelection::Selected(provider) => provider,
+    let selected_manager = match manager_resolution {
+        ManagerSelection::Selected(provider) => Some(provider),
+        ManagerSelection::Native => None,
         ManagerSelection::Conflict(conflict) => return Ok(conflict.into_response()),
     };
+    let (manager_provider_id, manager_label) = selected_manager
+        .as_ref()
+        .map(|manager| (manager.detail.provider.provider_id, provider_label(manager)))
+        .unwrap_or_else(|| {
+            (
+                native_acquisition_provider_id(media_type),
+                "Elixir Native".to_string(),
+            )
+        });
 
     info!(
         media_type = media_type_api_name(media_type),
         title = %title,
-        manager_provider_id = %manager.detail.provider.provider_id,
-        manager_label = %provider_label(&manager),
+        manager_provider_id = %manager_provider_id,
+        manager_label = %manager_label,
         "find media add resolved manager"
     );
 
-    let manager_item_id = add_with_manager_provider(
-        &state,
-        &store,
-        &manager,
-        media_type,
-        &item,
-        &payload.options,
-    )
-    .await
-    .map_err(ApiError::from)?;
+    let manager_item_id = if let Some(manager) = selected_manager.as_ref() {
+        add_with_manager_provider(&state, &store, manager, media_type, &item, &payload.options)
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        None
+    };
 
     let intent_id = persist_managed_ingest_intent(
         &store,
         media_type,
         &item,
-        manager.detail.provider.provider_id,
-        &provider_label(&manager),
+        manager_provider_id,
+        &manager_label,
         manager_item_id.as_deref(),
     )
     .await
@@ -1022,8 +1075,8 @@ pub async fn find_media_add(
     let response = FindMediaAddResponse {
         operation_id: Uuid::new_v4(),
         intent_id,
-        manager_provider_id: manager.detail.provider.provider_id,
-        manager_label: provider_label(&manager),
+        manager_provider_id,
+        manager_label,
         media_type: media_type_api_name(media_type).to_string(),
         title,
         manager_item_id,
@@ -1141,15 +1194,26 @@ async fn build_find_media_acquisition_response(
         load_acquisition_downloader_progress_index(state, store, &provider_contexts).await;
     let downloader_totals = load_acquisition_downloader_totals(state, store).await?;
     let recent_cutoff = Utc::now() - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS);
+    let intents = store.list_active_managed_ingest_intents().await?;
+    let intent_ids = intents
+        .iter()
+        .map(|intent| intent.intent_id)
+        .collect::<Vec<_>>();
+    let torrentio_jobs =
+        list_torrentio_acquisition_jobs_for_intents(&state.db_pool, &intent_ids).await?;
 
     let mut items = Vec::new();
-    for intent in store.list_active_managed_ingest_intents().await? {
+    for intent in intents {
         let item = build_find_media_acquisition_item(
             state,
             store,
             &provider_map,
             &recovery_views,
             &downloader_progress,
+            torrentio_jobs
+                .get(&intent.intent_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
             &intent,
         )
         .await?;
@@ -1216,6 +1280,7 @@ async fn build_find_media_acquisition_item(
     provider_map: &HashMap<Uuid, ProviderContext>,
     recovery_views: &HashMap<Uuid, IntentRecoveryView>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
+    torrentio_jobs: &[TorrentioAcquisitionJobView],
     intent: &crate::extensions::store::ManagedIngestIntent,
 ) -> AnyResult<FindMediaAcquisitionItem> {
     let manager_label = provider_map
@@ -1224,6 +1289,28 @@ async fn build_find_media_acquisition_item(
         .or_else(|| intent.manager_label.clone())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Manager".to_string());
+    let torrentio_import_linked = if torrentio_jobs.is_empty() {
+        false
+    } else {
+        match detect_and_ingest_torrentio_import_events(
+            state,
+            store,
+            intent,
+            torrentio_jobs,
+            downloader_progress,
+        )
+        .await
+        {
+            Ok(linked) => linked,
+            Err(err) => {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    "failed to process Torrentio import events: {err}"
+                );
+                false
+            }
+        }
+    };
     let state_view = resolve_acquisition_item_state(
         state,
         store,
@@ -1233,6 +1320,13 @@ async fn build_find_media_acquisition_item(
         intent,
     )
     .await?;
+    let state_view = if torrentio_import_linked && state_view.phase != AcquisitionPhase::Completed {
+        completed_acquisition_state()
+    } else {
+        state_view
+    };
+    let state_view =
+        merge_torrentio_acquisition_state(state_view, torrentio_jobs, downloader_progress);
 
     Ok(FindMediaAcquisitionItem {
         intent_id: intent.intent_id,
@@ -1261,6 +1355,10 @@ async fn build_find_media_acquisition_item(
         eta_seconds: state_view.eta_seconds,
         downloader_label: state_view.downloader_label,
         protocol: state_view.protocol,
+        source_label: state_view
+            .children
+            .iter()
+            .find_map(|child| child.source_label.clone()),
         last_matched_at: intent.last_matched_at,
         created_at: intent.created_at,
         updated_at: intent.updated_at,
@@ -1299,6 +1397,31 @@ async fn resolve_acquisition_item_state(
     }
 
     let Some(provider) = provider else {
+        if is_native_acquisition_provider_id(intent.manager_provider_id) {
+            return Ok(AcquisitionItemState {
+                phase: AcquisitionPhase::Requested,
+                headline: "Elixir acquisition subscription created.".to_string(),
+                detail: Some(
+                    "Elixir is using native metadata and acquisition routes for this item."
+                        .to_string(),
+                ),
+                blocker: None,
+                evidence: base_acquisition_evidence(
+                    intent.manager_item_id.is_some(),
+                    false,
+                    false,
+                    0,
+                    None,
+                    None,
+                ),
+                actions: Vec::new(),
+                progress_percent: None,
+                eta_seconds: None,
+                downloader_label: None,
+                protocol: None,
+                children: Vec::new(),
+            });
+        }
         return Ok(acquisition_attention(
             "manager_missing",
             "Manager unavailable",
@@ -1565,7 +1688,10 @@ async fn load_acquisition_downloader_progress_index(
 
     for provider in providers {
         let capability = provider.detail.provider.capability.as_str();
-        if !matches!(capability, "downloader.nzb" | "downloader.torrent") {
+        if !matches!(
+            capability,
+            "downloader.nzb" | "downloader.torrent" | "debrid.resolver"
+        ) {
             continue;
         }
         if provider.detail.provider.health_state == ProviderHealthState::Unhealthy {
@@ -1589,6 +1715,15 @@ async fn load_acquisition_downloader_progress_index(
                 load_qbittorrent_acquisition_progress_index(state, store, instance_id).await
             }
             "nzbget" => load_nzbget_acquisition_progress_index(state, store, instance_id).await,
+            "real_debrid" => {
+                load_real_debrid_acquisition_progress_index(
+                    state,
+                    store,
+                    provider.detail.provider.provider_id,
+                    instance_id,
+                )
+                .await
+            }
             _ => Ok(AcquisitionDownloaderProgressIndex::default()),
         };
 
@@ -1822,6 +1957,43 @@ async fn load_nzbget_acquisition_progress_index(
     Ok(index)
 }
 
+async fn load_real_debrid_acquisition_progress_index(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+    instance_id: Uuid,
+) -> AnyResult<AcquisitionDownloaderProgressIndex> {
+    let items = load_real_debrid_progress(state, store, provider_id, instance_id).await?;
+    let mut index = AcquisitionDownloaderProgressIndex::default();
+    for item in items {
+        let progress_percent = item.progress.map(|value| (value * 100.0).clamp(0.0, 100.0));
+        index.insert(
+            &item.id,
+            AcquisitionDownloaderProgress {
+                release_title: item.name,
+                status: item.state,
+                category: item.category,
+                local_path: item.local_path,
+                progress_percent,
+                eta_seconds: None,
+                size_bytes: item.total_bytes,
+                downloaded_bytes: item.downloaded_bytes,
+                remaining_bytes: item.remaining_bytes,
+                download_rate_bps: item.download_rate_bps,
+                upload_rate_bps: None,
+                connected_seeds: None,
+                connected_peers: None,
+                known_seeds: None,
+                known_peers: None,
+                availability: None,
+                seen_complete_at: None,
+                issue: None,
+            },
+        );
+    }
+    Ok(index)
+}
+
 async fn load_acquisition_downloader_totals(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -2042,6 +2214,283 @@ async fn detect_and_ingest_managed_import_events(
     }
 
     Ok(linked)
+}
+
+async fn detect_and_ingest_torrentio_import_events(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    intent: &ManagedIngestIntent,
+    jobs: &[TorrentioAcquisitionJobView],
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> AnyResult<bool> {
+    let paths = RuntimePaths::from_roots(
+        &state.settings.extensions.storage_root,
+        &state.settings.library.local_root,
+    );
+    let mut linked = false;
+
+    for job in jobs {
+        if job.imported_at.is_some() || job.status != "submitted" {
+            continue;
+        }
+        let Some(progress) = job
+            .download_id
+            .as_deref()
+            .and_then(|download_id| downloader_progress.get(download_id))
+        else {
+            continue;
+        };
+        if !torrentio_progress_is_import_ready(progress) {
+            continue;
+        }
+
+        let Some(file) = torrentio_import_file_for_progress(&paths, job, progress).await? else {
+            debug!(
+                intent_id = %intent.intent_id,
+                job_id = %job.job_id,
+                download_id = ?job.download_id,
+                "Torrentio completed download has no visible importable media file yet"
+            );
+            continue;
+        };
+        let event_key = managed_import_event_key(
+            intent,
+            "torrentio",
+            &[format!(
+                "job:{}:{}",
+                job.job_id,
+                file.path.to_ascii_lowercase()
+            )],
+        );
+        let event = NewManagedImportEvent {
+            event_key,
+            intent_id: intent.intent_id,
+            media_type: intent.media_type,
+            external_ids: intent.external_ids.clone(),
+            manager_provider_id: intent.manager_provider_id,
+            manager_item_id: intent.manager_item_id.clone(),
+            manager_label: intent.manager_label.clone(),
+            manager_implementation: Some("torrentio".to_string()),
+            imported_files: vec![file],
+            raw_manager_payload: Some(torrentio_import_event_payload(job, progress)),
+            imported_at: Some(Utc::now()),
+        };
+        let persisted = store.upsert_managed_import_event(&event).await?;
+        match ingest_managed_import_event(
+            &state.db_pool,
+            Some(state.metadata.as_ref()),
+            Some(state.linkers.as_ref()),
+            Some(state.artwork.as_ref()),
+            intent,
+            &persisted,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                mark_torrentio_acquisition_job_imported(
+                    &state.db_pool,
+                    job.job_id,
+                    persisted.event_id,
+                )
+                .await?;
+                linked = true;
+            }
+            Ok(None) => {
+                debug!(
+                    intent_id = %intent.intent_id,
+                    job_id = %job.job_id,
+                    event_key = %persisted.event_key,
+                    "Torrentio import event files are not visible to Elixir yet"
+                );
+            }
+            Err(err) => {
+                let detail = err.to_string();
+                store
+                    .mark_managed_import_event_failed(persisted.event_id, &detail)
+                    .await?;
+                mark_torrentio_acquisition_job_import_failed(&state.db_pool, job.job_id, &detail)
+                    .await?;
+                warn!(
+                    intent_id = %intent.intent_id,
+                    job_id = %job.job_id,
+                    event_key = %persisted.event_key,
+                    "failed to link Torrentio import event: {detail}"
+                );
+            }
+        }
+    }
+
+    Ok(linked)
+}
+
+fn torrentio_progress_is_import_ready(progress: &AcquisitionDownloaderProgress) -> bool {
+    progress
+        .local_path
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        && (progress
+            .status
+            .as_deref()
+            .is_some_and(downloader_status_is_complete)
+            || progress
+                .progress_percent
+                .map(|value| value >= 99.5)
+                .unwrap_or(false)
+            || progress.remaining_bytes == Some(0))
+}
+
+async fn torrentio_import_file_for_progress(
+    paths: &RuntimePaths,
+    job: &TorrentioAcquisitionJobView,
+    progress: &AcquisitionDownloaderProgress,
+) -> AnyResult<Option<ManagedImportFile>> {
+    let Some(local_path) = progress.local_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = downloader_local_path(paths, local_path);
+    let Some((path, size_bytes)) = largest_visible_media_file(path).await? else {
+        return Ok(None);
+    };
+    let container = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(Some(ManagedImportFile {
+        path: path.to_string_lossy().to_string(),
+        season_number: job.season_number,
+        episode_number: job.episode_number,
+        absolute_episode_number: job.absolute_episode_number,
+        episode_title: None,
+        size_bytes: i64::try_from(size_bytes).ok(),
+        container,
+        video_codec: None,
+        audio_codec: None,
+    }))
+}
+
+fn downloader_local_path(paths: &RuntimePaths, raw_path: &str) -> PathBuf {
+    let trimmed = raw_path.trim();
+    if let Some(relative) = trimmed.strip_prefix("/downloads/") {
+        return PathBuf::from(&paths.downloads_root).join(relative);
+    }
+    if trimmed == "/downloads" {
+        return PathBuf::from(&paths.downloads_root);
+    }
+    PathBuf::from(trimmed)
+}
+
+async fn largest_visible_media_file(root: PathBuf) -> AnyResult<Option<(PathBuf, u64)>> {
+    let metadata = match tokio::fs::metadata(&root).await {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if metadata.is_file() {
+        return Ok(is_importable_media_file(&root).then_some((root, metadata.len())));
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+
+    let mut directories = vec![root];
+    let mut best: Option<(PathBuf, u64)> = None;
+    while let Some(directory) = directories.pop() {
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                debug!(
+                    path = %directory.display(),
+                    "skipping unreadable Torrentio import directory: {err}"
+                );
+                continue;
+            }
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path_contains_ignored_download_segment(&path) {
+                continue;
+            }
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    debug!(
+                        path = %path.display(),
+                        "skipping unreadable Torrentio import candidate: {err}"
+                    );
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() && is_importable_media_file(&path) {
+                if best
+                    .as_ref()
+                    .map(|(_, size)| metadata.len() > *size)
+                    .unwrap_or(true)
+                {
+                    best = Some((path, metadata.len()));
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn path_contains_ignored_download_segment(path: &StdPath) -> bool {
+    path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        matches!(
+            value.as_str(),
+            ".incomplete" | ".tmp" | ".nzb" | ".queue" | "sample" | "samples"
+        )
+    })
+}
+
+fn is_importable_media_file(path: &StdPath) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "mkv" | "mp4" | "m4v" | "avi" | "mov" | "wmv" | "webm" | "ts" | "m2ts"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn torrentio_import_event_payload(
+    job: &TorrentioAcquisitionJobView,
+    progress: &AcquisitionDownloaderProgress,
+) -> Value {
+    json!({
+        "source": "torrentio",
+        "jobId": job.job_id,
+        "routeLogicalId": job.route_logical_id.as_deref(),
+        "downloadId": job.download_id.as_deref(),
+        "download": {
+            "status": progress.status.as_deref(),
+            "category": progress.category.as_deref(),
+            "localPath": progress.local_path.as_deref(),
+            "progressPercent": progress.progress_percent,
+            "sizeBytes": progress.size_bytes,
+            "downloadedBytes": progress.downloaded_bytes
+        },
+        "candidate": {
+            "id": job.candidate_id.as_deref(),
+            "title": job.candidate_title.as_deref(),
+            "source": job.candidate_source.as_deref(),
+            "sourceKind": job.candidate_source_kind.as_deref(),
+            "infoHash": job.candidate_info_hash.as_deref(),
+            "fileIndex": job.candidate_file_index,
+            "quality": job.candidate_quality.as_deref(),
+            "sizeBytes": job.candidate_size_bytes,
+            "seeders": job.candidate_seeders,
+            "language": job.candidate_language.as_deref(),
+            "cachedDebrid": job.candidate_cached_debrid,
+            "score": job.candidate_score,
+            "scoreBadges": &job.candidate_score_badges,
+            "rank": job.candidate_rank
+        }
+    })
 }
 
 async fn detect_managed_import_events(
@@ -2716,6 +3165,15 @@ fn build_download_attempt_child(
         eta_seconds: state.eta_seconds,
         downloader_label: state.downloader_label,
         protocol: state.protocol,
+        source_label: None,
+        candidate_quality: None,
+        candidate_size_bytes: None,
+        candidate_language: None,
+        candidate_cached_debrid: None,
+        candidate_score: None,
+        candidate_score_badges: Vec::new(),
+        import_event_id: None,
+        imported_at: None,
         size_bytes: progress.and_then(|item| item.size_bytes),
         downloaded_bytes: progress.and_then(|item| item.downloaded_bytes),
         remaining_bytes: progress.and_then(|item| item.remaining_bytes),
@@ -2974,6 +3432,329 @@ fn completed_acquisition_state() -> AcquisitionItemState {
         protocol: None,
         children: Vec::new(),
     }
+}
+
+fn merge_torrentio_acquisition_state(
+    mut base: AcquisitionItemState,
+    jobs: &[TorrentioAcquisitionJobView],
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> AcquisitionItemState {
+    if jobs.is_empty() {
+        return base;
+    }
+
+    let mut children = jobs
+        .iter()
+        .map(|job| build_torrentio_acquisition_child(job, downloader_progress))
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        acquisition_phase_from_str(&left.phase)
+            .sort_priority()
+            .cmp(&acquisition_phase_from_str(&right.phase).sort_priority())
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    let blocked_count = jobs
+        .iter()
+        .filter(|job| matches!(job.status.as_str(), "blocked" | "failed"))
+        .count();
+    let submitted_count = jobs.iter().filter(|job| job.status == "submitted").count();
+    let pending_count = jobs.iter().filter(|job| job.status == "pending").count();
+    let imported_count = jobs.iter().filter(|job| job.imported_at.is_some()).count();
+
+    base.evidence.push(acquisition_evidence(
+        "Torrentio targets",
+        jobs.len().to_string(),
+        Some("neutral"),
+    ));
+
+    if !matches!(
+        base.phase,
+        AcquisitionPhase::Requested
+            | AcquisitionPhase::AcceptedByManager
+            | AcquisitionPhase::FindingAnotherRelease
+    ) {
+        base.children.extend(children);
+        return base;
+    }
+
+    if imported_count > 0 {
+        base.evidence.push(acquisition_evidence(
+            "Torrentio imports linked",
+            format!("{imported_count} / {}", jobs.len()),
+            Some("success"),
+        ));
+    }
+
+    let source_phase = if imported_count == jobs.len() {
+        AcquisitionPhase::Completed
+    } else if blocked_count > 0 {
+        AcquisitionPhase::NeedsAttention
+    } else if submitted_count > 0 {
+        AcquisitionPhase::Downloading
+    } else {
+        AcquisitionPhase::Requested
+    };
+    let first_error = jobs
+        .iter()
+        .find_map(|job| job.last_error.as_ref())
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    let first_submitted = jobs.iter().find(|job| job.status == "submitted");
+
+    base.phase = source_phase;
+    base.headline = match source_phase {
+        AcquisitionPhase::NeedsAttention => {
+            "Torrentio source acquisition needs attention.".to_string()
+        }
+        AcquisitionPhase::Downloading if submitted_count > 1 => {
+            format!("Submitted {submitted_count} Torrentio downloads.")
+        }
+        AcquisitionPhase::Downloading => "Submitted Torrentio download.".to_string(),
+        AcquisitionPhase::Completed => "Torrentio downloads linked in Elixir.".to_string(),
+        _ if pending_count > 0 => "Waiting for Torrentio source acquisition.".to_string(),
+        _ => base.headline,
+    };
+    base.detail = match source_phase {
+        AcquisitionPhase::NeedsAttention => first_error.clone(),
+        AcquisitionPhase::Downloading => first_submitted.map(|job| {
+            let route = job
+                .route_logical_id
+                .as_deref()
+                .map(torrentio_route_label)
+                .unwrap_or("selected acquisition route");
+            format!("Elixir submitted the selected source through {route}.")
+        }),
+        AcquisitionPhase::Completed => Some(
+            "Elixir imported the completed Torrentio downloads through the normal library flow."
+                .to_string(),
+        ),
+        _ => Some(
+            "Elixir created monitored Torrentio targets and is waiting for source discovery."
+                .to_string(),
+        ),
+    };
+    base.blocker =
+        (source_phase == AcquisitionPhase::NeedsAttention).then(|| FindMediaAcquisitionBlocker {
+            code: "torrentio_acquisition_blocked".to_string(),
+            title: "Torrentio acquisition blocked".to_string(),
+            detail: first_error.unwrap_or_else(|| {
+                "The Torrentio source route is not currently available.".to_string()
+            }),
+            severity: "warning".to_string(),
+        });
+    base.progress_percent = if source_phase == AcquisitionPhase::Completed {
+        Some(100.0)
+    } else if submitted_count > 0 && blocked_count == 0 {
+        children
+            .iter()
+            .filter_map(|child| child.progress_percent)
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        None
+    };
+    base.eta_seconds = children.iter().find_map(|child| child.eta_seconds);
+    base.downloader_label = first_submitted
+        .and_then(|job| job.route_logical_id.as_deref())
+        .map(torrentio_route_label)
+        .map(str::to_string);
+    base.protocol = first_submitted
+        .and_then(|job| job.route_logical_id.as_deref())
+        .map(torrentio_route_protocol)
+        .map(str::to_string);
+    base.children = children;
+    base
+}
+
+fn build_torrentio_acquisition_child(
+    job: &TorrentioAcquisitionJobView,
+    downloader_progress_index: &AcquisitionDownloaderProgressIndex,
+) -> FindMediaAcquisitionChildItem {
+    let progress = job
+        .download_id
+        .as_deref()
+        .and_then(|download_id| downloader_progress_index.get(download_id));
+    let issue = progress.and_then(|item| item.issue.clone());
+    let route_label = job
+        .route_logical_id
+        .as_deref()
+        .map(torrentio_route_label)
+        .map(str::to_string);
+    let protocol = job
+        .route_logical_id
+        .as_deref()
+        .map(torrentio_route_protocol)
+        .map(str::to_string);
+    let imported = job.imported_at.is_some();
+    let phase = if let Some(issue) = issue.as_ref() {
+        if issue.code.starts_with("nzbget_release_")
+            || issue.code.starts_with("qbittorrent_release_")
+        {
+            AcquisitionPhase::NeedsAttention
+        } else {
+            AcquisitionPhase::Downloading
+        }
+    } else if imported {
+        AcquisitionPhase::Completed
+    } else {
+        match job.status.as_str() {
+            "submitted" => progress
+                .and_then(|item| item.progress_percent)
+                .filter(|value| *value >= 99.5)
+                .map(|_| AcquisitionPhase::Importing)
+                .or_else(|| {
+                    progress
+                        .and_then(|item| item.status.as_deref())
+                        .filter(|status| downloader_status_is_complete(status))
+                        .map(|_| AcquisitionPhase::Importing)
+                })
+                .or_else(|| {
+                    progress
+                        .and_then(|item| item.progress_percent)
+                        .filter(|value| *value > 0.0)
+                        .map(|_| AcquisitionPhase::Downloading)
+                })
+                .unwrap_or(AcquisitionPhase::QueuedInDownloader),
+            "blocked" => AcquisitionPhase::NeedsAttention,
+            "failed" => AcquisitionPhase::Failed,
+            _ => AcquisitionPhase::Requested,
+        }
+    };
+    let detail = issue
+        .as_ref()
+        .map(|issue| issue.detail.clone())
+        .or_else(|| job.last_error.clone())
+        .or_else(|| job.import_error.clone())
+        .or_else(|| {
+            route_label
+                .as_deref()
+                .map(|route| format!("Submitted through {route}."))
+        });
+    let blocker = issue
+        .map(|issue| FindMediaAcquisitionBlocker {
+            code: issue.code,
+            title: issue.title,
+            detail: issue.detail,
+            severity: "warning".to_string(),
+        })
+        .or_else(|| {
+            matches!(job.status.as_str(), "blocked" | "failed").then(|| {
+                FindMediaAcquisitionBlocker {
+                    code: format!("torrentio_{}", job.status),
+                    title: "Torrentio source acquisition".to_string(),
+                    detail: job.last_error.clone().unwrap_or_else(|| {
+                        "Torrentio source acquisition could not continue.".to_string()
+                    }),
+                    severity: "warning".to_string(),
+                }
+            })
+        });
+    let title = if let (Some(season), Some(episode)) = (job.season_number, job.episode_number) {
+        format!("S{season:02}E{episode:02} - {}", job.title)
+    } else {
+        job.title.clone()
+    };
+    let source_label = torrentio_job_source_label(job, route_label.as_deref());
+
+    FindMediaAcquisitionChildItem {
+        id: job.job_id.to_string(),
+        title,
+        subtitle: job.candidate_title.clone(),
+        download_id: job.download_id.clone(),
+        status: progress
+            .and_then(|item| item.status.clone())
+            .or_else(|| Some(job.status.clone())),
+        category: progress.and_then(|item| item.category.clone()),
+        phase: phase.as_str().to_string(),
+        phase_label: phase.label().to_string(),
+        headline: match phase {
+            AcquisitionPhase::QueuedInDownloader => "Submitted to downloader.".to_string(),
+            AcquisitionPhase::Downloading => "Torrentio source download active.".to_string(),
+            AcquisitionPhase::Importing => "Torrentio download ready to import.".to_string(),
+            AcquisitionPhase::Completed => "Torrentio download linked in Elixir.".to_string(),
+            AcquisitionPhase::NeedsAttention => "Torrentio source needs attention.".to_string(),
+            AcquisitionPhase::Failed => "Torrentio source failed.".to_string(),
+            _ => "Torrentio source target pending.".to_string(),
+        },
+        detail,
+        blocker,
+        progress_percent: progress.and_then(|item| item.progress_percent),
+        eta_seconds: progress.and_then(|item| item.eta_seconds),
+        downloader_label: route_label,
+        protocol,
+        source_label: Some(source_label),
+        candidate_quality: job.candidate_quality.clone(),
+        candidate_size_bytes: job.candidate_size_bytes,
+        candidate_language: job.candidate_language.clone(),
+        candidate_cached_debrid: job.candidate_cached_debrid,
+        candidate_score: job.candidate_score,
+        candidate_score_badges: job.candidate_score_badges.clone(),
+        import_event_id: job.import_event_id,
+        imported_at: job.imported_at,
+        size_bytes: progress.and_then(|item| item.size_bytes),
+        downloaded_bytes: progress.and_then(|item| item.downloaded_bytes),
+        remaining_bytes: progress.and_then(|item| item.remaining_bytes),
+        download_rate_bps: progress.and_then(|item| item.download_rate_bps),
+        upload_rate_bps: progress.and_then(|item| item.upload_rate_bps),
+        connected_seeds: progress.and_then(|item| item.connected_seeds),
+        connected_peers: progress.and_then(|item| item.connected_peers),
+        known_seeds: progress.and_then(|item| item.known_seeds),
+        known_peers: progress.and_then(|item| item.known_peers),
+        availability: progress.and_then(|item| item.availability),
+        seen_complete_at: progress.and_then(|item| item.seen_complete_at),
+    }
+}
+
+fn torrentio_route_label(logical_id: &str) -> &'static str {
+    match logical_id {
+        "acquisition.debrid.default" => "Real-Debrid",
+        "downloaders.torrent.default" => "qBittorrent",
+        _ => "selected acquisition route",
+    }
+}
+
+fn torrentio_route_protocol(logical_id: &str) -> &'static str {
+    match logical_id {
+        "acquisition.debrid.default" => "debrid",
+        "downloaders.torrent.default" => "torrent",
+        _ => "source",
+    }
+}
+
+fn torrentio_job_source_label(
+    job: &TorrentioAcquisitionJobView,
+    route_label: Option<&str>,
+) -> String {
+    let route = route_label.unwrap_or("selected route");
+    let mut parts = vec!["Torrentio".to_string(), route.to_string()];
+    if let Some(quality) = job
+        .candidate_quality
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(quality.to_string());
+    }
+    if job.candidate_cached_debrid == Some(true) {
+        parts.push("cached".to_string());
+    }
+    parts.join(" -> ")
+}
+
+fn downloader_status_is_complete(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "finished"
+            | "downloaded"
+            | "uploading"
+            | "stalledup"
+            | "forcedup"
+            | "queuedup"
+            | "pausedup"
+            | "checkingup"
+    )
 }
 
 fn acquisition_evidence(
@@ -3343,6 +4124,7 @@ fn qbittorrent_acquisition_progress(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        local_path: qbittorrent_torrent_local_path(torrent),
         progress_percent,
         eta_seconds: torrent.eta.filter(|value| *value > 0),
         size_bytes: total_size,
@@ -3444,6 +4226,33 @@ fn qbittorrent_torrent_issue(
     None
 }
 
+fn qbittorrent_torrent_local_path(torrent: &AcquisitionQbittorrentTorrent) -> Option<String> {
+    torrent
+        .content_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let save_path = torrent
+                .save_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let name = torrent
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(
+                StdPath::new(save_path)
+                    .join(name)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        })
+}
+
 fn timestamp_to_datetime(timestamp: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(timestamp, 0)
 }
@@ -3474,6 +4283,7 @@ fn nzbget_acquisition_progress(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            local_path: None,
             progress_percent,
             eta_seconds: None,
             size_bytes: total_size,
@@ -3842,6 +4652,70 @@ fn provider_summary(provider: &ProviderContext) -> ProviderSummary {
     }
 }
 
+fn native_acquisition_provider_id(media_type: MediaType) -> Uuid {
+    let raw = match media_type {
+        MediaType::Movie => NATIVE_ACQUISITION_MOVIE_PROVIDER_ID,
+        MediaType::Series => NATIVE_ACQUISITION_SERIES_PROVIDER_ID,
+        MediaType::Anime => NATIVE_ACQUISITION_ANIME_PROVIDER_ID,
+    };
+    Uuid::parse_str(raw).expect("native acquisition provider id is valid")
+}
+
+fn native_acquisition_instance_id() -> Uuid {
+    Uuid::parse_str(NATIVE_ACQUISITION_INSTANCE_ID)
+        .expect("native acquisition instance id is valid")
+}
+
+fn is_native_acquisition_provider_id(provider_id: Uuid) -> bool {
+    [
+        native_acquisition_provider_id(MediaType::Movie),
+        native_acquisition_provider_id(MediaType::Series),
+        native_acquisition_provider_id(MediaType::Anime),
+    ]
+    .contains(&provider_id)
+}
+
+fn native_acquisition_available(providers: &[ProviderContext]) -> bool {
+    providers.iter().any(|provider| {
+        provider.detail.extension_id == TORRENTIO_EXTENSION_ID
+            && provider.detail.provider.capability == TORRENTIO_CANDIDATE_CAPABILITY
+            && provider.detail.provider.health_state != ProviderHealthState::Unhealthy
+    })
+}
+
+fn native_acquisition_provider_summary(media_type: MediaType) -> ProviderSummary {
+    ProviderSummary {
+        provider_id: native_acquisition_provider_id(media_type),
+        extension_id: NATIVE_ACQUISITION_EXTENSION_ID.to_string(),
+        instance_id: native_acquisition_instance_id(),
+        instance_name: "native".to_string(),
+        capability: match media_type {
+            MediaType::Movie => "media.manager.movies",
+            MediaType::Series => "media.manager.tv",
+            MediaType::Anime => "media.manager.anime",
+        }
+        .to_string(),
+        implementation: Some("elixir_native".to_string()),
+        health_state: ProviderHealthState::Healthy,
+        media_types: vec![media_type_name(media_type).to_string()],
+        label: "Elixir Native".to_string(),
+    }
+}
+
+fn append_native_acquisition_provider(
+    providers: &mut Vec<ProviderSummary>,
+    media_type: MediaType,
+    native_available: bool,
+) {
+    if native_available
+        && !providers
+            .iter()
+            .any(|provider| provider.provider_id == native_acquisition_provider_id(media_type))
+    {
+        providers.push(native_acquisition_provider_summary(media_type));
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProviderFilterError {
     provider: ProviderContext,
@@ -4108,6 +4982,7 @@ fn is_manager_capability(capability: &str) -> bool {
 #[derive(Debug)]
 enum ManagerSelection {
     Selected(ProviderContext),
+    Native,
     Conflict(FindMediaConflict),
 }
 
@@ -4181,19 +5056,24 @@ async fn execute_find_media_search(
 
     let search_providers: Vec<ProviderSummary> =
         search_contexts.iter().map(provider_summary).collect();
-    let manager_providers: Vec<ProviderSummary> =
+    let native_available = native_acquisition_available(&providers);
+    let mut manager_providers: Vec<ProviderSummary> =
         manager_contexts.iter().map(provider_summary).collect();
+    append_native_acquisition_provider(&mut manager_providers, media_type, native_available);
 
     let preferred_manager_provider_id = preferred_manager_for_type(&preferences, media_type);
     let blueprint_preferred =
         resolve_blueprint_preferred_manager(&store, &manager_contexts, media_type)
             .await
             .map_err(ApiError::from)?;
-    let default_manager_provider_id = resolve_default_manager(
+    let mut default_manager_provider_id = resolve_default_manager(
         preferred_manager_provider_id,
         blueprint_preferred,
         &manager_contexts,
     );
+    if default_manager_provider_id.is_none() && native_available {
+        default_manager_provider_id = Some(native_acquisition_provider_id(media_type));
+    }
     let has_requested_provider_filter = !requested_provider_ids.is_empty();
 
     let filtered_search_contexts = if requested_provider_ids.is_empty() {
@@ -4628,8 +5508,24 @@ async fn resolve_manager_for_add(
     preferences: &ManagerPreferenceState,
     media_type: MediaType,
     explicit_manager: Option<Uuid>,
+    native_available: bool,
 ) -> AnyResult<ManagerSelection> {
+    if explicit_manager == Some(native_acquisition_provider_id(media_type)) {
+        return if native_available {
+            Ok(ManagerSelection::Native)
+        } else {
+            Ok(ManagerSelection::Conflict(conflict(
+                "missing_manager",
+                "Elixir native acquisition is not available",
+                json!({ "mediaType": media_type_api_name(media_type) }),
+            )))
+        };
+    }
+
     if manager_contexts.is_empty() {
+        if native_available {
+            return Ok(ManagerSelection::Native);
+        }
         return Ok(ManagerSelection::Conflict(conflict(
             "missing_manager",
             "no compatible manager provider is available",
@@ -5608,6 +6504,50 @@ fn value_as_f64(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torrentio_progress_import_ready_requires_complete_download_with_path() {
+        let mut progress = AcquisitionDownloaderProgress {
+            local_path: Some("/downloads/elixir-extensions-torrentio-debrid/movie.mkv".to_string()),
+            status: Some("completed".to_string()),
+            progress_percent: Some(100.0),
+            ..Default::default()
+        };
+        assert!(torrentio_progress_is_import_ready(&progress));
+
+        progress.local_path = None;
+        assert!(!torrentio_progress_is_import_ready(&progress));
+
+        progress.local_path = Some("/downloads/movie.mkv".to_string());
+        progress.status = Some("downloading".to_string());
+        progress.progress_percent = Some(42.0);
+        progress.remaining_bytes = Some(100);
+        assert!(!torrentio_progress_is_import_ready(&progress));
+    }
+
+    #[test]
+    fn downloader_local_path_maps_downloads_mount_to_host_root() {
+        let paths = RuntimePaths {
+            data_root: "/tmp/elixir".to_string(),
+            extensions_root: "/tmp/elixir/extensions".to_string(),
+            downloads_root: "/tmp/elixir/downloads".to_string(),
+            media_root: "/tmp/elixir/media".to_string(),
+        };
+
+        assert_eq!(
+            downloader_local_path(
+                &paths,
+                "/downloads/elixir-extensions-torrentio-torrent/release/file.mkv"
+            ),
+            PathBuf::from(
+                "/tmp/elixir/downloads/elixir-extensions-torrentio-torrent/release/file.mkv"
+            )
+        );
+        assert_eq!(
+            downloader_local_path(&paths, "/var/lib/elixir/downloads/movie.mkv"),
+            PathBuf::from("/var/lib/elixir/downloads/movie.mkv")
+        );
+    }
 
     #[test]
     fn derive_arr_acquisition_state_marks_downloading_from_queue_state_without_fake_progress() {
