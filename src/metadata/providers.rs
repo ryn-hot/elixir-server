@@ -651,9 +651,6 @@ pub mod anilist {
         pub episodes: Option<i32>,
         pub duration: Option<i32>,
         pub format: Option<String>,
-        pub status: Option<String>,
-        #[serde(rename = "nextAiringEpisode")]
-        pub next_airing_episode: Option<serde_json::Value>,
         pub description: Option<String>,
         pub genres: Option<Vec<String>>,
         pub startDate: Option<serde_json::Value>,
@@ -699,8 +696,6 @@ pub mod anilist {
                   episodes
                   duration
                   format
-                  status
-                  nextAiringEpisode { episode airingAt }
                   description
                   genres
                   startDate { year }
@@ -755,8 +750,6 @@ pub mod anilist {
                 episodes
                 duration
                 format
-                status
-                nextAiringEpisode { episode airingAt }
                 description
                 genres
                 coverImage { extraLarge large medium }
@@ -805,8 +798,6 @@ pub mod anilist {
                 episodes
                 duration
                 format
-                status
-                nextAiringEpisode { episode airingAt }
                 description
                 genres
                 coverImage { extraLarge large medium }

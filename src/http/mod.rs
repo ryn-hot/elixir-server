@@ -110,10 +110,6 @@ pub fn router(state: AppState) -> Router {
             delete(handlers::download_broker::cancel),
         )
         .route(
-            "/api/v1/acquisition/candidates/search",
-            post(handlers::acquisition_sources::search_candidates),
-        )
-        .route(
             "/api/v1/extensions/catalog",
             get(handlers::extensions::catalog),
         )

@@ -46,7 +46,8 @@ use crate::{
     state::AppState,
 };
 
-pub use linkers::{AniZipEpisodeRecord, AniZipMapping, LinkerService};
+pub use linkers::LinkerService;
+use linkers::{AniZipEpisodeRecord, AniZipMapping};
 
 const ANILIST_ENDPOINT: &str = "https://graphql.anilist.co";
 
@@ -2046,10 +2047,10 @@ async fn load_existing_classification_for_path(
 }
 
 #[derive(Debug, Clone)]
-pub struct AniListSeasonChainEntry {
-    pub season_number: i32,
-    pub anilist_id: String,
-    pub confidence: f32,
+struct AniListSeasonChainEntry {
+    season_number: i32,
+    anilist_id: String,
+    confidence: f32,
 }
 
 async fn classify_candidate_files(
@@ -2573,23 +2574,6 @@ async fn expand_anilist_season_chain(
     }
 
     Ok(expanded)
-}
-
-pub async fn resolve_anilist_season_chain(
-    config: Option<&ClassifierConfig>,
-    seed_season: i32,
-    anilist_id: &str,
-    confidence: f32,
-) -> Result<Vec<AniListSeasonChainEntry>> {
-    let seed = SeasonAnilistSeed {
-        anilist_id: anilist_id.trim().to_string(),
-        confidence,
-    };
-    if seed.anilist_id.is_empty() || seed_season < 1 {
-        return Ok(Vec::new());
-    }
-    let anilist = build_anilist_identifier(config);
-    expand_anilist_season_chain(&anilist, seed_season, &seed).await
 }
 
 fn build_anilist_identifier(config: Option<&ClassifierConfig>) -> AniListIdentifier {

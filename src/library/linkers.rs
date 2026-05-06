@@ -555,12 +555,9 @@ struct TvdbEpisodeBaseRecord {
     number: Option<i32>,
     absolute_number: Option<i32>,
     name: Option<String>,
-    aired: Option<String>,
     overview: Option<String>,
     runtime: Option<i32>,
     image: Option<String>,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
