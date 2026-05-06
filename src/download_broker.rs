@@ -1491,8 +1491,8 @@ mod tests {
         .await?;
         insert_acquisition_extension(
             &store,
-            "elixir.extensions.torrentio",
-            "Torrentio",
+            "elixir.extensions.test_source",
+            "Test Source",
             &["torrent"],
         )
         .await?;
@@ -1519,9 +1519,9 @@ mod tests {
             .iter()
             .find(|route| {
                 route.logical_id == TORRENT_DEFAULT_LOGICAL_ID
-                    && route.owner_id == "elixir.extensions.torrentio"
+                    && route.owner_id == "elixir.extensions.test_source"
             })
-            .expect("torrentio route");
+            .expect("test source route");
         assert!(inherited.inherited);
         assert_eq!(inherited.selected_provider_id, Some(external_id));
 
@@ -1531,7 +1531,7 @@ mod tests {
             TORRENT_DEFAULT_LOGICAL_ID,
             DownloadBrokerRouteUpdate {
                 binding_kind: DownloadBrokerBindingKind::ManagedProtected,
-                owner_id: Some("elixir.extensions.torrentio".to_string()),
+                owner_id: Some("elixir.extensions.test_source".to_string()),
                 provider_id: Some(managed_id),
                 profile_id: None,
                 category: None,
@@ -1545,7 +1545,7 @@ mod tests {
         assert_eq!(override_route.selected_provider_id, Some(managed_id));
         assert_eq!(
             override_route.category.as_deref(),
-            Some("elixir-extensions-torrentio-torrent")
+            Some("elixir-extensions-test-source-torrent")
         );
 
         let default_resolved = resolve_logical_downloader_with_bindings(
@@ -1559,13 +1559,13 @@ mod tests {
             &database.pool,
             &store,
             TORRENT_DEFAULT_LOGICAL_ID,
-            "elixir.extensions.torrentio",
+            "elixir.extensions.test_source",
         )
         .await?;
         assert_eq!(extension_resolved.record.provider_id, managed_id);
         assert_eq!(
             extension_resolved.category.as_deref(),
-            Some("elixir-extensions-torrentio-torrent")
+            Some("elixir-extensions-test-source-torrent")
         );
         Ok(())
     }
