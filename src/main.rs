@@ -171,8 +171,8 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = debrid::ensure_real_debrid_builtin(&state).await {
         tracing::warn!("Real-Debrid provider bootstrap failed: {err}");
     }
-    if let Err(err) = torrentio::ensure_torrentio_installed_provider(&state).await {
-        tracing::warn!("Torrentio installed provider bootstrap failed: {err}");
+    if let Err(err) = torrentio::ensure_torrentio_builtin(&state).await {
+        tracing::warn!("Torrentio source bootstrap failed: {err}");
     }
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");

@@ -1656,10 +1656,6 @@ async fn install_extension_internal_with_policy(
         })
         .await?;
 
-    if extension_id == crate::torrentio::TORRENTIO_EXTENSION_ID {
-        crate::torrentio::ensure_torrentio_installed_provider(state).await?;
-    }
-
     Ok(InstallResult {
         response: InstallResponse {
             extension_id,
@@ -1723,11 +1719,6 @@ pub async fn enable_extension(
         .set_extension_enabled(&extension_id, true)
         .await
         .map_err(ApiError::from)?;
-    if extension_id == crate::torrentio::TORRENTIO_EXTENSION_ID {
-        crate::torrentio::ensure_torrentio_installed_provider(&state)
-            .await
-            .map_err(ApiError::from)?;
-    }
     let extension = store
         .get_extension(&extension_id)
         .await
@@ -1896,12 +1887,6 @@ pub async fn create_instance(
         })
         .await
         .map_err(|err| map_unique_violation(err, "instance already exists"))?;
-
-    if extension.extension_id == crate::torrentio::TORRENTIO_EXTENSION_ID {
-        crate::torrentio::ensure_torrentio_installed_provider(&state)
-            .await
-            .map_err(ApiError::from)?;
-    }
 
     let instance = store
         .get_instance(instance_id)

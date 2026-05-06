@@ -14,7 +14,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    db::models::{MediaType, ProviderHealthState, ProviderReadinessPhase, SlotCardinality},
+    db::models::{
+        ExtensionKind, ExtensionTrustLevel, MediaType, ProviderHealthState, ProviderReadinessPhase,
+        SlotCardinality,
+    },
     debrid::REAL_DEBRID_EXTENSION_ID,
     download_broker::{
         DEBRID_DEFAULT_LOGICAL_ID, DownloadBrokerBindingKind, DownloadBrokerRouteRecord,
@@ -22,7 +25,9 @@ use crate::{
     },
     extensions::{
         ExternalIds, MediaIdentity,
-        store::{ExtensionStore, ManagedIngestIntent, NewExtensionInstance, NewProvider},
+        store::{
+            ExtensionStore, ManagedIngestIntent, NewExtension, NewExtensionInstance, NewProvider,
+        },
     },
     http::handlers::download_broker::submit_download_broker_source,
     library::{AniZipEpisodeRecord, AniZipMapping, resolve_anilist_season_chain},
@@ -319,18 +324,28 @@ struct TorrentioSourcePreferences {
     max_size_bytes: Option<u64>,
 }
 
-pub async fn ensure_torrentio_installed_provider(state: &AppState) -> Result<()> {
+pub async fn ensure_torrentio_builtin(state: &AppState) -> Result<()> {
     let store = ExtensionStore::new(&state.db_pool);
-    ensure_torrentio_installed_provider_in_store(&store).await
+    ensure_torrentio_builtin_in_store(&store).await
 }
 
-async fn ensure_torrentio_installed_provider_in_store(store: &ExtensionStore<'_>) -> Result<()> {
-    let Some(extension) = store.get_extension(TORRENTIO_EXTENSION_ID).await? else {
-        return Ok(());
-    };
-    if !extension.enabled {
-        return Ok(());
-    }
+async fn ensure_torrentio_builtin_in_store(store: &ExtensionStore<'_>) -> Result<()> {
+    let existing = store.get_extension(TORRENTIO_EXTENSION_ID).await?;
+    let enabled = existing.as_ref().map(|item| item.enabled).unwrap_or(true);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: TORRENTIO_EXTENSION_ID.to_string(),
+            name: "Torrentio Source".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: Some("Elixir".to_string()),
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: torrentio_manifest_json(),
+            package_hash: None,
+            enabled,
+        })
+        .await?;
 
     let mut instances = store.list_instances(Some(TORRENTIO_EXTENSION_ID)).await?;
     if instances.is_empty() {
@@ -386,7 +401,7 @@ async fn ensure_torrentio_installed_provider_in_store(store: &ExtensionStore<'_>
         .upsert_provider_readiness(
             provider_id,
             ProviderReadinessPhase::DriverReady,
-            Some("Torrentio-compatible source discovery is available through the installed extension package."),
+            Some("Torrentio-compatible source discovery is available."),
         )
         .await?;
     Ok(())
@@ -3422,7 +3437,6 @@ fn non_empty_str(value: &str) -> Option<&str> {
     }
 }
 
-#[cfg(test)]
 fn torrentio_manifest_json() -> Value {
     json!({
         "id": TORRENTIO_EXTENSION_ID,
@@ -3431,7 +3445,7 @@ fn torrentio_manifest_json() -> Value {
         "name": "Torrentio Source",
         "description": "Torrentio-compatible source discovery for brokered download-first acquisition.",
         "publisher": { "name": "Elixir" },
-        "trust": "community",
+        "trust": "verified",
         "permissions": ["network.egress"],
         "provides": [{
             "capability": TORRENTIO_CANDIDATE_CAPABILITY,
@@ -3536,15 +3550,12 @@ mod tests {
     use super::*;
     use crate::{
         config::DatabaseConfig,
-        db::{
-            Database,
-            models::{ExtensionKind, ExtensionTrustLevel},
-        },
+        db::Database,
         download_broker::{
             DownloadBrokerProviderKind, DownloadBrokerRole, DownloadBrokerRouteCandidate,
             list_acquisition_routes,
         },
-        extensions::{manifest::ExtensionManifest, store::NewExtension},
+        extensions::manifest::ExtensionManifest,
     };
 
     async fn setup_db() -> Result<Database> {
@@ -3556,24 +3567,6 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
-    }
-
-    async fn install_torrentio_extension_record(store: &ExtensionStore<'_>) -> Result<()> {
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: TORRENTIO_EXTENSION_ID.to_string(),
-                name: "Torrentio Source".to_string(),
-                version: "0.1.0".to_string(),
-                kind: ExtensionKind::Module,
-                publisher_name: Some("Elixir".to_string()),
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Community,
-                manifest_json: torrentio_manifest_json(),
-                package_hash: Some("test-package".to_string()),
-                enabled: true,
-            })
-            .await?;
-        Ok(())
     }
 
     #[test]
@@ -3636,24 +3629,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_torrentio_provider_does_not_auto_install_extension() -> Result<()> {
+    async fn ensure_torrentio_builtin_installs_instance_provider_and_routes() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
 
-        ensure_torrentio_installed_provider_in_store(&store).await?;
-
-        assert!(store.get_extension(TORRENTIO_EXTENSION_ID).await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ensure_torrentio_installed_provider_creates_instance_provider_and_routes() -> Result<()>
-    {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-
-        install_torrentio_extension_record(&store).await?;
-        ensure_torrentio_installed_provider_in_store(&store).await?;
+        ensure_torrentio_builtin_in_store(&store).await?;
 
         let extension = store
             .get_extension(TORRENTIO_EXTENSION_ID)
@@ -3731,18 +3711,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_torrentio_installed_provider_preserves_disabled_extension_state() -> Result<()>
-    {
+    async fn ensure_torrentio_builtin_preserves_disabled_extension_state() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
 
-        install_torrentio_extension_record(&store).await?;
-        ensure_torrentio_installed_provider_in_store(&store).await?;
+        ensure_torrentio_builtin_in_store(&store).await?;
         store
             .set_extension_enabled(TORRENTIO_EXTENSION_ID, false)
             .await?;
 
-        ensure_torrentio_installed_provider_in_store(&store).await?;
+        ensure_torrentio_builtin_in_store(&store).await?;
 
         let extension = store
             .get_extension(TORRENTIO_EXTENSION_ID)
