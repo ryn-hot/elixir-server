@@ -132,6 +132,10 @@ pub fn router(state: AppState) -> Router {
             patch(handlers::acquisition_subscriptions::patch_acquisition_target_state),
         )
         .route(
+            "/api/v1/acquisition/targets/:target_id/submit",
+            post(handlers::acquisition_subscriptions::submit_acquisition_target_candidate),
+        )
+        .route(
             "/api/v1/download-broker/:logical_id/items/:download_id",
             delete(handlers::download_broker::cancel),
         )

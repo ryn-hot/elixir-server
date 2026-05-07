@@ -46,8 +46,8 @@ use crate::{
     state::AppState,
 };
 
-pub use linkers::LinkerService;
-use linkers::{AniZipEpisodeRecord, AniZipMapping};
+use linkers::AniZipEpisodeRecord;
+pub use linkers::{AniZipMapping, LinkerService};
 
 const ANILIST_ENDPOINT: &str = "https://graphql.anilist.co";
 
@@ -2047,10 +2047,18 @@ async fn load_existing_classification_for_path(
 }
 
 #[derive(Debug, Clone)]
-struct AniListSeasonChainEntry {
-    season_number: i32,
-    anilist_id: String,
-    confidence: f32,
+pub struct AniListSeasonChainEntry {
+    pub season_number: i32,
+    pub anilist_id: String,
+    pub title: String,
+    pub format: Option<String>,
+    pub season_year: Option<i32>,
+    pub start_year: Option<i32>,
+    pub status: Option<String>,
+    pub episodes: Option<i32>,
+    pub next_airing_episode: Option<i32>,
+    pub next_airing_at: Option<i64>,
+    pub confidence: f32,
 }
 
 async fn classify_candidate_files(
@@ -2561,6 +2569,20 @@ async fn expand_anilist_season_chain(
         expanded.push(AniListSeasonChainEntry {
             season_number,
             anilist_id: node.id.to_string(),
+            title: node.title.clone(),
+            format: node.format.clone(),
+            season_year: node.season_year,
+            start_year: node.start_year,
+            status: node.status.clone(),
+            episodes: node.episodes,
+            next_airing_episode: node
+                .next_airing_episode
+                .as_ref()
+                .map(|episode| episode.episode),
+            next_airing_at: node
+                .next_airing_episode
+                .as_ref()
+                .map(|episode| episode.airing_at),
             confidence,
         });
     }
@@ -2574,6 +2596,20 @@ async fn expand_anilist_season_chain(
     }
 
     Ok(expanded)
+}
+
+pub async fn resolve_anilist_season_chain(
+    config: Option<&ClassifierConfig>,
+    seed_season: i32,
+    anilist_id: &str,
+    confidence: f32,
+) -> Result<Vec<AniListSeasonChainEntry>> {
+    let anilist = build_anilist_identifier(config);
+    let seed = SeasonAnilistSeed {
+        anilist_id: anilist_id.trim().to_string(),
+        confidence,
+    };
+    expand_anilist_season_chain(&anilist, seed_season.max(1), &seed).await
 }
 
 fn build_anilist_identifier(config: Option<&ClassifierConfig>) -> AniListIdentifier {

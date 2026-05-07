@@ -31,20 +31,20 @@ use crate::{
     state::AppState,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadBrokerSubmitRequest {
-    source: String,
+    pub source: String,
     #[serde(default)]
-    category: Option<String>,
+    pub category: Option<String>,
     #[serde(default)]
-    paused: Option<bool>,
+    pub paused: Option<bool>,
     #[serde(default)]
-    name: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    priority: Option<i64>,
+    pub priority: Option<i64>,
     #[serde(default)]
-    add_to_top: Option<bool>,
+    pub add_to_top: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,10 +57,10 @@ pub struct DownloadBrokerRouteQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadBrokerSubmitResponse {
-    logical_id: String,
-    provider_id: Uuid,
-    accepted: bool,
-    download_id: Option<String>,
+    pub logical_id: String,
+    pub provider_id: Uuid,
+    pub accepted: bool,
+    pub download_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +79,8 @@ pub struct DownloadBrokerProgressItem {
     name: Option<String>,
     state: Option<String>,
     category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_path: Option<String>,
     progress: Option<f64>,
     downloaded_bytes: Option<u64>,
     total_bytes: Option<u64>,
@@ -153,43 +155,48 @@ pub async fn submit(
     Json(request): Json<DownloadBrokerSubmitRequest>,
 ) -> ApiResult<Json<DownloadBrokerSubmitResponse>> {
     let store = ExtensionStore::new(&state.db_pool);
-    let resolved = resolve_broker_provider(
-        &state.db_pool,
-        &store,
-        &logical_id,
-        query.owner_id.as_deref(),
-    )
-    .await?;
-    ensure_route_allows_submit(&state, &resolved).await?;
+    Ok(Json(
+        submit_to_broker(
+            &state,
+            &store,
+            &logical_id,
+            query.owner_id.as_deref(),
+            request,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn submit_to_broker(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    logical_id: &str,
+    owner_id: Option<&str>,
+    request: DownloadBrokerSubmitRequest,
+) -> ApiResult<DownloadBrokerSubmitResponse> {
+    let resolved = resolve_broker_provider(&state.db_pool, store, logical_id, owner_id).await?;
+    ensure_route_allows_submit(state, &resolved).await?;
     let source = normalized_source(&request.source)?;
 
     let download_id = match resolved.record.role {
         DownloadBrokerRole::Torrent => {
-            submit_qbittorrent(&state, &store, &resolved, source, &request).await?;
+            submit_qbittorrent(state, store, &resolved, source, &request).await?;
             None
         }
         DownloadBrokerRole::Usenet => {
-            Some(submit_nzbget(&state, &store, &resolved, source, &request).await?)
+            Some(submit_nzbget(state, store, &resolved, source, &request).await?)
         }
         DownloadBrokerRole::DebridResolver => Some(
-            submit_real_debrid_broker(
-                &state,
-                &store,
-                &resolved,
-                source,
-                &request,
-                query.owner_id.as_deref(),
-            )
-            .await?,
+            submit_real_debrid_broker(state, store, &resolved, source, &request, owner_id).await?,
         ),
     };
 
-    Ok(Json(DownloadBrokerSubmitResponse {
-        logical_id,
+    Ok(DownloadBrokerSubmitResponse {
+        logical_id: logical_id.to_string(),
         provider_id: resolved.record.provider_id,
         accepted: true,
         download_id,
-    }))
+    })
 }
 
 pub async fn progress(
@@ -478,6 +485,8 @@ async fn load_qbittorrent_progress(
                 name: string_field(item, "name"),
                 state: string_field(item, "state"),
                 category: string_field(item, "category"),
+                local_path: string_field(item, "content_path")
+                    .or_else(|| string_field(item, "save_path")),
                 progress: item.get("progress").and_then(Value::as_f64),
                 downloaded_bytes: number_field(item, "downloaded"),
                 total_bytes: number_field(item, "total_size"),
@@ -536,6 +545,7 @@ async fn load_nzbget_progress(
                 name: string_field(group, "NZBName").or_else(|| string_field(group, "NZBFilename")),
                 state: string_field(group, "Status"),
                 category: string_field(group, "Category"),
+                local_path: None,
                 progress: progress_fraction(downloaded_bytes, total_bytes),
                 downloaded_bytes,
                 total_bytes,
@@ -567,6 +577,7 @@ async fn load_real_debrid_broker_progress(
             name: item.name,
             state: item.state,
             category: item.category,
+            local_path: item.local_path,
             progress: item.progress,
             downloaded_bytes: item.downloaded_bytes,
             total_bytes: item.total_bytes,

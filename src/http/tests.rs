@@ -1554,6 +1554,87 @@ async fn seed_download_broker_provider(
     Ok(provider_id)
 }
 
+async fn seed_acquisition_candidate_provider(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> Result<Uuid> {
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: "Test Candidate Source".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Test Candidate Source",
+                "provides": [
+                    {
+                        "capability": "acquisition.candidate_provider",
+                        "slot": "default",
+                        "cardinality": "many",
+                        "implementation": "test_candidate_provider",
+                        "scope": {
+                            "media_types": ["movie", "tv", "anime"],
+                            "actions": ["search"]
+                        }
+                    }
+                ],
+                "requires": {
+                    "downloads": [
+                        { "kind": "debrid", "mode": "broker", "optional": true },
+                        { "kind": "torrent", "mode": "broker", "optional": true }
+                    ]
+                },
+                "runtime": {
+                    "type": "container",
+                    "image": "test/candidate-source:1.0.0"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("test_candidate_provider".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie", "tv", "anime"],
+                "actions": ["search"]
+            })),
+            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
+                "http".to_string(),
+                "candidate-source".to_string(),
+                8097,
+                None,
+                Some("elixir_net".to_string()),
+            )?)?),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    Ok(provider_id)
+}
+
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
     let settings = test_settings_with_db();
@@ -1979,6 +2060,160 @@ async fn download_broker_debrid_submit_without_token_fails_closed() -> Result<()
             .and_then(Value::as_str)
             .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn acquisition_target_submit_records_source_owned_debrid_account_blocker() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_download_broker_provider(
+        &store,
+        "elixir.modules.real_debrid",
+        "debrid.resolver",
+        "real_debrid",
+        "api.real-debrid.com",
+        Some("debrid"),
+        ProviderHealthState::Healthy,
+    )
+    .await?;
+    let source_extension_id = "elixir.sources.test_candidate_provider";
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, source_extension_id).await?;
+
+    let subscription_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/subscriptions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "mediaType": "movie",
+                    "title": "Example Movie",
+                    "routePolicy": "debrid_first",
+                    "sourceProviderId": source_provider_id,
+                    "targets": [
+                        {
+                            "targetKey": "movie",
+                            "mediaType": "movie",
+                            "title": "Example Movie"
+                        }
+                    ]
+                }))?))?,
+        )
+        .await?;
+
+    let subscription_status = subscription_response.status();
+    let body = body::to_bytes(subscription_response.into_body(), 1_048_576).await?;
+    let created: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        subscription_status,
+        StatusCode::OK,
+        "create subscription response: {created}"
+    );
+    let target_id = created
+        .get("targets")
+        .and_then(Value::as_array)
+        .and_then(|targets| targets.first())
+        .and_then(|target| target.get("targetId"))
+        .and_then(Value::as_str)
+        .context("created target id")?
+        .to_string();
+    let subscription_id = created
+        .pointer("/subscription/subscriptionId")
+        .and_then(Value::as_str)
+        .context("created subscription id")?
+        .to_string();
+
+    let submit_response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/acquisition/targets/{target_id}/submit"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "providerId": source_provider_id,
+                    "candidate": {
+                        "title": "Example Movie 1080p",
+                        "source": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                        "sourceKind": "magnet",
+                        "infoHash": "0123456789abcdef0123456789abcdef01234567",
+                        "supportedRoutes": [
+                            "acquisition.debrid.default",
+                            "downloaders.torrent.default"
+                        ],
+                        "defaultRoute": "acquisition.debrid.default"
+                    }
+                }))?))?,
+        )
+        .await?;
+
+    assert_eq!(submit_response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(submit_response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(json.get("code").and_then(Value::as_str), Some("conflict"));
+    assert!(
+        json.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    );
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/acquisition/subscriptions/{subscription_id}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let body = body::to_bytes(detail_response.into_body(), 1_048_576).await?;
+    let detail: Value = serde_json::from_slice(&body)?;
+    let target = detail
+        .get("targets")
+        .and_then(Value::as_array)
+        .and_then(|targets| targets.first())
+        .context("blocked target")?;
+    assert_eq!(target.get("state").and_then(Value::as_str), Some("blocked"));
+    assert_eq!(
+        target
+            .get("selectedProviderId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok()),
+        Some(source_provider_id)
+    );
+    assert_eq!(
+        target.get("selectedRouteLogicalId").and_then(Value::as_str),
+        Some("acquisition.debrid.default")
+    );
+    assert!(
+        target
+            .get("stateReason")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    );
+    assert_eq!(
+        target
+            .pointer("/selectedCandidate/sourceProviderId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok()),
+        Some(source_provider_id)
+    );
+    assert_eq!(
+        target
+            .pointer("/selectedCandidate/sourceExtensionId")
+            .and_then(Value::as_str),
+        Some(source_extension_id)
+    );
+    assert_eq!(
+        target
+            .pointer("/selectedCandidate/sourceKind")
+            .and_then(Value::as_str),
+        Some("magnet")
+    );
+    assert_eq!(target.get("downloadId").and_then(Value::as_str), None);
     Ok(())
 }
 

@@ -7,7 +7,9 @@ use serde_json::Value as JsonValue;
 use sqlx::{AnyPool, Row, TypeInfo, Value as SqlxValue, ValueRef, any::AnyRow};
 use uuid::Uuid;
 
-use crate::{db::models::MediaType, extensions::ExternalIds};
+use crate::{
+    db::models::MediaType, download_broker::DEBRID_DEFAULT_LOGICAL_ID, extensions::ExternalIds,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -455,6 +457,27 @@ pub async fn update_subscription(
     get_subscription(pool, subscription_id).await
 }
 
+pub async fn update_subscription_external_ids(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    external_ids: &ExternalIds,
+) -> Result<Option<AcquisitionSubscription>> {
+    let external_ids_json = external_ids_json(Some(external_ids))?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_subscriptions
+         SET external_ids_json = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?",
+    )
+    .bind(external_ids_json.as_deref())
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("updating acquisition subscription external ids")?;
+
+    get_subscription(pool, subscription_id).await
+}
+
 pub async fn list_subscriptions(
     pool: &AnyPool,
     filter: AcquisitionSubscriptionFilter,
@@ -713,7 +736,6 @@ pub async fn update_target_state(
     get_target(pool, target_id).await
 }
 
-#[allow(dead_code)]
 pub async fn list_due_metadata_subscriptions(
     pool: &AnyPool,
     now: DateTime<Utc>,
@@ -754,7 +776,6 @@ pub async fn list_due_metadata_subscriptions(
     rows.into_iter().map(|row| map_subscription(&row)).collect()
 }
 
-#[allow(dead_code)]
 pub async fn list_due_candidate_targets(
     pool: &AnyPool,
     now: DateTime<Utc>,
@@ -803,7 +824,6 @@ pub async fn list_due_candidate_targets(
     rows.into_iter().map(|row| map_target(&row)).collect()
 }
 
-#[allow(dead_code)]
 pub async fn record_metadata_refresh(
     pool: &AnyPool,
     subscription_id: Uuid,
@@ -844,6 +864,52 @@ pub async fn record_candidate_search(
     .await
     .context("recording acquisition candidate search")?;
     Ok(())
+}
+
+pub async fn list_submitted_debrid_targets(
+    pool: &AnyPool,
+    limit: i64,
+) -> Result<Vec<AcquisitionTarget>> {
+    let rows = sqlx::query(
+        "SELECT
+            t.target_id,
+            t.subscription_id,
+            t.target_key,
+            t.media_type,
+            t.title,
+            t.season_number,
+            t.episode_number,
+            t.absolute_episode_number,
+            CAST(t.air_date AS TEXT) AS air_date,
+            CAST(t.air_time AS TEXT) AS air_time,
+            CAST(t.metadata_json AS TEXT) AS metadata_json,
+            t.state,
+            CAST(t.state_reason AS TEXT) AS state_reason,
+            CAST(t.selected_provider_id AS TEXT) AS selected_provider_id,
+            CAST(t.selected_route_logical_id AS TEXT) AS selected_route_logical_id,
+            CAST(t.selected_candidate_json AS TEXT) AS selected_candidate_json,
+            CAST(t.download_id AS TEXT) AS download_id,
+            CAST(t.import_event_id AS TEXT) AS import_event_id,
+            t.search_attempts,
+            CAST(t.last_search_at AS TEXT) AS last_search_at,
+            CAST(t.next_search_after AS TEXT) AS next_search_after,
+            CAST(t.created_at AS TEXT) AS created_at,
+            CAST(t.updated_at AS TEXT) AS updated_at
+         FROM acquisition_targets t
+         JOIN acquisition_subscriptions s ON s.subscription_id = t.subscription_id
+         WHERE s.active = 1
+           AND s.status = 'active'
+           AND t.state = 'submitted'
+           AND t.selected_route_logical_id = ?
+           AND t.download_id IS NOT NULL
+         ORDER BY t.updated_at ASC
+         LIMIT ?",
+    )
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(|row| map_target(&row)).collect()
 }
 
 async fn upsert_subscription_target(
@@ -957,7 +1023,7 @@ async fn upsert_subscription_target(
     Ok(())
 }
 
-async fn get_target(pool: &AnyPool, target_id: Uuid) -> Result<Option<AcquisitionTarget>> {
+pub async fn get_target(pool: &AnyPool, target_id: Uuid) -> Result<Option<AcquisitionTarget>> {
     let row = sqlx::query(
         "SELECT
             target_id,
@@ -1128,7 +1194,7 @@ fn map_subscription(row: &AnyRow) -> Result<AcquisitionSubscription> {
         "acquisition_subscriptions.quality_profile_json",
     )?;
     let status_raw: String = row.try_get("status")?;
-    let year: Option<i64> = row.try_get("year")?;
+    let year = row_get_i64_opt(row, "year")?;
 
     Ok(AcquisitionSubscription {
         subscription_id: parse_uuid(

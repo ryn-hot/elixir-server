@@ -235,7 +235,7 @@ pub async fn search_candidates(
     Ok(Json(response))
 }
 
-async fn search_candidates_with_store(
+pub(crate) async fn search_candidates_with_store(
     pool: &sqlx::AnyPool,
     request: CandidateSearchRequest,
 ) -> Result<CandidateSearchResponse> {
@@ -248,7 +248,7 @@ async fn search_candidates_with_store(
     let candidates = upstream
         .candidates
         .into_iter()
-        .map(normalize_candidate)
+        .map(normalize_acquisition_candidate)
         .collect::<Result<Vec<_>>>()?;
 
     Ok(CandidateSearchResponse {
@@ -463,7 +463,9 @@ fn validate_candidate_search_request(request: &CandidateSearchRequest) -> Result
     Ok(())
 }
 
-fn normalize_candidate(mut candidate: AcquisitionCandidate) -> Result<AcquisitionCandidate> {
+pub(crate) fn normalize_acquisition_candidate(
+    mut candidate: AcquisitionCandidate,
+) -> Result<AcquisitionCandidate> {
     candidate.title = candidate.title.trim().to_string();
     candidate.source = candidate.source.trim().to_string();
     candidate.source_kind = candidate.source_kind.trim().to_ascii_lowercase();
@@ -549,7 +551,7 @@ mod tests {
 
     #[test]
     fn normalize_candidate_rejects_missing_source() {
-        let err = normalize_candidate(AcquisitionCandidate {
+        let err = normalize_acquisition_candidate(AcquisitionCandidate {
             id: None,
             title: "Release".to_string(),
             source: " ".to_string(),
@@ -707,7 +709,7 @@ mod tests {
         let candidates = upstream
             .candidates
             .into_iter()
-            .map(normalize_candidate)
+            .map(normalize_acquisition_candidate)
             .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(selected.summary.provider_id, provider_id);

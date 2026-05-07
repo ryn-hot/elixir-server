@@ -210,6 +210,12 @@ async fn main() -> anyhow::Result<()> {
         acquisition::start_acquisition_recovery_loop(acquisition_recovery_state).await;
     });
 
+    let acquisition_automation_state = state.clone();
+    tokio::spawn(async move {
+        acquisition::automation::start_acquisition_automation_loop(acquisition_automation_state)
+            .await;
+    });
+
     let debrid_materializer_state = state.clone();
     tokio::spawn(async move {
         debrid::start_debrid_materializer_loop(debrid_materializer_state).await;

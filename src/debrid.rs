@@ -35,11 +35,19 @@ pub struct DebridBrokerProgressItem {
     pub name: Option<String>,
     pub state: Option<String>,
     pub category: Option<String>,
+    pub local_path: Option<String>,
     pub progress: Option<f64>,
     pub downloaded_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub remaining_bytes: Option<u64>,
     pub download_rate_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebridJobStatus {
+    pub job_id: Uuid,
+    pub status: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +502,7 @@ pub async fn load_real_debrid_progress(
                 .or_else(|| Some(job.source.clone())),
             state: Some(job.status),
             category: job.category,
+            local_path: job.local_path,
             progress: job.progress,
             downloaded_bytes: job.downloaded_bytes,
             total_bytes: job.total_bytes,
@@ -501,6 +510,30 @@ pub async fn load_real_debrid_progress(
             download_rate_bps: job.download_rate_bps,
         })
         .collect())
+}
+
+pub async fn get_debrid_job_status(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+) -> Result<Option<DebridJobStatus>> {
+    let row = sqlx::query(
+        "SELECT status, COALESCE(CAST(last_error AS TEXT), '') as last_error
+         FROM debrid_download_jobs
+         WHERE job_id = ?
+         LIMIT 1",
+    )
+    .bind(job_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        Ok(DebridJobStatus {
+            job_id,
+            status: row.try_get("status")?,
+            last_error: empty_string_to_none(row.try_get::<String, _>("last_error")?),
+        })
+    })
+    .transpose()
 }
 
 pub async fn cancel_real_debrid_job(
@@ -588,13 +621,22 @@ async fn materialize_debrid_links(
     job: &DebridDownloadJob,
 ) -> Result<()> {
     mark_debrid_job_status(&state.db_pool, job.job_id, "materializing", None).await?;
-    let target_dir = Path::new(&paths.downloads_root).join(
+    let mut target_dir = Path::new(&paths.downloads_root).join(
         job.category
             .as_deref()
             .map(safe_path_segment)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "debrid".to_string()),
     );
+    if job.links.len() > 1 {
+        let pack_dir = job
+            .display_name
+            .as_deref()
+            .map(safe_path_segment)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| job.job_id.to_string());
+        target_dir = target_dir.join(pack_dir);
+    }
     tokio::fs::create_dir_all(&target_dir)
         .await
         .with_context(|| format!("creating debrid download dir '{}'", target_dir.display()))?;
@@ -623,9 +665,13 @@ async fn materialize_debrid_links(
         .await?;
         completed_paths.push(target_path);
     }
-    let local_path = completed_paths
-        .first()
-        .map(|path| path.to_string_lossy().to_string());
+    let local_path = if completed_paths.len() == 1 {
+        completed_paths
+            .first()
+            .map(|path| path.to_string_lossy().to_string())
+    } else {
+        Some(target_dir.to_string_lossy().to_string())
+    };
     mark_debrid_job_completed(&state.db_pool, job.job_id, local_path.as_deref()).await?;
     Ok(())
 }

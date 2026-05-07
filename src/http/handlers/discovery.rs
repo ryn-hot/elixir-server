@@ -22,8 +22,17 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    acquisition::{AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView, load_intent_recovery_views},
+    acquisition::{
+        AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView, load_intent_recovery_views,
+        subscriptions::{
+            AcquisitionSubscription, AcquisitionSubscriptionFilter, AcquisitionTarget,
+            AcquisitionTargetState, AcquisitionTargetStateUpdate, list_subscription_targets,
+            list_subscriptions, update_target_state,
+        },
+    },
     db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
+    debrid::{is_real_debrid_implementation, load_real_debrid_progress},
+    download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
     drivers::{
         AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
     },
@@ -39,6 +48,7 @@ use crate::{
     library::{ingest_managed_import_event, managed_episode_tombstone_matches_series},
     metadata::DiscoveryResult,
     orchestrator::model::ProviderEndpoint,
+    runtime::RuntimePaths,
     state::AppState,
 };
 
@@ -49,6 +59,11 @@ const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.insta
 const NZBGET_DRONE_DOWNLOAD_ID_PARAM: &str = "drone";
 const TORRENT_METADATA_STALL_TIMEOUT_SECONDS: i64 = 10 * 60;
 const TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS: i64 = 15 * 60;
+const SOURCE_ACQUISITION_INTENT_SOURCE: &str = "acquisition_subscription";
+const SOURCE_ACQUISITION_FILE_SELECTION_REASON: &str =
+    "Downloaded pack needs file selection before import.";
+const SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON: &str =
+    "Downloaded file is waiting for library visibility.";
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -558,6 +573,7 @@ struct AcquisitionDownloaderProgress {
     release_title: Option<String>,
     status: Option<String>,
     category: Option<String>,
+    local_path: Option<String>,
     progress_percent: Option<f64>,
     eta_seconds: Option<i64>,
     size_bytes: Option<u64>,
@@ -581,6 +597,25 @@ struct AcquisitionDownloaderIssue {
     detail: String,
 }
 
+#[derive(Debug)]
+enum SourceImportSelection {
+    Ready(ManagedImportFile),
+    Pending,
+    NeedsFileSelection(String),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceAcquisitionCounts {
+    requested: usize,
+    queued: usize,
+    downloading: usize,
+    post_processing: usize,
+    importing: usize,
+    completed: usize,
+    needs_attention: usize,
+    failed: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct AcquisitionQbittorrentTorrent {
     #[serde(default)]
@@ -591,6 +626,10 @@ struct AcquisitionQbittorrentTorrent {
     state: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    content_path: Option<String>,
+    #[serde(default)]
+    save_path: Option<String>,
     #[serde(default)]
     progress: Option<f64>,
     #[serde(default)]
@@ -1142,8 +1181,13 @@ async fn build_find_media_acquisition_response(
     let downloader_totals = load_acquisition_downloader_totals(state, store).await?;
     let recent_cutoff = Utc::now() - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS);
 
+    sync_source_acquisition_imports(state, store, &provider_map, &downloader_progress).await?;
+
     let mut items = Vec::new();
     for intent in store.list_active_managed_ingest_intents().await? {
+        if intent.source == SOURCE_ACQUISITION_INTENT_SOURCE {
+            continue;
+        }
         let item = build_find_media_acquisition_item(
             state,
             store,
@@ -1161,6 +1205,16 @@ async fn build_find_media_acquisition_response(
         }
         items.push(item);
     }
+    items.extend(
+        build_source_acquisition_items(
+            state,
+            store,
+            &provider_map,
+            &downloader_progress,
+            recent_cutoff,
+        )
+        .await?,
+    );
 
     items.sort_by(|left, right| {
         let left_phase = acquisition_phase_from_str(&left.phase);
@@ -1266,6 +1320,1047 @@ async fn build_find_media_acquisition_item(
         updated_at: intent.updated_at,
         children: state_view.children,
     })
+}
+
+async fn sync_source_acquisition_imports(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> AnyResult<()> {
+    let subscriptions = list_subscriptions(
+        &state.db_pool,
+        AcquisitionSubscriptionFilter { active: Some(true) },
+    )
+    .await?;
+
+    for subscription in subscriptions {
+        let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id)
+            .await?
+            .into_iter()
+            .filter(|target| target.state == AcquisitionTargetState::Submitted)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            continue;
+        }
+
+        let Some(source_provider_id) = source_provider_id_for_subscription(&subscription, &targets)
+        else {
+            continue;
+        };
+        let source_label = provider_map
+            .get(&source_provider_id)
+            .map(provider_label)
+            .unwrap_or_else(|| "Acquisition source".to_string());
+        let source_implementation = provider_map
+            .get(&source_provider_id)
+            .and_then(|provider| provider.detail.provider.implementation.clone());
+
+        let mut intent = None;
+        for target in targets {
+            let Some(download_id) = target.download_id.as_deref() else {
+                continue;
+            };
+            let Some(progress) = downloader_progress.get(download_id) else {
+                continue;
+            };
+            if !downloader_progress_is_completed(progress) {
+                continue;
+            }
+
+            match select_source_import_file(state, &subscription, &target, progress) {
+                SourceImportSelection::Pending => {}
+                SourceImportSelection::NeedsFileSelection(reason) => {
+                    update_target_state(
+                        &state.db_pool,
+                        target.target_id,
+                        AcquisitionTargetStateUpdate {
+                            state: AcquisitionTargetState::Submitted,
+                            state_reason: Some(reason),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                }
+                SourceImportSelection::Ready(file) => {
+                    if intent.is_none() {
+                        intent = Some(
+                            upsert_source_managed_ingest_intent(
+                                store,
+                                &subscription,
+                                source_provider_id,
+                                &source_label,
+                            )
+                            .await?,
+                        );
+                    }
+                    let Some(intent) = intent.as_ref() else {
+                        continue;
+                    };
+                    let event = source_managed_import_event(
+                        intent,
+                        &subscription,
+                        &target,
+                        source_provider_id,
+                        &source_label,
+                        source_implementation.as_deref(),
+                        file,
+                        progress,
+                    );
+                    let persisted = store.upsert_managed_import_event(&event).await?;
+                    match ingest_managed_import_event(
+                        &state.db_pool,
+                        Some(state.metadata.as_ref()),
+                        Some(state.linkers.as_ref()),
+                        Some(state.artwork.as_ref()),
+                        intent,
+                        &persisted,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            update_target_state(
+                                &state.db_pool,
+                                target.target_id,
+                                AcquisitionTargetStateUpdate {
+                                    state: AcquisitionTargetState::Imported,
+                                    state_reason: Some(
+                                        "Imported into the Elixir library.".to_string(),
+                                    ),
+                                    import_event_id: Some(persisted.event_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(None) => {
+                            update_target_state(
+                                &state.db_pool,
+                                target.target_id,
+                                AcquisitionTargetStateUpdate {
+                                    state: AcquisitionTargetState::Submitted,
+                                    state_reason: Some(
+                                        SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON.to_string(),
+                                    ),
+                                    import_event_id: Some(persisted.event_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        }
+                        Err(err) => {
+                            let detail = err.to_string();
+                            store
+                                .mark_managed_import_event_failed(persisted.event_id, &detail)
+                                .await?;
+                            update_target_state(
+                                &state.db_pool,
+                                target.target_id,
+                                AcquisitionTargetStateUpdate {
+                                    state: AcquisitionTargetState::Submitted,
+                                    state_reason: Some(format!("Import failed: {detail}")),
+                                    import_event_id: Some(persisted.event_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn upsert_source_managed_ingest_intent(
+    store: &ExtensionStore<'_>,
+    subscription: &AcquisitionSubscription,
+    source_provider_id: Uuid,
+    source_label: &str,
+) -> AnyResult<crate::extensions::store::ManagedIngestIntent> {
+    let intent_id = store
+        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
+            media_type: subscription.media_type,
+            title: subscription.title.clone(),
+            normalized_title: subscription.normalized_title.clone(),
+            year: subscription.year,
+            external_ids: subscription.external_ids.clone(),
+            manager_provider_id: source_provider_id,
+            manager_item_id: Some(subscription.subscription_id.to_string()),
+            manager_label: Some(source_label.to_string()),
+            source: SOURCE_ACQUISITION_INTENT_SOURCE.to_string(),
+        })
+        .await?;
+    store
+        .list_active_managed_ingest_intents()
+        .await?
+        .into_iter()
+        .find(|intent| intent.intent_id == intent_id)
+        .ok_or_else(|| anyhow::anyhow!("source acquisition managed intent was not readable"))
+}
+
+fn source_managed_import_event(
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    source_provider_id: Uuid,
+    source_label: &str,
+    source_implementation: Option<&str>,
+    file: ManagedImportFile,
+    progress: &AcquisitionDownloaderProgress,
+) -> NewManagedImportEvent {
+    let event_key = managed_import_event_key(
+        intent,
+        "source_acquisition",
+        &[format!(
+            "target:{}:{}",
+            target.target_id,
+            file.path.to_ascii_lowercase()
+        )],
+    );
+    NewManagedImportEvent {
+        event_key,
+        intent_id: intent.intent_id,
+        media_type: target.media_type,
+        external_ids: subscription.external_ids.clone(),
+        manager_provider_id: source_provider_id,
+        manager_item_id: Some(subscription.subscription_id.to_string()),
+        manager_label: Some(source_label.to_string()),
+        manager_implementation: source_implementation.map(str::to_string),
+        imported_files: vec![file],
+        raw_manager_payload: Some(json!({
+            "acquisitionSubscriptionId": subscription.subscription_id.to_string(),
+            "acquisitionTargetId": target.target_id.to_string(),
+            "targetKey": target.target_key.clone(),
+            "selectedProviderId": target.selected_provider_id.map(|value| value.to_string()),
+            "selectedRouteLogicalId": target.selected_route_logical_id.clone(),
+            "selectedCandidate": target.selected_candidate.clone(),
+            "downloadId": target.download_id.clone(),
+            "download": {
+                "releaseTitle": progress.release_title.clone(),
+                "status": progress.status.clone(),
+                "category": progress.category.clone(),
+                "localPath": progress.local_path.clone(),
+                "progressPercent": progress.progress_percent,
+                "downloadedBytes": progress.downloaded_bytes,
+                "totalBytes": progress.size_bytes
+            }
+        })),
+        imported_at: Some(Utc::now()),
+    }
+}
+
+async fn build_source_acquisition_items(
+    state: &AppState,
+    _store: &ExtensionStore<'_>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+    recent_cutoff: DateTime<Utc>,
+) -> AnyResult<Vec<FindMediaAcquisitionItem>> {
+    let subscriptions = list_subscriptions(
+        &state.db_pool,
+        AcquisitionSubscriptionFilter { active: Some(true) },
+    )
+    .await?;
+    let mut items = Vec::new();
+
+    for subscription in subscriptions {
+        let targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        let visible_targets = targets
+            .into_iter()
+            .filter(|target| target.state != AcquisitionTargetState::Excluded)
+            .collect::<Vec<_>>();
+        if visible_targets.is_empty() {
+            continue;
+        }
+        let Some(item) = build_source_acquisition_item(
+            &subscription,
+            &visible_targets,
+            provider_map,
+            downloader_progress,
+        ) else {
+            continue;
+        };
+        if item.phase == AcquisitionPhase::Completed.as_str() {
+            let reference = item.last_matched_at.unwrap_or(item.updated_at);
+            if reference < recent_cutoff {
+                continue;
+            }
+        }
+        items.push(item);
+    }
+
+    Ok(items)
+}
+
+fn build_source_acquisition_item(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+    provider_map: &HashMap<Uuid, ProviderContext>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+) -> Option<FindMediaAcquisitionItem> {
+    let source_provider_id = source_provider_id_for_subscription(subscription, targets);
+    let source_provider = source_provider_id.and_then(|id| provider_map.get(&id));
+    let manager_provider_id = source_provider_id.unwrap_or_else(Uuid::nil);
+    let source_label = source_provider
+        .map(provider_label)
+        .unwrap_or_else(|| "Acquisition source".to_string());
+
+    let mut children = targets
+        .iter()
+        .map(|target| {
+            build_source_acquisition_child(
+                target,
+                target
+                    .download_id
+                    .as_deref()
+                    .and_then(|download_id| downloader_progress.get(download_id)),
+            )
+        })
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        return None;
+    }
+    children.sort_by(|left, right| {
+        let left_phase = acquisition_phase_from_str(&left.phase);
+        let right_phase = acquisition_phase_from_str(&right.phase);
+        left_phase
+            .sort_priority()
+            .cmp(&right_phase.sort_priority())
+            .then_with(|| {
+                source_target_sort_key(&left.title).cmp(&source_target_sort_key(&right.title))
+            })
+    });
+    if children.len() > 250 {
+        children.truncate(250);
+    }
+
+    let counts = source_acquisition_counts(&children);
+    let phase = summarize_source_acquisition_phase(counts);
+    let last_matched_at = targets
+        .iter()
+        .filter(|target| target.state == AcquisitionTargetState::Imported)
+        .map(|target| target.updated_at.clone())
+        .max();
+    let updated_at = targets
+        .iter()
+        .map(|target| target.updated_at.clone())
+        .max()
+        .unwrap_or_else(|| subscription.updated_at.clone());
+    let progress_percent = source_parent_progress(&children);
+    let downloader_label = children
+        .iter()
+        .filter_map(|child| child.downloader_label.clone())
+        .next();
+    let protocol = children
+        .iter()
+        .filter_map(|child| child.protocol.clone())
+        .next();
+    let blocker = build_source_acquisition_blocker(&children);
+    let mut evidence = vec![
+        acquisition_evidence("Source", source_label.clone(), Some("neutral")),
+        acquisition_evidence("Targets", targets.len().to_string(), Some("neutral")),
+        acquisition_evidence("Imported", counts.completed.to_string(), Some("success")),
+    ];
+    if let Some(route) = subscription_route_evidence(targets) {
+        evidence.push(acquisition_evidence("Route", route, Some("neutral")));
+    }
+
+    Some(FindMediaAcquisitionItem {
+        intent_id: subscription.subscription_id,
+        title: subscription.title.clone(),
+        media_type: media_type_api_name(subscription.media_type).to_string(),
+        year: subscription.year,
+        external_ids: subscription.external_ids.clone(),
+        manager_provider_id,
+        manager_label: source_label,
+        manager_item_id: Some(subscription.subscription_id.to_string()),
+        source: SOURCE_ACQUISITION_INTENT_SOURCE.to_string(),
+        phase: phase.as_str().to_string(),
+        phase_label: phase.label().to_string(),
+        headline: format_source_acquisition_headline(counts, targets.len()),
+        detail: Some(format_source_acquisition_detail(counts, targets.len())),
+        blocker,
+        evidence,
+        actions: Vec::new(),
+        stage: phase.legacy_stage().to_string(),
+        stage_label: phase.legacy_stage_label().to_string(),
+        description: format_source_acquisition_detail(counts, targets.len()),
+        progress_percent,
+        eta_seconds: children.iter().find_map(|child| child.eta_seconds),
+        downloader_label,
+        protocol,
+        last_matched_at,
+        created_at: subscription.created_at.clone(),
+        updated_at,
+        children,
+    })
+}
+
+fn build_source_acquisition_child(
+    target: &AcquisitionTarget,
+    progress: Option<&AcquisitionDownloaderProgress>,
+) -> FindMediaAcquisitionChildItem {
+    let phase = source_target_phase(target, progress);
+    let blocker = source_target_blocker(target, progress, phase);
+    let selected_title = selected_candidate_title(target);
+    let title = source_target_title(target, selected_title.as_deref(), progress);
+    let subtitle = source_target_subtitle(target, selected_title.as_deref());
+    let route = target.selected_route_logical_id.as_deref();
+    let downloader_label = source_route_downloader_label(route);
+    let protocol = source_route_protocol(route);
+
+    FindMediaAcquisitionChildItem {
+        id: target.target_id.to_string(),
+        title,
+        subtitle,
+        download_id: target.download_id.clone(),
+        status: progress
+            .and_then(|item| item.status.clone())
+            .or_else(|| Some(target.state.as_str().to_string())),
+        category: progress.and_then(|item| item.category.clone()),
+        phase: phase.as_str().to_string(),
+        phase_label: phase.label().to_string(),
+        headline: source_target_headline(target, phase, downloader_label.as_deref()),
+        detail: source_target_detail(target, phase, selected_title.as_deref()),
+        blocker,
+        progress_percent: if target.state == AcquisitionTargetState::Imported {
+            Some(100.0)
+        } else {
+            progress.and_then(|item| item.progress_percent)
+        },
+        eta_seconds: progress.and_then(|item| item.eta_seconds),
+        downloader_label,
+        protocol,
+        size_bytes: progress.and_then(|item| item.size_bytes),
+        downloaded_bytes: progress.and_then(|item| item.downloaded_bytes),
+        remaining_bytes: progress.and_then(|item| item.remaining_bytes),
+        download_rate_bps: progress.and_then(|item| item.download_rate_bps),
+        upload_rate_bps: progress.and_then(|item| item.upload_rate_bps),
+        connected_seeds: progress.and_then(|item| item.connected_seeds),
+        connected_peers: progress.and_then(|item| item.connected_peers),
+        known_seeds: progress.and_then(|item| item.known_seeds),
+        known_peers: progress.and_then(|item| item.known_peers),
+        availability: progress.and_then(|item| item.availability),
+        seen_complete_at: progress.and_then(|item| item.seen_complete_at),
+    }
+}
+
+fn source_provider_id_for_subscription(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+) -> Option<Uuid> {
+    subscription.source_provider_id.or_else(|| {
+        targets
+            .iter()
+            .find_map(|target| target.selected_provider_id)
+    })
+}
+
+fn select_source_import_file(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    progress: &AcquisitionDownloaderProgress,
+) -> SourceImportSelection {
+    let Some(raw_path) = progress
+        .local_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return SourceImportSelection::Pending;
+    };
+    let path = resolve_download_visible_path(state, raw_path);
+    select_source_import_file_from_visible_path(subscription, target, &path)
+}
+
+fn select_source_import_file_from_visible_path(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    path: &str,
+) -> SourceImportSelection {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return SourceImportSelection::Pending,
+    };
+    if metadata.is_file() {
+        if !is_video_file_path(StdPath::new(path)) {
+            return SourceImportSelection::Pending;
+        }
+        return SourceImportSelection::Ready(managed_import_file_for_target(
+            target,
+            path,
+            Some(metadata.len()),
+        ));
+    }
+    if !metadata.is_dir() {
+        return SourceImportSelection::Pending;
+    }
+
+    let mut files = collect_video_files(StdPath::new(path), 500);
+    if files.is_empty() {
+        return SourceImportSelection::Pending;
+    }
+    files.sort_by(|left, right| right.1.cmp(&left.1));
+
+    if target.media_type == MediaType::Movie {
+        let (path, size) = files.remove(0);
+        return SourceImportSelection::Ready(managed_import_file_for_target(
+            target,
+            &path.to_string_lossy(),
+            Some(size),
+        ));
+    }
+
+    let hints = source_target_file_hints(subscription, target);
+    let mut matches = files
+        .iter()
+        .filter(|(path, _)| video_path_matches_hints(path, &hints))
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.1.cmp(&left.1));
+    if matches.len() == 1 {
+        let (path, size) = matches.remove(0);
+        return SourceImportSelection::Ready(managed_import_file_for_target(
+            target,
+            &path.to_string_lossy(),
+            Some(size),
+        ));
+    }
+    if files.len() == 1 {
+        let (path, size) = files.remove(0);
+        return SourceImportSelection::Ready(managed_import_file_for_target(
+            target,
+            &path.to_string_lossy(),
+            Some(size),
+        ));
+    }
+
+    SourceImportSelection::NeedsFileSelection(SOURCE_ACQUISITION_FILE_SELECTION_REASON.to_string())
+}
+
+fn resolve_download_visible_path(state: &AppState, path: &str) -> String {
+    let path = path.trim();
+    let raw = StdPath::new(path);
+    let downloads = StdPath::new("/downloads");
+    if let Ok(relative) = raw.strip_prefix(downloads) {
+        let runtime_paths = RuntimePaths::from_roots(
+            &state.settings.extensions.storage_root,
+            &state.settings.library.local_root,
+        );
+        return StdPath::new(&runtime_paths.downloads_root)
+            .join(relative)
+            .to_string_lossy()
+            .to_string();
+    }
+    path.to_string()
+}
+
+fn collect_video_files(root: &StdPath, max_files: usize) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    collect_video_files_inner(root, max_files, &mut out);
+    out
+}
+
+fn collect_video_files_inner(
+    root: &StdPath,
+    max_files: usize,
+    out: &mut Vec<(std::path::PathBuf, u64)>,
+) {
+    if out.len() >= max_files {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max_files {
+            break;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_video_files_inner(&path, max_files, out);
+        } else if metadata.is_file() && is_video_file_path(&path) {
+            out.push((path, metadata.len()));
+        }
+    }
+}
+
+fn is_video_file_path(path: &StdPath) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "mkv" | "mp4" | "m4v" | "avi" | "mov" | "wmv" | "ts" | "m2ts" | "webm"
+    )
+}
+
+fn source_target_file_hints(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    if let (Some(season), Some(episode)) = (target.season_number, target.episode_number) {
+        hints.push(normalize_file_hint(&format!("S{season:02}E{episode:02}")));
+        hints.push(normalize_file_hint(&format!("{season}x{episode:02}")));
+    }
+    if let Some(value) = candidate_file_hint(target) {
+        hints.push(normalize_file_hint(&value));
+    }
+    if let Some(title) = selected_candidate_title(target) {
+        hints.push(normalize_file_hint(&title));
+    }
+    if target.title != subscription.title {
+        hints.push(normalize_file_hint(&target.title));
+    }
+    hints.into_iter().filter(|value| value.len() >= 4).fold(
+        Vec::<String>::new(),
+        |mut acc, value| {
+            if !acc.contains(&value) {
+                acc.push(value);
+            }
+            acc
+        },
+    )
+}
+
+fn candidate_file_hint(target: &AcquisitionTarget) -> Option<String> {
+    let candidate = target.selected_candidate.as_ref()?;
+    [
+        "/raw/stream/behaviorHints/filename",
+        "/raw/stream/filename",
+        "/raw/stream/fileName",
+        "/raw/fileName",
+        "/raw/filePath",
+        "/fileName",
+        "/filePath",
+        "/path",
+    ]
+    .into_iter()
+    .find_map(|pointer| {
+        candidate
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn video_path_matches_hints(path: &StdPath, hints: &[String]) -> bool {
+    if hints.is_empty() {
+        return false;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let normalized = normalize_file_hint(file_name);
+    hints
+        .iter()
+        .any(|hint| !hint.is_empty() && (normalized.contains(hint) || hint.contains(&normalized)))
+}
+
+fn normalize_file_hint(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn managed_import_file_for_target(
+    target: &AcquisitionTarget,
+    path: &str,
+    size_bytes: Option<u64>,
+) -> ManagedImportFile {
+    ManagedImportFile {
+        path: path.to_string(),
+        season_number: target.season_number,
+        episode_number: target.episode_number,
+        absolute_episode_number: target.absolute_episode_number,
+        episode_title: Some(target.title.clone()).filter(|value| !value.trim().is_empty()),
+        size_bytes: size_bytes.and_then(|value| i64::try_from(value).ok()),
+        container: StdPath::new(path)
+            .extension()
+            .map(|value| value.to_string_lossy().to_string()),
+        video_codec: None,
+        audio_codec: None,
+    }
+}
+
+fn downloader_progress_is_completed(progress: &AcquisitionDownloaderProgress) -> bool {
+    progress
+        .progress_percent
+        .map(|value| value >= 99.5)
+        .unwrap_or(false)
+        || progress.remaining_bytes == Some(0)
+        || progress
+            .status
+            .as_deref()
+            .map(|value| {
+                let status = value.trim().to_ascii_lowercase();
+                matches!(
+                    status.as_str(),
+                    "completed"
+                        | "rd_downloaded"
+                        | "uploading"
+                        | "stalledup"
+                        | "forcedup"
+                        | "pausedup"
+                        | "queuedup"
+                ) || status.contains("completed")
+            })
+            .unwrap_or(false)
+}
+
+fn source_target_phase(
+    target: &AcquisitionTarget,
+    progress: Option<&AcquisitionDownloaderProgress>,
+) -> AcquisitionPhase {
+    match target.state {
+        AcquisitionTargetState::Imported => return AcquisitionPhase::Completed,
+        AcquisitionTargetState::Blocked => return AcquisitionPhase::NeedsAttention,
+        AcquisitionTargetState::Pending => return AcquisitionPhase::Requested,
+        AcquisitionTargetState::Searching => return AcquisitionPhase::FindingAnotherRelease,
+        AcquisitionTargetState::Excluded => return AcquisitionPhase::Completed,
+        AcquisitionTargetState::Submitted => {}
+    }
+
+    if target
+        .state_reason
+        .as_deref()
+        .is_some_and(source_reason_needs_attention)
+    {
+        return AcquisitionPhase::NeedsAttention;
+    }
+    if target.import_event_id.is_some()
+        && target
+            .state_reason
+            .as_deref()
+            .is_some_and(|reason| reason == SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON)
+    {
+        return AcquisitionPhase::Importing;
+    }
+    let Some(progress) = progress else {
+        return AcquisitionPhase::QueuedInDownloader;
+    };
+    if progress.issue.is_some() {
+        return AcquisitionPhase::NeedsAttention;
+    }
+    if downloader_progress_is_completed(progress) {
+        return AcquisitionPhase::PostProcessing;
+    }
+    if progress
+        .progress_percent
+        .map(|value| value > 0.0)
+        .unwrap_or(false)
+        || progress.download_rate_bps.unwrap_or(0) > 0
+    {
+        return AcquisitionPhase::Downloading;
+    }
+    AcquisitionPhase::QueuedInDownloader
+}
+
+fn source_reason_needs_attention(reason: &str) -> bool {
+    let normalized = reason.trim().to_ascii_lowercase();
+    normalized.contains("blocked")
+        || normalized.contains("failed")
+        || normalized.contains("needs file selection")
+        || normalized == SOURCE_ACQUISITION_FILE_SELECTION_REASON.to_ascii_lowercase()
+}
+
+fn source_target_blocker(
+    target: &AcquisitionTarget,
+    progress: Option<&AcquisitionDownloaderProgress>,
+    phase: AcquisitionPhase,
+) -> Option<FindMediaAcquisitionBlocker> {
+    if phase != AcquisitionPhase::NeedsAttention {
+        return None;
+    }
+    if let Some(issue) = progress.and_then(|item| item.issue.clone()) {
+        return Some(FindMediaAcquisitionBlocker {
+            code: issue.code,
+            title: issue.title,
+            detail: issue.detail,
+            severity: "warning".to_string(),
+        });
+    }
+    let detail = target
+        .state_reason
+        .clone()
+        .unwrap_or_else(|| "This acquisition target needs attention.".to_string());
+    let code = if detail == SOURCE_ACQUISITION_FILE_SELECTION_REASON {
+        "source_file_selection_required"
+    } else if detail.to_ascii_lowercase().contains("import failed") {
+        "source_import_failed"
+    } else {
+        "source_target_blocked"
+    };
+    Some(FindMediaAcquisitionBlocker {
+        code: code.to_string(),
+        title: if code == "source_file_selection_required" {
+            "File selection required".to_string()
+        } else {
+            "Acquisition needs attention".to_string()
+        },
+        detail,
+        severity: "warning".to_string(),
+    })
+}
+
+fn source_target_title(
+    target: &AcquisitionTarget,
+    selected_title: Option<&str>,
+    progress: Option<&AcquisitionDownloaderProgress>,
+) -> String {
+    target_episode_label(target)
+        .or_else(|| selected_title.map(str::to_string))
+        .or_else(|| progress.and_then(|item| item.release_title.clone()))
+        .unwrap_or_else(|| target.title.clone())
+}
+
+fn source_target_subtitle(
+    target: &AcquisitionTarget,
+    selected_title: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(title) = selected_title.filter(|value| !value.trim().is_empty()) {
+        parts.push(title.trim().to_string());
+    }
+    if let Some(quality) = selected_candidate_quality(target) {
+        parts.push(quality);
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn source_target_headline(
+    target: &AcquisitionTarget,
+    phase: AcquisitionPhase,
+    downloader_label: Option<&str>,
+) -> String {
+    match phase {
+        AcquisitionPhase::Requested => "Waiting for source search.".to_string(),
+        AcquisitionPhase::FindingAnotherRelease => "Searching for a release.".to_string(),
+        AcquisitionPhase::QueuedInDownloader => downloader_label
+            .map(|label| format!("Queued with {label}."))
+            .unwrap_or_else(|| "Queued with downloader.".to_string()),
+        AcquisitionPhase::Downloading => downloader_label
+            .map(|label| format!("Downloading via {label}."))
+            .unwrap_or_else(|| "Download in progress.".to_string()),
+        AcquisitionPhase::PostProcessing => "Download finished.".to_string(),
+        AcquisitionPhase::Importing => "Importing into Elixir.".to_string(),
+        AcquisitionPhase::Completed => "Imported.".to_string(),
+        AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed => target
+            .state_reason
+            .clone()
+            .unwrap_or_else(|| "Acquisition needs attention.".to_string()),
+        AcquisitionPhase::AcceptedByManager => "Accepted.".to_string(),
+    }
+}
+
+fn source_target_detail(
+    target: &AcquisitionTarget,
+    phase: AcquisitionPhase,
+    selected_title: Option<&str>,
+) -> Option<String> {
+    if matches!(
+        phase,
+        AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed
+    ) {
+        return target.state_reason.clone();
+    }
+    if let Some(title) = selected_title.filter(|value| !value.trim().is_empty()) {
+        return Some(format!("Selected release: {}.", title.trim()));
+    }
+    target.state_reason.clone()
+}
+
+fn target_episode_label(target: &AcquisitionTarget) -> Option<String> {
+    if let (Some(season), Some(episode)) = (target.season_number, target.episode_number) {
+        return Some(format!("S{season:02}E{episode:02}"));
+    }
+    target
+        .absolute_episode_number
+        .map(|absolute| format!("Episode {absolute}"))
+}
+
+fn selected_candidate_title(target: &AcquisitionTarget) -> Option<String> {
+    target
+        .selected_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn selected_candidate_quality(target: &AcquisitionTarget) -> Option<String> {
+    target
+        .selected_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.get("quality"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn source_route_downloader_label(route: Option<&str>) -> Option<String> {
+    match route {
+        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("Real-Debrid".to_string()),
+        Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("qBittorrent".to_string()),
+        Some(_) => Some("Downloader".to_string()),
+        None => None,
+    }
+}
+
+fn source_route_protocol(route: Option<&str>) -> Option<String> {
+    match route {
+        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("debrid".to_string()),
+        Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("torrent".to_string()),
+        Some(value) => Some(value.to_string()),
+        None => None,
+    }
+}
+
+fn source_acquisition_counts(
+    children: &[FindMediaAcquisitionChildItem],
+) -> SourceAcquisitionCounts {
+    let mut counts = SourceAcquisitionCounts::default();
+    for child in children {
+        match acquisition_phase_from_str(&child.phase) {
+            AcquisitionPhase::Requested => counts.requested += 1,
+            AcquisitionPhase::QueuedInDownloader => counts.queued += 1,
+            AcquisitionPhase::Downloading => counts.downloading += 1,
+            AcquisitionPhase::PostProcessing => counts.post_processing += 1,
+            AcquisitionPhase::Importing => counts.importing += 1,
+            AcquisitionPhase::Completed => counts.completed += 1,
+            AcquisitionPhase::NeedsAttention => counts.needs_attention += 1,
+            AcquisitionPhase::Failed => counts.failed += 1,
+            AcquisitionPhase::AcceptedByManager | AcquisitionPhase::FindingAnotherRelease => {
+                counts.requested += 1
+            }
+        }
+    }
+    counts
+}
+
+fn summarize_source_acquisition_phase(counts: SourceAcquisitionCounts) -> AcquisitionPhase {
+    if counts.needs_attention > 0 || counts.failed > 0 {
+        AcquisitionPhase::NeedsAttention
+    } else if counts.downloading > 0 {
+        AcquisitionPhase::Downloading
+    } else if counts.post_processing > 0 {
+        AcquisitionPhase::PostProcessing
+    } else if counts.importing > 0 {
+        AcquisitionPhase::Importing
+    } else if counts.queued > 0 {
+        AcquisitionPhase::QueuedInDownloader
+    } else if counts.requested > 0 {
+        AcquisitionPhase::Requested
+    } else {
+        AcquisitionPhase::Completed
+    }
+}
+
+fn build_source_acquisition_blocker(
+    children: &[FindMediaAcquisitionChildItem],
+) -> Option<FindMediaAcquisitionBlocker> {
+    children.iter().find_map(|child| child.blocker.clone())
+}
+
+fn source_parent_progress(children: &[FindMediaAcquisitionChildItem]) -> Option<f64> {
+    let values = children
+        .iter()
+        .filter_map(|child| child.progress_percent)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    Some((values.iter().sum::<f64>() / values.len() as f64).clamp(0.0, 100.0))
+}
+
+fn format_source_acquisition_headline(
+    counts: SourceAcquisitionCounts,
+    total_targets: usize,
+) -> String {
+    if counts.needs_attention + counts.failed > 0 {
+        return format!(
+            "{} need attention.",
+            format_transfer_count(counts.needs_attention + counts.failed)
+        );
+    }
+    let mut parts = Vec::new();
+    if counts.downloading > 0 {
+        parts.push(format!(
+            "{} downloading",
+            format_transfer_count(counts.downloading)
+        ));
+    }
+    if counts.post_processing > 0 {
+        parts.push(format!(
+            "{} downloaded",
+            format_transfer_count(counts.post_processing)
+        ));
+    }
+    if counts.importing > 0 {
+        parts.push(format!(
+            "{} importing",
+            format_transfer_count(counts.importing)
+        ));
+    }
+    if counts.queued > 0 {
+        parts.push(format!("{} queued", format_transfer_count(counts.queued)));
+    }
+    if parts.is_empty() && counts.completed >= total_targets {
+        "All targets imported.".to_string()
+    } else if parts.is_empty() {
+        "Waiting for source search.".to_string()
+    } else {
+        format!("{}.", parts.join(", "))
+    }
+}
+
+fn format_source_acquisition_detail(
+    counts: SourceAcquisitionCounts,
+    total_targets: usize,
+) -> String {
+    format!(
+        "{} of {} targets imported.",
+        counts.completed, total_targets
+    )
+}
+
+fn subscription_route_evidence(targets: &[AcquisitionTarget]) -> Option<String> {
+    let mut routes = targets
+        .iter()
+        .filter_map(|target| target.selected_route_logical_id.as_deref())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    routes.sort();
+    routes.dedup();
+    if routes.is_empty() {
+        None
+    } else if routes.len() == 1 {
+        routes.into_iter().next()
+    } else {
+        Some(format!("{} routes", routes.len()))
+    }
+}
+
+fn source_target_sort_key(title: &str) -> String {
+    title.to_ascii_lowercase()
 }
 
 async fn resolve_acquisition_item_state(
@@ -1565,7 +2660,10 @@ async fn load_acquisition_downloader_progress_index(
 
     for provider in providers {
         let capability = provider.detail.provider.capability.as_str();
-        if !matches!(capability, "downloader.nzb" | "downloader.torrent") {
+        if !matches!(
+            capability,
+            "downloader.nzb" | "downloader.torrent" | "debrid.resolver"
+        ) {
             continue;
         }
         if provider.detail.provider.health_state == ProviderHealthState::Unhealthy {
@@ -1589,6 +2687,15 @@ async fn load_acquisition_downloader_progress_index(
                 load_qbittorrent_acquisition_progress_index(state, store, instance_id).await
             }
             "nzbget" => load_nzbget_acquisition_progress_index(state, store, instance_id).await,
+            implementation if is_real_debrid_implementation(Some(implementation)) => {
+                load_real_debrid_acquisition_progress_index(
+                    state,
+                    store,
+                    provider.detail.provider.provider_id,
+                    instance_id,
+                )
+                .await
+            }
             _ => Ok(AcquisitionDownloaderProgressIndex::default()),
         };
 
@@ -1818,6 +2925,43 @@ async fn load_nzbget_acquisition_progress_index(
         if let Some((download_id, progress)) = nzbget_acquisition_progress(&group) {
             index.insert(&download_id, progress);
         }
+    }
+    Ok(index)
+}
+
+async fn load_real_debrid_acquisition_progress_index(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+    instance_id: Uuid,
+) -> AnyResult<AcquisitionDownloaderProgressIndex> {
+    let items = load_real_debrid_progress(state, store, provider_id, instance_id).await?;
+    let mut index = AcquisitionDownloaderProgressIndex::default();
+    for item in items {
+        let progress_percent = item.progress.map(|value| (value * 100.0).clamp(0.0, 100.0));
+        index.insert(
+            &item.id,
+            AcquisitionDownloaderProgress {
+                release_title: item.name,
+                status: item.state,
+                category: item.category,
+                local_path: item.local_path,
+                progress_percent,
+                eta_seconds: None,
+                size_bytes: item.total_bytes,
+                downloaded_bytes: item.downloaded_bytes,
+                remaining_bytes: item.remaining_bytes,
+                download_rate_bps: item.download_rate_bps,
+                upload_rate_bps: None,
+                connected_seeds: None,
+                connected_peers: None,
+                known_seeds: None,
+                known_peers: None,
+                availability: None,
+                seen_complete_at: None,
+                issue: None,
+            },
+        );
     }
     Ok(index)
 }
@@ -3343,6 +4487,7 @@ fn qbittorrent_acquisition_progress(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        local_path: qbittorrent_local_path(torrent),
         progress_percent,
         eta_seconds: torrent.eta.filter(|value| *value > 0),
         size_bytes: total_size,
@@ -3358,6 +4503,16 @@ fn qbittorrent_acquisition_progress(
         seen_complete_at: torrent.seen_complete.and_then(timestamp_to_datetime),
         issue,
     })
+}
+
+fn qbittorrent_local_path(torrent: &AcquisitionQbittorrentTorrent) -> Option<String> {
+    torrent
+        .content_path
+        .as_deref()
+        .or(torrent.save_path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn qbittorrent_torrent_issue(
@@ -3474,6 +4629,7 @@ fn nzbget_acquisition_progress(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            local_path: None,
             progress_percent,
             eta_seconds: None,
             size_bytes: total_size,
@@ -5608,6 +6764,231 @@ fn value_as_f64(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn source_import_pack_requires_file_selection_without_episode_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("Example Episode 01.mkv"), b"one").expect("write e1");
+        fs::write(dir.path().join("Example Episode 02.mkv"), b"two").expect("write e2");
+        let subscription = test_source_subscription(MediaType::Anime);
+        let target = test_source_target(
+            subscription.subscription_id,
+            MediaType::Anime,
+            None,
+            None,
+            None,
+        );
+
+        let selected = select_source_import_file_from_visible_path(
+            &subscription,
+            &target,
+            &dir.path().to_string_lossy(),
+        );
+
+        assert!(matches!(
+            selected,
+            SourceImportSelection::NeedsFileSelection(_)
+        ));
+    }
+
+    #[test]
+    fn source_import_pack_uses_candidate_filename_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("Example Episode 01.mkv"), b"one").expect("write e1");
+        let expected_path = dir.path().join("Example Episode 02.mkv");
+        fs::write(&expected_path, b"two").expect("write e2");
+        let subscription = test_source_subscription(MediaType::Anime);
+        let target = test_source_target(
+            subscription.subscription_id,
+            MediaType::Anime,
+            None,
+            None,
+            Some(json!({
+                "title": "Example Anime Pack",
+                "raw": {
+                    "stream": {
+                        "behaviorHints": {
+                            "filename": "Example Episode 02.mkv"
+                        }
+                    }
+                }
+            })),
+        );
+
+        let selected = select_source_import_file_from_visible_path(
+            &subscription,
+            &target,
+            &dir.path().to_string_lossy(),
+        );
+
+        let SourceImportSelection::Ready(file) = selected else {
+            panic!("expected pack file to be selected");
+        };
+        assert_eq!(file.path, expected_path.to_string_lossy());
+    }
+
+    #[test]
+    fn source_acquisition_status_keeps_source_label_and_progress() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Movie)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "Example Movie 1080p",
+                "quality": "1080p",
+                "sourceKind": "magnet"
+            })),
+            download_id: Some("rd-job".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                None,
+            )
+        };
+        let mut progress_index = AcquisitionDownloaderProgressIndex::default();
+        progress_index.insert(
+            "rd-job",
+            AcquisitionDownloaderProgress {
+                release_title: Some("Example Movie 1080p".to_string()),
+                status: Some("materializing".to_string()),
+                category: Some("movies".to_string()),
+                progress_percent: Some(42.0),
+                downloaded_bytes: Some(42),
+                size_bytes: Some(100),
+                download_rate_bps: Some(1_024),
+                ..Default::default()
+            },
+        );
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+
+        let item =
+            build_source_acquisition_item(&subscription, &[target], &provider_map, &progress_index)
+                .expect("source acquisition item");
+
+        assert_eq!(item.manager_label, "External Source (test_source)");
+        assert_eq!(item.phase, "downloading");
+        assert_eq!(item.children.len(), 1);
+        assert_eq!(item.children[0].download_id.as_deref(), Some("rd-job"));
+        assert_eq!(item.children[0].progress_percent, Some(42.0));
+        assert!(
+            item.evidence
+                .iter()
+                .any(|evidence| evidence.label == "Source"
+                    && evidence.value == "External Source (test_source)")
+        );
+    }
+
+    fn test_source_subscription(media_type: MediaType) -> AcquisitionSubscription {
+        let now = Utc::now();
+        AcquisitionSubscription {
+            subscription_id: Uuid::new_v4(),
+            media_type,
+            title: match media_type {
+                MediaType::Movie => "Example Movie",
+                MediaType::Series => "Example Series",
+                MediaType::Anime => "Example Anime",
+            }
+            .to_string(),
+            normalized_title: "example".to_string(),
+            year: Some(2026),
+            external_ids: None,
+            monitor_policy: crate::acquisition::subscriptions::AcquisitionMonitorPolicy::AllMissing,
+            route_policy: crate::acquisition::subscriptions::AcquisitionRoutePolicy::DebridFirst,
+            source_provider_id: None,
+            release_delay_seconds: 0,
+            quality_profile: None,
+            metadata_refresh_after: now,
+            candidate_search_after: now,
+            last_metadata_refresh_at: None,
+            last_candidate_search_at: None,
+            status: crate::acquisition::subscriptions::AcquisitionSubscriptionStatus::Active,
+            active: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_source_target(
+        subscription_id: Uuid,
+        media_type: MediaType,
+        season_number: Option<i32>,
+        episode_number: Option<i32>,
+        selected_candidate: Option<Value>,
+    ) -> AcquisitionTarget {
+        let now = Utc::now();
+        AcquisitionTarget {
+            target_id: Uuid::new_v4(),
+            subscription_id,
+            target_key: match (season_number, episode_number) {
+                (Some(season), Some(episode)) => format!("S{season:02}E{episode:02}"),
+                _ => "movie".to_string(),
+            },
+            media_type,
+            title: "Example Target".to_string(),
+            season_number,
+            episode_number,
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: None,
+            metadata: None,
+            state: AcquisitionTargetState::Submitted,
+            state_reason: None,
+            selected_provider_id: None,
+            selected_route_logical_id: None,
+            selected_candidate,
+            download_id: None,
+            import_event_id: None,
+            search_attempts: 0,
+            last_search_at: None,
+            next_search_after: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_provider_context(
+        provider_id: Uuid,
+        instance_name: &str,
+        implementation: &str,
+    ) -> ProviderContext {
+        let now = Utc::now();
+        let instance_id = Uuid::new_v4();
+        ProviderContext {
+            detail: crate::extensions::store::ProviderDetails {
+                provider: crate::db::models::Provider {
+                    provider_id,
+                    instance_id,
+                    capability: "acquisition.candidate_provider".to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: crate::db::models::SlotCardinality::Many,
+                    implementation: Some(implementation.to_string()),
+                    scope_json: None,
+                    endpoint_json: None,
+                    health_state: ProviderHealthState::Healthy,
+                    last_healthcheck_at: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                extension_id: "elixir.sources.test".to_string(),
+                trust_level: ExtensionTrustLevel::Community,
+            },
+            instance_name: instance_name.to_string(),
+            instance_config: None,
+            scope: ProviderScopeDocument::default(),
+            media_types: vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
+        }
+    }
 
     #[test]
     fn derive_arr_acquisition_state_marks_downloading_from_queue_state_without_fake_progress() {
