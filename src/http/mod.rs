@@ -106,6 +106,14 @@ pub fn router(state: AppState) -> Router {
             post(handlers::download_broker::submit),
         )
         .route(
+            "/api/v1/acquisition/candidates/providers",
+            get(handlers::acquisition_sources::list_candidate_providers),
+        )
+        .route(
+            "/api/v1/acquisition/candidates/search",
+            post(handlers::acquisition_sources::search_candidates),
+        )
+        .route(
             "/api/v1/download-broker/:logical_id/items/:download_id",
             delete(handlers::download_broker::cancel),
         )
