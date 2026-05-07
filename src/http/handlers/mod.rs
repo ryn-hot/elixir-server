@@ -1,4 +1,5 @@
 pub mod acquisition_sources;
+pub mod acquisition_subscriptions;
 pub mod artwork;
 pub mod auth;
 pub mod control;

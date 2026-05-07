@@ -114,6 +114,24 @@ pub fn router(state: AppState) -> Router {
             post(handlers::acquisition_sources::search_candidates),
         )
         .route(
+            "/api/v1/acquisition/subscriptions",
+            get(handlers::acquisition_subscriptions::list_acquisition_subscriptions)
+                .post(handlers::acquisition_subscriptions::create_acquisition_subscription),
+        )
+        .route(
+            "/api/v1/acquisition/subscriptions/:subscription_id",
+            get(handlers::acquisition_subscriptions::get_acquisition_subscription)
+                .patch(handlers::acquisition_subscriptions::patch_acquisition_subscription),
+        )
+        .route(
+            "/api/v1/acquisition/subscriptions/:subscription_id/targets",
+            put(handlers::acquisition_subscriptions::upsert_acquisition_targets),
+        )
+        .route(
+            "/api/v1/acquisition/targets/:target_id/state",
+            patch(handlers::acquisition_subscriptions::patch_acquisition_target_state),
+        )
+        .route(
             "/api/v1/download-broker/:logical_id/items/:download_id",
             delete(handlers::download_broker::cancel),
         )
