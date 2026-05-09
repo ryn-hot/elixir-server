@@ -1,0 +1,41 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr2-path-current",
+  "cases": [
+    {
+      "fixture": "PathParserFixture",
+      "input": "z:\\tv shows\\series title (2003)\\Season 3\\S03E05 - Title.mkv",
+      "season": 3,
+      "episodes": [5],
+      "kind": "single"
+    },
+    {
+      "fixture": "PathParserFixture",
+      "input": "S:\\TV Drop\\Series - 10x11 - Title [SDTV]\\1011 - Title.avi",
+      "season": 10,
+      "episodes": [11],
+      "kind": "single"
+    },
+    {
+      "fixture": "PathParserFixture",
+      "input": "S:\\TV Drop\\Series Title - 10x12 - 24 Hours of Development [SDTV]\\Hours of Development.avi",
+      "season": 10,
+      "episodes": [12],
+      "kind": "single"
+    },
+    {
+      "fixture": "PathParserFixture",
+      "input": "C:\\Test\\Unsorted\\Series.Title.S02E19.720p.BluRay.x264-SiNNERS-RP\\ba27283b17c00d01193eacc02a8ba98eeb523a76.mkv",
+      "season": 2,
+      "episodes": [19],
+      "kind": "single"
+    },
+    {
+      "fixture": "PathParserFixture",
+      "input": "Season 2\\E05-06 - Episode Title HDTV-720p Proper",
+      "season": 2,
+      "episodes": [5, 6],
+      "kind": "multi_episode"
+    }
+  ]
+}

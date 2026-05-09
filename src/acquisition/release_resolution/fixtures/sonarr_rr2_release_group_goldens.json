@@ -1,0 +1,35 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr2-release-group-current",
+  "cases": [
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series.2009.S01E14.English.HDTV.XviD-LOL",
+      "releaseGroup": "LOL"
+    },
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series 2009 S01E14 English HDTV XviD LOL"
+    },
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series.Title.S01.EXTRAS.DVDRip.XviD-RUNNER",
+      "releaseGroup": "RUNNER"
+    },
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series.Title.S02E04.720p.WEB-DL.AAC2.0.H.264-EVL-RP",
+      "releaseGroup": "EVL"
+    },
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series.Title.S02E04.720p.WEBRip.x264-SKGTV English",
+      "releaseGroup": "SKGTV"
+    },
+    {
+      "fixture": "ReleaseGroupParserFixture",
+      "input": "Series.2009.S01E14.English.HDTV.XviD-LOL[www.abb.com]",
+      "releaseGroup": "LOL"
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 pub mod automation;
+pub mod release_resolution;
 pub mod subscriptions;
 
 use std::collections::{BTreeMap, HashMap};

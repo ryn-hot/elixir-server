@@ -1,0 +1,40 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr2-quality-current",
+  "cases": [
+    {
+      "fixture": "QualityParserFixture",
+      "input": "The.Series.S08E05.720p.HDTV.X264-DIMENSION",
+      "resolution": "R720p",
+      "source": "Hdtv",
+      "proper": false
+    },
+    {
+      "fixture": "QualityParserFixture",
+      "input": "Series.S01E01.The.Sonarr.Principle.720p.WEB-DL.DD5.1.H.264-BD",
+      "resolution": "R720p",
+      "source": "WebDl",
+      "proper": false
+    },
+    {
+      "fixture": "QualityParserFixture",
+      "input": "The.Series.S05E11.PROPER.HDTV.XviD-2HD",
+      "source": "Hdtv",
+      "proper": true
+    },
+    {
+      "fixture": "QualityParserFixture",
+      "input": "Series.Title.S01.1080p.BluRay.Remux.AVC.FLAC.2.0-GROUP",
+      "resolution": "R1080p",
+      "source": "BluRay",
+      "remux": true
+    },
+    {
+      "fixture": "QualityParserFixture",
+      "input": "Series.Title.S01E01.Raw-HD.1080i-GROUP",
+      "resolution": "R1080p",
+      "source": "RawHd",
+      "rawHd": true
+    }
+  ]
+}

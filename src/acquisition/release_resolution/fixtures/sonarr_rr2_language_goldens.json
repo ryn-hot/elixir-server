@@ -1,0 +1,31 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr2-language-current",
+  "cases": [
+    {
+      "fixture": "LanguageParserFixture",
+      "input": "Title.the.Series.2009.S01E14.English.HDTV.XviD-LOL",
+      "contains": ["ENGLISH"]
+    },
+    {
+      "fixture": "LanguageParserFixture",
+      "input": "Title.S01.720p.TRUEFRENCH.WEB-DL.AAC2.0.H.264-BTN",
+      "contains": ["TRUEFRENCH"]
+    },
+    {
+      "fixture": "LanguageParserFixture",
+      "input": "Series Title S01 Eng Fre Ger Ita Spa Cze Jpn 2160p BluRay Remux",
+      "contains": ["ENG", "FRE", "GER", "ITA", "SPA", "CZE", "JPN"]
+    },
+    {
+      "fixture": "LanguageParserFixture",
+      "input": "Series Title - Temporada 2 [HDTV 720p][Cap.206][AC3 5.1 Español Castellano]",
+      "contains": ["ESPAÑOL", "CASTELLANO"]
+    },
+    {
+      "fixture": "LanguageParserFixture",
+      "input": "Title.the.Series.S01.COMPLETE.2009.1080p.WEB-DL.x264.AVC.AAC.LT.LV.RU",
+      "contains": ["LV", "RU"]
+    }
+  ]
+}

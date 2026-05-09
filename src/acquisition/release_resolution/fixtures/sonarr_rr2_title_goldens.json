@@ -1,0 +1,84 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr2-title-current",
+  "cases": [
+    {
+      "fixture": "SingleEpisodeParserFixture",
+      "input": "Series.and.a.Title.103.720p.HDTV.X264-DIMENSION",
+      "seriesTitle": "Series and a Title",
+      "season": 1,
+      "episodes": [3],
+      "kind": "single"
+    },
+    {
+      "fixture": "MultiEpisodeParserFixture",
+      "input": "Series.Title.103.104.720p.HDTV.X264-DIMENSION",
+      "seriesTitle": "Series Title",
+      "season": 1,
+      "episodes": [3, 4],
+      "kind": "multi_episode"
+    },
+    {
+      "fixture": "MultiEpisodeParserFixture",
+      "input": "Series Title (S05E06-08 of 24) City Sushi",
+      "seriesTitle": "Series Title",
+      "season": 5,
+      "episodes": [6, 7, 8],
+      "kind": "multi_episode"
+    },
+    {
+      "fixture": "DailyEpisodeParserFixture",
+      "input": "The_Series_US_04.28.2014.HDTV.x264-2HD",
+      "seriesTitle": "The Series US",
+      "airDate": "2014-04-28",
+      "kind": "single"
+    },
+    {
+      "fixture": "MiniSeriesEpisodeParserFixture",
+      "input": "It's a Series Title.E56.190121.720p-NEXT.mp4",
+      "seriesTitle": "It's a Series Title",
+      "season": 1,
+      "episodes": [56],
+      "airDate": "2019-01-21",
+      "kind": "single",
+      "isMiniSeries": true
+    },
+    {
+      "fixture": "SeasonParserFixture",
+      "input": "Series Title Season 01 - Season 07 BluRay 1080p x264 REPACK -SacReD",
+      "seriesTitle": "Series Title",
+      "season": 1,
+      "seasonEnd": 7,
+      "kind": "multi_season_pack",
+      "fullSeason": true
+    },
+    {
+      "fixture": "SeriesTitleInfoFixture",
+      "input": "Series Title (2023).S01E01.1080p.WEB-DL-GROUP",
+      "seriesTitle": "Series Title (2023)",
+      "season": 1,
+      "episodes": [1],
+      "kind": "single",
+      "titleWithoutYear": "Series Title",
+      "titleYear": 2023
+    },
+    {
+      "fixture": "SplitSpecialEpisode",
+      "input": "Series.Title.S01E05a.HDTV.x264-GROUP",
+      "seriesTitle": "Series Title",
+      "season": 1,
+      "episodes": [5],
+      "kind": "single",
+      "isSplitEpisode": true
+    },
+    {
+      "fixture": "SplitSpecialEpisode",
+      "input": "Series.Title.S00E16.Dear.Title.SDTV-GROUP",
+      "seriesTitle": "Series Title",
+      "season": 0,
+      "episodes": [16],
+      "kind": "single",
+      "special": true
+    }
+  ]
+}

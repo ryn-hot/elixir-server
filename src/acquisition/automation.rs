@@ -1461,6 +1461,63 @@ mod tests {
         }
     }
 
+    fn test_subscription() -> AcquisitionSubscription {
+        AcquisitionSubscription {
+            subscription_id: Uuid::new_v4(),
+            media_type: MediaType::Series,
+            title: "Show".to_string(),
+            normalized_title: "show".to_string(),
+            year: Some(2026),
+            external_ids: None,
+            monitor_policy: Default::default(),
+            route_policy: AcquisitionRoutePolicy::DebridFirst,
+            source_provider_id: None,
+            release_delay_seconds: 0,
+            quality_profile: None,
+            metadata_refresh_after: Utc::now(),
+            candidate_search_after: Utc::now(),
+            last_metadata_refresh_at: None,
+            last_candidate_search_at: None,
+            status: Default::default(),
+            active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn episode_target(
+        subscription: &AcquisitionSubscription,
+        season_number: i32,
+        episode_number: i32,
+    ) -> AcquisitionTarget {
+        let now = Utc::now();
+        AcquisitionTarget {
+            target_id: Uuid::new_v4(),
+            subscription_id: subscription.subscription_id,
+            target_key: format!("S{season_number:02}E{episode_number:02}"),
+            media_type: MediaType::Series,
+            title: "Show".to_string(),
+            season_number: Some(season_number),
+            episode_number: Some(episode_number),
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: Some(now - ChronoDuration::days(1)),
+            metadata: None,
+            state: AcquisitionTargetState::Pending,
+            state_reason: None,
+            selected_provider_id: None,
+            selected_route_logical_id: None,
+            selected_candidate: None,
+            download_id: None,
+            import_event_id: None,
+            search_attempts: 0,
+            last_search_at: None,
+            next_search_after: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[test]
     fn best_candidate_prefers_cached_debrid_for_debrid_first() {
         let torrent = candidate("torrent", vec![TORRENT_DEFAULT_LOGICAL_ID], None, Some(500));
@@ -1473,6 +1530,107 @@ mod tests {
         let best = select_best_candidate(&[torrent, cached], AcquisitionRoutePolicy::DebridFirst)
             .expect("best candidate");
         assert_eq!(best.title, "cached");
+    }
+
+    #[test]
+    fn candidate_search_request_is_single_episode_not_pack_aware_yet() {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 1);
+        let request = candidate_search_request(&subscription, &target);
+        let serialized = serde_json::to_value(&request).expect("serialized request");
+
+        assert_eq!(request.media_type, "series");
+        assert_eq!(request.title, "Show");
+        assert_eq!(
+            request
+                .target
+                .as_ref()
+                .and_then(|target| target.season_number),
+            Some(1)
+        );
+        assert_eq!(
+            request
+                .target
+                .as_ref()
+                .and_then(|target| target.episode_number),
+            Some(1)
+        );
+        assert_eq!(serialized["target"]["seasonNumber"], 1);
+        assert_eq!(serialized["target"]["episodeNumber"], 1);
+
+        assert!(serialized.get("targets").is_none());
+        assert!(serialized.get("missingTargets").is_none());
+        assert!(serialized.get("coverage").is_none());
+        assert!(serialized.get("release").is_none());
+    }
+
+    #[test]
+    fn duplicate_pack_failure_mode_is_target_local_until_release_resolution_exists() {
+        let subscription = test_subscription();
+        let episode_one = episode_target(&subscription, 1, 1);
+        let episode_two = episode_target(&subscription, 1, 2);
+        let episode_one_request = candidate_search_request(&subscription, &episode_one);
+        let episode_two_request = candidate_search_request(&subscription, &episode_two);
+
+        assert_eq!(
+            episode_one_request
+                .target
+                .as_ref()
+                .and_then(|target| target.episode_number),
+            Some(1)
+        );
+        assert_eq!(
+            episode_two_request
+                .target
+                .as_ref()
+                .and_then(|target| target.episode_number),
+            Some(2)
+        );
+
+        let mut season_pack = candidate(
+            "Show.S01.COMPLETE.1080p",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(200),
+        );
+        season_pack.info_hash = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        season_pack.size_bytes = Some(10 * 1024 * 1024 * 1024);
+
+        let episode_one_selection =
+            select_best_candidate(&[season_pack.clone()], subscription.route_policy)
+                .expect("episode one selected candidate");
+        let episode_two_selection =
+            select_best_candidate(&[season_pack.clone()], subscription.route_policy)
+                .expect("episode two selected candidate");
+
+        assert_eq!(episode_one_selection.source, episode_two_selection.source);
+        assert_eq!(
+            episode_one_selection.info_hash,
+            episode_two_selection.info_hash
+        );
+
+        let provider_id = Uuid::new_v4();
+        let episode_one_provenance = selected_candidate_provenance(&CandidateSubmission {
+            provider_id,
+            source_extension_id: "elixir.marketplace.torrentio".to_string(),
+            candidate: episode_one_selection,
+        })
+        .expect("episode one provenance");
+        let episode_two_provenance = selected_candidate_provenance(&CandidateSubmission {
+            provider_id,
+            source_extension_id: "elixir.marketplace.torrentio".to_string(),
+            candidate: episode_two_selection,
+        })
+        .expect("episode two provenance");
+
+        assert_eq!(
+            episode_one_provenance["infoHash"],
+            episode_two_provenance["infoHash"]
+        );
+        assert!(episode_one_provenance.get("releaseId").is_none());
+        assert!(episode_one_provenance.get("coverage").is_none());
+        assert!(episode_two_provenance.get("releaseId").is_none());
+        assert!(episode_two_provenance.get("coverage").is_none());
     }
 
     #[test]
