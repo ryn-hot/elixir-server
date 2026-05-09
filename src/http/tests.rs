@@ -2910,6 +2910,97 @@ async fn extension_status_summary_surfaces_setup_and_connection_issues() -> Resu
 }
 
 #[tokio::test]
+async fn extension_status_summary_auto_provisions_missing_zero_config_instance() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.sources.torrentio_stremio".to_string(),
+            name: "Torrentio".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": "elixir.sources.torrentio_stremio",
+                "version": "0.1.0",
+                "kind": "module",
+                "name": "Torrentio",
+                "provides": [{
+                    "capability": "acquisition.candidate_provider",
+                    "slot": "torrentio",
+                    "implementation": "torrentio"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "elixir/torrentio-candidate-provider:0.1.0"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8097
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let torrentio = items
+        .iter()
+        .find(|item| {
+            item.get("extensionId").and_then(Value::as_str)
+                == Some("elixir.sources.torrentio_stremio")
+        })
+        .expect("torrentio summary item");
+    assert_ne!(
+        torrentio.get("statusCode").and_then(Value::as_str),
+        Some("missing_instance")
+    );
+
+    let instances = store
+        .list_instances(Some("elixir.sources.torrentio_stremio"))
+        .await?;
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].instance_name, "default");
+    assert!(instances[0].enabled);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn extension_status_summary_includes_optional_addons_for_blueprints() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
@@ -8069,7 +8160,7 @@ async fn extensions_enable_instance_requires_secret() -> Result<()> {
 }
 
 #[tokio::test]
-async fn extension_control_surface_can_create_default_instance_for_missing_module() -> Result<()> {
+async fn extension_control_surface_auto_provisions_zero_config_module_instance() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -8143,20 +8234,9 @@ async fn extension_control_surface_can_create_default_instance_for_missing_modul
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert!(actions.iter().any(|action| {
+    assert!(!actions.iter().any(|action| {
         action.get("id").and_then(Value::as_str) == Some("create_default_instance")
     }));
-
-    let action_resp = app
-        .clone()
-        .oneshot(
-            Request::post(
-                "/api/v1/extensions/elixir.modules.byparr/control-surface/actions/create_default_instance",
-            )
-            .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(action_resp.status(), StatusCode::OK);
 
     let instances = store.list_instances(Some("elixir.modules.byparr")).await?;
     assert_eq!(instances.len(), 1);

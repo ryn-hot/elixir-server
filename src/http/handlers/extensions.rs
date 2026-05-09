@@ -1656,6 +1656,10 @@ async fn install_extension_internal_with_policy(
         })
         .await?;
 
+    if ensure_default_extension_instance(&store, &manifest, false).await? {
+        trigger_extensions_reconcile(state, "extension install default instance create").await;
+    }
+
     Ok(InstallResult {
         response: InstallResponse {
             extension_id,
@@ -2724,6 +2728,7 @@ async fn build_extension_status_summary(
 ) -> anyhow::Result<ExtensionStatusSummaryResponse> {
     let runtime_snapshot = state.orchestrator.docker_runtime_snapshot();
     let extensions = store.list_extensions().await?;
+    ensure_auto_default_instances_for_installed_modules(state, store, &extensions).await?;
     let instances = store.list_instances(None).await?;
     let providers = store.list_providers(None).await?;
     let readiness_by_provider: HashMap<Uuid, ProviderReadiness> = store
@@ -2874,6 +2879,45 @@ async fn build_extension_status_summary(
         docker_runtime: summarize_docker_runtime(&runtime_snapshot),
         items,
     })
+}
+
+async fn ensure_auto_default_instances_for_installed_modules(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extensions: &[Extension],
+) -> anyhow::Result<bool> {
+    let mut created = false;
+    for extension in extensions {
+        if !extension.enabled || extension.kind != ExtensionKind::Module {
+            continue;
+        }
+        let manifest = match serde_json::from_value::<ExtensionManifest>(
+            extension.manifest_json.clone(),
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                tracing::warn!(
+                    extension_id = %extension.extension_id,
+                    "skipping default instance auto-provisioning; manifest could not be parsed: {err}"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = manifest.validate() {
+            tracing::warn!(
+                extension_id = %extension.extension_id,
+                "skipping default instance auto-provisioning; manifest is invalid: {err}"
+            );
+            continue;
+        }
+        if ensure_default_extension_instance(store, &manifest, false).await? {
+            created = true;
+        }
+    }
+    if created {
+        trigger_extensions_reconcile(state, "status default instance auto-provision").await;
+    }
+    Ok(created)
 }
 
 fn summarize_docker_runtime(
