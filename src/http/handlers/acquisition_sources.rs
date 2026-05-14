@@ -73,6 +73,8 @@ pub struct CandidateSearchRequest {
     pub external_ids: Option<ExternalIds>,
     #[serde(default)]
     pub target: Option<CandidateSearchTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_intent: Option<CandidateSearchIntent>,
     #[serde(default)]
     pub preferences: CandidateSearchPreferences,
     #[serde(default)]
@@ -103,6 +105,28 @@ pub struct CandidateSearchTarget {
     pub absolute_episode_number: Option<i32>,
     #[serde(default)]
     pub air_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateSearchIntent {
+    pub kind: String,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub episode_start: Option<i32>,
+    #[serde(default)]
+    pub episode_end: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_start: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_end: Option<i32>,
+    #[serde(default)]
+    pub target_count: u32,
+    #[serde(default)]
+    pub target_keys: Vec<String>,
+    #[serde(default)]
+    pub retry_bucket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,11 +179,27 @@ pub struct AcquisitionCandidate {
     #[serde(default)]
     pub score_badges: Vec<CandidateScoreBadge>,
     #[serde(default)]
+    pub files: Vec<AcquisitionCandidateFile>,
+    #[serde(default)]
     pub supported_routes: Vec<String>,
     #[serde(default)]
     pub default_route: Option<String>,
     #[serde(default)]
     pub raw: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionCandidateFile {
+    #[serde(default, alias = "id")]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_index: Option<i64>,
+    pub path: String,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub selectable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -484,7 +524,26 @@ pub(crate) fn normalize_acquisition_candidate(
         .map(|route| route.trim().to_string())
         .filter(|route| !route.is_empty())
         .collect();
+    candidate.files = candidate
+        .files
+        .into_iter()
+        .filter_map(normalize_candidate_file)
+        .collect();
     Ok(candidate)
+}
+
+fn normalize_candidate_file(
+    mut file: AcquisitionCandidateFile,
+) -> Option<AcquisitionCandidateFile> {
+    file.path = file.path.trim().replace('\\', "/");
+    if file.path.is_empty() {
+        return None;
+    }
+    file.file_id = file
+        .file_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(file)
 }
 
 fn provider_scope(provider: &Provider) -> (Vec<String>, Vec<String>) {
@@ -566,6 +625,7 @@ mod tests {
             rank: None,
             score: None,
             score_badges: Vec::new(),
+            files: Vec::new(),
             supported_routes: Vec::new(),
             default_route: None,
             raw: None,
@@ -694,6 +754,7 @@ mod tests {
                 ..Default::default()
             }),
             target: None,
+            search_intent: None,
             preferences: CandidateSearchPreferences::default(),
             limit: Some(10),
         };

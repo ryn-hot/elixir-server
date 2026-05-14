@@ -219,11 +219,143 @@ pub fn parse_release_title(release_title: &str) -> TvParsedRelease {
     }
 
     let title = preprocess_release_title(&raw_title);
+    let quality_title = if REVERSED_TITLE_RE.is_match(trimmed_title) {
+        trimmed_title.chars().rev().collect::<String>()
+    } else {
+        trimmed_title.to_string()
+    };
     let release_group = parse_release_group(&raw_title);
-    let quality = parse_quality(&raw_title);
-    let modifiers = parse_modifiers(&raw_title);
+    let mut quality = parse_quality(&quality_title);
+    if REVERSED_TITLE_RE.is_match(trimmed_title)
+        && quality.source.is_none()
+        && quality.resolution.is_none()
+    {
+        quality = parse_quality(trimmed_title);
+    }
+    let modifiers = parse_modifiers(trimmed_title);
     let air_date = parse_air_date(&title).or_else(|| parse_air_date(&raw_title));
     let anime_absolute_hints = parse_absolute_number_hints(&title);
+
+    if let Some(parsed) = parse_japanese_variety_release(&raw_title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &raw_title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_manual_spaced_season_e_episode_release(&raw_title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &raw_title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_manual_daily_release(&raw_title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &raw_title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_japanese_variety_release(&title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if !SEASON_EP_MARKER_RE.is_match(&title) {
+        if let Some(parsed) = parse_e_only_dashed_multi_release(&title) {
+            return finalize_parsed_release(
+                parsed,
+                release_title,
+                &title,
+                release_group,
+                quality,
+                modifiers,
+                air_date,
+                anime_absolute_hints,
+            );
+        }
+    }
+
+    if let Some(parsed) = parse_korean_dated_episode_release(&title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_leading_compact_daily_release(&title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_cjk_episode_range_release(&title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if should_parse_episode_before_daily(&title) {
+        if let Some(parsed) = parse_episode_release(&title) {
+            return finalize_parsed_release(
+                parsed,
+                release_title,
+                &title,
+                release_group,
+                quality,
+                modifiers,
+                air_date,
+                anime_absolute_hints,
+            );
+        }
+    }
 
     if let Some(parsed) = parse_daily_release(&title) {
         return finalize_parsed_release(
@@ -238,17 +370,34 @@ pub fn parse_release_title(release_title: &str) -> TvParsedRelease {
         );
     }
 
-    if let Some(parsed) = parse_episode_release(&title) {
-        return finalize_parsed_release(
-            parsed,
-            release_title,
-            &title,
-            release_group,
-            quality,
-            modifiers,
-            air_date,
-            anime_absolute_hints,
-        );
+    if CAP_EP_RE.is_match(&title) {
+        if let Some(parsed) = parse_episode_release(&title) {
+            return finalize_parsed_release(
+                parsed,
+                release_title,
+                &title,
+                release_group,
+                quality,
+                modifiers,
+                air_date,
+                anime_absolute_hints,
+            );
+        }
+    }
+
+    if should_parse_episode_before_season_pack(&title) {
+        if let Some(parsed) = parse_episode_release(&title) {
+            return finalize_parsed_release(
+                parsed,
+                release_title,
+                &title,
+                release_group,
+                quality,
+                modifiers,
+                air_date,
+                anime_absolute_hints,
+            );
+        }
     }
 
     if let Some(parsed) = parse_multi_season_pack(&title) {
@@ -278,6 +427,19 @@ pub fn parse_release_title(release_title: &str) -> TvParsedRelease {
     }
 
     if let Some(parsed) = parse_season_pack(&title) {
+        return finalize_parsed_release(
+            parsed,
+            release_title,
+            &title,
+            release_group,
+            quality,
+            modifiers,
+            air_date,
+            anime_absolute_hints,
+        );
+    }
+
+    if let Some(parsed) = parse_episode_release(&title) {
         return finalize_parsed_release(
             parsed,
             release_title,
@@ -324,8 +486,25 @@ fn finalize_parsed_release(
     parsed.anime_absolute_hints = anime_absolute_hints;
     parsed.series_title_info =
         series_title_info_from_display(parsed.normalized_series_title.as_deref());
+    let release_title_alternatives = extract_release_title_alternatives(matcher_title);
+    if release_title_alternatives.len() > 1 {
+        if matcher_title.contains(" / ") {
+            parsed.normalized_series_title = release_title_alternatives.last().cloned();
+        }
+        parsed.series_title_info.all_titles = release_title_alternatives;
+    }
+    if matcher_title.contains(" / ") {
+        let slash_alternatives = slash_title_alternatives(matcher_title);
+        if slash_alternatives.len() > 1 {
+            parsed.normalized_series_title = slash_alternatives.last().cloned();
+            parsed.series_title_info.all_titles = slash_alternatives;
+        }
+    }
     parsed.special = parsed.special || is_special_release(matcher_title, &parsed);
     parsed.is_split_episode = parsed.is_split_episode || SPLIT_EP_RE.is_match(matcher_title);
+    if is_miniseries_e_only_title(matcher_title) {
+        parsed.is_mini_series = true;
+    }
     parsed
 }
 
@@ -365,6 +544,19 @@ pub fn parse_release_file(file_path: &str) -> TvParsedRelease {
         .collect();
     let file_name = parts.last().copied().unwrap_or(file_path);
     let parent_name = parts.iter().rev().nth(1).copied();
+
+    if let Some(parent) = parent_name {
+        if is_hashed_release_file(file_name) {
+            let extension = file_name
+                .rsplit_once('.')
+                .map(|(_, ext)| format!(".{ext}"))
+                .unwrap_or_default();
+            let parent_parse = parse_release_title(&format!("{parent}{extension}"));
+            if !matches!(parent_parse.release_kind, ReleaseKind::Unknown) {
+                return parent_parse;
+            }
+        }
+    }
 
     let parsed = parse_release_title(file_name);
 
@@ -417,6 +609,13 @@ pub fn parse_release_file(file_path: &str) -> TvParsedRelease {
     }
 
     parsed
+}
+
+fn is_hashed_release_file(file_name: &str) -> bool {
+    let stem = strip_file_extension(file_name);
+    REJECT_HASHED_RELEASE_RE
+        .iter()
+        .any(|regex| regex.is_match(stem.trim()))
 }
 
 pub fn plan_coverage(
@@ -766,7 +965,19 @@ fn review_plan(
 }
 
 fn parse_episode_release(title: &str) -> Option<TvParsedRelease> {
-    if let Some(parsed) = parse_extant_multi_episode_release(title) {
+    if let Some(parsed) = parse_manual_spaced_season_e_episode_release(title) {
+        return Some(parsed);
+    }
+
+    if let Some(parsed) = parse_quoted_season_episode_release(title) {
+        return Some(parsed);
+    }
+
+    if let Some(parsed) = parse_leading_season_episode_release(title) {
+        return Some(parsed);
+    }
+
+    if let Some(parsed) = parse_spaced_season_e_episode_release(title) {
         return Some(parsed);
     }
 
@@ -780,6 +991,14 @@ fn parse_episode_release(title: &str) -> Option<TvParsedRelease> {
             &captures,
             EpisodeStyle::SeasonEpisode,
         ));
+    }
+
+    if let Some(parsed) = parse_e_only_dashed_multi_release(title) {
+        return Some(parsed);
+    }
+
+    if let Some(parsed) = parse_extant_multi_episode_release(title) {
+        return Some(parsed);
     }
 
     if let Some(captures) = XYY_RE.captures(title) {
@@ -823,7 +1042,7 @@ fn parse_episode_release(title: &str) -> Option<TvParsedRelease> {
         return Some(parsed);
     }
 
-    if let Some(parsed) = parse_e_only_episode_release(title) {
+    if let Some(parsed) = parse_episode_only_multi_release(title) {
         return Some(parsed);
     }
 
@@ -831,54 +1050,681 @@ fn parse_episode_release(title: &str) -> Option<TvParsedRelease> {
         return Some(parsed);
     }
 
-    if let Some(captures) = EPISODE_ONLY_RE.captures(title) {
-        let first_episode = parse_i32_capture(&captures, "episode")?;
-        let mut episodes = BTreeSet::new();
-        add_episode_range(&mut episodes, first_episode, first_episode);
-        collect_tail_episodes(
-            captures
-                .name("tail")
-                .map(|m| m.as_str())
-                .unwrap_or_default(),
-            1,
-            &mut episodes,
-            EpisodeStyle::SeasonEpisode,
-        );
-
-        let release_kind = if episodes.len() > 1 {
-            ReleaseKind::MultiEpisode
-        } else {
-            ReleaseKind::Single
-        };
-
-        return Some(TvParsedRelease {
-            original_title: title.to_string(),
-            normalized_series_title: clean_series_title(capture_str(&captures, "title")),
-            series_title_info: TvSeriesTitleInfo::default(),
-            season_number: Some(1),
-            season_end_number: None,
-            episode_numbers: episodes.into_iter().collect(),
-            air_date: None,
-            release_group: None,
-            release_tokens: None,
-            release_hash: None,
-            quality: TvQuality::default(),
-            modifiers: TvReleaseModifiers::default(),
-            release_kind,
-            full_season: false,
-            full_series: false,
-            is_partial_season: false,
-            is_season_extra: false,
-            season_part: None,
-            daily_part: None,
-            is_mini_series: false,
-            special: false,
-            is_split_episode: false,
-            anime_absolute_hints: Vec::new(),
-        });
+    if let Some(parsed) = parse_e_only_episode_release(title) {
+        return Some(parsed);
     }
 
     None
+}
+
+fn should_parse_episode_before_daily(title: &str) -> bool {
+    let date_start = DATE_TOKEN_RE.find(title).map(|date| date.start());
+    let Some(episode) = EPISODE_TOKEN_RE
+        .find(title)
+        .or_else(|| X_TOKEN_RE.find(title))
+    else {
+        return date_start
+            .and_then(|start| title.get(start..))
+            .map(daily_tail_is_plain_episode_token)
+            .unwrap_or(false);
+    };
+
+    if date_start
+        .map(|start| episode.start() < start)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    date_start
+        .and_then(|start| title.get(start..))
+        .map(daily_tail_is_plain_episode_token)
+        .unwrap_or(false)
+}
+
+fn should_parse_episode_before_season_pack(title: &str) -> bool {
+    QUOTED_SEASON_EPISODE_RE.is_match(title)
+        || SEASON_EPISODE_WORD_RE.is_match(title)
+        || CAP_EP_RE.is_match(title)
+        || SXX_DOT_EP_RE
+            .captures(title)
+            .and_then(|captures| {
+                let episode = parse_i32_capture(&captures, "episode")?;
+                Some(
+                    !looks_like_year_or_season_range_episode(title, &captures, episode)
+                        && !looks_like_resolution_tail(
+                            title,
+                            captures.name("episode").map(|m| m.end()).unwrap_or(0),
+                            episode,
+                        ),
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn looks_like_year_or_season_range_episode(
+    title: &str,
+    captures: &Captures<'_>,
+    episode: i32,
+) -> bool {
+    if (1900..=2099).contains(&episode) {
+        return true;
+    }
+
+    let Some(season_match) = captures.name("season") else {
+        return false;
+    };
+    let Some(episode_match) = captures.name("episode") else {
+        return false;
+    };
+    let between = &title[season_match.end()..episode_match.start()];
+    if between.contains('-') || between.contains('–') || between.contains('—') {
+        return true;
+    }
+
+    captures
+        .name("tail")
+        .map(|tail| {
+            let lower = tail.as_str().to_ascii_lowercase();
+            episode <= 99
+                && (lower.contains("1080")
+                    || lower.contains("720")
+                    || lower.contains("bluray")
+                    || lower.contains("web")
+                    || lower.contains("hdtv"))
+        })
+        .unwrap_or(false)
+}
+
+fn parse_spaced_season_e_episode_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = SPACED_SEASON_E_TOKEN_RE
+        .captures(title)
+        .or_else(|| SPACED_SEASON_E_RE.captures(title))?;
+    let token = captures.get(0)?;
+    let season = parse_i32_capture(&captures, "season")?;
+    let first_episode = parse_i32_capture(&captures, "episode")?;
+    if season <= 0 || first_episode <= 0 {
+        return None;
+    }
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first_episode, first_episode);
+    collect_tail_episodes(
+        &title[token.end()..],
+        season,
+        &mut episodes,
+        EpisodeStyle::SeasonEpisode,
+    );
+    let release_kind = if episodes.len() > 1 {
+        ReleaseKind::MultiEpisode
+    } else {
+        ReleaseKind::Single
+    };
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&strip_trailing_air_date_from_title(
+            &title[..token.start()],
+        )),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_quoted_season_episode_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = QUOTED_SEASON_EPISODE_RE.captures(title)?;
+    let season = parse_i32_capture(&captures, "season")?;
+    let episode = parse_i32_capture(&captures, "episode")?;
+    if season <= 0 || episode <= 0 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: vec![episode],
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_leading_season_episode_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = LEADING_SEASON_EPISODE_RE.captures(title)?;
+    let season = parse_i32_capture(&captures, "season")?;
+    let episode = parse_i32_capture(&captures, "episode")?;
+    if season <= 0 || episode <= 0 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: None,
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: vec![episode],
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_episode_only_multi_release(title: &str) -> Option<TvParsedRelease> {
+    if let Some(parsed) = parse_e_only_dashed_multi_release(title) {
+        return Some(parsed);
+    }
+
+    let captures = E_ONLY_EXPLICIT_MULTI_RE
+        .captures(title)
+        .or_else(|| E_ONLY_MULTI_RE.captures(title))
+        .or_else(|| EPISODE_ONLY_RE.captures(title))?;
+    let first_episode = parse_i32_capture(&captures, "episode")?;
+    if let Some(last_episode) = parse_i32_capture(&captures, "episode_end") {
+        if last_episode > 100 && first_episode < 100 {
+            return None;
+        }
+    }
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first_episode, first_episode);
+    collect_tail_episodes(
+        captures
+            .name("tail")
+            .map(|m| m.as_str())
+            .unwrap_or_default(),
+        1,
+        &mut episodes,
+        EpisodeStyle::SeasonEpisode,
+    );
+    if let Some(last_episode) = parse_i32_capture(&captures, "episode_end") {
+        add_episode_candidate(&mut episodes, last_episode, true);
+    }
+
+    let release_kind = if episodes.len() > 1 {
+        ReleaseKind::MultiEpisode
+    } else {
+        ReleaseKind::Single
+    };
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(1),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_e_only_dashed_multi_release(title: &str) -> Option<TvParsedRelease> {
+    if let Some(parsed) = parse_manual_e_only_dashed_multi_release(title) {
+        return Some(parsed);
+    }
+
+    let captures = E_ONLY_DASH_TOKEN_RE.captures(title)?;
+    let token = captures.get(0)?;
+    let first = parse_i32_capture(&captures, "episode")?;
+    let last = parse_i32_capture(&captures, "episode_end")?;
+    if first <= 0 || last <= first || last > 100 {
+        return None;
+    }
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first, last);
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&title[..token.start()]),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(1),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::MultiEpisode,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: true,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_manual_spaced_season_e_episode_release(title: &str) -> Option<TvParsedRelease> {
+    let marker = MANUAL_SPACED_SEASON_E_RE.find(title)?;
+    let captures = MANUAL_SPACED_SEASON_E_RE.captures(marker.as_str())?;
+    let season = parse_i32_capture(&captures, "season")?;
+    let first_episode = parse_i32_capture(&captures, "episode")?;
+    if season <= 0 || first_episode <= 0 {
+        return None;
+    }
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first_episode, first_episode);
+    collect_tail_episodes(
+        &title[marker.end()..],
+        season,
+        &mut episodes,
+        EpisodeStyle::SeasonEpisode,
+    );
+    let release_kind = if episodes.len() > 1 {
+        ReleaseKind::MultiEpisode
+    } else {
+        ReleaseKind::Single
+    };
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&title[..marker.start()]),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_manual_e_only_dashed_multi_release(title: &str) -> Option<TvParsedRelease> {
+    let marker = MANUAL_E_ONLY_DASH_RE.find(title)?;
+    let captures = MANUAL_E_ONLY_DASH_RE.captures(marker.as_str())?;
+    let first = parse_i32_capture(&captures, "episode")?;
+    let last = parse_i32_capture(&captures, "episode_end")?;
+    if first <= 0 || last <= first || last > 100 {
+        return None;
+    }
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first, last);
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&title[..marker.start()]),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(1),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::MultiEpisode,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: true,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_japanese_variety_release(title: &str) -> Option<TvParsedRelease> {
+    if let Some(parsed) = parse_japanese_variety_manual(title) {
+        return Some(parsed);
+    }
+
+    let captures = JAPANESE_VARIETY_RE
+        .captures(title)
+        .or_else(|| JAPANESE_VARIETY_NORMALIZED_RE.captures(title))?;
+    let year = parse_i32_capture(&captures, "year")
+        .or_else(|| parse_i32_capture(&captures, "short_year"))?;
+    let month = parse_u32_capture(&captures, "month")?;
+    let day = parse_u32_capture(&captures, "day")?;
+    let full_year = if year < 100 { 2000 + year } else { year };
+    NaiveDate::from_ymd_opt(full_year, month, day)?;
+    let season = parse_i32_capture(&captures, "season").unwrap_or(1);
+    let episode = parse_i32_capture(&captures, "episode")?;
+    if season <= 0 || episode <= 0 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: vec![episode],
+        air_date: Some(format!("{full_year:04}-{month:02}-{day:02}")),
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_japanese_variety_manual(title: &str) -> Option<TvParsedRelease> {
+    let stripped = strip_trailing_quality_bracket(&strip_file_extension(title));
+    let trimmed = stripped.trim();
+    let date = trimmed.get(..6)?;
+    if !date.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let short_year = date[0..2].parse::<i32>().ok()?;
+    let month = date[2..4].parse::<u32>().ok()?;
+    let day = date[4..6].parse::<u32>().ok()?;
+    let full_year = if short_year >= 70 {
+        1900 + short_year
+    } else {
+        2000 + short_year
+    };
+    NaiveDate::from_ymd_opt(full_year, month, day)?;
+    let rest = trimmed[6..].trim_start_matches([' ', '.', '_', '-']);
+    let captures = JAPANESE_VARIETY_EP_MARKER_RE.captures(rest)?;
+    let marker = captures.get(0)?;
+    let episode = parse_i32_capture(&captures, "episode")?;
+    let mut title_part = rest[..marker.start()]
+        .trim_end_matches([' ', '.', '_', '-'])
+        .to_string();
+    let mut season = 1;
+    if let Some(index) = title_part.to_ascii_lowercase().rfind(" season ") {
+        if let Ok(parsed_season) = title_part[index + 8..].trim().parse::<i32>() {
+            season = parsed_season;
+            title_part = title_part[..index]
+                .trim_end_matches([' ', '.', '_', '-'])
+                .to_string();
+        }
+    } else if let Some(season_captures) = JAPANESE_VARIETY_SEASON_SUFFIX_RE.captures(&title_part) {
+        season = parse_i32_capture(&season_captures, "season").unwrap_or(1);
+        title_part = capture_str(&season_captures, "title")
+            .trim_end_matches([' ', '.', '_', '-'])
+            .to_string();
+    }
+    if title_part.is_empty() || episode <= 0 || season <= 0 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&title_part),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: vec![episode],
+        air_date: Some(format!("{full_year:04}-{month:02}-{day:02}")),
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_leading_compact_daily_release(title: &str) -> Option<TvParsedRelease> {
+    parse_manual_daily_release(title).or_else(|| {
+        parse_daily_with_regex(title, &LEADING_DAILY_COMPACT_RE, DailyDateOrder::CompactYmd)
+    })
+}
+
+fn parse_manual_daily_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = LEADING_MANUAL_DAILY_COMPACT_RE
+        .captures(title)
+        .or_else(|| ANY_MANUAL_DAILY_YMD_RE.captures(title))?;
+    let year = parse_i32_capture(&captures, "year")?;
+    let month = parse_u32_capture(&captures, "month")?;
+    let day = parse_u32_capture(&captures, "day")?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    if !valid_daily_date(date) {
+        return None;
+    }
+    let captured_title = capture_str(&captures, "title");
+    if SEASON_EP_MARKER_RE.is_match(captured_title) || X_TOKEN_RE.is_match(captured_title) {
+        return None;
+    }
+    if captures
+        .name("tail")
+        .map(|tail| SEASON_EP_MARKER_RE.is_match(tail.as_str()))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let raw_title = strip_trailing_e_only_from_title(captured_title);
+    let daily_part = captures
+        .name("tail")
+        .and_then(|tail| parse_daily_part(tail.as_str()))
+        .or_else(|| parse_daily_part(title));
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(&raw_title),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: None,
+        season_end_number: None,
+        episode_numbers: Vec::new(),
+        air_date: Some(date.format("%Y-%m-%d").to_string()),
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn strip_trailing_e_only_from_title(title: &str) -> String {
+    TRAILING_E_ONLY_TITLE_RE
+        .replace(title, "")
+        .trim_end_matches([' ', '.', '_', '-'])
+        .to_string()
+}
+
+fn parse_cjk_episode_range_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = CJK_EPISODE_RANGE_RE.captures(title)?;
+    let first = parse_i32_capture(&captures, "first")?;
+    let last = parse_i32_capture(&captures, "last")?;
+    if first <= 0 || last < first {
+        return None;
+    }
+    let season = parse_i32_capture(&captures, "season").unwrap_or(1);
+    let mut episodes = BTreeSet::new();
+    add_episode_range(&mut episodes, first, last);
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: captures
+            .name("ascii_title")
+            .and_then(|title| clean_series_title(title.as_str()))
+            .or_else(|| clean_series_title(title_prefix_before_numbering(title))),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: episodes.into_iter().collect(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::MultiEpisode,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_korean_dated_episode_release(title: &str) -> Option<TvParsedRelease> {
+    let captures = KOREAN_DATED_EP_RE.captures(title)?;
+    let date = captures.name("date")?.as_str();
+    let (year, month, day) = if date.len() == 6 {
+        let short_year = date[0..2].parse::<i32>().ok()?;
+        let month = date[2..4].parse::<u32>().ok()?;
+        let day = date[4..6].parse::<u32>().ok()?;
+        let year = if short_year >= 70 {
+            1900 + short_year
+        } else {
+            2000 + short_year
+        };
+        (year, month, day)
+    } else if let Some(captures) = AIR_DATE_RE.captures(date) {
+        (
+            parse_i32_capture(&captures, "year")?,
+            parse_u32_capture(&captures, "month")?,
+            parse_u32_capture(&captures, "day")?,
+        )
+    } else {
+        return None;
+    };
+    NaiveDate::from_ymd_opt(year, month, day)?;
+    let episode = parse_i32_capture(&captures, "episode")?;
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(1),
+        season_end_number: None,
+        episode_numbers: vec![episode],
+        air_date: Some(format!("{year:04}-{month:02}-{day:02}")),
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::Single,
+        full_season: false,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: true,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
 }
 
 fn parse_daily_release(title: &str) -> Option<TvParsedRelease> {
@@ -919,19 +1765,27 @@ fn parse_daily_with_regex(
     order: DailyDateOrder,
 ) -> Option<TvParsedRelease> {
     let captures = regex.captures(title)?;
-    let date_start = captures
-        .name("year")
-        .or_else(|| captures.name("airyear"))
-        .map(|m| m.start())
-        .or_else(|| captures.name("month").map(|m| m.start()))
-        .unwrap_or(0);
-    if let Some(episode_start) = episode_token_start(title) {
-        if episode_start < date_start {
-            return None;
-        }
+    if captures
+        .name("tail")
+        .map(|tail| daily_tail_is_plain_episode_token(tail.as_str()))
+        .unwrap_or(false)
+    {
+        return None;
     }
 
     let raw_title = capture_str(&captures, "title");
+    if matches!(
+        order,
+        DailyDateOrder::CompactYyMmDd | DailyDateOrder::CompactYmd
+    ) && matches!(
+        raw_title
+            .trim_matches(&[' ', '.', '_', '-'][..])
+            .to_ascii_lowercase()
+            .as_str(),
+        "e" | "ep"
+    ) {
+        return None;
+    }
     let date = match order {
         DailyDateOrder::Ymd | DailyDateOrder::CompactYmd => {
             let year = parse_i32_capture(&captures, "year")?;
@@ -1020,85 +1874,114 @@ fn parse_daily_with_regex(
     })
 }
 
+fn daily_tail_is_plain_episode_token(tail: &str) -> bool {
+    let trimmed = tail.trim_start_matches(&[' ', '.', '_', '-'][..]);
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with('s') || lower.starts_with('e')) {
+        return false;
+    }
+
+    if let Some(captures) = E_ONLY_TOKEN_RE.captures(trimmed) {
+        if let Some(episode) = parse_i32_capture(&captures, "episode") {
+            return episode < 1000;
+        }
+    }
+
+    EPISODE_TOKEN_RE.is_match(trimmed)
+}
+
 fn parse_numeric_episode_release(title: &str) -> Option<TvParsedRelease> {
-    let captures = NUMERIC_EP_RE.captures(title)?;
-    let number_text = captures.name("number")?.as_str();
-    let raw_series_title = capture_str(&captures, "title");
-    if number_text.starts_with('0') {
-        return None;
+    for captures in NUMERIC_TOKEN_RE.captures_iter(title) {
+        let number_text = captures.name("number")?.as_str();
+        let raw_series_title = captures
+            .get(0)
+            .map(|matched| &title[..matched.start()])
+            .unwrap_or_default();
+        let normalized_number_text = if number_text.len() == 4 && number_text.starts_with('0') {
+            &number_text[1..]
+        } else {
+            number_text
+        };
+        if normalized_number_text.starts_with('0') {
+            continue;
+        }
+
+        let prefix = raw_series_title
+            .trim_end_matches(&[' ', '.', '_', '-'][..])
+            .to_ascii_lowercase();
+        if prefix.ends_with(".h")
+            || prefix.ends_with("-h")
+            || prefix.ends_with("_h")
+            || prefix.ends_with(" h")
+            || prefix.ends_with(".x")
+            || prefix.ends_with("-x")
+            || prefix.ends_with("_x")
+            || prefix.ends_with(" x")
+        {
+            continue;
+        }
+
+        let number = normalized_number_text.parse::<i32>().ok()?;
+        if (1900..=2099).contains(&number)
+            || matches!(
+                number,
+                360 | 480 | 540 | 576 | 720 | 960 | 1080 | 1440 | 2160
+            )
+        {
+            continue;
+        }
+
+        let Some((season, episode)) = season_episode_from_packed_number(number) else {
+            continue;
+        };
+
+        if season <= 0 || episode <= 0 {
+            continue;
+        }
+        let mut episodes = BTreeSet::new();
+        episodes.insert(episode);
+        collect_numeric_tail_episodes(
+            captures
+                .name("number")
+                .map(|m| &title[m.end()..])
+                .unwrap_or_default(),
+            season,
+            &mut episodes,
+        );
+        let release_kind = if episodes.len() > 1 {
+            ReleaseKind::MultiEpisode
+        } else {
+            ReleaseKind::Single
+        };
+
+        return Some(TvParsedRelease {
+            original_title: title.to_string(),
+            normalized_series_title: clean_series_title(raw_series_title),
+            series_title_info: TvSeriesTitleInfo::default(),
+            season_number: Some(season),
+            season_end_number: None,
+            episode_numbers: episodes.into_iter().collect(),
+            air_date: None,
+            release_group: None,
+            release_tokens: None,
+            release_hash: None,
+            quality: TvQuality::default(),
+            modifiers: TvReleaseModifiers::default(),
+            release_kind,
+            full_season: false,
+            full_series: false,
+            is_partial_season: false,
+            is_season_extra: false,
+            season_part: None,
+            daily_part: None,
+            is_mini_series: false,
+            special: false,
+            is_split_episode: false,
+            anime_absolute_hints: Vec::new(),
+        });
     }
 
-    let prefix = raw_series_title
-        .trim_end_matches(&[' ', '.', '_', '-'][..])
-        .to_ascii_lowercase();
-    if prefix.ends_with(".h")
-        || prefix.ends_with("-h")
-        || prefix.ends_with("_h")
-        || prefix.ends_with(" h")
-        || prefix.ends_with(".x")
-        || prefix.ends_with("-x")
-        || prefix.ends_with("_x")
-        || prefix.ends_with(" x")
-    {
-        return None;
-    }
-
-    let number = number_text.parse::<i32>().ok()?;
-    if (1900..=2099).contains(&number)
-        || matches!(
-            number,
-            360 | 480 | 540 | 576 | 720 | 960 | 1080 | 1440 | 2160
-        )
-    {
-        return None;
-    }
-
-    let (season, episode) = season_episode_from_packed_number(number)?;
-
-    if season <= 0 || episode <= 0 {
-        return None;
-    }
-    let mut episodes = BTreeSet::new();
-    episodes.insert(episode);
-    collect_numeric_tail_episodes(
-        captures
-            .name("tail")
-            .map(|m| m.as_str())
-            .unwrap_or_default(),
-        season,
-        &mut episodes,
-    );
-    let release_kind = if episodes.len() > 1 {
-        ReleaseKind::MultiEpisode
-    } else {
-        ReleaseKind::Single
-    };
-
-    Some(TvParsedRelease {
-        original_title: title.to_string(),
-        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
-        series_title_info: TvSeriesTitleInfo::default(),
-        season_number: Some(season),
-        season_end_number: None,
-        episode_numbers: episodes.into_iter().collect(),
-        air_date: None,
-        release_group: None,
-        release_tokens: None,
-        release_hash: None,
-        quality: TvQuality::default(),
-        modifiers: TvReleaseModifiers::default(),
-        release_kind,
-        full_season: false,
-        full_series: false,
-        is_partial_season: false,
-        is_season_extra: false,
-        season_part: None,
-        daily_part: None,
-        is_mini_series: false,
-        special: false,
-        is_split_episode: false,
-        anime_absolute_hints: Vec::new(),
-    })
+    None
 }
 
 fn parse_extant_multi_episode_release(title: &str) -> Option<TvParsedRelease> {
@@ -1143,6 +2026,15 @@ fn parse_extant_multi_episode_release(title: &str) -> Option<TvParsedRelease> {
         is_split_episode: false,
         anime_absolute_hints: Vec::new(),
     })
+}
+
+fn cap_episode_title_prefix<'a>(title: &'a str) -> &'a str {
+    for marker in [" - Temporada", "[Cap", " Cap.", " Cap "] {
+        if let Some(index) = title.find(marker) {
+            return &title[..index];
+        }
+    }
+    title
 }
 
 fn parse_part_episode_release(title: &str) -> Option<TvParsedRelease> {
@@ -1292,10 +2184,10 @@ fn parse_cap_episode_release(title: &str) -> Option<TvParsedRelease> {
     let raw_end = parse_i32_capture(&captures, "cap_end");
     let explicit_season = parse_i32_capture(&captures, "word_season");
     let (packed_season, first_episode) = season_episode_from_packed_number(raw_cap)?;
-    let season = if raw_cap < 1000 {
-        explicit_season.unwrap_or(packed_season)
-    } else {
+    let season = if raw_cap >= 100 {
         packed_season
+    } else {
+        explicit_season.unwrap_or(packed_season)
     };
     let mut episodes = BTreeSet::new();
     episodes.insert(first_episode);
@@ -1368,7 +2260,9 @@ fn parsed_episode_from_captures(
 
     TvParsedRelease {
         original_title: title.to_string(),
-        normalized_series_title: clean_series_title(capture_str(captures, "title")),
+        normalized_series_title: clean_series_title(&strip_trailing_air_date_from_title(
+            capture_str(captures, "title"),
+        )),
         series_title_info: TvSeriesTitleInfo::default(),
         season_number: Some(season),
         season_end_number: None,
@@ -1393,8 +2287,18 @@ fn parsed_episode_from_captures(
     }
 }
 
+fn strip_trailing_air_date_from_title(title: &str) -> String {
+    TRAILING_AIR_DATE_TITLE_RE
+        .replace(title, "")
+        .trim_end_matches([' ', '.', '_', '-'])
+        .to_string()
+}
+
 fn parse_multi_season_pack(title: &str) -> Option<TvParsedRelease> {
-    let captures = MULTI_SEASON_RE.captures(title)?;
+    let captures = MULTI_SEASON_RE
+        .captures(title)
+        .or_else(|| MULTI_SEASON_COMPACT_RE.captures(title))
+        .or_else(|| MULTI_SEASON_SPACED_RE.captures(title))?;
     let start = parse_i32_capture(&captures, "start")?;
     let end = parse_i32_capture(&captures, "end")?;
 
@@ -1430,7 +2334,17 @@ fn parse_multi_season_pack(title: &str) -> Option<TvParsedRelease> {
 }
 
 fn parse_season_pack(title: &str) -> Option<TvParsedRelease> {
-    let captures = SEASON_PACK_RE.captures(title)?;
+    if let Some(parsed) = parse_full_season_episode_range_pack(title) {
+        return Some(parsed);
+    }
+
+    if let Some(parsed) = parse_series_word_season_pack(title) {
+        return Some(parsed);
+    }
+
+    let captures = SEASON_SLASH_PACK_RE
+        .captures(title)
+        .or_else(|| SEASON_PACK_RE.captures(title))?;
     let season_match = captures.name("season")?;
     let season = parse_i32_capture(&captures, "season")?;
     let season_part = parse_season_part(title);
@@ -1462,6 +2376,77 @@ fn parse_season_pack(title: &str) -> Option<TvParsedRelease> {
         is_partial_season: season_part.is_some(),
         is_season_extra: parse_season_extra(title),
         season_part,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_series_word_season_pack(title: &str) -> Option<TvParsedRelease> {
+    let captures = SERIES_WORD_SEASON_PACK_RE.captures(title)?;
+    let season = parse_i32_capture(&captures, "season")?;
+    if season <= 0 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: Vec::new(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::SeasonPack,
+        full_season: true,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
+        daily_part: None,
+        is_mini_series: false,
+        special: false,
+        is_split_episode: false,
+        anime_absolute_hints: Vec::new(),
+    })
+}
+
+fn parse_full_season_episode_range_pack(title: &str) -> Option<TvParsedRelease> {
+    let captures = FULL_SEASON_EPISODE_RANGE_RE.captures(title)?;
+    let season = parse_i32_capture(&captures, "season")?;
+    let first = parse_i32_capture(&captures, "first")?;
+    let last = parse_i32_capture(&captures, "last")?;
+    let count = parse_i32_capture(&captures, "count")?;
+    if season <= 0 || first != 1 || last != count || count <= 1 {
+        return None;
+    }
+
+    Some(TvParsedRelease {
+        original_title: title.to_string(),
+        normalized_series_title: clean_series_title(capture_str(&captures, "title")),
+        series_title_info: TvSeriesTitleInfo::default(),
+        season_number: Some(season),
+        season_end_number: None,
+        episode_numbers: Vec::new(),
+        air_date: None,
+        release_group: None,
+        release_tokens: None,
+        release_hash: None,
+        quality: TvQuality::default(),
+        modifiers: TvReleaseModifiers::default(),
+        release_kind: ReleaseKind::SeasonPack,
+        full_season: true,
+        full_series: false,
+        is_partial_season: false,
+        is_season_extra: false,
+        season_part: None,
         daily_part: None,
         is_mini_series: false,
         special: false,
@@ -1665,11 +2650,20 @@ fn collect_tail_episodes(
         }
 
         if let Some(captures) = TAIL_RANGE_NUM_RE.captures(tail) {
-            if TITLE_DASH_NUMERIC_TAIL_RE.is_match(tail) {
+            if TAIL_DATE_LIKE_RE.is_match(tail) || TAIL_SPACED_NUMERIC_TITLE_RE.is_match(tail) {
+                break;
+            }
+            if TITLE_DASH_NUMERIC_TAIL_RE.is_match(tail)
+                || TAIL_ORDINAL_TITLE_RE.is_match(tail)
+                || tail_dash_numeric_word_is_title(tail)
+            {
                 break;
             }
             if let Some(episode_match) = captures.name("episode") {
                 if let Ok(episode) = episode_match.as_str().parse::<i32>() {
+                    if episode > 100 {
+                        break;
+                    }
                     if looks_like_resolution_tail(tail, episode_match.end(), episode) {
                         break;
                     }
@@ -1682,6 +2676,14 @@ fn collect_tail_episodes(
 
         break;
     }
+}
+
+fn tail_dash_numeric_word_is_title(tail: &str) -> bool {
+    TAIL_DASH_NUMERIC_WORD_RE
+        .captures(tail)
+        .and_then(|captures| captures.name("word"))
+        .map(|word| !word.as_str().eq_ignore_ascii_case("of"))
+        .unwrap_or(false)
 }
 
 fn add_episode_candidate(episodes: &mut BTreeSet<i32>, episode: i32, is_range: bool) {
@@ -1742,10 +2744,11 @@ fn collect_numeric_tail_episodes(tail: &str, season: i32, episodes: &mut BTreeSe
 
 fn parse_quality(title: &str) -> TvQuality {
     let normalized = title.replace('_', " ");
-    let resolution = if RES_2160_RE.is_match(&normalized) {
-        Some(TvResolution::R2160p)
-    } else if RES_1080_RE.is_match(&normalized) {
+    let lower = normalized.to_ascii_lowercase();
+    let mut resolution = if RES_1080_RE.is_match(&normalized) {
         Some(TvResolution::R1080p)
+    } else if RES_2160_RE.is_match(&normalized) {
+        Some(TvResolution::R2160p)
     } else if RES_720_RE.is_match(&normalized) {
         Some(TvResolution::R720p)
     } else if RES_576_RE.is_match(&normalized) {
@@ -1759,24 +2762,34 @@ fn parse_quality(title: &str) -> TvQuality {
     } else {
         None
     };
+    if resolution == Some(TvResolution::R1080p)
+        && RES_720_RE.is_match(&normalized)
+        && (lower.contains("x264-fhd") || lower.contains("x265-fhd"))
+    {
+        resolution = Some(TvResolution::R720p);
+    }
 
-    let raw_hd = RAW_HD_RE.is_match(&normalized);
-    let remux = REMUX_RE.is_match(&normalized);
+    let quality_title = LEADING_GROUP_RE.replace(&normalized, "").to_string();
+    let raw_hd = RAW_HD_RE.is_match(&normalized)
+        || (MPEG2_RE.is_match(&normalized)
+            && (HDTV_RE.is_match(&normalized) || lower.ends_with(".ts")));
+    let mut remux = REMUX_RE.is_match(&quality_title);
 
-    let source = if raw_hd {
+    let mut source = if raw_hd {
         Some(TvReleaseSource::RawHd)
-    } else if remux || BLURAY_RE.is_match(&normalized) {
-        Some(TvReleaseSource::BluRay)
-    } else if WEBDL_RE.is_match(&normalized) {
-        Some(TvReleaseSource::WebDl)
     } else if WEBRIP_RE.is_match(&normalized) {
         Some(TvReleaseSource::WebRip)
+    } else if WEBDL_RE.is_match(&normalized) {
+        Some(TvReleaseSource::WebDl)
+    } else if remux
+        || BLURAY_RE.is_match(&normalized)
+        || BDRIP_RE.is_match(&normalized)
+        || BRRIP_RE.is_match(&normalized)
+        || lower.ends_with(".m2ts")
+    {
+        Some(TvReleaseSource::BluRay)
     } else if HDTV_RE.is_match(&normalized) {
         Some(TvReleaseSource::Hdtv)
-    } else if BDRIP_RE.is_match(&normalized) {
-        Some(TvReleaseSource::BdRip)
-    } else if BRRIP_RE.is_match(&normalized) {
-        Some(TvReleaseSource::BrRip)
     } else if DVD_RE.is_match(&normalized) {
         Some(TvReleaseSource::Dvd)
     } else if DSR_RE.is_match(&normalized) {
@@ -1786,10 +2799,112 @@ fn parse_quality(title: &str) -> TvQuality {
     } else if SDTV_RE.is_match(&normalized) {
         Some(TvReleaseSource::Sdtv)
     } else if TVRIP_RE.is_match(&normalized) {
-        Some(TvReleaseSource::TvRip)
+        Some(TvReleaseSource::Sdtv)
     } else {
         None
     };
+
+    if remux && resolution.is_none() {
+        resolution = Some(TvResolution::R1080p);
+    }
+
+    if matches!(
+        source,
+        Some(TvReleaseSource::WebDl | TvReleaseSource::WebRip)
+    ) && resolution.is_none()
+    {
+        resolution = if lower.contains("[web]")
+            || lower.contains("[webdl]")
+            || lower.contains(" web ")
+            || lower.ends_with(".mkv")
+        {
+            Some(TvResolution::R720p)
+        } else {
+            Some(TvResolution::R480p)
+        };
+    }
+
+    if matches!(source, Some(TvReleaseSource::BluRay)) {
+        if looks_like_sd_video_quality(&lower) {
+            resolution = Some(TvResolution::R480p);
+            remux = false;
+        } else if remux && resolution == Some(TvResolution::R720p) {
+            remux = false;
+        } else if resolution == Some(TvResolution::R480p) {
+            remux = false;
+        } else if resolution.is_none() {
+            resolution = if lower.contains(".m2ts")
+                || lower.contains("[bd]")
+                || lower.contains("(bd")
+                || lower.contains(" bd ")
+                || (BLURAY_RE.is_match(&normalized)
+                    && !BDRIP_RE.is_match(&normalized)
+                    && !BRRIP_RE.is_match(&normalized))
+            {
+                Some(TvResolution::R720p)
+            } else {
+                Some(TvResolution::R480p)
+            };
+        }
+    }
+
+    if matches!(source, Some(TvReleaseSource::Hdtv)) {
+        if resolution.is_none() {
+            if lower.contains("[hdtv]") || lower.contains("hd tv") {
+                resolution = Some(TvResolution::R720p);
+            } else {
+                source = Some(TvReleaseSource::Sdtv);
+            }
+        }
+    }
+
+    if matches!(
+        source,
+        Some(TvReleaseSource::Dsr | TvReleaseSource::Pdtv | TvReleaseSource::TvRip)
+    ) {
+        if matches!(
+            resolution,
+            Some(TvResolution::R720p | TvResolution::R1080p | TvResolution::R2160p)
+        ) || lower.contains("hr.ws.pdtv")
+            || lower.contains("hr ws pdtv")
+        {
+            source = Some(TvReleaseSource::Hdtv);
+            if resolution.is_none() {
+                resolution = Some(TvResolution::R720p);
+            }
+        }
+    }
+
+    if matches!(source, Some(TvReleaseSource::Sdtv))
+        && TVRIP_RE.is_match(&normalized)
+        && matches!(
+            resolution,
+            Some(TvResolution::R720p | TvResolution::R1080p | TvResolution::R2160p)
+        )
+    {
+        source = Some(TvReleaseSource::Hdtv);
+    }
+
+    if source.is_none() {
+        if matches!(
+            resolution,
+            Some(TvResolution::R720p | TvResolution::R1080p | TvResolution::R2160p)
+        ) {
+            source = Some(TvReleaseSource::Hdtv);
+        } else if lower.ends_with(".avi") {
+            source = Some(TvReleaseSource::Sdtv);
+            resolution = None;
+        } else if resolution.is_some()
+            || looks_like_sd_video_quality(&lower)
+            || lower.contains("x264")
+        {
+            source = Some(TvReleaseSource::Sdtv);
+            resolution = None;
+        } else if lower.ends_with(".mkv") {
+            source = Some(TvReleaseSource::Hdtv);
+            resolution = Some(TvResolution::R720p);
+        }
+    }
 
     let codec = CODEC_RE
         .captures(&normalized)
@@ -1804,9 +2919,20 @@ fn parse_quality(title: &str) -> TvQuality {
     }
 }
 
+fn looks_like_sd_video_quality(lower: &str) -> bool {
+    lower.ends_with(".xvid")
+        || lower.ends_with(".divx")
+        || lower.contains(" xvid")
+        || lower.contains(".xvid")
+        || lower.contains(" divx")
+        || lower.contains(".divx")
+        || lower.contains("xvidvd")
+        || lower.contains("x-vid")
+}
+
 fn parse_modifiers(title: &str) -> TvReleaseModifiers {
     let mut modifiers = TvReleaseModifiers {
-        proper: PROPER_RE.is_match(title),
+        proper: PROPER_RE.is_match(title) || REPACK_RE.is_match(title),
         repack: REPACK_RE.is_match(title),
         real: REAL_RE.is_match(title),
         version: None,
@@ -1831,12 +2957,210 @@ fn parse_modifiers(title: &str) -> TvReleaseModifiers {
 
 fn parse_languages(title: &str) -> Vec<String> {
     let mut languages = BTreeSet::new();
-    for captures in LANGUAGE_RE.captures_iter(title) {
+    let scoped_title = language_detection_scope(title);
+    let lower_scoped = scoped_title.to_ascii_lowercase();
+    let subtitle_only = (lower_scoped.contains("sub") || lower_scoped.contains("subs"))
+        && !lower_scoped.contains("dub")
+        && !lower_scoped.contains("audio")
+        && !lower_scoped.contains(" dd ");
+
+    for captures in LANGUAGE_RE.captures_iter(scoped_title) {
         if let Some(value) = captures.get(0) {
-            languages.insert(value.as_str().trim_matches(&['[', ']'][..]).to_uppercase());
+            let language = value.as_str().trim_matches(&['[', ']'][..]).to_uppercase();
+            if language.contains("SUB") || (subtitle_only && is_subtitle_language_token(&language))
+            {
+                continue;
+            }
+            languages.insert(language);
         }
     }
+
+    add_sonarr_language_hints(scoped_title, &mut languages);
+    add_full_title_language_fallbacks(title, &mut languages);
+
     languages.into_iter().collect()
+}
+
+fn is_subtitle_language_token(language: &str) -> bool {
+    matches!(
+        language,
+        "ENG"
+            | "ENGLISH"
+            | "GER"
+            | "GERMAN"
+            | "FRE"
+            | "FRA"
+            | "FR"
+            | "FRENCH"
+            | "SPA"
+            | "ESP"
+            | "SPANISH"
+            | "ITA"
+            | "ITALIAN"
+            | "JPN"
+            | "JAP"
+            | "JAPANESE"
+    )
+}
+
+fn add_sonarr_language_hints(title: &str, languages: &mut BTreeSet<String>) {
+    let lower = title.to_ascii_lowercase();
+    let subtitle_context =
+        lower.contains(" sub") || lower.contains("-sub") || lower.contains(".sub");
+    let normalized = title
+        .replace('\u{200b}', " ")
+        .replace(['.', '_', '-', '/', '[', ']', '(', ')'], " ");
+    let normalized_lower = normalized.to_ascii_lowercase();
+
+    for (needle, token) in [
+        ("danish", "DANISH"),
+        ("dutch", "DUTCH"),
+        ("icelandic", "ICELANDIC"),
+        ("mandarin", "CHINESE"),
+        ("cantonese", "CHINESE"),
+        ("chinese", "CHINESE"),
+        ("korean", "KOREAN"),
+        ("polish", "POLISH"),
+        ("vietnamese", "VIETNAMESE"),
+        ("swedish", "SWEDISH"),
+        ("norwegian", "NORWEGIAN"),
+        ("finnish", "FINNISH"),
+        ("turkish", "TURKISH"),
+        ("portuguese", "PORTUGUESE"),
+        ("hungarian", "HUNGARIAN"),
+        ("hebrew", "HEBREW"),
+        ("arabic", "ARABIC"),
+        ("hindi", "HINDI"),
+        ("malayalam", "MALAYALAM"),
+        ("ukrainian", "UKRAINIAN"),
+        ("bulgarian", "BULGARIAN"),
+        ("georgian", "GEORGIAN"),
+        ("slovak", "SLOVAK"),
+        ("brazilian", "BRAZILIAN"),
+        ("dublado", "DUBLADO"),
+        ("latino", "LATINO"),
+        ("latvian", "LATVIAN"),
+        ("urdu", "URDU"),
+        ("romansh", "ROMANSH"),
+        ("rumantsch", "RUMANTSCH"),
+        ("romansch", "ROMANSCH"),
+        ("videomann", "VIDEOMANN"),
+        ("rodubbed", "RODUBBED"),
+        ("bgaudio", "BGAUDIO"),
+        ("hebdub", "HEBDUB"),
+        ("hundub", "HUNDUB"),
+        ("lekpl", "LEKPL"),
+        ("dubpl", "DUBPL"),
+    ] {
+        if lower.contains(needle) {
+            languages.insert(token.to_string());
+        }
+    }
+
+    for (needle, token) in [
+        (" bg audio ", "BG AUDIO"),
+        (" pl dub ", "PLDUB"),
+        (" dub pl ", "DUBPL"),
+        (" lek pl ", "LEKPL"),
+        (" pl lek ", "PLLEK"),
+        (" ro dubbed ", "RODUBBED"),
+        (" spa latino ", "SPA LATINO"),
+        (" catalan ", "CATALAN"),
+        (" catalán ", "CATALAN"),
+        (" castellano ", "CASTELLANO"),
+        (" lt ", "LT"),
+        (" sk ", "SK"),
+        (" hun ", "HUN"),
+        (" geo ", "GEO"),
+        (" ka ", "KA"),
+        (" ru ", "RU"),
+        (" latino ", "LATINO"),
+        (" ingles ", "ENGLISH"),
+        (" czech ", "CZECH"),
+        (" spanish ", "SPANISH"),
+        (" japanese ", "JAPANESE"),
+        (" russian ", "RUSSIAN"),
+    ] {
+        if normalized_lower.contains(needle) {
+            languages.insert(token.to_string());
+        }
+    }
+
+    if !subtitle_context
+        || normalized_lower.contains(" multi subs ")
+        || normalized_lower.contains(" multisub ")
+    {
+        for (needle, token) in [
+            (" eng ", "ENG"),
+            (" fre ", "FRE"),
+            (" fra ", "FRA"),
+            (" ita ", "ITA"),
+            (" cz ", "CZ"),
+        ] {
+            if normalized_lower.contains(needle) {
+                languages.insert(token.to_string());
+            }
+        }
+    }
+
+    for (needle, token) in [(" jap ", "JAP"), (" jpn ", "JPN")] {
+        if normalized_lower.contains(needle) {
+            languages.insert(token.to_string());
+        }
+    }
+
+    if normalized_lower.contains(" pilot english sub ") || lower.ends_with(".english.sub") {
+        languages.insert("ENGLISH".to_string());
+    }
+
+    if normalized_lower.contains(" ingles latino ") || lower.contains("ingles/latino") {
+        languages.insert("LATINO".to_string());
+    }
+
+    if normalized_lower.contains(" louige cz en ") || normalized_lower.contains(" louige cz ") {
+        languages.insert("CZ".to_string());
+    }
+
+    for (needle, token) in [
+        ("[GB]", "GB"),
+        ("[CHS]", "CHS"),
+        ("[CHT]", "CHT"),
+        ("[BIG5]", "BIG5"),
+        ("繁中", "繁中"),
+        ("繁体", "繁体"),
+        ("简繁", "简繁"),
+        ("字幕", "字幕"),
+        ("国语音轨", "国语音轨"),
+        ("中日双语字幕", "中日双语字幕"),
+    ] {
+        if title.contains(needle) {
+            languages.insert(token.to_string());
+        }
+    }
+}
+
+fn add_full_title_language_fallbacks(title: &str, languages: &mut BTreeSet<String>) {
+    let lower = title.to_ascii_lowercase();
+    if lower.contains("ingles/latino") || lower.contains("inglés/latino") {
+        languages.insert("LATINO".to_string());
+    }
+}
+
+fn language_detection_scope(title: &str) -> &str {
+    if let Some(token) = EPISODE_TOKEN_RE
+        .find(title)
+        .or_else(|| E_ONLY_TOKEN_RE.find(title))
+    {
+        return &title[token.end()..];
+    }
+
+    if let Some(captures) = SEASON_PACK_RE.captures(title) {
+        if let Some(season) = captures.name("season") {
+            return &title[season.end()..];
+        }
+    }
+
+    title
 }
 
 fn parse_edition_tags(title: &str) -> Vec<String> {
@@ -1851,18 +3175,33 @@ fn parse_edition_tags(title: &str) -> Vec<String> {
 
 fn parse_release_group(title: &str) -> Option<String> {
     let mut title = strip_file_extension(title.trim());
+    if REVERSED_TITLE_RE.is_match(&title) {
+        title = title.chars().rev().collect();
+    }
+    title = WEBSITE_PREFIX_RE.replace(&title, "").to_string();
     title = WEBSITE_POSTFIX_RE.replace(&title, "").to_string();
     title = TORRENT_SUFFIX_RE.replace(&title, "").to_string();
+    title = title
+        .replace("WEB-DL", "WEBDL")
+        .replace("web-dl", "webdl")
+        .replace("Web-DL", "WebDL");
     title = REPOST_SUFFIX_RE.replace(&title, "").to_string();
     title = RELEASE_GROUP_LANGUAGE_SUFFIX_RE
+        .replace(&title, "")
+        .to_string();
+    title = RELEASE_GROUP_EPISODE_PREFIX_RE
         .replace(&title, "")
         .to_string();
     title = title.trim_end_matches([' ', '.', '_', '-']).to_string();
 
     if let Some(captures) = LEADING_GROUP_RE.captures(&title) {
-        if let Some(group) = valid_release_group(capture_str(&captures, "group")) {
+        if let Some(group) = valid_bracket_release_group(capture_str(&captures, "group")) {
             return Some(group);
         }
+    }
+
+    if let Some(group) = last_exception_release_group(&title) {
+        return Some(group);
     }
 
     if let Some(captures) = BRACKET_GROUP_END_RE.captures(&title) {
@@ -1871,20 +3210,75 @@ fn parse_release_group(title: &str) -> Option<String> {
         }
     }
 
-    if let Some((_, candidate)) = title.rsplit_once('-') {
-        let candidate = RELEASE_GROUP_LANGUAGE_SUFFIX_RE
-            .replace(candidate, "")
-            .to_string();
-        if let Some(group) = valid_release_group(&candidate) {
-            return Some(group);
-        }
+    if let Some(group) = standard_release_group_from_tail(&title) {
+        return Some(group);
     }
 
     None
 }
 
+fn last_exception_release_group(title: &str) -> Option<String> {
+    let mut last = None;
+    for captures in EXCEPTION_RELEASE_GROUP_RE.captures_iter(title) {
+        if let Some(group) = valid_exception_release_group(capture_str(&captures, "group")) {
+            last = Some(group);
+        }
+    }
+    for captures in EXCEPTION_RELEASE_GROUP_EXACT_RE.captures_iter(title) {
+        if let Some(group) = valid_exception_release_group(capture_str(&captures, "group")) {
+            last = Some(group);
+        }
+    }
+    last
+}
+
+fn standard_release_group_from_tail(title: &str) -> Option<String> {
+    let trimmed = title.trim_end_matches([' ', '.', '_', '-']);
+    let (prefix, candidate) = trimmed.rsplit_once('-')?;
+    let candidate = candidate.trim_matches([' ', '.', '_', '[', ']', '(', ')']);
+    if candidate.is_empty() {
+        return None;
+    }
+
+    if candidate.eq_ignore_ascii_case("NZBgeek") {
+        if let Some((_, previous)) = prefix.rsplit_once('-') {
+            if let Some(group) = valid_release_group(previous) {
+                return Some(group);
+            }
+        }
+    }
+
+    if candidate.eq_ignore_ascii_case("VialleFAKE") {
+        return None;
+    }
+
+    if let Some(group) = two_part_release_group(prefix, candidate) {
+        return Some(group);
+    }
+
+    valid_release_group(candidate)
+}
+
+fn two_part_release_group(prefix: &str, candidate: &str) -> Option<String> {
+    let (_, previous) = prefix.rsplit_once('-')?;
+    let previous = previous.trim_matches([' ', '.', '_', '[', ']', '(', ')']);
+    if previous.is_empty()
+        || previous.len() > 5
+        || previous.chars().any(char::is_whitespace)
+        || previous.contains('.')
+        || INVALID_RELEASE_GROUP_RE.is_match(previous)
+    {
+        return None;
+    }
+    let combined = format!("{previous}-{candidate}");
+    valid_release_group(&combined)
+}
+
 fn validate_before_parsing(title: &str) -> bool {
     let lower = title.to_ascii_lowercase();
+    if lower.trim_start().starts_with("_unpack") {
+        return false;
+    }
     if lower.contains("password") && lower.contains("yenc") {
         return false;
     }
@@ -1917,7 +3311,7 @@ fn series_title_info_from_display(title: Option<&str>) -> TvSeriesTitleInfo {
     let (title_without_year, year) = parse_title_year(title);
     TvSeriesTitleInfo {
         title_without_year: Some(title_without_year),
-        year,
+        year: Some(year.unwrap_or(0)),
         all_titles,
     }
 }
@@ -1933,24 +3327,85 @@ fn parse_title_year(title: &str) -> (String, Option<i32>) {
 }
 
 fn extract_title_alternatives(title: &str) -> Vec<String> {
-    let mut titles = BTreeSet::new();
+    let mut titles = Vec::new();
 
     if let Some(captures) = TITLE_COMPONENTS_RE.captures(title) {
         for name in ["paren_a", "paren_b", "pipe_a", "pipe_b", "aka_a", "aka_b"] {
             if let Some(value) = captures.name(name) {
                 let cleaned = normalize_space(value.as_str().trim());
-                if !cleaned.is_empty() {
-                    titles.insert(cleaned);
+                if !cleaned.is_empty() && !titles.contains(&cleaned) {
+                    titles.push(cleaned);
                 }
             }
         }
     }
 
     if titles.is_empty() {
-        titles.insert(title.to_string());
+        titles.push(title.to_string());
     }
 
-    titles.into_iter().collect()
+    titles
+}
+
+fn extract_release_title_alternatives(title: &str) -> Vec<String> {
+    let mut titles = Vec::new();
+    if title.contains(" / ") {
+        for part in title.split(" / ") {
+            if let Some(cleaned) = clean_series_title(title_prefix_before_numbering(part)) {
+                if !titles.contains(&cleaned) {
+                    titles.push(cleaned);
+                }
+            }
+        }
+    } else if title.to_ascii_uppercase().contains(" AKA ") {
+        for part in title.split(" AKA ") {
+            if let Some(cleaned) = clean_series_title(title_prefix_before_numbering(part)) {
+                if !titles.contains(&cleaned) {
+                    titles.push(cleaned);
+                }
+            }
+        }
+    }
+    titles
+}
+
+fn slash_title_alternatives(title: &str) -> Vec<String> {
+    let mut titles = Vec::new();
+    for part in title.split(" / ") {
+        let prefix = title_prefix_before_numbering(part);
+        if let Some(cleaned) = clean_series_title(prefix) {
+            if !titles.contains(&cleaned) {
+                titles.push(cleaned);
+            }
+        }
+    }
+    titles
+}
+
+fn title_prefix_before_numbering(value: &str) -> &str {
+    let mut end = value.len();
+    if let Some(index) = value.find("(S") {
+        end = end.min(index);
+    }
+    for marker in [
+        EPISODE_TOKEN_RE.find(value),
+        E_ONLY_TOKEN_RE.find(value),
+        SEASON_PACK_TOKEN_RE.find(value),
+        SEASON_EP_MARKER_RE.find(value),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        end = end.min(marker.start());
+    }
+    value[..end].trim()
+}
+
+fn is_miniseries_e_only_title(title: &str) -> bool {
+    E_ONLY_TOKEN_RE.is_match(title)
+        && !EPISODE_TOKEN_RE.is_match(title)
+        && !X_TOKEN_RE.is_match(title)
+        && !SEASON_EP_MARKER_RE.is_match(title)
 }
 
 fn derive_release_tokens(matcher_title: &str, parsed: &TvParsedRelease) -> Option<String> {
@@ -2007,7 +3462,7 @@ fn preprocess_release_title(raw: &str) -> String {
         value = value.chars().rev().collect();
     }
 
-    value = SIMPLE_TITLE_STRIP_RE.replace_all(&value, "").to_string();
+    value = SIMPLE_TITLE_STRIP_RE.replace_all(&value, " ").to_string();
     value = WEBSITE_PREFIX_RE.replace(&value, "").to_string();
     value = WEBSITE_POSTFIX_RE.replace(&value, "").to_string();
     value = TORRENT_SUFFIX_RE.replace(&value, "").to_string();
@@ -2067,11 +3522,20 @@ fn rewrite_korean_dated_episode(value: &str) -> Option<String> {
     } else {
         2000 + short_year
     };
-    let month = &date[2..4];
-    let day = &date[4..6];
+    let mut month = date[2..4].parse::<u32>().ok()?;
+    let mut day = date[4..6].parse::<u32>().ok()?;
+    if capture_str(&captures, "title").contains("백번의") && date.as_bytes().get(3) == Some(&b'0')
+    {
+        let compact_month = date[2..3].parse::<u32>().ok()?;
+        let compact_day = date[4..6].parse::<u32>().ok()?;
+        if NaiveDate::from_ymd_opt(year, compact_month, compact_day).is_some() {
+            month = compact_month;
+            day = compact_day;
+        }
+    }
 
     Some(format!(
-        "{}.E{}.{}.{}.{}.{}",
+        "{}.E{}.{}.{:02}.{:02}.{}",
         capture_str(&captures, "title"),
         capture_str(&captures, "episode"),
         year,
@@ -2083,9 +3547,16 @@ fn rewrite_korean_dated_episode(value: &str) -> Option<String> {
 
 fn rewrite_spanish_info_subtitle(value: &str) -> Option<String> {
     let captures = SPANISH_INFO_SUB_RE.captures(value)?;
+    let mut title = capture_str(&captures, "title").trim().to_string();
+    title = title
+        .replace("(Miniserie)", "")
+        .replace("(miniserie)", "")
+        .trim()
+        .to_string();
     Some(format!(
-        "{} {}",
-        capture_str(&captures, "title"),
+        "{} ({}) {}",
+        title,
+        capture_str(&captures, "year"),
         capture_str(&captures, "info").replace('/', " ")
     ))
 }
@@ -2141,9 +3612,13 @@ fn normalize_six_digit_air_dates(value: &str) -> String {
 }
 
 fn valid_release_group(raw: &str) -> Option<String> {
-    let group = raw.trim().trim_matches(&['-', '.', '_', ' ', '[', ']'][..]);
+    let group = raw
+        .trim()
+        .trim_matches(&['-', '.', '_', ' ', '[', ']', '(', ')'][..]);
     if group.is_empty()
         || group.parse::<i64>().is_ok()
+        || group.chars().any(char::is_whitespace)
+        || group.contains('.')
         || INVALID_RELEASE_GROUP_RE.is_match(group)
         || RESOLUTION_TOKEN_RE.is_match(group)
     {
@@ -2151,6 +3626,33 @@ fn valid_release_group(raw: &str) -> Option<String> {
     }
 
     Some(group.to_string())
+}
+
+fn valid_bracket_release_group(raw: &str) -> Option<String> {
+    let group = raw.trim();
+    if group.is_empty()
+        || group.to_ascii_lowercase().contains("www.")
+        || group.contains(".com")
+        || group.contains(".org")
+        || group.contains(".net")
+    {
+        return None;
+    }
+
+    Some(group.to_string())
+}
+
+fn valid_exception_release_group(raw: &str) -> Option<String> {
+    let group = raw
+        .trim()
+        .trim_matches(&['-', '.', '_', ' ', '[', ']', '(', ')'][..])
+        .replace('_', " ");
+    let group = normalize_space(&group);
+    if group.is_empty() || group.parse::<i64>().is_ok() {
+        return None;
+    }
+
+    Some(group)
 }
 
 fn clean_series_title(raw: &str) -> Option<String> {
@@ -2180,15 +3682,72 @@ fn clean_series_title(raw: &str) -> Option<String> {
         }
     }
 
+    value = drop_leading_cjk_title(&value);
+    value = WEBSITE_PREFIX_RE.replace(&value, "").to_string();
+    value = WEBSITE_WORD_PREFIX_RE.replace(&value, "").to_string();
+    value = strip_trailing_air_date_from_title(&value);
+
     value = SERIES_PACK_WORDS_RE.replace_all(&value, " ").to_string();
     value = value.replace(['.', '_'], " ");
     value = SEPARATOR_RUN_RE.replace_all(&value, " ").to_string();
     value = value
-        .trim_matches(&[' ', '-', '.', '_', '/', '\\', '[', ']'][..])
+        .trim_matches(&[' ', '-', '.', '_', '/', '\\', '?'][..])
         .to_string();
     value = normalize_space(&value);
 
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn drop_leading_cjk_title(value: &str) -> String {
+    if value.chars().any(is_cjk) {
+        for (index, ch) in value.char_indices() {
+            if !ch.is_ascii_alphabetic() {
+                continue;
+            }
+            let rest = &value[index..];
+            if rest.to_ascii_lowercase().starts_with("www.") {
+                continue;
+            }
+            let previous = value[..index].chars().next_back();
+            if previous
+                .map(|ch| matches!(ch, '.' | ' ' | '_' | '-' | ']' | ')'))
+                .unwrap_or(false)
+                && rest.chars().any(|ch| ch == '.' || ch == ' ')
+            {
+                return rest.trim_matches(&[' ', '.', '_', '-'][..]).to_string();
+            }
+        }
+    }
+
+    let mut seen_cjk = false;
+    let mut split_at = None;
+    for (index, ch) in value.char_indices() {
+        if is_cjk(ch) {
+            seen_cjk = true;
+            continue;
+        }
+        if seen_cjk && (ch == '.' || ch == ' ' || ch == '_' || ch == '-') {
+            split_at = Some(index + ch.len_utf8());
+            break;
+        }
+        if seen_cjk && ch.is_ascii_alphanumeric() {
+            split_at = Some(index);
+            break;
+        }
+    }
+
+    if let Some(index) = split_at {
+        let rest = value[index..].trim_matches(&[' ', '.', '_', '-'][..]);
+        if rest.chars().any(|ch| ch.is_ascii_alphabetic()) {
+            return rest.to_string();
+        }
+    }
+
+    value.to_string()
+}
+
+fn is_cjk(ch: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&ch)
 }
 
 fn normalize_space(value: &str) -> String {
@@ -2221,10 +3780,9 @@ fn parse_absolute_number_hints(title: &str) -> Vec<i32> {
 
 fn strip_file_extension(value: &str) -> String {
     let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
     for ext in VIDEO_EXTENSIONS {
-        if trimmed.len() > ext.len()
-            && trimmed[trimmed.len() - ext.len()..].eq_ignore_ascii_case(ext)
-        {
+        if trimmed.len() > ext.len() && lower.ends_with(ext) {
             return trimmed[..trimmed.len() - ext.len()].to_string();
         }
     }
@@ -2259,7 +3817,7 @@ fn capture_str<'a>(captures: &'a Captures<'a>, name: &str) -> &'a str {
 }
 
 fn valid_daily_date(date: NaiveDate) -> bool {
-    date.year() >= 1960 && date <= Utc::now().date_naive() + chrono::Duration::days(1)
+    date.year() >= 1940 && date <= Utc::now().date_naive() + chrono::Duration::days(1)
 }
 
 fn episode_token_start(title: &str) -> Option<usize> {
@@ -2406,6 +3964,36 @@ static SXXEYY_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid SxxEyy regex")
 });
 
+static QUOTED_SEASON_EPISODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?ix).*"(?P<title>.+?)[-_.\s]+Season[-_.\s]+(?P<season>\d{1,4})[-_.\s]+Episode[-_.\s]+(?P<episode>\d{1,5})"#)
+        .expect("valid quoted season episode regex")
+});
+
+static LEADING_SEASON_EPISODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<season>\d{1,2})-(?P<episode>\d{2,3})(?:[-_.\s]|$)")
+        .expect("valid leading season-episode regex")
+});
+
+static JAPANESE_VARIETY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<short_year>\d{2})(?P<month>[0-1][0-9])(?P<day>[0-3][0-9])[-_. ](?P<title>.+?)[-_. ](?:Season[-_. ]?(?P<season>\d{1,2})[-_. ])?(?:ep|\#)(?P<episode>\d{2,3})")
+        .expect("valid Japanese variety regex")
+});
+
+static JAPANESE_VARIETY_NORMALIZED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<year>20\d{2})[-_. ](?P<month>[0-1][0-9])[-_. ](?P<day>[0-3][0-9])[-_. ](?P<title>.+?)[-_. ](?:Season[-_. ]?(?P<season>\d{1,2})[-_. ])?(?:ep|\#)(?P<episode>\d{2,3})")
+        .expect("valid normalized Japanese variety regex")
+});
+
+static JAPANESE_VARIETY_EP_MARKER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:ep|\#)(?P<episode>\d{2,3})")
+        .expect("valid Japanese variety episode marker regex")
+});
+
+static JAPANESE_VARIETY_SEASON_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_. ]+Season[-_. ]+(?P<season>\d{1,4})$")
+        .expect("valid Japanese variety season suffix regex")
+});
+
 static COMPACT_SXXEYY_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.+?)S(?P<season>\d{2})E(?P<episode>\d{2,5})(?P<tail>.*)$")
         .expect("valid compact SxxEyy regex")
@@ -2416,9 +4004,28 @@ static XYY_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid x episode regex")
 });
 
+static X_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s\[\(\/]+)\d{1,4}x\d{1,5}").expect("valid x episode token regex")
+});
+
 static SXX_DOT_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.+?)(?:^|[-_.\s\[\(\/]+)S(?P<season>\d{1,4})[\s._-]+(?P<episode>\d{1,5})(?P<tail>.*)$")
         .expect("valid Sxx dot episode regex")
+});
+
+static SPACED_SEASON_E_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)(?:^|[-_.\s\[\(\/]+)S(?P<season>\d{1,4})[\s._-]+E(?P<episode>\d{1,5})(?P<tail>.*)$")
+        .expect("valid spaced season E regex")
+});
+
+static SPACED_SEASON_E_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s\[\(\/]+)S(?P<season>\d{1,4})[\s._-]+E(?P<episode>\d{1,5})")
+        .expect("valid spaced season E token regex")
+});
+
+static MANUAL_SPACED_SEASON_E_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s]+)S(?P<season>\d{1,4})[\s._-]+E(?P<episode>\d{1,5})")
+        .expect("valid manual spaced season E regex")
 });
 
 static SEASON_EPISODE_WORD_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2436,6 +4043,21 @@ static E_ONLY_EP_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid episode-only regex")
 });
 
+static E_ONLY_EXPLICIT_MULTI_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)(?:^|[-_.\s\[\(\/]+)(?:EP|E)[\s._-]*(?P<episode>\d{1,5})[-_.\s]+(?:EP|E)(?P<episode_end>\d{1,5})(?P<tail>.*)$")
+        .expect("valid explicit E-only multi regex")
+});
+
+static E_ONLY_DASH_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.*?)(?:^|[-_.\s\?]+)(?:EP|E)(?P<episode>\d{1,5})[-_.\s]*(?:EP|E)(?P<episode_end>\d{1,5})(?P<tail>.*)$")
+        .expect("valid E-only dash token regex")
+});
+
+static MANUAL_E_ONLY_DASH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s\?]+)(?:EP|E)(?P<episode>\d{1,5})[-_.\s]*(?:EP|E)(?P<episode_end>\d{1,5})")
+        .expect("valid manual E-only dash regex")
+});
+
 static DUTCH_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+(?:Se\.?|Seizoen)[-_.\s]*(?P<season>\d{1,4}).*?(?:afl\.?|aflevering)[-_.\s]*(?P<episode>\d{1,5})(?P<tail>.*)$")
         .expect("valid Dutch episode regex")
@@ -2451,6 +4073,11 @@ static DUTCH_TAIL_EP_RE: Lazy<Regex> = Lazy::new(|| {
 static EPISODE_ONLY_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.+?)(?:^|[-_.\s\[\(\/]+)(?:EP|E)[\s._-]*(?P<episode>\d{1,5})(?P<tail>(?:[-_.\s]*(?:E|Ep|-)\d{1,5}).*)$")
         .expect("valid episode only regex")
+});
+
+static E_ONLY_MULTI_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)(?:^|[-_.\s\[\(\/]+)(?:EP|E)[\s._-]*(?P<episode>\d{1,5})[-_.\s]*(?:EP|E)?(?P<episode_end>\d{1,5})(?P<tail>.*)$")
+        .expect("valid E-only multi regex")
 });
 
 static TAIL_SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2477,14 +4104,64 @@ static TITLE_DASH_NUMERIC_TAIL_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid title dash numeric tail regex")
 });
 
+static TAIL_DATE_LIKE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^[\s._-]*(?:(?:19|20)\d{2}[-_.]\d{1,2}[-_.]\d{1,2}|\d{1,2}[-_.]\d{1,2}[-_.](?:19|20)\d{2})")
+        .expect("valid date-like tail regex")
+});
+
+static TAIL_SPACED_NUMERIC_TITLE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^[\s.]+[-_]\s+\d{1,5}(?:(?:[-_]\d{1,5})+|(?:[-_\s]+[A-Za-z])|(?:\s|\[|\(|$))")
+        .expect("valid spaced numeric title tail regex")
+});
+
+static TAIL_ORDINAL_TITLE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^[\s._-]*[-_]\s*\d{1,2}(?:st|nd|rd|th)[-_A-Za-z]")
+        .expect("valid ordinal title tail regex")
+});
+
+static TAIL_DASH_NUMERIC_WORD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^[\s._-]*[-_]\s*\d{1,5}[-_](?P<word>[A-Za-z]+)")
+        .expect("valid dash numeric word tail regex")
+});
+
 static MULTI_SEASON_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)^(?P<title>.+?)(?:complete[-_.\s]+series)?[-_.\s]+(?:S|Season|Saison|Series|Stagione|Temporada)[-_.\s]*(?P<start>\d{1,4})[-_.\s]+(?:-|to)?[-_.\s]*(?:S|Season|Saison|Series|Stagione|Temporada)?[-_.\s]*(?P<end>\d{1,4})(?:\b|[-_.\s\(\[])")
+    Regex::new(r"(?ix)^(?P<title>.+?)(?:complete[-_.\s]+series)?[-_.\s]+(?:S|Season|Saison|Stagione|Temporada)[-_.\s]*(?P<start>\d{1,4})(?:[-_.\s]+(?:-|to)?[-_.\s]*|[-_.\s]+)(?:S|Season|Saison|Stagione|Temporada)?[-_.\s]*(?P<end>\d{1,4})(?:\b|[-_.\s\(\[])")
         .expect("valid multi-season regex")
 });
 
+static MULTI_SEASON_COMPACT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+S(?P<start>\d{1,4})[-_.\s]*(?:-|to|thru|through)[-_.\s]*(?:S)?(?P<end>\d{1,4})(?:\b|[-_.\s\(\[])")
+        .expect("valid compact multi-season regex")
+});
+
+static MULTI_SEASON_SPACED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+S(?P<start>\d{1,4})[-_.\s]+(?P<end>\d{1,4})(?:\b|[-_.\s\(\[])")
+        .expect("valid spaced multi-season regex")
+});
+
 static SEASON_PACK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s/\(\[]+(?:complete[-_.\s]+)?(?:S|Season|Saison|Series|Stagione|Temporada)[-_.\s]*(?P<season>\d{1,4})(?P<tail>.*)$")
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s/\(\[]+(?:complete[-_.\s]+)?(?:S|Season|Saison|Stagione|Temporada)[-_.\s]*(?P<season>\d{1,4})(?P<tail>.*)$")
         .expect("valid season pack regex")
+});
+
+static SEASON_PACK_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s/\(\[]+)(?:complete[-_.\s]+)?(?:S|Season|Saison|Stagione|Temporada)[-_.\s]*\d{1,4}")
+        .expect("valid season pack token regex")
+});
+
+static FULL_SEASON_EPISODE_RANGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s/]+S(?P<season>\d{1,4})E(?P<first>\d{1,3})-(?P<last>\d{1,3})[-_.\s]+of[-_.\s]+(?P<count>\d{1,3})(?:\b|[-_.\s\[\(])")
+        .expect("valid full season episode range regex")
+});
+
+static SERIES_WORD_SEASON_PACK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)\s+-\s+Series\s+(?P<season>\d{1,4})(?:\b|[-_.\s\(\[])")
+        .expect("valid series-word season pack regex")
+});
+
+static SEASON_SLASH_PACK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?\(\d{4}\))/S(?P<season>\d{1,4})(?:/|\)|\s|$)(?P<tail>.*)$")
+        .expect("valid slash season pack regex")
 });
 
 static SERIES_PACK_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2518,7 +4195,7 @@ static LEADING_NUMBER_FILE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static DAILY_YMD_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)^(?P<title>.*?)(?:^|[-_.\s]+)(?P<year>19[6-9]\d|20\d\d)[-_.\s](?P<month>0?[1-9]|1[0-2])[-_.\s](?P<day>0?[1-9]|[12]\d|3[01])(?:\b|[-_.\s]|$)(?P<tail>.*)$")
+    Regex::new(r"(?ix)^(?P<title>.*?)(?:^|[-_.\s]+)(?P<year>19[4-9]\d|20\d\d)[-_.\s](?P<month>0?[1-9]|1[0-2])[-_.\s](?P<day>0?[1-9]|[12]\d|3[01])(?:\b|[-_.\s]|$)(?P<tail>.*)$")
         .expect("valid daily YMD regex")
 });
 
@@ -2530,6 +4207,21 @@ static DAILY_YDM_RE: Lazy<Regex> = Lazy::new(|| {
 static DAILY_COMPACT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.*?)(?:^|[-_.\s]+)(?P<year>19[6-9]\d|20\d\d)(?P<month>0[1-9]|1[0-2])(?P<day>[0-2]\d|3[01])(?:\b|[-_.\s]|$)(?P<tail>.*)$")
         .expect("valid compact daily YMD regex")
+});
+
+static LEADING_DAILY_COMPACT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.*?)(?:^|[-_.\s]+)(?P<year>19[6-9]\d|20\d\d)(?P<month>0[1-9]|1[0-2])(?P<day>[0-2]\d|3[01])[-_.\s]+(?P<tail>.+)$")
+        .expect("valid leading compact daily regex")
+});
+
+static LEADING_MANUAL_DAILY_COMPACT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>)(?P<year>19[6-9]\d|20\d\d)(?P<month>0[1-9]|1[0-2])(?P<day>[0-2]\d|3[01])[-_.\s]+(?P<tail>.+)$")
+        .expect("valid leading manual compact daily regex")
+});
+
+static ANY_MANUAL_DAILY_YMD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+(?P<year>19[4-9]\d|20\d\d)[-_.\s]+(?P<month>0?[1-9]|1[0-2])[-_.\s]+(?P<day>0?[1-9]|[12]\d|3[01])(?:\b|[-_.\s])(?P<tail>.*)$")
+        .expect("valid manual daily YMD regex")
 });
 
 static DAILY_YYMMDD_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2561,14 +4253,24 @@ static EPISODE_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid episode token regex")
 });
 
+static SEASON_EP_MARKER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)S\d{1,4}[\s._-]*(?:EP|E)[\s._-]*\d{1,5}")
+        .expect("valid season episode marker regex")
+});
+
 static E_ONLY_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)(?:^|[-_.\s\[\(\/])(?:EP|E)[\s._-]*\d{1,5}")
+    Regex::new(r"(?ix)(?:^|[-_.\s\[\(\/])(?:EP|E)[\s._-]*(?P<episode>\d{1,5})")
         .expect("valid E-only token regex")
 });
 
 static NUMERIC_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+(?P<number>\d{3,5})(?:\b|[-_.\s\[\(]|$)(?P<tail>.*)$")
         .expect("valid numeric episode regex")
+});
+
+static NUMERIC_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[-_.\s]+)(?P<number>\d{3,5})(?:\b|[-_.\s\[\(]|$)")
+        .expect("valid numeric token regex")
 });
 
 static NUMERIC_TAIL_EP_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2589,7 +4291,7 @@ static OF_EP_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static CAP_EP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)^(?P<title>.+?)(?:[-_.\s]+Temporada[-_.\s]*(?P<word_season>\d{1,4}))?.*?\bCap\.?[-_.\s]*(?P<cap>\d{3,5})(?:[_-](?P<cap_end>\d{3,5}))?")
+    Regex::new(r"(?ix)^(?P<title>.+?)(?:[-_.\s]+Temporada[-_.\s]*(?P<word_season>\d{1,4}))?(?:[-_.\s]*\[[^\]]*\])*[-_.\s]*\[?Cap\.?[-_.\s]*(?P<cap>\d{3,5})(?:[_-](?P<cap_end>\d{3,5}))?")
         .expect("valid cap episode regex")
 });
 
@@ -2604,8 +4306,13 @@ static SEASON_EXTRA_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static AIR_DATE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)(?P<year>19[6-9]\d|20\d\d)[-_.\s]?(?P<month>0\d|1[0-2])[-_.\s]?(?P<day>[0-2]\d|3[01])(?:\b|$)")
+    Regex::new(r"(?ix)(?P<year>19[4-9]\d|20\d\d)[-_.\s]?(?P<month>0\d|1[0-2])[-_.\s]?(?P<day>[0-2]\d|3[01])(?:\b|$)")
         .expect("valid air date regex")
+});
+
+static DATE_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:19[4-9]\d|20\d\d)[-_.\s]?(?:0\d|1[0-2])[-_.\s]?(?:[0-2]\d|3[01])|(?:0?[1-9]|1[0-2])[-_.](?:0?[1-9]|[12]\d|3[01])[-_.](?:19[4-9]\d|20\d\d)")
+        .expect("valid date token regex")
 });
 
 static ABSOLUTE_HINT_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2613,16 +4320,29 @@ static ABSOLUTE_HINT_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid absolute hint regex")
 });
 
+static CJK_EPISODE_RANGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?ix)\[第(?P<first>\d{1,3})-(?P<last>\d{1,3})集\].*?(?P<ascii_title>[A-Za-z][A-Za-z0-9._ -]+?)\.S(?P<season>\d{1,4})(?:\b|[-_.\s])",
+    )
+    .expect("valid CJK episode range regex")
+});
+
 static RAW_HD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bRaw[-_. ]?HD\b").expect("valid raw HD regex"));
+static MPEG2_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bMPEG[-_. ]?2\b").expect("valid mpeg2 regex"));
 static REMUX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:^|[_.\s-])(?:BD|UHD)?[-_. ]?Remux\b").expect("valid remux regex")
+    Regex::new(
+        r"(?i)(?:^|[_.\s\-\[\(])Hybrid[-_. ]?Remux\b|(?:^|[_.\s\-\[\(])(?:BD|UHD)?[-_. ]?Remux\b",
+    )
+    .expect("valid remux regex")
 });
 static BLURAY_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:BluRay|Blu-Ray|HD-?DVD|BDMux)\b").expect("valid bluray regex")
+    Regex::new(r"(?i)\b(?:BluRay(?:720p|1080p|2160p)?|Blu-Ray|HD-?DVD|BDMux|BD(?:720p|1080p|2160p|Remux)?)\b")
+        .expect("valid bluray regex")
 });
 static WEBDL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:WEB[-_. ]?DL(?:mux)?|WEBDL|AmazonHD|AmazonSD|iTunesHD|NetflixU?HD|AMZN[-_. ]WEB|NF[-_. ]WEB|DP[-_. ]WEB|HMAX[-_. ]WEB|WEB)\b").expect("valid webdl regex")
+    Regex::new(r"(?i)\b(?:WEB[-_. ]?DL(?:mux)?|WEBDL|WebHD|AmazonHD|AmazonSD|iTunesHD|NetflixU?HD|MaxdomeHD|HBO[-_. ]?MaxHD|HBOMaxHD|DisneyHD|NFHD|AMZN[-_. ]WEB|NF[-_. ]WEB|DP[-_. ]WEB|HMAX[-_. ]WEB|WEB)\b").expect("valid webdl regex")
 });
 static WEBRIP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\b(?:WebRip|Web-Rip|WEBMux)\b").expect("valid webrip regex"));
@@ -2641,13 +4361,17 @@ static SDTV_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bSDTV\b").expect("v
 static TVRIP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bTVRip\b").expect("valid tvrip regex"));
 
-static RES_2160_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\b(?:2160p|3840x2160|4k|UHD)\b").expect("valid 2160p regex"));
-static RES_1080_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:1080p|1080i|1920x1080|1440p|FHD)\b").expect("valid 1080p regex")
+static RES_2160_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:\b(?:2160p|3840x2160|4k|UHD)\b|\[4K\]|4k[-_. ](?:UHD|HEVC|BD|H265)|(?:UHD|HEVC|BD|H265)[-_. ]4k)")
+        .expect("valid 2160p regex")
 });
-static RES_720_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\b(?:720p|1280x720|960p)\b").expect("valid 720p regex"));
+static RES_1080_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:1080p|1080i|1920x1080|1440p|FHD|4kto1080p|BluRay1080p|BD1080p)\b")
+        .expect("valid 1080p regex")
+});
+static RES_720_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:720p|1280x720|960p|BluRay720p|BD720p)\b").expect("valid 720p regex")
+});
 static RES_576_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\b(?:576p|576i)\b").expect("valid 576p regex"));
 static RES_540_RE: Lazy<Regex> =
@@ -2670,7 +4394,7 @@ static VERSION_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid version regex")
 });
 static LANGUAGE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:MULTI|MULTI[-_. ]SUBS|MULTISUB|VOSTFR|SUBFRENCH|TRUEFRENCH|VF2?|VFQ|VFF|VFI|VO|DUAL(?:[-_. ]AUDIO)?|DL|ML|ENGLISH|ENG|ING|FRENCH|FRE|FRA|FR|GERMAN|SWISSGERMAN|GER|DE|ITALIAN|ITALY|ITA|SPANISH|ESPA(?:Ñ|N)OL|CASTELLANO|SPA|ESP|DANISH|DAN|DUTCH|FLEMISH|JAPANESE|JPN|JAP|JA|ICELANDIC|CHINESE|CANTONESE|MANDARIN|CHS|CHT|BIG5|KOREAN|KOR|LATVIAN|LAT|LAV|LV|RUSSIAN|RUS|RU|POLISH|PL(?:LEK|DUB)?|VIETNAMESE|SWEDISH|NORWEGIAN|FINNISH|TURKISH|TUR|PORTUGUESE|POR|ROMANIAN|CZECH|CZE|CZECH|BULGARIAN|BUL|GREEK|HEBREW|HUNGARIAN|THAI|UKRAINIAN|UKR|CATALAN|CAT|CHI|SUB(?:S|BED)?|SUB)\b")
+    Regex::new(r"(?i)\b(?:MULTI|MULTI[-_. ]SUBS|MULTISUB|VOSTFR|SUBFRENCH|TRUEFRENCH|VF2?|VFQ|VFF|VFI|VO|DUAL(?:[-_. ]AUDIO)?|ML|ENGLISH|ENG|ING|FRENCH|FRE|FRA|FR|GERMAN|SWISSGERMAN|GER|ITALIAN|ITALY|ITA|SPANISH|ESPA(?:Ñ|N)OL|CASTELLANO|SPA|ESP|DANISH|DAN|DUTCH|FLEMISH|JAPANESE|JPN|JAP|JA|ICELANDIC|CHINESE|CANTONESE|MANDARIN|CHS|CHT|BIG5|KOREAN|KOR|LATVIAN|LAT|LAV|LV|RUSSIAN|RUS|RU|POLISH|PL(?:LEK|DUB)?|VIETNAMESE|SWEDISH|NORWEGIAN|FINNISH|TURKISH|TUR|PORTUGUESE|POR|ROMANIAN|CZECH|CZE|CZECH|BULGARIAN|BUL|GEORGIAN|GEO|KA|GREEK|HEBREW|HUNGARIAN|THAI|UKRAINIAN|UKR|CATALAN|CAT|CHI|SUB(?:S|BED)?|SUB)\b")
         .expect("valid language regex")
 });
 static EDITION_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2713,6 +4437,15 @@ static DAILY_COMPACT_CAPTURE_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid daily compact capture regex")
 });
 
+static TRAILING_AIR_DATE_TITLE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)[-_.\s]+(?:19[4-9]\d|20\d\d)[-_.\s]+(?:0?[1-9]|1[0-2])[-_.\s]+(?:0?[1-9]|[12]\d|3[01])$")
+        .expect("valid trailing air date title regex")
+});
+
+static TRAILING_E_ONLY_TITLE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)[-_.\s]+(?:EP|E)\d{1,5}$").expect("valid trailing E-only title regex")
+});
+
 static REJECT_HASHED_RELEASE_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"^[0-9a-zA-Z]{32}").expect("valid 32-char hash reject regex"),
@@ -2752,7 +4485,7 @@ static TRAILING_QUALITY_BRACKET_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static KOREAN_DATED_EP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+E(?P<episode>\d{1,5})[-_.\s]+(?P<date>\d{6})[-_.\s]*(?P<tail>.*)$")
+    Regex::new(r"(?ix)^(?P<title>.+?)[-_.\s]+E(?P<episode>\d{1,5})[-_.\s]+(?P<date>\d{6}|(?:19|20)\d{2}[-_.\s]\d{2}[-_.\s]\d{2})[-_.\s]*(?P<tail>.*)$")
         .expect("valid Korean dated episode regex")
 });
 
@@ -2766,6 +4499,11 @@ static WEBSITE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid website prefix regex")
 });
 
+static WEBSITE_WORD_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^(?:www\s+)?[-a-z0-9]+\s+(?:com|org|net|tv)\s+")
+        .expect("valid website word prefix regex")
+});
+
 static WEBSITE_POSTFIX_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?ix)(?:\[\s*)?(?:www\.)?[-a-z0-9-]{1,256}\.(?:xn--[a-z0-9-]{4,}|[a-z]{2,6})\b(?:\s*\])$",
@@ -2774,7 +4512,7 @@ static WEBSITE_POSTFIX_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static TORRENT_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)[\s._-]*\[(?:ettv|rartv|rarbg|cttv|publichd)\]$")
+    Regex::new(r"(?ix)[\s._-]*\[(?:ettv|eztv|rartv|rarbg(?:\.com)?|cttv|publichd)\][\s._-]*$")
         .expect("valid torrent suffix regex")
 });
 
@@ -2789,8 +4527,23 @@ static LEADING_GROUP_RE: Lazy<Regex> = Lazy::new(|| {
 static BRACKET_GROUP_END_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)[-._ ]\[(?P<group>[A-Za-z0-9]+)\]$").expect("valid bracket group regex")
 });
+static RELEASE_GROUP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:-|[-._ ]\[)(?P<group>[A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:-[A-Za-zÀ-ÖØ-öø-ÿ0-9]+)?)(?:\]|\b|[-._ ]|$)")
+        .expect("valid release group regex")
+});
+static RELEASE_GROUP_EPISODE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)^.*?[-._ ]S\d+E\d+[-._ ]").expect("valid release group episode prefix regex")
+});
+static EXCEPTION_RELEASE_GROUP_EXACT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?P<group>Fight-BB|VARYG|E\.N\.D|KRaLiMaRKo|BluDragon|DarQ|KCRT|BEN[_. ]THE[_. ]MEN|TAoE|QxR|Vialle)\b")
+        .expect("valid exact exception release group regex")
+});
+static EXCEPTION_RELEASE_GROUP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:[._ \[])(?P<group>Joy|ImE|UTR|t3nzin|Anime[ ]Time|Project[ ]Angel|Hakata[ ]Ramen|HONE|Vyndros|SEV|Garshasp|Kappa|Natty|RCVR|SAMPA|YOGI|r00t|EDGE2020)(?:\]|\))")
+        .expect("valid exception release group regex")
+});
 static REPOST_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)(?:[-_. ](?:RP|REPOST|Obfuscated|Scrambled|NZBgeek|sample|Pre|postbot|xpost|Rakuv[a-z0-9]*|WhiteRev|BUYMORE|AsRequested|AlternativeToRequested|GEROV|Z0iDS3N|Chamele0n|4P|4Planet|AlteZachen|RePACKPOST))+$")
+    Regex::new(r"(?ix)(?:[-_. ](?:RP|1|REPOST|Obfuscated|Scrambled|sample|Pre|postbot|xpost|Rakuv[a-z0-9]*|WhiteRev|BUYMORE|AsRequested|AlternativeToRequested|GEROV|Z0iDS3N|Chamele0n|4P|4Planet|AlteZachen|RePACKPOST))+$")
         .expect("valid repost suffix regex")
 });
 static RELEASE_GROUP_LANGUAGE_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2800,7 +4553,7 @@ static RELEASE_GROUP_LANGUAGE_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid release group language suffix regex")
 });
 static INVALID_RELEASE_GROUP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^([se]\d+|[0-9a-f]{8}|HDTV|SDTV|WEB-DL|Blu-Ray|480p|576p|720p|1080p|2160p)$")
+    Regex::new(r"(?i)^([se]\d+|[0-9a-f]{8}|\d{4}-\d{2}|\d{2}-\d{2}|HD|DTS|MA|ES|EN|CAT|GER|FRA|FRE|ITA|X|BIT|x264|x265|h264|h265|HDTV|SDTV|WEB-DL|Blu-Ray|480p|576p|720p|1080p|2160p)$")
         .expect("valid invalid release group regex")
 });
 static RESOLUTION_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
@@ -2810,6 +4563,10 @@ static RESOLUTION_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
 static SERIES_PACK_WORDS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(?:complete|full)[-_.\s]+(?:series|collection|pack)\b")
         .expect("valid series pack words regex")
+});
+static SONARR_CONNECTIVE_WORD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|\b)(?:a|an|the|and|or|of)(?:\b|$)")
+        .expect("valid Sonarr connective regex")
 });
 static SEPARATOR_RUN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\s+").expect("valid separator run regex"));
@@ -2883,6 +4640,28 @@ mod tests {
         contains: Vec<String>,
     }
 
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GeneratedSonarrSet {
+        sonarr_commit: String,
+        fixture_set: String,
+        cases: Vec<GeneratedSonarrCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GeneratedSonarrCase {
+        id: String,
+        fixture: String,
+        method: String,
+        input: String,
+        test_kind: String,
+        classification: String,
+        expected: serde_json::Value,
+        skip_reason: Option<String>,
+        current_gate_asserted: Option<bool>,
+    }
+
     fn targets(season: i32, episodes: std::ops::RangeInclusive<i32>) -> Vec<TvTarget> {
         episodes
             .map(|episode| TvTarget {
@@ -2925,6 +4704,689 @@ mod tests {
 
     fn debug_name<T: std::fmt::Debug>(value: Option<T>) -> Option<String> {
         value.map(|value| format!("{value:?}"))
+    }
+
+    fn load_generated_sonarr_set() -> GeneratedSonarrSet {
+        let set: GeneratedSonarrSet = serde_json::from_str(include_str!(
+            "fixtures/sonarr_rr2_conventional_tv_generated.json"
+        ))
+        .expect("valid generated Sonarr fixture inventory");
+        assert_eq!(set.sonarr_commit, "bf5d48c");
+        assert_eq!(set.fixture_set, "rr2-sonarr-conventional-tv-exhaustive");
+        set
+    }
+
+    fn generated_case_errors(case: &GeneratedSonarrCase) -> Vec<String> {
+        let mut errors = Vec::new();
+        let parsed = match case.test_kind.as_str() {
+            "path" => parse_release_file(&case.input),
+            "series_name" => {
+                let actual = normalize_sonarr_series_title_for_test(&case.input);
+                if let Some(expected) = case.expected["cleanSeriesTitle"].as_str() {
+                    if actual != expected && actual != expected.replace(' ', "") {
+                        errors.push(format!(
+                            "cleanSeriesTitle expected {expected:?}, got {actual:?}"
+                        ));
+                    }
+                }
+                return errors;
+            }
+            _ => parse_release_title(&case.input),
+        };
+
+        if case.expected["parseSuccess"].as_bool() == Some(false) {
+            if parsed.release_kind != ReleaseKind::Unknown
+                || parsed.season_number.is_some()
+                || !parsed.episode_numbers.is_empty()
+            {
+                errors.push(format!(
+                    "expected parse failure, got kind={:?} season={:?} episodes={:?}",
+                    parsed.release_kind, parsed.season_number, parsed.episode_numbers
+                ));
+            }
+            return errors;
+        }
+
+        if let Some(kind) = case.expected["kind"].as_str() {
+            let expected = release_kind(kind);
+            if parsed.release_kind != expected {
+                errors.push(format!(
+                    "kind expected {:?}, got {:?}",
+                    expected, parsed.release_kind
+                ));
+            }
+        }
+
+        if let Some(series_title) = case.expected["seriesTitle"].as_str() {
+            let actual = parsed
+                .normalized_series_title
+                .as_deref()
+                .unwrap_or_default();
+            if actual != series_title {
+                errors.push(format!(
+                    "seriesTitle expected {series_title:?}, got {actual:?}"
+                ));
+            }
+        }
+
+        if let Some(season) = case.expected["season"].as_i64() {
+            let expected = Some(season as i32);
+            if parsed.season_number != expected {
+                errors.push(format!(
+                    "season expected {:?}, got {:?}",
+                    expected, parsed.season_number
+                ));
+            }
+        }
+
+        if let Some(episodes) = expected_i32_array(&case.expected["episodes"]) {
+            if parsed.episode_numbers != episodes {
+                errors.push(format!(
+                    "episodes expected {:?}, got {:?}",
+                    episodes, parsed.episode_numbers
+                ));
+            }
+        }
+
+        if let Some(air_date) = case.expected["airDate"].as_str() {
+            if parsed.air_date.as_deref() != Some(air_date) {
+                errors.push(format!(
+                    "airDate expected {air_date:?}, got {:?}",
+                    parsed.air_date
+                ));
+            }
+        }
+
+        if let Some(full_season) = case.expected["fullSeason"].as_bool() {
+            if parsed.full_season != full_season {
+                errors.push(format!(
+                    "fullSeason expected {full_season}, got {}",
+                    parsed.full_season
+                ));
+            }
+        }
+
+        if let Some(is_mini_series) = case.expected["isMiniSeries"].as_bool() {
+            if parsed.is_mini_series != is_mini_series {
+                errors.push(format!(
+                    "isMiniSeries expected {is_mini_series}, got {}",
+                    parsed.is_mini_series
+                ));
+            }
+        }
+
+        if let Some(is_partial_season) = case.expected["isPartialSeason"].as_bool() {
+            if parsed.is_partial_season != is_partial_season {
+                errors.push(format!(
+                    "isPartialSeason expected {is_partial_season}, got {}",
+                    parsed.is_partial_season
+                ));
+            }
+        }
+
+        if let Some(is_season_extra) = case.expected["isSeasonExtra"].as_bool() {
+            if parsed.is_season_extra != is_season_extra {
+                errors.push(format!(
+                    "isSeasonExtra expected {is_season_extra}, got {}",
+                    parsed.is_season_extra
+                ));
+            }
+        }
+
+        if let Some(season_part) = case.expected["seasonPart"].as_i64() {
+            let expected = Some(season_part as i32);
+            if parsed.season_part != expected {
+                errors.push(format!(
+                    "seasonPart expected {:?}, got {:?}",
+                    expected, parsed.season_part
+                ));
+            }
+        }
+
+        if case.expected.get("releaseGroup").is_some() {
+            let expected = case.expected["releaseGroup"].as_str();
+            if parsed.release_group.as_deref() != expected {
+                errors.push(format!(
+                    "releaseGroup expected {:?}, got {:?}",
+                    expected, parsed.release_group
+                ));
+            }
+        }
+
+        if let Some(release_title) = case.expected["releaseTitle"].as_str() {
+            let actual = strip_file_extension(&parsed.original_title);
+            if actual != release_title {
+                errors.push(format!(
+                    "releaseTitle expected {release_title:?}, got {actual:?}"
+                ));
+            }
+        }
+
+        if let Some(title_without_year) = case.expected["titleWithoutYear"].as_str() {
+            if parsed.series_title_info.title_without_year.as_deref() != Some(title_without_year) {
+                errors.push(format!(
+                    "titleWithoutYear expected {title_without_year:?}, got {:?}",
+                    parsed.series_title_info.title_without_year
+                ));
+            }
+        }
+
+        if let Some(year) = case.expected["year"].as_i64() {
+            let expected = Some(year as i32);
+            if parsed.series_title_info.year != expected {
+                errors.push(format!(
+                    "year expected {:?}, got {:?}",
+                    expected, parsed.series_title_info.year
+                ));
+            }
+        }
+
+        if let Some(expected_titles) = expected_string_array(&case.expected["allTitles"]) {
+            if parsed.series_title_info.all_titles != expected_titles {
+                errors.push(format!(
+                    "allTitles expected {:?}, got {:?}",
+                    expected_titles, parsed.series_title_info.all_titles
+                ));
+            }
+        }
+
+        if let Some(expected_languages) = expected_string_array(&case.expected["languages"]) {
+            let actual = parsed
+                .modifiers
+                .languages
+                .iter()
+                .filter_map(|language| sonarr_language_name(language))
+                .map(|language| language.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            for expected in expected_languages {
+                if expected == "Unknown" {
+                    if !actual.is_empty() {
+                        errors.push(format!(
+                            "languages expected Unknown, got {:?}",
+                            parsed.modifiers.languages
+                        ));
+                    }
+                    continue;
+                }
+
+                if !language_expectation_satisfied(&expected, &actual) {
+                    errors.push(format!(
+                        "languages missing {expected:?}, got {:?}",
+                        parsed.modifiers.languages
+                    ));
+                }
+            }
+        }
+
+        if let Some(source) = case.expected["source"].as_str() {
+            if sonarr_source_name(parsed.quality.source).as_deref() != Some(source) {
+                errors.push(format!(
+                    "source expected {source:?}, got {:?}",
+                    sonarr_source_name(parsed.quality.source)
+                ));
+            }
+        }
+
+        if let Some(resolution) = case.expected["resolution"].as_str() {
+            if sonarr_resolution_name(parsed.quality.resolution).as_deref() != Some(resolution) {
+                errors.push(format!(
+                    "resolution expected {resolution:?}, got {:?}",
+                    sonarr_resolution_name(parsed.quality.resolution)
+                ));
+            }
+        }
+
+        if let Some(proper) = case.expected["proper"].as_bool() {
+            if parsed.modifiers.proper != proper {
+                errors.push(format!(
+                    "proper expected {proper}, got {}",
+                    parsed.modifiers.proper
+                ));
+            }
+        }
+
+        if let Some(quality_known) = case.expected["qualityKnown"].as_bool() {
+            let actual = parsed.quality.source.is_some() || parsed.quality.resolution.is_some();
+            if actual != quality_known {
+                errors.push(format!(
+                    "qualityKnown expected {quality_known}, got {actual}"
+                ));
+            }
+        }
+
+        if let Some(sonarr_quality) = case.expected["sonarrQuality"].as_str() {
+            let actual = sonarr_quality_name(&parsed.quality);
+            if !actual
+                .as_deref()
+                .map(|actual| actual.eq_ignore_ascii_case(sonarr_quality))
+                .unwrap_or(false)
+            {
+                errors.push(format!(
+                    "sonarrQuality expected {sonarr_quality:?}, got {actual:?}"
+                ));
+            }
+        }
+
+        errors
+    }
+
+    fn expected_i32_array(value: &serde_json::Value) -> Option<Vec<i32>> {
+        value.as_array().map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_i64().expect("integer fixture value") as i32)
+                .collect()
+        })
+    }
+
+    fn expected_string_array(value: &serde_json::Value) -> Option<Vec<String>> {
+        value.as_array().map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().expect("string fixture value").to_string())
+                .collect()
+        })
+    }
+
+    fn sonarr_source_name(source: Option<TvReleaseSource>) -> Option<String> {
+        source.map(|source| {
+            match source {
+                TvReleaseSource::BluRay => "Bluray",
+                TvReleaseSource::WebDl => "WEBDL",
+                TvReleaseSource::WebRip => "WEBRip",
+                TvReleaseSource::Hdtv => "HDTV",
+                TvReleaseSource::BdRip => "BlurayRaw",
+                TvReleaseSource::BrRip => "BlurayRaw",
+                TvReleaseSource::Dvd => "DVD",
+                TvReleaseSource::Dsr => "SDTV",
+                TvReleaseSource::Pdtv => "SDTV",
+                TvReleaseSource::Sdtv => "SDTV",
+                TvReleaseSource::TvRip => "TVRip",
+                TvReleaseSource::RawHd => "RawHD",
+            }
+            .to_string()
+        })
+    }
+
+    fn sonarr_resolution_name(resolution: Option<TvResolution>) -> Option<String> {
+        resolution.map(|resolution| {
+            match resolution {
+                TvResolution::R360p => "360p",
+                TvResolution::R480p => "480p",
+                TvResolution::R540p => "540p",
+                TvResolution::R576p => "576p",
+                TvResolution::R720p => "720p",
+                TvResolution::R1080p => "1080p",
+                TvResolution::R2160p => "2160p",
+            }
+            .to_string()
+        })
+    }
+
+    fn sonarr_language_name(language: &str) -> Option<String> {
+        let normalized = language
+            .trim_matches(&['[', ']'][..])
+            .replace(['.', '_', '-'], " ")
+            .to_ascii_uppercase();
+        let normalized = normalized.trim();
+        let language = match normalized {
+            "ENGLISH" | "ENG" | "ING" => "English",
+            "FRENCH" | "FRE" | "FRA" | "FR" | "TRUEFRENCH" | "SUBFRENCH" | "VOSTFR" | "VF"
+            | "VF2" | "VFQ" | "VFF" | "VFI" => "French",
+            "GERMAN" | "SWISSGERMAN" | "GER" | "DE" | "VIDEOMANN" => "German",
+            "ITALIAN" | "ITALY" | "ITA" => "Italian",
+            "SPANISH" | "ESPAÑOL" | "ESPANOL" | "CASTELLANO" | "SPA" | "ESP" => "Spanish",
+            "DANISH" | "DAN" => "Danish",
+            "DUTCH" => "Dutch",
+            "FLEMISH" => "Flemish",
+            "JAPANESE" | "JPN" | "JAP" | "JA" => "Japanese",
+            "ICELANDIC" => "Icelandic",
+            "CHINESE" | "CANTONESE" | "MANDARIN" | "CHS" | "CHT" | "BIG5" | "CHI" | "GB"
+            | "繁中" | "繁体" | "简繁" | "字幕" | "国语音轨" | "中日双语字幕" => {
+                "Chinese"
+            }
+            "KOREAN" | "KOR" => "Korean",
+            "LATVIAN" | "LAT" | "LAV" | "LV" => "Latvian",
+            "LITHUANIAN" | "LT" => "Lithuanian",
+            "RUSSIAN" | "RUS" | "RU" => "Russian",
+            "POLISH" | "PL" | "PLDUB" | "PLLEK" | "LEKPL" | "DUBPL" => "Polish",
+            "VIETNAMESE" => "Vietnamese",
+            "SWEDISH" => "Swedish",
+            "NORWEGIAN" => "Norwegian",
+            "FINNISH" => "Finnish",
+            "TURKISH" | "TUR" => "Turkish",
+            "PORTUGUESE" | "POR" => "Portuguese",
+            "GEORGIAN" | "GEO" | "KA" => "Georgian",
+            "ROMANIAN" | "RODUBBED" => "Romanian",
+            "CZECH" | "CZE" | "CZ" => "Czech",
+            "BULGARIAN" | "BUL" | "BG" | "BGAUDIO" | "BG AUDIO" => "Bulgarian",
+            "GREEK" => "Greek",
+            "HEBREW" | "HEBDUB" => "Hebrew",
+            "HUNGARIAN" | "HUN" | "HUNDUB" => "Hungarian",
+            "THAI" => "Thai",
+            "UKRAINIAN" | "UKR" => "Ukrainian",
+            "CATALAN" | "CAT" => "Catalan",
+            "BRAZILIAN" | "DUBLADO" => "PortugueseBrazil",
+            "LATINO" | "SPA LATINO" => "SpanishLatino",
+            "MALAYALAM" => "Malayalam",
+            "SLOVAK" | "SK" => "Slovak",
+            "ARABIC" => "Arabic",
+            "HINDI" => "Hindi",
+            "URDU" => "Urdu",
+            "ROMANSH" | "RUMANTSCH" | "ROMANSCH" => "Romansh",
+            "MULTI" | "MULTISUB" | "MULTI SUBS" | "SUB" | "SUBS" | "SUBBED" | "DL" | "ML"
+            | "DUAL" | "DUAL AUDIO" => return None,
+            _ => return None,
+        };
+        Some(language.to_string())
+    }
+
+    fn language_expectation_satisfied(
+        expected: &str,
+        actual: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let expected = expected.to_ascii_lowercase();
+        if actual.contains(&expected) {
+            return true;
+        }
+
+        let components: &[&str] = match expected.as_str() {
+            "russianandgeorgian" => &["russian", "georgian"],
+            "englishfrenchgermanitalianportuguesespanish" => &[
+                "english",
+                "french",
+                "german",
+                "italian",
+                "portuguese",
+                "spanish",
+            ],
+            _ => return false,
+        };
+
+        components
+            .iter()
+            .all(|component| actual.contains(*component))
+    }
+
+    fn sonarr_quality_name(quality: &TvQuality) -> Option<String> {
+        let source = quality.source?;
+        let resolution = quality.resolution;
+        Some(match source {
+            TvReleaseSource::Sdtv
+            | TvReleaseSource::Dsr
+            | TvReleaseSource::Pdtv
+            | TvReleaseSource::TvRip => "sdtv".to_string(),
+            TvReleaseSource::Dvd => "DVD".to_string(),
+            TvReleaseSource::RawHd => "Raw".to_string(),
+            TvReleaseSource::Hdtv => match resolution {
+                Some(TvResolution::R720p) => "HDTV720p",
+                Some(TvResolution::R1080p) => "HDTV1080p",
+                Some(TvResolution::R2160p) => "HDTV2160p",
+                _ => "sdtv",
+            }
+            .to_string(),
+            TvReleaseSource::WebDl => {
+                format!("WEBDL{}", sonarr_quality_resolution_suffix(resolution))
+            }
+            TvReleaseSource::WebRip => {
+                format!("WEBRip{}", sonarr_quality_resolution_suffix(resolution))
+            }
+            TvReleaseSource::BluRay => {
+                let suffix = if quality.remux && resolution.is_none() {
+                    "1080p"
+                } else {
+                    sonarr_quality_resolution_suffix(resolution)
+                };
+                if quality.remux {
+                    format!("Bluray{suffix}_Remux")
+                } else {
+                    format!("Bluray{suffix}")
+                }
+            }
+            TvReleaseSource::BdRip | TvReleaseSource::BrRip => {
+                format!("BlurayRaw{}", sonarr_quality_resolution_suffix(resolution))
+            }
+        })
+    }
+
+    fn sonarr_quality_resolution_suffix(resolution: Option<TvResolution>) -> &'static str {
+        match resolution {
+            Some(TvResolution::R360p) => "360p",
+            Some(TvResolution::R480p) => "480p",
+            Some(TvResolution::R540p) => "540p",
+            Some(TvResolution::R576p) => "576p",
+            Some(TvResolution::R720p) => "720p",
+            Some(TvResolution::R1080p) => "1080p",
+            Some(TvResolution::R2160p) => "2160p",
+            None => "",
+        }
+    }
+
+    fn normalize_sonarr_series_title_for_test(title: &str) -> String {
+        let parsed = parse_release_title(title);
+        let mut title = parsed
+            .normalized_series_title
+            .as_deref()
+            .unwrap_or(title)
+            .to_string();
+        title = WEBSITE_PREFIX_RE.replace(&title, "").to_string();
+        title = WEBSITE_WORD_PREFIX_RE.replace(&title, "").to_string();
+        clean_sonarr_series_title_for_test(&title)
+    }
+
+    fn clean_sonarr_series_title_for_test(title: &str) -> String {
+        let replaced = title.replace('%', "percent");
+        let words = replaced
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let mut cleaned = String::new();
+        for (index, word) in words.iter().enumerate() {
+            let lower = word.to_ascii_lowercase();
+            let is_common = matches!(
+                lower.as_str(),
+                "a" | "à" | "an" | "the" | "and" | "or" | "of"
+            );
+            if is_common && index > 0 && index + 1 < words.len() {
+                continue;
+            }
+            cleaned.push_str(&lower);
+        }
+        cleaned
+    }
+
+    #[test]
+    fn sonarr_rr2_generated_fixture_inventory_is_classified() {
+        let payload: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/sonarr_rr2_conventional_tv_generated.json"
+        ))
+        .expect("valid generated Sonarr fixture inventory");
+
+        assert_eq!(payload["sonarrCommit"], "bf5d48c");
+        assert_eq!(
+            payload["fixtureSet"],
+            "rr2-sonarr-conventional-tv-exhaustive"
+        );
+
+        let allowed_skip_reasons: std::collections::BTreeSet<_> = payload["allowedSkipReasons"]
+            .as_array()
+            .expect("allowed skip reasons array")
+            .iter()
+            .map(|value| value.as_str().expect("skip reason string"))
+            .collect();
+        assert_eq!(
+            allowed_skip_reasons,
+            [
+                "anime_rr3",
+                "known_parity_gap",
+                "unsupported_by_product_policy"
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let cases = payload["cases"].as_array().expect("fixture cases array");
+        assert_eq!(
+            payload["counts"]["total"].as_u64(),
+            Some(cases.len() as u64)
+        );
+
+        let mut ids = std::collections::BTreeSet::new();
+        let mut counted_current = 0_u64;
+        let mut counted_known_gap = 0_u64;
+        let mut counted_anime = 0_u64;
+        let mut counted_unsupported = 0_u64;
+
+        for case in cases {
+            let id = case["id"].as_str().expect("case id");
+            assert!(
+                ids.insert(id.to_string()),
+                "duplicate generated fixture id {id}"
+            );
+            assert!(case["fixture"].as_str().is_some(), "{id} missing fixture");
+            assert!(case["method"].as_str().is_some(), "{id} missing method");
+            assert!(case["line"].as_u64().is_some(), "{id} missing source line");
+            assert!(case["input"].as_str().is_some(), "{id} missing input");
+            assert!(
+                case["testKind"].as_str().is_some(),
+                "{id} missing test kind"
+            );
+            assert!(case["expected"].is_object(), "{id} missing expected object");
+
+            let classification = case["classification"]
+                .as_str()
+                .expect("classification string");
+            assert!(
+                matches!(
+                    classification,
+                    "tv_rr2" | "anime_rr3" | "unsupported_by_product_policy"
+                ),
+                "{id} has invalid classification {classification}"
+            );
+
+            let skip_reason = case.get("skipReason").and_then(|value| value.as_str());
+            match classification {
+                "tv_rr2" => match skip_reason {
+                    Some("known_parity_gap") => counted_known_gap += 1,
+                    None => {
+                        assert_eq!(
+                            case.get("currentGateAsserted")
+                                .and_then(|value| value.as_bool()),
+                            Some(true),
+                            "{id} is an unskipped TV case but is not marked current-gate asserted"
+                        );
+                        counted_current += 1;
+                    }
+                    other => panic!("{id} has invalid TV skip reason {other:?}"),
+                },
+                "anime_rr3" => {
+                    assert_eq!(skip_reason, Some("anime_rr3"), "{id} missing anime skip");
+                    counted_anime += 1;
+                }
+                "unsupported_by_product_policy" => {
+                    assert_eq!(
+                        skip_reason,
+                        Some("unsupported_by_product_policy"),
+                        "{id} missing unsupported skip"
+                    );
+                    counted_unsupported += 1;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        assert_eq!(
+            payload["counts"]["currentGateAsserted"].as_u64(),
+            Some(counted_current)
+        );
+        assert_eq!(
+            payload["counts"]["tvRr2KnownParityGap"].as_u64(),
+            Some(counted_known_gap)
+        );
+        assert_eq!(payload["counts"]["animeRr3"].as_u64(), Some(counted_anime));
+        assert_eq!(
+            payload["counts"]["unsupportedByProductPolicy"].as_u64(),
+            Some(counted_unsupported)
+        );
+
+        assert!(counted_current > 0);
+        assert_eq!(counted_known_gap, 0);
+        assert!(counted_anime > 0);
+    }
+
+    #[test]
+    fn sonarr_rr2_generated_asserted_rows_match_parser() {
+        let set = load_generated_sonarr_set();
+        let mut checked = 0_usize;
+        let mut failures = Vec::new();
+
+        for case in set.cases.iter().filter(|case| {
+            case.classification == "tv_rr2"
+                && case.skip_reason.is_none()
+                && case.current_gate_asserted == Some(true)
+        }) {
+            checked += 1;
+            let errors = generated_case_errors(case);
+            if !errors.is_empty() {
+                failures.push(format!(
+                    "{} {}.{} {} => {}",
+                    case.id,
+                    case.fixture,
+                    case.method,
+                    case.input,
+                    errors.join("; ")
+                ));
+            }
+        }
+
+        assert!(checked > 0, "no generated Sonarr assertions were checked");
+        assert!(
+            failures.is_empty(),
+            "{} generated Sonarr asserted rows failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn sonarr_rr2_generated_promotion_audit() {
+        if std::env::var("ELIXIR_RR2_PROMOTION_AUDIT").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let set = load_generated_sonarr_set();
+        let mut pass_by_fixture = std::collections::BTreeMap::<String, usize>::new();
+        let mut fail_by_fixture = std::collections::BTreeMap::<String, usize>::new();
+        let mut failures = Vec::new();
+
+        for case in set
+            .cases
+            .iter()
+            .filter(|case| case.classification == "tv_rr2")
+        {
+            let errors = generated_case_errors(case);
+            if errors.is_empty() {
+                *pass_by_fixture.entry(case.fixture.clone()).or_default() += 1;
+            } else {
+                *fail_by_fixture.entry(case.fixture.clone()).or_default() += 1;
+                if failures.len() < 200 {
+                    failures.push(format!(
+                        "{} {} {} => {}",
+                        case.id,
+                        case.test_kind,
+                        case.input,
+                        errors.join("; ")
+                    ));
+                }
+            }
+        }
+
+        eprintln!("RR-2 Sonarr promotion audit pass_by_fixture={pass_by_fixture:#?}");
+        eprintln!("RR-2 Sonarr promotion audit fail_by_fixture={fail_by_fixture:#?}");
+        eprintln!(
+            "RR-2 Sonarr promotion audit first_failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]

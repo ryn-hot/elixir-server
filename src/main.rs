@@ -216,6 +216,14 @@ async fn main() -> anyhow::Result<()> {
             .await;
     });
 
+    let anime_hash_worker_state = state.clone();
+    tokio::spawn(async move {
+        acquisition::release_resolution::hashing::start_anime_hash_worker_loop(
+            anime_hash_worker_state,
+        )
+        .await;
+    });
+
     let debrid_materializer_state = state.clone();
     tokio::spawn(async move {
         debrid::start_debrid_materializer_loop(debrid_materializer_state).await;

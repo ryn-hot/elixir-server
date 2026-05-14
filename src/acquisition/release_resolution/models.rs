@@ -347,3 +347,317 @@ pub struct ReleaseJobStateUpdate {
     pub remote_release_id: Option<String>,
     pub completed_at: Option<DateTime<Utc>>,
 }
+
+string_enum! {
+    pub enum AnimeFileHashStatus {
+        Pending => "pending",
+        Hashed => "hashed",
+        Invalidated => "invalidated",
+        Failed => "failed",
+    }
+}
+
+string_enum! {
+    pub enum AniDbFileLookupStatus {
+        Pending => "pending",
+        Hit => "hit",
+        NoSuchFile => "no_such_file",
+        Banned => "banned",
+        TransportFailed => "transport_failed",
+        Disabled => "disabled",
+    }
+}
+
+string_enum! {
+    pub enum AnimeEpisodeType {
+        Normal => "normal",
+        Special => "special",
+        Credits => "credits",
+        Trailer => "trailer",
+        Parody => "parody",
+        Other => "other",
+        Movie => "movie",
+    }
+}
+
+string_enum! {
+    pub enum AnimeMatchOutcome {
+        Planned => "planned",
+        Verified => "verified",
+        Mismatch => "mismatch",
+        NoMatch => "no_match",
+        Deferred => "deferred",
+        Rejected => "rejected",
+    }
+}
+
+string_enum! {
+    pub enum AnimeMismatchState {
+        Open => "open",
+        Resolved => "resolved",
+        Ignored => "ignored",
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAnimeGraphSnapshot {
+    pub graph_snapshot_id: Uuid,
+    pub subscription_id: Option<Uuid>,
+    pub owner_id: String,
+    pub media_type: MediaType,
+    pub anilist_root_id: Option<i64>,
+    pub anilist_season_id: Option<i64>,
+    pub anilist_status: Option<String>,
+    pub anilist_next_airing_at: Option<DateTime<Utc>>,
+    pub tvdb_series_id: Option<i64>,
+    pub anidb_anime_id: Option<i64>,
+    pub fingerprint: String,
+    pub graph: JsonValue,
+    pub aliases: JsonValue,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAnimeGraphSnapshot {
+    pub graph_snapshot_id: Option<Uuid>,
+    pub subscription_id: Option<Uuid>,
+    pub owner_id: String,
+    pub media_type: MediaType,
+    pub anilist_root_id: Option<i64>,
+    pub anilist_season_id: Option<i64>,
+    pub anilist_status: Option<String>,
+    pub anilist_next_airing_at: Option<DateTime<Utc>>,
+    pub tvdb_series_id: Option<i64>,
+    pub anidb_anime_id: Option<i64>,
+    pub fingerprint: String,
+    pub graph: JsonValue,
+    pub aliases: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAnimeCandidateParse {
+    pub candidate_parse_id: Uuid,
+    pub release_id: Uuid,
+    pub source_provider_id: Option<Uuid>,
+    pub source_candidate_id: Option<String>,
+    pub release_title: String,
+    pub normalized_title: Option<String>,
+    pub parsed: JsonValue,
+    pub confidence: ReleaseConfidence,
+    pub review_reasons: JsonValue,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAnimeCandidateParse {
+    pub candidate_parse_id: Option<Uuid>,
+    pub release_id: Uuid,
+    pub source_provider_id: Option<Uuid>,
+    pub source_candidate_id: Option<String>,
+    pub release_title: String,
+    pub normalized_title: Option<String>,
+    pub parsed: JsonValue,
+    pub confidence: ReleaseConfidence,
+    pub review_reasons: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionFileHash {
+    pub file_hash_id: Uuid,
+    pub release_file_id: Option<Uuid>,
+    pub local_file_id: Option<String>,
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub mtime_fingerprint: Option<String>,
+    pub ed2k: Option<String>,
+    pub crc32: Option<String>,
+    pub hash_status: AnimeFileHashStatus,
+    pub hash_computed_at: Option<DateTime<Utc>>,
+    pub hash_invalidated_at: Option<DateTime<Utc>>,
+    pub filename_history: JsonValue,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionFileHash {
+    pub file_hash_id: Option<Uuid>,
+    pub release_file_id: Option<Uuid>,
+    pub local_file_id: Option<String>,
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub mtime_fingerprint: Option<String>,
+    pub ed2k: Option<String>,
+    pub crc32: Option<String>,
+    pub hash_status: AnimeFileHashStatus,
+    pub hash_computed_at: Option<DateTime<Utc>>,
+    pub hash_invalidated_at: Option<DateTime<Utc>>,
+    pub filename_history: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAniDbFileCache {
+    pub lookup_key: String,
+    pub ed2k: String,
+    pub size_bytes: i64,
+    pub lookup_status: AniDbFileLookupStatus,
+    pub anidb_file_id: Option<i64>,
+    pub anidb_anime_id: Option<i64>,
+    pub anidb_episode_ids: JsonValue,
+    pub anidb_group_id: Option<i64>,
+    pub anidb_group_name: Option<String>,
+    pub anidb_group_short_name: Option<String>,
+    pub anidb_version: Option<i64>,
+    pub anidb_source: Option<String>,
+    pub anidb_quality: Option<String>,
+    pub anidb_audio_languages: JsonValue,
+    pub anidb_subtitle_languages: JsonValue,
+    pub anidb_state_flags: JsonValue,
+    pub anidb_original_filename: Option<String>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub raw_response: Option<String>,
+    pub positive_cached_at: Option<DateTime<Utc>>,
+    pub negative_cached_until: Option<DateTime<Utc>>,
+    pub last_lookup_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAniDbFileCache {
+    pub lookup_key: String,
+    pub ed2k: String,
+    pub size_bytes: i64,
+    pub lookup_status: AniDbFileLookupStatus,
+    pub anidb_file_id: Option<i64>,
+    pub anidb_anime_id: Option<i64>,
+    pub anidb_episode_ids: JsonValue,
+    pub anidb_group_id: Option<i64>,
+    pub anidb_group_name: Option<String>,
+    pub anidb_group_short_name: Option<String>,
+    pub anidb_version: Option<i64>,
+    pub anidb_source: Option<String>,
+    pub anidb_quality: Option<String>,
+    pub anidb_audio_languages: JsonValue,
+    pub anidb_subtitle_languages: JsonValue,
+    pub anidb_state_flags: JsonValue,
+    pub anidb_original_filename: Option<String>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub raw_response: Option<String>,
+    pub positive_cached_at: Option<DateTime<Utc>>,
+    pub negative_cached_until: Option<DateTime<Utc>>,
+    pub last_lookup_attempt_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAniDbFileXref {
+    pub xref_id: Uuid,
+    pub lookup_key: String,
+    pub release_file_id: Option<Uuid>,
+    pub anidb_file_id: Option<i64>,
+    pub anidb_anime_id: i64,
+    pub anidb_episode_id: i64,
+    pub episode_type: AnimeEpisodeType,
+    pub percentage_start: i64,
+    pub percentage_end: i64,
+    pub episode_order: i64,
+    pub provider: String,
+    pub confidence: ReleaseConfidence,
+    pub is_manual_override: bool,
+    pub created_from_release_id: Option<Uuid>,
+    pub created_from_target_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAniDbFileXref {
+    pub xref_id: Option<Uuid>,
+    pub lookup_key: String,
+    pub release_file_id: Option<Uuid>,
+    pub anidb_file_id: Option<i64>,
+    pub anidb_anime_id: i64,
+    pub anidb_episode_id: i64,
+    pub episode_type: AnimeEpisodeType,
+    pub percentage_start: i64,
+    pub percentage_end: i64,
+    pub episode_order: i64,
+    pub provider: String,
+    pub confidence: ReleaseConfidence,
+    pub is_manual_override: bool,
+    pub created_from_release_id: Option<Uuid>,
+    pub created_from_target_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAnimeMatchAttempt {
+    pub match_attempt_id: Uuid,
+    pub release_id: Option<Uuid>,
+    pub release_file_id: Option<Uuid>,
+    pub attempted_providers: JsonValue,
+    pub selected_provider: Option<String>,
+    pub ed2k: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub candidate_fingerprint: Option<String>,
+    pub planned_targets: JsonValue,
+    pub verified_targets: JsonValue,
+    pub outcome: AnimeMatchOutcome,
+    pub rejection_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAnimeMatchAttempt {
+    pub match_attempt_id: Option<Uuid>,
+    pub release_id: Option<Uuid>,
+    pub release_file_id: Option<Uuid>,
+    pub attempted_providers: JsonValue,
+    pub selected_provider: Option<String>,
+    pub ed2k: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub candidate_fingerprint: Option<String>,
+    pub planned_targets: JsonValue,
+    pub verified_targets: JsonValue,
+    pub outcome: AnimeMatchOutcome,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionAnimeIdentityMismatch {
+    pub mismatch_id: Uuid,
+    pub release_id: Option<Uuid>,
+    pub release_file_id: Option<Uuid>,
+    pub target_id: Option<Uuid>,
+    pub planned_target: JsonValue,
+    pub verified_identity: JsonValue,
+    pub provider: String,
+    pub confidence: ReleaseConfidence,
+    pub state: AnimeMismatchState,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAcquisitionAnimeIdentityMismatch {
+    pub mismatch_id: Option<Uuid>,
+    pub release_id: Option<Uuid>,
+    pub release_file_id: Option<Uuid>,
+    pub target_id: Option<Uuid>,
+    pub planned_target: JsonValue,
+    pub verified_identity: JsonValue,
+    pub provider: String,
+    pub confidence: ReleaseConfidence,
+    pub state: AnimeMismatchState,
+    pub reason: Option<String>,
+}

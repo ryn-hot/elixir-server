@@ -286,6 +286,7 @@ mod tests {
             rank: None,
             score: None,
             score_badges: Vec::new(),
+            files: Vec::new(),
             supported_routes: Vec::new(),
             default_route: None,
             raw: None,

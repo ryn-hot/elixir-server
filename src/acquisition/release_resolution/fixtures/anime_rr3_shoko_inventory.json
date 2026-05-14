@@ -1,0 +1,317 @@
+{
+  "fixtureSet": "rr3-shoko-anime-resolver-inventory",
+  "resolver": "anime_shoko_style",
+  "shokoRepository": "https://github.com/ShokoAnime/ShokoServer",
+  "shokoCommit": "74a673ed57daef76ac6ac1c745728bebcfbd870b",
+  "inspectedSourceFiles": [
+    {
+      "path": "Shoko.Server/Services/VideoHashingService.cs",
+      "phase": "rr3g_hash_worker",
+      "coverage": [
+        "ed2k_hashing",
+        "crc32_hashing",
+        "file_size_invalidation",
+        "filename_hash_history",
+        "duplicate_ed2k_association",
+        "hash_before_release_lookup"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Scheduling/Jobs/Shoko/HashFileJob.cs",
+      "phase": "rr3g_hash_worker",
+      "coverage": [
+        "bounded_hash_job_concurrency",
+        "force_hash_flag",
+        "skip_find_release_flag",
+        "skip_mylist_flag"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Scheduling/Jobs/Shoko/ProcessFileJob.cs",
+      "phase": "rr3h_anidb_file_provider",
+      "coverage": [
+        "bounded_process_job_concurrency",
+        "udp_rate_limited_job",
+        "anidb_udp_concurrency_group",
+        "release_lookup_after_hash"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Services/VideoReleaseService.cs",
+      "phase": "rr3i_xref_reconciliation",
+      "coverage": [
+        "provider_attempt_provenance",
+        "selected_provider_provenance",
+        "xref_validation",
+        "percentage_range_normalization",
+        "release_group_validation",
+        "metadata_refresh_after_match"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/Release/AnidbReleaseProvider.cs",
+      "phase": "rr3h_anidb_file_provider",
+      "coverage": [
+        "ed2k_size_identity_key",
+        "thirty_minute_memory_dedupe",
+        "banned_state_short_circuit",
+        "no_such_file_handling",
+        "release_info_mapping",
+        "creditless_detection"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/UDP/Info/RequestGetFile.cs",
+      "phase": "rr3h_anidb_file_provider",
+      "coverage": [
+        "file_command_by_ed2k_size",
+        "main_episode_percentage_parsing",
+        "other_episode_percentage_parsing",
+        "state_flag_version_mapping",
+        "source_mapping"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/UDP/Info/ResponseGetFile.cs",
+      "phase": "rr3h_anidb_file_provider",
+      "coverage": [
+        "file_id",
+        "anime_id",
+        "episode_ids",
+        "group_id",
+        "state_flags",
+        "quality",
+        "source",
+        "audio_languages",
+        "subtitle_languages",
+        "original_filename"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Models/CrossReference/CrossRef_File_Episode.cs",
+      "phase": "rr3i_xref_reconciliation",
+      "coverage": [
+        "file_episode_many_to_many",
+        "hash_and_size_identity",
+        "percentage_range_inference",
+        "manual_override_survival"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Models/AniDB/AniDB_Episode.cs",
+      "phase": "rr3c_metadata_graph",
+      "coverage": [
+        "episode_id",
+        "anime_id",
+        "episode_type",
+        "episode_number",
+        "air_date",
+        "has_aired"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/HTTP/HttpAnimeParser.cs",
+      "phase": "rr3c_metadata_graph",
+      "coverage": [
+        "anime_titles",
+        "episode_list",
+        "episode_type_prefixes",
+        "relations",
+        "resources",
+        "date_parsing"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Services/AnimeSeriesService.cs",
+      "phase": "rr3c_metadata_graph",
+      "coverage": [
+        "normal_episode_stats",
+        "missing_episode_stats",
+        "aired_episode_filtering",
+        "specials_separate_from_normal"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Tasks/AnimeGroupCreator.cs",
+      "phase": "rr3_relation_grouping",
+      "coverage": [
+        "anidb_relation_graph",
+        "relation_exclusions",
+        "main_series_selection",
+        "fuzzy_relation_title_guard"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/UDP/UDPRateLimiter.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "two_second_short_delay",
+        "six_second_sustained_delay",
+        "ten_second_sustained_activation",
+        "one_hundred_twenty_second_idle_reset",
+        "fifty_millisecond_padding"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/HTTP/HttpRateLimiter.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "separate_http_limiter",
+        "two_second_short_delay",
+        "six_second_sustained_delay",
+        "one_hundred_twenty_second_idle_reset",
+        "fifty_millisecond_padding"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Settings/AnidbRateLimitSettings.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "base_rate_minimum_two_seconds",
+        "slow_rate_multiplier_three",
+        "slow_rate_period_multiplier_five",
+        "reset_period_multiplier_sixty"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/ConnectionHandler.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "ban_state_events",
+        "ban_timer",
+        "overload_backoff",
+        "cooldown_pause_state"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/UDP/AniDBUDPConnectionHandler.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "ninety_minute_udp_ban",
+        "session_reuse",
+        "idle_logout",
+        "ping_handling",
+        "invalid_session_reauth"
+      ]
+    },
+    {
+      "path": "Shoko.Server/Providers/AniDB/HTTP/AniDBHttpConnectionHandler.cs",
+      "phase": "rr3j_anidb_limiter",
+      "coverage": [
+        "twelve_hour_http_ban",
+        "http_ban_state",
+        "http_backoff_state"
+      ]
+    }
+  ],
+  "fixtureSchemas": [
+    {
+      "name": "anime_title_parser",
+      "phase": "rr3d_pre_download_anime_parser",
+      "requiredFields": [
+        "id",
+        "input",
+        "fixtureGroup",
+        "classification",
+        "expected"
+      ],
+      "allowedClassifications": [
+        "rr3_asserted",
+        "rr3d_asserted",
+        "unsupported_by_product_policy"
+      ]
+    },
+    {
+      "name": "metadata_graph",
+      "phase": "rr3c_metadata_graph_expansion",
+      "requiredFields": [
+        "id",
+        "seed",
+        "seasonChain",
+        "anizipMappings",
+        "expectedTargets",
+        "classification"
+      ],
+      "allowedClassifications": [
+        "rr3_asserted",
+        "rr3d_asserted",
+        "unsupported_by_product_policy"
+      ]
+    },
+    {
+      "name": "pack_file_list",
+      "phase": "rr3f_pack_file_list_coverage",
+      "requiredFields": [
+        "id",
+        "candidate",
+        "files",
+        "wantedTargets",
+        "expectedCoverage",
+        "classification"
+      ],
+      "allowedClassifications": [
+        "rr3_asserted",
+        "rr3d_asserted",
+        "unsupported_by_product_policy"
+      ]
+    },
+    {
+      "name": "anidb_file_response",
+      "phase": "rr3h_anidb_file_cache_provider",
+      "requiredFields": [
+        "id",
+        "ed2k",
+        "sizeBytes",
+        "rawResponse",
+        "expectedIdentity",
+        "classification"
+      ],
+      "allowedClassifications": [
+        "rr3_asserted",
+        "rr3d_asserted",
+        "unsupported_by_product_policy"
+      ]
+    },
+    {
+      "name": "reconciliation",
+      "phase": "rr3i_xref_validation_reconciliation",
+      "requiredFields": [
+        "id",
+        "plannedTargets",
+        "verifiedIdentity",
+        "expectedOutcome",
+        "classification"
+      ],
+      "allowedClassifications": [
+        "rr3_asserted",
+        "rr3d_asserted",
+        "unsupported_by_product_policy"
+      ]
+    }
+  ],
+  "anidbSafety": {
+    "directProviderDefaultEnabled": false,
+    "requiresExplicitCapabilityGate": true,
+    "shortDelaySeconds": 2,
+    "sustainedDelaySeconds": 6,
+    "sustainedActivationSeconds": 10,
+    "idleResetSeconds": 120,
+    "paddingMillis": 50,
+    "minimumProtocolDelaySeconds": 2,
+    "minimumSustainedDelaySeconds": 4,
+    "udpBanCooldownMinutes": 90,
+    "httpBanCooldownHours": 12,
+    "negativeCacheTtlDays": 7,
+    "requiredGates": [
+      "global_udp_limiter",
+      "global_http_limiter_when_http_enabled",
+      "unsafe_configuration_rejection",
+      "duplicate_ed2k_size_coalescing",
+      "positive_cache",
+      "negative_cache",
+      "separate_udp_http_ban_state",
+      "ban_backoff_pause",
+      "no_live_anidb_unit_tests"
+    ]
+  }
+}

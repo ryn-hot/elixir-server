@@ -9,9 +9,14 @@ use sqlx::Row;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use crate::acquisition::release_resolution::{
+    hashing::{HashFileJob, queue_anime_hash_file},
+    models::AcquisitionReleaseFile,
+    store::{get_release_by_download_id, list_release_files},
+};
 use crate::db::models::{
-    ExtensionKind, ExtensionTrustLevel, ProviderHealthState, ProviderReadinessPhase, SecretScope,
-    SlotCardinality,
+    ExtensionKind, ExtensionTrustLevel, MediaType, ProviderHealthState, ProviderReadinessPhase,
+    SecretScope, SlotCardinality,
 };
 use crate::download_broker::{DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID};
 use crate::extensions::store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider};
@@ -672,8 +677,74 @@ async fn materialize_debrid_links(
     } else {
         Some(target_dir.to_string_lossy().to_string())
     };
+    if let Err(err) =
+        queue_anime_hashes_for_completed_debrid_paths(state, job, &completed_paths).await
+    {
+        tracing::warn!(
+            debrid_job_id = %job.job_id,
+            "queueing anime hash jobs failed: {err}"
+        );
+    }
     mark_debrid_job_completed(&state.db_pool, job.job_id, local_path.as_deref()).await?;
     Ok(())
+}
+
+async fn queue_anime_hashes_for_completed_debrid_paths(
+    state: &AppState,
+    job: &DebridDownloadJob,
+    completed_paths: &[PathBuf],
+) -> Result<()> {
+    let Some(release) = get_release_by_download_id(&state.db_pool, &job.job_id.to_string()).await?
+    else {
+        return Ok(());
+    };
+    if release.media_type != MediaType::Anime {
+        return Ok(());
+    }
+    let release_files = list_release_files(&state.db_pool, release.release_id).await?;
+    for (index, path) in completed_paths.iter().enumerate() {
+        let release_file_id =
+            match_completed_release_file(path, &release_files, completed_paths.len())
+                .map(|file| file.release_file_id);
+        let basename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file");
+        let local_file_id = release_file_id
+            .map(|id| format!("release-file:{id}"))
+            .unwrap_or_else(|| format!("debrid:{}:{index}:{basename}", job.job_id));
+        queue_anime_hash_file(
+            &state.db_pool,
+            HashFileJob {
+                release_file_id,
+                local_file_id: Some(local_file_id),
+                file_path: path.clone(),
+                force_rehash: false,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn match_completed_release_file<'a>(
+    completed_path: &Path,
+    release_files: &'a [AcquisitionReleaseFile],
+    completed_count: usize,
+) -> Option<&'a AcquisitionReleaseFile> {
+    let basename = completed_path
+        .file_name()
+        .and_then(|value| value.to_str())?;
+    release_files
+        .iter()
+        .find(|file| {
+            file.basename == basename
+                || Path::new(&file.path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    == Some(basename)
+        })
+        .or_else(|| (completed_count == 1 && release_files.len() == 1).then(|| &release_files[0]))
 }
 
 async fn download_url_to_file(

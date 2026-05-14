@@ -1,0 +1,381 @@
+{
+  "fixtureSet": "rr3-anime-metadata-graph-goldens",
+  "resolver": "anime_shoko_style",
+  "classification": "rr3_asserted",
+  "cases": [
+    {
+      "id": "ongoing_current_season_adds_next_airing_target",
+      "classification": "rr3_asserted",
+      "input": {
+        "title": "Example Quest",
+        "year": 2026,
+        "seedAnilistId": "100",
+        "seedSeasonNumber": 1,
+        "releaseDelaySeconds": 900,
+        "externalIds": {
+          "anilist": "100"
+        },
+        "seasonChain": [
+          {
+            "seasonNumber": 1,
+            "anilistId": "100",
+            "title": "Example Quest",
+            "format": "TV",
+            "seasonYear": 2026,
+            "startYear": 2026,
+            "status": "RELEASING",
+            "episodes": 12,
+            "nextAiringEpisode": 4,
+            "nextAiringAt": 1893456000,
+            "confidence": 1.0
+          }
+        ],
+        "mappings": [
+          {
+            "anilistId": "100",
+            "ids": {
+              "anilist": "100",
+              "tvdbSeries": "200",
+              "anidb": "300"
+            },
+            "titles": {
+              "en": "Example Quest",
+              "romaji": "Example Quest"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 1,
+                "title": "Departure",
+                "tvdbId": "2001",
+                "anidbEid": "3001",
+                "raw": {
+                  "airDate": "2026-04-01"
+                }
+              },
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 2,
+                "absoluteEpisodeNumber": 2,
+                "title": "Shortcut",
+                "tvdbId": "2002",
+                "anidbEid": "3002",
+                "raw": {
+                  "airDate": "2026-04-08"
+                }
+              },
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 3,
+                "absoluteEpisodeNumber": 3,
+                "title": "Delay",
+                "tvdbId": "2003",
+                "anidbEid": "3003",
+                "raw": {
+                  "airDate": "2026-04-15"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "rootAnilistId": "100",
+        "tvdbSeriesId": "200",
+        "anidbAnimeId": "300",
+        "targetKeys": ["S01E01", "S01E02", "S01E03", "S01E04"],
+        "targetSources": {
+          "S01E01": "anizip",
+          "S01E04": "anilist_next_airing"
+        },
+        "aliases": ["Example Quest"]
+      }
+    },
+    {
+      "id": "between_seasons_new_season_placeholder",
+      "classification": "rr3_asserted",
+      "input": {
+        "title": "Long Runner",
+        "year": 2023,
+        "seedAnilistId": "400",
+        "seedSeasonNumber": 1,
+        "releaseDelaySeconds": 900,
+        "externalIds": {
+          "anilist": "400"
+        },
+        "seasonChain": [
+          {
+            "seasonNumber": 1,
+            "anilistId": "400",
+            "title": "Long Runner",
+            "format": "TV",
+            "seasonYear": 2023,
+            "startYear": 2023,
+            "status": "FINISHED",
+            "episodes": 1,
+            "confidence": 1.0
+          },
+          {
+            "seasonNumber": 2,
+            "anilistId": "401",
+            "title": "Long Runner Season 2",
+            "format": "TV",
+            "seasonYear": 2024,
+            "startYear": 2024,
+            "status": "FINISHED",
+            "episodes": 1,
+            "confidence": 0.97
+          },
+          {
+            "seasonNumber": 3,
+            "anilistId": "402",
+            "title": "Long Runner Season 3",
+            "format": "TV",
+            "seasonYear": 2025,
+            "startYear": 2025,
+            "status": "FINISHED",
+            "episodes": 1,
+            "confidence": 0.95
+          },
+          {
+            "seasonNumber": 4,
+            "anilistId": "403",
+            "title": "Long Runner Season 4",
+            "format": "TV",
+            "seasonYear": 2026,
+            "startYear": 2026,
+            "status": "NOT_YET_RELEASED",
+            "episodes": null,
+            "nextAiringEpisode": 1,
+            "nextAiringAt": 1896048000,
+            "confidence": 0.93
+          }
+        ],
+        "mappings": [
+          {
+            "anilistId": "400",
+            "ids": {
+              "anilist": "400",
+              "tvdbSeries": "800",
+              "anidb": "900"
+            },
+            "titles": {
+              "en": "Long Runner"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 1,
+                "title": "Start",
+                "tvdbId": "8001",
+                "anidbEid": "9001",
+                "raw": {
+                  "airDate": "2023-01-01"
+                }
+              }
+            ]
+          },
+          {
+            "anilistId": "401",
+            "ids": {
+              "anilist": "401",
+              "tvdbSeries": "800",
+              "anidb": "901"
+            },
+            "titles": {
+              "en": "Long Runner Season 2"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 2,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 2,
+                "title": "Return",
+                "tvdbId": "8101",
+                "anidbEid": "9101",
+                "raw": {
+                  "airDate": "2024-01-01"
+                }
+              }
+            ]
+          },
+          {
+            "anilistId": "402",
+            "ids": {
+              "anilist": "402",
+              "tvdbSeries": "800",
+              "anidb": "902"
+            },
+            "titles": {
+              "en": "Long Runner Season 3"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 3,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 3,
+                "title": "Again",
+                "tvdbId": "8201",
+                "anidbEid": "9201",
+                "raw": {
+                  "airDate": "2025-01-01"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "rootAnilistId": "400",
+        "tvdbSeriesId": "800",
+        "anidbAnimeId": "900",
+        "targetKeys": ["S01E01", "S02E01", "S03E01", "S04E01"],
+        "targetSources": {
+          "S04E01": "anilist_next_airing"
+        },
+        "aliases": ["Long Runner", "Long Runner Season 4"]
+      }
+    },
+    {
+      "id": "new_season_anizip_mapping_supersedes_placeholder",
+      "classification": "rr3_asserted",
+      "input": {
+        "title": "Long Runner",
+        "year": 2023,
+        "seedAnilistId": "403",
+        "seedSeasonNumber": 4,
+        "releaseDelaySeconds": 900,
+        "externalIds": {
+          "anilist": "403"
+        },
+        "seasonChain": [
+          {
+            "seasonNumber": 4,
+            "anilistId": "403",
+            "title": "Long Runner Season 4",
+            "format": "TV",
+            "seasonYear": 2026,
+            "startYear": 2026,
+            "status": "RELEASING",
+            "episodes": 12,
+            "nextAiringEpisode": 2,
+            "nextAiringAt": 1896652800,
+            "confidence": 1.0
+          }
+        ],
+        "mappings": [
+          {
+            "anilistId": "403",
+            "ids": {
+              "anilist": "403",
+              "tvdbSeries": "800",
+              "anidb": "903"
+            },
+            "titles": {
+              "en": "Long Runner Season 4"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 4,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 4,
+                "title": "New Road",
+                "tvdbId": "8301",
+                "anidbEid": "9301",
+                "raw": {
+                  "airDate": "2026-01-01"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "rootAnilistId": "403",
+        "tvdbSeriesId": "800",
+        "anidbAnimeId": "903",
+        "targetKeys": ["S04E01", "S04E02"],
+        "targetSources": {
+          "S04E01": "anizip",
+          "S04E02": "anilist_next_airing"
+        },
+        "aliases": ["Long Runner", "Long Runner Season 4"]
+      }
+    },
+    {
+      "id": "duplicate_episode_keeps_strongest_identity",
+      "classification": "rr3_asserted",
+      "input": {
+        "title": "Identity Check",
+        "year": 2026,
+        "seedAnilistId": "500",
+        "seedSeasonNumber": 1,
+        "releaseDelaySeconds": 0,
+        "externalIds": {
+          "anilist": "500"
+        },
+        "seasonChain": [
+          {
+            "seasonNumber": 1,
+            "anilistId": "500",
+            "title": "Identity Check",
+            "format": "TV",
+            "seasonYear": 2026,
+            "startYear": 2026,
+            "status": "FINISHED",
+            "episodes": 1,
+            "confidence": 1.0
+          }
+        ],
+        "mappings": [
+          {
+            "anilistId": "500",
+            "ids": {
+              "anilist": "500",
+              "tvdbSeries": "1500",
+              "anidb": "2500"
+            },
+            "titles": {
+              "en": "Identity Check"
+            },
+            "episodes": [
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 1,
+                "title": "Weak",
+                "raw": {
+                  "airDate": "2026-02-01"
+                }
+              },
+              {
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "absoluteEpisodeNumber": 1,
+                "title": "Strong",
+                "tvdbId": "15001",
+                "anidbEid": "25001",
+                "raw": {
+                  "airDate": "2026-02-01"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "rootAnilistId": "500",
+        "tvdbSeriesId": "1500",
+        "anidbAnimeId": "2500",
+        "targetKeys": ["S01E01"],
+        "targetSources": {
+          "S01E01": "anizip"
+        },
+        "aliases": ["Identity Check"],
+        "strongestTargetTitle": "Strong"
+      }
+    }
+  ]
+}

@@ -19,7 +19,7 @@
     {
       "fixture": "QualityParserFixture",
       "input": "The.Series.S05E11.PROPER.HDTV.XviD-2HD",
-      "source": "Hdtv",
+      "source": "Sdtv",
       "proper": true
     },
     {

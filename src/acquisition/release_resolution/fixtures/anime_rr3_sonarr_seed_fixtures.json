@@ -1,0 +1,1045 @@
+{
+  "fixtureSet": "rr3-sonarr-anime-seed-fixtures",
+  "generatedBy": "jq from elixir-server/src/acquisition/release_resolution/fixtures/sonarr_rr2_conventional_tv_generated.json",
+  "sourceFixtureSet": "rr2-sonarr-conventional-tv-exhaustive",
+  "sourceCommit": "bf5d48c",
+  "sourceFile": "sonarr_rr2_conventional_tv_generated.json",
+  "classification": "anime_rr3",
+  "counts": {
+    "total": 60,
+    "releaseGroup": 6,
+    "unicodeTitle": 54
+  },
+  "cases": [
+    {
+      "id": "ReleaseGroupParserFixture.should_parse_anime_release_groups.178",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_parse_anime_release_groups",
+      "sourceLine": 178,
+      "input": "[FFF] Series Title!! - S01E11 - Someday, With Sonarr",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": "FFF"
+      }
+    },
+    {
+      "id": "ReleaseGroupParserFixture.should_parse_anime_release_groups.179",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_parse_anime_release_groups",
+      "sourceLine": 179,
+      "input": "[HorribleSubs] Series Title!! - S01E12 - Sonarr Going Well!!",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": "HorribleSubs"
+      }
+    },
+    {
+      "id": "ReleaseGroupParserFixture.should_parse_anime_release_groups.180",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_parse_anime_release_groups",
+      "sourceLine": 180,
+      "input": "[Anime-Koi] Series Title - S01E06 - Guys From Sonarr",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": "Anime-Koi"
+      }
+    },
+    {
+      "id": "ReleaseGroupParserFixture.should_parse_anime_release_groups.181",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_parse_anime_release_groups",
+      "sourceLine": 181,
+      "input": "[Anime-Koi] Series Title - S01E07 - A High-Grade Sonarr",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": "Anime-Koi"
+      }
+    },
+    {
+      "id": "ReleaseGroupParserFixture.should_parse_anime_release_groups.182",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_parse_anime_release_groups",
+      "sourceLine": 182,
+      "input": "[Anime-Koi] Series Title 2 - 01 [h264-720p][28D54E2C]",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": "Anime-Koi"
+      }
+    },
+    {
+      "id": "ReleaseGroupParserFixture.should_not_parse_anime_hash_as_release_group.189",
+      "sourceFixture": "ReleaseGroupParserFixture",
+      "sourceMethod": "should_not_parse_anime_hash_as_release_group",
+      "sourceLine": 189,
+      "input": "Terrible.Anime.Title.001.DBOX.480p.x264-iKaos [v3] [6AFFEF6B]",
+      "testKind": "release_group",
+      "fixtureGroup": "anime_release_group",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "releaseGroup": null
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.12",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 12,
+      "input": "【喵萌奶茶屋】★10月新番★[哥布林杀手/Anime Series Title][12END][720p][繁体][招募翻译校对]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "喵萌奶茶屋",
+        "absoluteEpisodes": 12
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.13",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 13,
+      "input": "[桜都字幕组][盾之勇者成名录/Anime Series Title][01][BIG5][720P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "桜都字幕组",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.14",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 14,
+      "input": "[YMDR][輝夜姬想讓人告白～天才們的戀愛頭腦戰～][Anime Series Title][2019][02][1080p][HEVC][JAP][BIG5][MP4-AAC][繁中]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "YMDR",
+        "absoluteEpisodes": 2
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.15",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 15,
+      "input": "【DHR百合組】[天使降臨到我身邊！_Anime Series Title][05][繁體][1080P10][WebRip][HEVC][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "DHR百合組",
+        "absoluteEpisodes": 5
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.16",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 16,
+      "input": "【傲娇零&自由字幕组】[刀剑神域III UnderWorld/ Anime Series Title ][17][HEVC-10Bit-2160P AAC][外挂GB/BIG5][WEB-Rip][MKV+ass ]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "傲娇零&自由字幕组",
+        "absoluteEpisodes": 17
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.17",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 17,
+      "input": "【悠哈璃羽字幕社＆拉斯观测组】[刀剑神域Alicization _ Anime Series Title ][17][x264 1080p][CHS]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "悠哈璃羽字幕社＆拉斯观测组",
+        "absoluteEpisodes": 17
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.18",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 18,
+      "input": "【极影字幕社】 ★04月新番 【巴哈姆特之怒 Virgin Soul】【Anime Series Title】【24】 【END】GB MP4_720P",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "极影字幕社",
+        "absoluteEpisodes": 24
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.19",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 19,
+      "input": "[愛戀&漫貓字幕组][10月新番][關於我轉生後成爲史萊姆那件事][18][720P][BIG5][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "關於我轉生後成爲史萊姆那件事",
+        "releaseGroup": "愛戀&漫貓字幕组",
+        "absoluteEpisodes": 18
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.20",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 20,
+      "input": "【咕咕茶字幕組】★1月新番[天使降臨到了我身邊! / Anime Series Title!][04][1080P][繁體][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title!",
+        "releaseGroup": "咕咕茶字幕組",
+        "absoluteEpisodes": 4
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.21",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 21,
+      "input": "【千夏字幕组】【天使降临到了我身边！_Anime Series Title】[第05话][1080p_HEVC][简繁外挂]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "千夏字幕组",
+        "absoluteEpisodes": 5
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.22",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 22,
+      "input": "[星空字幕组] 剃须。然后捡到女高中生。 / Anime Series Title [05][1080p][简日内嵌]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "星空字幕组",
+        "absoluteEpisodes": 5
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.23",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 23,
+      "input": "【DHR动研字幕组】[多田君不恋爱_Anime Series Title][13完][繁体][720P][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "DHR动研字幕组",
+        "absoluteEpisodes": 13
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.24",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 24,
+      "input": "【动漫国字幕组】★01月新番[Anime Series Title～！][01][1080P][简体][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title～！",
+        "releaseGroup": "动漫国字幕组",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.25",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 25,
+      "input": "[风车字幕组][名侦探柯南][857][米花町反复变化之谜（前篇）][简体][MP4][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "名侦探柯南",
+        "releaseGroup": "风车字幕组",
+        "absoluteEpisodes": 857
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.26",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 26,
+      "input": "[风车字幕组][名侦探柯南][857集][米花町反复变化之谜（前篇）][简体][MP4][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "名侦探柯南",
+        "releaseGroup": "风车字幕组",
+        "absoluteEpisodes": 857
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_releases.27",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_releases",
+      "sourceLine": 27,
+      "input": "【喵萌奶茶屋】★10月新番★[后宫之乌/后宫の乌/Series Title][07][1080p][简日双语][招募翻译校对]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Series Title",
+        "releaseGroup": "喵萌奶茶屋",
+        "absoluteEpisodes": 7
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.40",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 40,
+      "input": "[Lilith-Raws] 在地下城尋求邂逅是否搞錯了什麼 / Anime-Series Title S04 - 12 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S4",
+        "releaseGroup": "Lilith-Raws",
+        "absoluteEpisodes": 12
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.41",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 41,
+      "input": "[Lilith-Raws] 魔王學院的不適任者 / Anime-Series Title S02 - 01 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "Lilith-Raws",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.42",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 42,
+      "input": "[Lilith-Raws x WitEx.io] 盾之勇者成名录 / Anime-Series Title S02 - 03 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4] [557.3MB]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "Lilith-Raws x WitEx.io",
+        "absoluteEpisodes": 3
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.43",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 43,
+      "input": "[SweetSub&LoliHouse] 来自深渊 烈日黄金乡 / Anime-Series Title S2 - 07 [WebRip 1080p HEVC-10bit AAC][简繁日内封字幕]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "SweetSub&LoliHouse",
+        "absoluteEpisodes": 7
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.44",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 44,
+      "input": "[LoliHouse] Love Live! 虹咲学园学园偶像同好会 第二季 / Anime-Series Title S2 - 10 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "LoliHouse",
+        "absoluteEpisodes": 10
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.45",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 45,
+      "input": "[澄空学园&雪飘工作室&LoliHouse] 辉夜大小姐想让我告白 第三季 / Anime-Series Title S3 - 06 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S3",
+        "releaseGroup": "澄空学园&雪飘工作室&LoliHouse",
+        "absoluteEpisodes": 6
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.46",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 46,
+      "input": "[诸神字幕组][致不灭的你 第二季][Anime-Series Title S2][10][简繁日语字幕][1080P][MKV HEVC]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "诸神字幕组",
+        "absoluteEpisodes": 10
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.47",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 47,
+      "input": "[NC-Raws] 魔王学院的不适任者～史上最强的魔王始祖，转生就读子孙们的学校～第二季 / Anime-Series Title S2 - 01 (Baha 1920x1080 AVC AAC MP4)",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "NC-Raws",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.48",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 48,
+      "input": "[Lilith-Raws] Anime-Series Title S02 - 11 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4].mp4",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "Lilith-Raws",
+        "absoluteEpisodes": 11
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.49",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 49,
+      "input": "[天月搬运组] 不要欺负我，长瀞同学 2nd Attack / Anime-Series Title S02 - 01 [1080P][简繁日外挂]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "天月搬运组",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.50",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 50,
+      "input": "[Skymoon-Raws] 怕痛的我，把防御力点满就对了 第二季 / Anime-Series Title S02 - 01 [ViuTV][WEB-DL][1080p][AVC AAC][繁体外挂][MP4+ASS](正式版本) ",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "Skymoon-Raws",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.51",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 51,
+      "input": "[Skymoon-Raws] Anime-Series Title S02 - 01 [ViuTV][CHT][WEB-DL][1080p][AVC AAC][MP4+ASS]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "Skymoon-Raws",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.52",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 52,
+      "input": "[orion origin] Anime-Series Title S02[07][1080p][H264 AAC][CHS][ENG＆JPN stidio]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "orion origin",
+        "absoluteEpisodes": 7
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.53",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 53,
+      "input": "[UHA-WINGS][Anime-Series Title S02][01][x264 1080p][CHT].mp4",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title S2",
+        "releaseGroup": "UHA-WINGS",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.54",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 54,
+      "input": "[Suzuya Raws] 腼腆英雄 东京夺还篇 / Series 2nd Season - 01 [CR WebRip 1080p HEVC-10bit AAC][Multi-Subs]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Series 2nd Season",
+        "releaseGroup": "Suzuya Raws",
+        "absoluteEpisodes": 1
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.55",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 55,
+      "input": "[ANi] SERIES / SERIES 靦腆英雄 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "SERIES",
+        "releaseGroup": "ANi",
+        "absoluteEpisodes": 11
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.56",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 56,
+      "input": "[Q] 全职高手 第3季 / Series S3 - 09 (1080p HBR HEVC Multi-Sub)",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Series S3",
+        "releaseGroup": "Q",
+        "absoluteEpisodes": 9
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_anime_season_episode_releases.57",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_anime_season_episode_releases",
+      "sourceLine": 57,
+      "input": "[Q] 全职高手 第3季 | Series S3 - 09 (1080p HBR HEVC Multi-Sub)",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_season_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Series S3",
+        "releaseGroup": "Q",
+        "absoluteEpisodes": 9
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.70",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 70,
+      "input": "[喵萌奶茶屋&LoliHouse]玛娜利亚魔法学院/巴哈姆特之怒Anime Series Title - 03 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "巴哈姆特之怒Anime Series Title",
+        "releaseGroup": "喵萌奶茶屋&LoliHouse",
+        "absoluteEpisodes": 3
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.71",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 71,
+      "input": "[悠哈璃羽字幕社&拉斯观测组&LoliHouse] 刀剑神域: Alicization / Anime Series: Title - 17 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series: Title",
+        "releaseGroup": "悠哈璃羽字幕社&拉斯观测组&LoliHouse",
+        "absoluteEpisodes": 17
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.72",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 72,
+      "input": "[ZERO字幕組]嫁給非人類·Anime-Series Title[11][BIG5][1080p]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title",
+        "releaseGroup": "ZERO字幕組",
+        "absoluteEpisodes": 11
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.73",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 73,
+      "input": "[Lilith-Raws] 艾梅洛閣下 II 世事件簿 -魔眼蒐集列車 Grace note- / Anime-Series Title - 04 [BiliBili][WEB-DL][1080p][AVC AAC][CHT][MKV]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title",
+        "releaseGroup": "Lilith-Raws",
+        "absoluteEpisodes": 4
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.74",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 74,
+      "input": "[NC-Raws] 影宅 / Anime-Series Title - 07 [B-Global][WEB-DL][1080p][AVC AAC][CHS_CHT_ENG_TH_SRT][MKV]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title",
+        "releaseGroup": "NC-Raws",
+        "absoluteEpisodes": 7
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.75",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 75,
+      "input": "[NC-Raws] ANIME-SERIES TITLE－影宅－ / Anime-Series Title - 07 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime-Series Title",
+        "releaseGroup": "NC-Raws",
+        "absoluteEpisodes": 7
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.76",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 76,
+      "input": "[OPFans楓雪動漫][ANIME SERIES 海賊王][第1008話][典藏版][1080P][MKV][簡繁]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "ANIME SERIES",
+        "releaseGroup": "OPFans",
+        "absoluteEpisodes": 1008
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.77",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 77,
+      "input": "[Skymoon-Raws][Anime Series 海賊王][1008][ViuTV][WEB-RIP][CHT][SRTx2][1080p][MKV]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series",
+        "releaseGroup": "Skymoon-Raws",
+        "absoluteEpisodes": 1008
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unbracketed_chinese_anime_releases.78",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unbracketed_chinese_anime_releases",
+      "sourceLine": 78,
+      "input": "[银光字幕组][名侦探柯南·Series Title][871][信长四五〇事件][繁日][HDrip][X264-AAC][720P][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Series Title",
+        "releaseGroup": "银光字幕组",
+        "absoluteEpisodes": 871
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_multiepisode_releases.91",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_multiepisode_releases",
+      "sourceLine": 91,
+      "input": "[YMDR][慕留人 -火影忍者新時代-][Anime Series Title-][2017][88-91][1080p][AVC][JAP][BIG5][MP4-AAC][繁中]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_multi_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "YMDR",
+        "absoluteEpisodes": [
+          88,
+          89,
+          90,
+          91
+        ]
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_chinese_multiepisode_releases.92",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_chinese_multiepisode_releases",
+      "sourceLine": 92,
+      "input": "[诸神字幕组][战栗杀机][ANIME SERIES TITLE][01-24完][简日双语字幕][720P][MP4]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_multi_episode_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "ANIME SERIES TITLE",
+        "releaseGroup": "诸神字幕组",
+        "absoluteEpisodes": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24
+        ]
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.107",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 107,
+      "input": "[GM-Team][国漫][斗罗大陆][Anime Title][Douro Mainland][2019][215][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 215
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.108",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 108,
+      "input": "[GM-Team][国漫][斗罗大陆][Anime Title][Douro Mainland][2019][215 END][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 215
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.109",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 109,
+      "input": "[GM-Team][国漫][斗罗大陆][Anime Title][2019][215 Fin][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 215
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.110",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 110,
+      "input": "[GM-Team][国漫][Anime Title][Douro Mainland][2019][234][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 234
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.111",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 111,
+      "input": "[GM-Team][国漫][Anime Title][2019][234][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 234
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.112",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 112,
+      "input": "[GM-Team][国漫][Anime Title][2019][234 END][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 234
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_gm_team_releases_and_files.113",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_gm_team_releases_and_files",
+      "sourceLine": 113,
+      "input": "[GM-Team][国漫][Anime Title][2019][234 Fin][AVC][GB][1080P]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_group_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Title",
+        "absoluteEpisodes": 234
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_unicode_digits.124",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_unicode_digits",
+      "sourceLine": 124,
+      "input": "[Subz] My Series - １５８ [h264 10-bit][1080p]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_unicode_digits_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "My Series",
+        "absoluteEpisodes": 158
+      }
+    },
+    {
+      "id": "UnicodeReleaseParserFixture.should_parse_false_positive_chinese_anime_releases.136",
+      "sourceFixture": "UnicodeReleaseParserFixture",
+      "sourceMethod": "should_parse_false_positive_chinese_anime_releases",
+      "sourceLine": 136,
+      "input": "[BeanSub][Anime_Series_Title][01][GB][1080P][x264_AAC]",
+      "testKind": "unicode_title",
+      "fixtureGroup": "anime_false_positive_title",
+      "classification": "rr3d_asserted",
+      "sourceClassification": "anime_rr3",
+      "sourceSkipReason": "anime_rr3",
+      "expected": {
+        "seriesTitle": "Anime Series Title",
+        "releaseGroup": "BeanSub",
+        "absoluteEpisodes": 1
+      }
+    }
+  ]
+}

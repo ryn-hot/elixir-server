@@ -46,8 +46,7 @@ use crate::{
     state::AppState,
 };
 
-use linkers::AniZipEpisodeRecord;
-pub use linkers::{AniZipMapping, LinkerService};
+pub use linkers::{AniZipEpisodeRecord, AniZipMapping, LinkerService};
 
 const ANILIST_ENDPOINT: &str = "https://graphql.anilist.co";
 
