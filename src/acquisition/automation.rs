@@ -28,10 +28,16 @@ use crate::{
             ReleaseCoverageState, ReleaseJobState, ReleaseKind, ReleaseResolverKind,
         },
         store::{
-            count_active_release_jobs_by_route, count_active_release_jobs_by_subscription_route,
+            count_active_release_jobs, count_active_release_jobs_by_route,
+            count_active_release_jobs_by_subscription,
+            count_active_release_jobs_by_subscription_route, count_stale_active_release_jobs,
             get_release_by_fingerprint, list_release_coverage, upsert_anime_candidate_parse,
             upsert_anime_graph_snapshot, upsert_release, upsert_release_coverage,
             upsert_release_file, upsert_release_job,
+        },
+        tv::{
+            TV_SONARR_STYLE_RESOLVER_VERSION, TvCoverageOptions, TvCoveragePlan,
+            TvReleaseFileInput, TvSonarrStyleResolver, TvTarget,
         },
     },
     acquisition::subscriptions::{
@@ -53,8 +59,9 @@ use crate::{
         handlers::{
             acquisition_sources::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
-                CandidateScoreBadge, CandidateSearchIntent, CandidateSearchPreferences,
-                CandidateSearchRequest, CandidateSearchTarget, search_candidates_with_store,
+                CandidateRouteOption, CandidateScoreBadge, CandidateSearchIntent,
+                CandidateSearchPreferences, CandidateSearchRequest, CandidateSearchResponse,
+                CandidateSearchTarget, search_candidates_with_store,
             },
             download_broker::{DownloadBrokerSubmitRequest, submit_to_broker},
         },
@@ -81,7 +88,12 @@ const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 10;
 const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 3;
 const DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP: i64 = 2;
+const DEFAULT_GLOBAL_RELEASE_JOB_CAP: i64 = 12;
+const DEFAULT_SUBSCRIPTION_RELEASE_JOB_CAP: i64 = 5;
+const DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK: usize = SEARCH_BATCH_LIMIT as usize;
+const DEFAULT_MAX_SUBMISSIONS_PER_TICK: usize = 5;
 const DEFAULT_STAGED_INSPECTION_JOB_CAP: i64 = 10;
+const DEFAULT_STALE_ACTIVE_JOB_SECONDS: i64 = 6 * 60 * 60;
 const PACK_BACKFILL_TARGET_THRESHOLD: usize = 3;
 const QUEUE_CAPACITY_RETRY_SECONDS: i64 = 5 * 60;
 
@@ -91,16 +103,118 @@ struct CandidateSubmission {
     source_extension_id: String,
     candidate: AcquisitionCandidate,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
+    tv_coverage_plan: Option<TvCoveragePlan>,
+    dispatch: Option<SchedulerDispatchEvidence>,
+}
+
+impl CandidateSubmission {
+    fn has_release_coverage_plan(&self) -> bool {
+        self.anime_coverage_plan.is_some() || self.tv_coverage_plan.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct CandidateSelection {
     candidate: AcquisitionCandidate,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
+    tv_coverage_plan: Option<TvCoveragePlan>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateReleasePlan {
+    provider_id: Uuid,
+    source_extension_id: String,
+    route_logical_id: String,
+    fingerprint: String,
+    selection: CandidateSelection,
+    release_kind: ReleaseKind,
+    resolver_kind: ReleaseResolverKind,
+    resolver_version: String,
+    confidence: ReleaseConfidence,
+    covered_target_ids: BTreeSet<Uuid>,
+    covered_target_keys: BTreeSet<String>,
+    overfetch_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerDispatchEvidence {
+    scheduler_phase: &'static str,
+    group_key: String,
+    search_intent: Option<CandidateSearchIntent>,
+    selected_plan_score: SchedulerPlanScoreEvidence,
+    capacity_snapshot: QueueCapacitySnapshot,
+    route_decision: SchedulerRouteDecisionEvidence,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerPlanScoreEvidence {
+    confidence: String,
+    covered_target_count: usize,
+    release_kind: String,
+    resolver_kind: String,
+    resolver_version: String,
+    route_preference_score: i32,
+    cached_debrid_score: i32,
+    quality_score: i32,
+    seeders: Option<u32>,
+    overfetch_count: usize,
+    source_rank: Option<u32>,
+    source_score: Option<f64>,
+    score_tuple: (i32, usize, i32, i32, i32, i32, i64, i32, i32, i32),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerRouteDecisionEvidence {
+    route_policy: String,
+    selected_route_logical_id: String,
+    default_route: Option<String>,
+    supported_routes: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueCapacitySnapshot {
+    global_active: i64,
+    global_limit: i64,
+    subscription_active: i64,
+    subscription_limit: i64,
+    route_active: i64,
+    route_limit: Option<i64>,
+    subscription_route_active: i64,
+    subscription_route_limit: Option<i64>,
+    searches_this_tick: usize,
+    search_tick_limit: usize,
+    submissions_this_tick: usize,
+    submission_tick_limit: usize,
+    stale_active_jobs: i64,
+}
+
+#[derive(Debug, Default)]
+struct CandidateReleasePlanBatch {
+    plans: Vec<CandidateReleasePlan>,
+    capacity_block: Option<QueueCapacityBlock>,
+}
+
+impl CandidateReleasePlan {
+    fn into_submission(self, dispatch: SchedulerDispatchEvidence) -> CandidateSubmission {
+        CandidateSubmission {
+            provider_id: self.provider_id,
+            source_extension_id: self.source_extension_id,
+            candidate: self.selection.candidate,
+            anime_coverage_plan: self.selection.anime_coverage_plan,
+            tv_coverage_plan: self.selection.tv_coverage_plan,
+            dispatch: Some(dispatch),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct TargetSearchGroup {
+    group_key: String,
     representative: AcquisitionTarget,
     targets: Vec<AcquisitionTarget>,
     search_intent: Option<CandidateSearchIntent>,
@@ -126,31 +240,34 @@ impl RetryBucket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct AnimeTargetGroupKey {
+struct TargetSearchGroupKey {
     subscription_id: Uuid,
+    media_type: &'static str,
+    route_policy: &'static str,
+    grouping_kind: &'static str,
     season_number: Option<i32>,
+    air_date: Option<String>,
+    target_key: Option<String>,
     retry_bucket: RetryBucket,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct SelectionPreference {
     prefer_packs_for_backfill: bool,
 }
 
-impl SelectionPreference {
-    fn for_group(group: &TargetSearchGroup) -> Self {
-        Self {
-            prefer_packs_for_backfill: group.targets.len() >= PACK_BACKFILL_TARGET_THRESHOLD,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct QueueGovernorCaps {
+    global: i64,
+    subscription: i64,
     global_debrid: i64,
     subscription_debrid: i64,
     global_torrent: i64,
     subscription_torrent: i64,
+    max_candidate_searches_per_tick: usize,
+    max_submissions_per_tick: usize,
+    stale_active_job_seconds: i64,
     #[allow(dead_code)]
     staged_inspection: i64,
 }
@@ -158,22 +275,40 @@ struct QueueGovernorCaps {
 impl Default for QueueGovernorCaps {
     fn default() -> Self {
         Self {
+            global: DEFAULT_GLOBAL_RELEASE_JOB_CAP,
+            subscription: DEFAULT_SUBSCRIPTION_RELEASE_JOB_CAP,
             global_debrid: DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP,
             subscription_debrid: DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP,
             global_torrent: DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP,
             subscription_torrent: DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP,
+            max_candidate_searches_per_tick: DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK,
+            max_submissions_per_tick: DEFAULT_MAX_SUBMISSIONS_PER_TICK,
+            stale_active_job_seconds: DEFAULT_STALE_ACTIVE_JOB_SECONDS,
             staged_inspection: DEFAULT_STAGED_INSPECTION_JOB_CAP,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueCapacityLimitKind {
+    Global,
+    Subscription,
+    Route,
+    SubscriptionRoute,
+    SearchTick,
+    SubmissionTick,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueueCapacityBlock {
-    route_logical_id: String,
+    kind: QueueCapacityLimitKind,
+    route_logical_id: Option<String>,
     global_active: i64,
     global_limit: i64,
     subscription_active: i64,
     subscription_limit: i64,
+    tick_active: usize,
+    tick_limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -185,15 +320,20 @@ enum CandidateSubmitOutcome {
 #[derive(Debug, Clone)]
 struct QueueGovernor {
     caps: QueueGovernorCaps,
+    global_active: i64,
     active_by_route: HashMap<String, i64>,
+    active_by_subscription: HashMap<Uuid, i64>,
     active_by_subscription_route: HashMap<(Uuid, String), i64>,
+    stale_active_jobs: i64,
+    searches_this_tick: usize,
+    submissions_this_tick: usize,
 }
 
 impl QueueGovernor {
     async fn load(pool: &sqlx::AnyPool) -> Result<Self> {
         let caps = QueueGovernorCaps::default();
+        let stale_before = Utc::now() - ChronoDuration::seconds(caps.stale_active_job_seconds);
         let mut active_by_route = HashMap::new();
-        let active_by_subscription_route = HashMap::new();
         for route in [DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID] {
             active_by_route.insert(
                 route.to_string(),
@@ -202,8 +342,236 @@ impl QueueGovernor {
         }
         Ok(Self {
             caps,
+            global_active: count_active_release_jobs(pool).await?,
             active_by_route,
-            active_by_subscription_route,
+            active_by_subscription: HashMap::new(),
+            active_by_subscription_route: HashMap::new(),
+            stale_active_jobs: count_stale_active_release_jobs(pool, stale_before).await?,
+            searches_this_tick: 0,
+            submissions_this_tick: 0,
+        })
+    }
+
+    async fn hydrate_subscription(
+        &mut self,
+        pool: &sqlx::AnyPool,
+        subscription_id: Uuid,
+    ) -> Result<()> {
+        if self.active_by_subscription.contains_key(&subscription_id) {
+            return Ok(());
+        }
+        let count = count_active_release_jobs_by_subscription(pool, subscription_id).await?;
+        self.active_by_subscription.insert(subscription_id, count);
+        Ok(())
+    }
+
+    async fn try_start_search(
+        &mut self,
+        pool: &sqlx::AnyPool,
+        subscription: &AcquisitionSubscription,
+    ) -> Result<std::result::Result<(), QueueCapacityBlock>> {
+        if self.searches_this_tick >= self.caps.max_candidate_searches_per_tick {
+            return Ok(Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::SearchTick,
+                route_logical_id: None,
+                global_active: self.global_active,
+                global_limit: self.caps.global,
+                subscription_active: 0,
+                subscription_limit: self.caps.subscription,
+                tick_active: self.searches_this_tick,
+                tick_limit: self.caps.max_candidate_searches_per_tick,
+            }));
+        }
+
+        self.hydrate_subscription(pool, subscription.subscription_id)
+            .await?;
+        let subscription_active = *self
+            .active_by_subscription
+            .get(&subscription.subscription_id)
+            .unwrap_or(&0);
+
+        if self.global_active >= self.caps.global {
+            return Ok(Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::Global,
+                route_logical_id: None,
+                global_active: self.global_active,
+                global_limit: self.caps.global,
+                subscription_active,
+                subscription_limit: self.caps.subscription,
+                tick_active: self.searches_this_tick,
+                tick_limit: self.caps.max_candidate_searches_per_tick,
+            }));
+        }
+        if subscription_active >= self.caps.subscription {
+            return Ok(Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::Subscription,
+                route_logical_id: None,
+                global_active: self.global_active,
+                global_limit: self.caps.global,
+                subscription_active,
+                subscription_limit: self.caps.subscription,
+                tick_active: self.searches_this_tick,
+                tick_limit: self.caps.max_candidate_searches_per_tick,
+            }));
+        }
+        let allowed_routes = route_preference_order(subscription.route_policy, None);
+        if !allowed_routes.is_empty() {
+            let mut first_block = None;
+            let mut has_route_capacity = false;
+            for route in allowed_routes {
+                self.hydrate_subscription_route(pool, subscription.subscription_id, route)
+                    .await?;
+                if let Some(block) = self.route_capacity_block(subscription.subscription_id, route)
+                {
+                    first_block.get_or_insert(block);
+                } else {
+                    has_route_capacity = true;
+                    break;
+                }
+            }
+            if !has_route_capacity && let Some(block) = first_block {
+                return Ok(Err(block));
+            }
+        }
+
+        self.searches_this_tick += 1;
+        Ok(Ok(()))
+    }
+
+    fn stale_active_jobs(&self) -> i64 {
+        self.stale_active_jobs
+    }
+
+    async fn refresh_dispatch_capacity(
+        &mut self,
+        pool: &sqlx::AnyPool,
+        subscription_id: Uuid,
+        route_logical_id: &str,
+    ) -> Result<()> {
+        self.global_active = count_active_release_jobs(pool).await?;
+        self.active_by_route.insert(
+            route_logical_id.to_string(),
+            count_active_release_jobs_by_route(pool, route_logical_id).await?,
+        );
+        self.active_by_subscription.insert(
+            subscription_id,
+            count_active_release_jobs_by_subscription(pool, subscription_id).await?,
+        );
+        self.active_by_subscription_route.insert(
+            (subscription_id, route_logical_id.to_string()),
+            count_active_release_jobs_by_subscription_route(
+                pool,
+                subscription_id,
+                route_logical_id,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    fn capacity_snapshot(
+        &self,
+        subscription_id: Uuid,
+        route_logical_id: &str,
+    ) -> QueueCapacitySnapshot {
+        let route_key = route_logical_id.to_string();
+        let sub_key = (subscription_id, route_key.clone());
+        let (route_limit, subscription_route_limit) = self
+            .route_limits(route_logical_id)
+            .map(|(route, subscription)| (Some(route), Some(subscription)))
+            .unwrap_or((None, None));
+        QueueCapacitySnapshot {
+            global_active: self.global_active,
+            global_limit: self.caps.global,
+            subscription_active: *self
+                .active_by_subscription
+                .get(&subscription_id)
+                .unwrap_or(&0),
+            subscription_limit: self.caps.subscription,
+            route_active: *self.active_by_route.get(&route_key).unwrap_or(&0),
+            route_limit,
+            subscription_route_active: *self
+                .active_by_subscription_route
+                .get(&sub_key)
+                .unwrap_or(&0),
+            subscription_route_limit,
+            searches_this_tick: self.searches_this_tick,
+            search_tick_limit: self.caps.max_candidate_searches_per_tick,
+            submissions_this_tick: self.submissions_this_tick,
+            submission_tick_limit: self.caps.max_submissions_per_tick,
+            stale_active_jobs: self.stale_active_jobs,
+        }
+    }
+
+    fn remaining_submission_slots(&self) -> usize {
+        self.caps
+            .max_submissions_per_tick
+            .saturating_sub(self.submissions_this_tick)
+    }
+
+    fn route_capacity_block(
+        &self,
+        subscription_id: Uuid,
+        route_logical_id: &str,
+    ) -> Option<QueueCapacityBlock> {
+        let route_key = route_logical_id.to_string();
+        let sub_key = (subscription_id, route_key.clone());
+        let (global_limit, subscription_limit) = self.route_limits(route_logical_id)?;
+        let global_active = *self.active_by_route.get(&route_key).unwrap_or(&0);
+        let subscription_active = *self
+            .active_by_subscription_route
+            .get(&sub_key)
+            .unwrap_or(&0);
+        if global_active >= global_limit {
+            return Some(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::Route,
+                route_logical_id: Some(route_key),
+                global_active,
+                global_limit,
+                subscription_active,
+                subscription_limit,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            });
+        }
+        if subscription_active >= subscription_limit {
+            return Some(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::SubscriptionRoute,
+                route_logical_id: Some(route_key),
+                global_active,
+                global_limit,
+                subscription_active,
+                subscription_limit,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            });
+        }
+        None
+    }
+
+    fn tick_submission_capacity_block(
+        &self,
+        subscription_id: Uuid,
+        route_logical_id: &str,
+    ) -> Option<QueueCapacityBlock> {
+        (self.submissions_this_tick >= self.caps.max_submissions_per_tick).then(|| {
+            let route_key = route_logical_id.to_string();
+            let sub_key = (subscription_id, route_key.clone());
+            let (global_limit, subscription_limit) =
+                self.route_limits(route_logical_id).unwrap_or((0, 0));
+            QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::SubmissionTick,
+                route_logical_id: Some(route_key.clone()),
+                global_active: *self.active_by_route.get(&route_key).unwrap_or(&0),
+                global_limit,
+                subscription_active: *self
+                    .active_by_subscription_route
+                    .get(&sub_key)
+                    .unwrap_or(&0),
+                subscription_limit,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            }
         })
     }
 
@@ -236,6 +604,13 @@ impl QueueGovernor {
         if self.route_limits(route_logical_id).is_none() {
             return Ok(Ok(()));
         }
+        self.refresh_dispatch_capacity(pool, subscription_id, route_logical_id)
+            .await?;
+        if let Some(block) = self.tick_submission_capacity_block(subscription_id, route_logical_id)
+        {
+            return Ok(Err(block));
+        }
+        self.hydrate_subscription(pool, subscription_id).await?;
         self.hydrate_subscription_route(pool, subscription_id, route_logical_id)
             .await?;
         Ok(self.try_reserve_loaded(subscription_id, route_logical_id))
@@ -251,18 +626,68 @@ impl QueueGovernor {
         let Some((global_limit, subscription_limit)) = self.route_limits(route_logical_id) else {
             return Ok(());
         };
+        if self.global_active >= self.caps.global {
+            return Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::Global,
+                route_logical_id: Some(route_key),
+                global_active: self.global_active,
+                global_limit: self.caps.global,
+                subscription_active: *self
+                    .active_by_subscription
+                    .get(&subscription_id)
+                    .unwrap_or(&0),
+                subscription_limit: self.caps.subscription,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            });
+        }
+        let total_subscription_active = *self
+            .active_by_subscription
+            .get(&subscription_id)
+            .unwrap_or(&0);
+        if total_subscription_active >= self.caps.subscription {
+            return Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::Subscription,
+                route_logical_id: Some(route_key),
+                global_active: self.global_active,
+                global_limit: self.caps.global,
+                subscription_active: total_subscription_active,
+                subscription_limit: self.caps.subscription,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            });
+        }
+        if let Some(block) = self.tick_submission_capacity_block(subscription_id, route_logical_id)
+        {
+            return Err(block);
+        }
         let global_active = *self.active_by_route.get(&route_key).unwrap_or(&0);
         let subscription_active = *self
             .active_by_subscription_route
             .get(&sub_key)
             .unwrap_or(&0);
-        if global_active >= global_limit || subscription_active >= subscription_limit {
+        if global_active >= global_limit {
             return Err(QueueCapacityBlock {
-                route_logical_id: route_key,
+                kind: QueueCapacityLimitKind::Route,
+                route_logical_id: Some(route_key),
                 global_active,
                 global_limit,
                 subscription_active,
                 subscription_limit,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
+            });
+        }
+        if subscription_active >= subscription_limit {
+            return Err(QueueCapacityBlock {
+                kind: QueueCapacityLimitKind::SubscriptionRoute,
+                route_logical_id: Some(route_key),
+                global_active,
+                global_limit,
+                subscription_active,
+                subscription_limit,
+                tick_active: self.submissions_this_tick,
+                tick_limit: self.caps.max_submissions_per_tick,
             });
         }
         *self.active_by_route.entry(route_key.clone()).or_default() += 1;
@@ -270,6 +695,12 @@ impl QueueGovernor {
             .active_by_subscription_route
             .entry(sub_key)
             .or_default() += 1;
+        *self
+            .active_by_subscription
+            .entry(subscription_id)
+            .or_default() += 1;
+        self.global_active += 1;
+        self.submissions_this_tick += 1;
         Ok(())
     }
 
@@ -282,6 +713,10 @@ impl QueueGovernor {
         if let Some(value) = self.active_by_subscription_route.get_mut(&sub_key) {
             *value = (*value).saturating_sub(1);
         }
+        if let Some(value) = self.active_by_subscription.get_mut(&subscription_id) {
+            *value = (*value).saturating_sub(1);
+        }
+        self.global_active = self.global_active.saturating_sub(1);
     }
 
     fn route_limits(&self, route_logical_id: &str) -> Option<(i64, i64)> {
@@ -385,13 +820,31 @@ async fn search_due_targets(state: &AppState) -> Result<()> {
     .map(|item| (item.subscription_id, item))
     .collect::<HashMap<_, _>>();
 
-    let groups = build_due_target_search_groups(state, &subscriptions, targets, now).await?;
+    let groups = fair_order_search_groups(
+        build_due_target_search_groups(state, &subscriptions, targets, now).await?,
+    );
     let mut governor = QueueGovernor::load(&state.db_pool).await?;
+    if governor.stale_active_jobs() > 0 {
+        debug!(
+            stale_active_jobs = governor.stale_active_jobs(),
+            "acquisition queue governor found stale active jobs"
+        );
+    }
 
     for group in groups {
         let Some(subscription) = subscriptions.get(&group.representative.subscription_id) else {
             continue;
         };
+        match governor
+            .try_start_search(&state.db_pool, subscription)
+            .await?
+        {
+            Ok(()) => {}
+            Err(block) => {
+                defer_group_for_queue_capacity(state, subscription, &group, block, now).await?;
+                continue;
+            }
+        }
         if let Err(err) =
             search_and_submit_group(state, subscription, &group, now, &mut governor).await
         {
@@ -431,13 +884,13 @@ async fn build_due_target_search_groups(
     due_targets: Vec<AcquisitionTarget>,
     now: DateTime<Utc>,
 ) -> Result<Vec<TargetSearchGroup>> {
-    let anime_subscription_ids = due_targets
+    let grouped_subscription_ids = due_targets
         .iter()
-        .filter(|target| target.media_type == MediaType::Anime)
+        .filter(|target| target.media_type != MediaType::Movie)
         .map(|target| target.subscription_id)
         .collect::<BTreeSet<_>>();
     let mut targets_by_subscription = HashMap::<Uuid, Vec<AcquisitionTarget>>::new();
-    for subscription_id in anime_subscription_ids {
+    for subscription_id in grouped_subscription_ids {
         targets_by_subscription.insert(
             subscription_id,
             list_subscription_targets(&state.db_pool, subscription_id).await?,
@@ -457,25 +910,28 @@ fn build_target_search_groups(
     targets_by_subscription: &HashMap<Uuid, Vec<AcquisitionTarget>>,
     now: DateTime<Utc>,
 ) -> Vec<TargetSearchGroup> {
-    let mut groups = Vec::new();
-    let mut anime_due_keys = BTreeSet::<AnimeTargetGroupKey>::new();
+    let mut singleton_groups = Vec::new();
+    let mut due_group_keys = BTreeSet::<TargetSearchGroupKey>::new();
 
     for target in due_targets {
         let Some(subscription) = subscriptions.get(&target.subscription_id) else {
             continue;
         };
-        if target.media_type != MediaType::Anime || subscription.media_type != MediaType::Anime {
-            groups.push(TargetSearchGroup {
+        let key = target_search_group_key(subscription, &target, now);
+        if key.grouping_kind == "target" || key.grouping_kind == "movie" {
+            singleton_groups.push(TargetSearchGroup {
+                group_key: key.as_stable_key(),
                 representative: target,
                 targets: Vec::new(),
                 search_intent: None,
             });
             continue;
         }
-        anime_due_keys.insert(anime_target_group_key(subscription, &target, now));
+        due_group_keys.insert(key);
     }
 
-    for key in anime_due_keys {
+    let mut groups = singleton_groups;
+    for key in due_group_keys {
         let Some(subscription) = subscriptions.get(&key.subscription_id) else {
             continue;
         };
@@ -486,7 +942,7 @@ fn build_target_search_groups(
         let mut targets = source_targets
             .iter()
             .filter(|target| target_is_due_for_group(subscription, target, now))
-            .filter(|target| anime_target_group_key(subscription, target, now) == key)
+            .filter(|target| target_search_group_key(subscription, target, now) == key)
             .cloned()
             .collect::<Vec<_>>();
         if targets.is_empty() {
@@ -495,6 +951,7 @@ fn build_target_search_groups(
         sort_targets_for_group(&mut targets);
         let representative = targets[0].clone();
         groups.push(TargetSearchGroup {
+            group_key: key.as_stable_key(),
             representative,
             search_intent: Some(search_intent_for_targets(&targets, key.retry_bucket)),
             targets,
@@ -538,48 +995,37 @@ async fn search_and_submit_group(
     let request =
         candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
     let response = search_candidates_with_store(&state.db_pool, request).await?;
-    let group_targets = if subscription.media_type == MediaType::Anime && !group.targets.is_empty()
-    {
+    let grouped_targets = if !group.targets.is_empty() {
         group.targets.clone()
-    } else if subscription.media_type == MediaType::Anime {
-        vec![target.clone()]
     } else {
-        Vec::new()
+        vec![target.clone()]
     };
-    let anime_context = anime_candidate_scoring_context(subscription, &target, &group_targets);
-    let preference = SelectionPreference::for_group(group);
-    let selection = select_best_candidate_with_preference(
-        &response.candidates,
-        subscription.route_policy,
-        anime_context.as_ref(),
-        preference,
+    let batch = build_candidate_release_plans(
+        state,
+        subscription,
+        &response,
+        &target,
+        &grouped_targets,
+        governor,
     )
-    .or_else(|| {
-        if group_targets.len() <= 1 {
-            return None;
+    .await?;
+    let selected_plans = select_bounded_release_plans(
+        batch.plans,
+        subscription.route_policy,
+        &grouped_targets,
+        governor.remaining_submission_slots(),
+    );
+
+    if selected_plans.is_empty() {
+        if let Some(block) = batch.capacity_block {
+            defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
+            return Ok(());
         }
-        let single_context =
-            anime_candidate_scoring_context(subscription, &target, std::slice::from_ref(&target));
-        select_best_candidate_with_preference(
-            &response.candidates,
-            subscription.route_policy,
-            single_context.as_ref(),
-            SelectionPreference {
-                prefer_packs_for_backfill: false,
-            },
-        )
-    });
-    let Some(selection) = selection else {
         let next_after = next_candidate_retry_after(subscription, &target, now);
-        let retry_targets = if group_targets.is_empty() {
-            vec![target.clone()]
-        } else {
-            group_targets.clone()
-        };
         update_group_targets_for_retry(
             state,
             subscription,
-            &retry_targets,
+            &grouped_targets,
             AcquisitionTargetStateUpdate {
                 state: AcquisitionTargetState::Pending,
                 state_reason: Some(format!(
@@ -598,41 +1044,639 @@ async fn search_and_submit_group(
         )
         .await?;
         return Ok(());
-    };
+    }
 
-    let submission = CandidateSubmission {
-        provider_id: response.provider.provider_id,
-        source_extension_id: response.provider.extension_id.clone(),
-        candidate: selection.candidate,
-        anime_coverage_plan: selection.anime_coverage_plan,
-    };
-    match submit_selected_candidate(
-        state,
-        subscription,
-        &target,
-        submission,
-        None,
-        Some(governor),
-    )
-    .await?
-    {
-        CandidateSubmitOutcome::Submitted => {}
-        CandidateSubmitOutcome::CapacityBlocked(block) => {
-            defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
+    for plan in selected_plans {
+        debug!(
+            target_id = %target.target_id,
+            route = plan.route_logical_id.as_str(),
+            release_kind = plan.release_kind.as_str(),
+            resolver_kind = plan.resolver_kind.as_str(),
+            resolver_version = plan.resolver_version.as_str(),
+            covered_targets = plan.covered_target_keys.len(),
+            "submitting RR-6C acquisition release plan"
+        );
+        let route_logical_id = plan.route_logical_id.clone();
+        let dispatch = scheduler_dispatch_evidence(
+            subscription,
+            group,
+            &plan,
+            governor.capacity_snapshot(subscription.subscription_id, &route_logical_id),
+        );
+        let submission = plan.into_submission(dispatch);
+        match submit_selected_candidate(
+            state,
+            subscription,
+            &target,
+            submission,
+            Some(&route_logical_id),
+            Some(governor),
+        )
+        .await?
+        {
+            CandidateSubmitOutcome::Submitted => {}
+            CandidateSubmitOutcome::CapacityBlocked(block) => {
+                defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
+                break;
+            }
         }
     }
     Ok(())
 }
 
-fn anime_target_group_key(
+async fn build_candidate_release_plans(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    response: &CandidateSearchResponse,
+    representative: &AcquisitionTarget,
+    grouped_targets: &[AcquisitionTarget],
+    governor: &mut QueueGovernor,
+) -> Result<CandidateReleasePlanBatch> {
+    let mut batch = CandidateReleasePlanBatch::default();
+    for candidate in response
+        .candidates
+        .iter()
+        .filter(|candidate| candidate_allowed_by_policy(candidate, subscription.route_policy))
+    {
+        if !candidate_allowed_by_subscription_preferences(candidate, subscription) {
+            continue;
+        }
+        let fingerprint =
+            candidate_release_fingerprint(candidate, Some(response.provider.provider_id));
+        if release_fingerprint_already_claimed(
+            &state.db_pool,
+            &response.provider.extension_id,
+            &fingerprint,
+        )
+        .await?
+        {
+            continue;
+        }
+        let Some(coverage) =
+            analyze_candidate_coverage(subscription, representative, grouped_targets, candidate)
+        else {
+            continue;
+        };
+        if coverage.confidence == ReleaseConfidence::ReviewRequired
+            || coverage.confidence == ReleaseConfidence::Low
+            || coverage.covered_target_ids.is_empty()
+        {
+            continue;
+        }
+        let route_selection = match select_candidate_route_for_plan(
+            &state.db_pool,
+            subscription,
+            candidate,
+            &response.route_options,
+            governor,
+        )
+        .await
+        {
+            Ok(selection) => selection,
+            Err(err) => {
+                debug!(
+                    candidate_title = candidate.title.as_str(),
+                    subscription_id = %subscription.subscription_id,
+                    "candidate route unavailable during RR-6C planning: {err}"
+                );
+                continue;
+            }
+        };
+        match route_selection {
+            Ok(route_logical_id) => batch.plans.push(CandidateReleasePlan {
+                provider_id: response.provider.provider_id,
+                source_extension_id: response.provider.extension_id.clone(),
+                route_logical_id,
+                fingerprint,
+                selection: coverage.selection,
+                release_kind: coverage.release_kind,
+                resolver_kind: coverage.resolver_kind,
+                resolver_version: coverage.resolver_version,
+                confidence: coverage.confidence,
+                covered_target_ids: coverage.covered_target_ids,
+                covered_target_keys: coverage.covered_target_keys,
+                overfetch_count: coverage.overfetch_count,
+            }),
+            Err(block) => {
+                batch.capacity_block.get_or_insert(block);
+            }
+        }
+    }
+    batch
+        .plans
+        .sort_by(|left, right| compare_release_plans(right, left, subscription.route_policy));
+    Ok(batch)
+}
+
+fn scheduler_dispatch_evidence(
+    subscription: &AcquisitionSubscription,
+    group: &TargetSearchGroup,
+    plan: &CandidateReleasePlan,
+    capacity_snapshot: QueueCapacitySnapshot,
+) -> SchedulerDispatchEvidence {
+    let candidate = &plan.selection.candidate;
+    SchedulerDispatchEvidence {
+        scheduler_phase: "rr6c",
+        group_key: group.group_key.clone(),
+        search_intent: group.search_intent.clone(),
+        selected_plan_score: SchedulerPlanScoreEvidence {
+            confidence: plan.confidence.as_str().to_string(),
+            covered_target_count: plan.covered_target_ids.len(),
+            release_kind: plan.release_kind.as_str().to_string(),
+            resolver_kind: plan.resolver_kind.as_str().to_string(),
+            resolver_version: plan.resolver_version.clone(),
+            route_preference_score: route_preference_score(
+                &plan.route_logical_id,
+                subscription.route_policy,
+            ),
+            cached_debrid_score: cached_debrid_score(candidate.cached_debrid),
+            quality_score: quality_score(candidate.quality.as_deref()),
+            seeders: candidate.seeders,
+            overfetch_count: plan.overfetch_count,
+            source_rank: candidate.rank,
+            source_score: candidate.score,
+            score_tuple: release_plan_score_tuple(plan, subscription.route_policy),
+        },
+        capacity_snapshot,
+        route_decision: SchedulerRouteDecisionEvidence {
+            route_policy: subscription.route_policy.as_str().to_string(),
+            selected_route_logical_id: plan.route_logical_id.clone(),
+            default_route: candidate.default_route.clone(),
+            supported_routes: candidate.supported_routes.clone(),
+            reason: route_decision_reason(subscription.route_policy, &plan.route_logical_id),
+        },
+    }
+}
+
+fn route_decision_reason(route_policy: AcquisitionRoutePolicy, route_logical_id: &str) -> String {
+    match (route_policy, route_logical_id) {
+        (AcquisitionRoutePolicy::DebridFirst, DEBRID_DEFAULT_LOGICAL_ID) => {
+            "debrid-first policy selected available debrid route".to_string()
+        }
+        (AcquisitionRoutePolicy::DebridFirst, TORRENT_DEFAULT_LOGICAL_ID) => {
+            "debrid-first policy selected torrent fallback due to debrid capacity or availability"
+                .to_string()
+        }
+        (AcquisitionRoutePolicy::DebridOnly, _) => {
+            "debrid-only policy selected debrid route".to_string()
+        }
+        (AcquisitionRoutePolicy::TorrentOnly, _) => {
+            "torrent-only policy selected torrent route".to_string()
+        }
+        (AcquisitionRoutePolicy::Manual, _) => {
+            "manual route policy selected candidate/default route".to_string()
+        }
+        (_, _) => "route policy selected supported candidate route".to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct CandidateCoverageAnalysis {
+    selection: CandidateSelection,
+    release_kind: ReleaseKind,
+    resolver_kind: ReleaseResolverKind,
+    resolver_version: String,
+    confidence: ReleaseConfidence,
+    covered_target_ids: BTreeSet<Uuid>,
+    covered_target_keys: BTreeSet<String>,
+    overfetch_count: usize,
+}
+
+fn analyze_candidate_coverage(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    grouped_targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+) -> Option<CandidateCoverageAnalysis> {
+    let targets = if grouped_targets.is_empty() {
+        vec![representative.clone()]
+    } else {
+        grouped_targets.to_vec()
+    };
+    match subscription.media_type {
+        MediaType::Anime => {
+            analyze_anime_candidate_coverage(subscription, representative, &targets, candidate)
+        }
+        MediaType::Series => analyze_tv_candidate_coverage(candidate, &targets),
+        MediaType::Movie => Some(analyze_movie_candidate_coverage(candidate, representative)),
+    }
+}
+
+fn analyze_anime_candidate_coverage(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+) -> Option<CandidateCoverageAnalysis> {
+    let context = anime_candidate_scoring_context(subscription, representative, targets)?;
+    let input = anime_candidate_input(candidate);
+    let plan = plan_anime_file_coverage(&context, &input, &anime_release_file_inputs(candidate));
+    if !plan.rejection_reasons.is_empty()
+        || plan.confidence == ReleaseConfidence::ReviewRequired
+        || plan.entries.is_empty()
+    {
+        return None;
+    }
+    let score = score_anime_candidate(&context, &input);
+    let target_by_key = targets
+        .iter()
+        .map(|target| (target.target_key.clone(), target))
+        .collect::<HashMap<_, _>>();
+    let mut covered_target_ids = BTreeSet::new();
+    let mut covered_target_keys = BTreeSet::new();
+    for entry in &plan.entries {
+        if let Some(target) = target_by_key.get(&entry.target_key) {
+            covered_target_ids.insert(target.target_id);
+            covered_target_keys.insert(target.target_key.clone());
+        }
+    }
+    let selected_files = plan.selected_file_keys.len();
+    Some(CandidateCoverageAnalysis {
+        selection: anime_scored_candidate(candidate, score, Some(plan.clone())),
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+        covered_target_ids,
+        covered_target_keys,
+        overfetch_count: candidate_media_file_count(&candidate).saturating_sub(selected_files),
+    })
+}
+
+fn analyze_tv_candidate_coverage(
+    candidate: &AcquisitionCandidate,
+    targets: &[AcquisitionTarget],
+) -> Option<CandidateCoverageAnalysis> {
+    let tv_targets = tv_targets_for_acquisition_targets(targets);
+    if tv_targets.is_empty() {
+        return None;
+    }
+    let resolver = TvSonarrStyleResolver;
+    let parsed = resolver.parse_title(&candidate.title);
+    let files = tv_release_file_inputs(candidate);
+    let plan = resolver.plan_coverage(
+        &parsed,
+        &tv_targets,
+        &files,
+        TvCoverageOptions {
+            allow_partial_pack: false,
+            file_selection_supported: candidate_file_selection_supported(candidate),
+        },
+    );
+    if plan.confidence == ReleaseConfidence::ReviewRequired || plan.entries.is_empty() {
+        return None;
+    }
+    let mut candidate = candidate.clone();
+    candidate.score_badges.push(CandidateScoreBadge {
+        label: "TV match".to_string(),
+        detail: Some(format!(
+            "{} coverage entries via {}",
+            plan.entries.len(),
+            TV_SONARR_STYLE_RESOLVER_VERSION
+        )),
+        score: Some(plan.entries.len() as f64),
+    });
+    let covered_target_ids = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_id)
+        .collect::<BTreeSet<_>>();
+    let covered_target_keys = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.clone())
+        .collect::<BTreeSet<_>>();
+    let selected_files = plan
+        .entries
+        .iter()
+        .filter_map(|entry| entry.release_file_id.as_ref())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let overfetch_count = candidate_media_file_count(&candidate).saturating_sub(selected_files);
+    Some(CandidateCoverageAnalysis {
+        selection: CandidateSelection {
+            candidate,
+            anime_coverage_plan: None,
+            tv_coverage_plan: Some(plan.clone()),
+        },
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+        covered_target_ids,
+        covered_target_keys,
+        overfetch_count,
+    })
+}
+
+fn analyze_movie_candidate_coverage(
+    candidate: &AcquisitionCandidate,
+    target: &AcquisitionTarget,
+) -> CandidateCoverageAnalysis {
+    CandidateCoverageAnalysis {
+        selection: CandidateSelection {
+            candidate: candidate.clone(),
+            anime_coverage_plan: None,
+            tv_coverage_plan: None,
+        },
+        release_kind: ReleaseKind::Single,
+        resolver_kind: ReleaseResolverKind::MovieSingle,
+        resolver_version: "rr6-movie-single-v0".to_string(),
+        confidence: ReleaseConfidence::High,
+        covered_target_ids: BTreeSet::from([target.target_id]),
+        covered_target_keys: BTreeSet::from([target.target_key.clone()]),
+        overfetch_count: 0,
+    }
+}
+
+async fn release_fingerprint_already_claimed(
+    pool: &sqlx::AnyPool,
+    source_extension_id: &str,
+    fingerprint: &str,
+) -> Result<bool> {
+    let Some(release) = get_release_by_fingerprint(
+        pool,
+        DEFAULT_ROUTE_OWNER_ID,
+        source_extension_id,
+        fingerprint,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    Ok(release_suppresses_automatic_rediscovery(&release)
+        || !matches!(
+            release.state,
+            AcquisitionReleaseState::Failed | AcquisitionReleaseState::Cancelled
+        ))
+}
+
+fn release_suppresses_automatic_rediscovery(
+    release: &crate::acquisition::release_resolution::models::AcquisitionRelease,
+) -> bool {
+    release.coverage_plan.as_ref().is_some_and(|plan| {
+        json_status(plan, &["retrySuppression", "status"]) == Some("rejected")
+            || json_status(plan, &["manualReview", "status"]) == Some("rejected")
+            || json_bool(plan, &["retrySuppression", "suppressAutomaticRediscovery"]) == Some(true)
+    })
+}
+
+fn json_status<'a>(value: &'a JsonValue, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn json_bool(value: &JsonValue, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_bool()
+}
+
+async fn select_candidate_route_for_plan(
+    pool: &sqlx::AnyPool,
+    subscription: &AcquisitionSubscription,
+    candidate: &AcquisitionCandidate,
+    route_options: &[CandidateRouteOption],
+    governor: &mut QueueGovernor,
+) -> Result<std::result::Result<String, QueueCapacityBlock>> {
+    let mut first_capacity_block = None;
+    for route in route_preference_order(
+        subscription.route_policy,
+        candidate.default_route.as_deref(),
+    ) {
+        if !candidate_supports_route(candidate, route)
+            || !route_option_available(route_options, route)
+        {
+            continue;
+        }
+        governor
+            .hydrate_subscription_route(pool, subscription.subscription_id, route)
+            .await?;
+        if let Some(block) = governor.route_capacity_block(subscription.subscription_id, route) {
+            first_capacity_block.get_or_insert(block);
+            continue;
+        }
+        return Ok(Ok(route.to_string()));
+    }
+    if let Some(block) = first_capacity_block {
+        return Ok(Err(block));
+    }
+    bail!(
+        "candidate has no available route for policy '{}'",
+        subscription.route_policy.as_str()
+    )
+}
+
+fn select_bounded_release_plans(
+    plans: Vec<CandidateReleasePlan>,
+    route_policy: AcquisitionRoutePolicy,
+    targets: &[AcquisitionTarget],
+    limit: usize,
+) -> Vec<CandidateReleasePlan> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let wanted_target_ids = targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    let mut sorted = plans;
+    sorted.sort_by(|left, right| compare_release_plans(right, left, route_policy));
+    let mut selected = Vec::new();
+    let mut covered = BTreeSet::new();
+    for plan in sorted {
+        if selected.len() >= limit {
+            break;
+        }
+        if !wanted_target_ids.is_empty()
+            && plan
+                .covered_target_ids
+                .iter()
+                .all(|target_id| !wanted_target_ids.contains(target_id))
+        {
+            continue;
+        }
+        if plan
+            .covered_target_ids
+            .iter()
+            .all(|target_id| covered.contains(target_id))
+        {
+            continue;
+        }
+        covered.extend(plan.covered_target_ids.iter().copied());
+        selected.push(plan);
+        if !wanted_target_ids.is_empty() && wanted_target_ids.iter().all(|id| covered.contains(id))
+        {
+            break;
+        }
+    }
+    selected
+}
+
+fn compare_release_plans(
+    left: &CandidateReleasePlan,
+    right: &CandidateReleasePlan,
+    route_policy: AcquisitionRoutePolicy,
+) -> Ordering {
+    release_plan_score_tuple(left, route_policy)
+        .cmp(&release_plan_score_tuple(right, route_policy))
+        .then_with(|| right.fingerprint.cmp(&left.fingerprint))
+}
+
+fn release_plan_score_tuple(
+    plan: &CandidateReleasePlan,
+    route_policy: AcquisitionRoutePolicy,
+) -> (i32, usize, i32, i32, i32, i32, i64, i32, i32, i32) {
+    let candidate = &plan.selection.candidate;
+    (
+        confidence_rank(plan.confidence),
+        plan.covered_target_ids.len(),
+        route_preference_score(&plan.route_logical_id, route_policy),
+        cached_debrid_score(candidate.cached_debrid),
+        quality_score(candidate.quality.as_deref()),
+        release_kind_rank(plan.release_kind),
+        candidate.seeders.unwrap_or_default() as i64,
+        -(plan.overfetch_count as i32),
+        (candidate.score.unwrap_or(0.0) * 1000.0).round() as i32,
+        source_rank_score(candidate.rank),
+    )
+}
+
+fn confidence_rank(confidence: ReleaseConfidence) -> i32 {
+    match confidence {
+        ReleaseConfidence::High => 4,
+        ReleaseConfidence::Medium => 3,
+        ReleaseConfidence::Low => 1,
+        ReleaseConfidence::ReviewRequired => 0,
+    }
+}
+
+fn release_kind_rank(kind: ReleaseKind) -> i32 {
+    match kind {
+        ReleaseKind::SeriesPack => 5,
+        ReleaseKind::MultiSeasonPack => 4,
+        ReleaseKind::SeasonPack => 3,
+        ReleaseKind::MultiEpisode => 2,
+        ReleaseKind::Single => 1,
+        ReleaseKind::Unknown => 0,
+    }
+}
+
+fn route_preference_score(route: &str, route_policy: AcquisitionRoutePolicy) -> i32 {
+    match route_policy {
+        AcquisitionRoutePolicy::DebridFirst => {
+            if route == DEBRID_DEFAULT_LOGICAL_ID {
+                2
+            } else if route == TORRENT_DEFAULT_LOGICAL_ID {
+                1
+            } else {
+                0
+            }
+        }
+        AcquisitionRoutePolicy::DebridOnly => (route == DEBRID_DEFAULT_LOGICAL_ID) as i32,
+        AcquisitionRoutePolicy::TorrentOnly => (route == TORRENT_DEFAULT_LOGICAL_ID) as i32,
+        AcquisitionRoutePolicy::Manual => 1,
+    }
+}
+
+fn cached_debrid_score(value: Option<bool>) -> i32 {
+    match value {
+        Some(true) => 2,
+        None => 1,
+        Some(false) => 0,
+    }
+}
+
+fn source_rank_score(rank: Option<u32>) -> i32 {
+    rank.map(|rank| 10_000 - rank as i32).unwrap_or_default()
+}
+
+impl TargetSearchGroupKey {
+    fn as_stable_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            self.subscription_id,
+            self.media_type,
+            self.route_policy,
+            self.grouping_kind,
+            self.season_number
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.air_date.as_deref().unwrap_or("-"),
+            self.target_key.as_deref().unwrap_or("-")
+        )
+    }
+}
+
+fn target_search_group_key(
     subscription: &AcquisitionSubscription,
     target: &AcquisitionTarget,
     now: DateTime<Utc>,
-) -> AnimeTargetGroupKey {
-    AnimeTargetGroupKey {
+) -> TargetSearchGroupKey {
+    let retry_bucket = retry_bucket_for_target(subscription, target, now);
+    let target_key = target.target_key.clone();
+    let (grouping_kind, season_number, air_date, target_key) = match subscription.media_type {
+        MediaType::Movie => ("movie", None, None, Some(target_key)),
+        MediaType::Series | MediaType::Anime
+            if target.air_date.is_some()
+                && (target.season_number.is_none()
+                    || target.target_key.to_ascii_uppercase().starts_with("DATE:")) =>
+        {
+            ("daily", None, target.air_date.clone(), None)
+        }
+        MediaType::Series | MediaType::Anime if target.season_number.is_some() => {
+            ("season", target.season_number, None, None)
+        }
+        MediaType::Anime if target.absolute_episode_number.is_some() => {
+            ("absolute", None, None, None)
+        }
+        _ => ("target", None, None, Some(target_key)),
+    };
+    TargetSearchGroupKey {
         subscription_id: target.subscription_id,
-        season_number: target.season_number,
-        retry_bucket: retry_bucket_for_target(subscription, target, now),
+        media_type: media_type_key(subscription.media_type),
+        route_policy: subscription.route_policy.as_str(),
+        grouping_kind,
+        season_number,
+        air_date,
+        target_key,
+        retry_bucket,
+    }
+}
+
+fn media_type_key(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Movie => "movie",
+        MediaType::Series => "series",
+        MediaType::Anime => "anime",
+    }
+}
+
+fn route_preference_order(
+    route_policy: AcquisitionRoutePolicy,
+    default_route: Option<&str>,
+) -> Vec<&'static str> {
+    match route_policy {
+        AcquisitionRoutePolicy::DebridFirst => {
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID]
+        }
+        AcquisitionRoutePolicy::DebridOnly => vec![DEBRID_DEFAULT_LOGICAL_ID],
+        AcquisitionRoutePolicy::TorrentOnly => vec![TORRENT_DEFAULT_LOGICAL_ID],
+        AcquisitionRoutePolicy::Manual => {
+            match default_route.and_then(|route| match route {
+                DEBRID_DEFAULT_LOGICAL_ID => Some(DEBRID_DEFAULT_LOGICAL_ID),
+                TORRENT_DEFAULT_LOGICAL_ID => Some(TORRENT_DEFAULT_LOGICAL_ID),
+                _ => None,
+            }) {
+                Some(route) => vec![route],
+                None => vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            }
+        }
     }
 }
 
@@ -714,6 +1758,49 @@ fn compare_search_groups(left: &TargetSearchGroup, right: &TargetSearchGroup) ->
                 .target_key
                 .cmp(&right.representative.target_key)
         })
+        .then_with(|| left.group_key.cmp(&right.group_key))
+}
+
+fn fair_order_search_groups(groups: Vec<TargetSearchGroup>) -> Vec<TargetSearchGroup> {
+    let mut by_subscription = HashMap::<Uuid, Vec<TargetSearchGroup>>::new();
+    for group in groups {
+        by_subscription
+            .entry(group.representative.subscription_id)
+            .or_default()
+            .push(group);
+    }
+    let mut lanes = by_subscription.into_iter().collect::<Vec<_>>();
+    for (_, lane) in &mut lanes {
+        lane.sort_by(compare_search_groups);
+    }
+    lanes.sort_by(|(left_id, left_lane), (right_id, right_lane)| {
+        let left = left_lane.first();
+        let right = right_lane.first();
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                compare_search_groups(left, right).then_with(|| left_id.cmp(right_id))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => left_id.cmp(right_id),
+        }
+    });
+
+    let mut ordered = Vec::new();
+    loop {
+        let mut emitted = false;
+        for (_, lane) in &mut lanes {
+            if lane.is_empty() {
+                continue;
+            }
+            ordered.push(lane.remove(0));
+            emitted = true;
+        }
+        if !emitted {
+            break;
+        }
+    }
+    ordered
 }
 
 fn search_intent_for_targets(
@@ -762,7 +1849,22 @@ fn search_intent_for_targets(
 
 fn search_intent_kind(targets: &[AcquisitionTarget], season_number: Option<i32>) -> &'static str {
     if targets.len() <= 1 {
-        return "episode";
+        return if targets
+            .first()
+            .and_then(|target| target.air_date.as_ref())
+            .is_some()
+        {
+            "daily"
+        } else {
+            "episode"
+        };
+    }
+    let air_dates = targets
+        .iter()
+        .filter_map(|target| target.air_date.as_deref())
+        .collect::<BTreeSet<_>>();
+    if air_dates.len() == 1 {
+        return "daily";
     }
     if season_number.is_some() && targets.len() >= PACK_BACKFILL_TARGET_THRESHOLD {
         return "season_pack";
@@ -849,14 +1951,36 @@ async fn defer_group_for_queue_capacity(
 }
 
 fn queue_capacity_reason(block: &QueueCapacityBlock) -> String {
-    format!(
-        "Queue capacity reached for {}: global {}/{}, subscription {}/{}.",
-        block.route_logical_id,
-        block.global_active,
-        block.global_limit,
-        block.subscription_active,
-        block.subscription_limit
-    )
+    match block.kind {
+        QueueCapacityLimitKind::Global => format!(
+            "Queue capacity reached: global active jobs {}/{}.",
+            block.global_active, block.global_limit
+        ),
+        QueueCapacityLimitKind::Subscription => format!(
+            "Queue capacity reached: subscription active jobs {}/{}.",
+            block.subscription_active, block.subscription_limit
+        ),
+        QueueCapacityLimitKind::Route => format!(
+            "Queue capacity reached for {}: route active jobs {}/{}.",
+            block.route_logical_id.as_deref().unwrap_or("route"),
+            block.global_active,
+            block.global_limit
+        ),
+        QueueCapacityLimitKind::SubscriptionRoute => format!(
+            "Queue capacity reached for {}: subscription route active jobs {}/{}.",
+            block.route_logical_id.as_deref().unwrap_or("route"),
+            block.subscription_active,
+            block.subscription_limit
+        ),
+        QueueCapacityLimitKind::SearchTick => format!(
+            "Queue capacity reached: candidate searches this tick {}/{}.",
+            block.tick_active, block.tick_limit
+        ),
+        QueueCapacityLimitKind::SubmissionTick => format!(
+            "Queue capacity reached: submissions this tick {}/{}.",
+            block.tick_active, block.tick_limit
+        ),
+    }
 }
 
 async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()> {
@@ -884,7 +2008,10 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
         let Some(status) = get_debrid_job_status(&state.db_pool, job_id).await? else {
             continue;
         };
-        if !debrid_status_failed(&status.status) {
+        if !status.is_failed() {
+            continue;
+        }
+        if status.source_kind != "magnet" {
             continue;
         }
         let Some(subscription) = subscriptions.get(&target.subscription_id) else {
@@ -905,8 +2032,14 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                 AcquisitionTargetStateUpdate {
                     state: AcquisitionTargetState::Blocked,
                     state_reason: Some(format!(
-                        "Real-Debrid failed and the selected candidate has no torrent fallback: {}",
-                        status.last_error.unwrap_or_else(|| status.status.clone())
+                        "Debrid failed and the selected candidate has no torrent fallback: {}",
+                        status
+                            .selection_error
+                            .clone()
+                            .or(status.last_error.clone())
+                            .or(status.remote_status.clone())
+                            .or(status.failure_class.clone())
+                            .unwrap_or_else(|| status.status.clone())
                     )),
                     next_search_after: Some(
                         Utc::now()
@@ -932,6 +2065,8 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
             source_extension_id,
             candidate,
             anime_coverage_plan: None,
+            tv_coverage_plan: None,
+            dispatch: None,
         };
         match submit_selected_candidate(
             state,
@@ -946,7 +2081,10 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
             Ok(CandidateSubmitOutcome::Submitted) => info!(
                 target_id = %target.target_id,
                 debrid_job_id = %status.job_id,
-                "submitted torrent fallback after Real-Debrid failure"
+                debrid_release_id = ?status.release_id,
+                remote_status = status.remote_status.as_deref().unwrap_or("unknown"),
+                failure_class = status.failure_class.as_deref().unwrap_or("unknown"),
+                "submitted torrent fallback after debrid failure"
             ),
             Ok(CandidateSubmitOutcome::CapacityBlocked(block)) => {
                 let next_after = Utc::now()
@@ -972,7 +2110,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                     AcquisitionTargetStateUpdate {
                         state: AcquisitionTargetState::Blocked,
                         state_reason: Some(format!(
-                            "Real-Debrid failed and torrent fallback is blocked: {err}"
+                            "Debrid failed and torrent fallback is blocked: {err}"
                         )),
                         next_search_after: Some(next_after),
                         ..Default::default()
@@ -998,10 +2136,10 @@ async fn submit_selected_candidate(
         subscription.route_policy,
         &submission.candidate,
     )?;
-    if submission.anime_coverage_plan.is_some()
-        && let Some(download_id) = existing_anime_release_download_id(state, &submission).await?
+    if submission.has_release_coverage_plan()
+        && let Some(download_id) = existing_release_download_id(state, &submission).await?
     {
-        persist_anime_release_submission(
+        persist_release_submission(
             state,
             subscription,
             target,
@@ -1013,7 +2151,7 @@ async fn submit_selected_candidate(
         .await?;
         return Ok(CandidateSubmitOutcome::Submitted);
     }
-    let governed_submission = submission.anime_coverage_plan.is_some() || route_override.is_some();
+    let governed_submission = governor.is_some();
     let mut reserved_route = None::<String>;
     if governed_submission && let Some(governor) = governor.as_deref_mut() {
         match governor
@@ -1028,15 +2166,17 @@ async fn submit_selected_candidate(
             Err(block) => return Ok(CandidateSubmitOutcome::CapacityBlocked(block)),
         }
     }
-    match submit_candidate_to_route(state, target, &submission, &route_logical_id).await {
+    match submit_candidate_to_route(state, subscription, target, &submission, &route_logical_id)
+        .await
+    {
         Ok(download_id) => {
             let reason = if route_override == Some(TORRENT_DEFAULT_LOGICAL_ID) {
                 "Submitted through torrent fallback."
             } else {
                 "Submitted through acquisition route."
             };
-            if submission.anime_coverage_plan.is_some() {
-                persist_anime_release_submission(
+            if submission.has_release_coverage_plan() {
+                persist_release_submission(
                     state,
                     subscription,
                     target,
@@ -1088,6 +2228,7 @@ async fn submit_selected_candidate(
             );
             let torrent_download_id = match submit_candidate_to_route(
                 state,
+                subscription,
                 target,
                 &submission,
                 TORRENT_DEFAULT_LOGICAL_ID,
@@ -1108,7 +2249,7 @@ async fn submit_selected_candidate(
                         AcquisitionTargetStateUpdate {
                             state: AcquisitionTargetState::Blocked,
                             state_reason: Some(format!(
-                                "Real-Debrid route failed: {err}; torrent fallback failed: {fallback_err}"
+                                "Debrid route failed: {err}; torrent fallback failed: {fallback_err}"
                             )),
                             selected_provider_id: Some(submission.provider_id),
                             selected_route_logical_id: Some(
@@ -1124,15 +2265,15 @@ async fn submit_selected_candidate(
                     return Ok(CandidateSubmitOutcome::Submitted);
                 }
             };
-            if submission.anime_coverage_plan.is_some() {
-                persist_anime_release_submission(
+            if submission.has_release_coverage_plan() {
+                persist_release_submission(
                     state,
                     subscription,
                     target,
                     &submission,
                     TORRENT_DEFAULT_LOGICAL_ID,
                     torrent_download_id,
-                    "Real-Debrid rejected the candidate; submitted torrent fallback.",
+                    "Debrid rejected the candidate; submitted torrent fallback.",
                 )
                 .await?;
             } else {
@@ -1142,7 +2283,7 @@ async fn submit_selected_candidate(
                     &submission,
                     TORRENT_DEFAULT_LOGICAL_ID,
                     torrent_download_id,
-                    "Real-Debrid rejected the candidate; submitted torrent fallback.",
+                    "Debrid rejected the candidate; submitted torrent fallback.",
                 )
                 .await?;
             }
@@ -1177,6 +2318,7 @@ async fn submit_selected_candidate(
 
 async fn submit_candidate_to_route(
     state: &AppState,
+    subscription: &AcquisitionSubscription,
     target: &AcquisitionTarget,
     submission: &CandidateSubmission,
     route_logical_id: &str,
@@ -1189,6 +2331,12 @@ async fn submit_candidate_to_route(
         name: Some(download_display_name(target, &submission.candidate)),
         priority: None,
         add_to_top: None,
+        subscription_id: Some(subscription.subscription_id),
+        source_provider_id: Some(submission.provider_id),
+        source_extension_id: Some(submission.source_extension_id.clone()),
+        media_type: Some(subscription.media_type),
+        media_title: Some(subscription.title.clone()),
+        selected_candidate: Some(submission.candidate.clone()),
     };
     let response = submit_to_broker(
         state,
@@ -1212,6 +2360,12 @@ async fn mark_target_submitted(
     download_id: Option<String>,
     reason: &str,
 ) -> Result<()> {
+    let selected_candidate = selected_candidate_provenance_with_submission(
+        submission,
+        route_logical_id,
+        &download_id,
+        reason,
+    )?;
     update_target_state(
         &state.db_pool,
         target.target_id,
@@ -1220,7 +2374,7 @@ async fn mark_target_submitted(
             state_reason: Some(format!("{reason} {route_logical_id}")),
             selected_provider_id: Some(submission.provider_id),
             selected_route_logical_id: Some(route_logical_id.to_string()),
-            selected_candidate: Some(selected_candidate_provenance(submission)?),
+            selected_candidate: Some(selected_candidate),
             download_id,
             next_search_after: None,
             increment_search_attempts: true,
@@ -1231,7 +2385,7 @@ async fn mark_target_submitted(
     Ok(())
 }
 
-async fn existing_anime_release_download_id(
+async fn existing_release_download_id(
     state: &AppState,
     submission: &CandidateSubmission,
 ) -> Result<Option<String>> {
@@ -1256,6 +2410,50 @@ async fn existing_anime_release_download_id(
     Ok(release.download_id)
 }
 
+async fn persist_release_submission(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    download_id: Option<String>,
+    reason: &str,
+) -> Result<()> {
+    if submission.anime_coverage_plan.is_some() {
+        persist_anime_release_submission(
+            state,
+            subscription,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            reason,
+        )
+        .await
+    } else if submission.tv_coverage_plan.is_some() {
+        persist_tv_release_submission(
+            state,
+            subscription,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            reason,
+        )
+        .await
+    } else {
+        mark_target_submitted(
+            state,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            reason,
+        )
+        .await
+    }
+}
+
 async fn persist_anime_release_submission(
     state: &AppState,
     subscription: &AcquisitionSubscription,
@@ -1266,7 +2464,7 @@ async fn persist_anime_release_submission(
     reason: &str,
 ) -> Result<()> {
     let Some(plan) = submission.anime_coverage_plan.as_ref() else {
-        mark_target_submitted(
+        return mark_target_submitted(
             state,
             target,
             submission,
@@ -1274,12 +2472,16 @@ async fn persist_anime_release_submission(
             download_id,
             reason,
         )
-        .await?;
-        return Ok(());
+        .await;
     };
     let fingerprint =
         candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
-    let selected_candidate = selected_candidate_provenance(submission)?;
+    let selected_candidate = selected_candidate_provenance_with_submission(
+        submission,
+        route_logical_id,
+        &download_id,
+        reason,
+    )?;
     let release = upsert_release(
         &state.db_pool,
         NewAcquisitionRelease {
@@ -1345,10 +2547,12 @@ async fn persist_anime_release_submission(
                 release_id: release.release_id,
                 file_index: file.file_index,
                 file_id: file.file_id.clone(),
+                provider_file_id: file.file_id.clone(),
                 path: file.path.clone(),
                 basename: None,
                 size_bytes: file.size_bytes,
                 selectable: file.selectable,
+                selected: None,
                 parsed_title: parsed.series_title.clone(),
                 parsed_season_number: parsed.season_number,
                 parsed_episode_number: parsed.episode_start_number,
@@ -1369,6 +2573,11 @@ async fn persist_anime_release_submission(
                 raw: Some(json!({
                     "fileKey": file.file_key.clone(),
                     "parsed": parsed,
+                })),
+                provider_metadata: Some(json!({
+                    "fileKey": file.file_key.clone(),
+                    "fileId": file.file_id.clone(),
+                    "selectable": file.selectable,
                 })),
             },
         )
@@ -1460,6 +2669,199 @@ async fn persist_anime_release_submission(
         release_id = %release.release_id,
         coverage = coverages.len(),
         "persisted RR-3F anime release coverage"
+    );
+    Ok(())
+}
+
+async fn persist_tv_release_submission(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    download_id: Option<String>,
+    reason: &str,
+) -> Result<()> {
+    let Some(plan) = submission.tv_coverage_plan.as_ref() else {
+        return mark_target_submitted(
+            state,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            reason,
+        )
+        .await;
+    };
+    let fingerprint =
+        candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+    let selected_candidate = selected_candidate_provenance_with_submission(
+        submission,
+        route_logical_id,
+        &download_id,
+        reason,
+    )?;
+    let release = upsert_release(
+        &state.db_pool,
+        NewAcquisitionRelease {
+            release_id: None,
+            subscription_id: Some(subscription.subscription_id),
+            source_provider_id: Some(submission.provider_id),
+            source_extension_id: submission.source_extension_id.clone(),
+            owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+            media_type: target.media_type,
+            title: subscription.title.clone(),
+            release_title: submission.candidate.title.clone(),
+            source: submission.candidate.source.clone(),
+            source_kind: submission.candidate.source_kind.clone(),
+            info_hash: submission.candidate.info_hash.clone(),
+            fingerprint,
+            release_kind: plan.release_kind,
+            resolver_kind: plan.resolver_kind,
+            resolver_version: plan.resolver_version.clone(),
+            confidence: plan.confidence,
+            score: submission.candidate.score,
+            selected_route_logical_id: Some(route_logical_id.to_string()),
+            selected_provider_id: Some(submission.provider_id),
+            download_id: download_id.clone(),
+            remote_release_id: None,
+            state: AcquisitionReleaseState::Submitted,
+            state_reason: Some(format!(
+                "{reason} TV coverage entries: {}",
+                plan.entries.len()
+            )),
+            selected_candidate: Some(selected_candidate.clone()),
+            coverage_plan: Some(serde_json::to_value(plan)?),
+        },
+    )
+    .await?;
+
+    let mut file_ids_by_key = HashMap::new();
+    for file in tv_release_file_inputs(&submission.candidate) {
+        let parsed = TvSonarrStyleResolver.parse_file(&file.path);
+        let release_file = upsert_release_file(
+            &state.db_pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id: release.release_id,
+                file_index: None,
+                file_id: Some(file.file_id.clone()),
+                provider_file_id: Some(file.file_id.clone()),
+                path: file.path.clone(),
+                basename: None,
+                size_bytes: file.size_bytes,
+                selectable: file.selectable,
+                selected: plan
+                    .entries
+                    .iter()
+                    .any(|entry| entry.release_file_id.as_deref() == Some(file.file_id.as_str()))
+                    .then_some(true),
+                parsed_title: parsed.normalized_series_title.clone(),
+                parsed_season_number: parsed.season_number,
+                parsed_episode_number: parsed.episode_numbers.first().copied(),
+                parsed_episode_end_number: parsed.episode_numbers.last().copied(),
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: parsed.air_date.clone(),
+                parsed_quality: parsed.quality.resolution.map(|value| format!("{value:?}")),
+                parsed_language: parsed.modifiers.languages.first().cloned(),
+                parsed_release_group: parsed.release_group.clone(),
+                parser_confidence: ReleaseConfidence::High,
+                parser_reason: None,
+                raw: Some(serde_json::to_value(&parsed)?),
+                provider_metadata: Some(json!({
+                    "fileId": file.file_id,
+                    "selectable": file.selectable,
+                })),
+            },
+        )
+        .await?;
+        file_ids_by_key.insert(file.file_id, release_file.release_file_id);
+    }
+
+    let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+    let targets_by_id = targets
+        .into_iter()
+        .map(|target| (target.target_id, target))
+        .collect::<HashMap<_, _>>();
+    let mut submitted_target_ids = BTreeSet::new();
+    for entry in &plan.entries {
+        let Some(covered_target) = targets_by_id.get(&entry.target_id) else {
+            continue;
+        };
+        let release_file_id = entry
+            .release_file_id
+            .as_ref()
+            .and_then(|key| file_ids_by_key.get(key))
+            .copied();
+        upsert_release_coverage(
+            &state.db_pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id,
+                target_id: covered_target.target_id,
+                coverage_kind: entry.coverage_kind,
+                confidence: plan.confidence,
+                score: submission.candidate.score,
+                reason: Some(format!("TV Sonarr-style {}", entry.target_key)),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("rr2_tv_sonarr_style".to_string()),
+            },
+        )
+        .await?;
+        submitted_target_ids.insert(covered_target.target_id);
+        update_target_state(
+            &state.db_pool,
+            covered_target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some(format!("{reason} {route_logical_id}")),
+                selected_provider_id: Some(submission.provider_id),
+                selected_route_logical_id: Some(route_logical_id.to_string()),
+                selected_candidate: Some(selected_candidate.clone()),
+                download_id: download_id.clone(),
+                next_search_after: None,
+                increment_search_attempts: covered_target.target_id == target.target_id,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+
+    if submitted_target_ids.is_empty() {
+        mark_target_submitted(
+            state,
+            target,
+            submission,
+            route_logical_id,
+            download_id.clone(),
+            reason,
+        )
+        .await?;
+    }
+
+    upsert_release_job(
+        &state.db_pool,
+        NewAcquisitionReleaseJob {
+            release_job_id: None,
+            release_id: release.release_id,
+            route_logical_id: route_logical_id.to_string(),
+            provider_id: Some(submission.provider_id),
+            download_id,
+            remote_release_id: None,
+            state: ReleaseJobState::Submitted,
+            state_reason: Some(reason.to_string()),
+            active: true,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+        },
+    )
+    .await?;
+    debug!(
+        release_id = %release.release_id,
+        coverage = plan.entries.len(),
+        "persisted RR-6B TV release coverage"
     );
     Ok(())
 }
@@ -1897,6 +3299,7 @@ fn select_best_candidate(
     )
 }
 
+#[cfg(test)]
 fn select_best_candidate_with_preference(
     candidates: &[AcquisitionCandidate],
     route_policy: AcquisitionRoutePolicy,
@@ -1927,6 +3330,7 @@ fn select_best_candidate_with_preference(
             None => CandidateSelection {
                 candidate: candidate.clone(),
                 anime_coverage_plan: None,
+                tv_coverage_plan: None,
             },
         };
         let replace = best
@@ -1943,6 +3347,7 @@ fn select_best_candidate_with_preference(
     best
 }
 
+#[cfg(test)]
 fn compare_candidate_selections(
     left: &CandidateSelection,
     right: &CandidateSelection,
@@ -1962,6 +3367,7 @@ fn compare_candidate_selections(
     compare_candidates(&left.candidate, &right.candidate, route_policy)
 }
 
+#[cfg(test)]
 fn anime_release_plan_rank(plan: Option<&AnimeFileCoveragePlan>) -> i32 {
     let Some(plan) = plan else {
         return 0;
@@ -1976,6 +3382,7 @@ fn anime_release_plan_rank(plan: Option<&AnimeFileCoveragePlan>) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn anime_release_plan_coverage(plan: Option<&AnimeFileCoveragePlan>) -> usize {
     plan.map(|plan| plan.entries.len()).unwrap_or_default()
 }
@@ -2036,6 +3443,7 @@ fn anime_scored_candidate(
     CandidateSelection {
         candidate,
         anime_coverage_plan,
+        tv_coverage_plan: None,
     }
 }
 
@@ -2053,6 +3461,7 @@ fn anime_match_detail(match_score: &AnimeCandidateScore) -> String {
     format!("{alias}; {target}; {:?}", match_score.confidence)
 }
 
+#[cfg(test)]
 fn compare_candidates(
     left: &AcquisitionCandidate,
     right: &AcquisitionCandidate,
@@ -2061,6 +3470,7 @@ fn compare_candidates(
     candidate_score_tuple(left, route_policy).cmp(&candidate_score_tuple(right, route_policy))
 }
 
+#[cfg(test)]
 fn candidate_score_tuple(
     candidate: &AcquisitionCandidate,
     route_policy: AcquisitionRoutePolicy,
@@ -2183,6 +3593,127 @@ fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bo
     }
 }
 
+fn route_option_available(route_options: &[CandidateRouteOption], route: &str) -> bool {
+    route_options
+        .iter()
+        .find(|option| option.logical_id == route)
+        .map(|option| option.available && option.blocker.is_none())
+        .unwrap_or(true)
+}
+
+fn candidate_allowed_by_subscription_preferences(
+    candidate: &AcquisitionCandidate,
+    subscription: &AcquisitionSubscription,
+) -> bool {
+    let profile = subscription.quality_profile.as_ref();
+    if let Some(max_size) = json_u64(profile, &["maxSizeBytes", "max_size_bytes"]) {
+        if candidate
+            .size_bytes
+            .is_some_and(|size_bytes| size_bytes > max_size)
+        {
+            return false;
+        }
+    }
+    let allowed_qualities = json_string_array(profile, &["allowedQualities", "qualities"]);
+    if !allowed_qualities.is_empty()
+        && !quality_matches_any(candidate.quality.as_deref(), &allowed_qualities)
+    {
+        return false;
+    }
+    let required_languages = json_string_array(profile, &["requiredLanguages", "languages"]);
+    if !required_languages.is_empty()
+        && !language_matches_any(candidate.language.as_deref(), &required_languages)
+    {
+        return false;
+    }
+    true
+}
+
+fn quality_matches_any(value: Option<&str>, allowed: &[String]) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let lower = value.to_ascii_lowercase();
+    allowed
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .any(|item| lower.contains(&item))
+}
+
+fn language_matches_any(value: Option<&str>, required: &[String]) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let lower = value.to_ascii_lowercase();
+    required
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .any(|item| lower.contains(&item))
+}
+
+fn tv_targets_for_acquisition_targets(targets: &[AcquisitionTarget]) -> Vec<TvTarget> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            if target.media_type != MediaType::Series {
+                return None;
+            }
+            Some(TvTarget {
+                target_id: target.target_id,
+                target_key: target.target_key.clone(),
+                season_number: target.season_number.unwrap_or_default(),
+                episode_number: target.episode_number.unwrap_or_default(),
+                air_date: target.air_date.clone(),
+            })
+        })
+        .collect()
+}
+
+fn tv_release_file_inputs(candidate: &AcquisitionCandidate) -> Vec<TvReleaseFileInput> {
+    candidate
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let fallback_id = file
+                .file_index
+                .or_else(|| i64::try_from(index).ok().map(|value| value + 1))
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| file.path.clone());
+            TvReleaseFileInput {
+                file_id: file.file_id.clone().unwrap_or(fallback_id),
+                path: file.path.clone(),
+                size_bytes: file.size_bytes.and_then(|value| i64::try_from(value).ok()),
+                selectable: file.selectable.unwrap_or(true),
+            }
+        })
+        .collect()
+}
+
+fn candidate_file_selection_supported(candidate: &AcquisitionCandidate) -> bool {
+    !candidate.files.is_empty()
+        && candidate
+            .files
+            .iter()
+            .any(|file| file.selectable.unwrap_or(true))
+}
+
+fn candidate_media_file_count(candidate: &AcquisitionCandidate) -> usize {
+    candidate
+        .files
+        .iter()
+        .filter(|file| looks_like_media_file(&file.path))
+        .count()
+}
+
+fn looks_like_media_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("mkv" | "mp4" | "m4v" | "avi" | "mov" | "wmv" | "ts" | "m2ts" | "webm")
+    )
+}
+
 async fn source_extension_id_for_candidate_provider(
     store: &ExtensionStore<'_>,
     provider_id: Uuid,
@@ -2220,6 +3751,30 @@ async fn source_extension_id_for_candidate_provider(
 }
 
 fn selected_candidate_provenance(submission: &CandidateSubmission) -> Result<JsonValue> {
+    selected_candidate_provenance_inner(submission, None)
+}
+
+fn selected_candidate_provenance_with_submission(
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    download_id: &Option<String>,
+    reason: &str,
+) -> Result<JsonValue> {
+    selected_candidate_provenance_inner(
+        submission,
+        Some(json!({
+            "routeLogicalId": route_logical_id,
+            "downloadId": download_id,
+            "reason": reason,
+            "recordedAt": Utc::now().to_rfc3339(),
+        })),
+    )
+}
+
+fn selected_candidate_provenance_inner(
+    submission: &CandidateSubmission,
+    submission_result: Option<JsonValue>,
+) -> Result<JsonValue> {
     let mut value = serde_json::to_value(&submission.candidate)?;
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -2232,6 +3787,18 @@ fn selected_candidate_provenance(submission: &CandidateSubmission) -> Result<Jso
         );
         if let Some(plan) = submission.anime_coverage_plan.as_ref() {
             object.insert("animeCoveragePlan".to_string(), serde_json::to_value(plan)?);
+        }
+        if let Some(plan) = submission.tv_coverage_plan.as_ref() {
+            object.insert("tvCoveragePlan".to_string(), serde_json::to_value(plan)?);
+        }
+        if let Some(dispatch) = submission.dispatch.as_ref() {
+            object.insert(
+                "schedulerDispatch".to_string(),
+                serde_json::to_value(dispatch)?,
+            );
+        }
+        if let Some(submission_result) = submission_result {
+            object.insert("submissionResult".to_string(), submission_result);
         }
     }
     Ok(value)
@@ -2396,13 +3963,6 @@ fn selected_seasons(profile: Option<&JsonValue>) -> HashSet<i32> {
     seasons
 }
 
-fn debrid_status_failed(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "failed" | "error" | "dead" | "virus" | "magnet_error"
-    )
-}
-
 fn api_error_to_anyhow(err: ApiError) -> anyhow::Error {
     let message = match err {
         ApiError::BadRequest(message)
@@ -2553,7 +4113,19 @@ fn jitter_seconds(seed: &Uuid, max_seconds: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::http::handlers::acquisition_sources::AcquisitionCandidateFile;
+    use crate::{config::DatabaseConfig, db::Database};
     use serde_json::json;
+
+    async fn setup_test_db() -> Result<Database> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        Ok(database)
+    }
 
     fn candidate(
         title: &str,
@@ -2678,6 +4250,108 @@ mod tests {
                     anidb_episode_id: Some(format!("20{episode:02}")),
                 })
                 .collect(),
+        }
+    }
+
+    fn available_route_options() -> Vec<CandidateRouteOption> {
+        vec![
+            CandidateRouteOption {
+                logical_id: DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                label: "Debrid".to_string(),
+                available: true,
+                selected_provider_id: Some(Uuid::new_v4()),
+                selected_extension_id: Some("test.debrid".to_string()),
+                blocker: None,
+            },
+            CandidateRouteOption {
+                logical_id: TORRENT_DEFAULT_LOGICAL_ID.to_string(),
+                label: "Torrent".to_string(),
+                available: true,
+                selected_provider_id: Some(Uuid::new_v4()),
+                selected_extension_id: Some("test.torrent".to_string()),
+                blocker: None,
+            },
+        ]
+    }
+
+    fn release_plan_for_test(
+        candidate: AcquisitionCandidate,
+        route_logical_id: &str,
+        release_kind: ReleaseKind,
+        confidence: ReleaseConfidence,
+        covered_targets: &[AcquisitionTarget],
+    ) -> CandidateReleasePlan {
+        CandidateReleasePlan {
+            provider_id: Uuid::new_v4(),
+            source_extension_id: "test.source".to_string(),
+            route_logical_id: route_logical_id.to_string(),
+            fingerprint: candidate_release_fingerprint(&candidate, None),
+            selection: CandidateSelection {
+                candidate,
+                anime_coverage_plan: None,
+                tv_coverage_plan: None,
+            },
+            release_kind,
+            resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+            resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+            confidence,
+            covered_target_ids: covered_targets
+                .iter()
+                .map(|target| target.target_id)
+                .collect(),
+            covered_target_keys: covered_targets
+                .iter()
+                .map(|target| target.target_key.clone())
+                .collect(),
+            overfetch_count: 0,
+        }
+    }
+
+    fn release_for_test(
+        subscription: &AcquisitionSubscription,
+        candidate: &AcquisitionCandidate,
+        route_logical_id: &str,
+        state: AcquisitionReleaseState,
+    ) -> NewAcquisitionRelease {
+        NewAcquisitionRelease {
+            release_id: None,
+            subscription_id: Some(subscription.subscription_id),
+            source_provider_id: None,
+            source_extension_id: "test.source".to_string(),
+            owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+            media_type: subscription.media_type,
+            title: subscription.title.clone(),
+            release_title: candidate.title.clone(),
+            source: candidate.source.clone(),
+            source_kind: candidate.source_kind.clone(),
+            info_hash: candidate.info_hash.clone(),
+            fingerprint: candidate_release_fingerprint(candidate, None),
+            release_kind: ReleaseKind::Single,
+            resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+            resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+            confidence: ReleaseConfidence::High,
+            score: candidate.score,
+            selected_route_logical_id: Some(route_logical_id.to_string()),
+            selected_provider_id: None,
+            download_id: Some(format!("download-{}", candidate.title)),
+            remote_release_id: None,
+            state,
+            state_reason: Some("test release".to_string()),
+            selected_candidate: None,
+            coverage_plan: None,
+        }
+    }
+
+    fn empty_queue_governor() -> QueueGovernor {
+        QueueGovernor {
+            caps: QueueGovernorCaps::default(),
+            global_active: 0,
+            active_by_route: HashMap::new(),
+            active_by_subscription: HashMap::new(),
+            active_by_subscription_route: HashMap::new(),
+            stale_active_jobs: 0,
+            searches_this_tick: 0,
+            submissions_this_tick: 0,
         }
     }
 
@@ -2892,6 +4566,121 @@ mod tests {
     }
 
     #[test]
+    fn series_backfill_grouping_collapses_large_season_into_one_search() {
+        let subscription = test_subscription();
+        let now = Utc::now();
+        let targets = (1..=1000)
+            .map(|episode| AcquisitionTarget {
+                air_time: Some(now - ChronoDuration::days(30)),
+                next_search_after: Some(now - ChronoDuration::minutes(1)),
+                ..episode_target(&subscription, 1, episode)
+            })
+            .collect::<Vec<_>>();
+        let subscriptions = HashMap::from([(subscription.subscription_id, subscription.clone())]);
+        let targets_by_subscription =
+            HashMap::from([(subscription.subscription_id, targets.clone())]);
+
+        let groups =
+            build_target_search_groups(&subscriptions, targets, &targets_by_subscription, now);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].targets.len(), 1000);
+        assert!(groups[0].group_key.contains(&format!(
+            "{}:series:debrid_first:season:1",
+            subscription.subscription_id
+        )));
+        let intent = groups[0].search_intent.as_ref().expect("search intent");
+        assert_eq!(intent.kind, "season_pack");
+        assert_eq!(intent.season_number, Some(1));
+        assert_eq!(intent.episode_start, Some(1));
+        assert_eq!(intent.episode_end, Some(1000));
+    }
+
+    #[test]
+    fn daily_tv_groups_by_air_date_window() {
+        let subscription = AcquisitionSubscription {
+            title: "Daily Show".to_string(),
+            normalized_title: "dailyshow".to_string(),
+            ..test_subscription()
+        };
+        let now = Utc::now();
+        let targets = vec![
+            AcquisitionTarget {
+                target_key: "DATE:2026-05-01".to_string(),
+                season_number: None,
+                episode_number: None,
+                air_date: Some("2026-05-01".to_string()),
+                air_time: Some(now - ChronoDuration::days(1)),
+                ..episode_target(&subscription, 1, 1)
+            },
+            AcquisitionTarget {
+                target_key: "DATE:2026-05-02".to_string(),
+                season_number: None,
+                episode_number: None,
+                air_date: Some("2026-05-02".to_string()),
+                air_time: Some(now - ChronoDuration::days(1)),
+                ..episode_target(&subscription, 1, 2)
+            },
+        ];
+        let subscriptions = HashMap::from([(subscription.subscription_id, subscription.clone())]);
+        let targets_by_subscription =
+            HashMap::from([(subscription.subscription_id, targets.clone())]);
+
+        let groups =
+            build_target_search_groups(&subscriptions, targets, &targets_by_subscription, now);
+
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| {
+            group
+                .search_intent
+                .as_ref()
+                .is_some_and(|intent| intent.kind == "daily")
+        }));
+        assert_ne!(groups[0].group_key, groups[1].group_key);
+    }
+
+    #[test]
+    fn movie_targets_remain_single_target_groups() {
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Movie".to_string(),
+            normalized_title: "movie".to_string(),
+            ..test_subscription()
+        };
+        let now = Utc::now();
+        let targets = vec![
+            AcquisitionTarget {
+                target_key: "movie".to_string(),
+                media_type: MediaType::Movie,
+                title: "Movie".to_string(),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                ..episode_target(&subscription, 1, 1)
+            },
+            AcquisitionTarget {
+                target_key: "movie-alt".to_string(),
+                media_type: MediaType::Movie,
+                title: "Movie Alt".to_string(),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                ..episode_target(&subscription, 1, 2)
+            },
+        ];
+        let subscriptions = HashMap::from([(subscription.subscription_id, subscription.clone())]);
+        let groups = build_target_search_groups(&subscriptions, targets, &HashMap::new(), now);
+
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.targets.is_empty()));
+        assert!(groups.iter().all(|group| group.search_intent.is_none()));
+    }
+
+    #[test]
     fn large_backfill_selection_prefers_high_coverage_pack_over_single() {
         let context = anime_scoring_context(3);
         let single = candidate(
@@ -2953,13 +4742,537 @@ mod tests {
     }
 
     #[test]
+    fn rr6b_tv_season_pack_plan_beats_single_episode_candidates() {
+        let subscription = test_subscription();
+        let targets = vec![
+            episode_target(&subscription, 1, 1),
+            episode_target(&subscription, 1, 2),
+            episode_target(&subscription, 1, 3),
+        ];
+        let mut pack = candidate(
+            "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(10),
+        );
+        pack.files = vec![
+            AcquisitionCandidateFile {
+                file_id: Some("1".to_string()),
+                file_index: Some(1),
+                path: "Show.S01.COMPLETE/Show.S01E01.1080p.mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: Some(true),
+            },
+            AcquisitionCandidateFile {
+                file_id: Some("2".to_string()),
+                file_index: Some(2),
+                path: "Show.S01.COMPLETE/Show.S01E02.1080p.mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: Some(true),
+            },
+            AcquisitionCandidateFile {
+                file_id: Some("3".to_string()),
+                file_index: Some(3),
+                path: "Show.S01.COMPLETE/Show.S01E03.1080p.mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: Some(true),
+            },
+        ];
+        let pack_plan = analyze_candidate_coverage(&subscription, &targets[0], &targets, &pack)
+            .expect("pack coverage");
+        let single = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(500),
+        );
+        let single_plan = analyze_candidate_coverage(&subscription, &targets[0], &targets, &single)
+            .expect("single coverage");
+
+        let selected = select_bounded_release_plans(
+            vec![
+                release_plan_for_test(
+                    pack,
+                    DEBRID_DEFAULT_LOGICAL_ID,
+                    pack_plan.release_kind,
+                    pack_plan.confidence,
+                    &targets,
+                ),
+                release_plan_for_test(
+                    single,
+                    DEBRID_DEFAULT_LOGICAL_ID,
+                    single_plan.release_kind,
+                    single_plan.confidence,
+                    &targets[0..1],
+                ),
+            ],
+            AcquisitionRoutePolicy::DebridFirst,
+            &targets,
+            5,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(selected[0].covered_target_ids.len(), 3);
+    }
+
+    #[test]
+    fn rr6b_singles_fill_only_uncovered_gaps_after_pack_selection() {
+        let subscription = test_subscription();
+        let targets = vec![
+            episode_target(&subscription, 1, 1),
+            episode_target(&subscription, 1, 2),
+            episode_target(&subscription, 1, 3),
+        ];
+        let pack = release_plan_for_test(
+            candidate(
+                "Show.S01E01-E02.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(10),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::MultiEpisode,
+            ReleaseConfidence::High,
+            &targets[0..2],
+        );
+        let duplicate_single = release_plan_for_test(
+            candidate(
+                "Show.S01E01.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(1000),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            &targets[0..1],
+        );
+        let gap_single = release_plan_for_test(
+            candidate(
+                "Show.S01E03.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            &targets[2..3],
+        );
+
+        let selected = select_bounded_release_plans(
+            vec![duplicate_single, gap_single, pack],
+            AcquisitionRoutePolicy::DebridFirst,
+            &targets,
+            5,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].release_kind, ReleaseKind::MultiEpisode);
+        assert_eq!(
+            selected[1].covered_target_keys,
+            BTreeSet::from(["S01E03".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn rr6b_existing_active_or_completed_fingerprint_is_not_resubmitted() -> Result<()> {
+        let database = setup_test_db().await?;
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(10),
+        );
+        let fingerprint = candidate_release_fingerprint(&candidate, None);
+        upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                release_id: None,
+                subscription_id: None,
+                source_provider_id: None,
+                source_extension_id: "test.source".to_string(),
+                owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                media_type: MediaType::Series,
+                title: "Show".to_string(),
+                release_title: candidate.title.clone(),
+                source: candidate.source.clone(),
+                source_kind: candidate.source_kind.clone(),
+                info_hash: candidate.info_hash.clone(),
+                fingerprint: fingerprint.clone(),
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+                confidence: ReleaseConfidence::High,
+                score: None,
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_provider_id: None,
+                download_id: Some("download-1".to_string()),
+                remote_release_id: None,
+                state: AcquisitionReleaseState::Submitted,
+                state_reason: Some("submitted".to_string()),
+                selected_candidate: None,
+                coverage_plan: None,
+            },
+        )
+        .await?;
+
+        assert!(
+            release_fingerprint_already_claimed(&database.pool, "test.source", &fingerprint)
+                .await?
+        );
+        upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                state: AcquisitionReleaseState::Failed,
+                fingerprint: "failed-fingerprint".to_string(),
+                release_title: "Failed".to_string(),
+                source: "magnet:?xt=urn:btih:failed".to_string(),
+                ..NewAcquisitionRelease {
+                    release_id: None,
+                    subscription_id: None,
+                    source_provider_id: None,
+                    source_extension_id: "test.source".to_string(),
+                    owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                    media_type: MediaType::Series,
+                    title: "Show".to_string(),
+                    release_title: candidate.title,
+                    source: candidate.source,
+                    source_kind: candidate.source_kind,
+                    info_hash: None,
+                    fingerprint: "failed-fingerprint".to_string(),
+                    release_kind: ReleaseKind::Single,
+                    resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                    resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+                    confidence: ReleaseConfidence::High,
+                    score: None,
+                    selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                    selected_provider_id: None,
+                    download_id: None,
+                    remote_release_id: None,
+                    state: AcquisitionReleaseState::Failed,
+                    state_reason: Some("failed".to_string()),
+                    selected_candidate: None,
+                    coverage_plan: None,
+                }
+            },
+        )
+        .await?;
+        assert!(
+            !release_fingerprint_already_claimed(
+                &database.pool,
+                "test.source",
+                "failed-fingerprint"
+            )
+            .await?
+        );
+        upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                state: AcquisitionReleaseState::Cancelled,
+                fingerprint: "rejected-fingerprint".to_string(),
+                release_title: "Rejected".to_string(),
+                source: "magnet:?xt=urn:btih:rejected".to_string(),
+                coverage_plan: Some(json!({
+                    "manualReview": {
+                        "status": "rejected",
+                        "reason": "wrong pack"
+                    },
+                    "retrySuppression": {
+                        "status": "rejected",
+                        "suppressAutomaticRediscovery": true
+                    }
+                })),
+                ..NewAcquisitionRelease {
+                    release_id: None,
+                    subscription_id: None,
+                    source_provider_id: None,
+                    source_extension_id: "test.source".to_string(),
+                    owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                    media_type: MediaType::Series,
+                    title: "Show".to_string(),
+                    release_title: "Rejected".to_string(),
+                    source: "magnet:?xt=urn:btih:rejected".to_string(),
+                    source_kind: "magnet".to_string(),
+                    info_hash: None,
+                    fingerprint: "rejected-fingerprint".to_string(),
+                    release_kind: ReleaseKind::Single,
+                    resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                    resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+                    confidence: ReleaseConfidence::High,
+                    score: None,
+                    selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                    selected_provider_id: None,
+                    download_id: None,
+                    remote_release_id: None,
+                    state: AcquisitionReleaseState::Cancelled,
+                    state_reason: Some("rejected".to_string()),
+                    selected_candidate: None,
+                    coverage_plan: None,
+                }
+            },
+        )
+        .await?;
+        assert!(
+            release_fingerprint_already_claimed(
+                &database.pool,
+                "test.source",
+                "rejected-fingerprint"
+            )
+            .await?,
+            "rejected fingerprint should be suppressed until explicit alternate search policy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rr6b_debrid_first_uses_torrent_when_debrid_capacity_is_full() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(10),
+        );
+        let mut governor = empty_queue_governor();
+        governor.caps.global_debrid = 0;
+
+        let route = select_candidate_route_for_plan(
+            &database.pool,
+            &subscription,
+            &candidate,
+            &available_route_options(),
+            &mut governor,
+        )
+        .await?
+        .expect("torrent route should be selected");
+
+        assert_eq!(route, TORRENT_DEFAULT_LOGICAL_ID);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rr6b_torrent_only_rejects_blocked_torrent_route() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            route_policy: AcquisitionRoutePolicy::TorrentOnly,
+            ..test_subscription()
+        };
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![TORRENT_DEFAULT_LOGICAL_ID],
+            None,
+            Some(10),
+        );
+        let mut routes = available_route_options();
+        if let Some(route) = routes
+            .iter_mut()
+            .find(|route| route.logical_id == TORRENT_DEFAULT_LOGICAL_ID)
+        {
+            route.available = false;
+            route.blocker = Some("protected downloader route is blocked".to_string());
+        }
+        let mut governor = empty_queue_governor();
+
+        let result = select_candidate_route_for_plan(
+            &database.pool,
+            &subscription,
+            &candidate,
+            &routes,
+            &mut governor,
+        )
+        .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rr6b_review_required_tv_pack_is_not_auto_planned() {
+        let subscription = test_subscription();
+        let targets = vec![
+            episode_target(&subscription, 1, 1),
+            episode_target(&subscription, 1, 2),
+        ];
+        let pack_without_files = candidate(
+            "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(10),
+        );
+
+        assert!(
+            analyze_candidate_coverage(&subscription, &targets[0], &targets, &pack_without_files)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rr6c_fair_order_rotates_due_groups_between_subscriptions() {
+        let sub_a = test_subscription();
+        let sub_b = AcquisitionSubscription {
+            subscription_id: Uuid::new_v4(),
+            title: "Other".to_string(),
+            normalized_title: "other".to_string(),
+            ..test_subscription()
+        };
+        let group = |subscription: &AcquisitionSubscription, episode: i32| TargetSearchGroup {
+            group_key: format!(
+                "{}:series:debrid_first:season:1:{episode}",
+                subscription.subscription_id
+            ),
+            representative: episode_target(subscription, 1, episode),
+            targets: vec![episode_target(subscription, 1, episode)],
+            search_intent: None,
+        };
+
+        let ordered = fair_order_search_groups(vec![
+            group(&sub_a, 1),
+            group(&sub_a, 2),
+            group(&sub_a, 3),
+            group(&sub_b, 1),
+            group(&sub_b, 2),
+        ]);
+        let ids = ordered
+            .iter()
+            .map(|group| group.representative.subscription_id)
+            .collect::<Vec<_>>();
+
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[0], ids[2]);
+        assert_eq!(ids[1], ids[3]);
+        assert!(ids[4] == sub_a.subscription_id || ids[4] == sub_b.subscription_id);
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == sub_a.subscription_id)
+                .count(),
+            3
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == sub_b.subscription_id)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rr6c_dispatch_evidence_records_plan_route_capacity_and_search_context() {
+        let subscription = test_subscription();
+        let targets = vec![
+            episode_target(&subscription, 1, 1),
+            episode_target(&subscription, 1, 2),
+        ];
+        let plan = release_plan_for_test(
+            candidate(
+                "Show.S01E01-E02.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(42),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::MultiEpisode,
+            ReleaseConfidence::High,
+            &targets,
+        );
+        let group = TargetSearchGroup {
+            group_key: "group-key".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: Some(search_intent_for_targets(&targets, RetryBucket::Cold)),
+        };
+        let evidence = scheduler_dispatch_evidence(
+            &subscription,
+            &group,
+            &plan,
+            QueueCapacitySnapshot {
+                global_active: 1,
+                global_limit: 12,
+                subscription_active: 1,
+                subscription_limit: 5,
+                route_active: 0,
+                route_limit: Some(10),
+                subscription_route_active: 0,
+                subscription_route_limit: Some(3),
+                searches_this_tick: 1,
+                search_tick_limit: 20,
+                submissions_this_tick: 0,
+                submission_tick_limit: 5,
+                stale_active_jobs: 0,
+            },
+        );
+        let value = serde_json::to_value(&evidence).expect("dispatch evidence serializes");
+
+        assert_eq!(value["schedulerPhase"], "rr6c");
+        assert_eq!(value["groupKey"], "group-key");
+        assert_eq!(value["searchIntent"]["kind"], "multi_episode");
+        assert_eq!(
+            value["routeDecision"]["selectedRouteLogicalId"],
+            DEBRID_DEFAULT_LOGICAL_ID
+        );
+        assert_eq!(value["selectedPlanScore"]["coveredTargetCount"], 2);
+        assert_eq!(value["capacitySnapshot"]["globalActive"], 1);
+    }
+
+    #[tokio::test]
+    async fn rr6c_dispatch_reservation_rechecks_database_capacity_for_races() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = test_subscription();
+        let active_candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(10),
+        );
+        let mut release_input = release_for_test(
+            &subscription,
+            &active_candidate,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            AcquisitionReleaseState::Submitted,
+        );
+        release_input.subscription_id = None;
+        let release = upsert_release(&database.pool, release_input).await?;
+        upsert_release_job(
+            &database.pool,
+            NewAcquisitionReleaseJob {
+                release_job_id: None,
+                release_id: release.release_id,
+                route_logical_id: DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                provider_id: None,
+                download_id: Some("race-download".to_string()),
+                remote_release_id: None,
+                state: ReleaseJobState::Submitted,
+                state_reason: Some("active race job".to_string()),
+                active: true,
+                started_at: Some(Utc::now()),
+                completed_at: None,
+            },
+        )
+        .await?;
+
+        let mut governor = empty_queue_governor();
+        governor.caps.global = 1;
+        let block = governor
+            .try_reserve(
+                &database.pool,
+                subscription.subscription_id,
+                DEBRID_DEFAULT_LOGICAL_ID,
+            )
+            .await?
+            .expect_err("db active job should fill global capacity");
+
+        assert_eq!(block.kind, QueueCapacityLimitKind::Global);
+        assert_eq!(block.global_active, 1);
+        assert_eq!(governor.global_active, 1);
+        Ok(())
+    }
+
+    #[test]
     fn queue_governor_enforces_subscription_route_caps() {
         let subscription_id = Uuid::new_v4();
-        let mut governor = QueueGovernor {
-            caps: QueueGovernorCaps::default(),
-            active_by_route: HashMap::new(),
-            active_by_subscription_route: HashMap::new(),
-        };
+        let mut governor = empty_queue_governor();
 
         assert!(
             governor
@@ -2980,7 +5293,11 @@ mod tests {
             .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
             .expect_err("subscription route cap");
 
-        assert_eq!(block.route_logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(block.kind, QueueCapacityLimitKind::SubscriptionRoute);
+        assert_eq!(
+            block.route_logical_id.as_deref(),
+            Some(DEBRID_DEFAULT_LOGICAL_ID)
+        );
         assert_eq!(
             block.subscription_active,
             DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP
@@ -2989,6 +5306,70 @@ mod tests {
             block.subscription_limit,
             DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP
         );
+    }
+
+    #[test]
+    fn queue_governor_enforces_global_subscription_search_and_submission_caps() {
+        let subscription_id = Uuid::new_v4();
+        let mut governor = empty_queue_governor();
+        governor.caps.global = 1;
+        governor.global_active = 1;
+        let global = governor
+            .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
+            .expect_err("global cap");
+        assert_eq!(global.kind, QueueCapacityLimitKind::Global);
+
+        let mut governor = empty_queue_governor();
+        governor.caps.subscription = 1;
+        governor.active_by_subscription.insert(subscription_id, 1);
+        let subscription = governor
+            .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
+            .expect_err("subscription cap");
+        assert_eq!(subscription.kind, QueueCapacityLimitKind::Subscription);
+
+        let mut governor = empty_queue_governor();
+        governor.caps.max_submissions_per_tick = 1;
+        assert!(
+            governor
+                .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
+                .is_ok()
+        );
+        let tick = governor
+            .try_reserve_loaded(Uuid::new_v4(), DEBRID_DEFAULT_LOGICAL_ID)
+            .expect_err("submission tick cap");
+        assert_eq!(tick.kind, QueueCapacityLimitKind::SubmissionTick);
+
+        let mut governor = empty_queue_governor();
+        governor.caps.max_candidate_searches_per_tick = 0;
+        assert_eq!(governor.searches_this_tick, 0);
+        let reason = queue_capacity_reason(&QueueCapacityBlock {
+            kind: QueueCapacityLimitKind::SearchTick,
+            route_logical_id: None,
+            global_active: 0,
+            global_limit: governor.caps.global,
+            subscription_active: 0,
+            subscription_limit: governor.caps.subscription,
+            tick_active: 0,
+            tick_limit: 0,
+        });
+        assert!(reason.contains("candidate searches this tick"));
+    }
+
+    #[tokio::test]
+    async fn queue_governor_blocks_search_before_source_call_when_tick_cap_is_full() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = test_subscription();
+        let mut governor = empty_queue_governor();
+        governor.caps.max_candidate_searches_per_tick = 0;
+
+        let block = governor
+            .try_start_search(&database.pool, &subscription)
+            .await?
+            .expect_err("search tick cap");
+
+        assert_eq!(block.kind, QueueCapacityLimitKind::SearchTick);
+        assert_eq!(governor.searches_this_tick, 0);
+        Ok(())
     }
 
     #[test]

@@ -736,6 +736,20 @@ pub async fn update_target_state(
     get_target(pool, target_id).await
 }
 
+pub async fn clear_target_next_search_after(pool: &AnyPool, target_id: Uuid) -> Result<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET next_search_after = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE target_id = ?",
+    )
+    .bind(target_id.to_string())
+    .execute(pool)
+    .await
+    .context("clearing acquisition target search schedule")?;
+    Ok(())
+}
+
 pub async fn list_due_metadata_subscriptions(
     pool: &AnyPool,
     now: DateTime<Utc>,

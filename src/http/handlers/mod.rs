@@ -1,3 +1,4 @@
+pub mod acquisition_review;
 pub mod acquisition_sources;
 pub mod acquisition_subscriptions;
 pub mod artwork;

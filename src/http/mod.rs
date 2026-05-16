@@ -124,8 +124,32 @@ pub fn router(state: AppState) -> Router {
                 .patch(handlers::acquisition_subscriptions::patch_acquisition_subscription),
         )
         .route(
+            "/api/v1/acquisition/subscriptions/:subscription_id/coverage",
+            get(handlers::acquisition_review::acquisition_subscription_coverage),
+        )
+        .route(
             "/api/v1/acquisition/subscriptions/:subscription_id/targets",
             put(handlers::acquisition_subscriptions::upsert_acquisition_targets),
+        )
+        .route(
+            "/api/v1/acquisition/releases",
+            get(handlers::acquisition_review::list_acquisition_releases),
+        )
+        .route(
+            "/api/v1/acquisition/releases/:release_id",
+            get(handlers::acquisition_review::get_acquisition_release),
+        )
+        .route(
+            "/api/v1/acquisition/releases/:release_id/approve",
+            post(handlers::acquisition_review::approve_acquisition_release),
+        )
+        .route(
+            "/api/v1/acquisition/releases/:release_id/reject",
+            post(handlers::acquisition_review::reject_acquisition_release),
+        )
+        .route(
+            "/api/v1/acquisition/releases/:release_id/retry",
+            post(handlers::acquisition_review::retry_acquisition_release),
         )
         .route(
             "/api/v1/acquisition/targets/:target_id/state",

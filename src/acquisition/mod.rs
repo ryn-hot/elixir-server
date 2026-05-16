@@ -1,4 +1,5 @@
 pub mod automation;
+pub mod imports;
 pub mod release_resolution;
 pub mod subscriptions;
 

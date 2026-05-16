@@ -228,10 +228,12 @@ pub struct AcquisitionReleaseFile {
     pub release_id: Uuid,
     pub file_index: Option<i64>,
     pub file_id: Option<String>,
+    pub provider_file_id: Option<String>,
     pub path: String,
     pub basename: String,
     pub size_bytes: Option<i64>,
     pub selectable: bool,
+    pub selected: Option<bool>,
     pub parsed_title: Option<String>,
     pub parsed_season_number: Option<i32>,
     pub parsed_episode_number: Option<i32>,
@@ -245,6 +247,7 @@ pub struct AcquisitionReleaseFile {
     pub parser_confidence: ReleaseConfidence,
     pub parser_reason: Option<String>,
     pub raw: Option<JsonValue>,
+    pub provider_metadata: Option<JsonValue>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -255,10 +258,12 @@ pub struct NewAcquisitionReleaseFile {
     pub release_id: Uuid,
     pub file_index: Option<i64>,
     pub file_id: Option<String>,
+    pub provider_file_id: Option<String>,
     pub path: String,
     pub basename: Option<String>,
     pub size_bytes: Option<i64>,
     pub selectable: bool,
+    pub selected: Option<bool>,
     pub parsed_title: Option<String>,
     pub parsed_season_number: Option<i32>,
     pub parsed_episode_number: Option<i32>,
@@ -272,6 +277,7 @@ pub struct NewAcquisitionReleaseFile {
     pub parser_confidence: ReleaseConfidence,
     pub parser_reason: Option<String>,
     pub raw: Option<JsonValue>,
+    pub provider_metadata: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2173,7 +2173,7 @@ mod tests {
     async fn ban_pause_blocks_udp_without_touching_http() -> Result<()> {
         let database = setup_db().await?;
         let config = AniDbRateLimiterConfig::default();
-        let now = fixed_now();
+        let now = Utc::now();
         pause_anidb_channel_for_ban(&database.pool, AniDbChannel::Udp, &config, "test ban", now)
             .await?;
         let provider = Arc::new(RecordingProvider::new(AniDbFileProviderResponse::Hit(

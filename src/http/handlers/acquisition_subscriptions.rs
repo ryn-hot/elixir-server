@@ -237,6 +237,12 @@ pub async fn submit_acquisition_target_candidate(
         name: request.name,
         priority: request.priority,
         add_to_top: request.add_to_top,
+        subscription_id: Some(subscription.subscription_id),
+        source_provider_id: Some(source_provider_id),
+        source_extension_id: Some(source_extension_id.clone()),
+        media_type: Some(subscription.media_type),
+        media_title: Some(subscription.title.clone()),
+        selected_candidate: Some(candidate.clone()),
     };
 
     let mut state_reason = format!("Submitted through '{}'.", route_logical_id);
@@ -267,14 +273,13 @@ pub async fn submit_acquisition_target_candidate(
                 Ok(response) => {
                     route_logical_id = TORRENT_DEFAULT_LOGICAL_ID.to_string();
                     state_reason =
-                        "Real-Debrid rejected the candidate; submitted torrent fallback."
-                            .to_string();
+                        "Debrid rejected the candidate; submitted torrent fallback.".to_string();
                     response
                 }
                 Err(fallback_err) => {
                     if should_record_target_blocker(&fallback_err) {
                         let message = format!(
-                            "Real-Debrid route failed: {}; torrent fallback failed: {}",
+                            "Debrid route failed: {}; torrent fallback failed: {}",
                             api_error_message(&err),
                             api_error_message(&fallback_err)
                         );

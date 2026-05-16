@@ -581,8 +581,14 @@ fn route_record_for_binding(
         .filter(|record| record.role == role && record.logical_id == role.logical_id())
         .cloned()
         .collect::<Vec<_>>();
-    let selected = select_provider_for_binding(&candidates, effective_binding);
+    let selected = select_provider_for_binding(role, &candidates, effective_binding);
     let mut checks = Vec::new();
+    let debrid_default_ambiguous = role == DownloadBrokerRole::DebridResolver
+        && selected.is_none()
+        && candidates.len() > 1
+        && effective_binding
+            .and_then(|binding| binding.provider_id)
+            .is_none();
     let blocker = if selected.is_some() {
         checks.push(route_check(
             "download_route_provider_selected",
@@ -590,6 +596,16 @@ fn route_record_for_binding(
             "The route resolves to a concrete acquisition provider.",
         ));
         None
+    } else if debrid_default_ambiguous {
+        checks.push(route_check(
+            "download_route_debrid_default_ambiguous",
+            DownloadBrokerRouteCheckStatus::Fail,
+            "Multiple debrid resolver providers are registered. Select one default debrid provider explicitly.",
+        ));
+        Some(
+            "Multiple debrid resolver providers are registered. Select one default debrid provider explicitly."
+                .to_string(),
+        )
     } else if candidates.is_empty() {
         checks.push(route_check(
             "download_route_provider_missing",
@@ -689,6 +705,7 @@ fn route_record_for_binding(
 }
 
 fn select_provider_for_binding(
+    role: DownloadBrokerRole,
     candidates: &[DownloadBrokerProviderRecord],
     binding: Option<&StoredRouteBinding>,
 ) -> Option<DownloadBrokerProviderRecord> {
@@ -706,6 +723,9 @@ fn select_provider_for_binding(
         .filter(|record| binding_kind_accepts_provider(binding_kind, record.provider_kind))
         .cloned()
         .collect::<Vec<_>>();
+    if role == DownloadBrokerRole::DebridResolver && filtered.len() > 1 {
+        return None;
+    }
     filtered.sort_by_key(|record| {
         (
             health_rank(record.health_state),
@@ -1078,6 +1098,9 @@ fn select_default_provider_id(
         .iter()
         .filter(|record| record.role == role)
         .collect::<Vec<_>>();
+    if role == DownloadBrokerRole::DebridResolver && candidates.len() != 1 {
+        return None;
+    }
     candidates.sort_by_key(|record| {
         (
             provider_kind_rank(record.provider_kind),
@@ -1461,6 +1484,164 @@ mod tests {
         assert_eq!(route.provider_id, Some(debrid_id));
         assert_eq!(route.binding_kind, DownloadBrokerBindingKind::Debrid);
         assert!(route.blocker.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn future_debrid_provider_scope_binds_to_default_debrid_route() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let provider_id = insert_downloader_provider(
+            &store,
+            "community.premiumize",
+            "debrid.resolver",
+            "premiumize",
+            "premiumize-extension",
+            Some(json!({
+                "download_broker": {
+                    "enabled": true,
+                    "provider_kind": "debrid",
+                    "logical_id": DEBRID_DEFAULT_LOGICAL_ID,
+                    "capabilities": {
+                        "magnetSubmit": true,
+                        "fileListing": true,
+                        "fileSelection": true,
+                        "fileSelectionMode": "before_transfer"
+                    }
+                }
+            })),
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let inventory = list_logical_downloaders(&store).await?;
+        let provider = inventory
+            .downloaders
+            .iter()
+            .find(|record| record.provider_id == provider_id)
+            .expect("future debrid provider");
+        assert_eq!(provider.logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(provider.role, DownloadBrokerRole::DebridResolver);
+        assert_eq!(provider.provider_kind, DownloadBrokerProviderKind::Debrid);
+        assert_eq!(provider.implementation.as_deref(), Some("premiumize"));
+        assert!(provider.selected_for_default);
+
+        let resolved = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await?;
+        assert_eq!(resolved.record.provider_id, provider_id);
+        assert_eq!(
+            resolved.record.implementation.as_deref(),
+            Some("premiumize")
+        );
+        assert_eq!(resolved.binding_kind, DownloadBrokerBindingKind::Auto);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debrid_default_requires_explicit_binding_when_multiple_providers_exist() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let real_debrid_id = insert_downloader_provider(
+            &store,
+            "elixir.modules.real_debrid",
+            "debrid.resolver",
+            "real_debrid",
+            "real-debrid",
+            Some(json!({ "download_broker": { "provider_kind": "debrid", "logical_id": DEBRID_DEFAULT_LOGICAL_ID } })),
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+        let premiumize_id = insert_downloader_provider(
+            &store,
+            "community.premiumize",
+            "debrid.resolver",
+            "premiumize",
+            "premiumize-extension",
+            Some(json!({ "download_broker": { "provider_kind": "debrid", "logical_id": DEBRID_DEFAULT_LOGICAL_ID } })),
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let inventory = list_logical_downloaders(&store).await?;
+        assert!(inventory.downloaders.iter().any(|record| {
+            record.provider_id == real_debrid_id && !record.selected_for_default
+        }));
+        assert!(
+            inventory.downloaders.iter().any(|record| {
+                record.provider_id == premiumize_id && !record.selected_for_default
+            })
+        );
+
+        let routes = list_acquisition_routes(&database.pool, &store).await?;
+        let debrid = routes
+            .routes
+            .iter()
+            .find(|route| route.logical_id == DEBRID_DEFAULT_LOGICAL_ID)
+            .expect("debrid route");
+        assert_eq!(debrid.candidates.len(), 2);
+        assert_eq!(debrid.selected_provider_id, None);
+        assert!(
+            debrid
+                .blocker
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Multiple debrid")
+        );
+        assert!(debrid.checks.iter().any(|check| {
+            check.code == "download_route_debrid_default_ambiguous"
+                && check.status == DownloadBrokerRouteCheckStatus::Fail
+        }));
+
+        let err = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await
+        .expect_err("ambiguous debrid route should not resolve");
+        assert!(err.to_string().contains("Multiple debrid"));
+
+        let route = upsert_acquisition_route(
+            &database.pool,
+            &store,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            DownloadBrokerRouteUpdate {
+                binding_kind: DownloadBrokerBindingKind::Debrid,
+                owner_id: None,
+                provider_id: Some(premiumize_id),
+                profile_id: None,
+                category: None,
+                download_path: None,
+                allow_shared_path: None,
+                status: Some("selected".to_string()),
+            },
+        )
+        .await?;
+        assert_eq!(route.selected_provider_id, Some(premiumize_id));
+        assert!(route.blocker.is_none());
+
+        let resolved = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await?;
+        assert_eq!(resolved.record.provider_id, premiumize_id);
+        assert_eq!(
+            resolved.record.implementation.as_deref(),
+            Some("premiumize")
+        );
+        assert_eq!(resolved.binding_kind, DownloadBrokerBindingKind::Debrid);
         Ok(())
     }
 

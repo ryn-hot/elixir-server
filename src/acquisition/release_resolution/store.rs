@@ -8,6 +8,13 @@ use uuid::Uuid;
 
 use crate::{acquisition::release_resolution::models::*, db::models::MediaType};
 
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseListFilter {
+    pub subscription_id: Option<Uuid>,
+    pub state: Option<AcquisitionReleaseState>,
+    pub limit: Option<i64>,
+}
+
 pub async fn upsert_release(
     pool: &AnyPool,
     data: NewAcquisitionRelease,
@@ -190,12 +197,78 @@ pub async fn get_release_by_download_id(
     row.map(|row| map_release(&row)).transpose()
 }
 
+pub async fn list_releases(
+    pool: &AnyPool,
+    filter: ReleaseListFilter,
+) -> Result<Vec<AcquisitionRelease>> {
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500);
+    let rows = match (filter.subscription_id, filter.state) {
+        (Some(subscription_id), Some(state)) => {
+            sqlx::query(RELEASE_SELECT_BY_SUBSCRIPTION_AND_STATE)
+                .bind(subscription_id.to_string())
+                .bind(state.as_str())
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
+        }
+        (Some(subscription_id), None) => {
+            sqlx::query(RELEASE_SELECT_BY_SUBSCRIPTION)
+                .bind(subscription_id.to_string())
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
+        }
+        (None, Some(state)) => {
+            sqlx::query(RELEASE_SELECT_BY_STATE)
+                .bind(state.as_str())
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
+        }
+        (None, None) => {
+            sqlx::query(RELEASE_SELECT_RECENT)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    rows.into_iter().map(|row| map_release(&row)).collect()
+}
+
+pub async fn update_release_review_state(
+    pool: &AnyPool,
+    release_id: Uuid,
+    state: AcquisitionReleaseState,
+    state_reason: Option<String>,
+    coverage_plan: Option<JsonValue>,
+) -> Result<Option<AcquisitionRelease>> {
+    let coverage_plan_json = json_to_string(coverage_plan.as_ref())?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = ?,
+             state_reason = ?,
+             coverage_plan_json = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?",
+    )
+    .bind(state.as_str())
+    .bind(state_reason.as_deref())
+    .bind(coverage_plan_json.as_deref())
+    .bind(release_id.to_string())
+    .execute(pool)
+    .await
+    .context("updating acquisition release review state")?;
+
+    get_release(pool, release_id).await
+}
+
 pub async fn upsert_release_file(
     pool: &AnyPool,
     data: NewAcquisitionReleaseFile,
 ) -> Result<AcquisitionReleaseFile> {
     validate_release_file_input(&data)?;
     let raw_json = json_to_string(data.raw.as_ref())?;
+    let provider_metadata_json = json_to_string(data.provider_metadata.as_ref())?;
     let existing = find_release_file(pool, &data).await?;
     let release_file_id = existing
         .as_ref()
@@ -213,10 +286,12 @@ pub async fn upsert_release_file(
              SET release_id = ?,
                  file_index = ?,
                  file_id = ?,
+                 provider_file_id = ?,
                  path = ?,
                  basename = ?,
                  size_bytes = ?,
                  selectable = ?,
+                 selected = ?,
                  parsed_title = ?,
                  parsed_season_number = ?,
                  parsed_episode_number = ?,
@@ -230,16 +305,19 @@ pub async fn upsert_release_file(
                  parser_confidence = ?,
                  parser_reason = ?,
                  raw_json = ?,
+                 provider_metadata_json = ?,
                  updated_at = CURRENT_TIMESTAMP
              WHERE release_file_id = ?",
         )
         .bind(data.release_id.to_string())
         .bind(data.file_index)
         .bind(data.file_id.as_deref())
+        .bind(data.provider_file_id.as_deref())
         .bind(data.path.trim())
         .bind(basename)
         .bind(data.size_bytes)
         .bind(data.selectable)
+        .bind(data.selected)
         .bind(data.parsed_title.as_deref())
         .bind(data.parsed_season_number)
         .bind(data.parsed_episode_number)
@@ -253,6 +331,7 @@ pub async fn upsert_release_file(
         .bind(data.parser_confidence.as_str())
         .bind(data.parser_reason.as_deref())
         .bind(raw_json.as_deref())
+        .bind(provider_metadata_json.as_deref())
         .bind(release_file_id.to_string())
         .execute(pool)
         .await
@@ -264,10 +343,12 @@ pub async fn upsert_release_file(
                 release_id,
                 file_index,
                 file_id,
+                provider_file_id,
                 path,
                 basename,
                 size_bytes,
                 selectable,
+                selected,
                 parsed_title,
                 parsed_season_number,
                 parsed_episode_number,
@@ -280,17 +361,20 @@ pub async fn upsert_release_file(
                 parsed_release_group,
                 parser_confidence,
                 parser_reason,
-                raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                raw_json,
+                provider_metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(release_file_id.to_string())
         .bind(data.release_id.to_string())
         .bind(data.file_index)
         .bind(data.file_id.as_deref())
+        .bind(data.provider_file_id.as_deref())
         .bind(data.path.trim())
         .bind(basename)
         .bind(data.size_bytes)
         .bind(data.selectable)
+        .bind(data.selected)
         .bind(data.parsed_title.as_deref())
         .bind(data.parsed_season_number)
         .bind(data.parsed_episode_number)
@@ -304,6 +388,7 @@ pub async fn upsert_release_file(
         .bind(data.parser_confidence.as_str())
         .bind(data.parser_reason.as_deref())
         .bind(raw_json.as_deref())
+        .bind(provider_metadata_json.as_deref())
         .execute(pool)
         .await
         .context("creating acquisition release file")?;
@@ -323,6 +408,26 @@ pub async fn list_release_files(
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(|row| map_release_file(&row)).collect()
+}
+
+pub async fn update_release_file_selection(
+    pool: &AnyPool,
+    release_file_id: Uuid,
+    selected: Option<bool>,
+) -> Result<Option<AcquisitionReleaseFile>> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_files
+         SET selected = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_file_id = ?",
+    )
+    .bind(selected)
+    .bind(release_file_id.to_string())
+    .execute(pool)
+    .await
+    .context("updating acquisition release file selection")?;
+
+    get_release_file(pool, release_file_id).await
 }
 
 pub async fn upsert_release_coverage(
@@ -410,6 +515,32 @@ pub async fn list_release_coverage(
     rows.into_iter()
         .map(|row| map_release_coverage(&row))
         .collect()
+}
+
+pub async fn update_release_coverage_review_state(
+    pool: &AnyPool,
+    coverage_id: Uuid,
+    state: ReleaseCoverageState,
+    reason: Option<String>,
+    verified_by: Option<String>,
+) -> Result<Option<AcquisitionReleaseCoverage>> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_coverage
+         SET state = ?,
+             reason = ?,
+             verified_by = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE coverage_id = ?",
+    )
+    .bind(state.as_str())
+    .bind(reason.as_deref())
+    .bind(verified_by.as_deref())
+    .bind(coverage_id.to_string())
+    .execute(pool)
+    .await
+    .context("updating acquisition release coverage review state")?;
+
+    get_release_coverage(pool, coverage_id).await
 }
 
 pub async fn upsert_release_job(
@@ -554,6 +685,38 @@ pub async fn count_active_release_jobs_by_route(
     Ok(count)
 }
 
+pub async fn count_active_release_jobs(pool: &AnyPool) -> Result<i64> {
+    let count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_release_jobs
+         WHERE active = 1
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("counting active acquisition release jobs")?;
+    Ok(count)
+}
+
+pub async fn count_active_release_jobs_by_subscription(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_release_jobs j
+         JOIN acquisition_releases r ON r.release_id = j.release_id
+         WHERE j.active = 1
+           AND r.subscription_id = ?
+           AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(pool)
+    .await
+    .context("counting active acquisition release jobs by subscription")?;
+    Ok(count)
+}
+
 pub async fn count_active_release_jobs_by_subscription_route(
     pool: &AnyPool,
     subscription_id: Uuid,
@@ -573,6 +736,24 @@ pub async fn count_active_release_jobs_by_subscription_route(
     .fetch_one(pool)
     .await
     .context("counting active acquisition release jobs by subscription route")?;
+    Ok(count)
+}
+
+pub async fn count_stale_active_release_jobs(
+    pool: &AnyPool,
+    stale_before: DateTime<Utc>,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_release_jobs
+         WHERE active = 1
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND updated_at <= ?",
+    )
+    .bind(db_datetime_string(stale_before))
+    .fetch_one(pool)
+    .await
+    .context("counting stale active acquisition release jobs")?;
     Ok(count)
 }
 
@@ -1305,6 +1486,14 @@ async fn find_release_file(
     if let Some(release_file_id) = data.release_file_id {
         return get_release_file(pool, release_file_id).await;
     }
+    if let Some(provider_file_id) = data.provider_file_id.as_deref() {
+        let row = sqlx::query(RELEASE_FILE_SELECT_BY_PROVIDER_FILE_ID)
+            .bind(data.release_id.to_string())
+            .bind(provider_file_id)
+            .fetch_optional(pool)
+            .await?;
+        return row.map(|row| map_release_file(&row)).transpose();
+    }
     if let Some(file_id) = data.file_id.as_deref() {
         let row = sqlx::query(RELEASE_FILE_SELECT_BY_FILE_ID)
             .bind(data.release_id.to_string())
@@ -1697,10 +1886,12 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
         release_id: parse_uuid(&release_id_raw, "acquisition_release_files.release_id")?,
         file_index: row_get_i64_opt(row, "file_index")?,
         file_id: row_get_opt_string(row, "file_id")?,
+        provider_file_id: row_get_opt_string(row, "provider_file_id")?,
         path: row.try_get("path")?,
         basename: row.try_get("basename")?,
         size_bytes: row_get_i64_opt(row, "size_bytes")?,
         selectable: row_get_bool(row, "selectable")?,
+        selected: row_get_bool_opt(row, "selected")?,
         parsed_title: row_get_opt_string(row, "parsed_title")?,
         parsed_season_number: row_get_i64_opt(row, "parsed_season_number")?
             .map(|value| value as i32),
@@ -1724,6 +1915,10 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
         raw: parse_json_opt(
             row_get_opt_string(row, "raw_json")?,
             "acquisition_release_files.raw_json",
+        )?,
+        provider_metadata: parse_json_opt(
+            row_get_opt_string(row, "provider_metadata_json")?,
+            "acquisition_release_files.provider_metadata_json",
         )?,
         created_at: parse_datetime(
             &row.try_get::<String, _>("created_at")?,
@@ -2264,6 +2459,14 @@ fn row_get_bool(row: &AnyRow, field: &str) -> Result<bool> {
     Ok(matches!(value.as_str(), "1" | "true" | "TRUE"))
 }
 
+fn row_get_bool_opt(row: &AnyRow, field: &str) -> Result<Option<bool>> {
+    let raw = row.try_get_raw(field)?;
+    if raw.type_info().name() == "NULL" {
+        return Ok(None);
+    }
+    row_get_bool(row, field).map(Some)
+}
+
 macro_rules! release_columns {
     () => {
         "release_id,
@@ -2312,6 +2515,26 @@ const RELEASE_SELECT_BY_DOWNLOAD_ID: &str = concat!(
     release_columns!(),
     " FROM acquisition_releases WHERE download_id = ? ORDER BY updated_at DESC LIMIT 1"
 );
+const RELEASE_SELECT_RECENT: &str = concat!(
+    "SELECT ",
+    release_columns!(),
+    " FROM acquisition_releases ORDER BY updated_at DESC LIMIT ?"
+);
+const RELEASE_SELECT_BY_SUBSCRIPTION: &str = concat!(
+    "SELECT ",
+    release_columns!(),
+    " FROM acquisition_releases WHERE subscription_id = ? ORDER BY updated_at DESC LIMIT ?"
+);
+const RELEASE_SELECT_BY_STATE: &str = concat!(
+    "SELECT ",
+    release_columns!(),
+    " FROM acquisition_releases WHERE state = ? ORDER BY updated_at DESC LIMIT ?"
+);
+const RELEASE_SELECT_BY_SUBSCRIPTION_AND_STATE: &str = concat!(
+    "SELECT ",
+    release_columns!(),
+    " FROM acquisition_releases WHERE subscription_id = ? AND state = ? ORDER BY updated_at DESC LIMIT ?"
+);
 
 macro_rules! release_file_columns {
     () => {
@@ -2319,10 +2542,12 @@ macro_rules! release_file_columns {
 release_id,
 file_index,
 CAST(file_id AS TEXT) AS file_id,
+CAST(provider_file_id AS TEXT) AS provider_file_id,
 path,
 basename,
 size_bytes,
 CAST(selectable AS INTEGER) AS selectable,
+CAST(selected AS INTEGER) AS selected,
 CAST(parsed_title AS TEXT) AS parsed_title,
 parsed_season_number,
 parsed_episode_number,
@@ -2336,6 +2561,7 @@ CAST(parsed_release_group AS TEXT) AS parsed_release_group,
 parser_confidence,
 CAST(parser_reason AS TEXT) AS parser_reason,
 CAST(raw_json AS TEXT) AS raw_json,
+CAST(provider_metadata_json AS TEXT) AS provider_metadata_json,
 CAST(created_at AS TEXT) AS created_at,
 CAST(updated_at AS TEXT) AS updated_at"
     };
@@ -2355,6 +2581,11 @@ const RELEASE_FILE_SELECT_BY_FILE_ID: &str = concat!(
     "SELECT ",
     release_file_columns!(),
     " FROM acquisition_release_files WHERE release_id = ? AND file_id = ? LIMIT 1"
+);
+const RELEASE_FILE_SELECT_BY_PROVIDER_FILE_ID: &str = concat!(
+    "SELECT ",
+    release_file_columns!(),
+    " FROM acquisition_release_files WHERE release_id = ? AND provider_file_id = ? LIMIT 1"
 );
 const RELEASE_FILE_SELECT_BY_FILE_INDEX: &str = concat!(
     "SELECT ",
@@ -2716,6 +2947,15 @@ mod tests {
         Ok(database)
     }
 
+    async fn table_columns(pool: &AnyPool, table: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("name").map_err(Into::into))
+            .collect()
+    }
+
     fn sample_release(fingerprint: String) -> NewAcquisitionRelease {
         NewAcquisitionRelease {
             release_id: None,
@@ -2744,6 +2984,37 @@ mod tests {
             selected_candidate: Some(json!({ "title": "Show.S01.COMPLETE.1080p" })),
             coverage_plan: None,
         }
+    }
+
+    #[tokio::test]
+    async fn generic_debrid_staging_migration_columns_exist() -> Result<()> {
+        let database = setup_db().await?;
+        let job_columns = table_columns(&database.pool, "debrid_download_jobs").await?;
+        for column in [
+            "provider_implementation",
+            "remote_release_id",
+            "remote_release_status",
+            "provider_capabilities_json",
+            "selection_mode",
+            "selected_file_ids_json",
+            "skipped_file_ids_json",
+            "selection_error",
+            "release_id",
+        ] {
+            assert!(
+                job_columns.iter().any(|candidate| candidate == column),
+                "missing debrid_download_jobs.{column}"
+            );
+        }
+
+        let file_columns = table_columns(&database.pool, "acquisition_release_files").await?;
+        for column in ["provider_file_id", "selected", "provider_metadata_json"] {
+            assert!(
+                file_columns.iter().any(|candidate| candidate == column),
+                "missing acquisition_release_files.{column}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2836,10 +3107,12 @@ mod tests {
                 release_id: release.release_id,
                 file_index: Some(0),
                 file_id: Some("rd-file-0".to_string()),
+                provider_file_id: Some("rd-file-0".to_string()),
                 path: "Show/Season 01/Show.S01E01.mkv".to_string(),
                 basename: None,
                 size_bytes: Some(1024),
                 selectable: true,
+                selected: Some(false),
                 parsed_title: Some("Show".to_string()),
                 parsed_season_number: Some(1),
                 parsed_episode_number: Some(1),
@@ -2853,6 +3126,7 @@ mod tests {
                 parser_confidence: ReleaseConfidence::High,
                 parser_reason: Some("exact SxxEyy".to_string()),
                 raw: Some(json!({ "id": "rd-file-0" })),
+                provider_metadata: Some(json!({ "providerFileId": "rd-file-0" })),
             },
         )
         .await?;
@@ -2865,10 +3139,12 @@ mod tests {
                     release_id: release.release_id,
                     file_index: Some(0),
                     file_id: Some("rd-file-0".to_string()),
+                    provider_file_id: Some("rd-file-0".to_string()),
                     path: "Show/Season 01/Show.S01E01.mkv".to_string(),
                     basename: None,
                     size_bytes: Some(1024),
                     selectable: true,
+                    selected: Some(true),
                     parsed_title: Some("Show".to_string()),
                     parsed_season_number: Some(1),
                     parsed_episode_number: Some(1),
@@ -2882,12 +3158,21 @@ mod tests {
                     parser_confidence: ReleaseConfidence::High,
                     parser_reason: Some("exact SxxEyy".to_string()),
                     raw: Some(json!({ "id": "rd-file-0" })),
+                    provider_metadata: Some(
+                        json!({ "providerFileId": "rd-file-0", "selected": true }),
+                    ),
                 }
             },
         )
         .await?;
         assert_eq!(file.release_file_id, updated_file.release_file_id);
         assert_eq!(updated_file.size_bytes, Some(2048));
+        assert_eq!(updated_file.provider_file_id.as_deref(), Some("rd-file-0"));
+        assert_eq!(updated_file.selected, Some(true));
+        assert_eq!(
+            updated_file.provider_metadata,
+            Some(json!({ "providerFileId": "rd-file-0", "selected": true }))
+        );
 
         let coverage = upsert_release_coverage(
             &database.pool,
@@ -3145,6 +3430,23 @@ mod tests {
             .await?;
         }
 
+        assert_eq!(count_active_release_jobs(&database.pool).await?, 3);
+        assert_eq!(
+            count_active_release_jobs_by_subscription(
+                &database.pool,
+                subscription_a.subscription_id,
+            )
+            .await?,
+            2
+        );
+        assert_eq!(
+            count_active_release_jobs_by_subscription(
+                &database.pool,
+                subscription_b.subscription_id,
+            )
+            .await?,
+            1
+        );
         assert_eq!(
             count_active_release_jobs_by_route(&database.pool, DEBRID_DEFAULT_LOGICAL_ID).await?,
             2
@@ -3180,6 +3482,30 @@ mod tests {
             .await?,
             1
         );
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET updated_at = ?
+             WHERE download_id = ?",
+        )
+        .bind(db_datetime_string(Utc::now() - chrono::Duration::hours(8)))
+        .bind("torrent-a")
+        .execute(&database.pool)
+        .await?;
+        assert_eq!(
+            count_stale_active_release_jobs(
+                &database.pool,
+                Utc::now() - chrono::Duration::hours(6)
+            )
+            .await?,
+            1
+        );
+        let jobs = list_release_jobs(&database.pool, release_a.release_id).await?;
+        let stale = jobs
+            .iter()
+            .find(|job| job.download_id.as_deref() == Some("torrent-a"))
+            .expect("stale job remains present");
+        assert!(stale.active);
+        assert_eq!(stale.state, ReleaseJobState::Downloading);
         Ok(())
     }
 
@@ -3324,10 +3650,12 @@ mod tests {
                 release_id: release.release_id,
                 file_index: Some(0),
                 file_id: Some("file-1".to_string()),
+                provider_file_id: Some("file-1".to_string()),
                 path: "Anime Series/Anime Series - 01.mkv".to_string(),
                 basename: None,
                 size_bytes: Some(1234),
                 selectable: true,
+                selected: None,
                 parsed_title: Some("Anime Series".to_string()),
                 parsed_season_number: None,
                 parsed_episode_number: None,
@@ -3341,6 +3669,7 @@ mod tests {
                 parser_confidence: ReleaseConfidence::High,
                 parser_reason: Some("absolute episode".to_string()),
                 raw: Some(json!({ "index": 0 })),
+                provider_metadata: None,
             },
         )
         .await?;
@@ -3508,10 +3837,12 @@ mod tests {
                 release_id: release.release_id,
                 file_index: Some(0),
                 file_id: Some("file-1".to_string()),
+                provider_file_id: Some("file-1".to_string()),
                 path: "Anime Series/Anime Series - 01.mkv".to_string(),
                 basename: None,
                 size_bytes: Some(1234),
                 selectable: true,
+                selected: None,
                 parsed_title: Some("Anime Series".to_string()),
                 parsed_season_number: None,
                 parsed_episode_number: None,
@@ -3525,6 +3856,7 @@ mod tests {
                 parser_confidence: ReleaseConfidence::High,
                 parser_reason: Some("absolute episode".to_string()),
                 raw: None,
+                provider_metadata: None,
             },
         )
         .await?;

@@ -86,6 +86,7 @@ impl ExtensionManifest {
                 validate_scope_media_for_capability(&provide.capability, scope)?;
             }
             validate_scope_actions_for_capability(&provide.capability, provide.scope.as_ref())?;
+            validate_debrid_provider_contract(self, provide)?;
         }
 
         self.requires.validate()?;
@@ -542,6 +543,8 @@ pub struct ManifestDownloadBrokerProviderScope {
     pub kind: Option<String>,
     #[serde(default)]
     pub logical_id: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<serde_json::Value>,
 }
 
 impl ManifestDownloadBrokerProviderScope {
@@ -573,6 +576,11 @@ impl ManifestDownloadBrokerProviderScope {
                     logical_id
                 );
             }
+        }
+        if let Some(capabilities) = self.capabilities.as_ref()
+            && !capabilities.is_object()
+        {
+            bail!("{prefix}.capabilities must be an object");
         }
         Ok(())
     }
@@ -1512,7 +1520,12 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match extension_id {
-        "elixir.blueprints.arr_stack" => false,
+        "elixir.blueprints.arr_stack" => ensure_string_array_item_after(
+            raw_json,
+            "connectors",
+            "elixir.connectors.nzbget_defaults",
+            "elixir.connectors.qbittorrent_defaults",
+        ),
         "elixir.modules.qbittorrent" => repair_downloader_broker_scope(
             raw_json,
             "downloader.torrent",
@@ -2034,6 +2047,82 @@ fn validate_scope_actions_for_capability(
     Ok(())
 }
 
+fn validate_debrid_provider_contract(
+    manifest: &ExtensionManifest,
+    provide: &ManifestProvide,
+) -> Result<()> {
+    if !provide
+        .capability
+        .trim()
+        .eq_ignore_ascii_case("debrid.resolver")
+    {
+        return Ok(());
+    }
+    let implementation = provide
+        .implementation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("debrid.resolver providers must declare provides.implementation")
+        })?;
+    if implementation.contains(char::is_whitespace) {
+        bail!("debrid.resolver provides.implementation must be a stable id without whitespace");
+    }
+    let scope = provide
+        .scope
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("debrid.resolver providers must declare provides.scope"))?;
+    let broker = scope
+        .download_broker
+        .as_ref()
+        .or(scope.broker.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("debrid.resolver providers must declare provides.scope.download_broker")
+        })?;
+    if broker.enabled == Some(false) {
+        bail!("debrid.resolver providers cannot disable provides.scope.download_broker");
+    }
+    let provider_kind = broker
+        .provider_kind
+        .as_deref()
+        .or(broker.kind.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "debrid.resolver providers must declare provides.scope.download_broker.provider_kind"
+            )
+        })?;
+    if provider_kind != "debrid" {
+        bail!(
+            "debrid.resolver providers must use provides.scope.download_broker.provider_kind 'debrid'"
+        );
+    }
+    let logical_id = broker
+        .logical_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "debrid.resolver providers must declare provides.scope.download_broker.logical_id"
+            )
+        })?;
+    if logical_id != "acquisition.debrid.default" {
+        bail!("debrid.resolver providers must bind to logical route 'acquisition.debrid.default'");
+    }
+    if provide.endpoint.is_none() && manifest.networking.is_none() {
+        bail!(
+            "debrid.resolver providers must declare an endpoint or module networking service port"
+        );
+    }
+    if provide.healthcheck.is_none() {
+        bail!("debrid.resolver providers must declare a healthcheck for readiness");
+    }
+    Ok(())
+}
+
 fn validate_scope_media_for_capability(
     capability: &str,
     scope: &ManifestProviderScope,
@@ -2062,7 +2151,7 @@ fn validate_scope_media_for_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn manifest_accepts_container_backup_policy() {
@@ -2259,6 +2348,108 @@ runtime:
 "#;
         let err = parse_manifest_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("does not match kind"));
+    }
+
+    #[test]
+    fn manifest_accepts_debrid_resolver_provider_contract() {
+        let yaml = r#"
+id: elixir.modules.premiumize
+version: 1.0.0
+kind: module
+name: Premiumize
+provides:
+  - capability: debrid.resolver
+    slot: default
+    implementation: premiumize
+    scope:
+      requires_account: true
+      required_fields: ["api_token"]
+      download_broker:
+        enabled: true
+        provider_kind: debrid
+        logical_id: acquisition.debrid.default
+        capabilities:
+          magnetSubmit: true
+          hosterUnrestrict: true
+          fileListing: true
+          fileSelection: true
+          fileSelectionMode: before_transfer
+    endpoint:
+      type: http
+      scheme: http
+      port: 8080
+      base_path: /api
+    healthcheck:
+      type: http
+      path: /health
+runtime:
+  type: container
+  image: example/premiumize:1
+  network: elixir_net
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("debrid manifest should parse");
+        let provide = &parsed.manifest.provides[0];
+        assert_eq!(provide.capability, "debrid.resolver");
+        let scope = provide.scope.as_ref().expect("scope");
+        let broker = scope.download_broker.as_ref().expect("broker scope");
+        assert_eq!(broker.provider_kind.as_deref(), Some("debrid"));
+        assert_eq!(
+            broker.logical_id.as_deref(),
+            Some("acquisition.debrid.default")
+        );
+        assert!(broker.capabilities.as_ref().is_some_and(Value::is_object));
+    }
+
+    #[test]
+    fn manifest_rejects_debrid_resolver_without_route_contract() {
+        let yaml = r#"
+id: elixir.modules.bad_debrid
+version: 1.0.0
+kind: module
+name: Bad Debrid
+provides:
+  - capability: debrid.resolver
+    slot: default
+    implementation: bad_debrid
+runtime:
+  type: container
+  image: example/bad-debrid:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("debrid.resolver providers must declare provides.scope")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_debrid_resolver_with_ambiguous_broker_kind() {
+        let yaml = r#"
+id: elixir.modules.bad_debrid
+version: 1.0.0
+kind: module
+name: Bad Debrid
+provides:
+  - capability: debrid.resolver
+    slot: default
+    implementation: bad_debrid
+    scope:
+      download_broker:
+        provider_kind: external
+        logical_id: acquisition.debrid.default
+    endpoint:
+      type: http
+      scheme: http
+      port: 8080
+    healthcheck:
+      type: http
+      path: /health
+runtime:
+  type: container
+  image: example/bad-debrid:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("provider_kind 'debrid'"));
     }
 
     #[test]

@@ -154,6 +154,208 @@ pub async fn ingest_managed_movie_import(
         .await
 }
 
+#[derive(Debug, Clone)]
+pub struct AcquisitionLibraryImport {
+    pub media_type: MediaType,
+    pub title: String,
+    pub year: Option<i32>,
+    pub external_ids: ExternalIds,
+    pub files: Vec<AcquisitionLibraryImportFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcquisitionLibraryImportFile {
+    pub path: String,
+    pub size_bytes: Option<i64>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+    pub absolute_episode_number: Option<i32>,
+    pub episode_title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionLibraryImportFileResult {
+    pub path: String,
+    pub media_file_id: Uuid,
+    pub movie_id: Option<Uuid>,
+    pub episode_id: Option<Uuid>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionLibraryImportResult {
+    pub media_item_id: Uuid,
+    pub files: Vec<AcquisitionLibraryImportFileResult>,
+}
+
+pub async fn ingest_acquisition_library_import(
+    pool: &AnyPool,
+    request: AcquisitionLibraryImport,
+) -> Result<AcquisitionLibraryImportResult> {
+    if request.files.is_empty() {
+        anyhow::bail!("acquisition library import requires at least one file");
+    }
+
+    let identity = MediaIdentity {
+        r#type: request.media_type,
+        external_ids: request.external_ids.clone(),
+        title: request.title.clone(),
+        year: request.year,
+        season: None,
+        episode: None,
+    };
+
+    match request.media_type {
+        MediaType::Movie => {
+            let Some(file) = request
+                .files
+                .iter()
+                .find(|file| !file.path.trim().is_empty())
+            else {
+                anyhow::bail!("movie acquisition import has no usable file path");
+            };
+            let Some(descriptor) = descriptor_from_acquisition_import_file(file).await? else {
+                anyhow::bail!("movie acquisition import file is missing or not a regular file");
+            };
+            let movie_id = upsert_movie(pool, &identity, &request.external_ids, None).await?;
+            persist_movie_external_ids(pool, movie_id, &request.external_ids, "acquisition")
+                .await?;
+            upsert_legacy_media_item(pool, movie_id, &identity, &request.external_ids, None)
+                .await?;
+            let media_file =
+                upsert_media_file(pool, movie_id, None, &descriptor, None, false).await?;
+            link_movie_file(pool, movie_id, media_file.id).await?;
+            if let Some(duration) = media_file.duration_seconds {
+                update_movie_runtime_if_missing(pool, movie_id, duration).await?;
+            }
+            Ok(AcquisitionLibraryImportResult {
+                media_item_id: movie_id,
+                files: vec![AcquisitionLibraryImportFileResult {
+                    path: descriptor.path,
+                    media_file_id: media_file.id,
+                    movie_id: Some(movie_id),
+                    episode_id: None,
+                    season_number: None,
+                    episode_number: None,
+                }],
+            })
+        }
+        MediaType::Series | MediaType::Anime => {
+            let series_ids = if request.media_type == MediaType::Anime {
+                strip_anime_ids(&request.external_ids)
+            } else {
+                request.external_ids.clone()
+            };
+            let series_id = upsert_series(pool, &identity, &series_ids, None).await?;
+            upsert_legacy_media_item(pool, series_id, &identity, &series_ids, None).await?;
+            persist_series_external_ids(pool, series_id, &series_ids, "acquisition").await?;
+            if request.media_type == MediaType::Anime {
+                mark_series_as_anime(pool, series_id).await?;
+            }
+
+            let mut season_ids: HashMap<i32, Uuid> = HashMap::new();
+            let mut media_files_by_path: HashMap<String, MediaFileUpsert> = HashMap::new();
+            let mut results = Vec::new();
+
+            for file in &request.files {
+                let season_number = file.season_number.unwrap_or(1);
+                let Some(episode_number) = file.episode_number else {
+                    anyhow::bail!(
+                        "series acquisition import file '{}' is missing an episode number",
+                        file.path
+                    );
+                };
+                let Some(descriptor) = descriptor_from_acquisition_import_file(file).await? else {
+                    anyhow::bail!(
+                        "series acquisition import file '{}' is missing or not a regular file",
+                        file.path
+                    );
+                };
+                let season_id = if let Some(season_id) = season_ids.get(&season_number).copied() {
+                    season_id
+                } else {
+                    let season_id = upsert_season(pool, series_id, season_number).await?;
+                    season_ids.insert(season_number, season_id);
+                    season_id
+                };
+                let episode_id = upsert_episode(
+                    pool,
+                    series_id,
+                    season_id,
+                    season_number,
+                    episode_number,
+                    file.absolute_episode_number,
+                )
+                .await?;
+                if let Some(title) = file
+                    .episode_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    update_episode_title_if_missing(pool, episode_id, title).await?;
+                }
+
+                let media_file = if let Some(media_file) = media_files_by_path.get(&descriptor.path)
+                {
+                    *media_file
+                } else {
+                    let media_file =
+                        upsert_media_file(pool, series_id, None, &descriptor, None, false).await?;
+                    media_files_by_path.insert(descriptor.path.clone(), media_file);
+                    media_file
+                };
+                link_episode_file(pool, episode_id, media_file.id).await?;
+                mark_episode_has_file(pool, episode_id).await?;
+                if let Some(duration) = media_file.duration_seconds {
+                    update_episode_runtime_if_missing(pool, episode_id, duration).await?;
+                }
+                results.push(AcquisitionLibraryImportFileResult {
+                    path: descriptor.path,
+                    media_file_id: media_file.id,
+                    movie_id: None,
+                    episode_id: Some(episode_id),
+                    season_number: Some(season_number),
+                    episode_number: Some(episode_number),
+                });
+            }
+
+            if results.is_empty() {
+                anyhow::bail!("series acquisition import did not link any files");
+            }
+            refresh_episode_file_state(pool).await?;
+            Ok(AcquisitionLibraryImportResult {
+                media_item_id: series_id,
+                files: results,
+            })
+        }
+    }
+}
+
+async fn descriptor_from_acquisition_import_file(
+    file: &AcquisitionLibraryImportFile,
+) -> Result<Option<FileDescriptor>> {
+    let path = file.path.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let file_metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(None),
+    };
+    Ok(Some(FileDescriptor {
+        path: path.to_string(),
+        size_bytes: Some(file_metadata.len() as i64).or(file.size_bytes),
+        hash: None,
+        container: Path::new(path)
+            .extension()
+            .map(|value| value.to_string_lossy().to_string()),
+        video_codec: None,
+        audio_codec: None,
+    }))
+}
+
 #[derive(Debug, Clone, Default)]
 struct MetadataHydration {
     meta: Option<MetadataResult>,

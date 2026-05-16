@@ -224,6 +224,11 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    let acquisition_import_state = state.clone();
+    tokio::spawn(async move {
+        acquisition::imports::start_acquisition_import_loop(acquisition_import_state).await;
+    });
+
     let debrid_materializer_state = state.clone();
     tokio::spawn(async move {
         debrid::start_debrid_materializer_loop(debrid_materializer_state).await;
