@@ -69,6 +69,8 @@ use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
 
+const ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY: &str = "acquisition.candidate_provider";
+
 pub enum ExecutorAction {
     EnsureInstanceInstalled {
         instance_id: Uuid,
@@ -2639,6 +2641,10 @@ impl<'a> Executor<'a> {
         provider: &Provider,
         instance: &crate::db::models::ExtensionInstance,
     ) -> Result<()> {
+        if provider.capability == ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY {
+            ensure_candidate_provider_runtime_ready(provider).await?;
+            return Ok(());
+        }
         let Some(driver) = self.drivers.get(&provider.capability) else {
             return Ok(());
         };
@@ -4384,6 +4390,62 @@ async fn resolve_driver_transport_base_url(
     }
 
     Ok(None)
+}
+
+async fn ensure_candidate_provider_runtime_ready(provider: &Provider) -> Result<()> {
+    let endpoint_json = provider.endpoint_json.as_ref().cloned().ok_or_else(|| {
+        anyhow!(
+            "candidate provider {} has no endpoint",
+            provider.provider_id
+        )
+    })?;
+    let endpoint: ProviderEndpoint =
+        serde_json::from_value(endpoint_json).context("parsing candidate provider endpoint")?;
+    endpoint.validate()?;
+    let base_url = resolve_driver_transport_base_url(provider.instance_id, &endpoint)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "candidate provider transport is not ready for instance {} endpoint {}:{}",
+                provider.instance_id,
+                endpoint.host,
+                endpoint.port
+            )
+        })?;
+    let mut base = Url::parse(&base_url).context("parsing candidate provider base URL")?;
+    let mut path = base.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        path.push('/');
+    } else {
+        path.push('/');
+    }
+    base.set_path(&path);
+    let health_url = base
+        .join("health")
+        .context("building candidate provider health URL")?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building candidate provider health client")?
+        .get(health_url.clone())
+        .send()
+        .await
+        .with_context(|| format!("calling candidate provider health endpoint at {health_url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("candidate provider health endpoint returned {status}");
+    }
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("parsing candidate provider health response")?;
+    if payload.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        bail!("candidate provider health endpoint reported not ok");
+    }
+    if payload.get("ready").and_then(serde_json::Value::as_bool) == Some(false) {
+        bail!("candidate provider health endpoint reported not ready");
+    }
+    Ok(())
 }
 
 fn probe_container_host(host: &str) -> String {

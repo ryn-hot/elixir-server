@@ -5,7 +5,7 @@ name: "Radarr Quality Policy"
 description: "Apply Elixir's blended TRaSH quality policy preset to Radarr."
 publisher:
   name: "Elixir"
-  key_id: "ed25519:ZXcPdxnr1ziJpDC3TwCNXWkt1vG7njkyQ/3l52mEhQI="
+  key_id: "ed25519:DK6TdfETFxJk61DW/CXhzzq5TRFi4I98XD5FXGpSmNg="
 trust: community
 permissions:
   - drivers.configure.media.manager.movies

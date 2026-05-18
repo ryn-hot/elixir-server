@@ -119,6 +119,10 @@ pub fn router(state: AppState) -> Router {
                 .post(handlers::acquisition_subscriptions::create_acquisition_subscription),
         )
         .route(
+            "/api/v1/acquisition/intents",
+            post(handlers::acquisition_subscriptions::create_acquisition_intent),
+        )
+        .route(
             "/api/v1/acquisition/subscriptions/:subscription_id",
             get(handlers::acquisition_subscriptions::get_acquisition_subscription)
                 .patch(handlers::acquisition_subscriptions::patch_acquisition_subscription),
@@ -462,7 +466,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/find-media/acquisition",
-            get(handlers::discovery::find_media_acquisition),
+            get(handlers::discovery::find_media_acquisition)
+                .post(handlers::acquisition_subscriptions::create_acquisition_intent),
         )
         .route(
             "/api/v1/find-media/acquisition/:intent_id/find-another-release",
@@ -470,7 +475,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/find/acquisition",
-            get(handlers::discovery::find_media_acquisition),
+            get(handlers::discovery::find_media_acquisition)
+                .post(handlers::acquisition_subscriptions::create_acquisition_intent),
         )
         .route(
             "/api/v1/find/acquisition/:intent_id/find-another-release",

@@ -198,17 +198,29 @@ async fn build_owned_setting_sections(
     control_surface: &ManifestControlSurface,
 ) -> anyhow::Result<Vec<ExtensionControlSection>> {
     let mut seeded_fields = Vec::new();
+    let mut seeded_advanced_fields = Vec::new();
     let mut managed_fields = Vec::new();
+    let mut managed_advanced_fields = Vec::new();
     let mut seeded_requires_instance = false;
+    let mut seeded_advanced_requires_instance = false;
     let mut managed_requires_instance = false;
+    let mut managed_advanced_requires_instance = false;
 
     for setting in &control_surface.owned_settings {
         let field = read_owned_setting_field(state, store, context, setting).await?;
         let requires_instance =
             field.readonly && uses_instance_scope(setting) && context.selected_instance.is_none();
         if setting.ownership_mode().eq_ignore_ascii_case("seeded") {
-            seeded_requires_instance |= requires_instance;
-            seeded_fields.push(field);
+            if setting.advanced {
+                seeded_advanced_requires_instance |= requires_instance;
+                seeded_advanced_fields.push(field);
+            } else {
+                seeded_requires_instance |= requires_instance;
+                seeded_fields.push(field);
+            }
+        } else if setting.advanced {
+            managed_advanced_requires_instance |= requires_instance;
+            managed_advanced_fields.push(field);
         } else {
             managed_requires_instance |= requires_instance;
             managed_fields.push(field);
@@ -217,57 +229,101 @@ async fn build_owned_setting_sections(
 
     let mut sections = Vec::new();
     if !seeded_fields.is_empty() {
-        let mut notices = Vec::new();
-        if seeded_requires_instance {
-            notices.push(control_notice(
-                "warning",
-                "instance_required",
-                "Enable a default instance first",
-                "This extension stores some seeded defaults per instance. Create or enable a default instance before editing them here.",
-            ));
-        }
-        sections.push(ExtensionControlSection {
-            id: "ownedSettingsSeeded".to_string(),
-            title: "Seeded settings".to_string(),
-            description:
-                "Elixir can seed these defaults for the extension, but downstream overrides are allowed and can become the new live value."
-                    .to_string(),
-            policy: Some(control_policy_seeded(
-                "These are extension-defined seeded defaults. Elixir writes them intentionally, but does not treat downstream changes as drift by default.",
-            )),
-            notices,
-            fields: seeded_fields,
-            entities: Vec::new(),
-            actions: Vec::new(),
-        });
+        sections.push(seed_settings_section(
+            "ownedSettingsSeeded",
+            "Seeded settings",
+            seeded_requires_instance,
+            seeded_fields,
+        ));
+    }
+    if !seeded_advanced_fields.is_empty() {
+        sections.push(seed_settings_section(
+            "ownedSettingsSeededAdvanced",
+            "Advanced settings",
+            seeded_advanced_requires_instance,
+            seeded_advanced_fields,
+        ));
     }
     if !managed_fields.is_empty() {
-        let mut notices = Vec::new();
-        if managed_requires_instance {
-            notices.push(control_notice(
-                "warning",
-                "instance_required",
-                "Enable a default instance first",
-                "This extension stores some managed settings per instance. Create or enable a default instance before editing them here.",
-            ));
-        }
-        sections.push(ExtensionControlSection {
-            id: "ownedSettingsManaged".to_string(),
-            title: "Managed settings".to_string(),
-            description:
-                "These extension-defined settings are explicitly owned by Elixir. Downstream tools should not silently redefine them."
-                    .to_string(),
-            policy: Some(control_policy_managed(
-                "These settings are declared as managed by the extension. Elixir owns their meaning and should not silently adopt downstream changes as the new source of truth.",
-            )),
-            notices,
-            fields: managed_fields,
-            entities: Vec::new(),
-            actions: Vec::new(),
-        });
+        sections.push(managed_settings_section(
+            "ownedSettingsManaged",
+            "Managed settings",
+            managed_requires_instance,
+            managed_fields,
+        ));
+    }
+    if !managed_advanced_fields.is_empty() {
+        sections.push(managed_settings_section(
+            "ownedSettingsManagedAdvanced",
+            "Advanced managed settings",
+            managed_advanced_requires_instance,
+            managed_advanced_fields,
+        ));
     }
 
     Ok(sections)
+}
+
+fn seed_settings_section(
+    id: &str,
+    title: &str,
+    requires_instance: bool,
+    fields: Vec<ExtensionControlField>,
+) -> ExtensionControlSection {
+    let mut notices = Vec::new();
+    if requires_instance {
+        notices.push(control_notice(
+            "warning",
+            "instance_required",
+            "Enable a default instance first",
+            "This extension stores some seeded defaults per instance. Create or enable a default instance before editing them here.",
+        ));
+    }
+    ExtensionControlSection {
+        id: id.to_string(),
+        title: title.to_string(),
+        description:
+            "Elixir can seed these defaults for the extension, but downstream overrides are allowed and can become the new live value."
+                .to_string(),
+        policy: Some(control_policy_seeded(
+            "These are extension-defined seeded defaults. Elixir writes them intentionally, but does not treat downstream changes as drift by default.",
+        )),
+        notices,
+        fields,
+        entities: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+fn managed_settings_section(
+    id: &str,
+    title: &str,
+    requires_instance: bool,
+    fields: Vec<ExtensionControlField>,
+) -> ExtensionControlSection {
+    let mut notices = Vec::new();
+    if requires_instance {
+        notices.push(control_notice(
+            "warning",
+            "instance_required",
+            "Enable a default instance first",
+            "This extension stores some managed settings per instance. Create or enable a default instance before editing them here.",
+        ));
+    }
+    ExtensionControlSection {
+        id: id.to_string(),
+        title: title.to_string(),
+        description:
+            "These extension-defined settings are explicitly owned by Elixir. Downstream tools should not silently redefine them."
+                .to_string(),
+        policy: Some(control_policy_managed(
+            "These settings are declared as managed by the extension. Elixir owns their meaning and should not silently adopt downstream changes as the new source of truth.",
+        )),
+        notices,
+        fields,
+        entities: Vec::new(),
+        actions: Vec::new(),
+    }
 }
 
 async fn read_owned_setting_field(
@@ -317,6 +373,7 @@ async fn read_owned_setting_value(
             let value = store
                 .get_extension_setting(&key)
                 .await?
+                .or_else(|| setting.default.clone())
                 .unwrap_or(serde_json::Value::Null);
             Ok((value, false))
         }
@@ -329,6 +386,7 @@ async fn read_owned_setting_value(
                 .as_ref()
                 .and_then(|config| config.get(&setting.storage.key))
                 .cloned()
+                .or_else(|| setting.default.clone())
                 .unwrap_or(serde_json::Value::Null);
             Ok((value, false))
         }

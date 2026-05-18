@@ -16,6 +16,9 @@ pub const TORRENT_DEFAULT_LOGICAL_ID: &str = "downloaders.torrent.default";
 pub const USENET_DEFAULT_LOGICAL_ID: &str = "downloaders.usenet.default";
 pub const DEBRID_DEFAULT_LOGICAL_ID: &str = "acquisition.debrid.default";
 pub const DEFAULT_ROUTE_OWNER_ID: &str = "default";
+pub const DEBRID_ACCOUNT_MISSING_MESSAGE: &str = "Add debrid account";
+pub const DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE: &str = "Active debrid service is not configured";
+pub const DEBRID_SERVICE_UNAVAILABLE_MESSAGE: &str = "Active debrid service is unavailable";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -589,43 +592,63 @@ fn route_record_for_binding(
         && effective_binding
             .and_then(|binding| binding.provider_id)
             .is_none();
-    let blocker = if selected.is_some() {
+    let debrid_selected_unhealthy = selected.as_ref().is_some_and(|record| {
+        role == DownloadBrokerRole::DebridResolver
+            && record.health_state == ProviderHealthState::Unhealthy
+    });
+    let blocker = if selected.is_some() && !debrid_selected_unhealthy {
         checks.push(route_check(
             "download_route_provider_selected",
             DownloadBrokerRouteCheckStatus::Pass,
             "The route resolves to a concrete acquisition provider.",
         ));
         None
+    } else if debrid_selected_unhealthy {
+        checks.push(route_check(
+            "download_route_debrid_service_unavailable",
+            DownloadBrokerRouteCheckStatus::Fail,
+            DEBRID_SERVICE_UNAVAILABLE_MESSAGE,
+        ));
+        Some(DEBRID_SERVICE_UNAVAILABLE_MESSAGE.to_string())
     } else if debrid_default_ambiguous {
+        let detail = if role == DownloadBrokerRole::DebridResolver {
+            DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE
+        } else {
+            "Multiple debrid resolver providers are registered. Select one default debrid provider explicitly."
+        };
         checks.push(route_check(
             "download_route_debrid_default_ambiguous",
             DownloadBrokerRouteCheckStatus::Fail,
-            "Multiple debrid resolver providers are registered. Select one default debrid provider explicitly.",
+            detail,
         ));
-        Some(
-            "Multiple debrid resolver providers are registered. Select one default debrid provider explicitly."
-                .to_string(),
-        )
+        Some(detail.to_string())
     } else if candidates.is_empty() {
+        let detail = if role == DownloadBrokerRole::DebridResolver {
+            DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE
+        } else {
+            "No provider is registered for this acquisition route."
+        };
         checks.push(route_check(
             "download_route_provider_missing",
             DownloadBrokerRouteCheckStatus::Fail,
-            "No provider is registered for this acquisition route.",
+            detail,
         ));
-        Some("No provider is registered for this acquisition route.".to_string())
+        Some(detail.to_string())
     } else {
+        let detail = if role == DownloadBrokerRole::DebridResolver {
+            DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE.to_string()
+        } else {
+            format!(
+                "No provider matches binding kind '{}'.",
+                binding_kind.as_str()
+            )
+        };
         checks.push(route_check(
             "download_route_provider_binding_unmatched",
             DownloadBrokerRouteCheckStatus::Fail,
-            &format!(
-                "No provider matches binding kind '{}'.",
-                binding_kind.as_str()
-            ),
+            &detail,
         ));
-        Some(format!(
-            "No provider matches binding kind '{}'.",
-            binding_kind.as_str()
-        ))
+        Some(detail)
     };
     let owner_id = route_owner_id(Some(owner_id));
     let category = effective_binding
@@ -1593,7 +1616,7 @@ mod tests {
                 .blocker
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Multiple debrid")
+                .contains(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE)
         );
         assert!(debrid.checks.iter().any(|check| {
             check.code == "download_route_debrid_default_ambiguous"
@@ -1608,7 +1631,10 @@ mod tests {
         )
         .await
         .expect_err("ambiguous debrid route should not resolve");
-        assert!(err.to_string().contains("Multiple debrid"));
+        assert!(
+            err.to_string()
+                .contains(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE)
+        );
 
         let route = upsert_acquisition_route(
             &database.pool,

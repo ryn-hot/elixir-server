@@ -5,7 +5,7 @@ name: "Prowlarr"
 description: "Indexer registry module backed by Prowlarr."
 publisher:
   name: "Elixir"
-  key_id: "ed25519:ZXcPdxnr1ziJpDC3TwCNXWkt1vG7njkyQ/3l52mEhQI="
+  key_id: "ed25519:DK6TdfETFxJk61DW/CXhzzq5TRFi4I98XD5FXGpSmNg="
 trust: community
 permissions:
   - runtime.manage_containers

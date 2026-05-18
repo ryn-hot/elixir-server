@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     body::{self, Body},
     extract::{Path as AxumPath, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
 };
@@ -40,7 +40,7 @@ use crate::{
     db::Database,
     db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, MediaType, OrchestratorRunStatus,
-        ProviderHealthState, SecretScope, SlotCardinality,
+        ProviderHealthState, ProviderReadinessPhase, SecretScope, SlotCardinality,
     },
     extensions::ExtensionManager,
     extensions::ExternalIds,
@@ -106,6 +106,30 @@ fn control_surface_section<'a>(payload: &'a Value, section_id: &str) -> &'a Valu
                 .find(|section| section.get("id").and_then(Value::as_str) == Some(section_id))
         })
         .unwrap_or_else(|| panic!("missing control-surface section '{section_id}': {payload}"))
+}
+
+fn control_section_field<'a>(section: &'a Value, field_id: &str) -> &'a Value {
+    section
+        .get("fields")
+        .and_then(Value::as_array)
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|field| field.get("id").and_then(Value::as_str) == Some(field_id))
+        })
+        .unwrap_or_else(|| panic!("missing control-surface field '{field_id}': {section}"))
+}
+
+fn control_section_entity<'a>(section: &'a Value, entity_id: &str) -> &'a Value {
+    section
+        .get("entities")
+        .and_then(Value::as_array)
+        .and_then(|entities| {
+            entities
+                .iter()
+                .find(|entity| entity.get("id").and_then(Value::as_str) == Some(entity_id))
+        })
+        .unwrap_or_else(|| panic!("missing control-surface entity '{entity_id}': {section}"))
 }
 
 async fn setup_extension_instance(
@@ -368,6 +392,231 @@ async fn setup_generic_control_surface_extension() -> Result<(Router, AppState, 
     setup_generic_control_surface_extension_with_id("elixir.modules.generic_control").await
 }
 
+async fn setup_debrid_control_surface_extension() -> Result<(Router, AppState, Uuid)> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    crate::debrid::ensure_debrid_builtin(&state).await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let instance = store
+        .list_instances(Some(crate::debrid::DEBRID_EXTENSION_ID))
+        .await?
+        .into_iter()
+        .next()
+        .context("debrid default instance should exist")?;
+    let app = router(state.clone());
+    Ok((app, state, instance.instance_id))
+}
+
+async fn seed_lifecycle_safety_extension_provider(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    name: &str,
+    capability: &str,
+    implementation: &str,
+) -> Result<(Uuid, Uuid)> {
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "1.0.0",
+                "kind": "module",
+                "name": name,
+                "provides": [{
+                    "capability": capability,
+                    "slot": "default",
+                    "implementation": implementation
+                }]
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "fixture": true })),
+            enabled: true,
+        })
+        .await?;
+
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: capability.to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some(implementation.to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "localhost",
+                "port": 1,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    Ok((instance_id, provider_id))
+}
+
+async fn start_mock_torbox_account_server() -> Result<(String, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = Router::new().route("/api/user/me", get(mock_torbox_account));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    Ok((format!("http://{address}/api"), shutdown_tx))
+}
+
+async fn mock_torbox_account(headers: HeaderMap) -> impl IntoResponse {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if authorization != "Bearer tb-token" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "detail": "Invalid API token."
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "success": true,
+        "detail": "User data retrieved successfully.",
+        "data": {
+            "id": 44,
+            "username": "torbox-user"
+        }
+    }))
+    .into_response()
+}
+
+async fn start_mock_all_debrid_account_server() -> Result<(String, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = Router::new().route("/v4/user", get(mock_all_debrid_account));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    Ok((format!("http://{address}/v4"), shutdown_tx))
+}
+
+async fn mock_all_debrid_account(headers: HeaderMap) -> impl IntoResponse {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if authorization != "Bearer ad-token" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "error": {
+                    "code": "AUTH_BAD_APIKEY",
+                    "message": "The auth apikey is invalid"
+                }
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "status": "success",
+        "data": {
+            "user": {
+                "id": 55,
+                "username": "alldebrid-user"
+            }
+        }
+    }))
+    .into_response()
+}
+
+async fn start_mock_premiumize_account_server() -> Result<(String, oneshot::Sender<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = Router::new().route("/api/account/info", get(mock_premiumize_account));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    Ok((format!("http://{address}/api"), shutdown_tx))
+}
+
+async fn mock_premiumize_account(headers: HeaderMap) -> impl IntoResponse {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if authorization != "Bearer pm-token" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "authentication_failed",
+                "message": "The API token is invalid"
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "status": "success",
+        "customer_id": "pm-customer-123",
+        "premium_until": 1799999999_i64,
+        "limit_used": 0.23
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Clone)]
 struct TestPackage {
     path: PathBuf,
     hash: String,
@@ -379,12 +628,31 @@ struct TestPackage {
 
 struct RegistryState {
     registry_json: Value,
-    package_bytes: Vec<u8>,
+    packages: BTreeMap<String, Vec<u8>>,
+}
+
+struct TestSigningIdentity {
+    signing_key: SigningKey,
+    publisher_key_id: String,
 }
 
 async fn build_signed_package(temp_dir: &std::path::Path) -> Result<TestPackage> {
     let extension_id = "elixir.test.signed".to_string();
     let version = "0.1.0".to_string();
+    let identity = test_signing_identity();
+    let manifest = signed_test_manifest(&extension_id, &version, &identity.publisher_key_id);
+    build_signed_package_from_manifest(
+        temp_dir,
+        "signed.elx",
+        manifest,
+        extension_id,
+        version,
+        &identity,
+    )
+    .await
+}
+
+fn test_signing_identity() -> TestSigningIdentity {
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
     let signing_key = SigningKey::from_bytes(&secret);
@@ -393,12 +661,196 @@ async fn build_signed_package(temp_dir: &std::path::Path) -> Result<TestPackage>
         "ed25519:{}",
         general_purpose::STANDARD.encode(public_key.to_bytes())
     );
+    TestSigningIdentity {
+        signing_key,
+        publisher_key_id,
+    }
+}
 
-    let manifest = format!(
+fn signed_test_manifest(extension_id: &str, version: &str, publisher_key_id: &str) -> String {
+    format!(
         "id: {extension_id}\nversion: {version}\nkind: module\nname: \"Signed Test\"\npublisher:\n  name: \"Test Publisher\"\n  key_id: \"{publisher_key_id}\"\nprovides:\n  - capability: media.manager.tv\n    slot: default\n    implementation: \"sonarr\"\nruntime:\n  type: container\n  image: \"example/test:1\"\n"
-    );
+    )
+}
 
-    let package_path = temp_dir.join("signed.elx");
+fn torrentio_candidate_provider_manifest(version: &str, publisher_key_id: &str) -> String {
+    format!(
+        r#"id: elixir.sources.torrentio_stremio
+version: {version}
+kind: module
+name: "Torrentio-Compatible Source"
+description: "External source provider that converts Stremio/Torrentio-compatible stream results into Elixir acquisition candidates."
+publisher:
+  name: "Elixir Community"
+  key_id: "{publisher_key_id}"
+trust: community
+permissions:
+  - runtime.manage_containers
+  - network.egress
+provides:
+  - capability: acquisition.candidate_provider
+    slot: default
+    cardinality: many
+    implementation: torrentio_stremio
+    scope:
+      media_types: ["movie", "tv", "anime"]
+      actions: ["search"]
+      requires_account: false
+      required_fields: []
+runtime:
+  type: container
+  image: "elixir/torrentio-candidate-provider:{version}"
+  network: "elixir_net"
+  service_name: "elx-torrentio-source"
+  ports:
+    - container: 8097
+      host: 0
+  env:
+    - name: PORT
+      value: "8097"
+networking:
+  service_port:
+    scheme: http
+    container_port: 8097
+control_surface:
+  adapter: generic_v1
+  owned_settings:
+    - id: baseUrl
+      label: "Addon base URL"
+      type: text
+      ownership: seeded
+      advanced: true
+      default: "https://torrentio.strem.fun"
+      storage:
+        type: instance_setting
+        key: baseUrl
+    - id: addonPath
+      label: "Addon path"
+      type: text
+      ownership: seeded
+      advanced: true
+      default: ""
+      storage:
+        type: instance_setting
+        key: addonPath
+    - id: routePolicy
+      label: "Route policy"
+      type: select
+      ownership: seeded
+      advanced: true
+      default: "debrid_first"
+      storage:
+        type: instance_setting
+        key: routePolicy
+      options:
+        - value: "debrid_first"
+          label: "Prefer debrid"
+        - value: "debrid_only"
+          label: "Debrid only"
+        - value: "torrent_only"
+          label: "Torrent only"
+    - id: allowedQualities
+      label: "Allowed qualities"
+      type: text
+      ownership: seeded
+      advanced: true
+      default: ""
+      storage:
+        type: instance_setting
+        key: allowedQualities
+    - id: maxSizeGb
+      label: "Max size GB"
+      type: number
+      ownership: seeded
+      advanced: true
+      storage:
+        type: instance_setting
+        key: maxSizeGb
+    - id: requiredLanguages
+      label: "Required languages"
+      type: text
+      ownership: seeded
+      advanced: true
+      default: ""
+      storage:
+        type: instance_setting
+        key: requiredLanguages
+    - id: resultLimit
+      label: "Result limit"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 50
+      storage:
+        type: instance_setting
+        key: resultLimit
+    - id: timeoutMs
+      label: "Source timeout ms"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 12000
+      storage:
+        type: instance_setting
+        key: timeoutMs
+    - id: retryCount
+      label: "Retry count"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 1
+      storage:
+        type: instance_setting
+        key: retryCount
+    - id: retryBackoffMs
+      label: "Retry backoff ms"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 300
+      storage:
+        type: instance_setting
+        key: retryBackoffMs
+    - id: minRequestIntervalMs
+      label: "Minimum request interval ms"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 250
+      storage:
+        type: instance_setting
+        key: minRequestIntervalMs
+    - id: maxLookupAttempts
+      label: "Max lookup attempts"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 6
+      storage:
+        type: instance_setting
+        key: maxLookupAttempts
+    - id: releaseDelaySeconds
+      label: "Release delay seconds"
+      type: number
+      ownership: seeded
+      advanced: true
+      default: 0
+      storage:
+        type: instance_setting
+        key: releaseDelaySeconds
+"#
+    )
+}
+
+async fn build_signed_package_from_manifest(
+    temp_dir: &std::path::Path,
+    file_name: &str,
+    manifest: String,
+    extension_id: String,
+    version: String,
+    identity: &TestSigningIdentity,
+) -> Result<TestPackage> {
+    let package_path = temp_dir.join(file_name);
     let file = File::create(&package_path)?;
     let mut zip = ZipWriter::new(file);
     let options = FileOptions::<()>::default();
@@ -409,14 +861,14 @@ async fn build_signed_package(temp_dir: &std::path::Path) -> Result<TestPackage>
     zip.finish()?;
 
     let hash = compute_sha256(&package_path).await?;
-    let signature = signing_key.sign(hash.as_bytes());
+    let signature = identity.signing_key.sign(hash.as_bytes());
     let signature = general_purpose::STANDARD.encode(signature.to_bytes());
 
     Ok(TestPackage {
         path: package_path,
         hash,
         signature,
-        publisher_key_id,
+        publisher_key_id: identity.publisher_key_id.clone(),
         extension_id,
         version,
     })
@@ -612,6 +1064,993 @@ async fn extension_control_surface_updates_generic_manifest_owned_settings() -> 
 }
 
 #[tokio::test]
+async fn debrid_control_surface_redacts_tokens_and_lists_all_services() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    for (key, value) in [
+        (
+            crate::debrid::DEBRID_REAL_DEBRID_TOKEN_SECRET_KEY,
+            "rd-secret",
+        ),
+        (crate::debrid::DEBRID_TORBOX_TOKEN_SECRET_KEY, "tb-secret"),
+    ] {
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: key.to_string(),
+                value_encrypted: state.secrets.encrypt(value)?,
+                rotatable: false,
+            })
+            .await?;
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.debrid/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let serialized = serde_json::to_string(&payload)?;
+    assert!(!serialized.contains("rd-secret"));
+    assert!(!serialized.contains("tb-secret"));
+
+    let accounts = control_surface_section(&payload, "debridAccounts");
+    assert_eq!(
+        control_section_field(accounts, "activeService")
+            .get("value")
+            .and_then(Value::as_str),
+        Some("real_debrid")
+    );
+    assert_eq!(
+        control_section_field(accounts, "token.real_debrid")
+            .get("value")
+            .and_then(Value::as_str),
+        Some("saved")
+    );
+    assert_eq!(
+        control_section_field(accounts, "token.torbox")
+            .get("value")
+            .and_then(Value::as_str),
+        Some("saved")
+    );
+    assert_eq!(
+        control_section_entity(accounts, "debridAccount.torbox")
+            .get("subtitle")
+            .and_then(Value::as_str),
+        Some("Configured")
+    );
+    let premiumize_entity = control_section_entity(accounts, "debridAccount.premiumize");
+    assert_eq!(
+        premiumize_entity.get("subtitle").and_then(Value::as_str),
+        Some("Not configured")
+    );
+    assert!(
+        premiumize_entity
+            .get("actions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|action| action.get("label").and_then(Value::as_str) == Some("Add account"))
+    );
+    assert!(
+        premiumize_entity
+            .get("actions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|action| {
+                action.get("openUrl").and_then(Value::as_str)
+                    == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_surface_legacy_extension_id_resolves_after_migration() -> Result<()> {
+    let (app, _state, _instance_id) = setup_debrid_control_surface_extension().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.real_debrid/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("extensionId").and_then(Value::as_str),
+        Some(crate::debrid::DEBRID_EXTENSION_ID)
+    );
+    assert_eq!(
+        control_section_field(
+            control_surface_section(&payload, "debridAccounts"),
+            "activeService"
+        )
+        .get("value")
+        .and_then(Value::as_str),
+        Some(crate::debrid::REAL_DEBRID_IMPLEMENTATION)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_surface_updates_multiple_account_tokens() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.debrid/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "values": {
+                            "token.torbox": "tb-token",
+                            "token.premiumize": "pm-token"
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let torbox = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance_id),
+            crate::debrid::DEBRID_TORBOX_TOKEN_SECRET_KEY,
+        )
+        .await?
+        .context("torbox token should be stored")?;
+    let premiumize = store
+        .get_secret(
+            SecretScope::Instance,
+            Some(instance_id),
+            crate::debrid::DEBRID_PREMIUMIZE_TOKEN_SECRET_KEY,
+        )
+        .await?
+        .context("premiumize token should be stored")?;
+    assert_eq!(state.secrets.decrypt(&torbox.value_encrypted)?, "tb-token");
+    assert_eq!(
+        state.secrets.decrypt(&premiumize.value_encrypted)?,
+        "pm-token"
+    );
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let accounts = control_surface_section(&payload, "debridAccounts");
+    assert_eq!(
+        control_section_field(accounts, "token.torbox")
+            .get("value")
+            .and_then(Value::as_str),
+        Some("saved")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_action_switches_active_service_and_provider_registration() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let (torbox_base_url, torbox_shutdown) = start_mock_torbox_account_server().await?;
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    let mut config = instance
+        .config_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config.insert("testTorBoxApiBaseUrl".to_string(), json!(torbox_base_url));
+    store
+        .update_instance_config(instance_id, Some(&Value::Object(config)))
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: crate::debrid::DEBRID_TORBOX_TOKEN_SECRET_KEY.to_string(),
+            value_encrypted: state.secrets.encrypt("tb-token")?,
+            rotatable: false,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.debrid/control-surface/actions/set_active_debrid_service",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "params": {
+                        "service": "torbox"
+                    }
+                })
+                .to_string(),
+            ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("TorBox account 'torbox-user' is reachable")
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.get("activeService"))
+            .and_then(Value::as_str),
+        Some("torbox")
+    );
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/serviceValidation/torbox/state"))
+            .and_then(Value::as_str),
+        Some("healthy")
+    );
+
+    let providers = store.list_providers(Some(instance_id)).await?;
+    let debrid_providers = providers
+        .iter()
+        .filter(|provider| {
+            provider.capability == "debrid.resolver" && provider.slot_id == "default"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(debrid_providers.len(), 1);
+    let provider = debrid_providers[0];
+    assert_eq!(provider.implementation.as_deref(), Some("torbox"));
+    assert_eq!(
+        provider
+            .scope_json
+            .as_ref()
+            .and_then(|scope| scope.pointer("/download_broker/activeService"))
+            .and_then(Value::as_str),
+        Some("torbox")
+    );
+    let _ = torbox_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_action_switches_to_all_debrid_with_account_validation() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let (all_debrid_base_url, all_debrid_shutdown) = start_mock_all_debrid_account_server().await?;
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    let mut config = instance
+        .config_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config.insert(
+        "testAllDebridApiBaseUrl".to_string(),
+        json!(all_debrid_base_url),
+    );
+    store
+        .update_instance_config(instance_id, Some(&Value::Object(config)))
+        .await?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: crate::debrid::DEBRID_ALL_DEBRID_TOKEN_SECRET_KEY.to_string(),
+            value_encrypted: state.secrets.encrypt("ad-token")?,
+            rotatable: false,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.debrid/control-surface/actions/set_active_debrid_service",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "params": {
+                        "service": "all_debrid"
+                    }
+                })
+                .to_string(),
+            ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("AllDebrid account 'alldebrid-user' is reachable")
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.get("activeService"))
+            .and_then(Value::as_str),
+        Some("all_debrid")
+    );
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/serviceValidation/all_debrid/state"))
+            .and_then(Value::as_str),
+        Some("healthy")
+    );
+
+    let providers = store.list_providers(Some(instance_id)).await?;
+    let debrid_providers = providers
+        .iter()
+        .filter(|provider| {
+            provider.capability == "debrid.resolver" && provider.slot_id == "default"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(debrid_providers.len(), 1);
+    let provider = debrid_providers[0];
+    assert_eq!(provider.implementation.as_deref(), Some("all_debrid"));
+    assert_eq!(
+        provider
+            .scope_json
+            .as_ref()
+            .and_then(|scope| scope.pointer("/download_broker/activeService"))
+            .and_then(Value::as_str),
+        Some("all_debrid")
+    );
+    let _ = all_debrid_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_action_switches_to_premiumize_and_preserves_tokens() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let (premiumize_base_url, premiumize_shutdown) = start_mock_premiumize_account_server().await?;
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    let mut config = instance
+        .config_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config.insert(
+        "testPremiumizeApiBaseUrl".to_string(),
+        json!(premiumize_base_url),
+    );
+    store
+        .update_instance_config(instance_id, Some(&Value::Object(config)))
+        .await?;
+
+    for (key, token) in [
+        (
+            crate::debrid::DEBRID_REAL_DEBRID_TOKEN_SECRET_KEY,
+            "rd-token",
+        ),
+        (crate::debrid::DEBRID_TORBOX_TOKEN_SECRET_KEY, "tb-token"),
+        (
+            crate::debrid::DEBRID_ALL_DEBRID_TOKEN_SECRET_KEY,
+            "ad-token",
+        ),
+        (
+            crate::debrid::DEBRID_PREMIUMIZE_TOKEN_SECRET_KEY,
+            "pm-token",
+        ),
+    ] {
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: key.to_string(),
+                value_encrypted: state.secrets.encrypt(token)?,
+                rotatable: false,
+            })
+            .await?;
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/api/v1/extensions/elixir.modules.debrid/control-surface/actions/set_active_debrid_service",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "params": {
+                        "service": "premiumize"
+                    }
+                })
+                .to_string(),
+            ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert!(
+        payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("Premiumize account 'pm-customer-123' is reachable")
+    );
+
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.get("activeService"))
+            .and_then(Value::as_str),
+        Some("premiumize")
+    );
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.pointer("/serviceValidation/premiumize/state"))
+            .and_then(Value::as_str),
+        Some("healthy")
+    );
+
+    let providers = store.list_providers(Some(instance_id)).await?;
+    let debrid_providers = providers
+        .iter()
+        .filter(|provider| {
+            provider.capability == "debrid.resolver" && provider.slot_id == "default"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(debrid_providers.len(), 1);
+    let provider = debrid_providers[0];
+    assert_eq!(provider.implementation.as_deref(), Some("premiumize"));
+    assert_eq!(
+        provider
+            .scope_json
+            .as_ref()
+            .and_then(|scope| scope.pointer("/download_broker/activeService"))
+            .and_then(Value::as_str),
+        Some("premiumize")
+    );
+
+    for (key, token) in [
+        (
+            crate::debrid::DEBRID_REAL_DEBRID_TOKEN_SECRET_KEY,
+            "rd-token",
+        ),
+        (crate::debrid::DEBRID_TORBOX_TOKEN_SECRET_KEY, "tb-token"),
+        (
+            crate::debrid::DEBRID_ALL_DEBRID_TOKEN_SECRET_KEY,
+            "ad-token",
+        ),
+        (
+            crate::debrid::DEBRID_PREMIUMIZE_TOKEN_SECRET_KEY,
+            "pm-token",
+        ),
+    ] {
+        let secret = store
+            .get_secret(SecretScope::Instance, Some(instance_id), key)
+            .await?
+            .with_context(|| format!("{key} should still be stored after active switch"))?;
+        assert_eq!(state.secrets.decrypt(&secret.value_encrypted)?, token);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.debrid/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let accounts = control_surface_section(&payload, "debridAccounts");
+    let premiumize = control_section_entity(accounts, "debridAccount.premiumize");
+    assert_eq!(
+        premiumize.get("subtitle").and_then(Value::as_str),
+        Some("Active")
+    );
+    assert!(
+        premiumize
+            .get("actions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|action| {
+                action.get("openUrl").and_then(Value::as_str)
+                    == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
+            })
+    );
+
+    let _ = premiumize_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: crate::debrid::DEBRID_REAL_DEBRID_TOKEN_SECRET_KEY.to_string(),
+            value_encrypted: state.secrets.encrypt("rd-token")?,
+            rotatable: false,
+        })
+        .await?;
+    let provider_id =
+        crate::debrid::reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id)
+            .await?;
+
+    let materialized_root = tempdir()?;
+    let materialized_path = materialized_root
+        .path()
+        .join("movies")
+        .join("Example Movie (2024).mkv");
+    tokio::fs::create_dir_all(
+        materialized_path
+            .parent()
+            .context("materialized path should have a parent")?,
+    )
+    .await?;
+    tokio::fs::write(&materialized_path, b"materialized media").await?;
+
+    let source_extension_id = "elixir.sources.torrentio_lifecycle_disable";
+    let (_source_instance_id, source_provider_id) = seed_lifecycle_safety_extension_provider(
+        &store,
+        source_extension_id,
+        "Torrentio Lifecycle Disable Fixture",
+        "acquisition.candidate_provider",
+        "torrentio_stremio",
+    )
+    .await?;
+
+    let subscription_id = Uuid::new_v4();
+    let release_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id,
+            media_type,
+            title,
+            normalized_title,
+            source_provider_id
+         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+    )
+    .bind(subscription_id.to_string())
+    .bind(source_provider_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_releases (
+            release_id,
+            subscription_id,
+            source_provider_id,
+            source_extension_id,
+            owner_id,
+            media_type,
+            title,
+            release_title,
+            source,
+            source_kind,
+            info_hash,
+            fingerprint,
+            release_kind,
+            resolver_kind,
+            resolver_version,
+            confidence,
+            score,
+            selected_route_logical_id,
+            selected_provider_id,
+            download_id,
+            remote_release_id,
+            state,
+            selected_candidate_json
+         ) VALUES (?, ?, ?, ?, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', ?, 'magnet', ?, ?, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', ?, ?, 'rd-release-1', 'downloaded', ?)",
+    )
+    .bind(release_id.to_string())
+    .bind(subscription_id.to_string())
+    .bind(source_provider_id.to_string())
+    .bind(source_extension_id)
+    .bind("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+    .bind("0123456789abcdef0123456789abcdef01234567")
+    .bind("fixture-disable")
+    .bind(provider_id.to_string())
+    .bind(job_id.to_string())
+    .bind(
+        json!({
+            "providerId": source_provider_id,
+            "releaseTitle": "Example.Movie.2024.1080p"
+        })
+        .to_string(),
+    )
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO debrid_download_jobs (
+            job_id,
+            provider_id,
+            instance_id,
+            owner_id,
+            source,
+            source_kind,
+            category,
+            display_name,
+            remote_torrent_id,
+            remote_download_id,
+            status,
+            local_path,
+            links_json,
+            progress,
+            downloaded_bytes,
+            total_bytes,
+            download_rate_bps,
+            provider_implementation,
+            remote_release_id,
+            remote_release_status,
+            provider_capabilities_json,
+            selection_mode,
+            selected_file_ids_json,
+            skipped_file_ids_json,
+            release_id
+         ) VALUES (?, ?, ?, 'default', ?, 'magnet', 'movies', 'Example Movie', 'rd-torrent-1', 'rd-download-1', 'completed', ?, '[]', 1.0, 1024, 1024, 0, 'real_debrid', 'rd-release-1', 'downloaded', ?, 'all', '[]', '[]', ?)",
+    )
+    .bind(job_id.to_string())
+    .bind(provider_id.to_string())
+    .bind(instance_id.to_string())
+    .bind("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+    .bind(materialized_path.to_string_lossy().to_string())
+    .bind(json!({ "service": "real_debrid" }).to_string())
+    .bind(release_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/elixir.modules.real_debrid/disable")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("extension_id").and_then(Value::as_str),
+        Some(crate::debrid::DEBRID_EXTENSION_ID)
+    );
+    assert_eq!(payload.get("enabled").and_then(Value::as_bool), Some(false));
+
+    let routes = crate::download_broker::list_acquisition_routes(&state.db_pool, &store).await?;
+    let route = routes
+        .routes
+        .iter()
+        .find(|route| {
+            route.logical_id == "acquisition.debrid.default" && route.owner_id == "default"
+        })
+        .context("missing debrid acquisition route")?;
+    assert_eq!(route.selected_provider_id, None);
+    assert_eq!(
+        route.blocker.as_deref(),
+        Some(crate::download_broker::DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE)
+    );
+
+    let job_count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = ?",
+    )
+    .bind(job_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(job_count, 1);
+    let release_candidate = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT selected_candidate_json FROM acquisition_releases WHERE release_id = ?",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert!(
+        release_candidate.contains("Example.Movie.2024.1080p"),
+        "release provenance should remain queryable after disable"
+    );
+    let source_ref = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = ?",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(
+        source_ref.as_deref(),
+        Some(source_provider_id.to_string().as_str())
+    );
+    assert!(tokio::fs::metadata(&materialized_path).await.is_ok());
+    assert!(store.get_provider(provider_id).await?.is_some());
+    assert!(store.get_provider(source_provider_id).await?.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+    let store = ExtensionStore::new(&state.db_pool);
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: crate::debrid::DEBRID_REAL_DEBRID_TOKEN_SECRET_KEY.to_string(),
+            value_encrypted: state.secrets.encrypt("rd-token")?,
+            rotatable: false,
+        })
+        .await?;
+    let provider_id =
+        crate::debrid::reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id)
+            .await?;
+
+    let protected_file_root = tempdir()?;
+    let protected_file = protected_file_root
+        .path()
+        .join("completed")
+        .join("Episode.mkv");
+    tokio::fs::create_dir_all(
+        protected_file
+            .parent()
+            .context("protected file should have a parent")?,
+    )
+    .await?;
+    tokio::fs::write(&protected_file, b"completed file").await?;
+
+    let source_extension_id = "elixir.sources.torrentio_lifecycle_uninstall";
+    let (source_instance_id, source_provider_id) = seed_lifecycle_safety_extension_provider(
+        &store,
+        source_extension_id,
+        "Torrentio Lifecycle Uninstall Fixture",
+        "acquisition.candidate_provider",
+        "torrentio_stremio",
+    )
+    .await?;
+    let (qb_instance_id, qb_provider_id) = seed_lifecycle_safety_extension_provider(
+        &store,
+        "elixir.modules.qbittorrent",
+        "qBittorrent",
+        "download.torrent.client",
+        "qbittorrent",
+    )
+    .await?;
+    let (nzb_instance_id, nzb_provider_id) = seed_lifecycle_safety_extension_provider(
+        &store,
+        "elixir.modules.nzbget",
+        "NZBGet",
+        "download.usenet.client",
+        "nzbget",
+    )
+    .await?;
+
+    let subscription_id = Uuid::new_v4();
+    let release_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id,
+            media_type,
+            title,
+            normalized_title,
+            source_provider_id
+         ) VALUES (?, 'episode', 'Example Show', 'example show', ?)",
+    )
+    .bind(subscription_id.to_string())
+    .bind(source_provider_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_releases (
+            release_id,
+            subscription_id,
+            source_provider_id,
+            source_extension_id,
+            owner_id,
+            media_type,
+            title,
+            release_title,
+            source,
+            source_kind,
+            info_hash,
+            fingerprint,
+            release_kind,
+            resolver_kind,
+            resolver_version,
+            confidence,
+            score,
+            selected_route_logical_id,
+            selected_provider_id,
+            download_id,
+            remote_release_id,
+            state,
+            selected_candidate_json
+         ) VALUES (?, ?, ?, ?, 'default', 'episode', 'Example Show', 'Example.Show.S01E01.1080p', ?, 'magnet', ?, ?, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', ?, ?, 'rd-release-2', 'downloaded', ?)",
+    )
+    .bind(release_id.to_string())
+    .bind(subscription_id.to_string())
+    .bind(source_provider_id.to_string())
+    .bind(source_extension_id)
+    .bind("magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98")
+    .bind("fedcba9876543210fedcba9876543210fedcba98")
+    .bind("fixture-uninstall")
+    .bind(provider_id.to_string())
+    .bind(job_id.to_string())
+    .bind(
+        json!({
+            "providerId": source_provider_id,
+            "releaseTitle": "Example.Show.S01E01.1080p"
+        })
+        .to_string(),
+    )
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO debrid_download_jobs (
+            job_id,
+            provider_id,
+            instance_id,
+            owner_id,
+            source,
+            source_kind,
+            category,
+            display_name,
+            remote_torrent_id,
+            remote_download_id,
+            status,
+            local_path,
+            links_json,
+            progress,
+            downloaded_bytes,
+            total_bytes,
+            download_rate_bps,
+            provider_implementation,
+            remote_release_id,
+            remote_release_status,
+            provider_capabilities_json,
+            selection_mode,
+            selected_file_ids_json,
+            skipped_file_ids_json,
+            release_id
+         ) VALUES (?, ?, ?, 'default', ?, 'magnet', 'tv', 'Example Show S01E01', 'rd-torrent-2', 'rd-download-2', 'completed', ?, '[]', 1.0, 2048, 2048, 0, 'real_debrid', 'rd-release-2', 'downloaded', ?, 'all', '[]', '[]', ?)",
+    )
+    .bind(job_id.to_string())
+    .bind(provider_id.to_string())
+    .bind(instance_id.to_string())
+    .bind("magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98")
+    .bind(protected_file.to_string_lossy().to_string())
+    .bind(json!({ "service": "real_debrid" }).to_string())
+    .bind(release_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+
+    for extension_id in [
+        crate::debrid::DEBRID_EXTENSION_ID,
+        crate::debrid::LEGACY_REAL_DEBRID_EXTENSION_ID,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/extensions/{extension_id}/uninstall"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/extensions/instances/{instance_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_response.status(), StatusCode::FORBIDDEN);
+
+    assert!(
+        store
+            .get_extension(crate::debrid::DEBRID_EXTENSION_ID)
+            .await?
+            .is_some()
+    );
+    assert!(store.get_instance(instance_id).await?.is_some());
+    assert!(store.get_provider(provider_id).await?.is_some());
+    assert!(store.get_instance(source_instance_id).await?.is_some());
+    assert!(store.get_provider(source_provider_id).await?.is_some());
+    assert!(store.get_instance(qb_instance_id).await?.is_some());
+    assert!(store.get_provider(qb_provider_id).await?.is_some());
+    assert!(store.get_instance(nzb_instance_id).await?.is_some());
+    assert!(store.get_provider(nzb_provider_id).await?.is_some());
+
+    let job_count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = ?",
+    )
+    .bind(job_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(job_count, 1);
+    let release_source = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = ?",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(
+        release_source.as_deref(),
+        Some(source_provider_id.to_string().as_str())
+    );
+    let release_selected = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT selected_provider_id FROM acquisition_releases WHERE release_id = ?",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(
+        release_selected.as_deref(),
+        Some(provider_id.to_string().as_str())
+    );
+    assert!(tokio::fs::metadata(&protected_file).await.is_ok());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn extension_control_surface_does_not_route_generic_manifest_by_extension_id_substring()
 -> Result<()> {
     let extension_id = "elixir.modules.sonarr_helper";
@@ -660,17 +2099,29 @@ async fn start_registry_server(
     build_registry: impl FnOnce(SocketAddr) -> Value + Send + 'static,
     package_bytes: Vec<u8>,
 ) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    start_registry_server_with_packages(
+        build_registry,
+        BTreeMap::from([("package.elx".to_string(), package_bytes)]),
+    )
+    .await
+}
+
+async fn start_registry_server_with_packages(
+    build_registry: impl FnOnce(SocketAddr) -> Value + Send + 'static,
+    packages: BTreeMap<String, Vec<u8>>,
+) -> Result<(SocketAddr, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let registry_json = build_registry(addr);
     let state = Arc::new(RegistryState {
         registry_json,
-        package_bytes,
+        packages,
     });
 
     let app = Router::new()
         .route("/registry.json", get(registry_handler))
         .route("/package.elx", get(package_handler))
+        .route("/:package", get(named_package_handler))
         .with_state(state);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -690,7 +2141,41 @@ async fn registry_handler(State(state): State<Arc<RegistryState>>) -> Json<Value
 }
 
 async fn package_handler(State(state): State<Arc<RegistryState>>) -> impl IntoResponse {
-    (StatusCode::OK, state.package_bytes.clone())
+    package_response(&state, "package.elx")
+}
+
+async fn named_package_handler(
+    AxumPath(package): AxumPath<String>,
+    State(state): State<Arc<RegistryState>>,
+) -> impl IntoResponse {
+    package_response(&state, &package)
+}
+
+fn package_response(state: &RegistryState, package: &str) -> (StatusCode, Vec<u8>) {
+    match state.packages.get(package) {
+        Some(bytes) => (StatusCode::OK, bytes.clone()),
+        None => (StatusCode::NOT_FOUND, Vec::new()),
+    }
+}
+
+async fn extension_status_summary_item(app: &Router, extension_id: &str) -> Result<Value> {
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    payload
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("extensionId").and_then(Value::as_str) == Some(extension_id))
+                .cloned()
+        })
+        .ok_or_else(|| anyhow::anyhow!("status summary item '{extension_id}' not found"))
 }
 
 fn discover_test_host_ip() -> Result<String> {
@@ -1920,6 +3405,39 @@ async fn download_broker_inventory_exposes_stable_paths_without_raw_endpoints() 
 }
 
 #[tokio::test]
+async fn download_broker_debrid_route_without_active_service_uses_generic_blocker() -> Result<()> {
+    let (app, _db_pool, token) = setup_download_broker_test_app().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/download-broker/routes")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let route = json
+        .get("routes")
+        .and_then(Value::as_array)
+        .and_then(|routes| {
+            routes.iter().find(|route| {
+                route.get("logicalId").and_then(Value::as_str) == Some("acquisition.debrid.default")
+                    && route.get("ownerId").and_then(Value::as_str) == Some("default")
+            })
+        })
+        .context("missing default debrid route")?;
+    assert_eq!(
+        route.get("blocker").and_then(Value::as_str),
+        Some("Active debrid service is not configured")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn download_broker_route_can_select_external_provider() -> Result<()> {
     let (app, db_pool, token) = setup_download_broker_test_app().await?;
     let store = ExtensionStore::new(&db_pool);
@@ -2025,6 +3543,162 @@ async fn download_broker_debrid_route_exposes_native_provider() -> Result<()> {
 }
 
 #[tokio::test]
+async fn download_broker_debrid_route_candidates_preserve_provider_evidence() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let providers = [
+        (
+            "elixir.modules.debrid.real_debrid",
+            "real_debrid",
+            "api.real-debrid.com",
+        ),
+        ("elixir.modules.debrid.torbox", "torbox", "api.torbox.app"),
+        (
+            "elixir.modules.debrid.all_debrid",
+            "all_debrid",
+            "api.alldebrid.com",
+        ),
+        (
+            "elixir.modules.debrid.premiumize",
+            "premiumize",
+            "www.premiumize.me",
+        ),
+    ];
+    for (extension_id, implementation, host) in providers {
+        seed_download_broker_provider(
+            &store,
+            extension_id,
+            "debrid.resolver",
+            implementation,
+            host,
+            Some("debrid"),
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/download-broker/routes")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let route = json
+        .get("routes")
+        .and_then(Value::as_array)
+        .and_then(|routes| {
+            routes.iter().find(|route| {
+                route.get("logicalId").and_then(Value::as_str) == Some("acquisition.debrid.default")
+                    && route.get("ownerId").and_then(Value::as_str) == Some("default")
+            })
+        })
+        .context("missing default debrid route")?;
+
+    assert_eq!(
+        route.get("blocker").and_then(Value::as_str),
+        Some("Active debrid service is not configured")
+    );
+    assert!(!route.to_string().contains("Real-Debrid"));
+
+    let candidates = route
+        .get("candidates")
+        .and_then(Value::as_array)
+        .context("debrid route candidates")?;
+    assert_eq!(candidates.len(), providers.len());
+    for (_extension_id, implementation, _host) in providers {
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.get("providerKind").and_then(Value::as_str) == Some("debrid")
+                    && candidate.get("implementation").and_then(Value::as_str)
+                        == Some(implementation)
+                    && candidate.get("healthState").and_then(Value::as_str) == Some("healthy")
+            }),
+            "missing debrid provider candidate evidence for {implementation}: {candidates:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn download_broker_debrid_route_blocks_unhealthy_active_service() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    seed_download_broker_provider(
+        &store,
+        "elixir.modules.debrid",
+        "debrid.resolver",
+        "torbox",
+        "api.torbox.app",
+        Some("debrid"),
+        ProviderHealthState::Unhealthy,
+    )
+    .await?;
+
+    let routes_response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/download-broker/routes")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(routes_response.status(), StatusCode::OK);
+    let body = body::to_bytes(routes_response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let route = json
+        .get("routes")
+        .and_then(Value::as_array)
+        .and_then(|routes| {
+            routes.iter().find(|route| {
+                route.get("logicalId").and_then(Value::as_str) == Some("acquisition.debrid.default")
+                    && route.get("ownerId").and_then(Value::as_str) == Some("default")
+            })
+        })
+        .context("missing default debrid route")?;
+    assert_eq!(
+        route.get("blocker").and_then(Value::as_str),
+        Some("Active debrid service is unavailable")
+    );
+    assert!(
+        route
+            .get("candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|candidate| {
+                candidate.get("implementation").and_then(Value::as_str) == Some("torbox")
+                    && candidate.get("healthState").and_then(Value::as_str) == Some("unhealthy")
+            })
+    );
+
+    let submit_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/download-broker/acquisition.debrid.default/submit")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    r#"{"source":"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567","category":"debrid"}"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(submit_response.status(), StatusCode::CONFLICT);
+    let body = body::to_bytes(submit_response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("message").and_then(Value::as_str),
+        Some("Active debrid service is unavailable")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn download_broker_debrid_submit_without_token_fails_closed() -> Result<()> {
     let (app, db_pool, token) = setup_download_broker_test_app().await?;
     let store = ExtensionStore::new(&db_pool);
@@ -2055,10 +3729,280 @@ async fn download_broker_debrid_submit_without_token_fails_closed() -> Result<()
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let json: Value = serde_json::from_slice(&body)?;
     assert_eq!(json.get("code").and_then(Value::as_str), Some("conflict"));
-    assert!(
-        json.get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    assert_eq!(
+        json.get("message").and_then(Value::as_str),
+        Some("Add debrid account")
+    );
+    Ok(())
+}
+
+#[test]
+fn desktop_acquisition_debrid_copy_has_no_generic_real_debrid_language() -> Result<()> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let paths = [
+        "elixir-client/src/qml/views/FindMediaView.qml",
+        "elixir-client/src/qml/views/AcquisitionView.qml",
+        "elixir-client/src/qml/components/AcquisitionReviewPanel.qml",
+    ];
+
+    for relative in paths {
+        let path = root.join(relative);
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading client Debrid copy audit path {}", path.display()))?;
+        for (index, line) in content.lines().enumerate() {
+            let has_real_debrid_copy = line.contains("Real-Debrid") || line.contains("Real Debrid");
+            if !has_real_debrid_copy {
+                continue;
+            }
+            let allowed_legacy_sanitizer = line.contains("Real-Debrid API token is not configured")
+                || line.contains("Real Debrid API token is not configured");
+            let allowed_provider_evidence = line.contains("return \"Real-Debrid\"");
+            assert!(
+                allowed_legacy_sanitizer || allowed_provider_evidence,
+                "generic acquisition UI must not expose Real-Debrid-only copy at {}:{}: {}",
+                relative,
+                index + 1,
+                line.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn acquisition_intent_endpoints_create_and_reuse_native_subscription() -> Result<()> {
+    let (app, _db_pool, token) = setup_download_broker_test_app().await?;
+    let request = json!({
+        "mediaType": "series",
+        "title": "Endpoint Show",
+        "year": 2026,
+        "externalIds": {
+            "tvdbSeries": "98765"
+        },
+        "target": {
+            "kind": "season",
+            "seasonNumber": 2,
+            "episodeStart": 1,
+            "episodeEnd": 2
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find/acquisition")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let first: Value = serde_json::from_slice(&body)?;
+    assert_eq!(first.get("created").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        first.get("expandedTargetCount").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/monitorPolicy")
+            .and_then(Value::as_str),
+        Some("selected_targets")
+    );
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/routePolicy")
+            .and_then(Value::as_str),
+        Some("debrid_first")
+    );
+    let subscription_id = first
+        .pointer("/detail/subscription/subscriptionId")
+        .and_then(Value::as_str)
+        .context("created subscription id")?
+        .to_string();
+    let target_keys = first
+        .pointer("/detail/targets")
+        .and_then(Value::as_array)
+        .context("created targets")?
+        .iter()
+        .map(|target| target.get("targetKey").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(target_keys, vec![Some("S02E01"), Some("S02E02")]);
+
+    let reused_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/intents")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    assert_eq!(reused_response.status(), StatusCode::OK);
+    let body = body::to_bytes(reused_response.into_body(), 1_048_576).await?;
+    let reused: Value = serde_json::from_slice(&body)?;
+    assert_eq!(reused.get("created").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        reused
+            .pointer("/detail/subscription/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+
+    let movie_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/acquisition")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    r#"{"mediaType":"movie","title":"Endpoint Movie","year":2026}"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(movie_response.status(), StatusCode::OK);
+    let body = body::to_bytes(movie_response.into_body(), 1_048_576).await?;
+    let movie: Value = serde_json::from_slice(&body)?;
+    assert_eq!(movie.get("created").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        movie
+            .pointer("/detail/targets/0/targetKey")
+            .and_then(Value::as_str),
+        Some("MOVIE")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acquisition_intent_uses_source_provider_advanced_defaults() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let extension_id = "elixir.sources.torrentio_stremio";
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: "Torrentio-Compatible Source".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "0.1.0",
+                "kind": "module",
+                "name": "Torrentio-Compatible Source",
+                "provides": [{
+                    "capability": "acquisition.candidate_provider",
+                    "slot": "default",
+                    "cardinality": "many",
+                    "implementation": "torrentio_stremio"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "elixir/torrentio-candidate-provider:0.1.0"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({
+                "routePolicy": "torrent_only",
+                "releaseDelaySeconds": 900,
+                "allowedQualities": "2160p,1080p",
+                "requiredLanguages": "en,ja",
+                "maxSizeGb": 12.5,
+                "resultLimit": 25
+            })),
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("torrentio_stremio".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie", "tv", "anime"],
+                "actions": ["search"]
+            })),
+            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
+                "http".to_string(),
+                "candidate-source".to_string(),
+                8097,
+                None,
+                Some("elixir_net".to_string()),
+            )?)?),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find/acquisition")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "mediaType": "movie",
+                    "title": "Configured Movie",
+                    "year": 2026,
+                    "sourceProviderId": provider_id
+                }))?))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "create response: {payload}");
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/routePolicy")
+            .and_then(Value::as_str),
+        Some("torrent_only")
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/releaseDelaySeconds")
+            .and_then(Value::as_i64),
+        Some(900)
+    );
+    assert_eq!(
+        payload.pointer("/detail/subscription/sourceProviderId"),
+        Some(&json!(provider_id.to_string()))
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/qualityProfile/allowedQualities")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/qualityProfile/requiredLanguages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/qualityProfile/maxSizeBytes")
+            .and_then(Value::as_u64),
+        Some((12.5_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64)
     );
     Ok(())
 }
@@ -2152,10 +4096,9 @@ async fn acquisition_target_submit_records_source_owned_debrid_account_blocker()
     let body = body::to_bytes(submit_response.into_body(), 1_048_576).await?;
     let json: Value = serde_json::from_slice(&body)?;
     assert_eq!(json.get("code").and_then(Value::as_str), Some("conflict"));
-    assert!(
-        json.get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    assert_eq!(
+        json.get("message").and_then(Value::as_str),
+        Some("Add debrid account")
     );
 
     let detail_response = app
@@ -2188,12 +4131,15 @@ async fn acquisition_target_submit_records_source_owned_debrid_account_blocker()
         target.get("selectedRouteLogicalId").and_then(Value::as_str),
         Some("acquisition.debrid.default")
     );
-    assert!(
-        target
-            .get("stateReason")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("Real-Debrid API token is not configured"))
+    let state_reason = target
+        .get("stateReason")
+        .and_then(Value::as_str)
+        .context("target state reason")?;
+    assert_eq!(
+        state_reason,
+        "Debrid route failed: Add debrid account; torrent fallback failed: Active debrid service is not configured"
     );
+    assert!(!state_reason.contains("Real-Debrid"));
     assert_eq!(
         target
             .pointer("/selectedCandidate/sourceProviderId")
@@ -2989,6 +4935,18 @@ async fn extension_status_summary_auto_provisions_missing_zero_config_instance()
         torrentio.get("statusCode").and_then(Value::as_str),
         Some("missing_instance")
     );
+    assert_eq!(
+        torrentio.get("statusCode").and_then(Value::as_str),
+        Some("provider_registration_pending")
+    );
+    assert_eq!(
+        torrentio.get("label").and_then(Value::as_str),
+        Some("Starting up")
+    );
+    assert_eq!(
+        torrentio.get("primaryAction").and_then(Value::as_str),
+        Some("open")
+    );
 
     let instances = store
         .list_instances(Some("elixir.sources.torrentio_stremio"))
@@ -2997,6 +4955,193 @@ async fn extension_status_summary_auto_provisions_missing_zero_config_instance()
     assert_eq!(instances[0].instance_name, "default");
     assert!(instances[0].enabled);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn candidate_provider_status_summary_distinguishes_runtime_readiness() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    seed_candidate_provider_summary_case(
+        &store,
+        "elixir.sources.pending",
+        "Pending Source",
+        None,
+        None,
+    )
+    .await?;
+    seed_candidate_provider_summary_case(
+        &store,
+        "elixir.sources.transport",
+        "Transport Source",
+        Some(ProviderHealthState::Unknown),
+        Some(ProviderReadinessPhase::TransportReady),
+    )
+    .await?;
+    seed_candidate_provider_summary_case(
+        &store,
+        "elixir.sources.unhealthy",
+        "Unhealthy Source",
+        Some(ProviderHealthState::Unhealthy),
+        Some(ProviderReadinessPhase::Unknown),
+    )
+    .await?;
+    seed_candidate_provider_summary_case(
+        &store,
+        "elixir.sources.healthy",
+        "Healthy Source",
+        Some(ProviderHealthState::Healthy),
+        Some(ProviderReadinessPhase::DriverReady),
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let status_for = |extension_id: &str| -> Option<&str> {
+        items
+            .iter()
+            .find(|item| item.get("extensionId").and_then(Value::as_str) == Some(extension_id))
+            .and_then(|item| item.get("statusCode"))
+            .and_then(Value::as_str)
+    };
+
+    assert_eq!(
+        status_for("elixir.sources.pending"),
+        Some("provider_registration_pending")
+    );
+    assert_eq!(
+        status_for("elixir.sources.transport"),
+        Some("runtime_starting")
+    );
+    assert_eq!(
+        status_for("elixir.sources.unhealthy"),
+        Some("connection_issue")
+    );
+    assert_eq!(status_for("elixir.sources.healthy"), Some("ready"));
+
+    Ok(())
+}
+
+async fn seed_candidate_provider_summary_case(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    name: &str,
+    provider_health: Option<ProviderHealthState>,
+    readiness_phase: Option<ProviderReadinessPhase>,
+) -> Result<()> {
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "0.1.0",
+                "kind": "module",
+                "name": name,
+                "provides": [{
+                    "capability": "acquisition.candidate_provider",
+                    "slot": "default",
+                    "implementation": "torrentio_stremio",
+                    "scope": {
+                        "media_types": ["movie", "tv", "anime"],
+                        "actions": ["search"],
+                        "requires_account": false,
+                        "required_fields": []
+                    }
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "elixir/torrentio-candidate-provider:0.1.0"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8097
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let Some(provider_health) = provider_health else {
+        return Ok(());
+    };
+
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("torrentio_stremio".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie", "tv", "anime"],
+                "actions": ["search"],
+                "requires_account": false,
+                "required_fields": []
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-source",
+                "port": 8097,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: provider_health,
+        })
+        .await?;
+    if let Some(readiness_phase) = readiness_phase {
+        store
+            .upsert_provider_readiness(provider_id, readiness_phase, None)
+            .await?;
+    }
     Ok(())
 }
 
@@ -6665,6 +8810,7 @@ async fn extensions_install_signed_package() -> Result<()> {
     let storage_root = settings.extensions.storage_root.clone();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
+    let db_pool = database.pool.clone();
     let auth_service = AuthService::new(settings.auth.clone())?;
     let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
     let linkers = LinkerService::new(settings.classifier.clone())?;
@@ -6712,6 +8858,12 @@ async fn extensions_install_signed_package() -> Result<()> {
         "manifest not unpacked at {}",
         manifest_path.display()
     );
+
+    let store = ExtensionStore::new(&db_pool);
+    let instances = store.list_instances(Some(&package.extension_id)).await?;
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].instance_name, "default");
+    assert!(instances[0].enabled);
 
     let _ = shutdown_tx.send(());
     Ok(())
@@ -7745,6 +9897,528 @@ runtime:
         Some(package_path.to_string_lossy().as_ref())
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<()> {
+    let temp = tempdir()?;
+    let identity = test_signing_identity();
+    let extension_id = "elixir.sources.torrentio_stremio";
+    let package_v1 = build_signed_package_from_manifest(
+        temp.path(),
+        "torrentio-0.1.0.elx",
+        torrentio_candidate_provider_manifest("0.1.0", &identity.publisher_key_id),
+        extension_id.to_string(),
+        "0.1.0".to_string(),
+        &identity,
+    )
+    .await?;
+    let package_v2 = build_signed_package_from_manifest(
+        temp.path(),
+        "torrentio-0.2.0.elx",
+        torrentio_candidate_provider_manifest("0.2.0", &identity.publisher_key_id),
+        extension_id.to_string(),
+        "0.2.0".to_string(),
+        &identity,
+    )
+    .await?;
+    let package_v1_bytes = tokio::fs::read(&package_v1.path).await?;
+    let package_v2_bytes = tokio::fs::read(&package_v2.path).await?;
+
+    let v1_for_registry = package_v1.clone();
+    let v2_for_registry = package_v2.clone();
+    let (addr, shutdown_tx) = start_registry_server_with_packages(
+        move |addr| {
+            json!({
+                "registry_version": 1,
+                "extensions": [
+                    {
+                        "id": v1_for_registry.extension_id,
+                        "version": v1_for_registry.version,
+                        "download_url": format!("http://{addr}/torrentio-0.1.0.elx"),
+                        "sha256": v1_for_registry.hash,
+                        "signature": v1_for_registry.signature,
+                        "publisher_key_id": v1_for_registry.publisher_key_id,
+                        "trust": "community"
+                    },
+                    {
+                        "id": v2_for_registry.extension_id,
+                        "version": v2_for_registry.version,
+                        "download_url": format!("http://{addr}/torrentio-0.2.0.elx"),
+                        "sha256": v2_for_registry.hash,
+                        "signature": v2_for_registry.signature,
+                        "publisher_key_id": v2_for_registry.publisher_key_id,
+                        "trust": "community"
+                    }
+                ]
+            })
+        },
+        BTreeMap::from([
+            ("torrentio-0.1.0.elx".to_string(), package_v1_bytes),
+            ("torrentio-0.2.0.elx".to_string(), package_v2_bytes),
+        ]),
+    )
+    .await?;
+
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.registries = vec![format!("http://{addr}/registry.json")];
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+    let storage_root = settings.extensions.storage_root.clone();
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let catalog_resp = app
+        .clone()
+        .oneshot(Request::post("/api/v1/extensions/registries/refresh").body(Body::empty())?)
+        .await?;
+    assert_eq!(catalog_resp.status(), StatusCode::OK);
+    let catalog_body = body::to_bytes(catalog_resp.into_body(), 1_048_576).await?;
+    let catalog_json: Value = serde_json::from_slice(&catalog_body)?;
+    let available = catalog_json["available"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let entry_for = |version: &str| -> Value {
+        available
+            .iter()
+            .find(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(extension_id)
+                    && entry.get("version").and_then(Value::as_str) == Some(version)
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("catalog entry {extension_id} {version} not found"))
+    };
+    let v1_entry = entry_for("0.1.0");
+    let v2_entry = entry_for("0.2.0");
+
+    let install_v1 = json!({
+        "downloadUrl": v1_entry.get("download_url").and_then(Value::as_str).unwrap_or_default()
+    });
+    let install_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_v1.to_string()))?,
+        )
+        .await?;
+    let install_status = install_resp.status();
+    let install_body = body::to_bytes(install_resp.into_body(), 1_048_576).await?;
+    let install_json: Value = serde_json::from_slice(&install_body)?;
+    assert_eq!(
+        install_status,
+        StatusCode::OK,
+        "install failed: {install_json}"
+    );
+    assert_eq!(
+        install_json.get("extension_id").and_then(Value::as_str),
+        Some(extension_id)
+    );
+    assert_eq!(
+        install_json.get("version").and_then(Value::as_str),
+        Some("0.1.0")
+    );
+
+    let store = ExtensionStore::new(&db_pool);
+    let installed = store
+        .get_extension(extension_id)
+        .await?
+        .expect("installed extension");
+    assert_eq!(
+        installed.package_hash.as_deref(),
+        Some(package_v1.hash.as_str())
+    );
+    let instances = store.list_instances(Some(extension_id)).await?;
+    assert_eq!(instances.len(), 1, "expected one default instance");
+    let instance_id = instances[0].instance_id;
+    assert_eq!(instances[0].instance_name, "default");
+    assert!(instances[0].enabled);
+    let default_config = instances[0]
+        .config_json
+        .as_ref()
+        .expect("torrentio default instance config should be seeded");
+    assert_eq!(
+        default_config.get("baseUrl").and_then(Value::as_str),
+        Some("https://torrentio.strem.fun")
+    );
+    assert_eq!(
+        default_config.get("routePolicy").and_then(Value::as_str),
+        Some("debrid_first")
+    );
+    assert_eq!(
+        default_config.get("resultLimit").and_then(Value::as_i64),
+        Some(50)
+    );
+    assert_eq!(
+        default_config.get("timeoutMs").and_then(Value::as_i64),
+        Some(12000)
+    );
+    assert_eq!(
+        default_config.get("retryBackoffMs").and_then(Value::as_i64),
+        Some(300)
+    );
+    assert_eq!(
+        default_config.get("configVersion").and_then(Value::as_str),
+        Some("elixir.sources.torrentio_stremio@0.1.0")
+    );
+
+    let unpacked_v1 = PathBuf::from(&storage_root)
+        .join("unpacked")
+        .join(extension_id)
+        .join("0.1.0");
+    assert!(
+        tokio::fs::metadata(unpacked_v1.join("manifest.yaml"))
+            .await
+            .is_ok(),
+        "expected v1 package to be unpacked"
+    );
+
+    let pending_status = extension_status_summary_item(&app, extension_id).await?;
+    assert_eq!(
+        pending_status.get("statusCode").and_then(Value::as_str),
+        Some("provider_registration_pending")
+    );
+
+    let instance_config = json!({
+        "configVersion": "elixir.sources.torrentio_stremio@0.1.0",
+        "baseUrl": "https://torrentio.strem.fun",
+        "addonPath": "",
+        "routePolicy": "debrid_first",
+        "allowedQualities": "2160p,1080p",
+        "requiredLanguages": "en,ja",
+        "maxSizeGb": 25,
+        "resultLimit": 25,
+        "timeoutMs": 9000,
+        "retryCount": 2,
+        "retryBackoffMs": 750,
+        "minRequestIntervalMs": 1000,
+        "maxLookupAttempts": 4,
+        "releaseDelaySeconds": 1800
+    });
+    store
+        .update_instance_config(instance_id, Some(&instance_config))
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("torrentio_stremio".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie", "tv", "anime"],
+                "actions": ["search"],
+                "requires_account": false,
+                "required_fields": []
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-torrentio-source",
+                "port": 8097,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
+        .await?;
+    let ready_status = extension_status_summary_item(&app, extension_id).await?;
+    assert_eq!(
+        ready_status.get("statusCode").and_then(Value::as_str),
+        Some("ready")
+    );
+
+    store.delete_provider(provider_id).await?;
+    let recovered_provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: recovered_provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("torrentio_stremio".to_string()),
+            scope_json: Some(json!({
+                "media_types": ["movie", "tv", "anime"],
+                "actions": ["search"],
+                "requires_account": false,
+                "required_fields": []
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-torrentio-source",
+                "port": 8097,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_provider_readiness(
+            recovered_provider_id,
+            ProviderReadinessPhase::DriverReady,
+            None,
+        )
+        .await?;
+    let recovered_instance = store
+        .get_instance(instance_id)
+        .await?
+        .expect("recovered instance");
+    assert_eq!(
+        recovered_instance.config_json.as_ref(),
+        Some(&instance_config)
+    );
+
+    let install_v2 = json!({
+        "downloadUrl": v2_entry.get("download_url").and_then(Value::as_str).unwrap_or_default()
+    });
+    let upgrade_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/extensions/install")
+                .header("content-type", "application/json")
+                .body(Body::from(install_v2.to_string()))?,
+        )
+        .await?;
+    let upgrade_status = upgrade_resp.status();
+    let upgrade_body = body::to_bytes(upgrade_resp.into_body(), 1_048_576).await?;
+    let upgrade_json: Value = serde_json::from_slice(&upgrade_body)?;
+    assert_eq!(
+        upgrade_status,
+        StatusCode::OK,
+        "upgrade failed: {upgrade_json}"
+    );
+    assert_eq!(
+        upgrade_json.get("version").and_then(Value::as_str),
+        Some("0.2.0")
+    );
+    let upgraded = store
+        .get_extension(extension_id)
+        .await?
+        .expect("upgraded extension");
+    assert_eq!(upgraded.version, "0.2.0");
+    assert_eq!(
+        upgraded.package_hash.as_deref(),
+        Some(package_v2.hash.as_str())
+    );
+    assert_eq!(
+        upgraded
+            .manifest_json
+            .pointer("/runtime/image")
+            .and_then(Value::as_str),
+        Some("elixir/torrentio-candidate-provider:0.2.0")
+    );
+    let upgraded_instances = store.list_instances(Some(extension_id)).await?;
+    assert_eq!(upgraded_instances.len(), 1);
+    assert_eq!(upgraded_instances[0].instance_id, instance_id);
+    assert_eq!(
+        upgraded_instances[0].config_json.as_ref(),
+        Some(&instance_config)
+    );
+    let unpacked_v2 = PathBuf::from(&storage_root)
+        .join("unpacked")
+        .join(extension_id)
+        .join("0.2.0");
+    assert!(
+        tokio::fs::metadata(unpacked_v2.join("manifest.yaml"))
+            .await
+            .is_ok(),
+        "expected v2 package to be unpacked"
+    );
+
+    store
+        .update_instance_runtime_version(instance_id, "0.2.0", Some("0.1.0"))
+        .await?;
+    let rollback_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/extensions/instances/{instance_id}/rollback"
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(rollback_resp.status(), StatusCode::OK);
+    let rollback_body = body::to_bytes(rollback_resp.into_body(), 1_048_576).await?;
+    let rollback_json: Value = serde_json::from_slice(&rollback_body)?;
+    assert!(
+        rollback_json
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .map(Vec::is_empty)
+            .unwrap_or(false),
+        "rollback should be available: {rollback_json}"
+    );
+    let rollback_actions = rollback_json
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        rollback_actions
+            .iter()
+            .any(|action| action.get("type") == Some(&json!("rollback_runtime"))),
+        "expected rollback runtime action: {rollback_json}"
+    );
+
+    let subscription_id = Uuid::new_v4();
+    let release_id = Uuid::new_v4();
+    let release_job_id = Uuid::new_v4();
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id,
+            media_type,
+            title,
+            normalized_title,
+            source_provider_id
+         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+    )
+    .bind(subscription_id.to_string())
+    .bind(recovered_provider_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_releases (
+            release_id,
+            subscription_id,
+            source_provider_id,
+            source_extension_id,
+            owner_id,
+            media_type,
+            title,
+            release_title,
+            source,
+            source_kind,
+            fingerprint,
+            release_kind,
+            resolver_kind,
+            resolver_version,
+            confidence,
+            selected_provider_id
+         ) VALUES (?, ?, ?, ?, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', ?, 'magnet', ?, 'single', 'tv', 'test', 'high', ?)",
+    )
+    .bind(release_id.to_string())
+    .bind(subscription_id.to_string())
+    .bind(recovered_provider_id.to_string())
+    .bind(extension_id)
+    .bind("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+    .bind("fixture-fingerprint")
+    .bind(recovered_provider_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_release_jobs (
+            release_job_id,
+            release_id,
+            route_logical_id,
+            provider_id,
+            state
+         ) VALUES (?, ?, 'acquisition.debrid.default', ?, 'queued')",
+    )
+    .bind(release_job_id.to_string())
+    .bind(release_id.to_string())
+    .bind(recovered_provider_id.to_string())
+    .execute(&db_pool)
+    .await?;
+
+    let uninstall_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/extensions/{extension_id}/uninstall"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(uninstall_resp.status(), StatusCode::OK);
+    assert!(store.get_extension(extension_id).await?.is_none());
+    assert!(store.list_instances(Some(extension_id)).await?.is_empty());
+    assert!(store.list_providers(Some(instance_id)).await?.is_empty());
+    assert!(
+        tokio::fs::metadata(
+            PathBuf::from(&storage_root)
+                .join("unpacked")
+                .join(extension_id)
+        )
+        .await
+        .is_err(),
+        "uninstall should remove unpacked runtime package state"
+    );
+
+    let remaining_package_count = {
+        let mut count = 0i64;
+        let mut entries =
+            tokio::fs::read_dir(PathBuf::from(&storage_root).join("packages")).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("elx"))
+                .unwrap_or(false)
+            {
+                count += 1;
+            }
+        }
+        count
+    };
+    assert_eq!(
+        remaining_package_count, 0,
+        "uninstall should remove downloaded packages for every installed version"
+    );
+
+    let subscription_source_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT CASE WHEN source_provider_id IS NULL THEN 1 ELSE 0 END
+         FROM acquisition_subscriptions
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(subscription_source_cleared, 1);
+    let release_provider_refs_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT CASE WHEN source_provider_id IS NULL AND selected_provider_id IS NULL THEN 1 ELSE 0 END
+         FROM acquisition_releases
+         WHERE release_id = ?",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(release_provider_refs_cleared, 1);
+    let release_job_provider_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT CASE WHEN provider_id IS NULL THEN 1 ELSE 0 END
+         FROM acquisition_release_jobs
+         WHERE release_job_id = ?",
+    )
+    .bind(release_job_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(release_job_provider_cleared, 1);
+
+    let _ = shutdown_tx.send(());
     Ok(())
 }
 
@@ -12365,6 +15039,137 @@ async fn extensions_uninstall_blueprint_cascades_dependencies() -> Result<()> {
     assert!(
         desired.is_empty(),
         "expected desired blueprints to be removed with blueprint uninstall"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extensions_uninstall_source_preserves_acquisition_history() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let extension_id = "elixir.sources.torrentio_stremio";
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: "Torrentio-Compatible Source".to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "0.1.0",
+                "kind": "module",
+                "name": "Torrentio-Compatible Source",
+                "provides": [{
+                    "capability": "acquisition.candidate_provider",
+                    "slot": "default",
+                    "implementation": "torrentio_stremio",
+                    "scope": {
+                        "requires_account": false,
+                        "required_fields": []
+                    }
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "elixir/torrentio-candidate-provider:0.1.0"
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({ "baseUrl": "https://torrentio.strem.fun" })),
+            enabled: true,
+        })
+        .await?;
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "acquisition.candidate_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("torrentio_stremio".to_string()),
+            scope_json: None,
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-torrentio-source",
+                "port": 8097,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+
+    let subscription_id = Uuid::new_v4();
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id,
+            media_type,
+            title,
+            normalized_title,
+            source_provider_id
+         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+    )
+    .bind(subscription_id.to_string())
+    .bind(provider_id.to_string())
+    .execute(&db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/extensions/{extension_id}/uninstall"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(store.get_extension(extension_id).await?.is_none());
+    assert!(store.list_instances(Some(extension_id)).await?.is_empty());
+    assert!(store.list_providers(Some(instance_id)).await?.is_empty());
+
+    let source_provider_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT CASE WHEN source_provider_id IS NULL THEN 1 ELSE 0 END
+         FROM acquisition_subscriptions
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(
+        source_provider_cleared, 1,
+        "expected acquisition history to remain with source provider reference cleared"
     );
 
     Ok(())

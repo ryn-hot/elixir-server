@@ -335,6 +335,129 @@ pub struct AcquisitionSubscriptionFilter {
     pub active: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAcquisitionIntent {
+    pub media_type: MediaType,
+    pub title: String,
+    #[serde(default)]
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub external_ids: Option<ExternalIds>,
+    #[serde(default)]
+    pub monitor_policy: Option<AcquisitionMonitorPolicy>,
+    #[serde(default)]
+    pub route_policy: Option<AcquisitionRoutePolicy>,
+    #[serde(default)]
+    pub source_provider_id: Option<Uuid>,
+    #[serde(default)]
+    pub release_delay_seconds: Option<i64>,
+    #[serde(default)]
+    pub quality_profile: Option<JsonValue>,
+    #[serde(default)]
+    pub metadata_refresh_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub candidate_search_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub target: Option<AcquisitionIntentTarget>,
+    #[serde(default)]
+    pub targets: Vec<NewAcquisitionTarget>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionIntentTarget {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub target_key: Option<String>,
+    #[serde(default)]
+    pub target_keys: Vec<String>,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub episode_number: Option<i32>,
+    #[serde(default)]
+    pub episode_start: Option<i32>,
+    #[serde(default)]
+    pub episode_end: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_number: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_start: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_end: Option<i32>,
+    #[serde(default)]
+    pub air_date: Option<String>,
+    #[serde(default)]
+    pub air_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub metadata: Option<JsonValue>,
+    #[serde(default)]
+    pub targets: Vec<NewAcquisitionTarget>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionIntentCreation {
+    pub created: bool,
+    pub expanded_target_count: usize,
+    pub detail: AcquisitionSubscriptionDetail,
+}
+
+pub async fn create_or_update_acquisition_intent(
+    pool: &AnyPool,
+    intent: CreateAcquisitionIntent,
+    now: DateTime<Utc>,
+) -> Result<AcquisitionIntentCreation> {
+    validate_intent_input(&intent)?;
+    let explicit_targets = intent_explicit_targets(&intent, now)?;
+    let has_explicit_targets = !explicit_targets.is_empty();
+    let subscription_data = intent_subscription_data(&intent, has_explicit_targets, now);
+
+    let existing = find_subscription_by_intent_identity(pool, &subscription_data).await?;
+    let (subscription, created) = if let Some(existing) = existing {
+        let update = AcquisitionSubscriptionUpdate {
+            monitor_policy: Some(subscription_data.monitor_policy),
+            route_policy: Some(subscription_data.route_policy),
+            source_provider_id: subscription_data.source_provider_id,
+            release_delay_seconds: Some(
+                subscription_data.release_delay_seconds.unwrap_or_default(),
+            ),
+            quality_profile: subscription_data.quality_profile.clone(),
+            metadata_refresh_after: Some(subscription_data.metadata_refresh_after.unwrap_or(now)),
+            candidate_search_after: Some(subscription_data.candidate_search_after.unwrap_or(now)),
+            status: Some(AcquisitionSubscriptionStatus::Active),
+            active: Some(true),
+        };
+        (
+            update_subscription(pool, existing.subscription_id, update)
+                .await?
+                .ok_or_else(|| anyhow!("existing acquisition subscription was not readable"))?,
+            false,
+        )
+    } else {
+        (create_subscription(pool, subscription_data).await?, true)
+    };
+
+    if !explicit_targets.is_empty() {
+        upsert_subscription_targets(pool, subscription.subscription_id, explicit_targets).await?;
+    }
+
+    let detail = get_subscription_detail(pool, subscription.subscription_id)
+        .await?
+        .ok_or_else(|| anyhow!("acquisition subscription was not readable"))?;
+    Ok(AcquisitionIntentCreation {
+        created,
+        expanded_target_count: has_explicit_targets
+            .then_some(detail.targets.len())
+            .unwrap_or(0),
+        detail,
+    })
+}
+
 pub async fn create_subscription(
     pool: &AnyPool,
     data: NewAcquisitionSubscription,
@@ -576,6 +699,111 @@ pub async fn get_subscription(
     .fetch_optional(pool)
     .await?;
     row.map(|row| map_subscription(&row)).transpose()
+}
+
+async fn find_subscription_by_intent_identity(
+    pool: &AnyPool,
+    data: &NewAcquisitionSubscription,
+) -> Result<Option<AcquisitionSubscription>> {
+    let normalized_title = normalize_acquisition_title(&data.title);
+    let rows = if let Some(year) = data.year {
+        sqlx::query(
+            "SELECT
+                subscription_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                monitor_policy,
+                route_policy,
+                CAST(source_provider_id AS TEXT) AS source_provider_id,
+                release_delay_seconds,
+                CAST(quality_profile_json AS TEXT) AS quality_profile_json,
+                CAST(metadata_refresh_after AS TEXT) AS metadata_refresh_after,
+                CAST(candidate_search_after AS TEXT) AS candidate_search_after,
+                CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
+                CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                status,
+                CAST(active AS INTEGER) AS active,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM acquisition_subscriptions
+             WHERE media_type = ?
+               AND normalized_title = ?
+               AND year = ?
+               AND active = 1
+             ORDER BY created_at ASC
+             LIMIT 25",
+        )
+        .bind(data.media_type.as_str())
+        .bind(&normalized_title)
+        .bind(year)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT
+                subscription_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                CAST(external_ids_json AS TEXT) AS external_ids_json,
+                monitor_policy,
+                route_policy,
+                CAST(source_provider_id AS TEXT) AS source_provider_id,
+                release_delay_seconds,
+                CAST(quality_profile_json AS TEXT) AS quality_profile_json,
+                CAST(metadata_refresh_after AS TEXT) AS metadata_refresh_after,
+                CAST(candidate_search_after AS TEXT) AS candidate_search_after,
+                CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
+                CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                status,
+                CAST(active AS INTEGER) AS active,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM acquisition_subscriptions
+             WHERE media_type = ?
+               AND normalized_title = ?
+               AND year IS NULL
+               AND active = 1
+             ORDER BY created_at ASC
+             LIMIT 25",
+        )
+        .bind(data.media_type.as_str())
+        .bind(&normalized_title)
+        .fetch_all(pool)
+        .await?
+    };
+    let subscriptions = rows
+        .iter()
+        .map(map_subscription)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(match data.external_ids.as_ref() {
+        Some(request_ids) if external_ids_has_value(request_ids) => subscriptions
+            .iter()
+            .find(|subscription| {
+                subscription
+                    .external_ids
+                    .as_ref()
+                    .is_some_and(|existing| external_ids_overlap(existing, request_ids))
+            })
+            .cloned()
+            .or_else(|| {
+                subscriptions
+                    .iter()
+                    .all(|subscription| {
+                        subscription
+                            .external_ids
+                            .as_ref()
+                            .is_none_or(|ids| !external_ids_has_value(ids))
+                    })
+                    .then(|| subscriptions.first().cloned())
+                    .flatten()
+            }),
+        _ => subscriptions.into_iter().next(),
+    })
 }
 
 pub async fn get_subscription_detail(
@@ -980,7 +1208,7 @@ async fn upsert_subscription_target(
         .bind(target.air_date.as_deref())
         .bind(target.air_time.map(db_datetime_string))
         .bind(metadata_json.as_deref())
-        .bind(target.state.unwrap_or(existing.state).as_str())
+        .bind(refreshed_target_state(existing.state, target.state).as_str())
         .bind(existing.state_reason.as_deref())
         .bind(
             target
@@ -1035,6 +1263,20 @@ async fn upsert_subscription_target(
         .context("creating acquisition target")?;
     }
     Ok(())
+}
+
+fn refreshed_target_state(
+    existing: AcquisitionTargetState,
+    requested: Option<AcquisitionTargetState>,
+) -> AcquisitionTargetState {
+    match (existing, requested) {
+        (
+            AcquisitionTargetState::Submitted | AcquisitionTargetState::Imported,
+            Some(AcquisitionTargetState::Pending | AcquisitionTargetState::Searching),
+        ) => existing,
+        (_, Some(state)) => state,
+        _ => existing,
+    }
 }
 
 pub async fn get_target(pool: &AnyPool, target_id: Uuid) -> Result<Option<AcquisitionTarget>> {
@@ -1122,6 +1364,366 @@ fn validate_subscription_input(data: &NewAcquisitionSubscription) -> Result<()> 
         bail!("releaseDelaySeconds cannot be negative");
     }
     Ok(())
+}
+
+fn validate_intent_input(intent: &CreateAcquisitionIntent) -> Result<()> {
+    if intent.title.trim().is_empty() {
+        bail!("title is required");
+    }
+    if intent.release_delay_seconds.unwrap_or_default() < 0 {
+        bail!("releaseDelaySeconds cannot be negative");
+    }
+    Ok(())
+}
+
+fn intent_subscription_data(
+    intent: &CreateAcquisitionIntent,
+    has_explicit_targets: bool,
+    now: DateTime<Utc>,
+) -> NewAcquisitionSubscription {
+    NewAcquisitionSubscription {
+        media_type: intent.media_type,
+        title: intent.title.trim().to_string(),
+        year: intent.year,
+        external_ids: intent.external_ids.clone(),
+        monitor_policy: intent.monitor_policy.unwrap_or_else(|| {
+            if has_explicit_targets {
+                AcquisitionMonitorPolicy::SelectedTargets
+            } else {
+                AcquisitionMonitorPolicy::AllMissing
+            }
+        }),
+        route_policy: intent.route_policy.unwrap_or_default(),
+        source_provider_id: intent.source_provider_id,
+        release_delay_seconds: intent.release_delay_seconds,
+        quality_profile: intent.quality_profile.clone(),
+        metadata_refresh_after: Some(intent.metadata_refresh_after.unwrap_or(now)),
+        candidate_search_after: Some(intent.candidate_search_after.unwrap_or(now)),
+    }
+}
+
+fn intent_explicit_targets(
+    intent: &CreateAcquisitionIntent,
+    now: DateTime<Utc>,
+) -> Result<Vec<NewAcquisitionTarget>> {
+    let mut targets = intent.targets.clone();
+    if let Some(scope) = intent.target.as_ref() {
+        targets.extend(scope.targets.clone());
+        targets.extend(targets_from_scope(intent, scope, now)?);
+    }
+    if targets.is_empty() && intent.media_type == MediaType::Movie {
+        targets.push(movie_intent_target(intent, now));
+    }
+    validate_new_targets(intent.media_type, &targets)?;
+    Ok(targets)
+}
+
+fn targets_from_scope(
+    intent: &CreateAcquisitionIntent,
+    scope: &AcquisitionIntentTarget,
+    now: DateTime<Utc>,
+) -> Result<Vec<NewAcquisitionTarget>> {
+    let mut targets = Vec::new();
+    if let Some(key) = scope.target_key.as_deref() {
+        targets.push(target_from_key(intent, scope, key, now)?);
+    }
+    for key in &scope.target_keys {
+        targets.push(target_from_key(intent, scope, key, now)?);
+    }
+    if let (Some(season), Some(episode)) = (scope.season_number, scope.episode_number) {
+        targets.push(episode_intent_target(
+            intent, scope, season, episode, None, now,
+        )?);
+    }
+    if let Some(absolute) = scope.absolute_episode_number {
+        targets.push(absolute_intent_target(intent, scope, absolute, now)?);
+    }
+    if let Some(season) = scope.season_number
+        && let Some(start) = scope.episode_start
+    {
+        let end = scope.episode_end.unwrap_or(start);
+        validate_target_range(start, end, "episode")?;
+        for episode in start.min(end)..=start.max(end) {
+            targets.push(episode_intent_target(
+                intent, scope, season, episode, None, now,
+            )?);
+        }
+    }
+    if let Some(start) = scope.absolute_episode_start {
+        let end = scope.absolute_episode_end.unwrap_or(start);
+        validate_target_range(start, end, "absolute episode")?;
+        for absolute in start.min(end)..=start.max(end) {
+            targets.push(absolute_intent_target(intent, scope, absolute, now)?);
+        }
+    }
+    if targets.is_empty() && is_movie_scope(intent, scope) {
+        targets.push(movie_intent_target(intent, now));
+    }
+    if targets.is_empty() && is_explicit_scope_without_targets(scope) {
+        bail!(
+            "target scope '{}' requires targetKey, targetKeys, episodeNumber, episode range, absoluteEpisodeNumber, absolute episode range, or targets",
+            scope.kind.as_deref().unwrap_or("selected")
+        );
+    }
+    Ok(targets)
+}
+
+fn is_movie_scope(intent: &CreateAcquisitionIntent, scope: &AcquisitionIntentTarget) -> bool {
+    intent.media_type == MediaType::Movie
+        || scope
+            .kind
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("movie"))
+            .unwrap_or(false)
+}
+
+fn is_explicit_scope_without_targets(scope: &AcquisitionIntentTarget) -> bool {
+    scope
+        .kind
+        .as_deref()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "episode"
+                    | "season"
+                    | "season_pack"
+                    | "backlog"
+                    | "selected"
+                    | "selected_targets"
+                    | "absolute_episode"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn validate_target_range(start: i32, end: i32, label: &str) -> Result<()> {
+    if start <= 0 || end <= 0 {
+        bail!("{label} range values must be greater than zero");
+    }
+    if (start - end).abs() > 2000 {
+        bail!("{label} range is too large");
+    }
+    Ok(())
+}
+
+fn movie_intent_target(
+    intent: &CreateAcquisitionIntent,
+    now: DateTime<Utc>,
+) -> NewAcquisitionTarget {
+    NewAcquisitionTarget {
+        target_key: Some("movie".to_string()),
+        media_type: Some(MediaType::Movie),
+        title: Some(intent.title.trim().to_string()),
+        season_number: None,
+        episode_number: None,
+        absolute_episode_number: None,
+        air_date: None,
+        air_time: None,
+        metadata: Some(intent_target_metadata(intent, None)),
+        state: Some(AcquisitionTargetState::Pending),
+        next_search_after: Some(now),
+    }
+}
+
+fn episode_intent_target(
+    intent: &CreateAcquisitionIntent,
+    scope: &AcquisitionIntentTarget,
+    season: i32,
+    episode: i32,
+    target_key: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<NewAcquisitionTarget> {
+    if season <= 0 || episode <= 0 {
+        bail!("seasonNumber and episodeNumber must be greater than zero");
+    }
+    Ok(NewAcquisitionTarget {
+        target_key: target_key.or_else(|| Some(format!("S{season:02}E{episode:02}"))),
+        media_type: Some(intent.media_type),
+        title: target_title(intent, scope, Some(season), Some(episode), None),
+        season_number: Some(season),
+        episode_number: Some(episode),
+        absolute_episode_number: None,
+        air_date: scope.air_date.clone(),
+        air_time: scope.air_time,
+        metadata: Some(intent_target_metadata(intent, Some(scope))),
+        state: Some(AcquisitionTargetState::Pending),
+        next_search_after: Some(next_search_after_for_intent_target(
+            scope.air_time,
+            intent,
+            now,
+        )),
+    })
+}
+
+fn absolute_intent_target(
+    intent: &CreateAcquisitionIntent,
+    scope: &AcquisitionIntentTarget,
+    absolute: i32,
+    now: DateTime<Utc>,
+) -> Result<NewAcquisitionTarget> {
+    if absolute <= 0 {
+        bail!("absoluteEpisodeNumber must be greater than zero");
+    }
+    Ok(NewAcquisitionTarget {
+        target_key: Some(format!("A{absolute:04}")),
+        media_type: Some(intent.media_type),
+        title: target_title(intent, scope, None, None, Some(absolute)),
+        season_number: None,
+        episode_number: None,
+        absolute_episode_number: Some(absolute),
+        air_date: scope.air_date.clone(),
+        air_time: scope.air_time,
+        metadata: Some(intent_target_metadata(intent, Some(scope))),
+        state: Some(AcquisitionTargetState::Pending),
+        next_search_after: Some(next_search_after_for_intent_target(
+            scope.air_time,
+            intent,
+            now,
+        )),
+    })
+}
+
+fn target_from_key(
+    intent: &CreateAcquisitionIntent,
+    scope: &AcquisitionIntentTarget,
+    key: &str,
+    now: DateTime<Utc>,
+) -> Result<NewAcquisitionTarget> {
+    let key = normalized_target_key(key.to_string())?;
+    if let Some((season, episode)) = parse_season_episode_key(&key) {
+        return episode_intent_target(intent, scope, season, episode, Some(key), now);
+    }
+    if let Some(absolute) = parse_absolute_key(&key) {
+        return absolute_intent_target(intent, scope, absolute, now);
+    }
+    Ok(NewAcquisitionTarget {
+        target_key: Some(key),
+        media_type: Some(intent.media_type),
+        title: target_title(intent, scope, None, None, None),
+        season_number: None,
+        episode_number: None,
+        absolute_episode_number: None,
+        air_date: scope.air_date.clone(),
+        air_time: scope.air_time,
+        metadata: Some(intent_target_metadata(intent, Some(scope))),
+        state: Some(AcquisitionTargetState::Pending),
+        next_search_after: Some(next_search_after_for_intent_target(
+            scope.air_time,
+            intent,
+            now,
+        )),
+    })
+}
+
+fn parse_season_episode_key(key: &str) -> Option<(i32, i32)> {
+    let rest = key.strip_prefix('S')?;
+    let (season, episode) = rest.split_once('E')?;
+    Some((season.parse().ok()?, episode.parse().ok()?))
+}
+
+fn parse_absolute_key(key: &str) -> Option<i32> {
+    key.strip_prefix('A')?.parse().ok()
+}
+
+fn external_ids_has_value(ids: &ExternalIds) -> bool {
+    [
+        ids.imdb.as_deref(),
+        ids.tmdb.as_deref(),
+        ids.tvdb.as_deref(),
+        ids.tvdb_series.as_deref(),
+        ids.tvdb_movie.as_deref(),
+        ids.anilist.as_deref(),
+        ids.anidb.as_deref(),
+        ids.mal.as_deref(),
+        ids.kitsu.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+fn external_ids_overlap(left: &ExternalIds, right: &ExternalIds) -> bool {
+    external_id_matches(&left.imdb, &right.imdb)
+        || external_id_matches(&left.tmdb, &right.tmdb)
+        || external_id_matches(&left.tvdb, &right.tvdb)
+        || external_id_matches(&left.tvdb_series, &right.tvdb_series)
+        || external_id_matches(&left.tvdb_movie, &right.tvdb_movie)
+        || external_id_matches(&left.anilist, &right.anilist)
+        || external_id_matches(&left.anidb, &right.anidb)
+        || external_id_matches(&left.mal, &right.mal)
+        || external_id_matches(&left.kitsu, &right.kitsu)
+}
+
+fn external_id_matches(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left.as_deref(), right.as_deref()) {
+        (Some(left), Some(right)) => {
+            let left = left.trim();
+            let right = right.trim();
+            !left.is_empty() && left.eq_ignore_ascii_case(right)
+        }
+        _ => false,
+    }
+}
+
+fn target_title(
+    intent: &CreateAcquisitionIntent,
+    scope: &AcquisitionIntentTarget,
+    season: Option<i32>,
+    episode: Option<i32>,
+    absolute: Option<i32>,
+) -> Option<String> {
+    scope
+        .title
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| match (season, episode, absolute) {
+            (Some(season), Some(episode), _) => {
+                Some(format!("{} S{season:02}E{episode:02}", intent.title.trim()))
+            }
+            (_, _, Some(absolute)) => Some(format!("{} A{absolute:04}", intent.title.trim())),
+            _ => Some(intent.title.trim().to_string()),
+        })
+}
+
+fn intent_target_metadata(
+    intent: &CreateAcquisitionIntent,
+    scope: Option<&AcquisitionIntentTarget>,
+) -> JsonValue {
+    json_object_without_nulls(serde_json::json!({
+        "source": "acquisition_intent",
+        "intentKind": scope.and_then(|value| value.kind.clone()),
+        "externalIds": intent.external_ids.clone(),
+        "scopeMetadata": scope.and_then(|value| value.metadata.clone()),
+    }))
+}
+
+fn json_object_without_nulls(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| (!value.is_null()).then_some((key, value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn next_search_after_for_intent_target(
+    air_time: Option<DateTime<Utc>>,
+    intent: &CreateAcquisitionIntent,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match air_time {
+        Some(air_time)
+            if air_time
+                + chrono::Duration::seconds(intent.release_delay_seconds.unwrap_or_default())
+                > now =>
+        {
+            air_time + chrono::Duration::seconds(intent.release_delay_seconds.unwrap_or_default())
+        }
+        _ => now,
+    }
 }
 
 fn validate_target_input(
@@ -1593,6 +2195,421 @@ mod tests {
         let items = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].subscription_id, due.subscription_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_intent_creates_movie_subscription_and_target() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let result = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Movie,
+                title: "Example Movie".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    imdb: Some("tt1234567".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: None,
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+
+        assert!(result.created);
+        assert_eq!(result.expanded_target_count, 1);
+        assert_eq!(result.detail.subscription.media_type, MediaType::Movie);
+        assert_eq!(
+            result.detail.subscription.route_policy,
+            AcquisitionRoutePolicy::DebridFirst
+        );
+        assert_eq!(result.detail.targets.len(), 1);
+        assert_eq!(result.detail.targets[0].target_key, "MOVIE");
+        assert_eq!(
+            result.detail.targets[0].state,
+            AcquisitionTargetState::Pending
+        );
+        assert_eq!(
+            result.detail.targets[0]
+                .next_search_after
+                .map(|value| value.timestamp()),
+            Some(now.timestamp())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_intent_expands_episode_season_anime_and_backlog_targets() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+
+        let episode = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Series,
+                title: "Example Show".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("321".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: None,
+                route_policy: Some(AcquisitionRoutePolicy::DebridOnly),
+                source_provider_id: None,
+                release_delay_seconds: Some(900),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("episode".to_string()),
+                    season_number: Some(4),
+                    episode_number: Some(1),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+        assert_eq!(
+            episode.detail.subscription.monitor_policy,
+            AcquisitionMonitorPolicy::SelectedTargets
+        );
+        assert_eq!(
+            episode.detail.subscription.route_policy,
+            AcquisitionRoutePolicy::DebridOnly
+        );
+        assert_eq!(episode.detail.targets.len(), 1);
+        assert_eq!(episode.detail.targets[0].target_key, "S04E01");
+
+        let season = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Series,
+                title: "Example Season".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("season".to_string()),
+                    season_number: Some(2),
+                    episode_start: Some(1),
+                    episode_end: Some(3),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+        assert_eq!(
+            season
+                .detail
+                .targets
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S02E01", "S02E02", "S02E03"]
+        );
+
+        let anime = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Anime,
+                title: "Example Anime".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("42".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("absolute_episode".to_string()),
+                    absolute_episode_number: Some(1000),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+        assert_eq!(anime.detail.targets[0].target_key, "A1000");
+        assert_eq!(anime.detail.targets[0].absolute_episode_number, Some(1000));
+
+        let backlog = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Anime,
+                title: "Backlog Anime".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("backlog".to_string()),
+                    target_keys: vec!["S01E01".to_string(), "S01E02".to_string()],
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+        assert_eq!(
+            backlog
+                .detail
+                .targets
+                .iter()
+                .map(|target| (
+                    target.target_key.as_str(),
+                    target.season_number,
+                    target.episode_number
+                ))
+                .collect::<Vec<_>>(),
+            vec![("S01E01", Some(1), Some(1)), ("S01E02", Some(1), Some(2))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_intent_readd_is_idempotent_and_preserves_target_state() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let intent = CreateAcquisitionIntent {
+            media_type: MediaType::Series,
+            title: "Idempotent Show".to_string(),
+            year: Some(2026),
+            external_ids: None,
+            monitor_policy: None,
+            route_policy: None,
+            source_provider_id: None,
+            release_delay_seconds: None,
+            quality_profile: None,
+            metadata_refresh_after: None,
+            candidate_search_after: None,
+            target: Some(AcquisitionIntentTarget {
+                kind: Some("season".to_string()),
+                season_number: Some(1),
+                episode_start: Some(1),
+                episode_end: Some(2),
+                ..Default::default()
+            }),
+            targets: Vec::new(),
+        };
+        let first =
+            create_or_update_acquisition_intent(&database.pool, intent.clone(), now).await?;
+        let submitted = update_target_state(
+            &database.pool,
+            first.detail.targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                selected_route_logical_id: Some("acquisition.debrid.default".to_string()),
+                download_id: Some("rd-job".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .expect("updated target");
+        assert_eq!(submitted.state, AcquisitionTargetState::Submitted);
+
+        let second = create_or_update_acquisition_intent(
+            &database.pool,
+            intent,
+            now + ChronoDuration::minutes(5),
+        )
+        .await?;
+
+        assert!(!second.created);
+        assert_eq!(
+            first.detail.subscription.subscription_id,
+            second.detail.subscription.subscription_id
+        );
+        assert_eq!(second.detail.targets.len(), 2);
+        assert_eq!(
+            second.detail.targets[0].state,
+            AcquisitionTargetState::Submitted
+        );
+        assert_eq!(
+            second.detail.targets[0].download_id.as_deref(),
+            Some("rd-job")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_intent_does_not_merge_distinct_external_ids_for_same_title_year()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let first = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Series,
+                title: "Shared Name".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("111".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("episode".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+        let second_intent = CreateAcquisitionIntent {
+            media_type: MediaType::Series,
+            title: "Shared Name".to_string(),
+            year: Some(2026),
+            external_ids: Some(ExternalIds {
+                tvdb_series: Some("222".to_string()),
+                ..Default::default()
+            }),
+            monitor_policy: None,
+            route_policy: None,
+            source_provider_id: None,
+            release_delay_seconds: None,
+            quality_profile: None,
+            metadata_refresh_after: None,
+            candidate_search_after: None,
+            target: Some(AcquisitionIntentTarget {
+                kind: Some("episode".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                ..Default::default()
+            }),
+            targets: Vec::new(),
+        };
+        let second =
+            create_or_update_acquisition_intent(&database.pool, second_intent.clone(), now).await?;
+        let second_readd = create_or_update_acquisition_intent(
+            &database.pool,
+            second_intent,
+            now + ChronoDuration::minutes(1),
+        )
+        .await?;
+
+        assert!(first.created);
+        assert!(second.created);
+        assert!(!second_readd.created);
+        assert_ne!(
+            first.detail.subscription.subscription_id,
+            second.detail.subscription.subscription_id
+        );
+        assert_eq!(
+            second.detail.subscription.subscription_id,
+            second_readd.detail.subscription.subscription_id
+        );
+        let subscriptions = list_subscriptions(
+            &database.pool,
+            AcquisitionSubscriptionFilter { active: Some(true) },
+        )
+        .await?;
+        assert_eq!(subscriptions.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_intent_does_not_mutate_arr_managed_intents() -> Result<()> {
+        let database = setup_db().await?;
+        let manager_provider_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO managed_ingest_intents (
+                intent_id,
+                media_type,
+                title,
+                normalized_title,
+                year,
+                manager_provider_id,
+                manager_item_id,
+                manager_label,
+                source
+            ) VALUES (?, 'series', 'Arr Show', 'arrshow', 2026, ?, 'sonarr-1', 'Sonarr', 'find_media_add')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(manager_provider_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Series,
+                title: "Arr Show".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("episode".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            Utc::now(),
+        )
+        .await?;
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM managed_ingest_intents
+             WHERE manager_provider_id = ? AND manager_item_id = 'sonarr-1' AND active = 1",
+        )
+        .bind(manager_provider_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(rows, 1);
+        let subscriptions = list_subscriptions(
+            &database.pool,
+            AcquisitionSubscriptionFilter { active: Some(true) },
+        )
+        .await?;
+        assert_eq!(subscriptions.len(), 1);
         Ok(())
     }
 

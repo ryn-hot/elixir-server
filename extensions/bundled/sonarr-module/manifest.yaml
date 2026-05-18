@@ -5,7 +5,7 @@ name: "Sonarr"
 description: "TV series manager module backed by Sonarr."
 publisher:
   name: "Elixir"
-  key_id: "ed25519:ZXcPdxnr1ziJpDC3TwCNXWkt1vG7njkyQ/3l52mEhQI="
+  key_id: "ed25519:DK6TdfETFxJk61DW/CXhzzq5TRFi4I98XD5FXGpSmNg="
 trust: community
 permissions:
   - runtime.manage_containers
@@ -38,14 +38,7 @@ provides:
       actions: ["search"]
       requires_account: false
       required_fields: []
-requires:
-  downloads:
-    - kind: torrent
-      mode: broker
-      logical_id: downloaders.torrent.default
-    - kind: usenet
-      mode: broker
-      logical_id: downloaders.usenet.default
+requires: []
 conflicts:
   - capability: media.manager.tv
     slot: default

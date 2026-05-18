@@ -21,18 +21,32 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::download_broker::generic_debrid_error_message;
 use crate::{
     acquisition::{
-        AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView, load_intent_recovery_views,
+        AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView,
+        imports::{AcquisitionImportRunState, list_import_runs_by_release},
+        load_intent_recovery_views,
+        release_resolution::{
+            models::{AcquisitionReleaseState, ReleaseCoverageState, ReleaseJobState},
+            store::{ReleaseListFilter, list_release_coverage, list_release_jobs, list_releases},
+        },
         subscriptions::{
-            AcquisitionSubscription, AcquisitionSubscriptionFilter, AcquisitionTarget,
-            AcquisitionTargetState, AcquisitionTargetStateUpdate, list_subscription_targets,
-            list_subscriptions, update_target_state,
+            AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionFilter,
+            AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
+            list_subscription_targets, list_subscriptions, update_target_state,
         },
     },
     db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
-    debrid::{is_real_debrid_implementation, load_real_debrid_progress},
-    download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
+    debrid::{
+        DEBRID_EXTENSION_ID, LEGACY_REAL_DEBRID_EXTENSION_ID, active_debrid_service_from_config,
+        debrid_secret_exists_for_instance, is_debrid_service_implementation, load_debrid_progress,
+    },
+    download_broker::{
+        DEBRID_ACCOUNT_MISSING_MESSAGE, DEBRID_DEFAULT_LOGICAL_ID,
+        DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE, DEBRID_SERVICE_UNAVAILABLE_MESSAGE,
+        TORRENT_DEFAULT_LOGICAL_ID,
+    },
     drivers::{
         AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
     },
@@ -64,6 +78,10 @@ const SOURCE_ACQUISITION_FILE_SELECTION_REASON: &str =
     "Downloaded pack needs file selection before import.";
 const SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON: &str =
     "Downloaded file is waiting for library visibility.";
+const ADD_DEBRID_ACCOUNT_ACTION_ID: &str = "add_debrid_account";
+const OPEN_REVIEW_ACTION_ID: &str = "open_review";
+const FIND_ANOTHER_RELEASE_ACTION_ID: &str = "find_another_release";
+const RETRY_IMPORT_ACTION_ID: &str = "retry_import";
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -308,6 +326,9 @@ pub struct FindMediaAcquisitionItem {
     pub headline: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    pub target_count: usize,
+    pub displayed_child_count: usize,
+    pub hidden_child_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocker: Option<FindMediaAcquisitionBlocker>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -333,6 +354,8 @@ pub struct FindMediaAcquisitionItem {
 pub struct FindMediaAcquisitionChildItem {
     pub id: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,11 +406,16 @@ enum AcquisitionPhase {
     Requested,
     AcceptedByManager,
     FindingAnotherRelease,
+    Staged,
+    Submitted,
     QueuedInDownloader,
     Downloading,
+    Materializing,
     PostProcessing,
     Importing,
     Completed,
+    ReviewRequired,
+    Quarantined,
     NeedsAttention,
     Failed,
 }
@@ -398,11 +426,16 @@ impl AcquisitionPhase {
             Self::Requested => "requested",
             Self::AcceptedByManager => "accepted_by_manager",
             Self::FindingAnotherRelease => "finding_another_release",
+            Self::Staged => "staged",
+            Self::Submitted => "submitted",
             Self::QueuedInDownloader => "queued_in_downloader",
             Self::Downloading => "downloading",
+            Self::Materializing => "materializing",
             Self::PostProcessing => "post_processing",
             Self::Importing => "importing",
             Self::Completed => "completed",
+            Self::ReviewRequired => "review_required",
+            Self::Quarantined => "quarantined",
             Self::NeedsAttention => "needs_attention",
             Self::Failed => "failed",
         }
@@ -413,11 +446,16 @@ impl AcquisitionPhase {
             Self::Requested => "Requested",
             Self::AcceptedByManager => "Accepted by manager",
             Self::FindingAnotherRelease => "Finding another release",
+            Self::Staged => "Staged",
+            Self::Submitted => "Submitted",
             Self::QueuedInDownloader => "Queued in downloader",
             Self::Downloading => "Downloading",
+            Self::Materializing => "Materializing",
             Self::PostProcessing => "Post-processing",
             Self::Importing => "Importing",
             Self::Completed => "Downloaded",
+            Self::ReviewRequired => "Review required",
+            Self::Quarantined => "Quarantined",
             Self::NeedsAttention => "Needs attention",
             Self::Failed => "Failed",
         }
@@ -427,14 +465,19 @@ impl AcquisitionPhase {
         match self {
             Self::NeedsAttention => 0,
             Self::Failed => 1,
-            Self::FindingAnotherRelease => 2,
-            Self::Downloading => 3,
-            Self::PostProcessing => 4,
-            Self::Importing => 5,
-            Self::QueuedInDownloader => 6,
-            Self::AcceptedByManager => 7,
-            Self::Requested => 8,
-            Self::Completed => 9,
+            Self::ReviewRequired => 2,
+            Self::Quarantined => 3,
+            Self::FindingAnotherRelease => 4,
+            Self::Downloading => 5,
+            Self::Materializing => 6,
+            Self::PostProcessing => 7,
+            Self::Importing => 8,
+            Self::QueuedInDownloader => 9,
+            Self::Submitted => 10,
+            Self::Staged => 11,
+            Self::AcceptedByManager => 12,
+            Self::Requested => 13,
+            Self::Completed => 14,
         }
     }
 
@@ -443,7 +486,7 @@ impl AcquisitionPhase {
     }
 
     fn counts_as_downloading(self) -> bool {
-        matches!(self, Self::Downloading)
+        matches!(self, Self::Downloading | Self::Materializing)
     }
 
     fn legacy_stage(self) -> &'static str {
@@ -451,11 +494,16 @@ impl AcquisitionPhase {
             Self::Requested => "requested",
             Self::AcceptedByManager => "searching",
             Self::FindingAnotherRelease => "searching",
+            Self::Staged => "queued",
+            Self::Submitted => "queued",
             Self::QueuedInDownloader => "queued",
             Self::Downloading => "downloading",
+            Self::Materializing => "post_processing",
             Self::PostProcessing => "post_processing",
             Self::Importing => "importing",
             Self::Completed => "ready",
+            Self::ReviewRequired => "needs_attention",
+            Self::Quarantined => "needs_attention",
             Self::NeedsAttention => "needs_attention",
             Self::Failed => "failed",
         }
@@ -541,6 +589,16 @@ pub struct FindMediaAcquisitionAction {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigate_extension_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigate_view: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -607,13 +665,62 @@ enum SourceImportSelection {
 #[derive(Debug, Clone, Copy, Default)]
 struct SourceAcquisitionCounts {
     requested: usize,
+    staged: usize,
+    submitted: usize,
     queued: usize,
     downloading: usize,
+    materializing: usize,
     post_processing: usize,
     importing: usize,
     completed: usize,
+    review_required: usize,
+    quarantined: usize,
     needs_attention: usize,
     failed: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AcquisitionUxContext {
+    debrid_account_missing: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SourceTargetReleaseRuntime {
+    release_id: Uuid,
+    release_title: String,
+    release_state: AcquisitionReleaseState,
+    release_state_reason: Option<String>,
+    coverage_state: Option<ReleaseCoverageState>,
+    coverage_reason: Option<String>,
+    selected_route_logical_id: Option<String>,
+    download_id: Option<String>,
+    job_state: Option<ReleaseJobState>,
+    job_state_reason: Option<String>,
+    import_state: Option<AcquisitionImportRunState>,
+    import_state_reason: Option<String>,
+    import_mismatch_class: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+impl SourceTargetReleaseRuntime {
+    fn status_text(&self) -> Option<String> {
+        if let Some(state) = self.import_state {
+            return Some(state.as_str().to_string());
+        }
+        if let Some(state) = self.job_state {
+            return Some(state.as_str().to_string());
+        }
+        Some(self.release_state.as_str().to_string())
+    }
+
+    fn state_reason(&self) -> Option<String> {
+        self.import_state_reason
+            .clone()
+            .or_else(|| self.import_mismatch_class.clone())
+            .or_else(|| self.job_state_reason.clone())
+            .or_else(|| self.coverage_reason.clone())
+            .or_else(|| self.release_state_reason.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1182,6 +1289,7 @@ async fn build_find_media_acquisition_response(
     let recent_cutoff = Utc::now() - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS);
 
     sync_source_acquisition_imports(state, store, &provider_map, &downloader_progress).await?;
+    let ux_context = load_acquisition_ux_context(store).await?;
 
     let mut items = Vec::new();
     for intent in store.list_active_managed_ingest_intents().await? {
@@ -1212,6 +1320,7 @@ async fn build_find_media_acquisition_response(
             &provider_map,
             &downloader_progress,
             recent_cutoff,
+            &ux_context,
         )
         .await?,
     );
@@ -1239,7 +1348,10 @@ async fn build_find_media_acquisition_response(
         }
         if matches!(
             phase,
-            AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed
+            AcquisitionPhase::NeedsAttention
+                | AcquisitionPhase::Failed
+                | AcquisitionPhase::ReviewRequired
+                | AcquisitionPhase::Quarantined
         ) {
             needs_attention_count += 1;
         }
@@ -1302,6 +1414,9 @@ async fn build_find_media_acquisition_item(
         phase_label: state_view.phase.label().to_string(),
         headline: state_view.headline.clone(),
         detail: state_view.detail.clone(),
+        target_count: state_view.children.len().max(1),
+        displayed_child_count: state_view.children.len(),
+        hidden_child_count: 0,
         blocker: state_view.blocker.clone(),
         evidence: state_view.evidence.clone(),
         actions: state_view.actions.clone(),
@@ -1558,6 +1673,7 @@ async fn build_source_acquisition_items(
     provider_map: &HashMap<Uuid, ProviderContext>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
     recent_cutoff: DateTime<Utc>,
+    ux_context: &AcquisitionUxContext,
 ) -> AnyResult<Vec<FindMediaAcquisitionItem>> {
     let subscriptions = list_subscriptions(
         &state.db_pool,
@@ -1569,6 +1685,9 @@ async fn build_source_acquisition_items(
     for subscription in subscriptions {
         let targets =
             list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        let release_runtime =
+            load_source_release_runtime_by_target(&state.db_pool, subscription.subscription_id)
+                .await?;
         let visible_targets = targets
             .into_iter()
             .filter(|target| target.state != AcquisitionTargetState::Excluded)
@@ -1581,6 +1700,8 @@ async fn build_source_acquisition_items(
             &visible_targets,
             provider_map,
             downloader_progress,
+            &release_runtime,
+            ux_context,
         ) else {
             continue;
         };
@@ -1596,11 +1717,129 @@ async fn build_source_acquisition_items(
     Ok(items)
 }
 
+async fn load_acquisition_ux_context(
+    store: &ExtensionStore<'_>,
+) -> AnyResult<AcquisitionUxContext> {
+    let canonical_extension = store.get_extension(DEBRID_EXTENSION_ID).await?;
+    let legacy_extension = store.get_extension(LEGACY_REAL_DEBRID_EXTENSION_ID).await?;
+    let mut instances = store.list_instances(Some(DEBRID_EXTENSION_ID)).await?;
+    instances.extend(
+        store
+            .list_instances(Some(LEGACY_REAL_DEBRID_EXTENSION_ID))
+            .await?,
+    );
+    let mut has_enabled_token = false;
+    for instance in instances.into_iter().filter(|instance| instance.enabled) {
+        let service = active_debrid_service_from_config(instance.config_json.as_ref())?;
+        if debrid_secret_exists_for_instance(store, instance.instance_id, service).await? {
+            has_enabled_token = true;
+            break;
+        }
+    }
+    Ok(AcquisitionUxContext {
+        debrid_account_missing: (canonical_extension.is_some() || legacy_extension.is_some())
+            && !has_enabled_token,
+    })
+}
+
+async fn load_source_release_runtime_by_target(
+    pool: &sqlx::AnyPool,
+    subscription_id: Uuid,
+) -> AnyResult<HashMap<Uuid, SourceTargetReleaseRuntime>> {
+    let releases = list_releases(
+        pool,
+        ReleaseListFilter {
+            subscription_id: Some(subscription_id),
+            state: None,
+            limit: Some(500),
+        },
+    )
+    .await?;
+    let mut index = HashMap::new();
+
+    for release in releases {
+        let latest_job = list_release_jobs(pool, release.release_id)
+            .await?
+            .into_iter()
+            .max_by_key(|job| job.updated_at);
+        let latest_import = list_import_runs_by_release(pool, release.release_id)
+            .await?
+            .into_iter()
+            .max_by_key(|run| run.updated_at);
+        let coverages = list_release_coverage(pool, release.release_id).await?;
+
+        for coverage in coverages {
+            let mut updated_at = release.updated_at;
+            if coverage.updated_at > updated_at {
+                updated_at = coverage.updated_at;
+            }
+            if let Some(job) = latest_job
+                .as_ref()
+                .filter(|job| job.updated_at > updated_at)
+            {
+                updated_at = job.updated_at;
+            }
+            if let Some(import_run) = latest_import
+                .as_ref()
+                .filter(|import_run| import_run.updated_at > updated_at)
+            {
+                updated_at = import_run.updated_at;
+            }
+
+            let runtime = SourceTargetReleaseRuntime {
+                release_id: release.release_id,
+                release_title: release.release_title.clone(),
+                release_state: release.state,
+                release_state_reason: release.state_reason.clone(),
+                coverage_state: Some(coverage.state),
+                coverage_reason: coverage.reason.clone(),
+                selected_route_logical_id: release
+                    .selected_route_logical_id
+                    .clone()
+                    .or_else(|| latest_job.as_ref().map(|job| job.route_logical_id.clone())),
+                download_id: release
+                    .download_id
+                    .clone()
+                    .or_else(|| latest_job.as_ref().and_then(|job| job.download_id.clone()))
+                    .or_else(|| {
+                        latest_import
+                            .as_ref()
+                            .and_then(|import_run| import_run.download_id.clone())
+                    }),
+                job_state: latest_job.as_ref().map(|job| job.state),
+                job_state_reason: latest_job.as_ref().and_then(|job| job.state_reason.clone()),
+                import_state: latest_import.as_ref().map(|import_run| import_run.state),
+                import_state_reason: latest_import
+                    .as_ref()
+                    .and_then(|import_run| import_run.state_reason.clone()),
+                import_mismatch_class: latest_import
+                    .as_ref()
+                    .and_then(|import_run| import_run.mismatch_class.clone()),
+                updated_at,
+            };
+
+            let should_replace = index
+                .get(&coverage.target_id)
+                .map(|existing: &SourceTargetReleaseRuntime| {
+                    runtime.updated_at > existing.updated_at
+                })
+                .unwrap_or(true);
+            if should_replace {
+                index.insert(coverage.target_id, runtime);
+            }
+        }
+    }
+
+    Ok(index)
+}
+
 fn build_source_acquisition_item(
     subscription: &AcquisitionSubscription,
     targets: &[AcquisitionTarget],
     provider_map: &HashMap<Uuid, ProviderContext>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
+    release_runtime: &HashMap<Uuid, SourceTargetReleaseRuntime>,
+    ux_context: &AcquisitionUxContext,
 ) -> Option<FindMediaAcquisitionItem> {
     let source_provider_id = source_provider_id_for_subscription(subscription, targets);
     let source_provider = source_provider_id.and_then(|id| provider_map.get(&id));
@@ -1617,7 +1856,14 @@ fn build_source_acquisition_item(
                 target
                     .download_id
                     .as_deref()
-                    .and_then(|download_id| downloader_progress.get(download_id)),
+                    .and_then(|download_id| downloader_progress.get(download_id))
+                    .or_else(|| {
+                        release_runtime
+                            .get(&target.target_id)
+                            .and_then(|runtime| runtime.download_id.as_deref())
+                            .and_then(|download_id| downloader_progress.get(download_id))
+                    }),
+                release_runtime.get(&target.target_id),
             )
         })
         .collect::<Vec<_>>();
@@ -1634,10 +1880,7 @@ fn build_source_acquisition_item(
                 source_target_sort_key(&left.title).cmp(&source_target_sort_key(&right.title))
             })
     });
-    if children.len() > 250 {
-        children.truncate(250);
-    }
-
+    let target_count = children.len();
     let counts = source_acquisition_counts(&children);
     let phase = summarize_source_acquisition_phase(counts);
     let last_matched_at = targets
@@ -1659,15 +1902,31 @@ fn build_source_acquisition_item(
         .iter()
         .filter_map(|child| child.protocol.clone())
         .next();
-    let blocker = build_source_acquisition_blocker(&children);
+    let debrid_account_missing =
+        ux_context.debrid_account_missing && route_policy_allows_debrid(subscription.route_policy);
+    let blocker = build_source_acquisition_blocker(&children)
+        .or_else(|| debrid_account_missing.then(build_missing_debrid_account_blocker));
+    let actions = build_source_acquisition_actions(subscription, &children, debrid_account_missing);
     let mut evidence = vec![
         acquisition_evidence("Source", source_label.clone(), Some("neutral")),
-        acquisition_evidence("Targets", targets.len().to_string(), Some("neutral")),
-        acquisition_evidence("Imported", counts.completed.to_string(), Some("success")),
+        acquisition_evidence("Targets", target_count.to_string(), Some("neutral")),
     ];
+    evidence.extend(source_status_count_evidence(counts));
     if let Some(route) = subscription_route_evidence(targets) {
         evidence.push(acquisition_evidence("Route", route, Some("neutral")));
     }
+    if debrid_account_missing {
+        evidence.push(acquisition_evidence(
+            "Debrid account",
+            "Add debrid account",
+            Some("warning"),
+        ));
+    }
+    let hidden_child_count = children.len().saturating_sub(250);
+    if children.len() > 250 {
+        children.truncate(250);
+    }
+    let displayed_child_count = children.len();
 
     Some(FindMediaAcquisitionItem {
         intent_id: subscription.subscription_id,
@@ -1683,9 +1942,12 @@ fn build_source_acquisition_item(
         phase_label: phase.label().to_string(),
         headline: format_source_acquisition_headline(counts, targets.len()),
         detail: Some(format_source_acquisition_detail(counts, targets.len())),
+        target_count,
+        displayed_child_count,
+        hidden_child_count,
         blocker,
         evidence,
-        actions: Vec::new(),
+        actions,
         stage: phase.legacy_stage().to_string(),
         stage_label: phase.legacy_stage_label().to_string(),
         description: format_source_acquisition_detail(counts, targets.len()),
@@ -1703,29 +1965,43 @@ fn build_source_acquisition_item(
 fn build_source_acquisition_child(
     target: &AcquisitionTarget,
     progress: Option<&AcquisitionDownloaderProgress>,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
 ) -> FindMediaAcquisitionChildItem {
-    let phase = source_target_phase(target, progress);
-    let blocker = source_target_blocker(target, progress, phase);
-    let selected_title = selected_candidate_title(target);
+    let phase = source_target_phase(target, progress, release_runtime);
+    let blocker = source_target_blocker(target, progress, release_runtime, phase);
+    let selected_title = selected_candidate_title(target)
+        .or_else(|| release_runtime.map(|runtime| runtime.release_title.clone()));
     let title = source_target_title(target, selected_title.as_deref(), progress);
     let subtitle = source_target_subtitle(target, selected_title.as_deref());
-    let route = target.selected_route_logical_id.as_deref();
+    let route = target.selected_route_logical_id.as_deref().or_else(|| {
+        release_runtime.and_then(|runtime| runtime.selected_route_logical_id.as_deref())
+    });
     let downloader_label = source_route_downloader_label(route);
     let protocol = source_route_protocol(route);
 
     FindMediaAcquisitionChildItem {
         id: target.target_id.to_string(),
         title,
+        release_id: release_runtime.map(|runtime| runtime.release_id),
         subtitle,
-        download_id: target.download_id.clone(),
+        download_id: target
+            .download_id
+            .clone()
+            .or_else(|| release_runtime.and_then(|runtime| runtime.download_id.clone())),
         status: progress
             .and_then(|item| item.status.clone())
+            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::status_text))
             .or_else(|| Some(target.state.as_str().to_string())),
         category: progress.and_then(|item| item.category.clone()),
         phase: phase.as_str().to_string(),
         phase_label: phase.label().to_string(),
-        headline: source_target_headline(target, phase, downloader_label.as_deref()),
-        detail: source_target_detail(target, phase, selected_title.as_deref()),
+        headline: source_target_headline(
+            target,
+            release_runtime,
+            phase,
+            downloader_label.as_deref(),
+        ),
+        detail: source_target_detail(target, release_runtime, phase, selected_title.as_deref()),
         blocker,
         progress_percent: if target.state == AcquisitionTargetState::Imported {
             Some(100.0)
@@ -2012,6 +2288,7 @@ fn downloader_progress_is_completed(progress: &AcquisitionDownloaderProgress) ->
                 matches!(
                     status.as_str(),
                     "completed"
+                        | "debrid_downloaded"
                         | "rd_downloaded"
                         | "uploading"
                         | "stalledup"
@@ -2026,14 +2303,14 @@ fn downloader_progress_is_completed(progress: &AcquisitionDownloaderProgress) ->
 fn source_target_phase(
     target: &AcquisitionTarget,
     progress: Option<&AcquisitionDownloaderProgress>,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
 ) -> AcquisitionPhase {
     match target.state {
         AcquisitionTargetState::Imported => return AcquisitionPhase::Completed,
         AcquisitionTargetState::Blocked => return AcquisitionPhase::NeedsAttention,
-        AcquisitionTargetState::Pending => return AcquisitionPhase::Requested,
         AcquisitionTargetState::Searching => return AcquisitionPhase::FindingAnotherRelease,
         AcquisitionTargetState::Excluded => return AcquisitionPhase::Completed,
-        AcquisitionTargetState::Submitted => {}
+        AcquisitionTargetState::Pending | AcquisitionTargetState::Submitted => {}
     }
 
     if target
@@ -2043,6 +2320,9 @@ fn source_target_phase(
     {
         return AcquisitionPhase::NeedsAttention;
     }
+    if let Some(phase) = release_runtime.and_then(source_release_runtime_attention_phase) {
+        return phase;
+    }
     if target.import_event_id.is_some()
         && target
             .state_reason
@@ -2051,14 +2331,71 @@ fn source_target_phase(
     {
         return AcquisitionPhase::Importing;
     }
-    let Some(progress) = progress else {
+    if let Some(progress_phase) = progress.and_then(source_downloader_progress_phase) {
+        return progress_phase;
+    }
+    if let Some(phase) = release_runtime.and_then(source_release_runtime_phase) {
+        return phase;
+    }
+    if target.state == AcquisitionTargetState::Pending {
+        return AcquisitionPhase::Requested;
+    }
+    if progress.is_none() {
         return AcquisitionPhase::QueuedInDownloader;
-    };
+    }
+    AcquisitionPhase::QueuedInDownloader
+}
+
+fn source_release_runtime_attention_phase(
+    runtime: &SourceTargetReleaseRuntime,
+) -> Option<AcquisitionPhase> {
+    if matches!(
+        runtime.import_state,
+        Some(AcquisitionImportRunState::Blocked | AcquisitionImportRunState::Mismatched)
+    ) {
+        return Some(AcquisitionPhase::Quarantined);
+    }
+    if matches!(
+        runtime.import_state,
+        Some(AcquisitionImportRunState::Failed | AcquisitionImportRunState::Cancelled)
+    ) {
+        return Some(AcquisitionPhase::Failed);
+    }
+    if matches!(
+        runtime.coverage_state,
+        Some(ReleaseCoverageState::ReviewRequired | ReleaseCoverageState::Rejected)
+    ) || runtime.release_state == AcquisitionReleaseState::ReviewRequired
+    {
+        return Some(AcquisitionPhase::ReviewRequired);
+    }
+    if matches!(
+        runtime.job_state,
+        Some(ReleaseJobState::Failed | ReleaseJobState::Cancelled)
+    ) || matches!(
+        runtime.release_state,
+        AcquisitionReleaseState::Failed | AcquisitionReleaseState::Cancelled
+    ) {
+        return Some(AcquisitionPhase::Failed);
+    }
+    None
+}
+
+fn source_downloader_progress_phase(
+    progress: &AcquisitionDownloaderProgress,
+) -> Option<AcquisitionPhase> {
     if progress.issue.is_some() {
-        return AcquisitionPhase::NeedsAttention;
+        return Some(AcquisitionPhase::NeedsAttention);
+    }
+    let status = progress
+        .status
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if status.contains("materializing") {
+        return Some(AcquisitionPhase::Materializing);
     }
     if downloader_progress_is_completed(progress) {
-        return AcquisitionPhase::PostProcessing;
+        return Some(AcquisitionPhase::PostProcessing);
     }
     if progress
         .progress_percent
@@ -2066,15 +2403,69 @@ fn source_target_phase(
         .unwrap_or(false)
         || progress.download_rate_bps.unwrap_or(0) > 0
     {
-        return AcquisitionPhase::Downloading;
+        return Some(AcquisitionPhase::Downloading);
     }
-    AcquisitionPhase::QueuedInDownloader
+    None
+}
+
+fn source_release_runtime_phase(runtime: &SourceTargetReleaseRuntime) -> Option<AcquisitionPhase> {
+    if let Some(state) = runtime.import_state {
+        return match state {
+            AcquisitionImportRunState::Pending | AcquisitionImportRunState::Importing => {
+                Some(AcquisitionPhase::Importing)
+            }
+            AcquisitionImportRunState::Imported => Some(AcquisitionPhase::Completed),
+            AcquisitionImportRunState::Blocked | AcquisitionImportRunState::Mismatched => {
+                Some(AcquisitionPhase::Quarantined)
+            }
+            AcquisitionImportRunState::Failed | AcquisitionImportRunState::Cancelled => {
+                Some(AcquisitionPhase::Failed)
+            }
+        };
+    }
+    if runtime.coverage_state == Some(ReleaseCoverageState::Imported) {
+        return Some(AcquisitionPhase::Completed);
+    }
+    if let Some(state) = runtime.job_state {
+        return Some(match state {
+            ReleaseJobState::Staging | ReleaseJobState::Ready => AcquisitionPhase::Staged,
+            ReleaseJobState::Submitted => AcquisitionPhase::Submitted,
+            ReleaseJobState::Downloading => AcquisitionPhase::Downloading,
+            ReleaseJobState::Materializing => AcquisitionPhase::Materializing,
+            ReleaseJobState::Completed => AcquisitionPhase::Importing,
+            ReleaseJobState::Failed | ReleaseJobState::Cancelled => AcquisitionPhase::Failed,
+        });
+    }
+    Some(match runtime.release_state {
+        AcquisitionReleaseState::Candidate
+        | AcquisitionReleaseState::Planned
+        | AcquisitionReleaseState::Staging
+        | AcquisitionReleaseState::Ready => AcquisitionPhase::Staged,
+        AcquisitionReleaseState::Submitted => AcquisitionPhase::Submitted,
+        AcquisitionReleaseState::Downloading => AcquisitionPhase::Downloading,
+        AcquisitionReleaseState::Materializing => AcquisitionPhase::Materializing,
+        AcquisitionReleaseState::Completed => AcquisitionPhase::Importing,
+        AcquisitionReleaseState::ReviewRequired => AcquisitionPhase::ReviewRequired,
+        AcquisitionReleaseState::Failed | AcquisitionReleaseState::Cancelled => {
+            AcquisitionPhase::Failed
+        }
+    })
 }
 
 fn source_reason_needs_attention(reason: &str) -> bool {
     let normalized = reason.trim().to_ascii_lowercase();
     normalized.contains("blocked")
         || normalized.contains("failed")
+        || normalized.contains("quarantine")
+        || normalized.contains("mismatch")
+        || normalized.contains("review required")
+        || normalized.contains("token is not configured")
+        || normalized.contains("real-debrid api token")
+        || normalized.contains(&DEBRID_ACCOUNT_MISSING_MESSAGE.to_ascii_lowercase())
+        || normalized.contains(&DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE.to_ascii_lowercase())
+        || normalized.contains(&DEBRID_SERVICE_UNAVAILABLE_MESSAGE.to_ascii_lowercase())
+        || normalized.contains("protected local acquisition")
+        || normalized.contains("download protection")
         || normalized.contains("needs file selection")
         || normalized == SOURCE_ACQUISITION_FILE_SELECTION_REASON.to_ascii_lowercase()
 }
@@ -2082,9 +2473,16 @@ fn source_reason_needs_attention(reason: &str) -> bool {
 fn source_target_blocker(
     target: &AcquisitionTarget,
     progress: Option<&AcquisitionDownloaderProgress>,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
     phase: AcquisitionPhase,
 ) -> Option<FindMediaAcquisitionBlocker> {
-    if phase != AcquisitionPhase::NeedsAttention {
+    if !matches!(
+        phase,
+        AcquisitionPhase::NeedsAttention
+            | AcquisitionPhase::ReviewRequired
+            | AcquisitionPhase::Quarantined
+            | AcquisitionPhase::Failed
+    ) {
         return None;
     }
     if let Some(issue) = progress.and_then(|item| item.issue.clone()) {
@@ -2095,23 +2493,63 @@ fn source_target_blocker(
             severity: "warning".to_string(),
         });
     }
-    let detail = target
-        .state_reason
-        .clone()
-        .unwrap_or_else(|| "This acquisition target needs attention.".to_string());
-    let code = if detail == SOURCE_ACQUISITION_FILE_SELECTION_REASON {
+    let raw_detail = release_runtime
+        .and_then(SourceTargetReleaseRuntime::state_reason)
+        .or_else(|| target.state_reason.clone())
+        .unwrap_or_else(|| match phase {
+            AcquisitionPhase::ReviewRequired => {
+                "Elixir needs review before this release can be imported.".to_string()
+            }
+            AcquisitionPhase::Quarantined => {
+                "Import verification quarantined this release.".to_string()
+            }
+            AcquisitionPhase::Failed => "This acquisition failed.".to_string(),
+            _ => "This acquisition target needs attention.".to_string(),
+        });
+    let normalized = raw_detail.to_ascii_lowercase();
+    let generic_debrid_message = generic_debrid_error_message(&raw_detail);
+    let code = if raw_detail == SOURCE_ACQUISITION_FILE_SELECTION_REASON {
         "source_file_selection_required"
-    } else if detail.to_ascii_lowercase().contains("import failed") {
+    } else if generic_debrid_message == Some(DEBRID_ACCOUNT_MISSING_MESSAGE) {
+        "debrid_account_missing"
+    } else if generic_debrid_message == Some(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE) {
+        "debrid_service_not_configured"
+    } else if generic_debrid_message == Some(DEBRID_SERVICE_UNAVAILABLE_MESSAGE) {
+        "debrid_service_unavailable"
+    } else if normalized.contains("protected local acquisition is blocked")
+        || normalized.contains("protected downloads remain blocked")
+        || normalized.contains("download protection")
+    {
+        "torrent_route_blocked_by_network_protection"
+    } else if normalized.contains("protected local acquisition requires") {
+        "torrent_route_not_selected_for_protection"
+    } else if phase == AcquisitionPhase::ReviewRequired {
+        "acquisition_review_required"
+    } else if phase == AcquisitionPhase::Quarantined {
+        "acquisition_import_quarantined"
+    } else if normalized.contains("import failed") || phase == AcquisitionPhase::Failed {
         "source_import_failed"
     } else {
         "source_target_blocked"
     };
+    let detail = source_user_attention_detail(phase, Some(&raw_detail), release_runtime);
     Some(FindMediaAcquisitionBlocker {
         code: code.to_string(),
-        title: if code == "source_file_selection_required" {
-            "File selection required".to_string()
-        } else {
-            "Acquisition needs attention".to_string()
+        title: match code {
+            "source_file_selection_required" => "File selection required".to_string(),
+            "debrid_account_missing" => "Add debrid account".to_string(),
+            "debrid_service_not_configured" => DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE.to_string(),
+            "debrid_service_unavailable" => DEBRID_SERVICE_UNAVAILABLE_MESSAGE.to_string(),
+            "torrent_route_blocked_by_network_protection" => {
+                "Torrent route blocked by network protection".to_string()
+            }
+            "torrent_route_not_selected_for_protection" => {
+                "Torrent route not selected for protected downloads".to_string()
+            }
+            "acquisition_review_required" => "Review required".to_string(),
+            "acquisition_import_quarantined" => "Import quarantined".to_string(),
+            "source_import_failed" => "Acquisition failed".to_string(),
+            _ => "Acquisition needs attention".to_string(),
         },
         detail,
         severity: "warning".to_string(),
@@ -2145,24 +2583,35 @@ fn source_target_subtitle(
 
 fn source_target_headline(
     target: &AcquisitionTarget,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
     phase: AcquisitionPhase,
     downloader_label: Option<&str>,
 ) -> String {
     match phase {
         AcquisitionPhase::Requested => "Waiting for source search.".to_string(),
         AcquisitionPhase::FindingAnotherRelease => "Searching for a release.".to_string(),
+        AcquisitionPhase::Staged => "Release staged for routing.".to_string(),
+        AcquisitionPhase::Submitted => downloader_label
+            .map(|label| format!("Submitted to {label}."))
+            .unwrap_or_else(|| "Submitted to acquisition route.".to_string()),
         AcquisitionPhase::QueuedInDownloader => downloader_label
             .map(|label| format!("Queued with {label}."))
             .unwrap_or_else(|| "Queued with downloader.".to_string()),
         AcquisitionPhase::Downloading => downloader_label
             .map(|label| format!("Downloading via {label}."))
             .unwrap_or_else(|| "Download in progress.".to_string()),
+        AcquisitionPhase::Materializing => downloader_label
+            .map(|label| format!("Materializing via {label}."))
+            .unwrap_or_else(|| "Materializing selected files.".to_string()),
         AcquisitionPhase::PostProcessing => "Download finished.".to_string(),
         AcquisitionPhase::Importing => "Importing into Elixir.".to_string(),
         AcquisitionPhase::Completed => "Imported.".to_string(),
+        AcquisitionPhase::ReviewRequired => "Review required before import.".to_string(),
+        AcquisitionPhase::Quarantined => "Import quarantined after verification.".to_string(),
         AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed => target
             .state_reason
             .clone()
+            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::state_reason))
             .unwrap_or_else(|| "Acquisition needs attention.".to_string()),
         AcquisitionPhase::AcceptedByManager => "Accepted.".to_string(),
     }
@@ -2170,19 +2619,143 @@ fn source_target_headline(
 
 fn source_target_detail(
     target: &AcquisitionTarget,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
     phase: AcquisitionPhase,
     selected_title: Option<&str>,
 ) -> Option<String> {
     if matches!(
         phase,
-        AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed
+        AcquisitionPhase::NeedsAttention
+            | AcquisitionPhase::ReviewRequired
+            | AcquisitionPhase::Quarantined
+            | AcquisitionPhase::Failed
     ) {
-        return target.state_reason.clone();
+        let raw_detail = release_runtime
+            .and_then(SourceTargetReleaseRuntime::state_reason)
+            .or_else(|| target.state_reason.clone());
+        return Some(source_user_attention_detail(
+            phase,
+            raw_detail.as_deref(),
+            release_runtime,
+        ));
     }
     if let Some(title) = selected_title.filter(|value| !value.trim().is_empty()) {
         return Some(format!("Selected release: {}.", title.trim()));
     }
-    target.state_reason.clone()
+    release_runtime
+        .and_then(SourceTargetReleaseRuntime::state_reason)
+        .or_else(|| target.state_reason.clone())
+}
+
+fn source_user_attention_detail(
+    phase: AcquisitionPhase,
+    raw_reason: Option<&str>,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
+) -> String {
+    if let Some(detail) = raw_reason.and_then(source_debrid_attention_detail) {
+        return detail;
+    }
+    match phase {
+        AcquisitionPhase::ReviewRequired => source_review_required_detail(raw_reason),
+        AcquisitionPhase::Quarantined => {
+            let mismatch_class =
+                release_runtime.and_then(|runtime| runtime.import_mismatch_class.as_deref());
+            source_quarantine_detail(raw_reason, mismatch_class)
+        }
+        AcquisitionPhase::Failed => {
+            let reason = raw_reason
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("The acquisition attempt failed.");
+            format!(
+                "{reason} You can find another release, or retry from review if the downloaded files are still available."
+            )
+        }
+        AcquisitionPhase::NeedsAttention => raw_reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "This acquisition needs attention before it can continue.".to_string()
+            }),
+        _ => raw_reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "This acquisition target needs attention.".to_string()),
+    }
+}
+
+fn source_debrid_attention_detail(raw_reason: &str) -> Option<String> {
+    match generic_debrid_error_message(raw_reason)? {
+        DEBRID_ACCOUNT_MISSING_MESSAGE => {
+            Some("Add a debrid account to enable direct HTTPS debrid downloads.".to_string())
+        }
+        DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE => Some(format!(
+            "{DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE}. Add or select a debrid account before using direct HTTPS debrid downloads."
+        )),
+        DEBRID_SERVICE_UNAVAILABLE_MESSAGE => Some(format!(
+            "{DEBRID_SERVICE_UNAVAILABLE_MESSAGE}. Try another configured debrid service or use torrent fallback when policy allows."
+        )),
+        _ => None,
+    }
+}
+
+fn source_review_required_detail(raw_reason: Option<&str>) -> String {
+    let reason = raw_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let normalized = reason.to_ascii_lowercase();
+    let base = if normalized.contains("pack")
+        || normalized.contains("coverage")
+        || normalized.contains("overfetch")
+    {
+        "Elixir could not prove exactly which requested episodes this release covers."
+    } else if normalized.contains("file selection")
+        || normalized.contains("multiple file")
+        || reason == SOURCE_ACQUISITION_FILE_SELECTION_REASON
+    {
+        "Elixir found multiple files and needs the correct file choice before import."
+    } else if normalized.contains("mapping")
+        || normalized.contains("ambiguous")
+        || normalized.contains("confidence")
+        || normalized.contains("uncertain")
+    {
+        "Elixir could not classify this release with enough confidence for automatic import."
+    } else {
+        "Elixir needs manual review before this release can be imported."
+    };
+    format!("{base} Review the selection, approve the correct files, or find another release.")
+}
+
+fn source_quarantine_detail(raw_reason: Option<&str>, mismatch_class: Option<&str>) -> String {
+    let reason = raw_reason
+        .or(mismatch_class)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let normalized = reason.to_ascii_lowercase();
+    let base = if normalized.contains("missing_release_file_mapping")
+        || normalized.contains("file mapping")
+    {
+        "Import verification could not match the downloaded file to the planned target."
+    } else if normalized.contains("missing_release_file") || normalized.contains("missing file") {
+        "The selected release file was not present when Elixir tried to import it."
+    } else if normalized.contains("missing_local_path") || normalized.contains("local path") {
+        "The downloader did not expose a local file path Elixir could import."
+    } else if normalized.contains("wrong episode")
+        || normalized.contains("identity_mismatch")
+        || normalized.contains("hash")
+        || normalized.contains("mismatch")
+    {
+        "Verification found that the downloaded file appears to be a different episode than planned."
+    } else {
+        "Import verification could not confirm this file belongs to the requested target."
+    };
+    format!(
+        "{base} The file was left quarantined; you can review it, retry import after fixing the issue, or find another release."
+    )
 }
 
 fn target_episode_label(target: &AcquisitionTarget) -> Option<String> {
@@ -2218,8 +2791,8 @@ fn selected_candidate_quality(target: &AcquisitionTarget) -> Option<String> {
 
 fn source_route_downloader_label(route: Option<&str>) -> Option<String> {
     match route {
-        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("Real-Debrid".to_string()),
-        Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("qBittorrent".to_string()),
+        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("Direct HTTPS debrid download".to_string()),
+        Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("Protected torrent downloader".to_string()),
         Some(_) => Some("Downloader".to_string()),
         None => None,
     }
@@ -2227,11 +2800,167 @@ fn source_route_downloader_label(route: Option<&str>) -> Option<String> {
 
 fn source_route_protocol(route: Option<&str>) -> Option<String> {
     match route {
-        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("debrid".to_string()),
-        Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("torrent".to_string()),
+        Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("direct HTTPS debrid download".to_string()),
+        Some(TORRENT_DEFAULT_LOGICAL_ID) => {
+            Some("torrent via protected downloader egress".to_string())
+        }
         Some(value) => Some(value.to_string()),
         None => None,
     }
+}
+
+fn route_policy_allows_debrid(policy: AcquisitionRoutePolicy) -> bool {
+    matches!(
+        policy,
+        AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::DebridOnly
+    )
+}
+
+fn build_add_debrid_account_action() -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: ADD_DEBRID_ACCOUNT_ACTION_ID.to_string(),
+        label: "Add debrid account".to_string(),
+        kind: "primary".to_string(),
+        confirm_text: None,
+        navigate_extension_id: Some(DEBRID_EXTENSION_ID.to_string()),
+        navigate_view: Some("extension_control".to_string()),
+        release_id: None,
+        subscription_id: None,
+        retry_mode: None,
+    }
+}
+
+fn build_source_acquisition_actions(
+    subscription: &AcquisitionSubscription,
+    children: &[FindMediaAcquisitionChildItem],
+    debrid_account_missing: bool,
+) -> Vec<FindMediaAcquisitionAction> {
+    let mut actions = Vec::new();
+    if debrid_account_missing || children.iter().any(child_needs_debrid_account) {
+        actions.push(build_add_debrid_account_action());
+    }
+
+    if let Some(child) = children
+        .iter()
+        .find(|child| acquisition_phase_from_str(&child.phase) == AcquisitionPhase::ReviewRequired)
+        && let Some(release_id) = child.release_id
+    {
+        actions.push(build_release_review_action(
+            release_id,
+            subscription.subscription_id,
+            "Review selection",
+        ));
+    }
+
+    if let Some(child) = children
+        .iter()
+        .find(|child| acquisition_phase_from_str(&child.phase) == AcquisitionPhase::Quarantined)
+        && let Some(release_id) = child.release_id
+    {
+        actions.push(build_release_review_action(
+            release_id,
+            subscription.subscription_id,
+            "Review quarantine",
+        ));
+        actions.push(build_retry_import_action(
+            release_id,
+            subscription.subscription_id,
+        ));
+        actions.push(build_find_another_release_for_release_action(
+            release_id,
+            subscription.subscription_id,
+        ));
+    }
+
+    if !actions
+        .iter()
+        .any(|action| action.id == FIND_ANOTHER_RELEASE_ACTION_ID)
+        && let Some(child) = children.iter().find(|child| {
+            matches!(
+                acquisition_phase_from_str(&child.phase),
+                AcquisitionPhase::Failed | AcquisitionPhase::NeedsAttention
+            )
+        })
+        && let Some(release_id) = child.release_id
+    {
+        actions.push(build_find_another_release_for_release_action(
+            release_id,
+            subscription.subscription_id,
+        ));
+    }
+
+    actions
+}
+
+fn build_release_review_action(
+    release_id: Uuid,
+    subscription_id: Uuid,
+    label: &str,
+) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: OPEN_REVIEW_ACTION_ID.to_string(),
+        label: label.to_string(),
+        kind: "primary".to_string(),
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: Some("acquisition_review".to_string()),
+        release_id: Some(release_id),
+        subscription_id: Some(subscription_id),
+        retry_mode: None,
+    }
+}
+
+fn build_retry_import_action(
+    release_id: Uuid,
+    subscription_id: Uuid,
+) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: RETRY_IMPORT_ACTION_ID.to_string(),
+        label: "Retry import".to_string(),
+        kind: "secondary".to_string(),
+        confirm_text: Some(
+            "Retry import for this release without deleting downloader data?".to_string(),
+        ),
+        navigate_extension_id: None,
+        navigate_view: None,
+        release_id: Some(release_id),
+        subscription_id: Some(subscription_id),
+        retry_mode: Some("import".to_string()),
+    }
+}
+
+fn build_find_another_release_for_release_action(
+    release_id: Uuid,
+    subscription_id: Uuid,
+) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: FIND_ANOTHER_RELEASE_ACTION_ID.to_string(),
+        label: "Find another release".to_string(),
+        kind: "secondary".to_string(),
+        confirm_text: Some("Search for another release for the affected target?".to_string()),
+        navigate_extension_id: None,
+        navigate_view: None,
+        release_id: Some(release_id),
+        subscription_id: Some(subscription_id),
+        retry_mode: Some("source_discovery".to_string()),
+    }
+}
+
+fn build_missing_debrid_account_blocker() -> FindMediaAcquisitionBlocker {
+    FindMediaAcquisitionBlocker {
+        code: "debrid_account_missing".to_string(),
+        title: "Add debrid account".to_string(),
+        detail: "Add a debrid account to enable direct HTTPS debrid downloads. Torrent fallback only runs when the protected torrent route is allowed."
+            .to_string(),
+        severity: "warning".to_string(),
+    }
+}
+
+fn child_needs_debrid_account(child: &FindMediaAcquisitionChildItem) -> bool {
+    child
+        .blocker
+        .as_ref()
+        .is_some_and(|blocker| blocker.code == "debrid_account_missing")
 }
 
 fn source_acquisition_counts(
@@ -2241,11 +2970,16 @@ fn source_acquisition_counts(
     for child in children {
         match acquisition_phase_from_str(&child.phase) {
             AcquisitionPhase::Requested => counts.requested += 1,
+            AcquisitionPhase::Staged => counts.staged += 1,
+            AcquisitionPhase::Submitted => counts.submitted += 1,
             AcquisitionPhase::QueuedInDownloader => counts.queued += 1,
             AcquisitionPhase::Downloading => counts.downloading += 1,
+            AcquisitionPhase::Materializing => counts.materializing += 1,
             AcquisitionPhase::PostProcessing => counts.post_processing += 1,
             AcquisitionPhase::Importing => counts.importing += 1,
             AcquisitionPhase::Completed => counts.completed += 1,
+            AcquisitionPhase::ReviewRequired => counts.review_required += 1,
+            AcquisitionPhase::Quarantined => counts.quarantined += 1,
             AcquisitionPhase::NeedsAttention => counts.needs_attention += 1,
             AcquisitionPhase::Failed => counts.failed += 1,
             AcquisitionPhase::AcceptedByManager | AcquisitionPhase::FindingAnotherRelease => {
@@ -2256,17 +2990,53 @@ fn source_acquisition_counts(
     counts
 }
 
+fn source_status_count_evidence(
+    counts: SourceAcquisitionCounts,
+) -> Vec<FindMediaAcquisitionEvidence> {
+    let mut evidence = Vec::new();
+    let mut push = |label: &str, value: usize, tone: Option<&str>| {
+        if value > 0 {
+            evidence.push(acquisition_evidence(label, value.to_string(), tone));
+        }
+    };
+    push("Staged", counts.staged, Some("neutral"));
+    push("Submitted", counts.submitted, Some("neutral"));
+    push("Queued", counts.queued, Some("neutral"));
+    push("Downloading", counts.downloading, Some("success"));
+    push("Materializing", counts.materializing, Some("success"));
+    push("Importing", counts.importing, Some("success"));
+    push("Imported", counts.completed, Some("success"));
+    push("Review", counts.review_required, Some("warning"));
+    push("Quarantined", counts.quarantined, Some("warning"));
+    push(
+        "Failed",
+        counts.failed + counts.needs_attention,
+        Some("warning"),
+    );
+    evidence
+}
+
 fn summarize_source_acquisition_phase(counts: SourceAcquisitionCounts) -> AcquisitionPhase {
     if counts.needs_attention > 0 || counts.failed > 0 {
         AcquisitionPhase::NeedsAttention
+    } else if counts.review_required > 0 {
+        AcquisitionPhase::ReviewRequired
+    } else if counts.quarantined > 0 {
+        AcquisitionPhase::Quarantined
     } else if counts.downloading > 0 {
         AcquisitionPhase::Downloading
+    } else if counts.materializing > 0 {
+        AcquisitionPhase::Materializing
     } else if counts.post_processing > 0 {
         AcquisitionPhase::PostProcessing
     } else if counts.importing > 0 {
         AcquisitionPhase::Importing
     } else if counts.queued > 0 {
         AcquisitionPhase::QueuedInDownloader
+    } else if counts.submitted > 0 {
+        AcquisitionPhase::Submitted
+    } else if counts.staged > 0 {
+        AcquisitionPhase::Staged
     } else if counts.requested > 0 {
         AcquisitionPhase::Requested
     } else {
@@ -2301,11 +3071,26 @@ fn format_source_acquisition_headline(
             format_transfer_count(counts.needs_attention + counts.failed)
         );
     }
+    if counts.review_required > 0 {
+        return format!(
+            "{} need review.",
+            format_transfer_count(counts.review_required)
+        );
+    }
+    if counts.quarantined > 0 {
+        return format!("{} quarantined.", format_transfer_count(counts.quarantined));
+    }
     let mut parts = Vec::new();
     if counts.downloading > 0 {
         parts.push(format!(
             "{} downloading",
             format_transfer_count(counts.downloading)
+        ));
+    }
+    if counts.materializing > 0 {
+        parts.push(format!(
+            "{} materializing",
+            format_transfer_count(counts.materializing)
         ));
     }
     if counts.post_processing > 0 {
@@ -2323,6 +3108,15 @@ fn format_source_acquisition_headline(
     if counts.queued > 0 {
         parts.push(format!("{} queued", format_transfer_count(counts.queued)));
     }
+    if counts.submitted > 0 {
+        parts.push(format!(
+            "{} submitted",
+            format_transfer_count(counts.submitted)
+        ));
+    }
+    if counts.staged > 0 {
+        parts.push(format!("{} staged", format_transfer_count(counts.staged)));
+    }
     if parts.is_empty() && counts.completed >= total_targets {
         "All targets imported.".to_string()
     } else if parts.is_empty() {
@@ -2336,17 +3130,34 @@ fn format_source_acquisition_detail(
     counts: SourceAcquisitionCounts,
     total_targets: usize,
 ) -> String {
-    format!(
-        "{} of {} targets imported.",
-        counts.completed, total_targets
-    )
+    let mut parts = Vec::new();
+    let mut push = |label: &str, value: usize| {
+        if value > 0 {
+            parts.push(format!("{value} {label}"));
+        }
+    };
+    push("staged", counts.staged);
+    push("submitted", counts.submitted);
+    push("queued", counts.queued);
+    push("downloading", counts.downloading);
+    push("materializing", counts.materializing);
+    push("downloaded", counts.post_processing);
+    push("importing", counts.importing);
+    push("imported", counts.completed);
+    push("needing review", counts.review_required);
+    push("quarantined", counts.quarantined);
+    push("failed", counts.failed + counts.needs_attention);
+    if parts.is_empty() {
+        return format!("0 of {total_targets} targets imported.");
+    }
+    format!("{} out of {} targets.", parts.join(", "), total_targets)
 }
 
 fn subscription_route_evidence(targets: &[AcquisitionTarget]) -> Option<String> {
     let mut routes = targets
         .iter()
         .filter_map(|target| target.selected_route_logical_id.as_deref())
-        .map(str::to_string)
+        .map(source_route_evidence_label)
         .collect::<Vec<_>>();
     routes.sort();
     routes.dedup();
@@ -2356,6 +3167,14 @@ fn subscription_route_evidence(targets: &[AcquisitionTarget]) -> Option<String> 
         routes.into_iter().next()
     } else {
         Some(format!("{} routes", routes.len()))
+    }
+}
+
+fn source_route_evidence_label(route: &str) -> String {
+    match route {
+        DEBRID_DEFAULT_LOGICAL_ID => "Direct HTTPS debrid download".to_string(),
+        TORRENT_DEFAULT_LOGICAL_ID => "Torrent via protected downloader egress".to_string(),
+        value => value.to_string(),
     }
 }
 
@@ -2687,8 +3506,8 @@ async fn load_acquisition_downloader_progress_index(
                 load_qbittorrent_acquisition_progress_index(state, store, instance_id).await
             }
             "nzbget" => load_nzbget_acquisition_progress_index(state, store, instance_id).await,
-            implementation if is_real_debrid_implementation(Some(implementation)) => {
-                load_real_debrid_acquisition_progress_index(
+            implementation if is_debrid_service_implementation(Some(implementation)) => {
+                load_debrid_acquisition_progress_index(
                     state,
                     store,
                     provider.detail.provider.provider_id,
@@ -2929,13 +3748,13 @@ async fn load_nzbget_acquisition_progress_index(
     Ok(index)
 }
 
-async fn load_real_debrid_acquisition_progress_index(
+async fn load_debrid_acquisition_progress_index(
     state: &AppState,
     store: &ExtensionStore<'_>,
     provider_id: Uuid,
     instance_id: Uuid,
 ) -> AnyResult<AcquisitionDownloaderProgressIndex> {
-    let items = load_real_debrid_progress(state, store, provider_id, instance_id).await?;
+    let items = load_debrid_progress(state, store, provider_id, instance_id).await?;
     let mut index = AcquisitionDownloaderProgressIndex::default();
     for item in items {
         let progress_percent = item.progress.map(|value| (value * 100.0).clamp(0.0, 100.0));
@@ -3104,11 +3923,16 @@ fn acquisition_phase_from_str(value: &str) -> AcquisitionPhase {
         "requested" => AcquisitionPhase::Requested,
         "accepted_by_manager" => AcquisitionPhase::AcceptedByManager,
         "finding_another_release" => AcquisitionPhase::FindingAnotherRelease,
+        "staged" => AcquisitionPhase::Staged,
+        "submitted" => AcquisitionPhase::Submitted,
         "queued_in_downloader" => AcquisitionPhase::QueuedInDownloader,
         "downloading" => AcquisitionPhase::Downloading,
+        "materializing" => AcquisitionPhase::Materializing,
         "post_processing" => AcquisitionPhase::PostProcessing,
         "importing" => AcquisitionPhase::Importing,
         "completed" => AcquisitionPhase::Completed,
+        "review_required" => AcquisitionPhase::ReviewRequired,
+        "quarantined" => AcquisitionPhase::Quarantined,
         "needs_attention" => AcquisitionPhase::NeedsAttention,
         "failed" => AcquisitionPhase::Failed,
         _ => AcquisitionPhase::Requested,
@@ -3845,6 +4669,7 @@ fn build_download_attempt_child(
     FindMediaAcquisitionChildItem {
         id,
         title,
+        release_id: None,
         subtitle,
         download_id,
         status: progress
@@ -6872,14 +7697,21 @@ mod tests {
             test_provider_context(source_provider_id, "External Source", "test_source"),
         )]);
 
-        let item =
-            build_source_acquisition_item(&subscription, &[target], &provider_map, &progress_index)
-                .expect("source acquisition item");
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &progress_index,
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
 
         assert_eq!(item.manager_label, "External Source (test_source)");
-        assert_eq!(item.phase, "downloading");
+        assert_eq!(item.phase, "materializing");
         assert_eq!(item.children.len(), 1);
         assert_eq!(item.children[0].download_id.as_deref(), Some("rd-job"));
+        assert_eq!(item.children[0].phase, "materializing");
         assert_eq!(item.children[0].progress_percent, Some(42.0));
         assert!(
             item.evidence
@@ -6887,6 +7719,271 @@ mod tests {
                 .any(|evidence| evidence.label == "Source"
                     && evidence.value == "External Source (test_source)")
         );
+    }
+
+    #[test]
+    fn source_acquisition_status_surfaces_release_review_runtime() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let release_id = Uuid::new_v4();
+        let target = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(1),
+            Some(json!({ "title": "Example Series S01E01 1080p" })),
+        );
+        let runtime = SourceTargetReleaseRuntime {
+            release_id,
+            release_title: "Example Series S01E01 1080p".to_string(),
+            release_state: AcquisitionReleaseState::ReviewRequired,
+            release_state_reason: Some("Pack coverage is ambiguous.".to_string()),
+            coverage_state: Some(ReleaseCoverageState::ReviewRequired),
+            coverage_reason: Some("Episode coverage needs review.".to_string()),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("rd-review".to_string()),
+            job_state: None,
+            job_state_reason: None,
+            import_state: None,
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, "review_required");
+        assert_eq!(item.children[0].phase, "review_required");
+        assert_eq!(
+            item.children[0]
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("acquisition_review_required")
+        );
+        assert_eq!(item.children[0].download_id.as_deref(), Some("rd-review"));
+        assert!(
+            item.children[0]
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.detail.contains("Review the selection"))
+                .unwrap_or(false)
+        );
+        assert!(item.actions.iter().any(|action| {
+            action.id == OPEN_REVIEW_ACTION_ID
+                && action.release_id == Some(release_id)
+                && action.subscription_id == Some(subscription.subscription_id)
+        }));
+    }
+
+    #[test]
+    fn source_acquisition_large_backfill_summarizes_all_targets_before_truncation() {
+        let subscription = test_source_subscription(MediaType::Anime);
+        let mut targets = Vec::new();
+        for episode in 1..=300 {
+            let state = match episode {
+                1..=20 => AcquisitionTargetState::Imported,
+                21..=30 => AcquisitionTargetState::Submitted,
+                31..=35 => AcquisitionTargetState::Pending,
+                _ => AcquisitionTargetState::Submitted,
+            };
+            let mut target = test_source_target(
+                subscription.subscription_id,
+                MediaType::Anime,
+                Some(((episode - 1) / 100) + 1),
+                Some(((episode - 1) % 100) + 1),
+                Some(json!({ "title": format!("Example Anime Episode {episode}") })),
+            );
+            target.state = state;
+            if episode <= 20 {
+                target.updated_at = Utc::now();
+            }
+            if episode > 35 {
+                target.download_id = Some(format!("queued-{episode}"));
+            }
+            targets.push(target);
+        }
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &targets,
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.target_count, 300);
+        assert_eq!(item.displayed_child_count, 250);
+        assert_eq!(item.hidden_child_count, 50);
+        assert!(
+            item.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("300 targets")
+        );
+        assert!(
+            item.evidence
+                .iter()
+                .any(|evidence| { evidence.label == "Imported" && evidence.value == "20" })
+        );
+        assert!(
+            item.evidence
+                .iter()
+                .any(|evidence| { evidence.label == "Queued" && evidence.value == "275" })
+        );
+    }
+
+    #[test]
+    fn source_acquisition_quarantine_surfaces_retry_and_find_another_actions() {
+        let subscription = test_source_subscription(MediaType::Anime);
+        let release_id = Uuid::new_v4();
+        let target = test_source_target(
+            subscription.subscription_id,
+            MediaType::Anime,
+            Some(1),
+            Some(7),
+            Some(json!({ "title": "Example Anime 007 1080p" })),
+        );
+        let runtime = SourceTargetReleaseRuntime {
+            release_id,
+            release_title: "Example Anime 007 1080p".to_string(),
+            release_state: AcquisitionReleaseState::Completed,
+            release_state_reason: None,
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("rd-quarantine".to_string()),
+            job_state: Some(ReleaseJobState::Completed),
+            job_state_reason: None,
+            import_state: Some(AcquisitionImportRunState::Mismatched),
+            import_state_reason: Some("anime_hash_identity_mismatch".to_string()),
+            import_mismatch_class: Some("anime_hash_identity_mismatch".to_string()),
+            updated_at: Utc::now(),
+        };
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, "quarantined");
+        let blocker = item.blocker.as_ref().expect("quarantine blocker");
+        assert_eq!(blocker.code, "acquisition_import_quarantined");
+        assert!(blocker.detail.contains("different episode than planned"));
+        assert!(blocker.detail.contains("left quarantined"));
+        assert!(item.actions.iter().any(|action| {
+            action.id == OPEN_REVIEW_ACTION_ID && action.release_id == Some(release_id)
+        }));
+        assert!(item.actions.iter().any(|action| {
+            action.id == RETRY_IMPORT_ACTION_ID
+                && action.release_id == Some(release_id)
+                && action.retry_mode.as_deref() == Some("import")
+        }));
+        assert!(item.actions.iter().any(|action| {
+            action.id == FIND_ANOTHER_RELEASE_ACTION_ID
+                && action.release_id == Some(release_id)
+                && action.retry_mode.as_deref() == Some("source_discovery")
+        }));
+    }
+
+    #[test]
+    fn source_acquisition_missing_debrid_account_surfaces_add_account_action() {
+        let subscription = test_source_subscription(MediaType::Movie);
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Pending,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext {
+                debrid_account_missing: true,
+            },
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(
+            item.blocker.as_ref().map(|blocker| blocker.code.as_str()),
+            Some("debrid_account_missing")
+        );
+        assert!(item.actions.iter().any(|action| {
+            action.id == ADD_DEBRID_ACCOUNT_ACTION_ID
+                && action.navigate_extension_id.as_deref() == Some(DEBRID_EXTENSION_ID)
+                && action.navigate_view.as_deref() == Some("extension_control")
+        }));
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Debrid account" && evidence.value == "Add debrid account"
+        }));
+    }
+
+    #[test]
+    fn source_acquisition_torrent_protection_blocker_preserves_reason() {
+        let subscription = test_source_subscription(MediaType::Series);
+        let reason = "protected local acquisition is blocked by 'warp_health': Protected downloads remain blocked whenever WARP health or leak checks fail.";
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Blocked,
+            state_reason: Some(reason.to_string()),
+            selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(2),
+                Some(json!({ "title": "Example Series S01E02 1080p" })),
+            )
+        };
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        let blocker = item.blocker.expect("parent blocker");
+        assert_eq!(blocker.code, "torrent_route_blocked_by_network_protection");
+        assert_eq!(blocker.title, "Torrent route blocked by network protection");
+        assert_eq!(blocker.detail, reason);
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Route" && evidence.value == "Torrent via protected downloader egress"
+        }));
     }
 
     fn test_source_subscription(media_type: MediaType) -> AcquisitionSubscription {

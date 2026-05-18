@@ -102,6 +102,7 @@ struct CandidateSubmission {
     provider_id: Uuid,
     source_extension_id: String,
     candidate: AcquisitionCandidate,
+    provider_warnings: Vec<String>,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
     tv_coverage_plan: Option<TvCoveragePlan>,
     dispatch: Option<SchedulerDispatchEvidence>,
@@ -124,6 +125,7 @@ struct CandidateSelection {
 struct CandidateReleasePlan {
     provider_id: Uuid,
     source_extension_id: String,
+    provider_warnings: Vec<String>,
     route_logical_id: String,
     fingerprint: String,
     selection: CandidateSelection,
@@ -205,6 +207,7 @@ impl CandidateReleasePlan {
             provider_id: self.provider_id,
             source_extension_id: self.source_extension_id,
             candidate: self.selection.candidate,
+            provider_warnings: self.provider_warnings,
             anime_coverage_plan: self.selection.anime_coverage_plan,
             tv_coverage_plan: self.selection.tv_coverage_plan,
             dispatch: Some(dispatch),
@@ -1146,6 +1149,7 @@ async fn build_candidate_release_plans(
             Ok(route_logical_id) => batch.plans.push(CandidateReleasePlan {
                 provider_id: response.provider.provider_id,
                 source_extension_id: response.provider.extension_id.clone(),
+                provider_warnings: response.warnings.clone(),
                 route_logical_id,
                 fingerprint,
                 selection: coverage.selection,
@@ -2064,6 +2068,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
             provider_id,
             source_extension_id,
             candidate,
+            provider_warnings: Vec::new(),
             anime_coverage_plan: None,
             tv_coverage_plan: None,
             dispatch: None,
@@ -3187,10 +3192,13 @@ fn candidate_search_request_for_group(
         year: subscription.year,
         external_ids: Some(external_ids),
         target: Some(CandidateSearchTarget {
+            target_key: Some(target.target_key.clone()),
+            title: Some(target.title.clone()),
             season_number: target.season_number,
             episode_number: target.episode_number,
             absolute_episode_number: target.absolute_episode_number,
             air_date: target.air_date.clone(),
+            metadata: target.metadata.clone(),
         }),
         search_intent,
         preferences: preferences_from_subscription(subscription),
@@ -3797,6 +3805,12 @@ fn selected_candidate_provenance_inner(
                 serde_json::to_value(dispatch)?,
             );
         }
+        if !submission.provider_warnings.is_empty() {
+            object.insert(
+                "providerWarnings".to_string(),
+                json!(submission.provider_warnings),
+            );
+        }
         if let Some(submission_result) = submission_result {
             object.insert("submissionResult".to_string(), submission_result);
         }
@@ -4113,8 +4127,30 @@ fn jitter_seconds(seed: &Uuid, max_seconds: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::http::handlers::acquisition_sources::AcquisitionCandidateFile;
-    use crate::{config::DatabaseConfig, db::Database};
-    use serde_json::json;
+    use crate::{
+        artwork::ArtworkService,
+        auth::AuthService,
+        config::Settings,
+        extensions::{
+            ExtensionManager,
+            store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider},
+        },
+        metadata::MetadataService,
+        orchestrator::planner::stable_provider_id,
+        secrets::SecretsManager,
+    };
+    use crate::{
+        config::DatabaseConfig,
+        db::{
+            Database,
+            models::{ExtensionKind, ExtensionTrustLevel, SlotCardinality},
+        },
+        library::LinkerService,
+    };
+    use axum::{Json, Router, extract::State, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     async fn setup_test_db() -> Result<Database> {
         let config = DatabaseConfig {
@@ -4125,6 +4161,314 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    async fn setup_test_state() -> Result<AppState> {
+        let mut settings = Settings::default();
+        settings.database = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&settings.database).await?;
+        database.run_migrations().await?;
+        let auth_service = AuthService::new(settings.auth.clone())?;
+        let metadata = MetadataService::new(settings.metadata.clone())?;
+        let linkers = LinkerService::new(settings.classifier.clone())?;
+        let artwork = ArtworkService::new(
+            settings.library.artwork_cache_dir.clone(),
+            settings.metadata.request_timeout_seconds,
+        )?;
+        let secrets = SecretsManager::from_key_bytes([0u8; 32], true);
+        Ok(AppState::new(
+            settings,
+            database,
+            auth_service,
+            ExtensionManager::new(),
+            metadata,
+            linkers,
+            artwork,
+            secrets,
+        ))
+    }
+
+    #[derive(Clone)]
+    struct MockCandidateProviderState {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn start_te10b_candidate_provider_server()
+    -> Result<(u16, Arc<Mutex<Vec<Value>>>, JoinHandle<()>)> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = MockCandidateProviderState {
+            requests: requests.clone(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let app = Router::new()
+            .route("/candidate-provider/search", post(te10b_candidate_provider))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        Ok((port, requests, handle))
+    }
+
+    async fn te10b_candidate_provider(
+        State(state): State<MockCandidateProviderState>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .requests
+            .lock()
+            .expect("requests lock")
+            .push(payload.clone());
+        let media_type = payload
+            .pointer("/request/mediaType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let title = payload
+            .pointer("/request/title")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let intent_kind = payload
+            .pointer("/request/searchIntent/kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let candidates = match (media_type, title, intent_kind) {
+            ("movie", _, _) => vec![candidate_json(
+                "Movie.2026.1080p.WEB-DL-GROUP",
+                "te10bmovie",
+                &[],
+            )],
+            ("series", _, "season_pack") => vec![candidate_json(
+                "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+                "te10bseasonpack",
+                &[
+                    ("1", "Show.S01.COMPLETE/Show.S01E01.1080p.mkv"),
+                    ("2", "Show.S01.COMPLETE/Show.S01E02.1080p.mkv"),
+                    ("3", "Show.S01.COMPLETE/Show.S01E03.1080p.mkv"),
+                ],
+            )],
+            ("series", _, "series_pack") => vec![candidate_json(
+                "Show Complete Series 1080p BluRay x265-GRP",
+                "te10bseriespack",
+                &[
+                    ("1", "Show Complete Series/Show.S01E01.1080p.mkv"),
+                    ("2", "Show Complete Series/Show.S02E01.1080p.mkv"),
+                ],
+            )],
+            ("series", _, _) => vec![candidate_json(
+                "Show.S02E01.1080p.WEB-DL-GROUP",
+                "te10btvepisode",
+                &[],
+            )],
+            ("anime", "Translated Anime", _) => vec![candidate_json(
+                "[SubsPlease] Translated Anime S04E01 [1080p]",
+                "te10banimetvdb",
+                &[],
+            )],
+            ("anime", _, _) => vec![candidate_json(
+                "[SubsPlease] Example Title - 1000 [1080p]",
+                "te10banimeabsolute",
+                &[],
+            )],
+            _ => Vec::new(),
+        };
+        let mut rows = candidates;
+        rows.push(json!({
+            "title": "Malformed Candidate",
+            "sourceKind": "magnet"
+        }));
+        Json(json!({
+            "candidates": rows,
+            "warnings": ["provider fixture warning"]
+        }))
+    }
+
+    fn candidate_json(title: &str, hash: &str, files: &[(&str, &str)]) -> Value {
+        json!({
+            "title": title,
+            "source": format!("magnet:?xt=urn:btih:{hash}"),
+            "sourceKind": "magnet",
+            "infoHash": hash,
+            "quality": "1080p",
+            "seeders": 100,
+            "cachedDebrid": true,
+            "supportedRoutes": [
+                DEBRID_DEFAULT_LOGICAL_ID,
+                TORRENT_DEFAULT_LOGICAL_ID
+            ],
+            "defaultRoute": DEBRID_DEFAULT_LOGICAL_ID,
+            "files": files.iter().enumerate().map(|(index, (id, path))| json!({
+                "fileId": id,
+                "fileIndex": index + 1,
+                "path": path,
+                "sizeBytes": 1_000_000u64,
+                "selectable": true
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    async fn seed_te10b_candidate_provider(state: &AppState, port: u16) -> Result<Uuid> {
+        let store = ExtensionStore::new(&state.db_pool);
+        seed_te10b_broker_provider(
+            &store,
+            "elixir.modules.real_debrid.test",
+            "debrid.resolver",
+            "real_debrid",
+            "debrid",
+        )
+        .await?;
+        seed_te10b_broker_provider(
+            &store,
+            "elixir.modules.qbittorrent.test",
+            "downloader.torrent",
+            "qbittorrent",
+            "managed",
+        )
+        .await?;
+
+        let extension_id = "elixir.sources.te10b.fixture";
+        let instance_id = Uuid::new_v4();
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "TE-10B Fixture Source".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "TE-10B Fixture Source",
+                    "provides": [{
+                        "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+                        "slot": "default",
+                        "cardinality": "one",
+                        "implementation": "te10b_fixture",
+                        "scope": {
+                            "media_types": ["movie", "series", "tv", "anime"],
+                            "actions": ["search"]
+                        }
+                    }],
+                    "requires": {
+                        "downloads": [
+                            { "kind": "debrid", "mode": "broker" },
+                            { "kind": "torrent", "mode": "broker" }
+                        ]
+                    },
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/te10b-fixture:1"
+                    }
+                }),
+                package_hash: Some("te10b".to_string()),
+                enabled: true,
+            })
+            .await?;
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({ "resultLimit": 25 })),
+                enabled: true,
+            })
+            .await?;
+        let provider_id = stable_provider_id(
+            instance_id,
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "default",
+        );
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("te10b_fixture".to_string()),
+                scope_json: Some(json!({
+                    "media_types": ["movie", "series", "tv", "anime"],
+                    "actions": ["search"]
+                })),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "te10b-provider.internal",
+                    "port": port,
+                    "base_path": "/candidate-provider",
+                    "network": null
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok(provider_id)
+    }
+
+    async fn seed_te10b_broker_provider(
+        store: &ExtensionStore<'_>,
+        extension_id: &str,
+        capability: &str,
+        implementation: &str,
+        provider_kind: &str,
+    ) -> Result<()> {
+        let instance_id = Uuid::new_v4();
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: extension_id.to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": extension_id
+                }),
+                package_hash: Some(format!("{extension_id}:te10b")),
+                enabled: true,
+            })
+            .await?;
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: Uuid::new_v4(),
+                instance_id,
+                capability: capability.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some(implementation.to_string()),
+                scope_json: Some(json!({
+                    "download_broker": {
+                        "provider_kind": provider_kind
+                    }
+                })),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "127.0.0.1",
+                    "port": 9,
+                    "base_path": "/",
+                    "network": null
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok(())
     }
 
     fn candidate(
@@ -4234,6 +4578,50 @@ mod tests {
         }
     }
 
+    fn movie_target(subscription: &AcquisitionSubscription) -> AcquisitionTarget {
+        let now = Utc::now();
+        AcquisitionTarget {
+            target_id: Uuid::new_v4(),
+            subscription_id: subscription.subscription_id,
+            target_key: "MOVIE".to_string(),
+            media_type: MediaType::Movie,
+            title: subscription.title.clone(),
+            season_number: None,
+            episode_number: None,
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: None,
+            metadata: Some(json!({
+                "source": "te10b_test",
+                "externalIds": subscription.external_ids.clone().unwrap_or_default()
+            })),
+            state: AcquisitionTargetState::Pending,
+            state_reason: None,
+            selected_provider_id: None,
+            selected_route_logical_id: None,
+            selected_candidate: None,
+            download_id: None,
+            import_event_id: None,
+            search_attempts: 0,
+            last_search_at: None,
+            next_search_after: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn anime_absolute_target(
+        subscription: &AcquisitionSubscription,
+        absolute_episode_number: i32,
+    ) -> AcquisitionTarget {
+        let mut target = anime_episode_target(subscription, 1, absolute_episode_number);
+        target.target_key = format!("A{absolute_episode_number:04}");
+        target.season_number = None;
+        target.episode_number = None;
+        target.absolute_episode_number = Some(absolute_episode_number);
+        target
+    }
+
     fn anime_scoring_context(target_count: i32) -> AnimeCandidateScoringContext {
         AnimeCandidateScoringContext {
             graph_fingerprint: Some("automation-rr3k".to_string()),
@@ -4284,6 +4672,7 @@ mod tests {
         CandidateReleasePlan {
             provider_id: Uuid::new_v4(),
             source_extension_id: "test.source".to_string(),
+            provider_warnings: Vec::new(),
             route_logical_id: route_logical_id.to_string(),
             fingerprint: candidate_release_fingerprint(&candidate, None),
             selection: CandidateSelection {
@@ -4353,6 +4742,308 @@ mod tests {
             searches_this_tick: 0,
             submissions_this_tick: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn te10b_due_provider_invocation_feeds_rr_decisions_for_required_media_shapes()
+    -> Result<()> {
+        let state = setup_test_state().await?;
+        let (port, requests, server) = start_te10b_candidate_provider_server().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, port).await?;
+
+        #[derive(Clone)]
+        struct Fixture {
+            subscription: AcquisitionSubscription,
+            targets: Vec<AcquisitionTarget>,
+            search_intent: Option<CandidateSearchIntent>,
+            release_kind: ReleaseKind,
+            resolver_kind: ReleaseResolverKind,
+            confidence: ReleaseConfidence,
+            covered: usize,
+        }
+
+        let mut movie_subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Movie".to_string(),
+            normalized_title: "movie".to_string(),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt1000001".to_string()),
+                ..Default::default()
+            }),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        movie_subscription.subscription_id = Uuid::new_v4();
+        let movie_targets = vec![movie_target(&movie_subscription)];
+
+        let mut episode_subscription = AcquisitionSubscription {
+            source_provider_id: Some(provider_id),
+            external_ids: Some(ExternalIds {
+                tvdb_series: Some("100".to_string()),
+                ..Default::default()
+            }),
+            ..test_subscription()
+        };
+        episode_subscription.subscription_id = Uuid::new_v4();
+        let episode_targets = vec![episode_target(&episode_subscription, 2, 1)];
+
+        let mut season_subscription = AcquisitionSubscription {
+            source_provider_id: Some(provider_id),
+            external_ids: Some(ExternalIds {
+                tvdb_series: Some("101".to_string()),
+                ..Default::default()
+            }),
+            ..test_subscription()
+        };
+        season_subscription.subscription_id = Uuid::new_v4();
+        let season_targets = vec![
+            episode_target(&season_subscription, 1, 1),
+            episode_target(&season_subscription, 1, 2),
+            episode_target(&season_subscription, 1, 3),
+        ];
+
+        let mut series_subscription = AcquisitionSubscription {
+            source_provider_id: Some(provider_id),
+            external_ids: Some(ExternalIds {
+                tvdb_series: Some("102".to_string()),
+                ..Default::default()
+            }),
+            ..test_subscription()
+        };
+        series_subscription.subscription_id = Uuid::new_v4();
+        let series_targets = vec![
+            episode_target(&series_subscription, 1, 1),
+            episode_target(&series_subscription, 2, 1),
+        ];
+
+        let mut anime_absolute_subscription = AcquisitionSubscription {
+            source_provider_id: Some(provider_id),
+            external_ids: Some(ExternalIds {
+                anilist: Some("200".to_string()),
+                ..Default::default()
+            }),
+            ..anime_subscription()
+        };
+        anime_absolute_subscription.subscription_id = Uuid::new_v4();
+        let anime_absolute_targets =
+            vec![anime_absolute_target(&anime_absolute_subscription, 1000)];
+
+        let mut anime_tvdb_subscription = AcquisitionSubscription {
+            title: "Translated Anime".to_string(),
+            normalized_title: "translated anime".to_string(),
+            source_provider_id: Some(provider_id),
+            external_ids: Some(ExternalIds {
+                anilist: Some("201".to_string()),
+                tvdb_series: Some("301".to_string()),
+                ..Default::default()
+            }),
+            ..anime_subscription()
+        };
+        anime_tvdb_subscription.subscription_id = Uuid::new_v4();
+        let mut anime_tvdb_target = anime_episode_target(&anime_tvdb_subscription, 4, 1);
+        anime_tvdb_target.title = "Translated Anime".to_string();
+        anime_tvdb_target.absolute_episode_number = Some(49);
+        anime_tvdb_target.metadata = Some(json!({
+            "source": "anilist_anizip_tvdb",
+            "aliases": ["Translated Anime"],
+            "targetCanonicalKey": "tvdb:301:S04E01",
+            "tvdbEpisodeId": "3010401",
+            "externalIds": anime_tvdb_subscription.external_ids.clone().unwrap_or_default()
+        }));
+        let anime_tvdb_targets = vec![anime_tvdb_target];
+
+        let fixtures = vec![
+            Fixture {
+                subscription: movie_subscription,
+                targets: movie_targets,
+                search_intent: None,
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::MovieSingle,
+                confidence: ReleaseConfidence::High,
+                covered: 1,
+            },
+            Fixture {
+                subscription: episode_subscription,
+                targets: episode_targets,
+                search_intent: None,
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                confidence: ReleaseConfidence::High,
+                covered: 1,
+            },
+            Fixture {
+                subscription: season_subscription,
+                targets: season_targets.clone(),
+                search_intent: Some(search_intent_for_targets(
+                    &season_targets,
+                    RetryBucket::Cold,
+                )),
+                release_kind: ReleaseKind::SeasonPack,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                confidence: ReleaseConfidence::High,
+                covered: 3,
+            },
+            Fixture {
+                subscription: series_subscription,
+                targets: series_targets.clone(),
+                search_intent: Some(CandidateSearchIntent {
+                    kind: "series_pack".to_string(),
+                    target_count: 2,
+                    target_keys: series_targets
+                        .iter()
+                        .map(|target| target.target_key.clone())
+                        .collect(),
+                    ..Default::default()
+                }),
+                release_kind: ReleaseKind::SeriesPack,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                confidence: ReleaseConfidence::High,
+                covered: 2,
+            },
+            Fixture {
+                subscription: anime_absolute_subscription,
+                targets: anime_absolute_targets,
+                search_intent: None,
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+                confidence: ReleaseConfidence::High,
+                covered: 1,
+            },
+            Fixture {
+                subscription: anime_tvdb_subscription,
+                targets: anime_tvdb_targets,
+                search_intent: None,
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+                confidence: ReleaseConfidence::Medium,
+                covered: 1,
+            },
+        ];
+
+        for fixture in fixtures {
+            let target = fixture.targets[0].clone();
+            let request = candidate_search_request_for_group(
+                &fixture.subscription,
+                &target,
+                fixture.search_intent.clone(),
+            );
+            let response =
+                crate::http::handlers::acquisition_sources::search_candidates_with_store_at_base_url(
+                    &state.db_pool,
+                    request,
+                    &format!("http://127.0.0.1:{port}/candidate-provider"),
+                )
+                .await?;
+            assert_eq!(
+                response.provider.provider_id, provider_id,
+                "provider selection should use the subscription provider"
+            );
+            assert_eq!(
+                response.candidates.len(),
+                1,
+                "{} should keep the valid candidate and drop malformed rows",
+                fixture.subscription.title
+            );
+            assert!(
+                response
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "provider fixture warning")
+            );
+            assert!(
+                response
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("candidate[1] rejected"))
+            );
+
+            let mut governor = QueueGovernor::load(&state.db_pool).await?;
+            let batch = build_candidate_release_plans(
+                &state,
+                &fixture.subscription,
+                &response,
+                &target,
+                &fixture.targets,
+                &mut governor,
+            )
+            .await?;
+            assert_eq!(
+                batch.plans.len(),
+                1,
+                "{} should produce one RR plan",
+                fixture.subscription.title
+            );
+            let plan = &batch.plans[0];
+            assert_eq!(plan.release_kind, fixture.release_kind);
+            assert_eq!(plan.resolver_kind, fixture.resolver_kind);
+            assert_eq!(plan.covered_target_ids.len(), fixture.covered);
+            assert_eq!(plan.confidence, fixture.confidence);
+            assert!(
+                plan.provider_warnings
+                    .iter()
+                    .any(|warning| warning.contains("candidate[1] rejected"))
+            );
+
+            let group = TargetSearchGroup {
+                group_key: "te10b-group".to_string(),
+                representative: target.clone(),
+                targets: fixture.targets.clone(),
+                search_intent: fixture.search_intent.clone(),
+            };
+            let dispatch = scheduler_dispatch_evidence(
+                &fixture.subscription,
+                &group,
+                plan,
+                governor.capacity_snapshot(
+                    fixture.subscription.subscription_id,
+                    &plan.route_logical_id,
+                ),
+            );
+            let provenance =
+                selected_candidate_provenance(&plan.clone().into_submission(dispatch))?;
+            assert_eq!(
+                provenance
+                    .pointer("/schedulerDispatch/selectedPlanScore/resolverKind")
+                    .and_then(Value::as_str),
+                Some(fixture.resolver_kind.as_str())
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/schedulerDispatch/selectedPlanScore/coveredTargetCount")
+                    .and_then(Value::as_u64),
+                Some(fixture.covered as u64)
+            );
+            assert!(
+                provenance
+                    .get("providerWarnings")
+                    .and_then(Value::as_array)
+                    .is_some_and(|warnings| !warnings.is_empty())
+            );
+        }
+
+        let captured = requests.lock().expect("requests lock").clone();
+        assert_eq!(captured.len(), 6);
+        assert!(captured.iter().all(|payload| {
+            payload
+                .pointer("/request/preferences/routePolicy")
+                .and_then(Value::as_str)
+                == Some("debrid_first")
+        }));
+        assert!(captured.iter().all(|payload| {
+            payload
+                .pointer("/request/target/targetKey")
+                .and_then(Value::as_str)
+                .is_some()
+        }));
+        assert!(captured.iter().any(|payload| {
+            payload
+                .pointer("/request/target/metadata/source")
+                .and_then(Value::as_str)
+                == Some("anilist_anizip_tvdb")
+        }));
+
+        server.abort();
+        Ok(())
     }
 
     #[test]

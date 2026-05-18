@@ -3,17 +3,19 @@ use axum::{
     extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, json};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{
     acquisition::subscriptions::{
         AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionDetail,
         AcquisitionSubscriptionFilter, AcquisitionSubscriptionUpdate, AcquisitionTarget,
-        AcquisitionTargetState, AcquisitionTargetStateUpdate, NewAcquisitionSubscription,
-        NewAcquisitionTarget, create_subscription, get_subscription, get_subscription_detail,
-        get_target, list_subscriptions, update_subscription, update_target_state,
-        upsert_subscription_targets, validate_new_targets,
+        AcquisitionTargetState, AcquisitionTargetStateUpdate, CreateAcquisitionIntent,
+        NewAcquisitionSubscription, NewAcquisitionTarget, create_or_update_acquisition_intent,
+        create_subscription, get_subscription, get_subscription_detail, get_target,
+        list_subscriptions, update_subscription, update_target_state, upsert_subscription_targets,
+        validate_new_targets,
     },
     db::models::ProviderHealthState,
     download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
@@ -26,7 +28,9 @@ use crate::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
                 normalize_acquisition_candidate,
             },
-            download_broker::{DownloadBrokerSubmitRequest, submit_to_broker},
+            download_broker::{
+                DownloadBrokerSubmitRequest, generic_debrid_error_message, submit_to_broker,
+            },
         },
     },
     state::AppState,
@@ -139,6 +143,127 @@ pub async fn create_acquisition_subscription(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::internal("created acquisition subscription was not readable"))?;
     Ok(Json(detail))
+}
+
+pub async fn create_acquisition_intent(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Json(mut request): Json<CreateAcquisitionIntent>,
+) -> ApiResult<Json<crate::acquisition::subscriptions::AcquisitionIntentCreation>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    apply_source_provider_config_defaults(&store, &mut request).await?;
+    let result = create_or_update_acquisition_intent(&state.db_pool, request, chrono::Utc::now())
+        .await
+        .map_err(map_acquisition_input_error)?;
+    Ok(Json(result))
+}
+
+async fn apply_source_provider_config_defaults(
+    store: &ExtensionStore<'_>,
+    request: &mut CreateAcquisitionIntent,
+) -> ApiResult<()> {
+    let Some(source_provider_id) = request.source_provider_id else {
+        return Ok(());
+    };
+    let provider = store
+        .get_provider(source_provider_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::bad_request("source provider was not found"))?;
+    if !provider
+        .capability
+        .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+    {
+        return Err(ApiError::bad_request(
+            "source provider must be an acquisition candidate provider",
+        ));
+    }
+    let instance = store
+        .get_instance(provider.instance_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::bad_request("source provider instance was not found"))?;
+    let Some(config) = instance.config_json.as_ref().and_then(JsonValue::as_object) else {
+        return Ok(());
+    };
+
+    if request.route_policy.is_none() {
+        if let Some(route_policy) = config
+            .get("routePolicy")
+            .and_then(JsonValue::as_str)
+            .map(AcquisitionRoutePolicy::from_str)
+            .transpose()
+            .map_err(|err| ApiError::bad_request(err.to_string()))?
+        {
+            request.route_policy = Some(route_policy);
+        }
+    }
+    if request.release_delay_seconds.is_none() {
+        if let Some(delay) = config
+            .get("releaseDelaySeconds")
+            .and_then(JsonValue::as_i64)
+        {
+            if delay < 0 {
+                return Err(ApiError::bad_request(
+                    "releaseDelaySeconds cannot be negative",
+                ));
+            }
+            request.release_delay_seconds = Some(delay);
+        }
+    }
+    if request.quality_profile.is_none() {
+        request.quality_profile = source_quality_profile_from_config(config);
+    }
+    Ok(())
+}
+
+fn source_quality_profile_from_config(config: &JsonMap<String, JsonValue>) -> Option<JsonValue> {
+    let mut profile = JsonMap::new();
+    if let Some(values) = string_list_config(config.get("allowedQualities")) {
+        if !values.is_empty() {
+            profile.insert("allowedQualities".to_string(), JsonValue::Array(values));
+        }
+    }
+    if let Some(values) = string_list_config(config.get("requiredLanguages")) {
+        if !values.is_empty() {
+            profile.insert("requiredLanguages".to_string(), JsonValue::Array(values));
+        }
+    }
+    if let Some(max_size_bytes) = max_size_bytes_from_config(config) {
+        profile.insert("maxSizeBytes".to_string(), json!(max_size_bytes));
+    }
+    (!profile.is_empty()).then_some(JsonValue::Object(profile))
+}
+
+fn string_list_config(value: Option<&JsonValue>) -> Option<Vec<JsonValue>> {
+    let values = match value {
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| json!(value))
+            .collect(),
+        Some(JsonValue::String(text)) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| json!(value))
+            .collect(),
+        _ => return None,
+    };
+    Some(values)
+}
+
+fn max_size_bytes_from_config(config: &JsonMap<String, JsonValue>) -> Option<u64> {
+    let raw_bytes = config.get("maxSizeBytes").and_then(JsonValue::as_u64);
+    if raw_bytes.is_some() {
+        return raw_bytes;
+    }
+    let max_size_gb = config
+        .get("maxSizeGb")
+        .and_then(|value| value.as_f64().filter(|gb| *gb > 0.0))?;
+    Some((max_size_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
 }
 
 pub async fn get_acquisition_subscription(
@@ -280,8 +405,8 @@ pub async fn submit_acquisition_target_candidate(
                     if should_record_target_blocker(&fallback_err) {
                         let message = format!(
                             "Debrid route failed: {}; torrent fallback failed: {}",
-                            api_error_message(&err),
-                            api_error_message(&fallback_err)
+                            acquisition_state_error_message(&err),
+                            acquisition_state_error_message(&fallback_err)
                         );
                         set_target_state_after_submission(
                             &state.db_pool,
@@ -301,7 +426,7 @@ pub async fn submit_acquisition_target_candidate(
         }
         Err(err) => {
             if should_record_target_blocker(&err) {
-                let message = api_error_message(&err).to_string();
+                let message = acquisition_state_error_message(&err);
                 set_target_state_after_submission(
                     &state.db_pool,
                     target_id,
@@ -513,6 +638,13 @@ fn api_error_message(err: &ApiError) -> &str {
         | ApiError::Conflict(message)
         | ApiError::Internal(message) => message,
     }
+}
+
+fn acquisition_state_error_message(err: &ApiError) -> String {
+    let message = api_error_message(err);
+    generic_debrid_error_message(message)
+        .unwrap_or(message)
+        .to_string()
 }
 
 fn map_source_provider_error(err: anyhow::Error) -> ApiError {

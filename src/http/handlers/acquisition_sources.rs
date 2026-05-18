@@ -7,7 +7,7 @@ use axum::{
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map as JsonMap, Value};
 use uuid::Uuid;
 
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
         DEBRID_DEFAULT_LOGICAL_ID, DownloadBrokerRouteRecord, TORRENT_DEFAULT_LOGICAL_ID,
         list_acquisition_routes,
     },
-    extensions::{ExternalIds, store::ExtensionStore},
+    extensions::{ExternalIds, manifest::ExtensionManifest, store::ExtensionStore},
     http::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
@@ -98,6 +98,10 @@ pub struct CandidateSearchPreferences {
 #[serde(rename_all = "camelCase")]
 pub struct CandidateSearchTarget {
     #[serde(default)]
+    pub target_key: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
     pub season_number: Option<i32>,
     #[serde(default)]
     pub episode_number: Option<i32>,
@@ -105,6 +109,8 @@ pub struct CandidateSearchTarget {
     pub absolute_episode_number: Option<i32>,
     #[serde(default)]
     pub air_date: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -228,14 +234,14 @@ struct CandidateProviderInvocationContext<'a> {
     instance_id: Uuid,
     implementation: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    config: Option<&'a Value>,
+    config: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CandidateProviderUpstreamResponse {
     #[serde(default)]
-    candidates: Vec<AcquisitionCandidate>,
+    candidates: Vec<Value>,
     #[serde(default)]
     warnings: Vec<String>,
 }
@@ -285,18 +291,39 @@ pub(crate) async fn search_candidates_with_store(
     let route_options =
         candidate_route_options(pool, &store, &provider.extension.extension_id).await?;
     let upstream = invoke_candidate_provider(&provider, &request).await?;
-    let candidates = upstream
-        .candidates
-        .into_iter()
-        .map(normalize_acquisition_candidate)
-        .collect::<Result<Vec<_>>>()?;
+    candidate_search_response_from_upstream(provider.summary, route_options, upstream)
+}
+
+#[cfg(test)]
+pub(crate) async fn search_candidates_with_store_at_base_url(
+    pool: &sqlx::AnyPool,
+    request: CandidateSearchRequest,
+    base_url: &str,
+) -> Result<CandidateSearchResponse> {
+    let store = ExtensionStore::new(pool);
+    let provider =
+        select_candidate_provider(&store, request.provider_id, Some(&request.media_type)).await?;
+    let route_options =
+        candidate_route_options(pool, &store, &provider.extension.extension_id).await?;
+    let upstream = invoke_candidate_provider_at_base_url(base_url, &provider, &request).await?;
+    candidate_search_response_from_upstream(provider.summary, route_options, upstream)
+}
+
+fn candidate_search_response_from_upstream(
+    provider: CandidateProviderSummary,
+    route_options: Vec<CandidateRouteOption>,
+    upstream: CandidateProviderUpstreamResponse,
+) -> Result<CandidateSearchResponse> {
+    let (candidates, normalization_warnings) = normalize_upstream_candidates(upstream.candidates);
+    let mut warnings = upstream.warnings;
+    warnings.extend(normalization_warnings);
 
     Ok(CandidateSearchResponse {
         schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
-        provider: provider.summary,
+        provider,
         route_options,
         candidates,
-        warnings: upstream.warnings,
+        warnings,
     })
 }
 
@@ -309,7 +336,7 @@ async fn available_candidate_providers(
         if detail.provider.capability != ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY {
             continue;
         }
-        if detail.provider.health_state == ProviderHealthState::Unhealthy {
+        if detail.provider.health_state != ProviderHealthState::Healthy {
             continue;
         }
         let Some(extension) = store.get_extension(&detail.extension_id).await? else {
@@ -406,6 +433,8 @@ async fn invoke_candidate_provider_at_base_url(
     request: &CandidateSearchRequest,
 ) -> Result<CandidateProviderUpstreamResponse> {
     let search_url = candidate_provider_search_url(&base_url)?;
+    let provider_config =
+        candidate_provider_invocation_config(&selected.extension, &selected.instance)?;
     let invocation = CandidateProviderInvocation {
         schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
         request,
@@ -414,7 +443,7 @@ async fn invoke_candidate_provider_at_base_url(
             extension_id: &selected.extension.extension_id,
             instance_id: selected.instance.instance_id,
             implementation: selected.provider.implementation.as_deref(),
-            config: selected.instance.config_json.as_ref(),
+            config: provider_config,
         },
     };
     let client = reqwest::Client::builder()
@@ -529,7 +558,184 @@ pub(crate) fn normalize_acquisition_candidate(
         .into_iter()
         .filter_map(normalize_candidate_file)
         .collect();
+    candidate.raw = candidate.raw.map(redact_sensitive_value);
     Ok(candidate)
+}
+
+fn normalize_upstream_candidates(values: Vec<Value>) -> (Vec<AcquisitionCandidate>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, value) in values.into_iter().enumerate() {
+        match serde_json::from_value::<AcquisitionCandidate>(value)
+            .context("deserializing acquisition candidate")
+            .and_then(normalize_acquisition_candidate)
+        {
+            Ok(candidate) => candidates.push(candidate),
+            Err(err) => warnings.push(format!("candidate[{index}] rejected: {err}")),
+        }
+    }
+    (candidates, warnings)
+}
+
+fn candidate_provider_invocation_config(
+    extension: &Extension,
+    instance: &ExtensionInstance,
+) -> Result<Option<Value>> {
+    let manifest = serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        .with_context(|| format!("parsing extension manifest '{}'", extension.extension_id))?;
+    let mut allowed_keys = manifest
+        .control_surface
+        .as_ref()
+        .map(|surface| {
+            surface
+                .owned_settings
+                .iter()
+                .filter(|setting| {
+                    !setting.secret
+                        && setting
+                            .storage
+                            .r#type
+                            .trim()
+                            .eq_ignore_ascii_case("instance_setting")
+                        && !is_sensitive_key(&setting.storage.key)
+                })
+                .map(|setting| setting.storage.key.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let config_object = instance.config_json.as_ref().and_then(Value::as_object);
+    if allowed_keys.is_empty() {
+        allowed_keys = config_object
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| is_public_instance_config_key(key))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    allowed_keys.sort();
+    allowed_keys.dedup();
+
+    let mut filtered = JsonMap::new();
+    if let Some(control_surface) = manifest.control_surface.as_ref() {
+        for setting in &control_surface.owned_settings {
+            if setting.secret
+                || !setting
+                    .storage
+                    .r#type
+                    .trim()
+                    .eq_ignore_ascii_case("instance_setting")
+                || is_sensitive_key(&setting.storage.key)
+                || !allowed_keys.iter().any(|key| key == &setting.storage.key)
+            {
+                continue;
+            }
+            let Some(default) = setting.default.as_ref() else {
+                continue;
+            };
+            if !default.is_null() {
+                filtered.insert(setting.storage.key.clone(), default.clone());
+            }
+        }
+    }
+    for key in allowed_keys {
+        let Some(value) = config_object.and_then(|object| object.get(&key)) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        filtered.insert(key, redact_sensitive_value(value.clone()));
+    }
+
+    Ok((!filtered.is_empty()).then_some(Value::Object(filtered)))
+}
+
+fn is_public_instance_config_key(key: &str) -> bool {
+    let normalized = normalize_sensitive_key(key);
+    if matches!(
+        normalized.as_str(),
+        "runtime" | "manageddefaults" | "managed" | "secrets" | "secret" | "credentials"
+    ) {
+        return false;
+    }
+    !is_sensitive_normalized_key(&normalized)
+}
+
+fn redact_sensitive_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_value).collect())
+        }
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_key(&key) {
+                        Value::String("[REDACTED]".to_string())
+                    } else {
+                        redact_sensitive_value(value)
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        Value::String(value) => Value::String(redact_sensitive_url(&value)),
+        other => other,
+    }
+}
+
+fn redact_sensitive_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return value.to_string();
+    };
+    let Some(_) = url.query() else {
+        return value.to_string();
+    };
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let redacted = if is_sensitive_key(&key) {
+                "[REDACTED]".to_string()
+            } else {
+                redact_sensitive_url(&value)
+            };
+            (key.into_owned(), redacted)
+        })
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in pairs {
+            query.append_pair(&key, &value);
+        }
+    }
+    url.to_string()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    is_sensitive_normalized_key(&normalize_sensitive_key(key))
+}
+
+fn normalize_sensitive_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| !matches!(ch, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_sensitive_normalized_key(key: &str) -> bool {
+    key.contains("token")
+        || key.contains("apikey")
+        || key.contains("secret")
+        || key.contains("password")
+        || matches!(
+            key,
+            "key" | "pass" | "auth" | "authorization" | "signature" | "sig"
+        )
 }
 
 fn normalize_candidate_file(
@@ -588,6 +794,7 @@ mod tests {
     };
     use axum::{Router, routing::post};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
     async fn setup_db() -> Result<Database> {
@@ -606,6 +813,14 @@ mod tests {
         let url = candidate_provider_search_url("http://127.0.0.1:1234/api/candidates")?;
         assert_eq!(url.as_str(), "http://127.0.0.1:1234/api/candidates/search");
         Ok(())
+    }
+
+    #[test]
+    fn debrid_route_label_is_service_neutral() {
+        assert_eq!(
+            route_label(DEBRID_DEFAULT_LOGICAL_ID),
+            "Direct HTTPS debrid download"
+        );
     }
 
     #[test]
@@ -632,6 +847,174 @@ mod tests {
         })
         .expect_err("missing source should fail");
         assert!(err.to_string().contains("candidate source is required"));
+    }
+
+    #[test]
+    fn normalize_upstream_candidates_keeps_valid_rows_and_warns_for_bad_rows() {
+        let (candidates, warnings) = normalize_upstream_candidates(vec![
+            json!({
+                "title": "Valid Release",
+                "source": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                "sourceKind": "magnet",
+                "raw": {
+                    "url": "https://source.example/path?token=secret"
+                }
+            }),
+            json!({
+                "title": "Missing Source",
+                "sourceKind": "magnet"
+            }),
+            json!({
+                "title": "Bad File",
+                "source": "magnet:?xt=urn:btih:bad",
+                "sourceKind": "magnet",
+                "files": [{ "sizeBytes": 10 }]
+            }),
+        ]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Valid Release");
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("candidate[1] rejected"));
+        assert!(warnings[1].contains("candidate[2] rejected"));
+    }
+
+    #[test]
+    fn normalize_candidate_redacts_sensitive_raw_provenance() -> Result<()> {
+        let candidate = normalize_acquisition_candidate(AcquisitionCandidate {
+            id: None,
+            title: "Release".to_string(),
+            source: "https://hoster.example/file.mkv?token=usable-submission-token".to_string(),
+            source_kind: "http".to_string(),
+            info_hash: None,
+            file_index: None,
+            quality: None,
+            size_bytes: None,
+            seeders: None,
+            language: None,
+            cached_debrid: None,
+            rank: None,
+            score: None,
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: Vec::new(),
+            default_route: None,
+            raw: Some(json!({
+                "stream": {
+                    "url": "https://hoster.example/file.mkv?token=secret&safe=visible",
+                    "authorization": "Bearer secret",
+                    "nested": {
+                        "api_key": "secret-api-key"
+                    }
+                }
+            })),
+        })?;
+
+        assert_eq!(
+            candidate.source,
+            "https://hoster.example/file.mkv?token=usable-submission-token"
+        );
+        let raw = candidate.raw.expect("raw");
+        assert_eq!(
+            raw.pointer("/stream/url").and_then(Value::as_str),
+            Some("https://hoster.example/file.mkv?token=%5BREDACTED%5D&safe=visible")
+        );
+        assert_eq!(
+            raw.pointer("/stream/authorization").and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            raw.pointer("/stream/nested/api_key")
+                .and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_candidate_accepts_release_resolution_hint_envelope() -> Result<()> {
+        let candidate = normalize_acquisition_candidate(AcquisitionCandidate {
+            id: Some("abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string()),
+            title: "  Example Show S02E01-E03 2160p WEB-DL  ".to_string(),
+            source: " magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd ".to_string(),
+            source_kind: "MAGNET".to_string(),
+            info_hash: Some("abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string()),
+            file_index: Some(0),
+            quality: Some("2160p".to_string()),
+            size_bytes: Some(12_345),
+            seeders: Some(42),
+            language: Some("en".to_string()),
+            cached_debrid: Some(true),
+            rank: Some(1),
+            score: Some(0.92),
+            score_badges: vec![CandidateScoreBadge {
+                label: "2160p".to_string(),
+                detail: Some("Detected source quality".to_string()),
+                score: Some(0.28),
+            }],
+            files: vec![
+                AcquisitionCandidateFile {
+                    file_id: None,
+                    file_index: Some(0),
+                    path: "Example Show\\Example.Show.S02E01.mkv".to_string(),
+                    size_bytes: Some(4_096),
+                    selectable: Some(true),
+                },
+                AcquisitionCandidateFile {
+                    file_id: Some("  ".to_string()),
+                    file_index: Some(1),
+                    path: "   ".to_string(),
+                    size_bytes: None,
+                    selectable: None,
+                },
+            ],
+            supported_routes: vec![
+                " acquisition.debrid.default ".to_string(),
+                " ".to_string(),
+                "downloaders.torrent.default".to_string(),
+            ],
+            default_route: Some("acquisition.debrid.default".to_string()),
+            raw: Some(json!({
+                "provider": "torrentio_stremio",
+                "parsedHints": {
+                    "authoritative": false,
+                    "pack": {
+                        "kind": "multi_episode",
+                        "episodes": [1, 2, 3],
+                        "authoritative": false
+                    }
+                },
+                "stream": {
+                    "url": "https://hoster.example/file.mkv?token=secret&safe=visible"
+                }
+            })),
+        })?;
+
+        assert_eq!(candidate.title, "Example Show S02E01-E03 2160p WEB-DL");
+        assert_eq!(candidate.source_kind, "magnet");
+        assert_eq!(
+            candidate.supported_routes,
+            vec![
+                "acquisition.debrid.default".to_string(),
+                "downloaders.torrent.default".to_string()
+            ]
+        );
+        assert_eq!(candidate.files.len(), 1);
+        assert_eq!(
+            candidate.files[0].path,
+            "Example Show/Example.Show.S02E01.mkv"
+        );
+        let raw = candidate.raw.expect("raw");
+        assert_eq!(
+            raw.pointer("/parsedHints/pack/kind")
+                .and_then(Value::as_str),
+            Some("multi_episode")
+        );
+        assert_eq!(
+            raw.pointer("/stream/url").and_then(Value::as_str),
+            Some("https://hoster.example/file.mkv?token=%5BREDACTED%5D&safe=visible")
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -767,17 +1150,193 @@ mod tests {
             &request,
         )
         .await?;
-        let candidates = upstream
-            .candidates
-            .into_iter()
-            .map(normalize_acquisition_candidate)
-            .collect::<Result<Vec<_>>>()?;
+        let (candidates, normalization_warnings) =
+            normalize_upstream_candidates(upstream.candidates);
 
         assert_eq!(selected.summary.provider_id, provider_id);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "Example Release");
         assert_eq!(route_options.len(), 2);
         assert!(upstream.warnings.iter().any(|item| item == "fixture"));
+        assert!(normalization_warnings.is_empty());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_provider_invocation_sends_only_public_instance_settings() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = Router::new().route(
+            "/candidate-provider/search",
+            post({
+                let captured = Arc::clone(&captured);
+                move |Json(payload): Json<Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        *captured.lock().expect("capture lock") = Some(payload);
+                        Json(json!({
+                            "candidates": [{
+                                "title": "Example Release",
+                                "source": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                                "sourceKind": "magnet"
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let extension_id = "ext.test.secure-candidates";
+        let instance_id = Uuid::new_v4();
+        let manifest = json!({
+            "id": extension_id,
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Secure Candidate Source",
+            "provides": [{
+                "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+                "slot": "default",
+                "cardinality": "one",
+                "implementation": "test_source"
+            }],
+            "runtime": {
+                "type": "container",
+                "image": "example/test-source:1"
+            },
+            "control_surface": {
+                "adapter": "generic_v1",
+                "owned_settings": [
+                    {
+                        "id": "baseUrl",
+                        "label": "Base URL",
+                        "type": "text",
+                        "storage": {
+                            "type": "instance_setting",
+                            "key": "baseUrl"
+                        }
+                    },
+                    {
+                        "id": "resultLimit",
+                        "label": "Result limit",
+                        "type": "number",
+                        "storage": {
+                            "type": "instance_setting",
+                            "key": "resultLimit"
+                        }
+                    }
+                ]
+            }
+        });
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "Secure Candidate Source".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: manifest,
+                package_hash: Some("test".to_string()),
+                enabled: true,
+            })
+            .await?;
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({
+                    "baseUrl": "https://source.example/manifest.json",
+                    "resultLimit": 10,
+                    "runtime": {
+                        "config_dir": "/private/elixir/source"
+                    },
+                    "realDebridApiToken": "must-not-cross-boundary",
+                    "api_key": "must-not-cross-boundary"
+                })),
+                enabled: true,
+            })
+            .await?;
+        let provider_id = stable_provider_id(
+            instance_id,
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "default",
+        );
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("test_source".to_string()),
+                scope_json: None,
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "candidate-provider.internal",
+                    "port": addr.port(),
+                    "base_path": "/candidate-provider",
+                    "network": null
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let request = CandidateSearchRequest {
+            provider_id: Some(provider_id),
+            media_type: "movie".to_string(),
+            title: "Example".to_string(),
+            year: Some(2026),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt1234567".to_string()),
+                ..Default::default()
+            }),
+            target: None,
+            search_intent: None,
+            preferences: CandidateSearchPreferences::default(),
+            limit: Some(10),
+        };
+        let selected =
+            select_candidate_provider(&store, request.provider_id, Some("movie")).await?;
+        invoke_candidate_provider_at_base_url(
+            &format!("http://127.0.0.1:{}/candidate-provider", addr.port()),
+            &selected,
+            &request,
+        )
+        .await?;
+
+        let payload = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("captured invocation");
+        assert_eq!(
+            payload
+                .pointer("/provider/config/baseUrl")
+                .and_then(Value::as_str),
+            Some("https://source.example/manifest.json")
+        );
+        assert_eq!(
+            payload
+                .pointer("/provider/config/resultLimit")
+                .and_then(Value::as_i64),
+            Some(10)
+        );
+        assert!(payload.pointer("/provider/config/runtime").is_none());
+        assert!(
+            payload
+                .pointer("/provider/config/realDebridApiToken")
+                .is_none()
+        );
+        assert!(payload.pointer("/provider/config/api_key").is_none());
         server.abort();
         Ok(())
     }

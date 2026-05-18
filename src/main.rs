@@ -167,8 +167,8 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("preinstalled core runtime bootstrap failed: {err}");
         }
     };
-    if let Err(err) = debrid::ensure_real_debrid_builtin(&state).await {
-        tracing::warn!("Real-Debrid provider bootstrap failed: {err}");
+    if let Err(err) = debrid::ensure_debrid_builtin(&state).await {
+        tracing::warn!("debrid provider bootstrap failed: {err}");
     }
     if let Err(err) = state.orchestrator.prepare_probe_binary().await {
         tracing::warn!("probe binary preparation failed: {err}");

@@ -23,7 +23,7 @@ use reqwest::header::{
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map as JsonMap, Value, json};
 use tokio::fs;
 use tokio::net::lookup_host;
 use tokio::process::Command;
@@ -36,7 +36,10 @@ use crate::db::models::{
     OrchestratorRunStatus, Provider, ProviderHealthState, ProviderReadiness,
     ProviderReadinessPhase, RuntimeLog, Secret, SecretScope,
 };
-use crate::debrid::{REAL_DEBRID_EXTENSION_ID, REAL_DEBRID_TOKEN_SECRET_KEY};
+use crate::debrid::{
+    DEBRID_EXTENSION_ID, DebridServiceKind, LEGACY_REAL_DEBRID_EXTENSION_ID,
+    active_debrid_service_from_config, debrid_secret_exists_for_instance, is_debrid_extension_id,
+};
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::managed_paths::{DOWNLOADS_ROOT, QBITTORRENT_INCOMPLETE_DIR};
@@ -1422,7 +1425,7 @@ pub async fn install_extension(
 ) -> ApiResult<Json<InstallResponse>> {
     let result = install_extension_internal(&state, &payload)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(map_install_error)?;
     Ok(Json(result.response))
 }
 
@@ -1604,7 +1607,8 @@ async fn install_extension_internal_with_policy(
     let new_version = Version::parse(&manifest.version)
         .map_err(|_| anyhow::anyhow!("extension version is not valid semver"))?;
     let store = ExtensionStore::new(&state.db_pool);
-    if let Some(existing) = store.get_extension(&manifest.id).await? {
+    let existing_extension = store.get_extension(&manifest.id).await?;
+    if let Some(existing) = existing_extension.as_ref() {
         validate_semver_upgrade(&existing, &new_version, package_hash.as_deref(), policy)?;
     }
     let required = required_secrets_from_manifest(&manifest)?;
@@ -1656,8 +1660,18 @@ async fn install_extension_internal_with_policy(
         })
         .await?;
 
-    if ensure_default_extension_instance(&store, &manifest, false).await? {
-        trigger_extensions_reconcile(state, "extension install default instance create").await;
+    let default_instance_created =
+        ensure_default_extension_instance(&store, &manifest, false).await?;
+    let existing_instances_need_reconcile = if existing_extension.is_some()
+        && manifest.kind == ExtensionKind::Module
+        && manifest.runtime.is_some()
+    {
+        !store.list_instances(Some(&extension_id)).await?.is_empty()
+    } else {
+        false
+    };
+    if default_instance_created || existing_instances_need_reconcile {
+        trigger_extensions_reconcile(state, "extension install runtime refresh");
     }
 
     Ok(InstallResult {
@@ -1677,6 +1691,9 @@ pub async fn enable_extension(
     Path(extension_id): Path<String>,
 ) -> ApiResult<Json<Extension>> {
     let store = ExtensionStore::new(&state.db_pool);
+    let extension_id = resolve_extension_request_extension_id(&store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
     let extension = store
         .get_extension(&extension_id)
         .await
@@ -1736,6 +1753,9 @@ pub async fn disable_extension(
     Path(extension_id): Path<String>,
 ) -> ApiResult<Json<Extension>> {
     let store = ExtensionStore::new(&state.db_pool);
+    let extension_id = resolve_extension_request_extension_id(&store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
     store
         .set_extension_enabled(&extension_id, false)
         .await
@@ -1752,16 +1772,15 @@ pub async fn uninstall_extension(
     State(state): State<AppState>,
     Path(extension_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if state
-        .settings
-        .extensions
-        .core_extensions
-        .iter()
-        .any(|id| id == &extension_id)
-    {
-        return Err(ApiError::forbidden("core extensions cannot be uninstalled"));
-    }
     let store = ExtensionStore::new(&state.db_pool);
+    let extension_id = resolve_extension_request_extension_id(&store, &extension_id)
+        .await
+        .map_err(ApiError::from)?;
+    if extension_uninstall_is_protected(&state, &extension_id) {
+        return Err(ApiError::forbidden(
+            "built-in extensions cannot be uninstalled; disable them instead",
+        ));
+    }
     let existing = store
         .get_extension(&extension_id)
         .await
@@ -1897,7 +1916,7 @@ pub async fn create_instance(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::internal("instance lookup failed"))?;
-    trigger_extensions_reconcile(&state, "manual extension instance create").await;
+    trigger_extensions_reconcile(&state, "manual extension instance create");
     Ok(Json(instance))
 }
 
@@ -1908,7 +1927,7 @@ pub(super) async fn create_default_extension_instance(
 ) -> anyhow::Result<bool> {
     let created = ensure_default_extension_instance(store, manifest, true).await?;
     if created {
-        trigger_extensions_reconcile(state, "manual default instance create").await;
+        trigger_extensions_reconcile(state, "manual default instance create");
     }
     Ok(created)
 }
@@ -1947,7 +1966,7 @@ async fn ensure_default_extension_instance(
             instance_id,
             extension_id: manifest.id.clone(),
             instance_name: "default".to_string(),
-            config_json: None,
+            config_json: default_instance_config_from_manifest(manifest),
             enabled: true,
         })
         .await?;
@@ -1955,11 +1974,45 @@ async fn ensure_default_extension_instance(
     Ok(true)
 }
 
-async fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
-    let config = ReconcileConfig::from_settings(&state.settings);
-    if let Err(err) = state.orchestrator.reconcile_once(&config).await {
-        tracing::warn!(reason = reason, "extension reconcile trigger failed: {err}");
+fn default_instance_config_from_manifest(manifest: &ExtensionManifest) -> Option<Value> {
+    let mut config = JsonMap::new();
+    if let Some(control_surface) = manifest.control_surface.as_ref() {
+        for setting in &control_surface.owned_settings {
+            if setting.secret
+                || !setting
+                    .storage
+                    .r#type
+                    .trim()
+                    .eq_ignore_ascii_case("instance_setting")
+            {
+                continue;
+            }
+            let Some(default) = setting.default.as_ref() else {
+                continue;
+            };
+            config.insert(setting.storage.key.clone(), default.clone());
+        }
     }
+
+    if config.is_empty() {
+        return None;
+    }
+    config.insert(
+        "configVersion".to_string(),
+        json!(format!("{}@{}", manifest.id, manifest.version)),
+    );
+    Some(Value::Object(config))
+}
+
+fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
+    let state = state.clone();
+    let reason = reason.to_string();
+    tokio::spawn(async move {
+        let config = ReconcileConfig::from_settings(&state.settings);
+        if let Err(err) = state.orchestrator.reconcile_once(&config).await {
+            tracing::warn!(reason = reason, "extension reconcile trigger failed: {err}");
+        }
+    });
 }
 
 pub async fn update_instance(
@@ -2040,8 +2093,13 @@ pub async fn delete_instance(
         .get_instance(instance_id)
         .await
         .map_err(ApiError::from)?;
-    if instance.is_none() {
+    let Some(instance) = instance else {
         return Err(ApiError::not_found("instance not found"));
+    };
+    if is_debrid_extension_id(&instance.extension_id) {
+        return Err(ApiError::forbidden(
+            "built-in Debrid instances cannot be deleted; disable Debrid instead",
+        ));
     }
 
     remove_instance_record(&state, &store, instance_id)
@@ -2915,7 +2973,7 @@ async fn ensure_auto_default_instances_for_installed_modules(
         }
     }
     if created {
-        trigger_extensions_reconcile(state, "status default instance auto-provision").await;
+        trigger_extensions_reconcile(state, "status default instance auto-provision");
     }
     Ok(created)
 }
@@ -3942,6 +4000,24 @@ async fn summarize_module_extension(
     }
 
     if provider_count == 0 {
+        if manifest
+            .map(is_zero_config_candidate_provider_manifest)
+            .unwrap_or(false)
+        {
+            return with_module_auto_update_summary(
+                store,
+                extension,
+                attention_extension_status(
+                    extension,
+                    "provider_registration_pending",
+                    "Starting up",
+                    "Elixir created the default source instance and is registering its candidate provider automatically.",
+                    "open",
+                    "Open",
+                ),
+            )
+            .await;
+        }
         return with_module_auto_update_summary(
             store,
             extension,
@@ -3957,19 +4033,11 @@ async fn summarize_module_extension(
         .await;
     }
 
-    if extension
-        .extension_id
-        .eq_ignore_ascii_case(REAL_DEBRID_EXTENSION_ID)
-    {
+    if is_debrid_extension_id(&extension.extension_id) {
         if let Some(instance) = choose_extension_control_instance(instances) {
-            let has_token = store
-                .get_secret(
-                    SecretScope::Instance,
-                    Some(instance.instance_id),
-                    REAL_DEBRID_TOKEN_SECRET_KEY,
-                )
-                .await?
-                .is_some();
+            let service = active_debrid_service_from_config(instance.config_json.as_ref())?;
+            let has_token =
+                debrid_secret_exists_for_instance(store, instance.instance_id, service).await?;
             if !has_token {
                 return with_module_auto_update_summary(
                     store,
@@ -3978,7 +4046,7 @@ async fn summarize_module_extension(
                         extension,
                         "provider_setup_required",
                         "Add account",
-                        "Add a Real-Debrid API token to enable debrid downloads.",
+                        "Add a debrid account to enable direct HTTPS debrid downloads.",
                         "open",
                         "Add account",
                     ),
@@ -4115,6 +4183,27 @@ async fn summarize_module_extension(
         ready_extension_status(extension, "ready", "Ready", &description, "open", "Open"),
     )
     .await
+}
+
+fn is_zero_config_candidate_provider_manifest(manifest: &ExtensionManifest) -> bool {
+    if manifest.kind != ExtensionKind::Module || manifest.runtime.is_none() {
+        return false;
+    }
+    if required_secrets_from_manifest(manifest)
+        .map(|required| !required.is_empty())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    manifest.provides.iter().any(|provide| {
+        if provide.capability != "acquisition.candidate_provider" {
+            return false;
+        }
+        let Some(scope) = provide.scope.as_ref() else {
+            return true;
+        };
+        !scope.requires_account && scope.required_fields.is_empty()
+    })
 }
 
 fn extension_status_sort_order(severity: &str) -> usize {
@@ -4428,7 +4517,11 @@ impl ExtensionControlBinding {
             ("indexer.registry", Some("prowlarr")) => Some(Self::Prowlarr),
             ("downloader.torrent", Some("qbittorrent")) => Some(Self::Qbittorrent),
             ("downloader.nzb", Some("nzbget")) => Some(Self::Nzbget),
-            ("debrid.resolver", Some("real_debrid")) => Some(Self::RealDebrid),
+            ("debrid.resolver", Some(implementation))
+                if DebridServiceKind::from_implementation_id(implementation).is_ok() =>
+            {
+                Some(Self::RealDebrid)
+            }
             _ => None,
         }
     }
@@ -5012,8 +5105,9 @@ async fn load_extension_control_context(
     store: &ExtensionStore<'_>,
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlContext> {
+    let extension_id = resolve_extension_control_extension_id(store, extension_id).await?;
     let extension = store
-        .get_extension(extension_id)
+        .get_extension(&extension_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("extension not found"))?;
     let manifest = parse_extension_control_manifest(&extension);
@@ -5023,7 +5117,7 @@ async fn load_extension_control_context(
         .into_iter()
         .find(|item| item.extension_id == extension_id)
         .ok_or_else(|| anyhow::anyhow!("extension status not found"))?;
-    let instances = store.list_instances(Some(extension_id)).await?;
+    let instances = store.list_instances(Some(&extension_id)).await?;
     let selected_instance = choose_extension_control_instance(&instances);
     let providers = if let Some(instance) = selected_instance.as_ref() {
         store.list_providers(Some(instance.instance_id)).await?
@@ -5044,6 +5138,43 @@ async fn load_extension_control_context(
         selected_provider,
         control_binding,
     })
+}
+
+async fn resolve_extension_control_extension_id(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> anyhow::Result<String> {
+    resolve_extension_request_extension_id(store, extension_id).await
+}
+
+async fn resolve_extension_request_extension_id(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> anyhow::Result<String> {
+    if is_debrid_extension_id(extension_id) {
+        if store.get_extension(DEBRID_EXTENSION_ID).await?.is_some() {
+            return Ok(DEBRID_EXTENSION_ID.to_string());
+        }
+        if extension_id.eq_ignore_ascii_case(DEBRID_EXTENSION_ID)
+            && store
+                .get_extension(LEGACY_REAL_DEBRID_EXTENSION_ID)
+                .await?
+                .is_some()
+        {
+            return Ok(LEGACY_REAL_DEBRID_EXTENSION_ID.to_string());
+        }
+    }
+    Ok(extension_id.to_string())
+}
+
+fn extension_uninstall_is_protected(state: &AppState, extension_id: &str) -> bool {
+    is_debrid_extension_id(extension_id)
+        || state
+            .settings
+            .extensions
+            .core_extensions
+            .iter()
+            .any(|id| id.as_str() == extension_id)
 }
 
 fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest {
@@ -8829,15 +8960,16 @@ async fn download_package(url: &str, dest_dir: &std::path::Path) -> Result<PathB
     Ok(dest_path)
 }
 
-async fn remove_downloaded_package(
-    packages_dir: &std::path::Path,
-    package_hash: &str,
+async fn remove_downloaded_packages_for_extension(
+    storage_paths: &ExtensionStoragePaths,
+    extension: &Extension,
 ) -> Result<(), anyhow::Error> {
-    let mut entries = match fs::read_dir(packages_dir).await {
+    let mut entries = match fs::read_dir(&storage_paths.packages_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
+    fs::create_dir_all(&storage_paths.tmp_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let file_type = entry.file_type().await?;
         if !file_type.is_file() {
@@ -8852,19 +8984,63 @@ async fn remove_downloaded_package(
         if !is_elx {
             continue;
         }
-        let hash = match compute_sha256(&path).await {
-            Ok(hash) => hash,
-            Err(err) => {
+
+        let hash_matches = match (
+            extension.package_hash.as_deref(),
+            compute_sha256(&path).await,
+        ) {
+            (Some(package_hash), Ok(hash)) => hash.eq_ignore_ascii_case(package_hash),
+            (Some(_), Err(err)) => {
                 tracing::warn!("failed to hash extension package {}: {err}", path.display());
-                continue;
+                false
             }
+            (None, _) => false,
         };
-        if hash.eq_ignore_ascii_case(package_hash) {
+        let manifest_matches = if hash_matches {
+            true
+        } else {
+            downloaded_package_matches_extension(
+                &path,
+                &storage_paths.tmp_dir,
+                &extension.extension_id,
+            )
+            .await
+        };
+
+        if manifest_matches {
             let _ = fs::remove_file(&path).await;
-            break;
         }
     }
     Ok(())
+}
+
+async fn downloaded_package_matches_extension(
+    package_path: &std::path::Path,
+    tmp_dir: &std::path::Path,
+    extension_id: &str,
+) -> bool {
+    let staging_dir = tmp_dir.join(Uuid::new_v4().to_string());
+    let matched = match unpack_package(package_path, &staging_dir).await {
+        Ok(unpacked) => match read_manifest_from_dir(&unpacked).await {
+            Ok(package) => package.manifest.id == extension_id,
+            Err(err) => {
+                tracing::debug!(
+                    "failed to read downloaded package manifest {} during uninstall cleanup: {err}",
+                    package_path.display()
+                );
+                false
+            }
+        },
+        Err(err) => {
+            tracing::debug!(
+                "failed to inspect downloaded package {} during uninstall cleanup: {err}",
+                package_path.display()
+            );
+            false
+        }
+    };
+    let _ = fs::remove_dir_all(&staging_dir).await;
+    matched
 }
 
 async fn uninstall_extension_record(
@@ -8874,13 +9050,11 @@ async fn uninstall_extension_record(
 ) -> Result<(), anyhow::Error> {
     store.delete_extension(&extension.extension_id).await?;
     let _ = fs::remove_dir_all(storage_paths.unpacked_dir.join(&extension.extension_id)).await;
-    if let Some(hash) = extension.package_hash.as_deref() {
-        if let Err(err) = remove_downloaded_package(&storage_paths.packages_dir, hash).await {
-            tracing::warn!(
-                "failed to remove package for {}: {err}",
-                extension.extension_id
-            );
-        }
+    if let Err(err) = remove_downloaded_packages_for_extension(storage_paths, extension).await {
+        tracing::warn!(
+            "failed to remove packages for {}: {err}",
+            extension.extension_id
+        );
     }
     Ok(())
 }
@@ -8970,6 +9144,33 @@ fn map_unique_violation(err: anyhow::Error, message: &str) -> ApiError {
         return ApiError::conflict(message);
     }
     ApiError::internal(details)
+}
+
+fn map_install_error(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    let bad_request_prefixes = [
+        "provide download_url or package_path",
+        "download_url or package_path is required",
+        "directory installs are only allowed",
+        "unsigned installs are disabled",
+        "package path does not exist",
+        "package path is not a file or directory",
+        "manifest id/version does not match registry entry",
+        "package hash does not match registry",
+        "publisher key mismatch between manifest and registry",
+        "package signature is required",
+        "extension version is not valid semver",
+        "extension version downgrade is not allowed",
+        "extension version is already installed",
+        "missing required secrets:",
+    ];
+    if bad_request_prefixes
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return ApiError::bad_request(message);
+    }
+    ApiError::from(err)
 }
 
 fn validate_semver_upgrade(

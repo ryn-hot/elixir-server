@@ -1,12 +1,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::control_contract::{
     ExtensionControlProvider, GenericManifestControlProvider, UnsupportedControlProvider,
+    control_notice, control_policy_managed,
 };
 use super::*;
+use crate::debrid::{
+    DebridAccount, DebridServiceKind, active_debrid_service_from_config,
+    debrid_secret_exists_for_instance, reconcile_debrid_provider_for_instance,
+    test_debrid_service_account,
+};
 use crate::drivers::render_nzbget_config_text_updates;
 use crate::extensions::managed_paths::{
     DOWNLOADS_ROOT, NZBGET_CONFIG_TEMPLATE, NZBGET_INCOMPLETE_DIR, NZBGET_LOCK_FILE,
@@ -205,19 +212,38 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
     }
 }
 
-struct RealDebridControlAdapter;
+struct DebridControlAdapter;
 
 #[async_trait::async_trait]
-impl ExtensionControlProvider for RealDebridControlAdapter {
+impl ExtensionControlProvider for DebridControlAdapter {
     async fn build_sections(
         &self,
-        state: &AppState,
+        _state: &AppState,
         store: &ExtensionStore<'_>,
         context: &ExtensionControlContext,
     ) -> anyhow::Result<Vec<ExtensionControlSection>> {
-        GenericManifestControlProvider
-            .build_sections(state, store, context)
-            .await
+        let Some(instance) = context.selected_instance.as_ref() else {
+            return Ok(vec![ExtensionControlSection {
+                id: "debridAccounts".to_string(),
+                title: "Debrid accounts".to_string(),
+                description: "Create a default instance before adding debrid service accounts."
+                    .to_string(),
+                policy: Some(control_policy_managed(
+                    "Debrid account credentials are encrypted instance secrets owned by Elixir.",
+                )),
+                notices: vec![control_notice(
+                    "warning",
+                    "instance_required",
+                    "Create an instance",
+                    "The Debrid module stores service accounts on its default instance.",
+                )],
+                fields: Vec::new(),
+                entities: Vec::new(),
+                actions: Vec::new(),
+            }]);
+        };
+
+        Ok(vec![build_debrid_accounts_section(store, instance).await?])
     }
 
     fn build_actions(&self, context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
@@ -235,9 +261,98 @@ impl ExtensionControlProvider for RealDebridControlAdapter {
         context: &ExtensionControlContext,
         values: &HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
-        GenericManifestControlProvider
-            .update_settings(state, store, context, values)
-            .await
+        let instance = context
+            .selected_instance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active debrid instance is available"))?;
+        let mut should_reconcile = false;
+        let mut active_validation: Option<(String, String)> = None;
+        let active_before = active_debrid_service_from_config(instance.config_json.as_ref())?;
+
+        for (field_id, value) in values {
+            if let Some(service) = parse_debrid_token_field_id(field_id)? {
+                let token = value.as_str().map(str::trim).unwrap_or_default();
+                if token.is_empty() {
+                    continue;
+                }
+                write_debrid_service_token(state, store, instance.instance_id, service, token)
+                    .await?;
+                mark_debrid_service_validation(
+                    store,
+                    instance.instance_id,
+                    service,
+                    "untested",
+                    "API token saved. Test the account to validate it.",
+                )
+                .await?;
+                if active_before == service {
+                    should_reconcile = true;
+                }
+                continue;
+            }
+        }
+
+        for (field_id, value) in values {
+            if field_id == "activeService" {
+                let service = parse_debrid_service_value(value)?;
+                ensure_debrid_service_configured(store, instance.instance_id, service).await?;
+                let (validation_state, message) = validate_debrid_service_for_activation(
+                    state,
+                    store,
+                    instance.instance_id,
+                    service,
+                )
+                .await?;
+                let mut config = load_instance_config_object(store, instance.instance_id).await?;
+                config.insert(
+                    "activeService".to_string(),
+                    json!(service.implementation_id()),
+                );
+                config.insert(
+                    "lastActiveServiceValidation".to_string(),
+                    json!({
+                        "state": validation_state,
+                        "message": message,
+                    }),
+                );
+                store
+                    .update_instance_config(instance.instance_id, Some(&Value::Object(config)))
+                    .await?;
+                active_validation = Some((validation_state, message));
+                should_reconcile = true;
+                continue;
+            }
+
+            if parse_debrid_token_field_id(field_id)?.is_some() {
+                continue;
+            }
+
+            anyhow::bail!("unsupported debrid control setting '{field_id}'");
+        }
+
+        if should_reconcile {
+            let provider_id =
+                reconcile_debrid_provider_for_instance(&state.db_pool, store, instance.instance_id)
+                    .await?;
+            if let Some((validation_state, message)) = active_validation {
+                let health = if validation_state == "healthy" {
+                    ProviderHealthState::Healthy
+                } else {
+                    ProviderHealthState::Unknown
+                };
+                let readiness = if validation_state == "healthy" {
+                    ProviderReadinessPhase::DriverReady
+                } else {
+                    ProviderReadinessPhase::Unknown
+                };
+                store.update_provider_health(provider_id, health).await?;
+                store
+                    .upsert_provider_readiness(provider_id, readiness, Some(&message))
+                    .await?;
+            }
+            super::trigger_extensions_reconcile(state, "debrid active service update");
+        }
+        Ok(())
     }
 
     async fn execute_action(
@@ -246,17 +361,392 @@ impl ExtensionControlProvider for RealDebridControlAdapter {
         store: &ExtensionStore<'_>,
         context: &ExtensionControlContext,
         action_id: &str,
-        _params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<String> {
+        let instance = context
+            .selected_instance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active debrid instance is available"))?;
         match action_id {
-            "test_connection" => {
-                let instance = context.selected_instance.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("no active Real-Debrid instance is available")
-                })?;
-                let user =
-                    crate::debrid::test_real_debrid_account(state, store, instance.instance_id)
-                        .await?;
-                if let Some(provider) = context.selected_provider.as_ref() {
+            "test_connection" | "test_debrid_service" => {
+                let service = debrid_service_from_action_or_active(params, instance)?;
+                run_debrid_service_test(state, store, instance.instance_id, service).await
+            }
+            "set_active_debrid_service" => {
+                let service = debrid_service_from_action(params)?;
+                ensure_debrid_service_configured(store, instance.instance_id, service).await?;
+                let (validation_state, message) = validate_debrid_service_for_activation(
+                    state,
+                    store,
+                    instance.instance_id,
+                    service,
+                )
+                .await?;
+                let mut config = load_instance_config_object(store, instance.instance_id).await?;
+                config.insert(
+                    "activeService".to_string(),
+                    json!(service.implementation_id()),
+                );
+                config.insert(
+                    "lastActiveServiceValidation".to_string(),
+                    json!({
+                        "state": validation_state,
+                        "message": message,
+                    }),
+                );
+                store
+                    .update_instance_config(instance.instance_id, Some(&Value::Object(config)))
+                    .await?;
+                let provider_id = reconcile_debrid_provider_for_instance(
+                    &state.db_pool,
+                    store,
+                    instance.instance_id,
+                )
+                .await?;
+                let health = if validation_state == "healthy" {
+                    ProviderHealthState::Healthy
+                } else {
+                    ProviderHealthState::Unknown
+                };
+                let readiness = if validation_state == "healthy" {
+                    ProviderReadinessPhase::DriverReady
+                } else {
+                    ProviderReadinessPhase::Unknown
+                };
+                store.update_provider_health(provider_id, health).await?;
+                store
+                    .upsert_provider_readiness(provider_id, readiness, Some(&message))
+                    .await?;
+                super::trigger_extensions_reconcile(state, "debrid active service switch");
+                Ok(message)
+            }
+            "remove_debrid_service_account" => {
+                let service = debrid_service_from_action(params)?;
+                remove_debrid_service_token(store, instance.instance_id, service).await?;
+                mark_debrid_service_validation(
+                    store,
+                    instance.instance_id,
+                    service,
+                    "not_configured",
+                    "Account removed.",
+                )
+                .await?;
+                let active = active_debrid_service_from_config(instance.config_json.as_ref())?;
+                if active == service {
+                    reconcile_debrid_provider_for_instance(
+                        &state.db_pool,
+                        store,
+                        instance.instance_id,
+                    )
+                    .await?;
+                }
+                Ok(format!("{} account removed.", service.display_name()))
+            }
+            _ => anyhow::bail!("unsupported control action '{action_id}'"),
+        }
+    }
+}
+
+async fn validate_debrid_service_for_activation(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+) -> anyhow::Result<(String, String)> {
+    match test_debrid_service_account(state, store, instance_id, service).await {
+        Ok(account) => {
+            let message = format!(
+                "{} account '{}' is reachable.",
+                service.display_name(),
+                debrid_account_display_id(&account)
+            );
+            mark_debrid_service_validation(store, instance_id, service, "healthy", &message)
+                .await?;
+            Ok(("healthy".to_string(), message))
+        }
+        Err(err) if debrid_adapter_pending(&err) => {
+            let message = format!(
+                "{} account token is saved. Native validation for this service is not implemented yet.",
+                service.display_name()
+            );
+            mark_debrid_service_validation(
+                store,
+                instance_id,
+                service,
+                "adapter_pending",
+                &message,
+            )
+            .await?;
+            Ok(("adapter_pending".to_string(), message))
+        }
+        Err(err) => {
+            let message = format!(
+                "{} account validation failed: {err}",
+                service.display_name()
+            );
+            mark_debrid_service_validation(store, instance_id, service, "unhealthy", &message)
+                .await?;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+async fn build_debrid_accounts_section(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+) -> anyhow::Result<ExtensionControlSection> {
+    let active_service = active_debrid_service_from_config(instance.config_json.as_ref())?;
+    let validation = debrid_validation_map(instance.config_json.as_ref());
+    let mut fields = vec![ExtensionControlField {
+        id: "activeService".to_string(),
+        label: "Active service".to_string(),
+        description: "New acquisition.debrid.default submissions use this debrid service."
+            .to_string(),
+        field_type: "select".to_string(),
+        value: json!(active_service.implementation_id()),
+        required: true,
+        readonly: false,
+        secret: false,
+        options: DebridServiceKind::ALL
+            .into_iter()
+            .map(|service| ExtensionControlOption {
+                value: json!(service.implementation_id()),
+                label: service.display_name().to_string(),
+            })
+            .collect(),
+        validation: None,
+    }];
+    let mut entities = Vec::new();
+
+    for service in DebridServiceKind::ALL {
+        let token_present =
+            debrid_secret_exists_for_instance(store, instance.instance_id, service).await?;
+        let token_field_id = debrid_token_field_id(service);
+        fields.push(ExtensionControlField {
+            id: token_field_id,
+            label: format!("{} API token", service.display_name()),
+            description: format!(
+                "Encrypted {} token used only by the built-in Debrid provider.",
+                service.display_name()
+            ),
+            field_type: "password".to_string(),
+            value: debrid_secret_field_value(token_present),
+            required: false,
+            readonly: false,
+            secret: true,
+            options: Vec::new(),
+            validation: None,
+        });
+
+        entities.push(build_debrid_account_entity(
+            instance.instance_id,
+            service,
+            token_present,
+            active_service == service,
+            validation.get(service.implementation_id()),
+        ));
+    }
+
+    Ok(ExtensionControlSection {
+        id: "debridAccounts".to_string(),
+        title: "Debrid accounts".to_string(),
+        description:
+            "Store debrid account tokens and choose the one Elixir uses for direct HTTPS debrid downloads."
+                .to_string(),
+        policy: Some(control_policy_managed(
+            "Debrid credentials are encrypted instance secrets. Source extensions never receive them.",
+        )),
+        notices: Vec::new(),
+        fields,
+        entities,
+        actions: Vec::new(),
+    })
+}
+
+fn build_debrid_account_entity(
+    instance_id: Uuid,
+    service: DebridServiceKind,
+    token_present: bool,
+    active: bool,
+    validation: Option<&Value>,
+) -> ExtensionControlEntity {
+    let validation_state = validation
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or(if token_present {
+            "untested"
+        } else {
+            "not_configured"
+        });
+    let validation_message = validation
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(if token_present {
+            "API token is saved."
+        } else {
+            "No API token is saved."
+        });
+    let last_tested_at = validation
+        .and_then(|value| value.get("lastTestedAt"))
+        .and_then(Value::as_str);
+    let mut details = vec![
+        if active {
+            "Active for new debrid submissions".to_string()
+        } else {
+            "Inactive".to_string()
+        },
+        if token_present {
+            "Account token saved".to_string()
+        } else {
+            "Account token missing".to_string()
+        },
+        format!("Validation: {validation_state}"),
+        validation_message.to_string(),
+    ];
+    if let Some(last_tested_at) = last_tested_at {
+        details.push(format!("Last tested: {last_tested_at}"));
+    }
+
+    let mut actions = vec![debrid_service_action(
+        "test_debrid_service",
+        if token_present {
+            "Test connection"
+        } else {
+            "Add account"
+        },
+        &format!("Validate the {} account token.", service.display_name()),
+        if token_present {
+            "secondary"
+        } else {
+            "primary"
+        },
+        service,
+        Some(instance_id),
+        !token_present,
+        None,
+    )];
+    if !active {
+        actions.push(debrid_service_action(
+            "set_active_debrid_service",
+            "Set active",
+            &format!("Use {} for new debrid submissions.", service.display_name()),
+            "primary",
+            service,
+            Some(instance_id),
+            !token_present,
+            None,
+        ));
+    }
+    if token_present {
+        actions.push(debrid_service_action(
+            "remove_debrid_service_account",
+            "Remove account",
+            &format!("Remove the saved {} token.", service.display_name()),
+            "danger",
+            service,
+            None,
+            false,
+            Some(format!(
+                "Remove the saved {} token from this Debrid instance?",
+                service.display_name()
+            )),
+        ));
+    }
+    actions.push(debrid_service_docs_action(service));
+
+    ExtensionControlEntity {
+        id: format!("debridAccount.{}", service.implementation_id()),
+        title: service.display_name().to_string(),
+        subtitle: Some(if active {
+            "Active".to_string()
+        } else if token_present {
+            "Configured".to_string()
+        } else {
+            "Not configured".to_string()
+        }),
+        details,
+        actions,
+    }
+}
+
+fn debrid_account_display_id(account: &DebridAccount) -> String {
+    account
+        .username
+        .as_deref()
+        .or(account.account_id.as_deref())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn debrid_service_action(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: &str,
+    service: DebridServiceKind,
+    instance_id: Option<Uuid>,
+    prompt_for_token: bool,
+    confirm_text: Option<String>,
+) -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        kind: kind.to_string(),
+        params: Some(json!({ "service": service.implementation_id() })),
+        confirm_text,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: if prompt_for_token {
+            vec!["API token".to_string()]
+        } else {
+            Vec::new()
+        },
+        secret_keys: if prompt_for_token {
+            vec![service.secret_key().to_string()]
+        } else {
+            Vec::new()
+        },
+        secret_scope_instance_id: if prompt_for_token { instance_id } else { None },
+    }
+}
+
+fn debrid_service_docs_action(service: DebridServiceKind) -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "open_debrid_service_docs".to_string(),
+        label: "API docs".to_string(),
+        description: format!("Open {} API documentation.", service.display_name()),
+        kind: "secondary".to_string(),
+        params: Some(json!({ "service": service.implementation_id() })),
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: Some(service.docs_url().to_string()),
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+async fn run_debrid_service_test(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+) -> anyhow::Result<String> {
+    ensure_debrid_service_configured(store, instance_id, service).await?;
+    match test_debrid_service_account(state, store, instance_id, service).await {
+        Ok(account) => {
+            let message = format!(
+                "{} account '{}' is reachable.",
+                service.display_name(),
+                debrid_account_display_id(&account)
+            );
+            mark_debrid_service_validation(store, instance_id, service, "healthy", &message)
+                .await?;
+            if let Some(provider) = active_debrid_provider_for_instance(store, instance_id).await? {
+                if provider.implementation.as_deref() == Some(service.implementation_id()) {
                     store
                         .update_provider_health(provider.provider_id, ProviderHealthState::Healthy)
                         .await?;
@@ -264,18 +754,239 @@ impl ExtensionControlProvider for RealDebridControlAdapter {
                         .upsert_provider_readiness(
                             provider.provider_id,
                             ProviderReadinessPhase::DriverReady,
-                            Some("Real-Debrid account validated."),
+                            Some(&message),
                         )
                         .await?;
                 }
-                Ok(format!(
-                    "Real-Debrid account '{}' is reachable.",
-                    user.username
-                ))
             }
-            _ => anyhow::bail!("unsupported control action '{action_id}'"),
+            Ok(message)
+        }
+        Err(err) if debrid_adapter_pending(&err) => {
+            let message = format!(
+                "{} account token is saved. Native validation for this service is not implemented yet.",
+                service.display_name()
+            );
+            mark_debrid_service_validation(
+                store,
+                instance_id,
+                service,
+                "adapter_pending",
+                &message,
+            )
+            .await?;
+            if let Some(provider) = active_debrid_provider_for_instance(store, instance_id).await? {
+                if provider.implementation.as_deref() == Some(service.implementation_id()) {
+                    store
+                        .update_provider_health(provider.provider_id, ProviderHealthState::Unknown)
+                        .await?;
+                    store
+                        .upsert_provider_readiness(
+                            provider.provider_id,
+                            ProviderReadinessPhase::Unknown,
+                            Some(&message),
+                        )
+                        .await?;
+                }
+            }
+            Ok(message)
+        }
+        Err(err) => {
+            let message = format!(
+                "{} account validation failed: {err}",
+                service.display_name()
+            );
+            mark_debrid_service_validation(store, instance_id, service, "unhealthy", &message)
+                .await?;
+            if let Some(provider) = active_debrid_provider_for_instance(store, instance_id).await? {
+                if provider.implementation.as_deref() == Some(service.implementation_id()) {
+                    store
+                        .update_provider_health(
+                            provider.provider_id,
+                            ProviderHealthState::Unhealthy,
+                        )
+                        .await?;
+                    store
+                        .upsert_provider_readiness(
+                            provider.provider_id,
+                            ProviderReadinessPhase::Unknown,
+                            Some(&message),
+                        )
+                        .await?;
+                }
+            }
+            Err(anyhow::anyhow!(message))
         }
     }
+}
+
+fn debrid_adapter_pending(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("native adapter is not implemented yet")
+}
+
+async fn ensure_debrid_service_configured(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+) -> anyhow::Result<()> {
+    if debrid_secret_exists_for_instance(store, instance_id, service).await? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Add a {} API token before selecting it as the active debrid service.",
+            service.display_name()
+        )
+    }
+}
+
+async fn write_debrid_service_token(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+    token: &str,
+) -> anyhow::Result<()> {
+    let encrypted = state.secrets.encrypt(token)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: service.secret_key().to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn remove_debrid_service_token(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+) -> anyhow::Result<()> {
+    for key in service.secret_keys_for_read() {
+        if let Some(secret) = store
+            .get_secret(SecretScope::Instance, Some(instance_id), key)
+            .await?
+        {
+            store.delete_secret(secret.secret_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn active_debrid_provider_for_instance(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<Option<Provider>> {
+    Ok(store
+        .list_providers(Some(instance_id))
+        .await?
+        .into_iter()
+        .find(|provider| provider.capability == "debrid.resolver" && provider.slot_id == "default"))
+}
+
+async fn mark_debrid_service_validation(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    service: DebridServiceKind,
+    state: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("debrid instance '{instance_id}' no longer exists"))?;
+    let mut config = instance
+        .config_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut validations = config
+        .get("serviceValidation")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    validations.insert(
+        service.implementation_id().to_string(),
+        json!({
+            "state": state,
+            "message": message,
+            "lastTestedAt": Utc::now().to_rfc3339(),
+        }),
+    );
+    config.insert("serviceValidation".to_string(), Value::Object(validations));
+    store
+        .update_instance_config(instance_id, Some(&Value::Object(config)))
+        .await?;
+    Ok(())
+}
+
+async fn load_instance_config_object(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<serde_json::Map<String, Value>> {
+    Ok(store
+        .get_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("debrid instance '{instance_id}' no longer exists"))?
+        .config_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn debrid_validation_map(config: Option<&Value>) -> serde_json::Map<String, Value> {
+    config
+        .and_then(|value| value.get("serviceValidation"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn parse_debrid_service_value(value: &Value) -> anyhow::Result<DebridServiceKind> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("debrid service must be text"))?;
+    DebridServiceKind::from_implementation_id(raw)
+}
+
+fn debrid_service_from_action(
+    params: &HashMap<String, Value>,
+) -> anyhow::Result<DebridServiceKind> {
+    let raw = params
+        .get("service")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("service is required"))?;
+    DebridServiceKind::from_implementation_id(raw)
+}
+
+fn debrid_service_from_action_or_active(
+    params: &HashMap<String, Value>,
+    instance: &ExtensionInstance,
+) -> anyhow::Result<DebridServiceKind> {
+    match params.get("service").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => DebridServiceKind::from_implementation_id(value),
+        _ => active_debrid_service_from_config(instance.config_json.as_ref()),
+    }
+}
+
+fn parse_debrid_token_field_id(field_id: &str) -> anyhow::Result<Option<DebridServiceKind>> {
+    let Some(raw) = field_id.strip_prefix("token.") else {
+        return Ok(None);
+    };
+    Ok(Some(DebridServiceKind::from_implementation_id(raw)?))
+}
+
+fn debrid_token_field_id(service: DebridServiceKind) -> String {
+    format!("token.{}", service.implementation_id())
+}
+
+fn debrid_secret_field_value(present: bool) -> Value {
+    if present { json!("saved") } else { Value::Null }
 }
 
 struct ProwlarrControlAdapter;
@@ -693,7 +1404,7 @@ fn resolve_adapter(context: &ExtensionControlContext) -> Box<dyn ExtensionContro
         ExtensionControlBinding::Qbittorrent | ExtensionControlBinding::Nzbget => {
             Box::new(DownloaderControlAdapter)
         }
-        ExtensionControlBinding::RealDebrid => Box::new(RealDebridControlAdapter),
+        ExtensionControlBinding::RealDebrid => Box::new(DebridControlAdapter),
         ExtensionControlBinding::GenericManifest => Box::new(GenericManifestControlProvider),
         ExtensionControlBinding::Unsupported => Box::new(UnsupportedControlProvider),
     }

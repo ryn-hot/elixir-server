@@ -795,7 +795,10 @@ fn plan_pack_coverage(
     let mut has_media_files = false;
     let mut unmapped_media_files = false;
 
-    for file in files.iter().filter(|file| is_media_file(&file.path)) {
+    for file in files
+        .iter()
+        .filter(|file| file.selectable && is_media_file(&file.path))
+    {
         has_media_files = true;
 
         if is_sample_file(&file.path) {

@@ -1268,6 +1268,10 @@ pub struct ManifestControlOwnedSetting {
     pub storage: ManifestControlStorage,
     #[serde(default)]
     pub options: Vec<ManifestControlOption>,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    #[serde(default)]
+    pub advanced: bool,
 }
 
 impl ManifestControlOwnedSetting {
@@ -1323,12 +1327,68 @@ impl ManifestControlOwnedSetting {
                 self.id
             );
         }
+        if let Some(default) = self.default.as_ref() {
+            validate_owned_setting_default(self, &field_type, default)?;
+        }
         self.storage.validate(self.secret, &self.id)?;
         for option in &self.options {
             option.validate()?;
         }
         Ok(())
     }
+}
+
+fn validate_owned_setting_default(
+    setting: &ManifestControlOwnedSetting,
+    field_type: &str,
+    default: &serde_json::Value,
+) -> Result<()> {
+    if setting.secret {
+        bail!(
+            "control_surface.owned_settings '{}' cannot declare a default for secret storage",
+            setting.id
+        );
+    }
+    match field_type {
+        "text" | "password" => {
+            if !default.is_string() {
+                bail!(
+                    "control_surface.owned_settings '{}' default must be a string",
+                    setting.id
+                );
+            }
+        }
+        "number" => {
+            if !default.is_number() {
+                bail!(
+                    "control_surface.owned_settings '{}' default must be a number",
+                    setting.id
+                );
+            }
+        }
+        "toggle" => {
+            if !default.is_boolean() {
+                bail!(
+                    "control_surface.owned_settings '{}' default must be a boolean",
+                    setting.id
+                );
+            }
+        }
+        "select" => {
+            if !setting
+                .options
+                .iter()
+                .any(|option| option.value == *default)
+            {
+                bail!(
+                    "control_surface.owned_settings '{}' default must match one declared option",
+                    setting.id
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2500,6 +2560,8 @@ control_surface:
     - id: mode
       label: Mode
       type: select
+      advanced: true
+      default: balanced
       storage:
         type: instance_setting
         key: mode
@@ -2540,6 +2602,11 @@ control_surface:
             .expect("control surface should exist");
         assert_eq!(control_surface.adapter, "generic_v1");
         assert_eq!(control_surface.owned_settings.len(), 2);
+        assert!(control_surface.owned_settings[1].advanced);
+        assert_eq!(
+            control_surface.owned_settings[1].default.as_ref(),
+            Some(&json!("balanced"))
+        );
         assert_eq!(control_surface.entities.len(), 1);
         assert_eq!(control_surface.actions.len(), 2);
     }

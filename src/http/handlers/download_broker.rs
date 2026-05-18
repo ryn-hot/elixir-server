@@ -44,11 +44,12 @@ use crate::{
     },
     db::models::MediaType,
     debrid::{
-        DebridReleaseSubmitContext, DebridSubmitOptions, cancel_real_debrid_job,
-        debrid_source_kind, is_real_debrid_implementation, load_real_debrid_progress,
-        submit_debrid,
+        DebridReleaseSubmitContext, DebridSubmitOptions, cancel_debrid_job, debrid_source_kind,
+        is_debrid_service_implementation, load_debrid_progress, submit_debrid,
     },
     download_broker::{
+        DEBRID_ACCOUNT_MISSING_MESSAGE, DEBRID_DEFAULT_LOGICAL_ID,
+        DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE, DEBRID_SERVICE_UNAVAILABLE_MESSAGE,
         DownloadBrokerBindingKind, DownloadBrokerInventory, DownloadBrokerProviderRecord,
         DownloadBrokerRole, DownloadBrokerRouteInventory, DownloadBrokerRouteRecord,
         DownloadBrokerRouteUpdate, ResolvedDownloadBrokerProvider, list_acquisition_routes,
@@ -332,7 +333,7 @@ pub async fn progress(
             load_nzbget_progress(&state, &store, &resolved.record).await?
         }
         DownloadBrokerRole::DebridResolver => {
-            load_real_debrid_broker_progress(&state, &store, &resolved.record).await?
+            load_debrid_broker_progress(&state, &store, &resolved.record).await?
         }
     };
     Ok(Json(DownloadBrokerProgressResponse {
@@ -372,7 +373,7 @@ pub async fn cancel(
             cancel_nzbget(&state, &store, &resolved.record, &download_id).await?
         }
         DownloadBrokerRole::DebridResolver => {
-            cancel_real_debrid_broker(&state, &store, &resolved.record, &download_id).await?
+            cancel_debrid_broker(&state, &store, &resolved.record, &download_id).await?
         }
     };
     Ok(Json(DownloadBrokerCancelResponse {
@@ -388,6 +389,7 @@ async fn resolve_broker_provider(
     logical_id: &str,
     owner_id: Option<&str>,
 ) -> ApiResult<ResolvedDownloadBrokerProvider> {
+    let is_debrid_route = logical_id == DEBRID_DEFAULT_LOGICAL_ID;
     resolve_logical_downloader_for_owner(
         pool,
         store,
@@ -397,6 +399,12 @@ async fn resolve_broker_provider(
     .await
     .map_err(|err| {
         let message = err.to_string();
+        if is_debrid_route && debrid_error_is_not_configured(&message) {
+            return ApiError::conflict(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE);
+        }
+        if is_debrid_route && message.contains(DEBRID_SERVICE_UNAVAILABLE_MESSAGE) {
+            return ApiError::conflict(DEBRID_SERVICE_UNAVAILABLE_MESSAGE);
+        }
         if message.contains("unknown downloader logical id")
             || message.contains("no downloader provider")
             || message.contains("No provider is registered")
@@ -413,6 +421,11 @@ async fn ensure_route_allows_submit(
     state: &AppState,
     resolved: &ResolvedDownloadBrokerProvider,
 ) -> ApiResult<()> {
+    if resolved.record.role == DownloadBrokerRole::DebridResolver
+        && resolved.record.health_state == crate::db::models::ProviderHealthState::Unhealthy
+    {
+        return Err(ApiError::conflict(DEBRID_SERVICE_UNAVAILABLE_MESSAGE));
+    }
     if resolved.binding_kind != DownloadBrokerBindingKind::ManagedProtected {
         return Ok(());
     }
@@ -593,7 +606,10 @@ async fn submit_debrid_broker(
         let message = err.to_string();
         if message.contains("source must") {
             ApiError::bad_request(message)
+        } else if let Some(message) = generic_debrid_error_message(&message) {
+            ApiError::conflict(message)
         } else if message.contains("token")
+            || message.contains("Debrid provider API")
             || message.contains("Real-Debrid API")
             || message.contains("native adapter")
         {
@@ -603,6 +619,51 @@ async fn submit_debrid_broker(
         }
     })?;
     Ok(job_id.to_string())
+}
+
+pub(crate) fn generic_debrid_error_message(message: &str) -> Option<&'static str> {
+    let normalized = message.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains(&DEBRID_ACCOUNT_MISSING_MESSAGE.to_ascii_lowercase())
+        || normalized.contains("api token is not configured")
+        || normalized.contains("token is not configured")
+        || normalized.contains("provider_auth_missing")
+        || normalized.contains("authentication_failed")
+        || normalized.contains("authentication failed")
+    {
+        Some(DEBRID_ACCOUNT_MISSING_MESSAGE)
+    } else if debrid_error_is_not_configured(&normalized) {
+        Some(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE)
+    } else if normalized.contains(&DEBRID_SERVICE_UNAVAILABLE_MESSAGE.to_ascii_lowercase())
+        || normalized.contains("provider_unavailable")
+        || normalized.contains("provider unavailable")
+        || normalized.contains("rate_limit")
+        || normalized.contains("rate limit")
+        || normalized.contains("account_limit")
+        || normalized.contains("service_down")
+        || normalized.contains("service unavailable")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("native adapter")
+        || normalized.contains("debrid provider api")
+        || normalized.contains("real-debrid api")
+    {
+        Some(DEBRID_SERVICE_UNAVAILABLE_MESSAGE)
+    } else {
+        None
+    }
+}
+
+fn debrid_error_is_not_configured(message: &str) -> bool {
+    let normalized = message.trim().to_ascii_lowercase();
+    normalized.contains(&DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE.to_ascii_lowercase())
+        || normalized.contains("no downloader provider")
+        || normalized.contains("no provider is registered")
+        || normalized.contains("no acquisition route")
+        || normalized.contains("no provider matches binding")
+        || normalized.contains("multiple debrid resolver providers")
+        || normalized.contains("none is selected")
 }
 
 fn debrid_release_context(
@@ -2871,17 +2932,17 @@ async fn load_nzbget_progress(
         .collect())
 }
 
-async fn load_real_debrid_broker_progress(
+async fn load_debrid_broker_progress(
     state: &AppState,
     store: &ExtensionStore<'_>,
     record: &DownloadBrokerProviderRecord,
 ) -> ApiResult<Vec<DownloadBrokerProgressItem>> {
-    if !is_real_debrid_implementation(record.implementation.as_deref()) {
+    if !is_debrid_service_implementation(record.implementation.as_deref()) {
         return Err(ApiError::conflict(
             "the selected debrid provider does not expose native debrid progress",
         ));
     }
-    let items = load_real_debrid_progress(state, store, record.provider_id, record.instance_id)
+    let items = load_debrid_progress(state, store, record.provider_id, record.instance_id)
         .await
         .map_err(ApiError::from)?;
     Ok(items
@@ -3012,18 +3073,18 @@ async fn cancel_nzbget(
     Ok(true)
 }
 
-async fn cancel_real_debrid_broker(
+async fn cancel_debrid_broker(
     state: &AppState,
     store: &ExtensionStore<'_>,
     record: &DownloadBrokerProviderRecord,
     download_id: &str,
 ) -> ApiResult<bool> {
-    if !is_real_debrid_implementation(record.implementation.as_deref()) {
+    if !is_debrid_service_implementation(record.implementation.as_deref()) {
         return Err(ApiError::conflict(
             "the selected debrid provider does not support native debrid cancellation",
         ));
     }
-    cancel_real_debrid_job(
+    cancel_debrid_job(
         state,
         store,
         record.provider_id,
