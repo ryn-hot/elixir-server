@@ -35,7 +35,7 @@ use crate::{
         subscriptions::{
             AcquisitionMonitorPolicy, AcquisitionSubscription, AcquisitionTarget,
             AcquisitionTargetState, AcquisitionTargetStateUpdate, get_subscription, get_target,
-            update_target_state,
+            start_subscription_tracking_if_initial_download_complete, update_target_state,
         },
     },
     db::models::MediaType,
@@ -970,6 +970,12 @@ async fn finalize_import_run_inner(
     }
 
     mark_release_and_job_imported(pool, candidate.release.release_id, run.release_job_id).await?;
+    start_subscription_tracking_if_initial_download_complete(
+        pool,
+        subscription.subscription_id,
+        Utc::now(),
+    )
+    .await?;
     update_subscription_completion_if_ready(pool, &subscription).await?;
     transition_import_run_state(
         pool,

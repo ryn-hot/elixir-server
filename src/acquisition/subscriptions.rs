@@ -240,6 +240,7 @@ pub struct AcquisitionSubscription {
     pub candidate_search_after: DateTime<Utc>,
     pub last_metadata_refresh_at: Option<DateTime<Utc>>,
     pub last_candidate_search_at: Option<DateTime<Utc>>,
+    pub tracking_started_at: Option<DateTime<Utc>>,
     pub status: AcquisitionSubscriptionStatus,
     pub active: bool,
     pub created_at: DateTime<Utc>,
@@ -623,6 +624,7 @@ pub async fn list_subscriptions(
                 CAST(candidate_search_after AS TEXT) AS candidate_search_after,
                 CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
                 CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                CAST(tracking_started_at AS TEXT) AS tracking_started_at,
                 status,
                 CAST(active AS INTEGER) AS active,
                 CAST(created_at AS TEXT) AS created_at,
@@ -652,6 +654,7 @@ pub async fn list_subscriptions(
                 CAST(candidate_search_after AS TEXT) AS candidate_search_after,
                 CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
                 CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                CAST(tracking_started_at AS TEXT) AS tracking_started_at,
                 status,
                 CAST(active AS INTEGER) AS active,
                 CAST(created_at AS TEXT) AS created_at,
@@ -687,6 +690,7 @@ pub async fn get_subscription(
             CAST(candidate_search_after AS TEXT) AS candidate_search_after,
             CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
             CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+            CAST(tracking_started_at AS TEXT) AS tracking_started_at,
             status,
             CAST(active AS INTEGER) AS active,
             CAST(created_at AS TEXT) AS created_at,
@@ -724,6 +728,7 @@ async fn find_subscription_by_intent_identity(
                 CAST(candidate_search_after AS TEXT) AS candidate_search_after,
                 CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
                 CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                CAST(tracking_started_at AS TEXT) AS tracking_started_at,
                 status,
                 CAST(active AS INTEGER) AS active,
                 CAST(created_at AS TEXT) AS created_at,
@@ -759,6 +764,7 @@ async fn find_subscription_by_intent_identity(
                 CAST(candidate_search_after AS TEXT) AS candidate_search_after,
                 CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
                 CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+                CAST(tracking_started_at AS TEXT) AS tracking_started_at,
                 status,
                 CAST(active AS INTEGER) AS active,
                 CAST(created_at AS TEXT) AS created_at,
@@ -1000,6 +1006,7 @@ pub async fn list_due_metadata_subscriptions(
             CAST(candidate_search_after AS TEXT) AS candidate_search_after,
             CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
             CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+            CAST(tracking_started_at AS TEXT) AS tracking_started_at,
             status,
             CAST(active AS INTEGER) AS active,
             CAST(created_at AS TEXT) AS created_at,
@@ -1008,6 +1015,15 @@ pub async fn list_due_metadata_subscriptions(
          WHERE active = 1
            AND status = 'active'
            AND metadata_refresh_after <= ?
+           AND (
+                tracking_started_at IS NOT NULL
+                OR last_metadata_refresh_at IS NULL
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM acquisition_targets t
+                    WHERE t.subscription_id = acquisition_subscriptions.subscription_id
+                )
+           )
          ORDER BY metadata_refresh_after ASC
          LIMIT ?",
     )
@@ -1084,6 +1100,46 @@ pub async fn record_metadata_refresh(
     .await
     .context("recording acquisition metadata refresh")?;
     Ok(())
+}
+
+pub async fn start_subscription_tracking_if_initial_download_complete(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let incomplete_due_targets: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM acquisition_targets
+         WHERE subscription_id = ?
+           AND state IN ('pending', 'searching', 'blocked', 'submitted')
+           AND (air_time IS NULL OR air_time <= ?)",
+    )
+    .bind(subscription_id.to_string())
+    .bind(db_datetime_string(now))
+    .fetch_one(pool)
+    .await
+    .context("checking initial acquisition target completion")?;
+
+    if incomplete_due_targets != 0 {
+        return Ok(false);
+    }
+
+    let result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_subscriptions
+         SET tracking_started_at = ?,
+             metadata_refresh_after = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?
+           AND tracking_started_at IS NULL",
+    )
+    .bind(db_datetime_string(now))
+    .bind(db_datetime_string(now))
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("starting acquisition subscription tracking")?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 #[allow(dead_code)]
@@ -1846,6 +1902,10 @@ fn map_subscription(row: &AnyRow) -> Result<AcquisitionSubscription> {
             row_get_opt_string(row, "last_candidate_search_at")?,
             "acquisition_subscriptions.last_candidate_search_at",
         )?,
+        tracking_started_at: parse_datetime_opt(
+            row_get_opt_string(row, "tracking_started_at")?,
+            "acquisition_subscriptions.tracking_started_at",
+        )?,
         status: AcquisitionSubscriptionStatus::from_str(&status_raw)?,
         active: row_get_bool(row, "active")?,
         created_at: parse_datetime(&created_at_raw, "acquisition_subscriptions.created_at")?,
@@ -2195,6 +2255,89 @@ mod tests {
         let items = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].subscription_id, due.subscription_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_tracking_starts_only_after_initial_due_downloads_import() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                ..series_subscription("Bootstrap Show")
+            },
+        )
+        .await?;
+
+        let due = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].subscription_id, subscription.subscription_id);
+
+        record_metadata_refresh(
+            &database.pool,
+            subscription.subscription_id,
+            now - ChronoDuration::minutes(1),
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                season_number: Some(1),
+                episode_number: Some(1),
+                air_time: Some(now - ChronoDuration::hours(1)),
+                next_search_after: Some(now - ChronoDuration::minutes(1)),
+                ..empty_target()
+            }],
+        )
+        .await?;
+
+        let suspended = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
+        assert!(
+            suspended.is_empty(),
+            "metadata refresh should suspend after bootstrap target expansion until import"
+        );
+
+        let started = start_subscription_tracking_if_initial_download_complete(
+            &database.pool,
+            subscription.subscription_id,
+            now,
+        )
+        .await?;
+        assert!(
+            !started,
+            "tracking cannot begin while a due initial target is still missing"
+        );
+
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Imported,
+                state_reason: Some("Imported during test.".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let started = start_subscription_tracking_if_initial_download_complete(
+            &database.pool,
+            subscription.subscription_id,
+            now,
+        )
+        .await?;
+        assert!(started);
+
+        let subscription = get_subscription(&database.pool, subscription.subscription_id)
+            .await?
+            .expect("subscription");
+        assert!(subscription.tracking_started_at.is_some());
+        let due =
+            list_due_metadata_subscriptions(&database.pool, now + ChronoDuration::seconds(1), 10)
+                .await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].subscription_id, subscription.subscription_id);
         Ok(())
     }
 

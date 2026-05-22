@@ -8009,6 +8009,7 @@ mod tests {
             candidate_search_after: now,
             last_metadata_refresh_at: None,
             last_candidate_search_at: None,
+            tracking_started_at: None,
             status: crate::acquisition::subscriptions::AcquisitionSubscriptionStatus::Active,
             active: true,
             created_at: now,
