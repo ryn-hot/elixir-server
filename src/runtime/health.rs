@@ -53,6 +53,14 @@ pub struct DockerRuntimeHealthSnapshot {
     pub dependency_actions_deferred_until: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DockerRuntimeSubsystemImpact {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub status: &'static str,
+    pub detail: String,
+}
+
 pub struct DockerRuntimeSupervisor {
     inner: Mutex<DockerRuntimeSupervisorState>,
 }
@@ -518,6 +526,131 @@ impl DockerRuntimeSupervisorState {
 
 pub fn runtime_health_poll_interval() -> Duration {
     Duration::from_secs(RUNTIME_HEALTH_POLL_INTERVAL_SECONDS)
+}
+
+pub fn docker_auto_reset_max_attempts_per_window() -> u32 {
+    RUNTIME_AUTO_RESET_MAX_ATTEMPTS_PER_WINDOW
+}
+
+pub fn docker_auto_reset_window_seconds() -> i64 {
+    RUNTIME_AUTO_RESET_WINDOW_SECONDS
+}
+
+pub fn docker_auto_reset_cooldown_seconds() -> i64 {
+    RUNTIME_AUTO_RESET_COOLDOWN_SECONDS
+}
+
+pub fn docker_runtime_affected_subsystems(
+    snapshot: &DockerRuntimeHealthSnapshot,
+) -> Vec<DockerRuntimeSubsystemImpact> {
+    const SUBSYSTEMS: [(&str, &str); 5] = [
+        ("extensions", "Extensions"),
+        ("qbittorrent", "qBittorrent"),
+        ("nzbget", "NZBGet"),
+        ("arr_stack", "Arr stack"),
+        (
+            "protected_downloader_networking",
+            "Protected downloader networking",
+        ),
+    ];
+
+    SUBSYSTEMS
+        .into_iter()
+        .map(|(id, label)| {
+            let (status, detail) = docker_runtime_subsystem_state(snapshot, id);
+            DockerRuntimeSubsystemImpact {
+                id,
+                label,
+                status,
+                detail,
+            }
+        })
+        .collect()
+}
+
+fn docker_runtime_subsystem_state(
+    snapshot: &DockerRuntimeHealthSnapshot,
+    subsystem_id: &str,
+) -> (&'static str, String) {
+    if snapshot.reboot_recommended {
+        return (
+            "blocked",
+            "Docker recovery needs a host reboot before Elixir resumes this runtime-backed subsystem."
+                .to_string(),
+        );
+    }
+
+    match snapshot.state {
+        DockerRuntimeHealthState::Degraded => (
+            "blocked",
+            match subsystem_id {
+                "extensions" => {
+                    "Container-backed extension runtimes are paused while Docker is degraded."
+                        .to_string()
+                }
+                "qbittorrent" => {
+                    "qBittorrent runtime operations fail closed while Docker is degraded."
+                        .to_string()
+                }
+                "nzbget" => "NZBGet runtime operations fail closed while Docker is degraded."
+                    .to_string(),
+                "arr_stack" => {
+                    "Arr connector and binding work is paused so downstream state is not rewritten while Docker is degraded."
+                        .to_string()
+                }
+                "protected_downloader_networking" => {
+                    "Protected downloader gateway and rehome operations are paused while Docker is degraded."
+                        .to_string()
+                }
+                _ => "Docker-backed runtime operations are paused while Docker is degraded."
+                    .to_string(),
+            },
+        ),
+        DockerRuntimeHealthState::Recovering => {
+            let status = if snapshot.dependency_actions_deferred_until.is_some() {
+                "deferred"
+            } else {
+                "recovering"
+            };
+            (
+                status,
+                match subsystem_id {
+                    "arr_stack" => {
+                        "Arr connector and binding work waits until core provider runtimes are reachable again."
+                            .to_string()
+                    }
+                    "protected_downloader_networking" => {
+                        "Protected downloader networking resumes after Docker recovery warmup completes."
+                            .to_string()
+                    }
+                    _ => {
+                        "Runtime operations are staged while Docker recovery and provider readiness checks complete."
+                            .to_string()
+                    }
+                },
+            )
+        }
+        DockerRuntimeHealthState::Healthy => {
+            if subsystem_id == "extensions" && !snapshot.quarantined_instances.is_empty() {
+                return (
+                    "attention",
+                    format!(
+                        "{} extension instance(s) remain quarantined while Docker stabilizes.",
+                        snapshot.quarantined_instances.len()
+                    ),
+                );
+            }
+            if let Some(host_warning) = snapshot.host_warning.as_deref() {
+                if !host_warning.trim().is_empty() {
+                    return ("attention", host_warning.to_string());
+                }
+            }
+            (
+                "ok",
+                "Runtime operations are available for this subsystem.".to_string(),
+            )
+        }
+    }
 }
 
 pub fn detect_docker_desktop_filesharing_warning() -> Option<String> {

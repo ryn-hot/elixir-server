@@ -435,6 +435,24 @@ impl<'a> Reconciler<'a> {
             }
 
             for action in repair_plan.actions {
+                let action_type = action.action_type().to_string();
+                if plan_action_is_dependency_work(&action) {
+                    if let Some((until, reason)) =
+                        self.runtime_health.should_defer_dependency_actions()
+                    {
+                        warn!(
+                            "reconcile: deferring repair action {} for {} until {} while runtime recovers: {}",
+                            action_type,
+                            item.blueprint_extension_id,
+                            until.to_rfc3339(),
+                            reason
+                        );
+                        metrics::RECONCILE_ACTIONS
+                            .with_label_values(&[action_type.as_str(), "deferred"])
+                            .inc();
+                        break;
+                    }
+                }
                 let action_json = match serde_json::to_value(&action) {
                     Ok(value) => value,
                     Err(err) => {
@@ -461,7 +479,6 @@ impl<'a> Reconciler<'a> {
                         break;
                     }
                 };
-                let action_type = action.action_type().to_string();
                 let result = self
                     .run_step(run_id, step_index, &action_type, action_json, || {
                         executor.apply(executor_action)
@@ -959,6 +976,18 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             }
+            if let Some(reason) =
+                binding_dependency_not_ready_reason(&self.store, consumer, target).await?
+            {
+                warn!(
+                    "reconcile: deferring binding {} until provider dependencies are readable: {}",
+                    binding.binding_id, reason
+                );
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&["apply_binding", "deferred"])
+                    .inc();
+                continue;
+            }
 
             let action = ExecutorAction::ApplyBinding {
                 binding: NewBinding {
@@ -1105,6 +1134,75 @@ fn repair_action_allowed(action: &PlanAction) -> bool {
     )
 }
 
+fn plan_action_is_dependency_work(action: &PlanAction) -> bool {
+    matches!(
+        action,
+        PlanAction::ApplyDriverPatch { .. } | PlanAction::ApplyBinding { .. }
+    )
+}
+
+async fn binding_dependency_not_ready_reason(
+    store: &ExtensionStore<'_>,
+    consumer: &crate::db::models::Provider,
+    target: &crate::db::models::Provider,
+) -> Result<Option<String>> {
+    for (role, provider) in [("consumer", consumer), ("target", target)] {
+        if !provider_requires_runtime_readiness(provider) {
+            continue;
+        }
+        if !matches!(
+            provider.health_state,
+            ProviderHealthState::Healthy | ProviderHealthState::Degraded
+        ) {
+            return Ok(Some(format!(
+                "{role} provider {} health is {}",
+                provider.provider_id,
+                provider.health_state.as_str()
+            )));
+        }
+        let phase = store
+            .get_provider_readiness(provider.provider_id)
+            .await?
+            .map(|readiness| readiness.readiness_phase)
+            .unwrap_or(ProviderReadinessPhase::Unknown);
+        if !readiness_satisfies(phase, ProviderReadinessPhase::DriverReady) {
+            return Ok(Some(format!(
+                "{role} provider {} readiness is {}; waiting for driver_ready",
+                provider.provider_id,
+                phase.as_str()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn provider_requires_runtime_readiness(provider: &crate::db::models::Provider) -> bool {
+    matches!(
+        provider.capability.as_str(),
+        "media.manager.tv"
+            | "media.manager.movies"
+            | "indexer.registry"
+            | "downloader.torrent"
+            | "downloader.nzb"
+    ) || matches!(
+        provider.implementation.as_deref(),
+        Some("sonarr" | "radarr" | "prowlarr" | "qbittorrent" | "nzbget")
+    )
+}
+
+fn readiness_satisfies(current: ProviderReadinessPhase, required: ProviderReadinessPhase) -> bool {
+    readiness_rank(current) >= readiness_rank(required)
+}
+
+fn readiness_rank(phase: ProviderReadinessPhase) -> u8 {
+    match phase {
+        ProviderReadinessPhase::Unknown => 0,
+        ProviderReadinessPhase::TransportReady => 1,
+        ProviderReadinessPhase::BootstrapReady => 2,
+        ProviderReadinessPhase::DriverReady => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,7 +1217,7 @@ mod tests {
     use crate::db::Database;
     use crate::db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
-        ProviderHealthState, SlotCardinality,
+        ProviderHealthState, ProviderReadinessPhase, SlotCardinality,
     };
     use crate::drivers::{
         ApplyResult, CapabilityDriver, DriverCtx, DriverPatch, DriverRegistry, StateSnapshot,
@@ -1442,6 +1540,105 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    #[tokio::test]
+    async fn binding_dependency_readiness_waits_for_arr_downloader_target() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "ext.arr".to_string(),
+                name: "ext.arr".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.arr".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let consumer_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: consumer_id,
+                instance_id,
+                capability: "media.manager.tv".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("sonarr".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        store
+            .upsert_provider_readiness(consumer_id, ProviderReadinessPhase::DriverReady, None)
+            .await?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: target_id,
+                instance_id,
+                capability: "downloader.torrent".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let providers = store
+            .list_providers(None)
+            .await?
+            .into_iter()
+            .map(|provider| (provider.provider_id, provider))
+            .collect::<HashMap<_, _>>();
+        let reason = binding_dependency_not_ready_reason(
+            &store,
+            providers.get(&consumer_id).expect("consumer provider"),
+            providers.get(&target_id).expect("target provider"),
+        )
+        .await?
+        .expect("target should not be ready");
+        assert!(reason.contains("target provider"));
+        assert!(reason.contains("readiness is unknown"));
+
+        store
+            .upsert_provider_readiness(target_id, ProviderReadinessPhase::DriverReady, None)
+            .await?;
+        let providers = store
+            .list_providers(None)
+            .await?
+            .into_iter()
+            .map(|provider| (provider.provider_id, provider))
+            .collect::<HashMap<_, _>>();
+        let ready = binding_dependency_not_ready_reason(
+            &store,
+            providers.get(&consumer_id).expect("consumer provider"),
+            providers.get(&target_id).expect("target provider"),
+        )
+        .await?;
+        assert_eq!(ready, None);
+
+        Ok(())
     }
 
     #[tokio::test]

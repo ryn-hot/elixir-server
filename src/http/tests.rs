@@ -3157,6 +3157,12 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
             .and_then(Value::as_str),
         Some("ok")
     );
+    assert_eq!(
+        json.get("runtime")
+            .and_then(|runtime| runtime.get("status"))
+            .and_then(Value::as_str),
+        Some("healthy")
+    );
 
     let settings_response = app
         .clone()
@@ -3176,6 +3182,326 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
             .and_then(|d| d.get("driver"))
             .and_then(Value::as_str),
         Some("sqlite")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_endpoint_reports_degraded_docker_runtime_state() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        MetadataService::new(crate::config::MetadataConfig::default())?,
+        linkers,
+        artwork,
+        secrets,
+    );
+    state.orchestrator.record_docker_runtime_failure(
+        "docker_runtime_unavailable",
+        "Docker daemon is unavailable during startup probe.",
+    );
+    let app = router(state);
+
+    let health_response = app
+        .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(health_response.status(), StatusCode::OK);
+    let body = body::to_bytes(health_response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let runtime = json
+        .get("runtime")
+        .unwrap_or_else(|| panic!("missing runtime health: {json}"));
+    assert_eq!(
+        runtime.get("status").and_then(Value::as_str),
+        Some("degraded")
+    );
+    assert_eq!(
+        runtime.get("code").and_then(Value::as_str),
+        Some("docker_runtime_unavailable")
+    );
+    assert!(
+        runtime
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("Docker daemon is unavailable")
+    );
+    assert_eq!(
+        runtime.get("state").and_then(Value::as_str),
+        Some("degraded")
+    );
+
+    let docker_runtime = json
+        .get("docker_runtime")
+        .unwrap_or_else(|| panic!("missing docker_runtime health alias: {json}"));
+    assert_eq!(
+        docker_runtime.get("state").and_then(Value::as_str),
+        Some("degraded")
+    );
+    assert_eq!(
+        docker_runtime.get("code").and_then(Value::as_str),
+        Some("docker_runtime_unavailable")
+    );
+    assert_eq!(
+        docker_runtime
+            .get("last_failure")
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str),
+        Some("docker_runtime_unavailable")
+    );
+    assert_eq!(
+        docker_runtime
+            .get("auto_reset_budget")
+            .and_then(|value| value.get("attempts_allowed"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let affected = docker_runtime
+        .get("affected_subsystems")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing affected_subsystems: {docker_runtime}"));
+    assert!(affected.iter().any(|subsystem| {
+        subsystem.get("id").and_then(Value::as_str) == Some("arr_stack")
+            && subsystem.get("status").and_then(Value::as_str) == Some("blocked")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_health_and_status_build_without_docker_probe() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        MetadataService::new(crate::config::MetadataConfig::default())?,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state);
+
+    let health_response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
+        .await?;
+    assert_eq!(health_response.status(), StatusCode::OK);
+    let body = body::to_bytes(health_response.into_body(), 1_048_576).await?;
+    let health: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        health
+            .get("docker_runtime")
+            .and_then(|runtime| runtime.get("state"))
+            .and_then(Value::as_str),
+        Some("healthy"),
+        "control-plane health should be available before any Docker probe mutates runtime state: {health}"
+    );
+
+    let summary_response = app
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(summary_response.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_reports_docker_runtime_state() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        MetadataService::new(crate::config::MetadataConfig::default())?,
+        linkers,
+        artwork,
+        secrets,
+    );
+    state.orchestrator.record_docker_runtime_failure(
+        "docker_runtime_unavailable",
+        "Docker daemon is unavailable during status-summary probe.",
+    );
+    let app = router(state);
+
+    let response = app
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    let runtime = json
+        .get("dockerRuntime")
+        .unwrap_or_else(|| panic!("missing docker runtime summary: {json}"));
+    assert_eq!(
+        runtime.get("state").and_then(Value::as_str),
+        Some("degraded")
+    );
+    assert_eq!(
+        runtime.get("code").and_then(Value::as_str),
+        Some("docker_runtime_unavailable")
+    );
+    assert_eq!(
+        runtime.get("severity").and_then(Value::as_str),
+        Some("attention")
+    );
+    assert!(
+        runtime
+            .get("dependencyActionsDeferredUntil")
+            .and_then(Value::as_str)
+            .is_some(),
+        "runtime dependency deferral should be visible: {runtime}"
+    );
+    assert_eq!(
+        runtime
+            .get("lastFailure")
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str),
+        Some("docker_runtime_unavailable")
+    );
+    assert_eq!(
+        runtime
+            .get("autoResetBudget")
+            .and_then(|value| value.get("attemptsAllowed"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let affected = runtime
+        .get("affectedSubsystems")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing affectedSubsystems: {runtime}"));
+    assert!(affected.iter().any(|subsystem| {
+        subsystem.get("id").and_then(Value::as_str) == Some("qbittorrent")
+            && subsystem.get("status").and_then(Value::as_str) == Some("blocked")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_control_surface_explains_degraded_runtime_blocker() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: "elixir.modules.runtime_blocked".to_string(),
+            name: "Runtime Blocked".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified,
+            manifest_json: json!({
+                "id": "elixir.modules.runtime_blocked",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "Runtime Blocked",
+                "provides": [
+                    {
+                        "capability": "indexer.proxy",
+                        "slot": "default",
+                        "implementation": "runtime_blocked"
+                    }
+                ],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/runtime-blocked:1"
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8080
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    state.orchestrator.record_docker_runtime_failure(
+        "docker_runtime_unavailable",
+        "Docker daemon is unavailable during control-surface probe.",
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/extensions/elixir.modules.runtime_blocked/control-surface")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let status = payload
+        .get("status")
+        .unwrap_or_else(|| panic!("missing control status: {payload}"));
+    assert_eq!(
+        status.get("summary").and_then(Value::as_str),
+        Some("Status stale")
+    );
+    let details = status
+        .get("details")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing control status details: {status}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        details.contains("Runtime operations are blocked because Docker is degraded"),
+        "runtime blocker should be explicit: {details}"
+    );
+    assert!(
+        details.contains("Affected subsystems:"),
+        "affected subsystems should be explicit: {details}"
     );
 
     Ok(())

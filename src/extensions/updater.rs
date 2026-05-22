@@ -286,6 +286,7 @@ async fn maybe_update_proxy_runtime(
             allow_internal_unsigned: true,
             allow_downgrade: false,
             allow_same_version_replace: false,
+            suppress_reconcile: false,
         },
     )
     .await;
@@ -495,6 +496,7 @@ async fn rollback_proxy_runtime_update(
             allow_internal_unsigned: true,
             allow_downgrade: true,
             allow_same_version_replace: false,
+            suppress_reconcile: false,
         },
     )
     .await;

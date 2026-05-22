@@ -52,7 +52,9 @@ use crate::orchestrator::naming::build_aliases;
 use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::playback::start_session_cleanup;
-use crate::runtime::docker::{DockerRuntimeManager, DockerStartupConfig};
+use crate::runtime::health::{
+    DockerRuntimeHealthSnapshot, DockerRuntimeHealthState, runtime_health_poll_interval,
+};
 use crate::secrets::SecretsManager;
 use crate::state::AppState;
 use anyhow::Context;
@@ -87,9 +89,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to prepare runtime directories")?;
     log_resolved_paths(&settings);
-    ensure_docker_runtime_available(&settings)
-        .await
-        .context("docker runtime is unavailable")?;
 
     let database = Database::connect(&settings.database)
         .await
@@ -143,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
         artwork,
         secrets,
     );
+
     if let Err(err) = bootstrap_core_extensions(&state).await {
         tracing::warn!("core extension bootstrap failed: {err}");
     }
@@ -158,36 +158,17 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("core extension instance bootstrap failed: {err}");
         }
     };
-    match bootstrap_preinstalled_core_extension_runtimes(&state).await {
-        Ok(bootstrapped) if bootstrapped > 0 => {
-            tracing::info!("bootstrapped {bootstrapped} preinstalled core runtime(s)");
-        }
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!("preinstalled core runtime bootstrap failed: {err}");
-        }
-    };
     if let Err(err) = debrid::ensure_debrid_builtin(&state).await {
         tracing::warn!("debrid provider bootstrap failed: {err}");
     }
-    if let Err(err) = state.orchestrator.prepare_probe_binary().await {
-        tracing::warn!("probe binary preparation failed: {err}");
-    }
-    let app = router(state.clone());
 
-    // Kick off background periodic scan.
-    let scan_interval = settings.library.scan_interval_seconds;
-    let scan_state = state.clone();
-    tokio::spawn(async move { start_periodic_scan(scan_state, scan_interval).await });
-
-    // Start extensions reconcile loop.
     let reconcile_config = ReconcileConfig::from_settings(&settings);
     if let Err(err) = state
         .orchestrator
-        .recover_orphaned_state_after_restart(&reconcile_config)
+        .recover_orphaned_db_state_after_restart(&reconcile_config)
         .await
     {
-        tracing::warn!("orchestrator startup recovery failed: {err}");
+        tracing::warn!("orchestrator db-only startup recovery failed: {err}");
     }
     if let Err(err) = state
         .orchestrator
@@ -196,6 +177,37 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("orchestrator runtime health restore failed: {err}");
     }
+
+    let app = router(state.clone());
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind to {}", addr))?;
+
+    tracing::info!("Elixir server listening on http://{}", addr);
+
+    tokio::spawn(start_post_listener_background_tasks(
+        state.clone(),
+        reconcile_config,
+    ));
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+
+    // Clean up any lingering transcodes/temp files on shutdown.
+    state.transcodes.stop_all().await;
+
+    tracing::info!("Elixir server shutdown complete");
+    Ok(())
+}
+
+async fn start_post_listener_background_tasks(state: AppState, reconcile_config: ReconcileConfig) {
+    // Kick off background periodic scan.
+    let scan_interval = state.settings.library.scan_interval_seconds;
+    let scan_state = state.clone();
+    tokio::spawn(async move { start_periodic_scan(scan_state, scan_interval).await });
+
     state
         .orchestrator
         .clone()
@@ -203,7 +215,11 @@ async fn main() -> anyhow::Result<()> {
     state
         .orchestrator
         .clone()
-        .start_reconcile_loop(reconcile_config);
+        .start_reconcile_loop(reconcile_config.clone());
+    let runtime_bootstrap_state = state.clone();
+    tokio::spawn(async move {
+        run_docker_dependent_startup_bootstrap(runtime_bootstrap_state, reconcile_config).await;
+    });
 
     let acquisition_recovery_state = state.clone();
     tokio::spawn(async move {
@@ -235,9 +251,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Refresh extension registries on an interval.
-    let registries = settings.extensions.registries.clone();
-    let storage_root = settings.extensions.storage_root.clone();
-    let registry_interval = settings.extensions.registry_refresh_interval_seconds;
+    let registries = state.settings.extensions.registries.clone();
+    let storage_root = state.settings.extensions.storage_root.clone();
+    let registry_interval = state.settings.extensions.registry_refresh_interval_seconds;
     tokio::spawn(async move {
         start_registry_refresh_loop(
             registries,
@@ -247,7 +263,10 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    let proxy_runtime_update_interval = settings.extensions.proxy_runtime_update_interval_seconds;
+    let proxy_runtime_update_interval = state
+        .settings
+        .extensions
+        .proxy_runtime_update_interval_seconds;
     let proxy_runtime_update_state = state.clone();
     tokio::spawn(async move {
         start_proxy_runtime_update_loop(
@@ -284,28 +303,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Cleanup stale playback sessions and transcode leftovers.
     let cleanup_state = state.clone();
-    let cleanup_interval = settings.playback.cleanup_interval_seconds;
-    let session_ttl = settings.playback.session_ttl_seconds;
+    let cleanup_interval = state.settings.playback.cleanup_interval_seconds;
+    let session_ttl = state.settings.playback.session_ttl_seconds;
     tokio::spawn(async move {
         start_session_cleanup(cleanup_state, session_ttl, cleanup_interval).await;
     });
 
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind to {}", addr))?;
-
-    tracing::info!("Elixir server listening on http://{}", addr);
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
-
-    // Clean up any lingering transcodes/temp files on shutdown.
-    state.transcodes.stop_all().await;
-
-    tracing::info!("Elixir server shutdown complete");
-    Ok(())
+    if _mdns_guard.is_some() {
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn ensure_runtime_directories(settings: &Settings) -> anyhow::Result<()> {
@@ -328,22 +334,6 @@ async fn ensure_runtime_directories(settings: &Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ensure_docker_runtime_available(settings: &Settings) -> anyhow::Result<()> {
-    let runtime = DockerRuntimeManager::new(None);
-    let startup = DockerStartupConfig {
-        auto_start_runtime: settings.extensions.docker.auto_start_runtime,
-        startup_timeout: std::time::Duration::from_secs(
-            settings.extensions.docker.startup_timeout_seconds,
-        ),
-        startup_poll_interval: std::time::Duration::from_millis(
-            settings.extensions.docker.startup_poll_interval_millis,
-        ),
-    };
-    let status = runtime.ensure_daemon_available(&startup).await?;
-    tracing::info!("docker daemon ready ({status:?})");
-    Ok(())
-}
-
 fn log_resolved_paths(settings: &Settings) {
     tracing::info!(
         "paths: db='{}' media='{}' artwork='{}' extensions_root='{}' bundled='{}'",
@@ -353,6 +343,120 @@ fn log_resolved_paths(settings: &Settings) {
         settings.extensions.storage_root,
         settings.extensions.bundled_dir
     );
+}
+
+async fn run_docker_dependent_startup_bootstrap(
+    state: AppState,
+    reconcile_config: ReconcileConfig,
+) {
+    let retry_interval = runtime_health_poll_interval();
+    loop {
+        if let Err(err) = state
+            .orchestrator
+            .run_runtime_health_check_once(&reconcile_config)
+            .await
+        {
+            tracing::warn!("initial docker runtime health check failed: {err}");
+        }
+        if let Err(err) = state
+            .orchestrator
+            .recover_orphaned_runtime_state_after_docker_ready()
+            .await
+        {
+            tracing::warn!("orchestrator runtime startup recovery failed: {err}");
+        }
+
+        let snapshot = state.orchestrator.docker_runtime_snapshot();
+        if let Some(reason) = core_runtime_bootstrap_blocker(&snapshot) {
+            tracing::info!(
+                "deferring preinstalled core runtime bootstrap until Docker runtime is ready: {reason}"
+            );
+            tokio::time::sleep(retry_interval).await;
+            continue;
+        }
+
+        if let Err(err) = state.orchestrator.prepare_probe_binary().await {
+            tracing::warn!("probe binary preparation failed: {err}");
+            tokio::time::sleep(retry_interval).await;
+            continue;
+        }
+
+        match bootstrap_preinstalled_core_extension_runtimes(&state).await {
+            Ok(result) => {
+                if result.bootstrapped > 0 {
+                    tracing::info!(
+                        "bootstrapped {} preinstalled core runtime(s)",
+                        result.bootstrapped
+                    );
+                }
+                if result.blocked_missing_secrets > 0 {
+                    tracing::warn!(
+                        "preinstalled core runtime bootstrap has {} instance(s) blocked on manual secrets",
+                        result.blocked_missing_secrets
+                    );
+                }
+                if result.should_retry() {
+                    tracing::warn!(
+                        "preinstalled core runtime bootstrap will retry: {} failed runnable instance(s), {} runnable instance(s) still pending",
+                        result.failed,
+                        result.pending_runnable()
+                    );
+                    tokio::time::sleep(retry_interval).await;
+                    continue;
+                }
+
+                match preinstalled_downloader_providers_exist(&state).await {
+                    Ok(true) => {
+                        if let Err(err) = state
+                            .orchestrator
+                            .apply_builtin_downloader_profiles_now()
+                            .await
+                        {
+                            tracing::warn!(
+                                "preinstalled downloader profile bootstrap failed and will retry: {err}"
+                            );
+                            tokio::time::sleep(retry_interval).await;
+                            continue;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "checking preinstalled downloader providers failed and will retry: {err}"
+                        );
+                        tokio::time::sleep(retry_interval).await;
+                        continue;
+                    }
+                }
+                return;
+            }
+            Err(err) => {
+                tracing::warn!("preinstalled core runtime bootstrap failed: {err}");
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
+
+fn core_runtime_bootstrap_blocker(snapshot: &DockerRuntimeHealthSnapshot) -> Option<String> {
+    if snapshot.reboot_recommended {
+        return Some(
+            snapshot
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Docker runtime requires a host reboot".to_string()),
+        );
+    }
+
+    match snapshot.state {
+        DockerRuntimeHealthState::Degraded => Some(
+            snapshot
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Docker runtime is degraded".to_string()),
+        ),
+        DockerRuntimeHealthState::Healthy | DockerRuntimeHealthState::Recovering => None,
+    }
 }
 
 fn sqlite_file_path(url: &str) -> Option<PathBuf> {
@@ -458,13 +562,35 @@ async fn ensure_core_extension_instances(state: &AppState) -> anyhow::Result<u32
     Ok(created)
 }
 
-async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> anyhow::Result<u32> {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CoreRuntimeBootstrapResult {
+    bootstrapped: u32,
+    failed: u32,
+    blocked_missing_secrets: u32,
+    runnable_candidates: u32,
+}
+
+impl CoreRuntimeBootstrapResult {
+    fn pending_runnable(&self) -> u32 {
+        self.runnable_candidates
+            .saturating_sub(self.bootstrapped)
+            .saturating_sub(self.failed)
+    }
+
+    fn should_retry(&self) -> bool {
+        self.failed > 0 || self.pending_runnable() > 0
+    }
+}
+
+async fn bootstrap_preinstalled_core_extension_runtimes(
+    state: &AppState,
+) -> anyhow::Result<CoreRuntimeBootstrapResult> {
     if state.settings.extensions.core_extensions.is_empty() {
-        return Ok(0);
+        return Ok(CoreRuntimeBootstrapResult::default());
     }
 
     let store = ExtensionStore::new(&state.db_pool);
-    let mut bootstrapped = 0u32;
+    let mut result = CoreRuntimeBootstrapResult::default();
 
     for extension_id in &state.settings.extensions.core_extensions {
         let Some(extension) = store.get_extension(extension_id).await? else {
@@ -505,6 +631,7 @@ async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> any
                     .await?,
             );
             if !missing.is_empty() {
+                result.blocked_missing_secrets += 1;
                 tracing::warn!(
                     extension_id = %extension.extension_id,
                     instance_id = %instance.instance_id,
@@ -515,6 +642,7 @@ async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> any
                 continue;
             }
 
+            result.runnable_candidates += 1;
             let actions = build_preinstalled_core_bootstrap_actions(&instance, &manifest)?;
             tracing::info!(
                 extension_id = %extension.extension_id,
@@ -523,8 +651,9 @@ async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> any
                 "bootstrapping preinstalled core runtime"
             );
             match state.orchestrator.apply_actions(actions).await {
-                Ok(()) => bootstrapped += 1,
+                Ok(()) => result.bootstrapped += 1,
                 Err(err) => {
+                    result.failed += 1;
                     tracing::warn!(
                         extension_id = %extension.extension_id,
                         instance_id = %instance.instance_id,
@@ -536,17 +665,29 @@ async fn bootstrap_preinstalled_core_extension_runtimes(state: &AppState) -> any
         }
     }
 
-    if bootstrapped > 0 {
-        if let Err(err) = state
-            .orchestrator
-            .apply_builtin_downloader_profiles_now()
-            .await
-        {
-            tracing::warn!("preinstalled downloader profile bootstrap failed: {err}");
+    Ok(result)
+}
+
+async fn preinstalled_downloader_providers_exist(state: &AppState) -> anyhow::Result<bool> {
+    let store = ExtensionStore::new(&state.db_pool);
+    for extension_id in &state.settings.extensions.core_extensions {
+        if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+            continue;
+        }
+        for instance in store.list_instances(Some(extension_id)).await? {
+            if !instance.enabled {
+                continue;
+            }
+            if !store
+                .list_providers(Some(instance.instance_id))
+                .await?
+                .is_empty()
+            {
+                return Ok(true);
+            }
         }
     }
-
-    Ok(bootstrapped)
+    Ok(false)
 }
 
 fn core_instance_needs_startup_bootstrap(
@@ -642,6 +783,7 @@ fn bundled_install_policy(allow_same_version_replace: bool) -> InstallPolicy {
         allow_internal_unsigned: true,
         allow_downgrade: false,
         allow_same_version_replace,
+        suppress_reconcile: true,
     }
 }
 
@@ -934,12 +1076,14 @@ fn bundled_package_drifted(
 #[cfg(test)]
 mod tests {
     use super::{
-        BundledPackage, ExecutorAction, build_preinstalled_core_bootstrap_actions,
-        bundled_install_policy, bundled_package_drifted, core_instance_needs_startup_bootstrap,
+        BundledPackage, CoreRuntimeBootstrapResult, ExecutorAction,
+        build_preinstalled_core_bootstrap_actions, bundled_install_policy, bundled_package_drifted,
+        core_instance_needs_startup_bootstrap, core_runtime_bootstrap_blocker,
         should_replace_bundled_package,
     };
     use crate::db::models::ExtensionInstance;
     use crate::extensions::manifest::ExtensionManifest;
+    use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
     use chrono::Utc;
     use serde_json::json;
     use std::path::PathBuf;
@@ -996,6 +1140,65 @@ mod tests {
         assert!(policy.allow_internal_unsigned);
         assert!(!policy.allow_same_version_replace);
         assert!(!policy.allow_downgrade);
+    }
+
+    fn runtime_snapshot(state: DockerRuntimeHealthState) -> DockerRuntimeHealthSnapshot {
+        DockerRuntimeHealthSnapshot {
+            state,
+            code: None,
+            reason: None,
+            until: None,
+            host_warning: None,
+            quarantined_instances: Vec::new(),
+            last_failure_code: None,
+            last_failure_reason: None,
+            last_failure_at: None,
+            last_reset_attempt_at: None,
+            auto_reset_attempts_in_window: 0,
+            reboot_recommended: false,
+            dependency_actions_deferred_until: None,
+        }
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_waits_while_runtime_degraded() {
+        let mut snapshot = runtime_snapshot(DockerRuntimeHealthState::Degraded);
+        snapshot.reason = Some("Docker daemon is unavailable".to_string());
+
+        let blocker = core_runtime_bootstrap_blocker(&snapshot).expect("blocked");
+
+        assert!(blocker.contains("Docker daemon is unavailable"));
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_can_run_during_recovery() {
+        let mut snapshot = runtime_snapshot(DockerRuntimeHealthState::Recovering);
+        snapshot.dependency_actions_deferred_until = Some(Utc::now());
+
+        assert!(core_runtime_bootstrap_blocker(&snapshot).is_none());
+    }
+
+    #[test]
+    fn core_runtime_bootstrap_result_retries_only_runnable_failures() {
+        let blocked = CoreRuntimeBootstrapResult {
+            blocked_missing_secrets: 1,
+            ..Default::default()
+        };
+        assert!(!blocked.should_retry());
+
+        let failed = CoreRuntimeBootstrapResult {
+            runnable_candidates: 1,
+            failed: 1,
+            ..Default::default()
+        };
+        assert!(failed.should_retry());
+
+        let complete = CoreRuntimeBootstrapResult {
+            runnable_candidates: 2,
+            bootstrapped: 2,
+            ..Default::default()
+        };
+        assert!(!complete.should_retry());
     }
 
     #[test]

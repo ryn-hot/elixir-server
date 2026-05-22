@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
@@ -191,6 +192,9 @@ pub struct OrchestratorService {
     runtime: std::sync::Arc<DockerRuntimeManager>,
     runtime_health: std::sync::Arc<DockerRuntimeSupervisor>,
     runtime_reset_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    startup_runtime_recovery_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    startup_runtime_recovery_complete: std::sync::Arc<AtomicBool>,
+    docker_runtime_ready_confirmed: std::sync::Arc<AtomicBool>,
     core_extensions: Vec<String>,
 }
 
@@ -231,6 +235,9 @@ impl OrchestratorService {
             runtime,
             runtime_health,
             runtime_reset_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            startup_runtime_recovery_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            startup_runtime_recovery_complete: std::sync::Arc::new(AtomicBool::new(false)),
+            docker_runtime_ready_confirmed: std::sync::Arc::new(AtomicBool::new(false)),
             core_extensions,
         }
     }
@@ -1368,12 +1375,22 @@ impl OrchestratorService {
                 if let Err(err) = self.run_runtime_health_iteration(&config).await {
                     tracing::warn!("docker runtime supervisor iteration failed: {}", err);
                 }
+                if let Err(err) = self
+                    .recover_orphaned_runtime_state_after_docker_ready()
+                    .await
+                {
+                    tracing::warn!("orchestrator runtime startup recovery failed: {}", err);
+                }
                 tokio::time::sleep(runtime_health_poll_interval()).await;
             }
         });
     }
 
-    pub async fn recover_orphaned_state_after_restart(
+    pub async fn run_runtime_health_check_once(&self, config: &ReconcileConfig) -> Result<()> {
+        self.run_runtime_health_iteration(config).await
+    }
+
+    pub async fn recover_orphaned_db_state_after_restart(
         &self,
         config: &ReconcileConfig,
     ) -> Result<()> {
@@ -1446,24 +1463,6 @@ impl OrchestratorService {
             );
         }
 
-        let active_instance_ids: HashSet<String> = store
-            .list_instances(None)
-            .await?
-            .into_iter()
-            .map(|instance| instance.instance_id.to_string())
-            .collect();
-        let removed_containers = self
-            .runtime
-            .prune_orphaned_managed_containers(&active_instance_ids)
-            .await?;
-        if !removed_containers.is_empty() {
-            tracing::warn!(
-                "orchestrator: removed {} orphaned managed container(s) on startup: {:?}",
-                removed_containers.len(),
-                removed_containers
-            );
-        }
-
         let pruned_secrets = store.prune_orphaned_instance_secrets().await?;
         if pruned_secrets > 0 {
             tracing::warn!(
@@ -1472,6 +1471,77 @@ impl OrchestratorService {
             );
         }
         Ok(())
+    }
+
+    pub async fn recover_orphaned_runtime_state_after_docker_ready(&self) -> Result<bool> {
+        if self
+            .startup_runtime_recovery_complete
+            .load(Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+
+        if !self.docker_runtime_ready_confirmed.load(Ordering::SeqCst) {
+            tracing::info!(
+                "orchestrator: deferring startup runtime cleanup until Docker readiness is confirmed"
+            );
+            return Ok(false);
+        }
+
+        let snapshot = self.runtime_health.snapshot();
+        if snapshot.state == DockerRuntimeHealthState::Degraded {
+            tracing::info!(
+                "orchestrator: deferring startup runtime cleanup while Docker runtime is degraded"
+            );
+            return Ok(false);
+        }
+
+        let _guard = self.startup_runtime_recovery_lock.lock().await;
+        if self
+            .startup_runtime_recovery_complete
+            .load(Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+
+        let store = ExtensionStore::new(&self.pool);
+        let active_instance_ids: HashSet<String> = store
+            .list_instances(None)
+            .await?
+            .into_iter()
+            .map(|instance| instance.instance_id.to_string())
+            .collect();
+
+        match self
+            .runtime
+            .prune_orphaned_managed_containers(&active_instance_ids)
+            .await
+        {
+            Ok(removed_containers) => {
+                if !removed_containers.is_empty() {
+                    tracing::warn!(
+                        "orchestrator: removed {} orphaned managed container(s) on startup: {:?}",
+                        removed_containers.len(),
+                        removed_containers
+                    );
+                }
+                self.startup_runtime_recovery_complete
+                    .store(true, Ordering::SeqCst);
+                Ok(true)
+            }
+            Err(err) => {
+                if let Some(kind) = classify_docker_runtime_failure(&err) {
+                    self.record_docker_runtime_failure_kind(kind, &err);
+                    self.persist_runtime_health_state().await?;
+                    tracing::warn!(
+                        "orchestrator: deferred startup runtime cleanup because Docker became unavailable: {}",
+                        err
+                    );
+                    return Ok(false);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub async fn restore_persisted_runtime_health_state(&self) -> Result<()> {
@@ -1510,8 +1580,7 @@ impl OrchestratorService {
             .await
         {
             Ok(status) => {
-                self.runtime_health
-                    .record_engine_ready(matches!(status, DockerDaemonStatus::StartedByElixir));
+                self.record_docker_runtime_ready(status);
                 match self.probe_core_runtime_liveness().await {
                     Ok(progress) => self
                         .runtime_health
@@ -1525,11 +1594,10 @@ impl OrchestratorService {
                 }
             }
             Err(err) => {
-                if let Some(kind) = classify_docker_runtime_failure(&err) {
-                    self.runtime_health.record_engine_failure(
-                        kind.code(),
-                        describe_docker_runtime_failure(kind, &err),
-                    );
+                if self
+                    .record_classified_docker_runtime_failure(&err)
+                    .is_some()
+                {
                     match self.runtime_health.auto_reset_decision() {
                         DockerAutoResetDecision::AttemptNow => {
                             if let Ok(_guard) = self.runtime_reset_lock.clone().try_lock_owned() {
@@ -1537,13 +1605,14 @@ impl OrchestratorService {
                                 self.persist_runtime_health_state().await?;
                                 let outcome = self.reset_elixir_runtime_inner(config).await?;
                                 if outcome.reboot_recommended {
-                                    self.runtime_health
-                                        .mark_reboot_recommended(outcome.message.clone());
+                                    self.mark_docker_runtime_reboot_recommended(
+                                        outcome.message.clone(),
+                                    );
                                 }
                             }
                         }
                         DockerAutoResetDecision::BudgetExceeded => {
-                            self.runtime_health.mark_reboot_recommended(
+                            self.mark_docker_runtime_reboot_recommended(
                                 "Elixir already used its automatic Docker recovery budget for this hour. Reboot the computer, then relaunch Elixir.",
                             );
                         }
@@ -1674,15 +1743,13 @@ impl OrchestratorService {
             .await
         {
             Ok(status) => {
-                self.runtime_health
-                    .record_engine_ready(matches!(status, DockerDaemonStatus::StartedByElixir));
+                self.record_docker_runtime_ready(status);
             }
             Err(err) => {
-                if let Some(kind) = classify_docker_runtime_failure(&err) {
-                    self.runtime_health.record_engine_failure(
-                        kind.code(),
-                        describe_docker_runtime_failure(kind, &err),
-                    );
+                if self
+                    .record_classified_docker_runtime_failure(&err)
+                    .is_some()
+                {
                     should_restart_runtime = true;
                 } else {
                     return Err(err);
@@ -1698,12 +1765,11 @@ impl OrchestratorService {
             {
                 Ok(status) => {
                     docker_restarted = true;
-                    self.runtime_health
-                        .record_engine_ready(matches!(status, DockerDaemonStatus::StartedByElixir));
+                    self.record_docker_runtime_ready(status);
                 }
                 Err(err) => {
                     if let Some(kind) = classify_docker_runtime_failure(&err) {
-                        self.runtime_health.mark_reboot_recommended(format!(
+                        self.mark_docker_runtime_reboot_recommended(format!(
                             "{} Elixir could not recover Docker automatically; reboot the host and relaunch Elixir.",
                             describe_docker_runtime_failure(kind, &err)
                         ));
@@ -1728,10 +1794,7 @@ impl OrchestratorService {
             Ok(removed) => removed_containers = removed,
             Err(err) => {
                 if let Some(kind) = classify_docker_runtime_failure(&err) {
-                    self.runtime_health.record_engine_failure(
-                        kind.code(),
-                        describe_docker_runtime_failure(kind, &err),
-                    );
+                    self.record_docker_runtime_failure_kind(kind, &err);
                     if !docker_restarted {
                         match self
                             .runtime
@@ -1740,17 +1803,14 @@ impl OrchestratorService {
                         {
                             Ok(status) => {
                                 docker_restarted = true;
-                                self.runtime_health.record_engine_ready(matches!(
-                                    status,
-                                    DockerDaemonStatus::StartedByElixir
-                                ));
+                                self.record_docker_runtime_ready(status);
                                 match self.runtime.stop_and_remove_managed_containers().await {
                                     Ok(removed) => removed_containers = removed,
                                     Err(retry_err) => {
                                         if let Some(retry_kind) =
                                             classify_docker_runtime_failure(&retry_err)
                                         {
-                                            self.runtime_health.mark_reboot_recommended(
+                                            self.mark_docker_runtime_reboot_recommended(
                                                 format!(
                                                     "{} Elixir could not recover Docker automatically; reboot the host and relaunch Elixir.",
                                                     describe_docker_runtime_failure(
@@ -1776,7 +1836,7 @@ impl OrchestratorService {
                                 }
                             }
                             Err(restart_err) => {
-                                self.runtime_health.mark_reboot_recommended(format!(
+                                self.mark_docker_runtime_reboot_recommended(format!(
                                     "{} Elixir could not recover Docker automatically; reboot the host and relaunch Elixir.",
                                     restart_err
                                 ));
@@ -1792,7 +1852,7 @@ impl OrchestratorService {
                             }
                         }
                     } else {
-                        self.runtime_health.mark_reboot_recommended(format!(
+                        self.mark_docker_runtime_reboot_recommended(format!(
                             "Docker is still unhealthy after Elixir restarted it ({}). Reboot the computer, then relaunch Elixir.",
                             kind.code()
                         ));
@@ -1823,8 +1883,9 @@ impl OrchestratorService {
                 }
                 Err(err) => {
                     if let Some(kind) = classify_docker_runtime_failure(&err) {
-                        self.runtime_health
-                            .mark_reboot_recommended(describe_docker_runtime_failure(kind, &err));
+                        self.mark_docker_runtime_reboot_recommended(
+                            describe_docker_runtime_failure(kind, &err),
+                        );
                         return Ok(RuntimeResetOutcome {
                             status: "reboot_recommended".to_string(),
                             message: "Elixir could not recreate the managed Docker network because Docker is still unhealthy. Reboot the computer, then relaunch Elixir."
@@ -1841,7 +1902,12 @@ impl OrchestratorService {
         }
 
         self.runtime_health.clear_all_quarantines();
-        self.runtime_health.record_engine_ready(docker_restarted);
+        let ready_status = if docker_restarted {
+            DockerDaemonStatus::StartedByElixir
+        } else {
+            DockerDaemonStatus::Ready
+        };
+        self.record_docker_runtime_ready(ready_status);
 
         match self.reconcile_once(config).await {
             Ok(()) => {
@@ -1884,7 +1950,7 @@ impl OrchestratorService {
             }
             Err(err) => {
                 if let Some(kind) = classify_docker_runtime_failure(&err) {
-                    self.runtime_health.mark_reboot_recommended(format!(
+                    self.mark_docker_runtime_reboot_recommended(format!(
                         "{} Elixir could not fully recover Docker automatically; reboot the host and relaunch Elixir.",
                         describe_docker_runtime_failure(kind, &err)
                     ));
@@ -1925,6 +1991,8 @@ impl OrchestratorService {
         code: impl Into<String>,
         reason: impl Into<String>,
     ) {
+        self.docker_runtime_ready_confirmed
+            .store(false, Ordering::SeqCst);
         self.runtime_health.record_engine_failure(code, reason);
     }
 
@@ -1939,22 +2007,53 @@ impl OrchestratorService {
             .await
         {
             Ok(status) => {
-                self.runtime_health.record_engine_ready(matches!(
-                    status,
-                    crate::runtime::docker::DockerDaemonStatus::StartedByElixir
-                ));
+                self.record_docker_runtime_ready(status);
+                self.persist_runtime_health_state().await?;
                 Ok(())
             }
             Err(err) => {
-                if let Some(kind) = crate::runtime::docker::classify_docker_runtime_failure(&err) {
-                    self.runtime_health.record_engine_failure(
-                        kind.code(),
-                        describe_docker_runtime_failure(kind, &err),
-                    );
+                if self
+                    .record_classified_docker_runtime_failure(&err)
+                    .is_some()
+                {
+                    self.persist_runtime_health_state().await?;
                 }
                 Err(err)
             }
         }
+    }
+
+    fn record_docker_runtime_ready(&self, status: DockerDaemonStatus) {
+        self.docker_runtime_ready_confirmed
+            .store(true, Ordering::SeqCst);
+        self.runtime_health
+            .record_engine_ready(matches!(status, DockerDaemonStatus::StartedByElixir));
+    }
+
+    fn record_docker_runtime_failure_kind(
+        &self,
+        kind: crate::runtime::docker::DockerRuntimeFailureKind,
+        err: &anyhow::Error,
+    ) {
+        self.docker_runtime_ready_confirmed
+            .store(false, Ordering::SeqCst);
+        self.runtime_health
+            .record_engine_failure(kind.code(), describe_docker_runtime_failure(kind, err));
+    }
+
+    fn record_classified_docker_runtime_failure(
+        &self,
+        err: &anyhow::Error,
+    ) -> Option<crate::runtime::docker::DockerRuntimeFailureKind> {
+        let kind = classify_docker_runtime_failure(err)?;
+        self.record_docker_runtime_failure_kind(kind, err);
+        Some(kind)
+    }
+
+    fn mark_docker_runtime_reboot_recommended(&self, reason: impl Into<String>) {
+        self.docker_runtime_ready_confirmed
+            .store(false, Ordering::SeqCst);
+        self.runtime_health.mark_reboot_recommended(reason);
     }
 
     pub(crate) async fn reconcile_once_with_probe(
@@ -1986,6 +2085,7 @@ impl OrchestratorService {
         probe: &dyn ProbeRunner,
         runtime: &dyn crate::runtime::RuntimeManager,
     ) -> Result<Vec<String>> {
+        self.ensure_dependency_actions_not_deferred(&actions)?;
         let executor = Executor::new(
             &self.pool,
             probe,
@@ -2005,6 +2105,27 @@ impl OrchestratorService {
         }
         Ok(notes)
     }
+
+    fn ensure_dependency_actions_not_deferred(&self, actions: &[ExecutorAction]) -> Result<()> {
+        if !actions.iter().any(executor_action_is_dependency_work) {
+            return Ok(());
+        }
+        if let Some((until, reason)) = self.runtime_health.should_defer_dependency_actions() {
+            anyhow::bail!(
+                "Docker runtime dependency actions are deferred until {} while recovery completes: {}",
+                until.to_rfc3339(),
+                reason
+            );
+        }
+        Ok(())
+    }
+}
+
+fn executor_action_is_dependency_work(action: &ExecutorAction) -> bool {
+    matches!(
+        action,
+        ExecutorAction::ApplyDriverPatch { .. } | ExecutorAction::ApplyBinding { .. }
+    )
 }
 
 fn backups_instance_root(storage_root: &str, extension_id: &str, instance_id: Uuid) -> PathBuf {
@@ -2911,6 +3032,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_actions_defers_dependency_work_while_runtime_is_recovering() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+
+        let service = OrchestratorService::new(
+            database.pool.clone(),
+            "data/extensions".to_string(),
+            "extensions/bundled".to_string(),
+            "data/library".to_string(),
+            Vec::new(),
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: Duration::from_secs(1),
+                startup_poll_interval: Duration::from_millis(100),
+            },
+            DownloaderPerformanceProfile::Balanced,
+            Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
+        );
+        service.record_docker_runtime_failure("docker_runtime_unavailable", "daemon missing");
+        service.runtime_health().record_engine_ready(true);
+
+        let binding = NewBinding {
+            binding_id: Uuid::new_v4(),
+            consumer_provider_id: Uuid::new_v4(),
+            requires_capability: "provider.capability".to_string(),
+            requires_slot_id: "default".to_string(),
+            target_provider_id: Uuid::new_v4(),
+            binding_params_json: None,
+            status: BindingStatus::Pending,
+        };
+        let probe = MockProbe::default();
+        let err = service
+            .apply_actions_with_probe(
+                vec![ExecutorAction::ApplyBinding { binding }],
+                &probe,
+                &crate::runtime::docker::DockerRuntimeManager::new(None),
+            )
+            .await
+            .expect_err("dependency actions should be deferred");
+
+        assert!(
+            err.to_string().contains("dependency actions are deferred"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            probe.calls().await.is_empty(),
+            "dependency deferral should happen before probing"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn recover_orphaned_state_clears_lock_and_running_runs() -> Result<()> {
         let config = DatabaseConfig {
             url: "sqlite::memory:?cache=shared".to_string(),
@@ -2990,7 +3171,7 @@ mod tests {
         };
 
         service
-            .recover_orphaned_state_after_restart(&reconcile_config)
+            .recover_orphaned_db_state_after_restart(&reconcile_config)
             .await?;
 
         let run = store
@@ -3157,7 +3338,7 @@ mod tests {
         };
 
         service
-            .recover_orphaned_state_after_restart(&reconcile_config)
+            .recover_orphaned_db_state_after_restart(&reconcile_config)
             .await?;
 
         assert!(
@@ -3171,6 +3352,50 @@ mod tests {
         assert!(
             store.get_instance(default_instance).await?.is_some(),
             "primary provider-backed instance should be preserved"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_runtime_state_defers_while_docker_degraded() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+
+        let service = OrchestratorService::new(
+            database.pool.clone(),
+            "/tmp/extensions".to_string(),
+            "/tmp/extensions/bundled".to_string(),
+            "/tmp/media".to_string(),
+            vec![],
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DockerStartupConfig {
+                auto_start_runtime: false,
+                startup_timeout: Duration::from_secs(1),
+                startup_poll_interval: Duration::from_millis(100),
+            },
+            DownloaderPerformanceProfile::Balanced,
+            Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
+        );
+
+        service.record_docker_runtime_failure(
+            "docker_runtime_unavailable",
+            "Docker is unavailable during startup recovery.",
+        );
+
+        let ran = service
+            .recover_orphaned_runtime_state_after_docker_ready()
+            .await?;
+
+        assert!(
+            !ran,
+            "runtime cleanup should be deferred without calling Docker while degraded"
         );
 
         Ok(())

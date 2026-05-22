@@ -2137,7 +2137,8 @@ impl<'a> Executor<'a> {
                 )
             })?;
 
-        ensure_provider_healthy(&provider)?;
+        ensure_provider_ready_for_driver_patch(&self.store, &provider, &connector_extension_id)
+            .await?;
 
         let endpoint_json = provider
             .endpoint_json
@@ -3541,6 +3542,13 @@ async fn resolve_indexer_apps(
         let host_hint = url_host(&app.url);
         if is_sonarr_app(&app.implementation) {
             let target = resolve_sonarr_target_for_app(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_ready(
+                store,
+                &target,
+                "Sonarr",
+                "Prowlarr application registration",
+            )
+            .await?;
             ensure_dependency_provider_reachable(
                 probe,
                 &target,
@@ -3553,6 +3561,13 @@ async fn resolve_indexer_apps(
             app.api_key = Some(api_key);
         } else if is_radarr_app(&app.implementation) {
             let target = resolve_radarr_target_for_app(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_ready(
+                store,
+                &target,
+                "Radarr",
+                "Prowlarr application registration",
+            )
+            .await?;
             ensure_dependency_provider_reachable(
                 probe,
                 &target,
@@ -3589,6 +3604,13 @@ async fn resolve_downloader_credentials(
         if is_qbittorrent_downloader(&downloader.r#type) {
             let target =
                 resolve_qbittorrent_target_for_downloader(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_ready(
+                store,
+                &target,
+                "qBittorrent",
+                "download client registration",
+            )
+            .await?;
             ensure_dependency_provider_reachable(
                 probe,
                 &target,
@@ -3607,6 +3629,13 @@ async fn resolve_downloader_credentials(
         }
         if is_nzbget_downloader(&downloader.r#type) {
             let target = resolve_nzbget_target_for_downloader(store, host_hint.as_deref()).await?;
+            ensure_dependency_provider_ready(
+                store,
+                &target,
+                "NZBGet",
+                "download client registration",
+            )
+            .await?;
             ensure_dependency_provider_reachable(
                 probe,
                 &target,
@@ -3899,6 +3928,81 @@ async fn ensure_dependency_provider_reachable(
         )));
     }
     Ok(())
+}
+
+async fn ensure_dependency_provider_ready(
+    store: &ExtensionStore<'_>,
+    target: &ManagedProviderTarget,
+    dependency_name: &str,
+    action_name: &str,
+) -> Result<()> {
+    ensure_provider_health_readable(&target.provider, dependency_name, action_name)?;
+    ensure_provider_driver_ready(
+        store,
+        target.provider.provider_id,
+        dependency_name,
+        action_name,
+    )
+    .await
+}
+
+async fn ensure_provider_ready_for_driver_patch(
+    store: &ExtensionStore<'_>,
+    provider: &Provider,
+    connector_extension_id: &str,
+) -> Result<()> {
+    ensure_provider_health_readable(
+        provider,
+        "target provider",
+        &format!("driver patch from {connector_extension_id}"),
+    )?;
+    ensure_provider_driver_ready(
+        store,
+        provider.provider_id,
+        "target provider",
+        &format!("driver patch from {connector_extension_id}"),
+    )
+    .await
+}
+
+fn ensure_provider_health_readable(
+    provider: &Provider,
+    dependency_name: &str,
+    action_name: &str,
+) -> Result<()> {
+    if matches!(
+        provider.health_state,
+        ProviderHealthState::Healthy | ProviderHealthState::Degraded
+    ) {
+        return Ok(());
+    }
+
+    Err(deferred_dependency_error(format!(
+        "{dependency_name} provider {} is not healthy/readable yet; deferring {action_name}: health is {}",
+        provider.provider_id,
+        provider.health_state.as_str()
+    )))
+}
+
+async fn ensure_provider_driver_ready(
+    store: &ExtensionStore<'_>,
+    provider_id: Uuid,
+    dependency_name: &str,
+    action_name: &str,
+) -> Result<()> {
+    let phase = store
+        .get_provider_readiness(provider_id)
+        .await?
+        .map(|readiness| readiness.readiness_phase)
+        .unwrap_or(ProviderReadinessPhase::Unknown);
+    if readiness_satisfies(phase, ProviderReadinessPhase::DriverReady) {
+        return Ok(());
+    }
+
+    Err(deferred_dependency_error(format!(
+        "{dependency_name} provider {provider_id} is not driver-ready yet; deferring {action_name}: readiness is {}",
+        phase.as_str()
+    )))
 }
 
 async fn provider_host_aliases(
@@ -5161,20 +5265,6 @@ fn matches_profile_version(current: Option<&str>, selected: DownloaderPerformanc
     }
 }
 
-fn ensure_provider_healthy(provider: &Provider) -> Result<()> {
-    match provider.health_state {
-        ProviderHealthState::Healthy | ProviderHealthState::Degraded => Ok(()),
-        ProviderHealthState::Unknown => bail!(
-            "provider {} health is unknown; cannot apply driver patches",
-            provider.provider_id
-        ),
-        ProviderHealthState::Unhealthy => bail!(
-            "provider {} is unhealthy; cannot apply driver patches",
-            provider.provider_id
-        ),
-    }
-}
-
 async fn ensure_runtime_secrets_present(
     store: &ExtensionStore<'_>,
     instance_id: Uuid,
@@ -5739,7 +5829,8 @@ mod tests {
     use crate::config::DatabaseConfig;
     use crate::db::Database;
     use crate::db::models::{
-        ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality,
+        ExtensionKind, ExtensionTrustLevel, ProviderHealthState, ProviderReadinessPhase,
+        SlotCardinality,
     };
     use crate::download_broker::{TORRENT_DEFAULT_LOGICAL_ID, list_logical_downloaders};
     use crate::extensions::managed_paths::NZBGET_LOCK_FILE;
@@ -8975,9 +9066,10 @@ mod tests {
             None,
             Some("elixir_net".to_string()),
         )?;
+        let provider_id = Uuid::new_v4();
         store
             .upsert_provider(&NewProvider {
-                provider_id: Uuid::new_v4(),
+                provider_id,
                 instance_id,
                 capability: "downloader.nzb".to_string(),
                 slot_id: "default".to_string(),
@@ -8987,6 +9079,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(&endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
@@ -9044,6 +9139,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_downloader_credentials_defers_until_nzbget_driver_ready() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(
+            &store,
+            "elixir.modules.nzbget",
+            json!({
+                "id": "elixir.modules.nzbget",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "NZBGet",
+                "provides": [{
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "implementation": "nzbget"
+                }]
+            }),
+        )
+        .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "svc-elixir-modules-nzbget-default".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id: Uuid::new_v4(),
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(&endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
+        let probe = StubProbe::default();
+        let mut patch = DriverPatch::MediaManagerTv(MediaManagerTvPatch::SetDownloaders {
+            downloaders: vec![DownloaderSpec {
+                name: "NZBGet".to_string(),
+                r#type: "nzbget".to_string(),
+                url: "http://elx-nzbget:6789".to_string(),
+                api_key: None,
+                category: Some("movies".to_string()),
+                tags: Vec::new(),
+                enabled: Some(true),
+                settings: HashMap::new(),
+            }],
+        });
+
+        let err = resolve_downloader_credentials(&store, &secrets, &probe, &mut patch)
+            .await
+            .expect_err("expected readiness deferral");
+        let message =
+            deferred_dependency_message(&err).expect("deferred dependency message should exist");
+        assert!(message.contains("NZBGet provider"));
+        assert!(message.contains("not driver-ready"));
+        assert!(message.contains("download client registration"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resolve_indexer_apps_defers_when_sonarr_dependency_is_unreachable() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -9087,9 +9262,10 @@ mod tests {
             None,
             None,
         )?;
+        let provider_id = Uuid::new_v4();
         store
             .upsert_provider(&NewProvider {
-                provider_id: Uuid::new_v4(),
+                provider_id,
                 instance_id,
                 capability: "media.manager.tv".to_string(),
                 slot_id: "default".to_string(),
@@ -9099,6 +9275,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(&endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let secrets = SecretsManager::from_key_bytes([9u8; 32], true);
@@ -9629,13 +9808,8 @@ mod tests {
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-qbit".to_string(),
-            8080,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
+        let endpoint =
+            ProviderEndpoint::new("http".to_string(), "svc-qbit".to_string(), 8080, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -9648,6 +9822,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let probe = StubProbe::default();
@@ -9718,13 +9895,8 @@ mod tests {
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-qbit".to_string(),
-            8080,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
+        let endpoint =
+            ProviderEndpoint::new("http".to_string(), "svc-qbit".to_string(), 8080, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -9737,6 +9909,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let probe = StubProbe::default();
@@ -9825,13 +10000,8 @@ mod tests {
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-qbit".to_string(),
-            8080,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
+        let endpoint =
+            ProviderEndpoint::new("http".to_string(), "svc-qbit".to_string(), 8080, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -9844,6 +10014,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let probe = StubProbe::default();
@@ -9914,13 +10087,8 @@ mod tests {
             .await?;
 
         let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-qbit".to_string(),
-            8080,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
+        let endpoint =
+            ProviderEndpoint::new("http".to_string(), "svc-qbit".to_string(), 8080, None, None)?;
         store
             .upsert_provider(&NewProvider {
                 provider_id,
@@ -9933,6 +10101,9 @@ mod tests {
                 endpoint_json: Some(serde_json::to_value(endpoint)?),
                 health_state: ProviderHealthState::Healthy,
             })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
             .await?;
 
         let probe = StubProbe::default();

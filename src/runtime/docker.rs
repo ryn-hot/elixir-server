@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::fs;
 use tokio::process::Command;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Duration as TokioDuration, Instant, sleep, timeout};
 use uuid::Uuid;
 
 use crate::runtime::RuntimeManager;
@@ -18,6 +18,7 @@ use crate::runtime::model::{
 };
 
 const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"];
+const DOCKER_PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DockerRuntimeManager {
     docker_bin: String,
@@ -114,11 +115,27 @@ impl DockerRuntimeManager {
     }
 
     async fn run_capture(&self, args: &[String]) -> Result<CommandOutput> {
-        let output = Command::new(&self.docker_bin)
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("running docker {}", args.join(" ")))?;
+        self.run_capture_with_timeout(args, None).await
+    }
+
+    async fn run_capture_with_timeout(
+        &self,
+        args: &[String],
+        timeout_duration: Option<TokioDuration>,
+    ) -> Result<CommandOutput> {
+        let mut command = Command::new(&self.docker_bin);
+        command.args(args).kill_on_drop(true);
+        let command_label = format!("docker {}", args.join(" "));
+        let output_future = command.output();
+        let output = match timeout_duration {
+            Some(duration) => timeout(duration, output_future)
+                .await
+                .with_context(|| format!("{command_label} timed out after {duration:?}"))?
+                .with_context(|| format!("running {command_label}"))?,
+            None => output_future
+                .await
+                .with_context(|| format!("running {command_label}"))?,
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -138,13 +155,26 @@ impl DockerRuntimeManager {
         Ok(self.run_capture(args).await?.stdout)
     }
 
+    async fn run_stdout_with_timeout(
+        &self,
+        args: &[String],
+        timeout_duration: TokioDuration,
+    ) -> Result<String> {
+        Ok(self
+            .run_capture_with_timeout(args, Some(timeout_duration))
+            .await?
+            .stdout)
+    }
+
     pub async fn server_version(&self) -> Result<String> {
         let args = vec![
             "version".to_string(),
             "--format".to_string(),
             "{{.Server.Version}}".to_string(),
         ];
-        let stdout = self.run_stdout(&args).await?;
+        let stdout = self
+            .run_stdout_with_timeout(&args, DOCKER_PROBE_COMMAND_TIMEOUT)
+            .await?;
         let version = stdout.trim();
         if version.is_empty() {
             bail!("docker daemon returned an empty server version");
@@ -1511,6 +1541,7 @@ fn is_docker_daemon_unavailable(err: &anyhow::Error) -> bool {
         || message.contains("is the docker daemon running")
         || message.contains("error during connect")
         || message.contains("docker daemon unavailable")
+        || (message.contains("docker version") && message.contains("timed out"))
         || (message.contains("dial unix")
             && (message.contains("docker.sock") || message.contains("docker.raw.sock"))
             && (message.contains("connection refused")
@@ -1933,6 +1964,36 @@ mod tests {
             "docker version --format {{.Server.Version}} failed: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
         );
         assert!(is_docker_daemon_unavailable(&err));
+    }
+
+    #[test]
+    fn docker_probe_timeouts_are_treated_as_unavailable() {
+        let err = anyhow::anyhow!("docker version --format {{.Server.Version}} timed out after 5s");
+        assert!(is_docker_daemon_unavailable(&err));
+        assert_eq!(
+            classify_docker_runtime_failure(&err),
+            Some(DockerRuntimeFailureKind::DaemonUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_probe_command_timeout_returns_promptly() {
+        let runtime = DockerRuntimeManager::new(Some("sleep".to_string()));
+        let start = std::time::Instant::now();
+
+        let result = runtime
+            .run_capture_with_timeout(&["5".to_string()], Some(Duration::from_millis(50)))
+            .await;
+        let err = match result {
+            Ok(_) => panic!("expected timed out command to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout path should return promptly"
+        );
     }
 
     #[test]

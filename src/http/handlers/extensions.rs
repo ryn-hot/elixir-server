@@ -72,7 +72,11 @@ use crate::orchestrator::plan_validation::{
 };
 use crate::orchestrator::planner::{Plan, PlanAction, PlanBlockedStage, PlanStage, Planner};
 use crate::orchestrator::reconcile::ReconcileConfig;
-use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
+use crate::runtime::health::{
+    DockerRuntimeHealthSnapshot, DockerRuntimeHealthState, DockerRuntimeSubsystemImpact,
+    docker_auto_reset_cooldown_seconds, docker_auto_reset_max_attempts_per_window,
+    docker_auto_reset_window_seconds, docker_runtime_affected_subsystems,
+};
 use crate::state::AppState;
 
 mod control;
@@ -123,6 +127,7 @@ pub(crate) struct InstallPolicy {
     pub allow_internal_unsigned: bool,
     pub allow_downgrade: bool,
     pub allow_same_version_replace: bool,
+    pub suppress_reconcile: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +317,8 @@ pub struct DockerRuntimeStatusSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<DockerRuntimeLastFailureSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_reason: Option<String>,
@@ -319,10 +326,35 @@ pub struct DockerRuntimeStatusSummary {
     pub last_failure_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reset_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_actions_deferred_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub auto_reset_budget: DockerRuntimeAutoResetBudgetSummary,
     #[serde(default)]
     pub auto_reset_attempts_in_window: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_subsystems: Vec<DockerRuntimeSubsystemImpact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantined_instances: Vec<DockerRuntimeQuarantineSummary>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerRuntimeLastFailureSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerRuntimeAutoResetBudgetSummary {
+    pub attempts_used: u32,
+    pub attempts_allowed: u32,
+    pub window_seconds: i64,
+    pub cooldown_seconds: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1670,7 +1702,8 @@ async fn install_extension_internal_with_policy(
     } else {
         false
     };
-    if default_instance_created || existing_instances_need_reconcile {
+    if (default_instance_created || existing_instances_need_reconcile) && !policy.suppress_reconcile
+    {
         trigger_extensions_reconcile(state, "extension install runtime refresh");
     }
 
@@ -3057,11 +3090,20 @@ fn summarize_docker_runtime(
         reboot_recommended: snapshot.reboot_recommended,
         until: snapshot.until.clone(),
         host_warning: snapshot.host_warning.clone(),
+        last_failure: docker_runtime_last_failure_summary(snapshot),
         last_failure_code: snapshot.last_failure_code.clone(),
         last_failure_reason: snapshot.last_failure_reason.clone(),
         last_failure_at: snapshot.last_failure_at,
         last_reset_attempt_at: snapshot.last_reset_attempt_at,
+        dependency_actions_deferred_until: snapshot.dependency_actions_deferred_until,
+        auto_reset_budget: DockerRuntimeAutoResetBudgetSummary {
+            attempts_used: snapshot.auto_reset_attempts_in_window,
+            attempts_allowed: docker_auto_reset_max_attempts_per_window(),
+            window_seconds: docker_auto_reset_window_seconds(),
+            cooldown_seconds: docker_auto_reset_cooldown_seconds(),
+        },
         auto_reset_attempts_in_window: snapshot.auto_reset_attempts_in_window,
+        affected_subsystems: docker_runtime_affected_subsystems(snapshot),
         quarantined_instances: snapshot
             .quarantined_instances
             .iter()
@@ -3075,6 +3117,23 @@ fn summarize_docker_runtime(
                 until: item.until,
             })
             .collect(),
+    })
+}
+
+fn docker_runtime_last_failure_summary(
+    snapshot: &DockerRuntimeHealthSnapshot,
+) -> Option<DockerRuntimeLastFailureSummary> {
+    if snapshot.last_failure_code.is_none()
+        && snapshot.last_failure_reason.is_none()
+        && snapshot.last_failure_at.is_none()
+    {
+        return None;
+    }
+
+    Some(DockerRuntimeLastFailureSummary {
+        code: snapshot.last_failure_code.clone(),
+        reason: snapshot.last_failure_reason.clone(),
+        at: snapshot.last_failure_at,
     })
 }
 
@@ -4572,6 +4631,11 @@ async fn build_extension_control_surface(
         details
             .push("Create or enable a default instance to manage this extension here.".to_string());
     }
+    append_runtime_control_surface_details(
+        &mut details,
+        &context.summary,
+        &state.orchestrator.docker_runtime_snapshot(),
+    );
     let mut status = ExtensionControlStatus {
         health: control_health_for_summary(&context.summary),
         summary: context.summary.label.clone(),
@@ -4643,6 +4707,47 @@ async fn build_extension_control_surface(
         sections,
         actions: build_extension_control_actions(&context),
     })
+}
+
+fn append_runtime_control_surface_details(
+    details: &mut Vec<String>,
+    summary: &ExtensionStatusSummaryItem,
+    runtime_snapshot: &DockerRuntimeHealthSnapshot,
+) {
+    let runtime_issue = matches!(
+        summary.status_code.as_str(),
+        "runtime_status_stale" | "runtime_status_recovering"
+    );
+    if !runtime_issue {
+        return;
+    }
+
+    match runtime_snapshot.state {
+        DockerRuntimeHealthState::Degraded => details.push(
+            "Runtime operations are blocked because Docker is degraded. Elixir is preserving installed extension state and will resume through normal reconcile after Docker recovers."
+                .to_string(),
+        ),
+        DockerRuntimeHealthState::Recovering => details.push(
+            "Docker is recovering. Runtime operations and connector rewrites are temporarily deferred until core providers are readable."
+                .to_string(),
+        ),
+        DockerRuntimeHealthState::Healthy => {}
+    }
+
+    if let Some(until) = runtime_snapshot.dependency_actions_deferred_until {
+        details.push(format!("Dependency actions are deferred until {until}."));
+    }
+
+    let mut affected = docker_runtime_affected_subsystems(runtime_snapshot)
+        .into_iter()
+        .filter(|subsystem| subsystem.status != "ok")
+        .map(|subsystem| subsystem.label)
+        .collect::<Vec<_>>();
+    affected.sort();
+    affected.dedup();
+    if !affected.is_empty() {
+        details.push(format!("Affected subsystems: {}.", affected.join(", ")));
+    }
 }
 
 fn is_indexer_registry_connector_manifest(manifest: &ExtensionManifest) -> bool {
