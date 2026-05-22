@@ -61,6 +61,8 @@ pub struct ExtensionManifest {
     // extensions. This field is intentionally dormant for now.
     #[serde(default)]
     pub control_surface: Option<ManifestControlSurface>,
+    #[serde(default)]
+    pub owner_release: Option<ManifestOwnerRelease>,
 }
 
 impl ExtensionManifest {
@@ -200,7 +202,49 @@ impl ExtensionManifest {
         if let Some(control_surface) = &self.control_surface {
             control_surface.validate()?;
         }
+        if let Some(owner_release) = &self.owner_release {
+            owner_release.validate()?;
+        }
 
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestOwnerRelease {
+    #[serde(default = "default_owner_release_adapter")]
+    pub adapter: String,
+    #[serde(default = "default_owner_release_endpoint")]
+    pub endpoint: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl ManifestOwnerRelease {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.adapter, "owner_release.adapter")?;
+        if self.adapter != "generic_v1" {
+            bail!(
+                "unsupported owner_release.adapter '{}'; expected generic_v1",
+                self.adapter
+            );
+        }
+        ensure_non_empty(&self.endpoint, "owner_release.endpoint")?;
+        if !self.endpoint.starts_with('/') {
+            bail!("owner_release.endpoint must be an absolute runtime path");
+        }
+        if self.endpoint.contains('?') || self.endpoint.contains('#') {
+            bail!("owner_release.endpoint must not include query or fragment components");
+        }
+        for scope in &self.scopes {
+            match scope.as_str() {
+                "media_item" | "episode" => {}
+                other => bail!(
+                    "unsupported owner_release.scopes value '{}'; expected media_item|episode",
+                    other
+                ),
+            }
+        }
         Ok(())
     }
 }
@@ -1946,6 +1990,14 @@ fn default_control_action_kind() -> String {
     "secondary".to_string()
 }
 
+fn default_owner_release_adapter() -> String {
+    "generic_v1".to_string()
+}
+
+fn default_owner_release_endpoint() -> String {
+    "/owner-release".to_string()
+}
+
 fn default_runtime_egress_mode() -> String {
     "direct".to_string()
 }
@@ -2609,6 +2661,56 @@ control_surface:
         );
         assert_eq!(control_surface.entities.len(), 1);
         assert_eq!(control_surface.actions.len(), 2);
+    }
+
+    #[test]
+    fn manifest_accepts_owner_release_contract() {
+        let yaml = r#"
+id: elixir.modules.community.owner
+version: 1.0.0
+kind: module
+name: Community Owner
+provides:
+  - capability: media.manager.tv
+    slot: default
+    implementation: community-owner
+runtime:
+  type: container
+  image: example/community-owner:1
+owner_release:
+  adapter: generic_v1
+  endpoint: /owner-release
+  scopes: [media_item, episode]
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        let owner_release = parsed
+            .manifest
+            .owner_release
+            .expect("owner release contract should exist");
+        assert_eq!(owner_release.adapter, "generic_v1");
+        assert_eq!(owner_release.endpoint, "/owner-release");
+        assert_eq!(owner_release.scopes, vec!["media_item", "episode"]);
+    }
+
+    #[test]
+    fn manifest_rejects_relative_owner_release_endpoint() {
+        let yaml = r#"
+id: elixir.modules.community.owner
+version: 1.0.0
+kind: module
+name: Community Owner
+provides:
+  - capability: media.manager.tv
+    slot: default
+    implementation: community-owner
+runtime:
+  type: container
+  image: example/community-owner:1
+owner_release:
+  endpoint: owner-release
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("owner_release.endpoint"));
     }
 
     #[test]

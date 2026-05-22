@@ -334,8 +334,20 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/library/items", get(handlers::library::list_items))
         .route(
+            "/api/v1/library/owner-release/events",
+            get(handlers::library::list_owner_release_events),
+        )
+        .route(
+            "/api/v1/library/owner-release/reconcile",
+            post(handlers::library::reconcile_owner_release_state),
+        )
+        .route(
             "/api/v1/library/items/:id",
             get(handlers::library::detail).delete(handlers::library::delete_item),
+        )
+        .route(
+            "/api/v1/library/items/:id/owner-release/events",
+            get(handlers::library::list_item_owner_release_events),
         )
         .route(
             "/api/v1/library/items/:id/restore-blocked-episodes",

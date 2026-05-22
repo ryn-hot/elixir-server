@@ -39,6 +39,7 @@ use crate::{
         },
     },
     db::models::MediaType,
+    extensions::store::ExtensionStore,
     library::{
         AcquisitionLibraryImport, AcquisitionLibraryImportFile, AcquisitionLibraryImportFileResult,
         ingest_acquisition_library_import,
@@ -907,6 +908,14 @@ async fn finalize_import_run_inner(
 
     let request = build_library_import_request(&subscription, &candidate.release, library_files)?;
     let import_result = ingest_acquisition_library_import(pool, request).await?;
+    ExtensionStore::new(pool)
+        .upsert_acquisition_media_ownership(
+            import_result.media_item_id,
+            subscription.subscription_id,
+            candidate.release.source_provider_id,
+            Some(&candidate.release.source_extension_id),
+        )
+        .await?;
     let result_by_key = import_result
         .files
         .iter()
@@ -2708,6 +2717,7 @@ mod tests {
 
     struct ImportFixture {
         database: Database,
+        subscription_id: Uuid,
         target_id: Uuid,
         release_id: Uuid,
         job_id: Uuid,
@@ -2874,6 +2884,7 @@ mod tests {
 
         Ok(ImportFixture {
             database,
+            subscription_id: subscription.subscription_id,
             target_id: target.target_id,
             release_id: release.release_id,
             job_id: job.release_job_id,
@@ -3165,6 +3176,46 @@ mod tests {
             Some(fixture.local_path.as_str())
         );
         assert!(links[0].media_file_id.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_import_persists_media_ownership() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("Show.S01E01.mkv");
+        let fixture = setup_completed_release(
+            DEBRID_DEFAULT_LOGICAL_ID,
+            Some(path.to_string_lossy().to_string()),
+            ReleaseCoverageState::Submitted,
+            Some(true),
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&fixture.database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+
+        let row = sqlx::query(
+            "SELECT owner_type, owner_label, acquisition_subscription_id, release_capability, release_policy
+             FROM media_ownerships
+             WHERE active = 1
+             LIMIT 1",
+        )
+        .fetch_one(&fixture.database.pool)
+        .await?;
+        let owner_type: String = row.try_get("owner_type")?;
+        let owner_label: Option<String> = row.try_get("owner_label").ok();
+        let subscription_id: Option<String> = row.try_get("acquisition_subscription_id").ok();
+        let release_capability: String = row.try_get("release_capability")?;
+        let release_policy: String = row.try_get("release_policy")?;
+        assert_eq!(owner_type, "acquisition");
+        assert_eq!(owner_label.as_deref(), Some("Elixir acquisition"));
+        let expected_subscription_id = fixture.subscription_id.to_string();
+        assert_eq!(
+            subscription_id.as_deref(),
+            Some(expected_subscription_id.as_str())
+        );
+        assert_eq!(release_capability, "acquisition.stop_monitoring");
+        assert_eq!(release_policy, "supported");
         Ok(())
     }
 

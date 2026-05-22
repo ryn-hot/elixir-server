@@ -1260,6 +1260,8 @@ mod tests {
                         "config_dir": "/private/elixir/source"
                     },
                     "realDebridApiToken": "must-not-cross-boundary",
+                    "debrid.real_debrid.api_token": "must-not-cross-boundary",
+                    "debrid.torbox.api_token": "must-not-cross-boundary",
                     "api_key": "must-not-cross-boundary"
                 })),
                 enabled: true,
@@ -1334,6 +1336,16 @@ mod tests {
         assert!(
             payload
                 .pointer("/provider/config/realDebridApiToken")
+                .is_none()
+        );
+        assert!(
+            payload
+                .pointer("/provider/config/debrid.real_debrid.api_token")
+                .is_none()
+        );
+        assert!(
+            payload
+                .pointer("/provider/config/debrid.torbox.api_token")
                 .is_none()
         );
         assert!(payload.pointer("/provider/config/api_key").is_none());

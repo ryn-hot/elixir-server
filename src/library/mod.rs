@@ -4019,21 +4019,30 @@ async fn upsert_legacy_media_item(
         .bind(id.to_string())
         .execute(pool)
         .await?;
-        return Ok(());
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, runtime_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(id.to_string())
+        .bind(identity.r#type.as_str())
+        .bind(external_ids_json)
+        .bind(&identity.title)
+        .bind(identity.year)
+        .bind(meta.and_then(|m| serde_json::to_string(&m.metadata_json).ok()))
+        .bind(meta.and_then(|m| m.runtime_seconds))
+        .execute(pool)
+        .await?;
     }
 
-    sqlx::query::<sqlx::Any>(
-        "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, runtime_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-    )
-    .bind(id.to_string())
-    .bind(identity.r#type.as_str())
-    .bind(external_ids_json)
-    .bind(&identity.title)
-    .bind(identity.year)
-    .bind(meta.and_then(|m| serde_json::to_string(&m.metadata_json).ok()))
-    .bind(meta.and_then(|m| m.runtime_seconds))
-    .execute(pool)
-    .await?;
+    ExtensionStore::new(pool)
+        .upsert_external_media_ownership_if_missing(
+            id,
+            identity.r#type,
+            &identity.title,
+            identity.year,
+            Some(merged_ids),
+        )
+        .await?;
     Ok(())
 }
 
@@ -6494,6 +6503,19 @@ mod tests {
             .await?;
         assert_eq!(link_count, 1);
 
+        let owner = sqlx::query(
+            "SELECT owner_type, owner_label, release_capability, release_policy
+             FROM media_ownerships
+             LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(owner.get::<String, _>("owner_type"), "external");
+        let owner_label: Option<String> = owner.try_get("owner_label").ok();
+        assert_eq!(owner_label.as_deref(), Some("External import"));
+        assert_eq!(owner.get::<String, _>("release_capability"), "none");
+        assert_eq!(owner.get::<String, _>("release_policy"), "unsupported");
+
         let (count_ok,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE scan_state = 'ok'")
                 .fetch_one(&database.pool)
@@ -6865,6 +6887,30 @@ mod tests {
         assert_eq!(stored_provider_id, provider_id.to_string());
         assert_eq!(stored_manager_item_id.as_deref(), Some("movie-123"));
         assert_eq!(stored_implementation.as_deref(), Some("radarr"));
+
+        let owner = sqlx::query(
+            "SELECT owner_type, owner_label, owner_provider_id, owner_external_id, release_capability, release_policy
+             FROM media_ownerships
+             LIMIT 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(owner.get::<String, _>("owner_type"), "extension");
+        let owner_label: Option<String> = owner.try_get("owner_label").ok();
+        assert_eq!(owner_label.as_deref(), Some("default (radarr)"));
+        let expected_provider_id = provider_id.to_string();
+        let owner_provider_id: Option<String> = owner.try_get("owner_provider_id").ok();
+        assert_eq!(
+            owner_provider_id.as_deref(),
+            Some(expected_provider_id.as_str())
+        );
+        let owner_external_id: Option<String> = owner.try_get("owner_external_id").ok();
+        assert_eq!(owner_external_id.as_deref(), Some("movie-123"));
+        assert_eq!(
+            owner.get::<String, _>("release_capability"),
+            "manager.remove_item"
+        );
+        assert_eq!(owner.get::<String, _>("release_policy"), "supported");
 
         Ok(())
     }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{AnyPool, QueryBuilder, Row, TypeInfo, Value, ValueRef, any::AnyRow};
 use std::time::Duration;
 use uuid::Uuid;
@@ -204,6 +205,90 @@ pub struct ManagedLibraryProvenance {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewMediaOwnership {
+    pub ownership_id: Uuid,
+    pub media_item_id: Uuid,
+    pub owner_type: String,
+    pub owner_role: String,
+    pub owner_label: Option<String>,
+    pub owner_implementation: Option<String>,
+    pub owner_provider_id: Option<Uuid>,
+    pub owner_instance_id: Option<Uuid>,
+    pub owner_extension_id: Option<String>,
+    pub owner_external_id: Option<String>,
+    pub acquisition_subscription_id: Option<Uuid>,
+    pub acquisition_target_scope: Option<serde_json::Value>,
+    pub release_capability: String,
+    pub release_policy: String,
+    pub metadata: Option<serde_json::Value>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaOwnership {
+    pub ownership_id: Uuid,
+    pub media_item_id: Uuid,
+    pub owner_type: String,
+    pub owner_role: String,
+    pub owner_label: Option<String>,
+    pub owner_implementation: Option<String>,
+    pub owner_provider_id: Option<Uuid>,
+    pub owner_instance_id: Option<Uuid>,
+    pub owner_extension_id: Option<String>,
+    pub owner_external_id: Option<String>,
+    pub acquisition_subscription_id: Option<Uuid>,
+    pub acquisition_target_scope: Option<serde_json::Value>,
+    pub release_capability: String,
+    pub release_policy: String,
+    pub metadata: Option<serde_json::Value>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewMediaOwnerReleaseEvent {
+    pub release_event_id: Uuid,
+    pub media_item_id: Option<Uuid>,
+    pub ownership_id: Option<Uuid>,
+    pub requested_action: String,
+    pub owner_type: String,
+    pub owner_label: Option<String>,
+    pub owner_provider_id: Option<Uuid>,
+    pub acquisition_subscription_id: Option<Uuid>,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub request: Option<serde_json::Value>,
+    pub response: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaOwnerReleaseEvent {
+    pub release_event_id: Uuid,
+    pub media_item_id: Option<Uuid>,
+    pub ownership_id: Option<Uuid>,
+    pub requested_action: String,
+    pub owner_type: String,
+    pub owner_label: Option<String>,
+    pub owner_provider_id: Option<Uuid>,
+    pub acquisition_subscription_id: Option<Uuid>,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub request: Option<serde_json::Value>,
+    pub response: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaOwnershipReconcileReport {
+    pub external_owners_created: usize,
+    pub stale_owners_marked_unsupported: usize,
+    pub unsupported_events_created: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewManagedMediaTombstone {
     pub media_type: crate::db::models::MediaType,
     pub title: String,
@@ -311,6 +396,28 @@ pub struct NewRuntimeLog {
     pub log_id: Uuid,
     pub instance_id: Uuid,
     pub log_uri: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderOwnershipContext {
+    instance_id: Option<Uuid>,
+    implementation: Option<String>,
+    extension_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AcquisitionOwnershipContext {
+    subscription_id: Uuid,
+    source_provider_id: Option<Uuid>,
+    source_extension_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MediaItemOwnershipIdentity {
+    media_type: crate::db::models::MediaType,
+    title: String,
+    year: Option<i32>,
+    external_ids: Option<ExternalIds>,
 }
 
 pub struct ExtensionStore<'a> {
@@ -1320,6 +1427,8 @@ impl<'a> ExtensionStore<'a> {
         .bind(data.intent_id.map(|value| value.to_string()))
         .execute(self.pool)
         .await?;
+        self.upsert_extension_media_ownership_for_managed(data)
+            .await?;
         Ok(())
     }
 
@@ -1351,6 +1460,729 @@ impl<'a> ExtensionStore<'a> {
         .await?;
         row.map(|row| map_managed_library_provenance(&row))
             .transpose()
+    }
+
+    pub async fn upsert_media_ownership(&self, data: &NewMediaOwnership) -> Result<()> {
+        let acquisition_target_scope_json = json_to_string(data.acquisition_target_scope.as_ref())?;
+        let metadata_json = json_to_string(data.metadata.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO media_ownerships (
+                ownership_id,
+                media_item_id,
+                owner_type,
+                owner_role,
+                owner_label,
+                owner_implementation,
+                owner_provider_id,
+                owner_instance_id,
+                owner_extension_id,
+                owner_external_id,
+                acquisition_subscription_id,
+                acquisition_target_scope_json,
+                release_capability,
+                release_policy,
+                metadata_json,
+                active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ownership_id) DO UPDATE SET
+                media_item_id = excluded.media_item_id,
+                owner_type = excluded.owner_type,
+                owner_role = excluded.owner_role,
+                owner_label = excluded.owner_label,
+                owner_implementation = excluded.owner_implementation,
+                owner_provider_id = excluded.owner_provider_id,
+                owner_instance_id = excluded.owner_instance_id,
+                owner_extension_id = excluded.owner_extension_id,
+                owner_external_id = excluded.owner_external_id,
+                acquisition_subscription_id = excluded.acquisition_subscription_id,
+                acquisition_target_scope_json = excluded.acquisition_target_scope_json,
+                release_capability = excluded.release_capability,
+                release_policy = excluded.release_policy,
+                metadata_json = excluded.metadata_json,
+                active = excluded.active,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.ownership_id.to_string())
+        .bind(data.media_item_id.to_string())
+        .bind(&data.owner_type)
+        .bind(&data.owner_role)
+        .bind(data.owner_label.as_deref())
+        .bind(data.owner_implementation.as_deref())
+        .bind(data.owner_provider_id.map(|value| value.to_string()))
+        .bind(data.owner_instance_id.map(|value| value.to_string()))
+        .bind(data.owner_extension_id.as_deref())
+        .bind(data.owner_external_id.as_deref())
+        .bind(
+            data.acquisition_subscription_id
+                .map(|value| value.to_string()),
+        )
+        .bind(acquisition_target_scope_json.as_deref())
+        .bind(&data.release_capability)
+        .bind(&data.release_policy)
+        .bind(metadata_json.as_deref())
+        .bind(data.active)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_external_media_ownership_if_missing(
+        &self,
+        media_item_id: Uuid,
+        media_type: crate::db::models::MediaType,
+        title: &str,
+        year: Option<i32>,
+        external_ids: Option<&ExternalIds>,
+    ) -> Result<()> {
+        let has_owner = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*)
+             FROM media_ownerships
+             WHERE media_item_id = ?
+               AND owner_role = 'primary'
+               AND active = 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_one(self.pool)
+        .await?
+            > 0;
+        if has_owner {
+            return Ok(());
+        }
+        self.upsert_media_ownership(&NewMediaOwnership {
+            ownership_id: media_item_id,
+            media_item_id,
+            owner_type: "external".to_string(),
+            owner_role: "primary".to_string(),
+            owner_label: Some("External import".to_string()),
+            owner_implementation: None,
+            owner_provider_id: None,
+            owner_instance_id: None,
+            owner_extension_id: None,
+            owner_external_id: None,
+            acquisition_subscription_id: None,
+            acquisition_target_scope: None,
+            release_capability: "none".to_string(),
+            release_policy: "unsupported".to_string(),
+            metadata: Some(media_ownership_identity_metadata(
+                media_type,
+                title,
+                year,
+                external_ids,
+            )),
+            active: true,
+        })
+        .await
+    }
+
+    pub async fn upsert_acquisition_media_ownership(
+        &self,
+        media_item_id: Uuid,
+        subscription_id: Uuid,
+        source_provider_id: Option<Uuid>,
+        source_extension_id: Option<&str>,
+    ) -> Result<()> {
+        let provider_context = match source_provider_id {
+            Some(provider_id) => self.provider_ownership_context(provider_id).await?,
+            None => None,
+        };
+        let owner_extension_id = provider_context
+            .as_ref()
+            .and_then(|context| context.extension_id.clone());
+        let owner_instance_id = provider_context
+            .as_ref()
+            .and_then(|context| context.instance_id);
+        let implementation = source_extension_id.map(str::to_string).or_else(|| {
+            provider_context
+                .as_ref()
+                .and_then(|context| context.implementation.clone())
+        });
+        self.upsert_media_ownership(&NewMediaOwnership {
+            ownership_id: media_item_id,
+            media_item_id,
+            owner_type: "acquisition".to_string(),
+            owner_role: "primary".to_string(),
+            owner_label: Some("Elixir acquisition".to_string()),
+            owner_implementation: implementation,
+            owner_provider_id: source_provider_id,
+            owner_instance_id,
+            owner_extension_id,
+            owner_external_id: Some(subscription_id.to_string()),
+            acquisition_subscription_id: Some(subscription_id),
+            acquisition_target_scope: None,
+            release_capability: "acquisition.stop_monitoring".to_string(),
+            release_policy: "supported".to_string(),
+            metadata: Some(json!({
+                "subscriptionId": subscription_id,
+                "source": "acquisition_import",
+            })),
+            active: true,
+        })
+        .await
+    }
+
+    pub async fn list_active_media_ownerships(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Vec<MediaOwnership>> {
+        let rows = sqlx::query(
+            "SELECT
+                ownership_id,
+                media_item_id,
+                owner_type,
+                owner_role,
+                CAST(owner_label AS TEXT) AS owner_label,
+                CAST(owner_implementation AS TEXT) AS owner_implementation,
+                CAST(owner_provider_id AS TEXT) AS owner_provider_id,
+                CAST(owner_instance_id AS TEXT) AS owner_instance_id,
+                CAST(owner_extension_id AS TEXT) AS owner_extension_id,
+                CAST(owner_external_id AS TEXT) AS owner_external_id,
+                CAST(acquisition_subscription_id AS TEXT) AS acquisition_subscription_id,
+                CAST(acquisition_target_scope_json AS TEXT) AS acquisition_target_scope_json,
+                release_capability,
+                release_policy,
+                CAST(metadata_json AS TEXT) AS metadata_json,
+                CAST(active AS INTEGER) AS active,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM media_ownerships
+             WHERE media_item_id = ?
+               AND active = 1
+             ORDER BY CASE owner_role WHEN 'primary' THEN 0 ELSE 1 END, created_at ASC",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_all(self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| map_media_ownership(&row))
+            .collect()
+    }
+
+    pub async fn ensure_media_ownerships_for_item(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Vec<MediaOwnership>> {
+        let existing = self.list_active_media_ownerships(media_item_id).await?;
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+
+        if let Some(provenance) = self.get_managed_library_provenance(media_item_id).await? {
+            self.upsert_extension_media_ownership_for_managed(&NewManagedLibraryProvenance {
+                media_item_id: provenance.media_item_id,
+                media_type: provenance.media_type,
+                title: provenance.title,
+                normalized_title: provenance.normalized_title,
+                year: provenance.year,
+                external_ids: provenance.external_ids,
+                manager_provider_id: provenance.manager_provider_id,
+                manager_item_id: provenance.manager_item_id,
+                manager_label: provenance.manager_label,
+                manager_implementation: provenance.manager_implementation,
+                intent_id: provenance.intent_id,
+            })
+            .await?;
+            return self.list_active_media_ownerships(media_item_id).await;
+        }
+
+        if let Some(acquisition) = self.acquisition_ownership_context(media_item_id).await? {
+            self.upsert_acquisition_media_ownership(
+                media_item_id,
+                acquisition.subscription_id,
+                acquisition.source_provider_id,
+                acquisition.source_extension_id.as_deref(),
+            )
+            .await?;
+            return self.list_active_media_ownerships(media_item_id).await;
+        }
+
+        if let Some(identity) = self.media_item_identity(media_item_id).await? {
+            self.upsert_external_media_ownership_if_missing(
+                media_item_id,
+                identity.media_type,
+                &identity.title,
+                identity.year,
+                identity.external_ids.as_ref(),
+            )
+            .await?;
+        }
+
+        self.list_active_media_ownerships(media_item_id).await
+    }
+
+    pub async fn create_media_owner_release_event(
+        &self,
+        data: &NewMediaOwnerReleaseEvent,
+    ) -> Result<()> {
+        let request_json = json_to_string(data.request.as_ref())?;
+        let response_json = json_to_string(data.response.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO media_owner_release_events (
+                release_event_id,
+                media_item_id,
+                ownership_id,
+                requested_action,
+                owner_type,
+                owner_label,
+                owner_provider_id,
+                acquisition_subscription_id,
+                status,
+                status_reason,
+                request_json,
+                response_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(data.release_event_id.to_string())
+        .bind(data.media_item_id.map(|value| value.to_string()))
+        .bind(data.ownership_id.map(|value| value.to_string()))
+        .bind(&data.requested_action)
+        .bind(&data.owner_type)
+        .bind(data.owner_label.as_deref())
+        .bind(data.owner_provider_id.map(|value| value.to_string()))
+        .bind(
+            data.acquisition_subscription_id
+                .map(|value| value.to_string()),
+        )
+        .bind(&data.status)
+        .bind(data.status_reason.as_deref())
+        .bind(request_json.as_deref())
+        .bind(response_json.as_deref())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_media_owner_release_event_status(
+        &self,
+        release_event_id: Uuid,
+        status: &str,
+        status_reason: Option<&str>,
+        response: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let response_json = json_to_string(response)?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE media_owner_release_events
+             SET status = ?,
+                 status_reason = ?,
+                 response_json = COALESCE(?, response_json),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_event_id = ?",
+        )
+        .bind(status)
+        .bind(status_reason)
+        .bind(response_json.as_deref())
+        .bind(release_event_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_media_owner_release_events_for_item(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Vec<MediaOwnerReleaseEvent>> {
+        let rows = sqlx::query(
+            "SELECT
+                release_event_id,
+                CAST(media_item_id AS TEXT) AS media_item_id,
+                CAST(ownership_id AS TEXT) AS ownership_id,
+                requested_action,
+                owner_type,
+                CAST(owner_label AS TEXT) AS owner_label,
+                CAST(owner_provider_id AS TEXT) AS owner_provider_id,
+                CAST(acquisition_subscription_id AS TEXT) AS acquisition_subscription_id,
+                status,
+                CAST(status_reason AS TEXT) AS status_reason,
+                CAST(request_json AS TEXT) AS request_json,
+                CAST(response_json AS TEXT) AS response_json,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM media_owner_release_events
+             WHERE media_item_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_all(self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| map_media_owner_release_event(&row))
+            .collect()
+    }
+
+    pub async fn list_media_owner_release_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<MediaOwnerReleaseEvent>> {
+        let rows = sqlx::query(
+            "SELECT
+                release_event_id,
+                CAST(media_item_id AS TEXT) AS media_item_id,
+                CAST(ownership_id AS TEXT) AS ownership_id,
+                requested_action,
+                owner_type,
+                CAST(owner_label AS TEXT) AS owner_label,
+                CAST(owner_provider_id AS TEXT) AS owner_provider_id,
+                CAST(acquisition_subscription_id AS TEXT) AS acquisition_subscription_id,
+                status,
+                CAST(status_reason AS TEXT) AS status_reason,
+                CAST(request_json AS TEXT) AS request_json,
+                CAST(response_json AS TEXT) AS response_json,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM media_owner_release_events
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| map_media_owner_release_event(&row))
+            .collect()
+    }
+
+    pub async fn latest_media_owner_release_event(
+        &self,
+        media_item_id: Uuid,
+        ownership_id: Uuid,
+        requested_action: &str,
+    ) -> Result<Option<MediaOwnerReleaseEvent>> {
+        let row = sqlx::query(
+            "SELECT
+                release_event_id,
+                CAST(media_item_id AS TEXT) AS media_item_id,
+                CAST(ownership_id AS TEXT) AS ownership_id,
+                requested_action,
+                owner_type,
+                CAST(owner_label AS TEXT) AS owner_label,
+                CAST(owner_provider_id AS TEXT) AS owner_provider_id,
+                CAST(acquisition_subscription_id AS TEXT) AS acquisition_subscription_id,
+                status,
+                CAST(status_reason AS TEXT) AS status_reason,
+                CAST(request_json AS TEXT) AS request_json,
+                CAST(response_json AS TEXT) AS response_json,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM media_owner_release_events
+             WHERE media_item_id = ?
+               AND ownership_id = ?
+               AND requested_action = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .bind(ownership_id.to_string())
+        .bind(requested_action)
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| map_media_owner_release_event(&row))
+            .transpose()
+    }
+
+    pub async fn reconcile_media_ownerships(&self) -> Result<MediaOwnershipReconcileReport> {
+        let missing_owner_rows = sqlx::query(
+            "SELECT id
+             FROM media_items mi
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM media_ownerships mo
+                 WHERE mo.media_item_id = mi.id
+                   AND mo.owner_role = 'primary'
+                   AND mo.active = 1
+             )
+             ORDER BY id",
+        )
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut report = MediaOwnershipReconcileReport::default();
+        for row in missing_owner_rows {
+            let media_item_id_raw: String = row.try_get("id")?;
+            let media_item_id = parse_uuid(&media_item_id_raw, "media_items.id")?;
+            if let Some(identity) = self.media_item_identity(media_item_id).await? {
+                self.upsert_external_media_ownership_if_missing(
+                    media_item_id,
+                    identity.media_type,
+                    &identity.title,
+                    identity.year,
+                    identity.external_ids.as_ref(),
+                )
+                .await?;
+                report.external_owners_created += 1;
+            }
+        }
+
+        let stale_owners = self.list_stale_releasable_extension_owners().await?;
+        for owner in stale_owners {
+            let request_json = json!({
+                "action": "reconcile_owner",
+                "mediaItemId": owner.media_item_id,
+                "ownershipId": owner.ownership_id,
+                "ownerType": owner.owner_type.clone(),
+                "previousReleaseCapability": owner.release_capability.clone(),
+                "previousReleasePolicy": owner.release_policy.clone(),
+            });
+            let response_json = json!({
+                "releaseCapability": "none",
+                "releasePolicy": "unsupported",
+            });
+            sqlx::query::<sqlx::Any>(
+                "UPDATE media_ownerships
+                 SET release_capability = 'none',
+                     release_policy = 'unsupported',
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE ownership_id = ?
+                   AND active = 1",
+            )
+            .bind(owner.ownership_id.to_string())
+            .execute(self.pool)
+            .await?;
+            report.stale_owners_marked_unsupported += 1;
+
+            self.create_media_owner_release_event(&NewMediaOwnerReleaseEvent {
+                release_event_id: Uuid::new_v4(),
+                media_item_id: Some(owner.media_item_id),
+                ownership_id: Some(owner.ownership_id),
+                requested_action: "reconcile_owner".to_string(),
+                owner_type: owner.owner_type.clone(),
+                owner_label: owner.owner_label.clone(),
+                owner_provider_id: owner.owner_provider_id,
+                acquisition_subscription_id: owner.acquisition_subscription_id,
+                status: "unsupported".to_string(),
+                status_reason: Some(
+                    "Owner provider or instance is no longer available; release is unsupported until ownership is repaired."
+                        .to_string(),
+                ),
+                request: Some(request_json),
+                response: Some(response_json),
+            })
+            .await?;
+            report.unsupported_events_created += 1;
+        }
+
+        Ok(report)
+    }
+
+    async fn list_stale_releasable_extension_owners(&self) -> Result<Vec<MediaOwnership>> {
+        let rows = sqlx::query(
+            "SELECT
+                mo.ownership_id,
+                mo.media_item_id,
+                mo.owner_type,
+                mo.owner_role,
+                CAST(mo.owner_label AS TEXT) AS owner_label,
+                CAST(mo.owner_implementation AS TEXT) AS owner_implementation,
+                CAST(mo.owner_provider_id AS TEXT) AS owner_provider_id,
+                CAST(mo.owner_instance_id AS TEXT) AS owner_instance_id,
+                CAST(mo.owner_extension_id AS TEXT) AS owner_extension_id,
+                CAST(mo.owner_external_id AS TEXT) AS owner_external_id,
+                CAST(mo.acquisition_subscription_id AS TEXT) AS acquisition_subscription_id,
+                CAST(mo.acquisition_target_scope_json AS TEXT) AS acquisition_target_scope_json,
+                mo.release_capability,
+                mo.release_policy,
+                CAST(mo.metadata_json AS TEXT) AS metadata_json,
+                CAST(mo.active AS INTEGER) AS active,
+                CAST(mo.created_at AS TEXT) AS created_at,
+                CAST(mo.updated_at AS TEXT) AS updated_at
+             FROM media_ownerships mo
+             WHERE mo.active = 1
+               AND mo.owner_type = 'extension'
+               AND mo.release_capability <> 'none'
+               AND (
+                   mo.owner_provider_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM providers p
+                       WHERE p.provider_id = mo.owner_provider_id
+                   )
+                   OR (
+                       mo.owner_instance_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM extension_instances ei
+                           WHERE ei.instance_id = mo.owner_instance_id
+                       )
+                   )
+               )
+             ORDER BY mo.updated_at ASC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| map_media_ownership(&row))
+            .collect()
+    }
+
+    async fn upsert_extension_media_ownership_for_managed(
+        &self,
+        data: &NewManagedLibraryProvenance,
+    ) -> Result<()> {
+        let provider_context = self
+            .provider_ownership_context(data.manager_provider_id)
+            .await?;
+        let provider_implementation = provider_context
+            .as_ref()
+            .and_then(|context| context.implementation.clone());
+        let implementation = data
+            .manager_implementation
+            .clone()
+            .or(provider_implementation);
+        let release_supported = implementation
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "sonarr" | "radarr"
+                )
+            })
+            .unwrap_or(false);
+        let owner_label = data
+            .manager_label
+            .clone()
+            .or_else(|| implementation.clone())
+            .unwrap_or_else(|| "Managed extension".to_string());
+        self.upsert_media_ownership(&NewMediaOwnership {
+            ownership_id: data.media_item_id,
+            media_item_id: data.media_item_id,
+            owner_type: "extension".to_string(),
+            owner_role: "primary".to_string(),
+            owner_label: Some(owner_label),
+            owner_implementation: implementation,
+            owner_provider_id: Some(data.manager_provider_id),
+            owner_instance_id: provider_context
+                .as_ref()
+                .and_then(|context| context.instance_id),
+            owner_extension_id: provider_context
+                .as_ref()
+                .and_then(|context| context.extension_id.clone()),
+            owner_external_id: data.manager_item_id.clone(),
+            acquisition_subscription_id: None,
+            acquisition_target_scope: None,
+            release_capability: if release_supported {
+                "manager.remove_item".to_string()
+            } else {
+                "none".to_string()
+            },
+            release_policy: if release_supported {
+                "supported".to_string()
+            } else {
+                "unsupported".to_string()
+            },
+            metadata: Some(media_ownership_identity_metadata(
+                data.media_type,
+                &data.title,
+                data.year,
+                data.external_ids.as_ref(),
+            )),
+            active: true,
+        })
+        .await
+    }
+
+    async fn provider_ownership_context(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<Option<ProviderOwnershipContext>> {
+        let row = sqlx::query(
+            "SELECT
+                CAST(p.instance_id AS TEXT) AS instance_id,
+                CAST(p.implementation AS TEXT) AS implementation,
+                CAST(ei.extension_id AS TEXT) AS extension_id
+             FROM providers p
+             LEFT JOIN extension_instances ei ON ei.instance_id = p.instance_id
+             WHERE p.provider_id = ?
+             LIMIT 1",
+        )
+        .bind(provider_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| {
+            let instance_id = row_get_opt_string(&row, "instance_id")?
+                .as_deref()
+                .map(|value| parse_uuid(value, "providers.instance_id"))
+                .transpose()?;
+            Ok(ProviderOwnershipContext {
+                instance_id,
+                implementation: row_get_opt_string(&row, "implementation")?,
+                extension_id: row_get_opt_string(&row, "extension_id")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn acquisition_ownership_context(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Option<AcquisitionOwnershipContext>> {
+        let row = sqlx::query(
+            "SELECT
+                CAST(r.subscription_id AS TEXT) AS subscription_id,
+                CAST(r.source_provider_id AS TEXT) AS source_provider_id,
+                CAST(r.source_extension_id AS TEXT) AS source_extension_id
+             FROM acquisition_import_file_links ail
+             JOIN acquisition_releases r ON r.release_id = ail.release_id
+             LEFT JOIN media_files mf ON mf.id = ail.media_file_id
+             LEFT JOIN episodes e ON e.id = ail.episode_id
+             WHERE ail.state = 'imported'
+               AND r.subscription_id IS NOT NULL
+               AND COALESCE(mf.media_item_id, ail.movie_id, e.series_id) = ?
+             ORDER BY ail.updated_at DESC
+             LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| {
+            let subscription_id_raw = row_get_opt_string(&row, "subscription_id")?
+                .ok_or_else(|| anyhow::anyhow!("acquisition ownership row missing subscription"))?;
+            Ok(AcquisitionOwnershipContext {
+                subscription_id: parse_uuid(
+                    &subscription_id_raw,
+                    "acquisition_releases.subscription_id",
+                )?,
+                source_provider_id: row_get_opt_string(&row, "source_provider_id")?
+                    .as_deref()
+                    .map(|value| parse_uuid(value, "acquisition_releases.source_provider_id"))
+                    .transpose()?,
+                source_extension_id: row_get_opt_string(&row, "source_extension_id")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn media_item_identity(
+        &self,
+        media_item_id: Uuid,
+    ) -> Result<Option<MediaItemOwnershipIdentity>> {
+        let row = sqlx::query(
+            "SELECT
+                type,
+                title,
+                year,
+                CAST(external_ids AS TEXT) AS external_ids
+             FROM media_items
+             WHERE id = ?
+             LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| {
+            let media_type_raw: String = row.try_get("type")?;
+            let external_ids = parse_json_opt(
+                row_get_opt_string(&row, "external_ids")?,
+                "media_items.external_ids",
+            )?
+            .map(serde_json::from_value::<ExternalIds>)
+            .transpose()
+            .context("parsing media item external ids")?;
+            Ok(MediaItemOwnershipIdentity {
+                media_type: parse_media_type(&media_type_raw, "media_items.type")?,
+                title: row.try_get("title")?,
+                year: row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+                external_ids,
+            })
+        })
+        .transpose()
     }
 
     pub async fn upsert_managed_media_tombstone(
@@ -2237,6 +3069,20 @@ fn json_to_string(value: Option<&serde_json::Value>) -> Result<Option<String>> {
     }
 }
 
+fn media_ownership_identity_metadata(
+    media_type: crate::db::models::MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids: Option<&ExternalIds>,
+) -> serde_json::Value {
+    json!({
+        "mediaType": media_type.as_str(),
+        "title": title,
+        "year": year,
+        "externalIds": external_ids,
+    })
+}
+
 fn map_extension(row: &AnyRow) -> Result<Extension> {
     let extension_id: String = row.try_get("extension_id")?;
     let name: String = row.try_get("name")?;
@@ -2582,6 +3428,105 @@ fn map_managed_library_provenance(row: &AnyRow) -> Result<ManagedLibraryProvenan
             .transpose()?,
         created_at: parse_datetime(&created_at_raw, "managed_library_provenance.created_at")?,
         updated_at: parse_datetime(&updated_at_raw, "managed_library_provenance.updated_at")?,
+    })
+}
+
+fn map_media_ownership(row: &AnyRow) -> Result<MediaOwnership> {
+    let ownership_id_raw: String = row.try_get("ownership_id")?;
+    let media_item_id_raw: String = row.try_get("media_item_id")?;
+    let owner_provider_id_raw = row_get_opt_string(row, "owner_provider_id")?;
+    let owner_instance_id_raw = row_get_opt_string(row, "owner_instance_id")?;
+    let acquisition_subscription_id_raw = row_get_opt_string(row, "acquisition_subscription_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(MediaOwnership {
+        ownership_id: parse_uuid(&ownership_id_raw, "media_ownerships.ownership_id")?,
+        media_item_id: parse_uuid(&media_item_id_raw, "media_ownerships.media_item_id")?,
+        owner_type: row.try_get("owner_type")?,
+        owner_role: row.try_get("owner_role")?,
+        owner_label: row_get_opt_string(row, "owner_label")?,
+        owner_implementation: row_get_opt_string(row, "owner_implementation")?,
+        owner_provider_id: owner_provider_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_ownerships.owner_provider_id"))
+            .transpose()?,
+        owner_instance_id: owner_instance_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_ownerships.owner_instance_id"))
+            .transpose()?,
+        owner_extension_id: row_get_opt_string(row, "owner_extension_id")?,
+        owner_external_id: row_get_opt_string(row, "owner_external_id")?,
+        acquisition_subscription_id: acquisition_subscription_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_ownerships.acquisition_subscription_id"))
+            .transpose()?,
+        acquisition_target_scope: parse_json_opt(
+            row_get_opt_string(row, "acquisition_target_scope_json")?,
+            "media_ownerships.acquisition_target_scope_json",
+        )?,
+        release_capability: row.try_get("release_capability")?,
+        release_policy: row.try_get("release_policy")?,
+        metadata: parse_json_opt(
+            row_get_opt_string(row, "metadata_json")?,
+            "media_ownerships.metadata_json",
+        )?,
+        active: row_get_bool(row, "active")?,
+        created_at: parse_datetime(&created_at_raw, "media_ownerships.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "media_ownerships.updated_at")?,
+    })
+}
+
+fn map_media_owner_release_event(row: &AnyRow) -> Result<MediaOwnerReleaseEvent> {
+    let release_event_id_raw: String = row.try_get("release_event_id")?;
+    let media_item_id_raw = row_get_opt_string(row, "media_item_id")?;
+    let ownership_id_raw = row_get_opt_string(row, "ownership_id")?;
+    let owner_provider_id_raw = row_get_opt_string(row, "owner_provider_id")?;
+    let acquisition_subscription_id_raw = row_get_opt_string(row, "acquisition_subscription_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+
+    Ok(MediaOwnerReleaseEvent {
+        release_event_id: parse_uuid(
+            &release_event_id_raw,
+            "media_owner_release_events.release_event_id",
+        )?,
+        media_item_id: media_item_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_owner_release_events.media_item_id"))
+            .transpose()?,
+        ownership_id: ownership_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_owner_release_events.ownership_id"))
+            .transpose()?,
+        requested_action: row.try_get("requested_action")?,
+        owner_type: row.try_get("owner_type")?,
+        owner_label: row_get_opt_string(row, "owner_label")?,
+        owner_provider_id: owner_provider_id_raw
+            .as_deref()
+            .map(|value| parse_uuid(value, "media_owner_release_events.owner_provider_id"))
+            .transpose()?,
+        acquisition_subscription_id: acquisition_subscription_id_raw
+            .as_deref()
+            .map(|value| {
+                parse_uuid(
+                    value,
+                    "media_owner_release_events.acquisition_subscription_id",
+                )
+            })
+            .transpose()?,
+        status: row.try_get("status")?,
+        status_reason: row_get_opt_string(row, "status_reason")?,
+        request: parse_json_opt(
+            row_get_opt_string(row, "request_json")?,
+            "media_owner_release_events.request_json",
+        )?,
+        response: parse_json_opt(
+            row_get_opt_string(row, "response_json")?,
+            "media_owner_release_events.response_json",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "media_owner_release_events.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "media_owner_release_events.updated_at")?,
     })
 }
 

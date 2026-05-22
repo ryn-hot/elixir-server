@@ -22,6 +22,7 @@ use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -51,7 +52,7 @@ use crate::{
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedLibraryProvenance,
-        NewManagedMediaTombstone, NewOrchestratorRun, NewProvider, NewSecret,
+        NewManagedMediaTombstone, NewMediaOwnership, NewOrchestratorRun, NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
@@ -8273,6 +8274,29 @@ async fn library_items_include_managed_card_lifecycle() -> Result<()> {
         lifecycle.get("managerLabel").and_then(Value::as_str),
         Some("Sonarr")
     );
+    let primary_owner = lifecycle
+        .get("primaryOwner")
+        .context("library item primary owner")?;
+    assert_eq!(
+        primary_owner.get("ownerType").and_then(Value::as_str),
+        Some("extension")
+    );
+    assert_eq!(
+        primary_owner
+            .get("ownerImplementation")
+            .and_then(Value::as_str),
+        Some("sonarr")
+    );
+    assert_eq!(
+        primary_owner.get("ownerExternalId").and_then(Value::as_str),
+        Some("42")
+    );
+    assert_eq!(
+        primary_owner
+            .get("releaseCapability")
+            .and_then(Value::as_str),
+        Some("manager.remove_item")
+    );
 
     Ok(())
 }
@@ -12210,6 +12234,20 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
         .await?;
     let _ = shutdown_tx.send(());
     assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        payload
+            .pointer("/ownerRelease/releasedCount")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/ownerRelease/owners/0/status")
+            .and_then(Value::as_str),
+        Some("succeeded")
+    );
 
     assert!(!media_path.exists(), "expected media file to be removed");
     assert!(
@@ -12249,6 +12287,510 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
         &["42".to_string()],
     );
 
+    let row = sqlx::query(
+        "SELECT owner_type, status, CAST(status_reason AS TEXT) AS status_reason
+         FROM media_owner_release_events
+         LIMIT 1",
+    )
+    .fetch_one(&db_pool)
+    .await?;
+    let owner_type: String = row.try_get("owner_type")?;
+    let status: String = row.try_get("status")?;
+    let status_reason: Option<String> = row.try_get("status_reason").ok();
+    assert_eq!(owner_type, "extension");
+    assert_eq!(status, "succeeded");
+    assert!(
+        status_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Sonarr removed")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let movie_id = Uuid::new_v4();
+    let subscription_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+    )
+    .bind(movie_id.to_string())
+    .bind(serde_json::to_string(&json!({ "tmdb": "999001" }))?)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
+         VALUES (?, 'Fixture Movie', 2026, '999001', NULL)",
+    )
+    .bind(movie_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id, media_type, title, normalized_title, year,
+            monitor_policy, route_policy, status, active
+         ) VALUES (?, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
+            'all_missing', 'debrid_first', 'active', 1)",
+    )
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO acquisition_targets (
+            target_id, subscription_id, target_key, media_type, title, state
+         ) VALUES (?, ?, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
+    )
+    .bind(target_id.to_string())
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    store
+        .upsert_acquisition_media_ownership(
+            movie_id,
+            subscription_id,
+            None,
+            Some("elixir.sources.torrentio_stremio"),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/library/items/{}", movie_id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "ownerReleaseAction": "delete_and_release_owner"
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        payload
+            .pointer("/ownerReleaseAction")
+            .and_then(Value::as_str),
+        Some("delete_and_release_owner")
+    );
+    assert_eq!(
+        payload
+            .pointer("/ownerRelease/owners/0/ownerType")
+            .and_then(Value::as_str),
+        Some("acquisition")
+    );
+    assert_eq!(
+        payload
+            .pointer("/ownerRelease/owners/0/status")
+            .and_then(Value::as_str),
+        Some("succeeded")
+    );
+
+    let subscription_row = sqlx::query(
+        "SELECT status, CAST(active AS INTEGER) AS active
+         FROM acquisition_subscriptions
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    let status: String = subscription_row.try_get("status")?;
+    let active: i64 = subscription_row.try_get("active")?;
+    assert_eq!(status, "paused");
+    assert_eq!(active, 0);
+
+    let target_state: String =
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+            .bind(target_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(target_state, "excluded");
+
+    let event_status: String =
+        sqlx::query_scalar("SELECT status FROM media_owner_release_events LIMIT 1")
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(event_status, "succeeded");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let movie_id = Uuid::new_v4();
+    let media_file_id = Uuid::new_v4();
+    let subscription_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let temp_dir = tempdir()?;
+    let media_path = temp_dir.path().join("Fixture.Movie.2026.mkv");
+    std::fs::write(&media_path, b"video-bytes")?;
+
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+    )
+    .bind(movie_id.to_string())
+    .bind(serde_json::to_string(&json!({ "tmdb": "999002" }))?)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
+         VALUES (?, 'Fixture Movie', 2026, '999002', NULL)",
+    )
+    .bind(movie_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files (
+            id, media_item_id, path, scan_state
+         ) VALUES (?, ?, ?, 'ok')",
+    )
+    .bind(media_file_id.to_string())
+    .bind(movie_id.to_string())
+    .bind(media_path.to_string_lossy().to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id, media_type, title, normalized_title, year,
+            monitor_policy, route_policy, status, active
+         ) VALUES (?, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
+            'all_missing', 'debrid_first', 'active', 1)",
+    )
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO acquisition_targets (
+            target_id, subscription_id, target_key, media_type, title, state
+         ) VALUES (?, ?, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
+    )
+    .bind(target_id.to_string())
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    store
+        .upsert_acquisition_media_ownership(
+            movie_id,
+            subscription_id,
+            None,
+            Some("elixir.sources.torrentio_stremio"),
+        )
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/library/items/{}", movie_id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "ownerReleaseAction": "release_owner_only"
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        payload
+            .pointer("/ownerReleaseAction")
+            .and_then(Value::as_str),
+        Some("release_owner_only")
+    );
+    assert_eq!(
+        payload
+            .pointer("/localDeletePerformed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        payload
+            .pointer("/ownerRelease/owners/0/status")
+            .and_then(Value::as_str),
+        Some("succeeded")
+    );
+
+    assert!(
+        media_path.exists(),
+        "release_owner_only must not delete local files"
+    );
+    let media_item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ?")
+        .bind(movie_id.to_string())
+        .fetch_one(&db_pool)
+        .await?;
+    assert_eq!(media_item_count, 1);
+    let movie_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies WHERE id = ?")
+        .bind(movie_id.to_string())
+        .fetch_one(&db_pool)
+        .await?;
+    assert_eq!(movie_count, 1);
+
+    let subscription_active: i64 = sqlx::query_scalar(
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(subscription_active, 0);
+    let target_state: String =
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+            .bind(target_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(target_state, "excluded");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/library/items/{}/owner-release/events?limit=10",
+                movie_id
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let audit_payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        audit_payload.pointer("/total").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        audit_payload
+            .pointer("/events/0/requestedAction")
+            .and_then(Value::as_str),
+        Some("release_owner_only")
+    );
+    assert_eq!(
+        audit_payload
+            .pointer("/events/0/status")
+            .and_then(Value::as_str),
+        Some("succeeded")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    let orphan_movie_id = Uuid::new_v4();
+    let stale_movie_id = Uuid::new_v4();
+    let extension_id = "elixir.modules.sonarr";
+    let instance_id = Uuid::new_v4();
+    let provider_id = Uuid::new_v4();
+    let stale_ownership_id = Uuid::new_v4();
+
+    for (movie_id, tmdb_id) in [(orphan_movie_id, "999003"), (stale_movie_id, "999004")] {
+        sqlx::query(
+            "INSERT INTO media_items (id, type, external_ids, title, year)
+             VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+        )
+        .bind(movie_id.to_string())
+        .bind(serde_json::to_string(&json!({ "tmdb": tmdb_id }))?)
+        .execute(&db_pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
+             VALUES (?, 'Fixture Movie', 2026, ?, NULL)",
+        )
+        .bind(movie_id.to_string())
+        .bind(tmdb_id)
+        .execute(&db_pool)
+        .await?;
+    }
+
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: "Sonarr".to_string(),
+            version: "1.0.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: Some(json!({})),
+            enabled: true,
+        })
+        .await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "media.manager.tv".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("sonarr".to_string()),
+            scope_json: None,
+            endpoint_json: None,
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_media_ownership(&NewMediaOwnership {
+            ownership_id: stale_ownership_id,
+            media_item_id: stale_movie_id,
+            owner_type: "extension".to_string(),
+            owner_role: "primary".to_string(),
+            owner_label: Some("default (sonarr)".to_string()),
+            owner_implementation: Some("sonarr".to_string()),
+            owner_provider_id: Some(provider_id),
+            owner_instance_id: Some(instance_id),
+            owner_extension_id: Some(extension_id.to_string()),
+            owner_external_id: Some("42".to_string()),
+            acquisition_subscription_id: None,
+            acquisition_target_scope: None,
+            release_capability: "manager.remove_item".to_string(),
+            release_policy: "supported".to_string(),
+            metadata: None,
+            active: true,
+        })
+        .await?;
+
+    sqlx::query("DELETE FROM providers WHERE provider_id = ?")
+        .bind(provider_id.to_string())
+        .execute(&db_pool)
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::post("/api/v1/library/owner-release/reconcile").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        payload
+            .pointer("/report/externalOwnersCreated")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/report/staleOwnersMarkedUnsupported")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/report/unsupportedEventsCreated")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let orphan_owner_type: String = sqlx::query_scalar(
+        "SELECT owner_type FROM media_ownerships WHERE media_item_id = ? AND active = 1",
+    )
+    .bind(orphan_movie_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(orphan_owner_type, "external");
+
+    let stale_release_capability: String = sqlx::query_scalar(
+        "SELECT release_capability FROM media_ownerships WHERE ownership_id = ?",
+    )
+    .bind(stale_ownership_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(stale_release_capability, "none");
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/library/owner-release/events?limit=5").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let audit_payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        audit_payload
+            .pointer("/events/0/requestedAction")
+            .and_then(Value::as_str),
+        Some("reconcile_owner")
+    );
+    assert_eq!(
+        audit_payload
+            .pointer("/events/0/status")
+            .and_then(Value::as_str),
+        Some("unsupported")
+    );
+
     Ok(())
 }
 
@@ -12279,6 +12821,8 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     let season_id = Uuid::new_v4();
     let episode_id = Uuid::new_v4();
     let media_file_id = Uuid::new_v4();
+    let subscription_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
     let temp_dir = tempdir()?;
     let media_path = temp_dir.path().join("Show.S01E02.mkv");
     let subtitle_path = temp_dir.path().join("Show.S01E02.srt");
@@ -12331,6 +12875,34 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     .execute(&db_pool)
     .await?;
     sqlx::query(
+        "INSERT INTO acquisition_subscriptions (
+            subscription_id, media_type, title, normalized_title, year,
+            monitor_policy, route_policy, status, active
+         ) VALUES (?, 'series', 'Blocked Show', 'blockedshow', 2024,
+            'all_missing', 'debrid_first', 'active', 1)",
+    )
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO acquisition_targets (
+            target_id, subscription_id, target_key, media_type, title,
+            season_number, episode_number, state
+         ) VALUES (?, ?, 'S01E02', 'series', 'Blocked Show', 1, 2, 'pending')",
+    )
+    .bind(target_id.to_string())
+    .bind(subscription_id.to_string())
+    .execute(&db_pool)
+    .await?;
+    store
+        .upsert_acquisition_media_ownership(
+            series_id,
+            subscription_id,
+            None,
+            Some("elixir.sources.torrentio_stremio"),
+        )
+        .await?;
+    sqlx::query(
         "INSERT INTO media_files (
             id, media_item_id, path, scan_state
          ) VALUES (?, ?, ?, 'ok')",
@@ -12371,6 +12943,20 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
+    let delete_payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        delete_payload
+            .pointer("/ownerReleaseAction")
+            .and_then(Value::as_str),
+        Some("block_episode")
+    );
+    assert_eq!(
+        delete_payload
+            .pointer("/ownerRelease/owners/0/ownerType")
+            .and_then(Value::as_str),
+        Some("acquisition")
+    );
 
     assert!(!media_path.exists(), "expected media file to be removed");
     assert!(
@@ -12397,6 +12983,24 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     assert_eq!(tombstones[0].season_number, 1);
     assert_eq!(tombstones[0].episode_number, 2);
     assert_eq!(tombstones[0].action, "block_episode");
+
+    let target_state: String =
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+            .bind(target_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(target_state, "excluded");
+
+    let subscription_active: i64 = sqlx::query_scalar(
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(
+        subscription_active, 1,
+        "episode blocking must preserve the series subscription"
+    );
 
     let response = app
         .clone()

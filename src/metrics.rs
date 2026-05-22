@@ -80,6 +80,14 @@ pub static RECONCILE_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["action", "result"]).expect("counter vec created")
 });
 
+pub static OWNER_RELEASE_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_owner_release_events_total",
+        "Count of media owner-release lifecycle events",
+    );
+    IntCounterVec::new(opts, &["action", "owner_type", "status"]).expect("counter vec created")
+});
+
 pub fn init_metrics() {
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
@@ -92,6 +100,9 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(PLAY_LATENCY.clone())).ok();
     REGISTRY.register(Box::new(RECONCILE_RUNS.clone())).ok();
     REGISTRY.register(Box::new(RECONCILE_ACTIONS.clone())).ok();
+    REGISTRY
+        .register(Box::new(OWNER_RELEASE_EVENTS.clone()))
+        .ok();
 }
 
 pub fn gather() -> Vec<u8> {

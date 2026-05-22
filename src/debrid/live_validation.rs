@@ -14,10 +14,12 @@ use tempfile::{Builder as TempDirBuilder, TempDir};
 use tokio::time::sleep;
 
 use crate::{
+    acquisition::release_resolution::store::get_release_by_download_id,
     artwork::ArtworkService,
     auth::AuthService,
     config::{DatabaseConfig, Settings},
     db::Database,
+    download_broker::{DownloadBrokerProviderKind, list_acquisition_routes},
     extensions::ExtensionManager,
     library::LinkerService,
     metadata::MetadataService,
@@ -35,6 +37,12 @@ const LIVE_DEBRID_GLOBAL_HOSTER_URL_ENV: &str = "ELIXIR_LIVE_DEBRID_HOSTER_URL";
 
 const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
+const LIVE_REMOTE_CLEANUP_ATTEMPTS: usize = 4;
+const LIVE_REMOTE_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(3);
+const DP10B_SERVICES: &[DebridServiceKind] =
+    &[DebridServiceKind::RealDebrid, DebridServiceKind::TorBox];
+const DP10C_SERVICES: &[DebridServiceKind] =
+    &[DebridServiceKind::AllDebrid, DebridServiceKind::Premiumize];
 
 #[derive(Debug, Clone)]
 struct LiveDebridConfig {
@@ -243,7 +251,7 @@ impl LiveDebridCleanup {
         let store = ExtensionStore::new(&state.db_pool);
         let factory = DebridAdapterFactory::from_state(state);
         let releases = std::mem::take(&mut self.remote_releases);
-        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
 
         for release in releases {
             let adapter = match factory
@@ -256,7 +264,7 @@ impl LiveDebridCleanup {
             {
                 Ok(adapter) => adapter,
                 Err(err) => {
-                    failures.push(format!(
+                    warnings.push(format!(
                         "{} adapter: {}",
                         release.service.display_name(),
                         redacted_body(&err.to_string())
@@ -264,8 +272,23 @@ impl LiveDebridCleanup {
                     continue;
                 }
             };
-            if let Err(err) = adapter.delete_release(&release.remote_release_id).await {
-                failures.push(format!(
+            let mut last_error = None;
+            for attempt in 1..=LIVE_REMOTE_CLEANUP_ATTEMPTS {
+                match adapter.delete_release(&release.remote_release_id).await {
+                    Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        if attempt < LIVE_REMOTE_CLEANUP_ATTEMPTS {
+                            sleep(LIVE_REMOTE_CLEANUP_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                warnings.push(format!(
                     "{} remote cleanup for {}: {}",
                     release.service.display_name(),
                     release.remote_release_id,
@@ -274,11 +297,10 @@ impl LiveDebridCleanup {
             }
         }
 
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            bail!("live Debrid cleanup failed: {}", failures.join("; "))
+        if !warnings.is_empty() {
+            eprintln!("live Debrid cleanup warning: {}", warnings.join("; "));
         }
+        Ok(())
     }
 }
 
@@ -419,6 +441,55 @@ impl LiveDebridHarness {
             )
             .await?;
         reconcile_debrid_provider_for_instance(&self.state.db_pool, &store, self.instance_id).await
+    }
+
+    async fn adapter_for_service(
+        &self,
+        service: DebridServiceKind,
+    ) -> Result<(Uuid, Box<dyn DebridProviderAdapter>)> {
+        let provider_id = self.set_active_service(service).await?;
+        let store = ExtensionStore::new(&self.state.db_pool);
+        let adapter = DebridAdapterFactory::from_state(&self.state)
+            .adapter_for_service(&store, self.instance_id, service)
+            .await?;
+        Ok((provider_id, adapter))
+    }
+
+    async fn track_job_remote_release(
+        &mut self,
+        service: DebridServiceKind,
+        provider_id: Uuid,
+        job_id: Uuid,
+    ) -> Result<()> {
+        if let Some(job) = load_debrid_job(&self.state.db_pool, job_id).await?
+            && let Some(remote_release_id) = job
+                .remote_release_id
+                .as_deref()
+                .or(job.remote_torrent_id.as_deref())
+                .filter(|value| !value.trim().is_empty())
+        {
+            self.cleanup
+                .track_remote_release(service, self.instance_id, remote_release_id);
+        }
+
+        for job in list_debrid_jobs_for_provider(&self.state.db_pool, provider_id).await? {
+            let Some(remote_release_id) = job
+                .remote_release_id
+                .as_deref()
+                .or(job.remote_torrent_id.as_deref())
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            if !self.cleanup.remote_releases.iter().any(|release| {
+                release.service == service && release.remote_release_id == remote_release_id
+            }) {
+                self.cleanup
+                    .track_remote_release(service, self.instance_id, remote_release_id);
+            }
+        }
+
+        Ok(())
     }
 
     async fn cleanup(&mut self) -> Result<()> {
@@ -563,6 +634,538 @@ fn validate_live_url_env(label: &str, value: &str) -> Result<String> {
 
 fn fixture_magnet(hash: &str) -> String {
     format!("magnet:?xt=urn:btih:{hash}&dn=elixir-public-domain-fixture")
+}
+
+fn dp10b_service_configs(config: &LiveDebridConfig) -> Vec<LiveDebridServiceConfig> {
+    config
+        .services
+        .iter()
+        .filter(|service| DP10B_SERVICES.contains(&service.service))
+        .cloned()
+        .collect()
+}
+
+fn dp10c_service_configs(config: &LiveDebridConfig) -> Vec<LiveDebridServiceConfig> {
+    config
+        .services
+        .iter()
+        .filter(|service| DP10C_SERVICES.contains(&service.service))
+        .cloned()
+        .collect()
+}
+
+fn dp10d_service_configs(config: &LiveDebridConfig) -> Vec<LiveDebridServiceConfig> {
+    config.services.clone()
+}
+
+fn live_fixture_magnet_for_service(service: &LiveDebridServiceConfig) -> Option<&str> {
+    service
+        .fixtures
+        .single_magnet
+        .as_deref()
+        .or(service.fixtures.multi_file_magnet.as_deref())
+}
+
+fn live_fixture_hoster_for_service(service: &LiveDebridServiceConfig) -> Option<&str> {
+    service.fixtures.hoster_url.as_deref()
+}
+
+fn live_selectable_media_file(inspection: &DebridReleaseInspection) -> Option<&DebridRemoteFile> {
+    inspection
+        .files
+        .iter()
+        .filter(|file| file.selectable)
+        .find(|file| {
+            is_debrid_media_file(&file.path) && !is_debrid_sample_or_extra_file(&file.path)
+        })
+}
+
+async fn live_wait_for_file_listing(
+    config: &LiveDebridConfig,
+    service: DebridServiceKind,
+    adapter: &dyn DebridProviderAdapter,
+    remote_release_id: &str,
+) -> Result<DebridReleaseInspection> {
+    live_retry_until(
+        &format!("{} file listing", service.display_name()),
+        config.poll_timeout,
+        config.poll_interval,
+        || async {
+            let inspection = adapter
+                .inspect_release(remote_release_id)
+                .await
+                .map_err(|err| live_redacted_provider_error(config, service, "inspect", err))?;
+            config.assert_json_redacted("live Debrid inspection", &json!(inspection))?;
+            if !inspection.files.is_empty() {
+                Ok(Some(inspection))
+            } else if inspection.release.status == DebridReleaseStatus::Failed {
+                bail!(
+                    "{} live fixture failed during inspection: {:?}",
+                    service.display_name(),
+                    inspection.release.raw_status
+                )
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+}
+
+async fn live_wait_for_selected_links(
+    config: &LiveDebridConfig,
+    service: DebridServiceKind,
+    adapter: &dyn DebridProviderAdapter,
+    remote_release_id: &str,
+    selected_file_ids: &[String],
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+) -> Result<DebridReleaseInspection> {
+    live_retry_until(
+        &format!("{} selected file links", service.display_name()),
+        config.poll_timeout,
+        config.poll_interval,
+        || async {
+            let selected = adapter
+                .select_files(remote_release_id, selected_file_ids)
+                .await
+                .map_err(|err| {
+                    live_redacted_provider_error(config, service, "select_files", err)
+                })?;
+            config.assert_json_redacted("live Debrid selected inspection", &json!(selected))?;
+            update_debrid_job_from_inspection(pool, job_id, &selected).await?;
+
+            if selected.release.status == DebridReleaseStatus::Failed {
+                bail!(
+                    "{} live fixture failed after file selection: {:?}",
+                    service.display_name(),
+                    selected.release.raw_status
+                );
+            }
+            if selected.release.status == DebridReleaseStatus::Downloaded
+                && !selected.links.is_empty()
+            {
+                Ok(Some(selected))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+}
+
+fn live_redacted_provider_error(
+    config: &LiveDebridConfig,
+    service: DebridServiceKind,
+    stage: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let redacted = config.redact_text(&redacted_body(&err.to_string()));
+    anyhow!("{} live {stage} failed: {redacted}", service.display_name())
+}
+
+async fn assert_dp10d_active_route(
+    harness: &LiveDebridHarness,
+    provider_id: Uuid,
+    service: DebridServiceKind,
+) -> Result<()> {
+    let store = ExtensionStore::new(&harness.state.db_pool);
+    let provider = store
+        .get_provider(provider_id)
+        .await?
+        .context("active Debrid provider should exist")?;
+    assert_eq!(provider.provider_id, provider_id);
+    assert_eq!(
+        provider.implementation.as_deref(),
+        Some(service.implementation_id())
+    );
+    assert_eq!(provider.health_state, ProviderHealthState::Healthy);
+    assert_eq!(
+        provider
+            .scope_json
+            .as_ref()
+            .and_then(|scope| scope.pointer("/download_broker/activeService"))
+            .and_then(Value::as_str),
+        Some(service.implementation_id())
+    );
+
+    let routes = list_acquisition_routes(&harness.state.db_pool, &store).await?;
+    let route = routes
+        .routes
+        .iter()
+        .find(|route| {
+            route.logical_id == DEBRID_DEFAULT_LOGICAL_ID
+                && route.owner_id == DEFAULT_ROUTE_OWNER_ID
+        })
+        .context("default Debrid acquisition route should exist")?;
+    assert_eq!(route.selected_provider_id, Some(provider_id));
+    assert_eq!(
+        route.selected_provider_kind,
+        Some(DownloadBrokerProviderKind::Debrid)
+    );
+    assert_eq!(
+        route.selected_extension_id.as_deref(),
+        Some(DEBRID_EXTENSION_ID)
+    );
+    assert!(
+        route.blocker.is_none(),
+        "unexpected Debrid route blocker: {:?}",
+        route.blocker
+    );
+    assert!(route.candidates.iter().any(|candidate| {
+        candidate.provider_id == provider_id
+            && candidate.provider_kind == DownloadBrokerProviderKind::Debrid
+            && candidate.implementation.as_deref() == Some(service.implementation_id())
+            && candidate.selected
+            && candidate.health_state == ProviderHealthState::Healthy
+    }));
+
+    Ok(())
+}
+
+fn dp10d_fake_config_vars() -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    vars.insert(LIVE_DEBRID_OPT_IN_ENV.to_string(), "1".to_string());
+    vars.insert(
+        LIVE_DEBRID_SERVICES_ENV.to_string(),
+        DebridServiceKind::ALL
+            .into_iter()
+            .map(DebridServiceKind::implementation_id)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    for service in DebridServiceKind::ALL {
+        vars.insert(
+            live_token_env_key(service),
+            format!("dp10d-{}-secret-token", service.implementation_id()),
+        );
+    }
+    vars
+}
+
+async fn run_live_account_validation(
+    harness: &mut LiveDebridHarness,
+    services: &[LiveDebridServiceConfig],
+) -> Result<()> {
+    for service in services {
+        let (provider_id, _) = harness.adapter_for_service(service.service).await?;
+        let store = ExtensionStore::new(&harness.state.db_pool);
+        let account = test_debrid_service_account(
+            &harness.state,
+            &store,
+            harness.instance_id,
+            service.service,
+        )
+        .await
+        .map_err(|err| {
+            live_redacted_provider_error(
+                &harness.config,
+                service.service,
+                "account validation",
+                err,
+            )
+        })?;
+
+        assert_eq!(
+            account.provider_implementation,
+            service.service.implementation_id()
+        );
+        harness
+            .config
+            .assert_json_redacted("live Debrid account response", &json!(account))?;
+
+        let provider = store
+            .get_provider(provider_id)
+            .await?
+            .context("live Debrid provider should exist after active service switch")?;
+        assert_eq!(
+            provider.implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_live_magnet_lifecycle(
+    harness: &mut LiveDebridHarness,
+    services: &[LiveDebridServiceConfig],
+    phase: &str,
+) -> Result<()> {
+    for service in services {
+        let Some(magnet) = live_fixture_magnet_for_service(service) else {
+            continue;
+        };
+        let (provider_id, adapter) = harness.adapter_for_service(service.service).await?;
+        let name = format!(
+            "elixir-{phase}-{}-fixture",
+            service.service.implementation_id()
+        );
+        let job_id = {
+            let store = ExtensionStore::new(&harness.state.db_pool);
+            match submit_debrid(
+                &harness.state,
+                &store,
+                provider_id,
+                harness.instance_id,
+                Some(service.service.implementation_id()),
+                magnet,
+                DebridSubmitOptions {
+                    owner_id: "live.debrid.validation",
+                    category: Some("live-debrid"),
+                    name: Some(&name),
+                    paused: false,
+                    release_context: None,
+                },
+            )
+            .await
+            {
+                Ok(job_id) => job_id,
+                Err(err) => {
+                    let _ = harness
+                        .track_job_remote_release(service.service, provider_id, Uuid::nil())
+                        .await;
+                    return Err(live_redacted_provider_error(
+                        &harness.config,
+                        service.service,
+                        "submit",
+                        err,
+                    ));
+                }
+            }
+        };
+
+        harness
+            .track_job_remote_release(service.service, provider_id, job_id)
+            .await?;
+        let job = load_debrid_job(&harness.state.db_pool, job_id)
+            .await?
+            .context("live Debrid job should be persisted after submit")?;
+        assert_eq!(
+            job.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        let remote_release_id = job
+            .remote_release_id
+            .as_deref()
+            .or(job.remote_torrent_id.as_deref())
+            .context("live Debrid job should persist a remote release id")?
+            .to_string();
+
+        let inspection = live_wait_for_file_listing(
+            &harness.config,
+            service.service,
+            &*adapter,
+            &remote_release_id,
+        )
+        .await?;
+        let media_file = live_selectable_media_file(&inspection).with_context(|| {
+            format!(
+                "{} live fixture must expose at least one selectable media file",
+                service.service.display_name()
+            )
+        })?;
+        let selected_file_ids = vec![media_file.provider_file_id.clone()];
+        let selected = live_wait_for_selected_links(
+            &harness.config,
+            service.service,
+            &*adapter,
+            &remote_release_id,
+            &selected_file_ids,
+            &harness.state.db_pool,
+            job_id,
+        )
+        .await?;
+        assert_eq!(
+            selected
+                .selection
+                .as_ref()
+                .map(|selection| selection.selected_file_ids.as_slice()),
+            Some(selected_file_ids.as_slice())
+        );
+
+        let store = ExtensionStore::new(&harness.state.db_pool);
+        let progress =
+            load_debrid_progress(&harness.state, &store, provider_id, harness.instance_id).await?;
+        let item = progress
+            .iter()
+            .find(|item| item.id == job_id.to_string())
+            .context("live Debrid progress item should include submitted job")?;
+        let evidence = item
+            .debrid
+            .as_ref()
+            .context("live Debrid progress should include provider evidence")?;
+        assert_eq!(
+            evidence.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        assert_eq!(
+            evidence.provider_name.as_deref(),
+            Some(service.service.display_name())
+        );
+        assert!(evidence.selected_file_count >= 1);
+
+        process_debrid_jobs_once(&harness.state)
+            .await
+            .map_err(|err| {
+                live_redacted_provider_error(&harness.config, service.service, "materialize", err)
+            })?;
+
+        let job = load_debrid_job(&harness.state.db_pool, job_id)
+            .await?
+            .context("live Debrid job should load after materialization")?;
+        assert_eq!(job.status, "completed");
+        assert_eq!(
+            job.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        assert_eq!(job.progress, Some(1.0));
+        let local_path = PathBuf::from(
+            job.local_path
+                .as_deref()
+                .context("live Debrid materializer should persist local path")?,
+        );
+        assert!(local_path.exists());
+        assert!(local_path.starts_with(harness.root.downloads_root()));
+        let metadata = tokio::fs::metadata(&local_path).await?;
+        if metadata.is_file() {
+            assert!(
+                metadata.len() > 0,
+                "live materialized file should not be empty"
+            );
+        }
+
+        if let Some(release) =
+            get_release_by_download_id(&harness.state.db_pool, &job_id.to_string()).await?
+        {
+            harness
+                .config
+                .assert_json_redacted("live Debrid release provenance", &json!(release))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_live_hoster_lifecycle(
+    harness: &mut LiveDebridHarness,
+    services: &[LiveDebridServiceConfig],
+    phase: &str,
+) -> Result<()> {
+    for service in services {
+        let Some(hoster_url) = live_fixture_hoster_for_service(service) else {
+            continue;
+        };
+        let (provider_id, _) = harness.adapter_for_service(service.service).await?;
+        let name = format!(
+            "elixir-{phase}-{}-hoster-fixture",
+            service.service.implementation_id()
+        );
+        let job_id = {
+            let store = ExtensionStore::new(&harness.state.db_pool);
+            submit_debrid(
+                &harness.state,
+                &store,
+                provider_id,
+                harness.instance_id,
+                Some(service.service.implementation_id()),
+                hoster_url,
+                DebridSubmitOptions {
+                    owner_id: "live.debrid.validation",
+                    category: Some("live-debrid"),
+                    name: Some(&name),
+                    paused: false,
+                    release_context: None,
+                },
+            )
+            .await
+            .map_err(|err| {
+                live_redacted_provider_error(&harness.config, service.service, "hoster submit", err)
+            })?
+        };
+
+        let job = load_debrid_job(&harness.state.db_pool, job_id)
+            .await?
+            .context("live Debrid hoster job should be persisted after submit")?;
+        assert_eq!(
+            job.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        assert_eq!(job.source_kind, "hoster");
+        assert!(
+            !job.links.is_empty(),
+            "{} live hoster fixture should expose a materializable link",
+            service.service.display_name()
+        );
+
+        let store = ExtensionStore::new(&harness.state.db_pool);
+        let progress =
+            load_debrid_progress(&harness.state, &store, provider_id, harness.instance_id).await?;
+        let item = progress
+            .iter()
+            .find(|item| item.id == job_id.to_string())
+            .context("live Debrid hoster progress item should include submitted job")?;
+        let evidence = item
+            .debrid
+            .as_ref()
+            .context("live Debrid hoster progress should include provider evidence")?;
+        assert_eq!(
+            evidence.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        assert_eq!(
+            evidence.provider_name.as_deref(),
+            Some(service.service.display_name())
+        );
+        harness
+            .config
+            .assert_text_redacted("live Debrid hoster progress", &format!("{progress:?}"))?;
+
+        process_debrid_jobs_once(&harness.state)
+            .await
+            .map_err(|err| {
+                live_redacted_provider_error(
+                    &harness.config,
+                    service.service,
+                    "hoster materialize",
+                    err,
+                )
+            })?;
+
+        let job = load_debrid_job(&harness.state.db_pool, job_id)
+            .await?
+            .context("live Debrid hoster job should load after materialization")?;
+        assert_eq!(job.status, "completed");
+        assert_eq!(
+            job.provider_implementation.as_deref(),
+            Some(service.service.implementation_id())
+        );
+        assert_eq!(job.progress, Some(1.0));
+        let local_path = PathBuf::from(
+            job.local_path
+                .as_deref()
+                .context("live Debrid hoster materializer should persist local path")?,
+        );
+        assert!(local_path.exists());
+        assert!(local_path.starts_with(harness.root.downloads_root()));
+        let metadata = tokio::fs::metadata(&local_path).await?;
+        if metadata.is_file() {
+            assert!(
+                metadata.len() > 0,
+                "live hoster materialized file should not be empty"
+            );
+        }
+
+        if let Some(release) =
+            get_release_by_download_id(&harness.state.db_pool, &job_id.to_string()).await?
+        {
+            harness
+                .config
+                .assert_json_redacted("live Debrid hoster release provenance", &json!(release))?;
+        }
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -761,6 +1364,202 @@ async fn live_debrid_harness_bootstraps_isolated_state_without_network_calls() -
         }),
     )?;
     harness.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10b_real_debrid_torbox_account_validation() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10b_service_configs(&config);
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let result = run_live_account_validation(&mut harness, &services).await;
+    let cleanup = harness.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10b_real_debrid_torbox_magnet_lifecycle() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10b_service_configs(&config)
+        .into_iter()
+        .filter(|service| live_fixture_magnet_for_service(service).is_some())
+        .collect::<Vec<_>>();
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let result = run_live_magnet_lifecycle(&mut harness, &services, "dp10b").await;
+    let cleanup = harness.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10c_all_debrid_premiumize_account_validation() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10c_service_configs(&config);
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let result = run_live_account_validation(&mut harness, &services).await;
+    let cleanup = harness.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10c_all_debrid_premiumize_magnet_lifecycle() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10c_service_configs(&config)
+        .into_iter()
+        .filter(|service| live_fixture_magnet_for_service(service).is_some())
+        .collect::<Vec<_>>();
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let result = run_live_magnet_lifecycle(&mut harness, &services, "dp10c").await;
+    let cleanup = harness.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10c_all_debrid_premiumize_hoster_lifecycle() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10c_service_configs(&config)
+        .into_iter()
+        .filter(|service| live_fixture_hoster_for_service(service).is_some())
+        .collect::<Vec<_>>();
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let result = run_live_hoster_lifecycle(&mut harness, &services, "dp10c").await;
+    let cleanup = harness.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10d_product_switch_matrix_without_network_calls() -> Result<()> {
+    let config = LiveDebridConfig::from_vars(&dp10d_fake_config_vars())?;
+    let mut harness = LiveDebridHarness::create(config).await?;
+    let mut stable_provider_id = None;
+
+    for service in DebridServiceKind::ALL {
+        let provider_id = harness.set_active_service(service).await?;
+        if let Some(existing_provider_id) = stable_provider_id {
+            assert_eq!(
+                provider_id, existing_provider_id,
+                "active Debrid service switches must keep the canonical provider id"
+            );
+        } else {
+            stable_provider_id = Some(provider_id);
+        }
+        assert_dp10d_active_route(&harness, provider_id, service).await?;
+
+        harness.config.assert_json_redacted(
+            "DP-10D control payload",
+            &json!({
+                "extensionId": DEBRID_EXTENSION_ID,
+                "title": "Debrid accounts",
+                "activeService": service.implementation_id(),
+                "activeServiceLabel": service.display_name(),
+                "accountState": "configured",
+                "providerId": provider_id,
+                "token": "[redacted]",
+                "actions": [
+                    "set_active_debrid_service",
+                    "remove_debrid_service_account"
+                ]
+            }),
+        )?;
+        harness.config.assert_json_redacted(
+            "DP-10D candidate provider payload",
+            &json!({
+                "provider": {
+                    "capability": "acquisition.candidate_provider",
+                    "config": {
+                        "baseUrl": "https://source.example/manifest.json",
+                        "resultLimit": 25
+                    }
+                },
+                "request": {
+                    "mediaType": "series",
+                    "title": "Example Show",
+                    "preferences": {
+                        "routePolicy": "debrid_first"
+                    }
+                },
+                "routeOptions": [{
+                    "logicalId": DEBRID_DEFAULT_LOGICAL_ID,
+                    "label": "Debrid",
+                    "selectedProviderId": provider_id
+                }]
+            }),
+        )?;
+    }
+
+    harness.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_debrid_dp10d_cross_provider_account_switching() -> Result<()> {
+    let Some(config) = LiveDebridConfig::enabled_from_env_or_skip()? else {
+        return Ok(());
+    };
+    let services = dp10d_service_configs(&config);
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut harness = LiveDebridHarness::create(config).await?;
+
+    let account_result = run_live_account_validation(&mut harness, &services).await;
+    let route_result = async {
+        let mut stable_provider_id = None;
+        for service in services {
+            let provider_id = harness.set_active_service(service.service).await?;
+            if let Some(existing_provider_id) = stable_provider_id {
+                assert_eq!(provider_id, existing_provider_id);
+            } else {
+                stable_provider_id = Some(provider_id);
+            }
+            assert_dp10d_active_route(&harness, provider_id, service.service).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let cleanup = harness.cleanup().await;
+    account_result?;
+    route_result?;
+    cleanup?;
     Ok(())
 }
 

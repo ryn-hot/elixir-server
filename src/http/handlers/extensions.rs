@@ -5210,6 +5210,7 @@ fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest 
                 policies: None,
                 networking: None,
                 control_surface: None,
+                owner_release: None,
             }
         }
     }
@@ -7904,6 +7905,7 @@ mod extension_ui_proxy_tests {
                 policies: None,
                 networking: None,
                 control_surface: None,
+                owner_release: None,
             };
             ExtensionControlContext {
                 extension: Extension {

@@ -4,7 +4,7 @@ use axum::{
     http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +19,9 @@ use crate::{
         ExternalIds, MediaIdentity,
         store::{
             ExtensionStore, ManagedEpisodeTombstone, ManagedLibraryProvenance,
-            NewManagedEpisodeTombstone, NewManagedMediaTombstone,
+            MediaOwnerReleaseEvent, MediaOwnership, MediaOwnershipReconcileReport,
+            NewManagedEpisodeTombstone, NewManagedLibraryProvenance, NewManagedMediaTombstone,
+            NewMediaOwnerReleaseEvent,
         },
     },
     http::error::{ApiError, ApiResult},
@@ -27,6 +29,10 @@ use crate::{
         managed_episode_tombstone_matches_series, match_managed_episode_tombstone,
         match_managed_ingest_intent, normalize_managed_intent_title,
         run_full_scan_with_metadata_and_linkers,
+    },
+    media::owner_release::{
+        MediaOwnerReleaseRequest, OwnerReleaseAction, OwnerReleaseEpisodeScope,
+        OwnerReleaseSummary, dispatch_media_owner_release,
     },
     state::AppState,
 };
@@ -54,6 +60,12 @@ pub struct LibraryItemCardLifecycleResponse {
     pub tracked_by_manager: bool,
     pub manager_label: Option<String>,
     pub can_stop_tracking: bool,
+    pub owner_release_supported: bool,
+    pub owner_release_label: String,
+    pub owner_release_status: Option<String>,
+    pub owner_release_status_reason: Option<String>,
+    pub primary_owner: Option<LibraryOwnerResponse>,
+    pub owners: Vec<LibraryOwnerResponse>,
 }
 
 pub async fn list_items(
@@ -232,6 +244,113 @@ pub async fn scan(
     Ok(Json("ok"))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReleaseEventsQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReleaseEventResponse {
+    pub release_event_id: String,
+    pub media_item_id: Option<String>,
+    pub ownership_id: Option<String>,
+    pub requested_action: String,
+    pub owner_type: String,
+    pub owner_label: Option<String>,
+    pub owner_provider_id: Option<String>,
+    pub acquisition_subscription_id: Option<String>,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub request: Option<Value>,
+    pub response: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReleaseEventsResponse {
+    pub media_item_id: Option<String>,
+    pub limit: i64,
+    pub total: usize,
+    pub events: Vec<OwnerReleaseEventResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReleaseReconcileResponse {
+    pub status: &'static str,
+    pub report: MediaOwnershipReconcileReport,
+}
+
+pub async fn list_owner_release_events(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerReleaseEventsQuery>,
+) -> ApiResult<Json<OwnerReleaseEventsResponse>> {
+    let limit = owner_release_events_limit(query.limit);
+    let store = ExtensionStore::new(&state.db_pool);
+    let events = store
+        .list_media_owner_release_events(limit)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(OwnerReleaseEventsResponse {
+        media_item_id: None,
+        limit,
+        total: events.len(),
+        events: events
+            .iter()
+            .map(owner_release_event_response)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn list_item_owner_release_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<OwnerReleaseEventsQuery>,
+) -> ApiResult<Json<OwnerReleaseEventsResponse>> {
+    let media_item_id =
+        Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("library item id is invalid"))?;
+    let limit = owner_release_events_limit(query.limit);
+    let store = ExtensionStore::new(&state.db_pool);
+    let mut events = store
+        .list_media_owner_release_events_for_item(media_item_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    events.truncate(limit as usize);
+    Ok(Json(OwnerReleaseEventsResponse {
+        media_item_id: Some(media_item_id.to_string()),
+        limit,
+        total: events.len(),
+        events: events
+            .iter()
+            .map(owner_release_event_response)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn reconcile_owner_release_state(
+    State(state): State<AppState>,
+) -> ApiResult<Json<OwnerReleaseReconcileResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let report = store
+        .reconcile_media_ownerships()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    tracing::info!(
+        external_owners_created = report.external_owners_created,
+        stale_owners_marked_unsupported = report.stale_owners_marked_unsupported,
+        unsupported_events_created = report.unsupported_events_created,
+        "media ownership reconciliation completed"
+    );
+    Ok(Json(OwnerReleaseReconcileResponse {
+        status: "ok",
+        report,
+    }))
+}
+
 #[derive(Serialize)]
 pub struct LibraryDetailResponse {
     pub id: String,
@@ -257,8 +376,36 @@ pub struct LibraryLifecycleResponse {
     pub manager_label: Option<String>,
     pub manager_implementation: Option<String>,
     pub can_stop_tracking: bool,
+    pub owner_release_supported: bool,
+    pub owner_release_label: String,
+    pub owner_release_status: Option<String>,
+    pub owner_release_status_reason: Option<String>,
     pub blocked_episode_count: i32,
     pub can_restore_blocked_episodes: bool,
+    pub primary_owner: Option<LibraryOwnerResponse>,
+    pub owners: Vec<LibraryOwnerResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryOwnerResponse {
+    pub ownership_id: String,
+    pub owner_type: String,
+    pub owner_role: String,
+    pub owner_label: Option<String>,
+    pub owner_implementation: Option<String>,
+    pub owner_provider_id: Option<String>,
+    pub owner_instance_id: Option<String>,
+    pub owner_extension_id: Option<String>,
+    pub owner_external_id: Option<String>,
+    pub acquisition_subscription_id: Option<String>,
+    pub release_capability: String,
+    pub release_policy: String,
+    pub release_supported: bool,
+    pub release_label: String,
+    pub latest_release_status: Option<String>,
+    pub latest_release_status_reason: Option<String>,
+    pub active: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -266,6 +413,122 @@ pub struct LibraryLifecycleResponse {
 pub struct DeleteLibraryItemRequest {
     #[serde(default)]
     pub stop_tracking: bool,
+    #[serde(default)]
+    pub owner_release_action: Option<String>,
+    #[serde(default)]
+    pub owner_release_best_effort: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryDeleteAction {
+    DeleteLocalOnly,
+    DeleteAndReleaseOwner,
+    ReleaseOwnerOnly,
+}
+
+impl LibraryDeleteAction {
+    fn from_item_request(payload: &DeleteLibraryItemRequest) -> ApiResult<Self> {
+        if let Some(value) = payload.owner_release_action.as_deref() {
+            return Self::from_api_value(value, false);
+        }
+        Ok(if payload.stop_tracking {
+            Self::DeleteAndReleaseOwner
+        } else {
+            Self::DeleteLocalOnly
+        })
+    }
+
+    fn from_api_value(value: &str, allow_block_episode: bool) -> ApiResult<Self> {
+        match normalize_action_value(value).as_str() {
+            "delete_local_only" | "deleteLocalOnly" => Ok(Self::DeleteLocalOnly),
+            "delete_and_release_owner" | "deleteAndReleaseOwner" => Ok(Self::DeleteAndReleaseOwner),
+            "release_owner_only" | "releaseOwnerOnly" => Ok(Self::ReleaseOwnerOnly),
+            "block_episode" | "blockEpisode" if allow_block_episode => {
+                Ok(Self::DeleteAndReleaseOwner)
+            }
+            "block_episode" | "blockEpisode" => Err(ApiError::bad_request(
+                "ownerReleaseAction 'block_episode' is only valid for episode deletes",
+            )),
+            other => Err(ApiError::bad_request(format!(
+                "unsupported ownerReleaseAction '{other}'"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteLocalOnly => "delete_local_only",
+            Self::DeleteAndReleaseOwner => "delete_and_release_owner",
+            Self::ReleaseOwnerOnly => "release_owner_only",
+        }
+    }
+
+    fn dispatcher_action(self) -> Option<OwnerReleaseAction> {
+        match self {
+            Self::DeleteLocalOnly => None,
+            Self::DeleteAndReleaseOwner => Some(OwnerReleaseAction::DeleteAndReleaseOwner),
+            Self::ReleaseOwnerOnly => Some(OwnerReleaseAction::ReleaseOwnerOnly),
+        }
+    }
+
+    fn deletes_local(self) -> bool {
+        matches!(self, Self::DeleteLocalOnly | Self::DeleteAndReleaseOwner)
+    }
+
+    fn releases_owner(self) -> bool {
+        self.dispatcher_action().is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpisodeDeleteAction {
+    DeleteLocalOnly,
+    DeleteAndBlockEpisode,
+}
+
+impl EpisodeDeleteAction {
+    fn from_request(payload: &DeleteEpisodeRequest) -> ApiResult<Self> {
+        if let Some(value) = payload.owner_release_action.as_deref() {
+            return match normalize_action_value(value).as_str() {
+                "delete_local_only" | "deleteLocalOnly" => Ok(Self::DeleteLocalOnly),
+                "block_episode" | "blockEpisode" => Ok(Self::DeleteAndBlockEpisode),
+                other => Err(ApiError::bad_request(format!(
+                    "unsupported ownerReleaseAction '{other}' for episode delete"
+                ))),
+            };
+        }
+        Ok(if payload.block_in_elixir {
+            Self::DeleteAndBlockEpisode
+        } else {
+            Self::DeleteLocalOnly
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteLocalOnly => "delete_local_only",
+            Self::DeleteAndBlockEpisode => "block_episode",
+        }
+    }
+
+    fn blocks_episode(self) -> bool {
+        matches!(self, Self::DeleteAndBlockEpisode)
+    }
+}
+
+fn normalize_action_value(value: &str) -> String {
+    value.trim().replace('-', "_")
+}
+
+fn api_error_message(error: &ApiError) -> String {
+    match error {
+        ApiError::BadRequest(message)
+        | ApiError::Unauthorized(message)
+        | ApiError::Forbidden(message)
+        | ApiError::NotFound(message)
+        | ApiError::Conflict(message)
+        | ApiError::Internal(message) => message.clone(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -274,6 +537,11 @@ pub struct DeleteLibraryItemResponse {
     pub id: String,
     pub r#type: String,
     pub stop_tracking: bool,
+    pub owner_release_action: String,
+    pub owner_release_best_effort: bool,
+    pub local_delete_performed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_release: Option<OwnerReleaseSummary>,
     pub message: String,
 }
 
@@ -291,6 +559,10 @@ pub struct EpisodeLifecycleResponse {
 pub struct DeleteEpisodeRequest {
     #[serde(default)]
     pub block_in_elixir: bool,
+    #[serde(default)]
+    pub owner_release_action: Option<String>,
+    #[serde(default)]
+    pub owner_release_best_effort: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +571,11 @@ pub struct DeleteEpisodeResponse {
     pub id: String,
     pub series_id: String,
     pub blocked_in_elixir: bool,
+    pub owner_release_action: String,
+    pub owner_release_best_effort: bool,
+    pub local_delete_performed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_release: Option<OwnerReleaseSummary>,
     pub message: String,
 }
 
@@ -899,6 +1176,9 @@ pub async fn delete_item(
     Path(id): Path<String>,
     Json(payload): Json<DeleteLibraryItemRequest>,
 ) -> ApiResult<Json<DeleteLibraryItemResponse>> {
+    let action = LibraryDeleteAction::from_item_request(&payload)?;
+    let media_item_id =
+        Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("library item id is invalid"))?;
     let target = load_library_delete_target(&state.db_pool, &id).await?;
     let lifecycle = resolve_library_item_lifecycle_resolved(
         &state,
@@ -910,56 +1190,62 @@ pub async fn delete_item(
     )
     .await?;
     let store = ExtensionStore::new(&state.db_pool);
+    let mut owner_release = None;
 
-    if payload.stop_tracking {
-        let lifecycle = lifecycle.as_ref().ok_or_else(|| {
-            ApiError::conflict("This item is not linked to a managed Sonarr/Radarr record.")
-        })?;
-        if !can_stop_tracking(lifecycle) {
-            return Err(ApiError::conflict(
-                "Stop tracking is only available for Sonarr/Radarr-managed movies and shows.",
-            ));
+    if action.releases_owner() {
+        if let Some(lifecycle) = lifecycle.as_ref() {
+            if can_stop_tracking(lifecycle) {
+                store
+                    .upsert_managed_library_provenance(&NewManagedLibraryProvenance {
+                        media_item_id,
+                        media_type: target.media_type,
+                        title: target.title.clone(),
+                        normalized_title: normalize_managed_intent_title(&target.title),
+                        year: target.year,
+                        external_ids: Some(target.external_ids.clone()),
+                        manager_provider_id: lifecycle.manager_provider_id,
+                        manager_item_id: lifecycle.manager_item_id.clone(),
+                        manager_label: lifecycle.manager_label.clone(),
+                        manager_implementation: lifecycle.manager_implementation.clone(),
+                        intent_id: lifecycle.intent_id,
+                    })
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+            }
         }
-        let manager_item_id = lifecycle
-            .manager_item_id
-            .as_deref()
-            .ok_or_else(|| ApiError::conflict("Manager item id is not available for this item."))?
-            .parse::<i64>()
-            .map_err(|_| ApiError::conflict("Manager item id is invalid for this item."))?;
-        let provider = store
-            .get_provider(lifecycle.manager_provider_id)
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-            .ok_or_else(|| {
-                ApiError::conflict("The linked manager provider is no longer available.")
-            })?;
-        crate::http::handlers::extensions::remove_managed_library_item_from_manager(
+        let dispatcher_action = action
+            .dispatcher_action()
+            .ok_or_else(|| ApiError::bad_request("delete action does not include owner release"))?;
+        let summary = dispatch_media_owner_release(
             &state,
             &store,
-            &provider,
-            manager_item_id,
+            MediaOwnerReleaseRequest {
+                action: dispatcher_action,
+                media_item_id,
+                media_type: target.media_type,
+                title: target.title.clone(),
+                year: target.year,
+                external_ids: target.external_ids.clone(),
+                episode: None,
+                fail_on_owner_error: !payload.owner_release_best_effort,
+            },
         )
         .await
-        .map_err(|error| {
-            ApiError::conflict(format!(
-                "Failed to stop tracking in {}: {}",
-                manager_display_name(
-                    lifecycle.manager_implementation.as_deref(),
-                    lifecycle.manager_label.as_deref()
-                ),
-                error
-            ))
-        })?;
+        .map_err(|error| ApiError::conflict(format!("Failed to release media owner: {error}")))?;
+        owner_release = Some(summary);
     }
 
-    let mut paths: HashSet<String> = HashSet::new();
-    paths.extend(target.file_paths.iter().cloned());
-    paths.extend(target.subtitle_paths.iter().cloned());
-    for path in paths {
-        delete_library_path(&path).await?;
+    if action.releases_owner() && !payload.owner_release_best_effort {
+        if let Some(summary) = owner_release.as_ref() {
+            if summary.has_failures() {
+                return Err(ApiError::conflict(
+                    "One or more media owners failed to release.",
+                ));
+            }
+        }
     }
 
-    if payload.stop_tracking {
+    if action.releases_owner() {
         if let Some(lifecycle) = lifecycle.as_ref() {
             store
                 .upsert_managed_media_tombstone(&NewManagedMediaTombstone {
@@ -985,41 +1271,43 @@ pub async fn delete_item(
         }
     }
 
-    match target.media_type {
-        MediaType::Movie => {
-            sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
-                .bind(&id)
-                .execute(&state.db_pool)
+    let local_delete_performed = action.deletes_local();
+    if local_delete_performed {
+        if let Err(error) = delete_library_item_locally(&state, &id, &target).await {
+            if owner_release.is_some() {
+                let error_message = api_error_message(&error);
+                record_local_delete_failure_after_release(
+                    &store,
+                    media_item_id,
+                    action.as_str(),
+                    &error_message,
+                )
                 .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-        }
-        MediaType::Series | MediaType::Anime => {
-            sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = ?")
-                .bind(&id)
-                .execute(&state.db_pool)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
+                .map_err(|record_error| ApiError::internal(record_error.to_string()))?;
+            }
+            return Err(error);
         }
     }
-    sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db_pool)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
 
-    let message = if payload.stop_tracking {
-        format!(
-            "Deleted from Elixir and stopped {} from tracking it.",
-            lifecycle
-                .as_ref()
-                .map(|value| {
-                    manager_display_name(
-                        value.manager_implementation.as_deref(),
-                        value.manager_label.as_deref(),
-                    )
-                })
-                .unwrap_or_else(|| "the manager".to_string())
-        )
+    let message = if action.releases_owner() && action.deletes_local() {
+        let released_count = owner_release
+            .as_ref()
+            .map(|summary| summary.released_count)
+            .unwrap_or_default();
+        let unsupported_count = owner_release
+            .as_ref()
+            .map(|summary| summary.unsupported_count)
+            .unwrap_or_default();
+        if released_count > 0 {
+            "Deleted from Elixir and stopped the owner from tracking it.".to_string()
+        } else if unsupported_count > 0 {
+            "Deleted from Elixir. This item did not have a releasable upstream owner.".to_string()
+        } else {
+            "Deleted from Elixir and processed owner release.".to_string()
+        }
+    } else if action.releases_owner() {
+        "Stopped owner tracking for this item. Local files and library rows were left in place."
+            .to_string()
     } else {
         "Deleted from Elixir.".to_string()
     };
@@ -1027,7 +1315,11 @@ pub async fn delete_item(
     Ok(Json(DeleteLibraryItemResponse {
         id,
         r#type: target.item_type,
-        stop_tracking: payload.stop_tracking,
+        stop_tracking: action.releases_owner(),
+        owner_release_action: action.as_str().to_string(),
+        owner_release_best_effort: payload.owner_release_best_effort,
+        local_delete_performed,
+        owner_release,
         message,
     }))
 }
@@ -1037,6 +1329,7 @@ pub async fn delete_episode(
     Path(id): Path<String>,
     Json(payload): Json<DeleteEpisodeRequest>,
 ) -> ApiResult<Json<DeleteEpisodeResponse>> {
+    let action = EpisodeDeleteAction::from_request(&payload)?;
     let target = load_episode_delete_target(&state.db_pool, &id).await?;
     let store = ExtensionStore::new(&state.db_pool);
 
@@ -1050,24 +1343,59 @@ pub async fn delete_episode(
     )
     .await?;
 
-    let mut paths: HashSet<String> = HashSet::new();
-    paths.extend(target.file_paths.iter().cloned());
-    paths.extend(target.subtitle_paths.iter().cloned());
-    for path in paths {
-        delete_library_path(&path).await?;
+    let mut owner_release = None;
+    if action.blocks_episode() {
+        let series_id = Uuid::parse_str(&target.series.series_id)
+            .map_err(|_| ApiError::bad_request("series id is invalid"))?;
+        let episode_id = Uuid::parse_str(&target.episode_id)
+            .map_err(|_| ApiError::bad_request("episode id is invalid"))?;
+        let summary = dispatch_media_owner_release(
+            &state,
+            &store,
+            MediaOwnerReleaseRequest {
+                action: OwnerReleaseAction::BlockEpisode,
+                media_item_id: series_id,
+                media_type: target.series.media_type,
+                title: target.series.title.clone(),
+                year: target.series.year,
+                external_ids: target.series.external_ids.clone(),
+                episode: Some(OwnerReleaseEpisodeScope {
+                    episode_id,
+                    season_number: target.season_number,
+                    episode_number: target.episode_number,
+                    absolute_episode_number: target.absolute_episode_number,
+                }),
+                fail_on_owner_error: !payload.owner_release_best_effort,
+            },
+        )
+        .await
+        .map_err(|error| ApiError::conflict(format!("Failed to release episode owner: {error}")))?;
+        if !payload.owner_release_best_effort && summary.has_failures() {
+            return Err(ApiError::conflict(
+                "One or more media owners failed to release this episode.",
+            ));
+        }
+        owner_release = Some(summary);
     }
 
-    for media_file_id in &target.media_file_ids {
-        sqlx::query::<sqlx::Any>("DELETE FROM media_files WHERE id = ?")
-            .bind(media_file_id)
-            .execute(&state.db_pool)
+    if let Err(error) = delete_episode_locally(&state, &target).await {
+        if owner_release.is_some() {
+            let error_message = api_error_message(&error);
+            let series_id = Uuid::parse_str(&target.series.series_id)
+                .map_err(|_| ApiError::bad_request("series id is invalid"))?;
+            record_local_delete_failure_after_release(
+                &store,
+                series_id,
+                action.as_str(),
+                &error_message,
+            )
             .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            .map_err(|record_error| ApiError::internal(record_error.to_string()))?;
+        }
+        return Err(error);
     }
 
-    refresh_episode_has_file_state(&state.db_pool, &target.episode_id).await?;
-
-    if payload.block_in_elixir {
+    if action.blocks_episode() {
         store
             .upsert_managed_episode_tombstone(&NewManagedEpisodeTombstone {
                 media_type: target.series.media_type,
@@ -1094,7 +1422,7 @@ pub async fn delete_episode(
             .map_err(|error| ApiError::internal(error.to_string()))?;
     }
 
-    let message = if payload.block_in_elixir {
+    let message = if action.blocks_episode() {
         format!(
             "Deleted episode S{:02}E{:02} from Elixir and blocked it from being re-imported here.",
             target.season_number, target.episode_number
@@ -1109,7 +1437,11 @@ pub async fn delete_episode(
     Ok(Json(DeleteEpisodeResponse {
         id: target.episode_id,
         series_id: target.series.series_id,
-        blocked_in_elixir: payload.block_in_elixir,
+        blocked_in_elixir: action.blocks_episode(),
+        owner_release_action: action.as_str().to_string(),
+        owner_release_best_effort: payload.owner_release_best_effort,
+        local_delete_performed: true,
+        owner_release,
         message,
     }))
 }
@@ -1211,6 +1543,7 @@ async fn resolve_library_item_lifecycle(
     year: Option<i32>,
     external_ids: &ExternalIds,
 ) -> ApiResult<LibraryLifecycleResponse> {
+    let store = ExtensionStore::new(&state.db_pool);
     let lifecycle = resolve_library_item_lifecycle_resolved(
         state,
         item_id,
@@ -1221,28 +1554,45 @@ async fn resolve_library_item_lifecycle(
     )
     .await?;
     let blocked_episode_count = if matches!(media_type, MediaType::Series | MediaType::Anime) {
-        let store = ExtensionStore::new(&state.db_pool);
         load_series_episode_tombstones(&store, media_type, title, year, external_ids)
             .await?
             .len() as i32
     } else {
         0
     };
+    let owners = load_library_owner_responses(&store, item_id).await?;
+    let primary_owner = primary_owner_response(&owners);
+    let owner_release_supported = owners.iter().any(|owner| owner.release_supported);
+    let (owner_release_status, owner_release_status_reason) = latest_owner_release_state(&owners);
+    let owner_release_label = owner_release_label(primary_owner.as_ref());
     Ok(match lifecycle {
         Some(value) => {
-            let can_stop = can_stop_tracking(&value);
+            let can_stop = can_stop_tracking(&value) || owner_release_supported;
             LibraryLifecycleResponse {
                 tracked_by_manager: true,
                 manager_label: value.manager_label,
                 manager_implementation: value.manager_implementation,
                 can_stop_tracking: can_stop,
+                owner_release_supported,
+                owner_release_label,
+                owner_release_status,
+                owner_release_status_reason,
                 blocked_episode_count,
                 can_restore_blocked_episodes: blocked_episode_count > 0,
+                primary_owner,
+                owners,
             }
         }
         None => LibraryLifecycleResponse {
             blocked_episode_count,
             can_restore_blocked_episodes: blocked_episode_count > 0,
+            can_stop_tracking: owner_release_supported,
+            owner_release_supported,
+            owner_release_label,
+            owner_release_status,
+            owner_release_status_reason,
+            primary_owner,
+            owners,
             ..LibraryLifecycleResponse::default()
         },
     })
@@ -1253,6 +1603,11 @@ async fn resolve_library_item_card_lifecycle(
     item_id: &str,
 ) -> ApiResult<LibraryItemCardLifecycleResponse> {
     let store = ExtensionStore::new(&state.db_pool);
+    let owners = load_library_owner_responses(&store, item_id).await?;
+    let primary_owner = primary_owner_response(&owners);
+    let owner_release_supported = owners.iter().any(|owner| owner.release_supported);
+    let (owner_release_status, owner_release_status_reason) = latest_owner_release_state(&owners);
+    let owner_release_label = owner_release_label(primary_owner.as_ref());
     let item_uuid = Uuid::parse_str(item_id)
         .map_err(|_| ApiError::bad_request("library item id is invalid"))?;
     let Some(provenance) = store
@@ -1260,7 +1615,16 @@ async fn resolve_library_item_card_lifecycle(
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
     else {
-        return Ok(LibraryItemCardLifecycleResponse::default());
+        return Ok(LibraryItemCardLifecycleResponse {
+            can_stop_tracking: owner_release_supported,
+            owner_release_supported,
+            owner_release_label,
+            owner_release_status,
+            owner_release_status_reason,
+            primary_owner,
+            owners,
+            ..LibraryItemCardLifecycleResponse::default()
+        });
     };
     let lifecycle = enrich_provenance_with_provider(&store, provenance).await?;
     let manager_label =
@@ -1275,8 +1639,184 @@ async fn resolve_library_item_card_lifecycle(
     Ok(LibraryItemCardLifecycleResponse {
         tracked_by_manager: true,
         manager_label,
-        can_stop_tracking: can_stop_tracking(&lifecycle),
+        can_stop_tracking: can_stop_tracking(&lifecycle) || owner_release_supported,
+        owner_release_supported,
+        owner_release_label,
+        owner_release_status,
+        owner_release_status_reason,
+        primary_owner,
+        owners,
     })
+}
+
+async fn load_library_owner_responses(
+    store: &ExtensionStore<'_>,
+    item_id: &str,
+) -> ApiResult<Vec<LibraryOwnerResponse>> {
+    let item_uuid = Uuid::parse_str(item_id)
+        .map_err(|_| ApiError::bad_request("library item id is invalid"))?;
+    let owners = store
+        .ensure_media_ownerships_for_item(item_uuid)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let events = store
+        .list_media_owner_release_events_for_item(item_uuid)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(owners
+        .iter()
+        .map(|owner| library_owner_response(owner, &events))
+        .collect())
+}
+
+fn primary_owner_response(owners: &[LibraryOwnerResponse]) -> Option<LibraryOwnerResponse> {
+    owners
+        .iter()
+        .find(|owner| owner.owner_role == "primary")
+        .cloned()
+        .or_else(|| owners.first().cloned())
+}
+
+fn library_owner_response(
+    owner: &MediaOwnership,
+    events: &[MediaOwnerReleaseEvent],
+) -> LibraryOwnerResponse {
+    let latest_event = events.iter().find(|event| {
+        event
+            .ownership_id
+            .map(|ownership_id| ownership_id == owner.ownership_id)
+            .unwrap_or(false)
+    });
+    LibraryOwnerResponse {
+        ownership_id: owner.ownership_id.to_string(),
+        owner_type: owner.owner_type.clone(),
+        owner_role: owner.owner_role.clone(),
+        owner_label: owner.owner_label.clone(),
+        owner_implementation: owner.owner_implementation.clone(),
+        owner_provider_id: owner.owner_provider_id.map(|value| value.to_string()),
+        owner_instance_id: owner.owner_instance_id.map(|value| value.to_string()),
+        owner_extension_id: owner.owner_extension_id.clone(),
+        owner_external_id: owner.owner_external_id.clone(),
+        acquisition_subscription_id: owner
+            .acquisition_subscription_id
+            .map(|value| value.to_string()),
+        release_capability: owner.release_capability.clone(),
+        release_policy: owner.release_policy.clone(),
+        release_supported: owner_release_supported(owner),
+        release_label: owner_label(owner),
+        latest_release_status: latest_event.map(|event| event.status.clone()),
+        latest_release_status_reason: latest_event.and_then(|event| event.status_reason.clone()),
+        active: owner.active,
+    }
+}
+
+fn owner_release_events_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(100).clamp(1, 500)
+}
+
+fn owner_release_event_response(event: &MediaOwnerReleaseEvent) -> OwnerReleaseEventResponse {
+    OwnerReleaseEventResponse {
+        release_event_id: event.release_event_id.to_string(),
+        media_item_id: event.media_item_id.map(|value| value.to_string()),
+        ownership_id: event.ownership_id.map(|value| value.to_string()),
+        requested_action: event.requested_action.clone(),
+        owner_type: event.owner_type.clone(),
+        owner_label: event.owner_label.clone(),
+        owner_provider_id: event.owner_provider_id.map(|value| value.to_string()),
+        acquisition_subscription_id: event
+            .acquisition_subscription_id
+            .map(|value| value.to_string()),
+        status: event.status.clone(),
+        status_reason: event.status_reason.clone(),
+        request: event.request.as_ref().map(redact_owner_release_audit_value),
+        response: event
+            .response
+            .as_ref()
+            .map(redact_owner_release_audit_value),
+        created_at: event.created_at.to_rfc3339(),
+        updated_at: event.updated_at.to_rfc3339(),
+    }
+}
+
+fn redact_owner_release_audit_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut redacted = serde_json::Map::with_capacity(object.len());
+            for (key, value) in object {
+                if is_sensitive_audit_key(key) {
+                    redacted.insert(key.clone(), Value::String("[redacted]".to_string()));
+                } else {
+                    redacted.insert(key.clone(), redact_owner_release_audit_value(value));
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(redact_owner_release_audit_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn is_sensitive_audit_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-' && *ch != '.')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "apikey" | "authorization" | "bearer" | "cookie" | "password" | "secret" | "token"
+    ) || normalized.ends_with("token")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("password")
+}
+
+fn owner_release_supported(owner: &MediaOwnership) -> bool {
+    match owner.owner_type.as_str() {
+        "acquisition" => owner.acquisition_subscription_id.is_some(),
+        "extension" => matches!(
+            owner.release_capability.as_str(),
+            "manager.remove_item" | "media.owner_release"
+        ),
+        _ => false,
+    }
+}
+
+fn owner_label(owner: &MediaOwnership) -> String {
+    match owner.owner_type.as_str() {
+        "acquisition" => "Stop Elixir acquisition monitoring".to_string(),
+        "extension" => {
+            let display = manager_display_name(
+                owner.owner_implementation.as_deref(),
+                owner.owner_label.as_deref(),
+            );
+            format!("Stop tracking in {display}")
+        }
+        "external" => "Local import".to_string(),
+        "system" => "System owner".to_string(),
+        _ => "Owner".to_string(),
+    }
+}
+
+fn owner_release_label(primary_owner: Option<&LibraryOwnerResponse>) -> String {
+    primary_owner
+        .map(|owner| owner.release_label.clone())
+        .unwrap_or_else(|| "Stop tracking in owner".to_string())
+}
+
+fn latest_owner_release_state(owners: &[LibraryOwnerResponse]) -> (Option<String>, Option<String>) {
+    owners
+        .iter()
+        .find_map(|owner| {
+            owner.latest_release_status.as_ref().map(|status| {
+                (
+                    Some(status.clone()),
+                    owner.latest_release_status_reason.clone(),
+                )
+            })
+        })
+        .unwrap_or((None, None))
 }
 
 async fn resolve_library_item_lifecycle_resolved(
@@ -1477,6 +2017,80 @@ async fn load_library_delete_target(
     })
 }
 
+async fn delete_library_item_locally(
+    state: &AppState,
+    item_id: &str,
+    target: &LibraryDeleteTarget,
+) -> ApiResult<()> {
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(target.file_paths.iter().cloned());
+    paths.extend(target.subtitle_paths.iter().cloned());
+    for path in paths {
+        delete_library_path(&path).await?;
+    }
+
+    match target.media_type {
+        MediaType::Movie => {
+            sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
+                .bind(item_id)
+                .execute(&state.db_pool)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        MediaType::Series | MediaType::Anime => {
+            sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = ?")
+                .bind(item_id)
+                .execute(&state.db_pool)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
+    sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
+        .bind(item_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn record_local_delete_failure_after_release(
+    store: &ExtensionStore<'_>,
+    media_item_id: Uuid,
+    action: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let owners = store.list_active_media_ownerships(media_item_id).await?;
+    for owner in owners {
+        store
+            .create_media_owner_release_event(&NewMediaOwnerReleaseEvent {
+                release_event_id: Uuid::new_v4(),
+                media_item_id: Some(media_item_id),
+                ownership_id: Some(owner.ownership_id),
+                requested_action: action.to_string(),
+                owner_type: owner.owner_type.clone(),
+                owner_label: owner.owner_label.clone(),
+                owner_provider_id: owner.owner_provider_id,
+                acquisition_subscription_id: owner.acquisition_subscription_id,
+                status: "rolled_back_local_delete".to_string(),
+                status_reason: Some(format!("Local delete failed after owner release: {reason}")),
+                request: Some(json!({
+                    "action": action,
+                    "mediaItemId": media_item_id,
+                    "owner": {
+                        "ownershipId": owner.ownership_id,
+                        "ownerType": owner.owner_type,
+                        "ownerLabel": owner.owner_label,
+                    }
+                })),
+                response: Some(json!({
+                    "localDeleteError": reason,
+                })),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 async fn load_series_identity_for_item(
     pool: &sqlx::AnyPool,
     item_id: &str,
@@ -1632,6 +2246,26 @@ async fn load_episode_delete_target(
         subtitle_paths,
         media_file_ids,
     })
+}
+
+async fn delete_episode_locally(state: &AppState, target: &EpisodeDeleteTarget) -> ApiResult<()> {
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(target.file_paths.iter().cloned());
+    paths.extend(target.subtitle_paths.iter().cloned());
+    for path in paths {
+        delete_library_path(&path).await?;
+    }
+
+    for media_file_id in &target.media_file_ids {
+        sqlx::query::<sqlx::Any>("DELETE FROM media_files WHERE id = ?")
+            .bind(media_file_id)
+            .execute(&state.db_pool)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+
+    refresh_episode_has_file_state(&state.db_pool, &target.episode_id).await?;
+    Ok(())
 }
 
 async fn load_series_episode_tombstones(

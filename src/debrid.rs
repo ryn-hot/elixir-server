@@ -75,6 +75,8 @@ const ALL_DEBRID_API_BASE: &str = "https://api.alldebrid.com/v4";
 #[allow(dead_code)]
 const PREMIUMIZE_API_BASE: &str = "https://www.premiumize.me/api";
 const REAL_DEBRID_POLL_INTERVAL_SECONDS: u64 = 20;
+const DEBRID_ACTIVE_JOB_CAP: i64 = 1;
+const DEBRID_MATERIALIZER_ACTIVE_JOB_LIMIT: i64 = 1;
 const REAL_DEBRID_USER_AGENT: &str = "Elixir/0.1 Real-Debrid";
 const TORBOX_USER_AGENT: &str = "Elixir/0.1 TorBox";
 const ALL_DEBRID_USER_AGENT: &str = "Elixir/0.1 AllDebrid";
@@ -1128,14 +1130,41 @@ impl TorBoxClient {
         torrent_id: &str,
         file: Option<&DebridRemoteFile>,
     ) -> Result<DebridResolvedLink> {
+        let _provider_url = self
+            .request_provider_download_url(
+                torrent_id,
+                file.map(|file| file.provider_file_id.as_str()),
+            )
+            .await?;
+        let stored_url = torbox_internal_download_url(torrent_id, file)?;
+        let file_id = file.map(|file| file.provider_file_id.clone());
+        Ok(DebridResolvedLink {
+            provider_file_id: file_id.clone(),
+            url: stored_url.clone(),
+            filename: file.map(|file| file.basename.clone()),
+            size_bytes: file.and_then(|file| file.size_bytes),
+            raw: Some(json!({
+                "torrentId": torrent_id,
+                "fileId": file_id,
+                "storedUrl": stored_url,
+                "providerUrlRedacted": true
+            })),
+        })
+    }
+
+    async fn request_provider_download_url(
+        &self,
+        torrent_id: &str,
+        file_id: Option<&str>,
+    ) -> Result<String> {
         let mut query = vec![
             ("token", self.token.trim()),
             ("torrent_id", torrent_id.trim()),
             ("redirect", "false"),
             ("append_name", "true"),
         ];
-        if let Some(file) = file {
-            query.push(("file_id", file.provider_file_id.as_str()));
+        if let Some(file_id) = file_id {
+            query.push(("file_id", file_id));
         } else {
             query.push(("zip_link", "true"));
         }
@@ -1147,17 +1176,7 @@ impl TorBoxClient {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("{} did not return a download URL", self.provider_name()))?;
-        Ok(DebridResolvedLink {
-            provider_file_id: file.map(|file| file.provider_file_id.clone()),
-            url: url.to_string(),
-            filename: file.map(|file| file.basename.clone()),
-            size_bytes: file.and_then(|file| file.size_bytes),
-            raw: Some(json!({
-                "torrentId": torrent_id,
-                "fileId": file.map(|file| file.provider_file_id.clone()),
-                "url": url
-            })),
-        })
+        Ok(url.to_string())
     }
 
     async fn request_download_links(
@@ -1445,6 +1464,22 @@ impl DebridProviderAdapter for TorBoxClient {
                 DebridServiceKind::TorBox.display_name()
             );
         }
+        if let Some(reference) = torbox_internal_download_ref(link)? {
+            let url = self
+                .request_provider_download_url(&reference.torrent_id, reference.file_id.as_deref())
+                .await?;
+            return Ok(DebridResolvedLink {
+                provider_file_id: reference.file_id,
+                url,
+                filename: reference.filename,
+                size_bytes: reference.size_bytes,
+                raw: Some(json!({
+                    "torrentId": reference.torrent_id,
+                    "storedUrl": link,
+                    "providerUrlRedacted": true
+                })),
+            });
+        }
         Ok(DebridResolvedLink {
             provider_file_id: None,
             url: link.to_string(),
@@ -1510,7 +1545,7 @@ struct AllDebridUploadedMagnet {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AllDebridStatusResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_all_debrid_status_magnets")]
     magnets: Vec<AllDebridMagnetStatus>,
 }
 
@@ -1534,6 +1569,29 @@ struct AllDebridMagnetStatus {
     seeders: Option<u64>,
     #[serde(default)]
     files: Vec<Value>,
+}
+
+fn deserialize_all_debrid_status_magnets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<AllDebridMagnetStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom),
+        Value::Object(_) => serde_json::from_value(value)
+            .map(|item| vec![item])
+            .map_err(serde::de::Error::custom),
+        Value::Null => Ok(Vec::new()),
+        other => Err(serde::de::Error::custom(format!(
+            "expected AllDebrid magnets array or object, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4414,6 +4472,74 @@ fn torbox_error_is_not_found(err: &anyhow::Error) -> bool {
     message.contains("not found") || message.contains("404")
 }
 
+struct TorBoxInternalDownloadRef {
+    torrent_id: String,
+    file_id: Option<String>,
+    filename: Option<String>,
+    size_bytes: Option<u64>,
+}
+
+fn torbox_internal_download_url(
+    torrent_id: &str,
+    file: Option<&DebridRemoteFile>,
+) -> Result<String> {
+    let mut url = Url::parse("elixir-debrid://torbox/download")
+        .context("building internal TorBox download reference")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("torrent_id", torrent_id.trim());
+        if let Some(file) = file {
+            query.append_pair("file_id", file.provider_file_id.as_str());
+            query.append_pair("filename", file.basename.as_str());
+            if let Some(size) = file.size_bytes {
+                query.append_pair("size", &size.to_string());
+            }
+        } else {
+            query.append_pair("zip_link", "true");
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn torbox_internal_download_ref(link: &str) -> Result<Option<TorBoxInternalDownloadRef>> {
+    let Ok(url) = Url::parse(link.trim()) else {
+        return Ok(None);
+    };
+    if url.scheme() != "elixir-debrid"
+        || url.host_str() != Some("torbox")
+        || url.path() != "/download"
+    {
+        return Ok(None);
+    }
+    let mut torrent_id = None::<String>;
+    let mut file_id = None::<String>;
+    let mut filename = None::<String>;
+    let mut size_bytes = None::<u64>;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "torrent_id" => torrent_id = non_empty(value.as_ref()).map(str::to_string),
+            "file_id" => file_id = non_empty(value.as_ref()).map(str::to_string),
+            "filename" => filename = non_empty(value.as_ref()).map(str::to_string),
+            "size" => {
+                if let Some(value) = non_empty(value.as_ref()) {
+                    size_bytes = Some(value.parse::<u64>().with_context(|| {
+                        format!("parsing internal TorBox download size '{value}'")
+                    })?);
+                }
+            }
+            _ => {}
+        }
+    }
+    let torrent_id =
+        torrent_id.context("internal TorBox download reference is missing torrent_id")?;
+    Ok(Some(TorBoxInternalDownloadRef {
+        torrent_id,
+        file_id,
+        filename,
+        size_bytes,
+    }))
+}
+
 fn torbox_create_torrent_limiter_key(base_url: &str, token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_url.trim().as_bytes());
@@ -4902,6 +5028,14 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
     adapter: &A,
 ) -> Result<Uuid> {
     let source_kind = debrid_source_kind(source)?;
+    if !options.paused {
+        let active_jobs = count_active_debrid_jobs_for_instance(pool, instance_id).await?;
+        if active_jobs >= DEBRID_ACTIVE_JOB_CAP {
+            bail!(
+                "Debrid route capacity reached: active Debrid jobs {active_jobs}/{DEBRID_ACTIVE_JOB_CAP}"
+            );
+        }
+    }
     let job_id = Uuid::new_v4();
     let mut remote_torrent_id = None;
     let mut remote_download_id = None;
@@ -7008,7 +7142,8 @@ pub async fn cancel_real_debrid_job(
 }
 
 async fn process_debrid_jobs_once(state: &AppState) -> Result<()> {
-    let jobs = list_active_debrid_jobs(&state.db_pool, 8).await?;
+    let jobs =
+        list_active_debrid_jobs(&state.db_pool, DEBRID_MATERIALIZER_ACTIVE_JOB_LIMIT).await?;
     if jobs.is_empty() {
         return Ok(());
     }
@@ -7550,6 +7685,23 @@ async fn list_active_debrid_jobs(
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(|row| map_debrid_job(&row)).collect()
+}
+
+async fn count_active_debrid_jobs_for_instance(
+    pool: &sqlx::AnyPool,
+    instance_id: Uuid,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM debrid_download_jobs
+         WHERE instance_id = ?
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required')",
+    )
+    .bind(instance_id.to_string())
+    .fetch_one(pool)
+    .await
+    .context("counting active Debrid jobs for instance")?;
+    Ok(count)
 }
 
 async fn list_refreshable_debrid_jobs(
@@ -10257,8 +10409,9 @@ mod tests {
         assert!(
             selected.links[0]
                 .url
-                .ends_with("/api/download/77/Show.S01E01.mkv")
+                .starts_with("elixir-debrid://torbox/download?")
         );
+        assert!(!selected.links[0].url.contains("good-token"));
         assert_eq!(
             selected.links[0].filename.as_deref(),
             Some("Show.S01E01.mkv")
@@ -10272,6 +10425,17 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].provider_file_id.as_deref(), Some("10"));
         assert_eq!(links[1].provider_file_id.as_deref(), Some("11"));
+
+        let internal_unrestricted = adapter.unrestrict_hoster(&selected.links[0].url).await?;
+        assert!(
+            internal_unrestricted
+                .url
+                .ends_with("/api/download/77/Show.S01E01.mkv")
+        );
+        assert_eq!(
+            internal_unrestricted.filename.as_deref(),
+            Some("Show.S01E01.mkv")
+        );
 
         let unrestricted = adapter
             .unrestrict_hoster("https://download.torbox.test/77/Show.S01E01.mkv")
@@ -12853,6 +13017,68 @@ mod tests {
                 .remove(remote_release_id)
                 .is_some())
         }
+    }
+
+    #[tokio::test]
+    async fn debrid_submit_enforces_single_active_job_cap() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let adapter = FakeDebridAdapter::new();
+        let first_source = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let second_source = "magnet:?xt=urn:btih:89abcdef012345670123456789abcdef01234567";
+
+        let first_job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            first_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E01.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+
+        let err = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            second_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E02.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await
+        .expect_err("second active Debrid submit should hit route capacity");
+        assert!(err.to_string().contains("Debrid route capacity reached"));
+
+        mark_debrid_job_status(&database.pool, first_job_id, "completed", None).await?;
+        let second_job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            second_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E02.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+        assert_ne!(first_job_id, second_job_id);
+        Ok(())
     }
 
     fn test_debrid_release(

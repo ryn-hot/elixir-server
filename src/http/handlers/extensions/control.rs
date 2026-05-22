@@ -3563,6 +3563,7 @@ mod tests {
                 policies: None,
                 networking: None,
                 control_surface: None,
+                owner_release: None,
             },
             summary: ExtensionStatusSummaryItem {
                 extension_id: "elixir.modules.sonarr".to_string(),

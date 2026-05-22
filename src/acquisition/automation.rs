@@ -84,8 +84,8 @@ const METADATA_BATCH_LIMIT: i64 = 5;
 const SEARCH_BATCH_LIMIT: i64 = 20;
 const FALLBACK_BATCH_LIMIT: i64 = 50;
 const DEFAULT_CANDIDATE_LIMIT: u32 = 25;
-const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 10;
-const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 3;
+const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 1;
+const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP: i64 = 2;
 const DEFAULT_GLOBAL_RELEASE_JOB_CAP: i64 = 12;
@@ -5884,9 +5884,9 @@ mod tests {
                 subscription_active: 1,
                 subscription_limit: 5,
                 route_active: 0,
-                route_limit: Some(10),
+                route_limit: Some(1),
                 subscription_route_active: 0,
-                subscription_route_limit: Some(3),
+                subscription_route_limit: Some(1),
                 searches_this_tick: 1,
                 search_tick_limit: 20,
                 submissions_this_tick: 0,
@@ -5961,7 +5961,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_governor_enforces_subscription_route_caps() {
+    fn queue_governor_enforces_debrid_single_lane_route_cap() {
         let subscription_id = Uuid::new_v4();
         let mut governor = empty_queue_governor();
 
@@ -5970,33 +5970,17 @@ mod tests {
                 .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
                 .is_ok()
         );
-        assert!(
-            governor
-                .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
-                .is_ok()
-        );
-        assert!(
-            governor
-                .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
-                .is_ok()
-        );
         let block = governor
             .try_reserve_loaded(subscription_id, DEBRID_DEFAULT_LOGICAL_ID)
-            .expect_err("subscription route cap");
+            .expect_err("debrid route cap");
 
-        assert_eq!(block.kind, QueueCapacityLimitKind::SubscriptionRoute);
+        assert_eq!(block.kind, QueueCapacityLimitKind::Route);
         assert_eq!(
             block.route_logical_id.as_deref(),
             Some(DEBRID_DEFAULT_LOGICAL_ID)
         );
-        assert_eq!(
-            block.subscription_active,
-            DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP
-        );
-        assert_eq!(
-            block.subscription_limit,
-            DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP
-        );
+        assert_eq!(block.global_active, DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP);
+        assert_eq!(block.global_limit, DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP);
     }
 
     #[test]
