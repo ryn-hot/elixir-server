@@ -224,7 +224,7 @@ impl LinkerService {
             return Ok(Vec::new());
         }
         let resp: Option<serde_json::Value> = self
-            .tvdb_get_json(&format!("/series/{}/seasons", tvdb_series_id), &[])
+            .tvdb_get_json(&format!("/series/{}/extended", tvdb_series_id), &[])
             .await?;
         let Some(value) = resp else {
             return Ok(Vec::new());
@@ -694,4 +694,74 @@ fn select_title(title_map: Option<&HashMap<String, String>>) -> Option<String> {
         return Some(romaji.clone());
     }
     map.values().next().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::{
+        Json, Router,
+        extract::Path as AxumPath,
+        routing::{get, post},
+    };
+    use serde_json::json;
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    async fn start_mock_tvdb_series_server() -> Result<(String, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let app = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(json!({ "data": { "token": "test-token" } })) }),
+            )
+            .route(
+                "/series/:series_id/extended",
+                get(|AxumPath(series_id): AxumPath<String>| async move {
+                    Json(json!({
+                        "data": {
+                            "id": series_id.parse::<i64>().unwrap_or_default(),
+                            "seasons": [
+                                { "id": 10, "number": 0 },
+                                { "id": 11, "number": 1 },
+                                { "id": 12, "number": 2 }
+                            ]
+                        }
+                    }))
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok((base_url, shutdown_tx))
+    }
+
+    #[tokio::test]
+    async fn fetch_tvdb_series_seasons_uses_extended_endpoint() -> Result<()> {
+        let (base_url, shutdown_tx) = start_mock_tvdb_series_server().await?;
+        let mut config = ClassifierConfig::default();
+        config.tvdb_base_url = base_url;
+        config.tvdb_api_key = Some("test-key".to_string());
+        let service = LinkerService::new(config)?;
+
+        let seasons = service.fetch_tvdb_series_seasons("338186").await?;
+
+        let _ = shutdown_tx.send(());
+        assert_eq!(seasons.len(), 3);
+        assert_eq!(
+            seasons[1].get("number").and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        Ok(())
+    }
 }

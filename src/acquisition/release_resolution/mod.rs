@@ -5,5 +5,6 @@ pub mod anime;
 pub mod fingerprint;
 pub mod hashing;
 pub mod models;
+pub mod review_candidates;
 pub mod store;
 pub mod tv;

@@ -10,9 +10,11 @@ use super::control_contract::{
 };
 use super::*;
 use crate::debrid::{
-    DebridAccount, DebridServiceKind, active_debrid_service_from_config,
+    DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY, DebridAccount, DebridServiceKind,
+    MAX_DEBRID_CONCURRENT_DOWNLOADS, MIN_DEBRID_CONCURRENT_DOWNLOADS,
+    active_debrid_service_from_config, debrid_concurrent_downloads_from_config,
     debrid_secret_exists_for_instance, reconcile_debrid_provider_for_instance,
-    test_debrid_service_account,
+    test_debrid_service_account, validate_debrid_concurrent_downloads,
 };
 use crate::drivers::render_nzbget_config_text_updates;
 use crate::extensions::managed_paths::{
@@ -323,6 +325,20 @@ impl ExtensionControlProvider for DebridControlAdapter {
                 continue;
             }
 
+            if field_id == DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY {
+                let cap = parse_debrid_concurrent_downloads_setting(value)?;
+                let mut config = load_instance_config_object(store, instance.instance_id).await?;
+                config.insert(
+                    DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY.to_string(),
+                    json!(cap),
+                );
+                store
+                    .update_instance_config(instance.instance_id, Some(&Value::Object(config)))
+                    .await?;
+                should_reconcile = true;
+                continue;
+            }
+
             if parse_debrid_token_field_id(field_id)?.is_some() {
                 continue;
             }
@@ -496,26 +512,44 @@ async fn build_debrid_accounts_section(
     instance: &ExtensionInstance,
 ) -> anyhow::Result<ExtensionControlSection> {
     let active_service = active_debrid_service_from_config(instance.config_json.as_ref())?;
+    let concurrent_downloads =
+        debrid_concurrent_downloads_from_config(instance.config_json.as_ref());
     let validation = debrid_validation_map(instance.config_json.as_ref());
-    let mut fields = vec![ExtensionControlField {
-        id: "activeService".to_string(),
-        label: "Active service".to_string(),
-        description: "New acquisition.debrid.default submissions use this debrid service."
-            .to_string(),
-        field_type: "select".to_string(),
-        value: json!(active_service.implementation_id()),
-        required: true,
-        readonly: false,
-        secret: false,
-        options: DebridServiceKind::ALL
-            .into_iter()
-            .map(|service| ExtensionControlOption {
-                value: json!(service.implementation_id()),
-                label: service.display_name().to_string(),
-            })
-            .collect(),
-        validation: None,
-    }];
+    let mut fields = vec![
+        ExtensionControlField {
+            id: "activeService".to_string(),
+            label: "Active service".to_string(),
+            description: "New acquisition.debrid.default submissions use this debrid service."
+                .to_string(),
+            field_type: "select".to_string(),
+            value: json!(active_service.implementation_id()),
+            required: true,
+            readonly: false,
+            secret: false,
+            options: DebridServiceKind::ALL
+                .into_iter()
+                .map(|service| ExtensionControlOption {
+                    value: json!(service.implementation_id()),
+                    label: service.display_name().to_string(),
+                })
+                .collect(),
+            validation: None,
+        },
+        ExtensionControlField {
+            id: DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY.to_string(),
+            label: "Concurrent Debrid downloads".to_string(),
+            description: format!(
+                "Default is 1. Check your active Debrid service and account plan before changing this. Values above provider limits can cause rate limits or failed downloads. Allowed range: {MIN_DEBRID_CONCURRENT_DOWNLOADS}-{MAX_DEBRID_CONCURRENT_DOWNLOADS}."
+            ),
+            field_type: "number".to_string(),
+            value: json!(concurrent_downloads),
+            required: true,
+            readonly: false,
+            secret: false,
+            options: Vec::new(),
+            validation: None,
+        },
+    ];
     let mut entities = Vec::new();
 
     for service in DebridServiceKind::ALL {
@@ -952,6 +986,27 @@ fn parse_debrid_service_value(value: &Value) -> anyhow::Result<DebridServiceKind
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("debrid service must be text"))?;
     DebridServiceKind::from_implementation_id(raw)
+}
+
+fn parse_debrid_concurrent_downloads_setting(value: &Value) -> anyhow::Result<i64> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|number| number.fract() == 0.0)
+                .map(|number| number as i64)
+        })
+        .or_else(|| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| text.parse::<i64>().ok())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Debrid concurrent downloads must be a whole number"))?;
+    validate_debrid_concurrent_downloads(raw)
 }
 
 fn debrid_service_from_action(

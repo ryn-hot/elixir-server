@@ -15,10 +15,11 @@ use uuid::Uuid;
 use crate::{
     acquisition::release_resolution::{
         anime::{
-            AnimeCandidateInput, AnimeCandidateScore, AnimeCandidateScoringContext,
-            AnimeCandidateTarget, AnimeFileCoveragePlan, AnimeMetadataGraphInput,
-            AnimeReleaseFileInput, AnimeSeasonMapping, build_anime_metadata_graph,
-            infer_anizip_season_number, plan_anime_file_coverage, score_anime_candidate,
+            ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
+            AnimeCandidateScoringContext, AnimeCandidateTarget, AnimeFileCoveragePlan,
+            AnimeMetadataGraphInput, AnimeReleaseFileInput, AnimeSeasonMapping,
+            build_anime_metadata_graph, infer_anizip_season_number, plan_anime_file_coverage,
+            score_anime_candidate,
         },
         fingerprint::candidate_release_fingerprint,
         models::{
@@ -26,6 +27,10 @@ use crate::{
             NewAcquisitionAnimeGraphSnapshot, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
             NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
             ReleaseCoverageState, ReleaseJobState, ReleaseKind, ReleaseResolverKind,
+        },
+        review_candidates::{
+            ManualReviewResolverEvidence, ManualReviewRoutePolicyEvidence, ManualReviewTargetScope,
+            NewManualReviewCandidateRelease, upsert_manual_review_candidate_release,
         },
         store::{
             count_active_release_jobs, count_active_release_jobs_by_route,
@@ -45,11 +50,14 @@ use crate::{
         AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
         NewAcquisitionTarget, get_target, list_due_candidate_targets,
         list_due_metadata_subscriptions, list_submitted_debrid_targets, list_subscription_targets,
-        list_subscriptions, record_metadata_refresh, update_subscription_external_ids,
-        update_target_state, upsert_subscription_targets,
+        list_subscriptions, record_metadata_refresh, reset_target_for_candidate_retry,
+        update_subscription_external_ids, update_target_state, upsert_subscription_targets,
     },
     db::models::{MediaType, ProviderHealthState},
-    debrid::get_debrid_job_status,
+    debrid::{
+        DebridFailureClass, DebridFailureResponsePolicy, active_debrid_concurrent_downloads,
+        get_debrid_job_status,
+    },
     download_broker::{
         DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
     },
@@ -61,9 +69,13 @@ use crate::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
                 CandidateRouteOption, CandidateScoreBadge, CandidateSearchIntent,
                 CandidateSearchPreferences, CandidateSearchRequest, CandidateSearchResponse,
-                CandidateSearchTarget, search_candidates_with_store,
+                CandidateSearchTarget, acquisition_candidate_tracker_count,
+                search_candidates_with_store,
             },
-            download_broker::{DownloadBrokerSubmitRequest, submit_to_broker},
+            download_broker::{
+                DownloadBrokerSubmitRequest, DownloadBrokerSubmitResponse,
+                process_stale_qbittorrent_acquisition_releases, submit_to_broker,
+            },
         },
     },
     library::{AniListSeasonChainEntry, resolve_anilist_season_chain},
@@ -96,6 +108,8 @@ const DEFAULT_STAGED_INSPECTION_JOB_CAP: i64 = 10;
 const DEFAULT_STALE_ACTIVE_JOB_SECONDS: i64 = 6 * 60 * 60;
 const PACK_BACKFILL_TARGET_THRESHOLD: usize = 3;
 const QUEUE_CAPACITY_RETRY_SECONDS: i64 = 5 * 60;
+const FALLBACK_NEXT_CANDIDATE_RETRY_SECONDS: i64 = 30;
+const MAX_MANUAL_REVIEW_CANDIDATES_PER_GROUP: usize = 5;
 
 #[derive(Debug, Clone)]
 struct CandidateSubmission {
@@ -106,6 +120,12 @@ struct CandidateSubmission {
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
     tv_coverage_plan: Option<TvCoveragePlan>,
     dispatch: Option<SchedulerDispatchEvidence>,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingReleaseReuse {
+    download_id: String,
+    selected_provider_id: Option<Uuid>,
 }
 
 impl CandidateSubmission {
@@ -138,6 +158,19 @@ struct CandidateReleasePlan {
     overfetch_count: usize,
 }
 
+#[derive(Debug, Clone)]
+struct CandidateReviewPlan {
+    candidate: AcquisitionCandidate,
+    release_kind: ReleaseKind,
+    resolver_kind: ReleaseResolverKind,
+    resolver_version: String,
+    confidence: ReleaseConfidence,
+    rejection_codes: Vec<String>,
+    parsed_release: Option<JsonValue>,
+    score: Option<f64>,
+    reason: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SchedulerDispatchEvidence {
@@ -159,12 +192,14 @@ struct SchedulerPlanScoreEvidence {
     resolver_version: String,
     route_preference_score: i32,
     cached_debrid_score: i32,
+    freshness_score: i32,
+    tracker_count: usize,
     quality_score: i32,
     seeders: Option<u32>,
     overfetch_count: usize,
     source_rank: Option<u32>,
     source_score: Option<f64>,
-    score_tuple: (i32, usize, i32, i32, i32, i32, i64, i32, i32, i32),
+    score_tuple: (i32, usize, i32, i32, i32, i32, i32, i64, i32, i32, i32),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -198,7 +233,14 @@ struct QueueCapacitySnapshot {
 #[derive(Debug, Default)]
 struct CandidateReleasePlanBatch {
     plans: Vec<CandidateReleasePlan>,
+    review_candidates: Vec<CandidateReviewPlan>,
     capacity_block: Option<QueueCapacityBlock>,
+    candidate_count: usize,
+    policy_rejected_count: usize,
+    preference_rejected_count: usize,
+    already_claimed_count: usize,
+    resolver_rejected_count: usize,
+    route_unavailable_count: usize,
 }
 
 impl CandidateReleasePlan {
@@ -334,7 +376,10 @@ struct QueueGovernor {
 
 impl QueueGovernor {
     async fn load(pool: &sqlx::AnyPool) -> Result<Self> {
-        let caps = QueueGovernorCaps::default();
+        let mut caps = QueueGovernorCaps::default();
+        let debrid_cap = active_debrid_concurrent_downloads(pool).await?;
+        caps.global_debrid = debrid_cap;
+        caps.subscription_debrid = debrid_cap;
         let stale_before = Utc::now() - ChronoDuration::seconds(caps.stale_active_job_seconds);
         let mut active_by_route = HashMap::new();
         for route in [DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID] {
@@ -749,6 +794,7 @@ pub async fn start_acquisition_automation_loop(state: AppState) {
 
 pub(crate) async fn run_acquisition_automation_iteration(state: &AppState) -> Result<()> {
     refresh_due_metadata(state).await?;
+    process_stale_qbittorrent_acquisition_releases(state, FALLBACK_BATCH_LIMIT).await?;
     search_due_targets(state).await?;
     retry_failed_debrid_targets_with_torrent(state).await?;
     Ok(())
@@ -998,22 +1044,43 @@ async fn search_and_submit_group(
     let request =
         candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
     let response = search_candidates_with_store(&state.db_pool, request).await?;
+    process_candidate_search_response_for_group(
+        state,
+        subscription,
+        group,
+        &response,
+        &target,
+        now,
+        governor,
+    )
+    .await
+}
+
+async fn process_candidate_search_response_for_group(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    group: &TargetSearchGroup,
+    response: &CandidateSearchResponse,
+    target: &AcquisitionTarget,
+    now: DateTime<Utc>,
+    governor: &mut QueueGovernor,
+) -> Result<()> {
     let grouped_targets = if !group.targets.is_empty() {
         group.targets.clone()
     } else {
         vec![target.clone()]
     };
-    let batch = build_candidate_release_plans(
+    let mut batch = build_candidate_release_plans(
         state,
         subscription,
-        &response,
-        &target,
+        response,
+        target,
         &grouped_targets,
         governor,
     )
     .await?;
     let selected_plans = select_bounded_release_plans(
-        batch.plans,
+        std::mem::take(&mut batch.plans),
         subscription.route_policy,
         &grouped_targets,
         governor.remaining_submission_slots(),
@@ -1024,21 +1091,28 @@ async fn search_and_submit_group(
             defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
             return Ok(());
         }
+        if !batch.review_candidates.is_empty() {
+            persist_group_manual_review_candidates(
+                state,
+                subscription,
+                group,
+                response,
+                &grouped_targets,
+                batch.review_candidates,
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
         let next_after = next_candidate_retry_after(subscription, &target, now);
+        let state_reason = no_matching_candidates_reason(&batch, group);
         update_group_targets_for_retry(
             state,
             subscription,
             &grouped_targets,
             AcquisitionTargetStateUpdate {
                 state: AcquisitionTargetState::Pending,
-                state_reason: Some(format!(
-                    "No matching acquisition candidates were found for {}.",
-                    group
-                        .search_intent
-                        .as_ref()
-                        .map(|intent| intent.kind.as_str())
-                        .unwrap_or("target")
-                )),
+                state_reason: Some(state_reason),
                 selected_provider_id: Some(response.provider.provider_id),
                 next_search_after: Some(next_after),
                 increment_search_attempts: true,
@@ -1096,12 +1170,22 @@ async fn build_candidate_release_plans(
     governor: &mut QueueGovernor,
 ) -> Result<CandidateReleasePlanBatch> {
     let mut batch = CandidateReleasePlanBatch::default();
-    for candidate in response
-        .candidates
-        .iter()
-        .filter(|candidate| candidate_allowed_by_policy(candidate, subscription.route_policy))
-    {
+    for candidate in &response.candidates {
+        batch.candidate_count += 1;
+        if !candidate_allowed_by_policy(candidate, subscription.route_policy) {
+            batch.policy_rejected_count += 1;
+            continue;
+        }
         if !candidate_allowed_by_subscription_preferences(candidate, subscription) {
+            batch.preference_rejected_count += 1;
+            continue;
+        }
+        if !candidate_has_available_route_for_policy(
+            candidate,
+            &response.route_options,
+            subscription.route_policy,
+        ) {
+            batch.route_unavailable_count += 1;
             continue;
         }
         let fingerprint =
@@ -1113,17 +1197,36 @@ async fn build_candidate_release_plans(
         )
         .await?
         {
+            batch.already_claimed_count += 1;
             continue;
         }
         let Some(coverage) =
             analyze_candidate_coverage(subscription, representative, grouped_targets, candidate)
         else {
+            batch.resolver_rejected_count += 1;
+            if let Some(plan) = build_manual_review_candidate_plan(
+                subscription,
+                representative,
+                grouped_targets,
+                candidate,
+            )? {
+                batch.review_candidates.push(plan);
+            }
             continue;
         };
         if coverage.confidence == ReleaseConfidence::ReviewRequired
             || coverage.confidence == ReleaseConfidence::Low
             || coverage.covered_target_ids.is_empty()
         {
+            batch.resolver_rejected_count += 1;
+            if let Some(plan) = build_manual_review_candidate_plan(
+                subscription,
+                representative,
+                grouped_targets,
+                candidate,
+            )? {
+                batch.review_candidates.push(plan);
+            }
             continue;
         }
         let route_selection = match select_candidate_route_for_plan(
@@ -1142,6 +1245,7 @@ async fn build_candidate_release_plans(
                     subscription_id = %subscription.subscription_id,
                     "candidate route unavailable during RR-6C planning: {err}"
                 );
+                batch.route_unavailable_count += 1;
                 continue;
             }
         };
@@ -1169,7 +1273,347 @@ async fn build_candidate_release_plans(
     batch
         .plans
         .sort_by(|left, right| compare_release_plans(right, left, subscription.route_policy));
+    batch.review_candidates.sort_by(|left, right| {
+        compare_review_candidate_plans(right, left, subscription.route_policy)
+    });
     Ok(batch)
+}
+
+fn no_matching_candidates_reason(
+    batch: &CandidateReleasePlanBatch,
+    group: &TargetSearchGroup,
+) -> String {
+    let intent = group
+        .search_intent
+        .as_ref()
+        .map(|intent| intent.kind.as_str())
+        .unwrap_or("target");
+    if batch.candidate_count == 0 {
+        return format!("No acquisition candidates were returned for {intent}.");
+    }
+    if batch.policy_rejected_count == batch.candidate_count {
+        return format!(
+            "Candidates were returned for {intent}, but none matched the configured route policy."
+        );
+    }
+    if batch.preference_rejected_count == batch.candidate_count {
+        return format!(
+            "Candidates were returned for {intent}, but none matched the subscription preferences."
+        );
+    }
+    if batch.already_claimed_count == batch.candidate_count {
+        return format!(
+            "Candidates were returned for {intent}, but every candidate has already been tried or suppressed."
+        );
+    }
+    if batch.route_unavailable_count > 0 && batch.route_unavailable_count >= batch.candidate_count {
+        return format!(
+            "Candidates were returned for {intent}, but no allowed acquisition route is currently available."
+        );
+    }
+    if batch.resolver_rejected_count > 0 {
+        return format!(
+            "Candidates were returned for {intent}, but Elixir could not safely match them."
+        );
+    }
+    format!("No matching acquisition candidates were found for {intent}.")
+}
+
+async fn persist_group_manual_review_candidates(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    group: &TargetSearchGroup,
+    response: &CandidateSearchResponse,
+    grouped_targets: &[AcquisitionTarget],
+    review_candidates: Vec<CandidateReviewPlan>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let target_scope = manual_review_target_scope(subscription, grouped_targets);
+    let selected = select_bounded_review_candidates(review_candidates);
+    let mut release_count = 0usize;
+    for plan in selected {
+        let route_policy =
+            manual_review_route_policy_evidence(subscription, response, &plan.candidate);
+        upsert_manual_review_candidate_release(
+            &state.db_pool,
+            NewManualReviewCandidateRelease {
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: Some(response.provider.provider_id),
+                source_extension_id: response.provider.extension_id.clone(),
+                owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                media_type: subscription.media_type,
+                title: subscription.title.clone(),
+                candidate: plan.candidate,
+                target_scope: target_scope.clone(),
+                resolver_evidence: ManualReviewResolverEvidence {
+                    resolver_kind: plan.resolver_kind,
+                    resolver_version: plan.resolver_version,
+                    parsed_release: plan.parsed_release,
+                    rejection_codes: plan.rejection_codes,
+                    candidate_score: plan.score,
+                    reason: Some(plan.reason.clone()),
+                },
+                route_policy,
+                release_kind: plan.release_kind,
+                score: plan.score,
+                state_reason: Some(plan.reason),
+            },
+        )
+        .await?;
+        release_count += 1;
+    }
+
+    let next_after = next_candidate_retry_after(subscription, &group.representative, now);
+    update_group_targets_for_retry(
+        state,
+        subscription,
+        grouped_targets,
+        AcquisitionTargetStateUpdate {
+            state: AcquisitionTargetState::Pending,
+            state_reason: Some(format!(
+                "Candidates found; awaiting manual release selection ({release_count} review item{}).",
+                if release_count == 1 { "" } else { "s" }
+            )),
+            selected_provider_id: Some(response.provider.provider_id),
+            next_search_after: Some(next_after),
+            increment_search_attempts: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    debug!(
+        subscription_id = %subscription.subscription_id,
+        provider_id = %response.provider.provider_id,
+        group_key = group.group_key.as_str(),
+        release_count,
+        "persisted manual review acquisition candidates"
+    );
+    Ok(())
+}
+
+fn select_bounded_review_candidates(
+    mut candidates: Vec<CandidateReviewPlan>,
+) -> Vec<CandidateReviewPlan> {
+    candidates.truncate(MAX_MANUAL_REVIEW_CANDIDATES_PER_GROUP);
+    candidates
+}
+
+fn build_manual_review_candidate_plan(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    grouped_targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+) -> Result<Option<CandidateReviewPlan>> {
+    let targets = if grouped_targets.is_empty() {
+        vec![representative.clone()]
+    } else {
+        grouped_targets.to_vec()
+    };
+    match subscription.media_type {
+        MediaType::Movie => Ok(None),
+        MediaType::Series => Ok(Some(build_tv_manual_review_candidate(candidate, &targets)?)),
+        MediaType::Anime => Ok(Some(build_anime_manual_review_candidate(
+            subscription,
+            representative,
+            &targets,
+            candidate,
+        )?)),
+    }
+}
+
+fn build_tv_manual_review_candidate(
+    candidate: &AcquisitionCandidate,
+    targets: &[AcquisitionTarget],
+) -> Result<CandidateReviewPlan> {
+    let tv_targets = tv_targets_for_acquisition_targets(targets);
+    let resolver = TvSonarrStyleResolver;
+    let parsed = resolver.parse_title(&candidate.title);
+    let files = tv_release_file_inputs(candidate);
+    let plan = resolver.plan_coverage(
+        &parsed,
+        &tv_targets,
+        &files,
+        TvCoverageOptions {
+            allow_partial_pack: false,
+            file_selection_supported: candidate_file_selection_supported(candidate),
+        },
+    );
+    let mut rejection_codes = plan
+        .rejection_reasons
+        .iter()
+        .map(|reason| reason.as_str().to_string())
+        .collect::<Vec<_>>();
+    if tv_targets.is_empty() {
+        rejection_codes.push("missing_tv_target_scope".to_string());
+    }
+    if plan.confidence == ReleaseConfidence::ReviewRequired {
+        rejection_codes.push("review_required_confidence".to_string());
+    }
+    if plan.confidence == ReleaseConfidence::Low {
+        rejection_codes.push("low_confidence".to_string());
+    }
+    if plan.entries.is_empty() {
+        rejection_codes.push("no_safe_target_coverage".to_string());
+    }
+    rejection_codes.sort();
+    rejection_codes.dedup();
+    let release_kind = if plan.release_kind == ReleaseKind::Unknown {
+        parsed.release_kind
+    } else {
+        plan.release_kind
+    };
+    let reason = manual_review_reason(&rejection_codes, "TV");
+    Ok(CandidateReviewPlan {
+        candidate: candidate.clone(),
+        release_kind,
+        resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+        resolver_version: TV_SONARR_STYLE_RESOLVER_VERSION.to_string(),
+        confidence: plan.confidence,
+        rejection_codes,
+        parsed_release: Some(json!({
+            "parsed": parsed,
+            "coveragePlan": plan,
+        })),
+        score: candidate.score,
+        reason,
+    })
+}
+
+fn build_anime_manual_review_candidate(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+) -> Result<CandidateReviewPlan> {
+    let Some(context) = anime_candidate_scoring_context(subscription, representative, targets)
+    else {
+        return Ok(CandidateReviewPlan {
+            candidate: candidate.clone(),
+            release_kind: ReleaseKind::Unknown,
+            resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+            resolver_version: ANIME_SHOKO_STYLE_RESOLVER_VERSION.to_string(),
+            confidence: ReleaseConfidence::ReviewRequired,
+            rejection_codes: vec!["missing_anime_graph_context".to_string()],
+            parsed_release: Some(json!({
+                "candidateTitle": candidate.title,
+                "reason": "anime metadata graph context was unavailable"
+            })),
+            score: candidate.score,
+            reason: "Anime candidate needs review because metadata graph context is unavailable."
+                .to_string(),
+        });
+    };
+    let input = anime_candidate_input(candidate);
+    let files = anime_release_file_inputs(candidate);
+    let plan = plan_anime_file_coverage(&context, &input, &files);
+    let mut rejection_codes = plan.rejection_reasons.clone();
+    rejection_codes.extend(plan.review_reasons.iter().cloned());
+    if plan.confidence == ReleaseConfidence::ReviewRequired {
+        rejection_codes.push("review_required_confidence".to_string());
+    }
+    if plan.confidence == ReleaseConfidence::Low {
+        rejection_codes.push("low_confidence".to_string());
+    }
+    if plan.entries.is_empty() {
+        rejection_codes.push("no_safe_target_coverage".to_string());
+    }
+    rejection_codes.sort();
+    rejection_codes.dedup();
+    let score = score_anime_candidate(&context, &input);
+    let reason = manual_review_reason(&rejection_codes, "Anime");
+    Ok(CandidateReviewPlan {
+        candidate: candidate.clone(),
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+        rejection_codes,
+        parsed_release: Some(json!({
+            "coveragePlan": plan,
+            "graphFingerprint": context.graph_fingerprint,
+            "aliasCount": context.aliases.len(),
+            "targetCount": context.targets.len(),
+        })),
+        score: Some(score.score),
+        reason,
+    })
+}
+
+fn manual_review_reason(rejection_codes: &[String], label: &str) -> String {
+    if rejection_codes.is_empty() {
+        return format!(
+            "{label} candidate needs manual review before Elixir can safely download it."
+        );
+    }
+    format!(
+        "{label} candidate needs manual review before download: {}.",
+        rejection_codes.join(", ")
+    )
+}
+
+fn manual_review_target_scope(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+) -> ManualReviewTargetScope {
+    ManualReviewTargetScope {
+        subscription_id: Some(subscription.subscription_id),
+        media_type: subscription.media_type,
+        targets: targets.iter().map(|target| target.target_id).collect(),
+        target_keys: targets
+            .iter()
+            .map(|target| target.target_key.clone())
+            .collect(),
+        season_number: common_season_number(targets),
+        episode_numbers: targets
+            .iter()
+            .filter_map(|target| target.episode_number)
+            .collect(),
+        absolute_episode_numbers: targets
+            .iter()
+            .filter_map(|target| target.absolute_episode_number)
+            .collect(),
+    }
+}
+
+fn manual_review_route_policy_evidence(
+    subscription: &AcquisitionSubscription,
+    response: &CandidateSearchResponse,
+    candidate: &AcquisitionCandidate,
+) -> ManualReviewRoutePolicyEvidence {
+    let mut allowed_routes = route_preference_order(
+        subscription.route_policy,
+        candidate.default_route.as_deref(),
+    )
+    .into_iter()
+    .filter(|route| candidate_supports_route(candidate, route))
+    .filter(|route| {
+        response
+            .route_options
+            .iter()
+            .any(|option| option.logical_id == *route)
+    })
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    if allowed_routes.is_empty() {
+        allowed_routes = candidate.supported_routes.clone();
+    }
+    ManualReviewRoutePolicyEvidence {
+        preferred: Some(subscription.route_policy.as_str().to_string()),
+        allowed_routes,
+    }
+}
+
+fn candidate_has_available_route_for_policy(
+    candidate: &AcquisitionCandidate,
+    route_options: &[CandidateRouteOption],
+    route_policy: AcquisitionRoutePolicy,
+) -> bool {
+    route_preference_order(route_policy, candidate.default_route.as_deref())
+        .into_iter()
+        .any(|route| {
+            candidate_supports_route(candidate, route)
+                && route_option_available(route_options, route)
+        })
 }
 
 fn scheduler_dispatch_evidence(
@@ -1194,6 +1638,8 @@ fn scheduler_dispatch_evidence(
                 subscription.route_policy,
             ),
             cached_debrid_score: cached_debrid_score(candidate.cached_debrid),
+            freshness_score: candidate_freshness_score(candidate),
+            tracker_count: candidate_tracker_count(candidate),
             quality_score: quality_score(candidate.quality.as_deref()),
             seeders: candidate.seeders,
             overfetch_count: plan.overfetch_count,
@@ -1210,6 +1656,38 @@ fn scheduler_dispatch_evidence(
             reason: route_decision_reason(subscription.route_policy, &plan.route_logical_id),
         },
     }
+}
+
+fn compare_review_candidate_plans(
+    left: &CandidateReviewPlan,
+    right: &CandidateReviewPlan,
+    route_policy: AcquisitionRoutePolicy,
+) -> Ordering {
+    review_candidate_score_tuple(left, route_policy)
+        .cmp(&review_candidate_score_tuple(right, route_policy))
+        .then_with(|| right.candidate.title.cmp(&left.candidate.title))
+}
+
+fn review_candidate_score_tuple(
+    plan: &CandidateReviewPlan,
+    route_policy: AcquisitionRoutePolicy,
+) -> (i32, i32, i32, i32, i64, i32, i32) {
+    (
+        confidence_rank(plan.confidence),
+        release_kind_rank(plan.release_kind),
+        route_preference_score(
+            plan.candidate.default_route.as_deref().unwrap_or_default(),
+            route_policy,
+        ),
+        candidate_freshness_score(&plan.candidate),
+        plan.candidate.seeders.unwrap_or_default() as i64,
+        (plan
+            .score
+            .unwrap_or_else(|| plan.candidate.score.unwrap_or(0.0))
+            * 1000.0)
+            .round() as i32,
+        source_rank_score(plan.candidate.rank),
+    )
 }
 
 fn route_decision_reason(route_policy: AcquisitionRoutePolicy, route_logical_id: &str) -> String {
@@ -1535,13 +2013,14 @@ fn compare_release_plans(
 fn release_plan_score_tuple(
     plan: &CandidateReleasePlan,
     route_policy: AcquisitionRoutePolicy,
-) -> (i32, usize, i32, i32, i32, i32, i64, i32, i32, i32) {
+) -> (i32, usize, i32, i32, i32, i32, i32, i64, i32, i32, i32) {
     let candidate = &plan.selection.candidate;
     (
         confidence_rank(plan.confidence),
         plan.covered_target_ids.len(),
         route_preference_score(&plan.route_logical_id, route_policy),
         cached_debrid_score(candidate.cached_debrid),
+        candidate_freshness_score(candidate),
         quality_score(candidate.quality.as_deref()),
         release_kind_rank(plan.release_kind),
         candidate.seeders.unwrap_or_default() as i64,
@@ -1598,6 +2077,41 @@ fn cached_debrid_score(value: Option<bool>) -> i32 {
 
 fn source_rank_score(rank: Option<u32>) -> i32 {
     rank.map(|rank| 10_000 - rank as i32).unwrap_or_default()
+}
+
+fn candidate_freshness_score(candidate: &AcquisitionCandidate) -> i32 {
+    if candidate.source_kind.eq_ignore_ascii_case("http") {
+        return 4;
+    }
+    let mut score = match candidate.cached_debrid {
+        Some(true) => 8,
+        Some(false) => -2,
+        None => 0,
+    };
+    if !candidate.source_kind.eq_ignore_ascii_case("magnet")
+        || candidate.cached_debrid == Some(true)
+    {
+        return score;
+    }
+    score += match candidate.seeders {
+        Some(100..) => 5,
+        Some(50..=99) => 4,
+        Some(15..=49) => 1,
+        Some(5..=14) => -1,
+        Some(1..=4) => -4,
+        Some(0) => -7,
+        None => -2,
+    };
+    score += match candidate_tracker_count(candidate) {
+        3.. => 3,
+        1..=2 => 1,
+        _ => -5,
+    };
+    score
+}
+
+fn candidate_tracker_count(candidate: &AcquisitionCandidate) -> usize {
+    acquisition_candidate_tracker_count(candidate)
 }
 
 impl TargetSearchGroupKey {
@@ -2021,103 +2535,125 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
         let Some(subscription) = subscriptions.get(&target.subscription_id) else {
             continue;
         };
-        if subscription.route_policy != AcquisitionRoutePolicy::DebridFirst {
-            continue;
-        }
         let Some(candidate_value) = target.selected_candidate.clone() else {
             continue;
         };
         let candidate: AcquisitionCandidate = serde_json::from_value(candidate_value)
             .context("parsing selected acquisition candidate for debrid fallback")?;
-        if !candidate_supports_route(&candidate, TORRENT_DEFAULT_LOGICAL_ID) {
-            update_target_state(
-                &state.db_pool,
-                target.target_id,
-                AcquisitionTargetStateUpdate {
-                    state: AcquisitionTargetState::Blocked,
-                    state_reason: Some(format!(
-                        "Debrid failed and the selected candidate has no torrent fallback: {}",
-                        status
-                            .selection_error
-                            .clone()
-                            .or(status.last_error.clone())
-                            .or(status.remote_status.clone())
-                            .or(status.failure_class.clone())
-                            .unwrap_or_else(|| status.status.clone())
-                    )),
-                    next_search_after: Some(
-                        Utc::now()
-                            + jittered_seconds(&target.target_id, WARM_RETRY_INTERVAL_SECONDS, 300),
+        match debrid_failure_fallback_action(subscription, &candidate, &status) {
+            DebridFailureFallbackAction::SubmitTorrent { route_logical_id } => {
+                let provider_id = target
+                    .selected_provider_id
+                    .or(subscription.source_provider_id)
+                    .ok_or_else(|| anyhow!("source provider is missing for torrent fallback"))?;
+                let source_extension_id = source_extension_id_for_candidate_provider(
+                    &ExtensionStore::new(&state.db_pool),
+                    provider_id,
+                )
+                .await?;
+                let submission = CandidateSubmission {
+                    provider_id,
+                    source_extension_id,
+                    candidate,
+                    provider_warnings: Vec::new(),
+                    anime_coverage_plan: None,
+                    tv_coverage_plan: None,
+                    dispatch: None,
+                };
+                match submit_selected_candidate(
+                    state,
+                    subscription,
+                    &target,
+                    submission,
+                    Some(route_logical_id),
+                    Some(&mut governor),
+                )
+                .await
+                {
+                    Ok(CandidateSubmitOutcome::Submitted) => info!(
+                        target_id = %target.target_id,
+                        debrid_job_id = %status.job_id,
+                        debrid_release_id = ?status.release_id,
+                        remote_status = status.remote_status.as_deref().unwrap_or("unknown"),
+                        failure_class = status.failure_class.as_deref().unwrap_or("unknown"),
+                        fallback_route = route_logical_id,
+                        "submitted torrent fallback after debrid failure"
                     ),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            continue;
-        }
-        let provider_id = target
-            .selected_provider_id
-            .or(subscription.source_provider_id)
-            .ok_or_else(|| anyhow!("source provider is missing for torrent fallback"))?;
-        let source_extension_id = source_extension_id_for_candidate_provider(
-            &ExtensionStore::new(&state.db_pool),
-            provider_id,
-        )
-        .await?;
-        let submission = CandidateSubmission {
-            provider_id,
-            source_extension_id,
-            candidate,
-            provider_warnings: Vec::new(),
-            anime_coverage_plan: None,
-            tv_coverage_plan: None,
-            dispatch: None,
-        };
-        match submit_selected_candidate(
-            state,
-            subscription,
-            &target,
-            submission,
-            Some(TORRENT_DEFAULT_LOGICAL_ID),
-            Some(&mut governor),
-        )
-        .await
-        {
-            Ok(CandidateSubmitOutcome::Submitted) => info!(
-                target_id = %target.target_id,
-                debrid_job_id = %status.job_id,
-                debrid_release_id = ?status.release_id,
-                remote_status = status.remote_status.as_deref().unwrap_or("unknown"),
-                failure_class = status.failure_class.as_deref().unwrap_or("unknown"),
-                "submitted torrent fallback after debrid failure"
-            ),
-            Ok(CandidateSubmitOutcome::CapacityBlocked(block)) => {
-                let next_after = Utc::now()
-                    + jittered_seconds(&target.target_id, QUEUE_CAPACITY_RETRY_SECONDS, 120);
-                update_target_state(
+                    Ok(CandidateSubmitOutcome::CapacityBlocked(block)) => {
+                        let next_after = Utc::now()
+                            + jittered_seconds(
+                                &target.target_id,
+                                QUEUE_CAPACITY_RETRY_SECONDS,
+                                120,
+                            );
+                        update_target_state(
+                            &state.db_pool,
+                            target.target_id,
+                            AcquisitionTargetStateUpdate {
+                                state: AcquisitionTargetState::Blocked,
+                                state_reason: Some(queue_capacity_reason(&block)),
+                                next_search_after: Some(next_after),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(err) => {
+                        warn!(
+                            target_id = %target.target_id,
+                            debrid_job_id = %status.job_id,
+                            fallback_route = route_logical_id,
+                            error = %err,
+                            "torrent fallback after debrid failure could not be submitted"
+                        );
+                        let next_after = Utc::now()
+                            + jittered_seconds(&target.target_id, WARM_RETRY_INTERVAL_SECONDS, 300);
+                        update_target_state(
+                            &state.db_pool,
+                            target.target_id,
+                            AcquisitionTargetStateUpdate {
+                                state: AcquisitionTargetState::Blocked,
+                                state_reason: Some(
+                                    "Debrid could not complete this release, and qBittorrent fallback could not be started. Check route/provider status or try another release."
+                                        .to_string(),
+                                ),
+                                next_search_after: Some(next_after),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            DebridFailureFallbackAction::RetryNextCandidate { reason } => {
+                reset_target_for_candidate_retry(
                     &state.db_pool,
                     target.target_id,
-                    AcquisitionTargetStateUpdate {
-                        state: AcquisitionTargetState::Blocked,
-                        state_reason: Some(queue_capacity_reason(&block)),
-                        next_search_after: Some(next_after),
-                        ..Default::default()
-                    },
+                    reason,
+                    Utc::now()
+                        + jittered_seconds(
+                            &target.target_id,
+                            FALLBACK_NEXT_CANDIDATE_RETRY_SECONDS,
+                            15,
+                        ),
                 )
                 .await?;
             }
-            Err(err) => {
-                let next_after = Utc::now()
-                    + jittered_seconds(&target.target_id, WARM_RETRY_INTERVAL_SECONDS, 300);
+            DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
                 update_target_state(
                     &state.db_pool,
                     target.target_id,
                     AcquisitionTargetStateUpdate {
                         state: AcquisitionTargetState::Blocked,
-                        state_reason: Some(format!(
-                            "Debrid failed and torrent fallback is blocked: {err}"
-                        )),
-                        next_search_after: Some(next_after),
+                        state_reason: Some(reason),
+                        next_search_after: Some(
+                            Utc::now()
+                                + jittered_seconds(
+                                    &target.target_id,
+                                    WARM_RETRY_INTERVAL_SECONDS,
+                                    300,
+                                ),
+                        ),
                         ..Default::default()
                     },
                 )
@@ -2126,6 +2662,161 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DebridFailureFallbackAction {
+    SubmitTorrent { route_logical_id: &'static str },
+    RetryNextCandidate { reason: String },
+    NoAutomaticFallback { reason: String },
+}
+
+fn debrid_failure_fallback_action(
+    subscription: &AcquisitionSubscription,
+    candidate: &AcquisitionCandidate,
+    status: &crate::debrid::DebridJobStatus,
+) -> DebridFailureFallbackAction {
+    let summary = debrid_failure_user_summary(status);
+    let failure_class = status
+        .failure_class
+        .as_deref()
+        .and_then(DebridFailureClass::from_str);
+    let response_policy = failure_class.map(DebridFailureClass::response_policy);
+    if matches!(
+        response_policy,
+        Some(DebridFailureResponsePolicy::AccountActionRequired)
+    ) {
+        return DebridFailureFallbackAction::NoAutomaticFallback {
+            reason: format!(
+                "Debrid could not complete this release. {summary} Check the active debrid account before submitting more debrid work."
+            ),
+        };
+    }
+    if matches!(
+        response_policy,
+        Some(DebridFailureResponsePolicy::RetryProviderLater)
+    ) {
+        return DebridFailureFallbackAction::NoAutomaticFallback {
+            reason: format!(
+                "Debrid could not complete this release. {summary} Elixir will retry provider-backed acquisition later instead of immediately submitting more work."
+            ),
+        };
+    }
+    if subscription.route_policy != AcquisitionRoutePolicy::DebridFirst {
+        return DebridFailureFallbackAction::NoAutomaticFallback {
+            reason: format!(
+                "Debrid could not complete this release. Route policy '{}' does not allow automatic qBittorrent fallback. {summary}",
+                subscription.route_policy.as_str()
+            ),
+        };
+    }
+    if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
+        return DebridFailureFallbackAction::SubmitTorrent {
+            route_logical_id: TORRENT_DEFAULT_LOGICAL_ID,
+        };
+    }
+    DebridFailureFallbackAction::RetryNextCandidate {
+        reason: format!(
+            "Debrid could not complete this release and the selected candidate has no qBittorrent fallback. {summary} Trying the next ranked release."
+        ),
+    }
+}
+
+fn debrid_failure_user_summary(status: &crate::debrid::DebridJobStatus) -> String {
+    let message = status
+        .last_error
+        .as_deref()
+        .or(status.selection_error.as_deref())
+        .unwrap_or_default()
+        .trim();
+    let normalized_message = message.to_ascii_lowercase();
+    if normalized_message.contains("torbox accepted this torrent") {
+        return ensure_sentence(message);
+    }
+    match status.failure_class.as_deref() {
+        Some("no_seeds") => {
+            if status
+                .remote_status
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("torbox")
+            {
+                "TorBox accepted this torrent, but it is not cached and has no seeds.".to_string()
+            } else {
+                "The debrid provider accepted this torrent, but it has no seeds.".to_string()
+            }
+        }
+        Some("provider_stalled") => {
+            "The debrid provider accepted this torrent, but the provider transfer is stalled."
+                .to_string()
+        }
+        Some("file_list_unavailable") => {
+            "The debrid provider accepted this torrent, but no file list is available yet."
+                .to_string()
+        }
+        Some("magnet_rejected") => "The debrid provider rejected this magnet.".to_string(),
+        Some("invalid_source") => {
+            "The debrid provider rejected this source as invalid or unsupported.".to_string()
+        }
+        Some("content_blocked") => {
+            "The debrid provider blocked or filtered this source.".to_string()
+        }
+        Some("not_found_or_expired") => {
+            "The debrid provider no longer has this source available.".to_string()
+        }
+        Some("rate_limited") => {
+            "The debrid provider is rate limiting requests. Try again later.".to_string()
+        }
+        Some("too_many_active_downloads") => {
+            "The debrid provider has reached its active download limit.".to_string()
+        }
+        Some("provider_account_limit_reached") => {
+            "The active debrid account has reached a provider account or service limit.".to_string()
+        }
+        Some("quota_exhausted") => {
+            "The active debrid account has exhausted traffic, quota, or fair-use allowance."
+                .to_string()
+        }
+        Some("provider_account_restricted") => {
+            "The active debrid account is restricted or not allowed to use this provider feature."
+                .to_string()
+        }
+        Some("provider_unavailable") => {
+            "The debrid provider is temporarily unavailable. Try again later.".to_string()
+        }
+        Some("unauthorized") => {
+            "The active debrid account rejected the request. Check the account token.".to_string()
+        }
+        Some("provider_auth_missing") => {
+            "The active debrid account rejected the request. Check the account token.".to_string()
+        }
+        Some("selection_failed") => {
+            "Elixir could not safely select files from the debrid release.".to_string()
+        }
+        Some(_) if !message.is_empty() && !looks_internal_debrid_message(message) => {
+            ensure_sentence(message)
+        }
+        _ => "The debrid provider reported a failed release.".to_string(),
+    }
+}
+
+fn ensure_sentence(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+fn looks_internal_debrid_message(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("parsing ")
+        || normalized.contains("serde")
+        || normalized.contains("json")
+        || normalized.contains("sql")
+        || normalized.contains("stack backtrace")
 }
 
 async fn submit_selected_candidate(
@@ -2142,7 +2833,7 @@ async fn submit_selected_candidate(
         &submission.candidate,
     )?;
     if submission.has_release_coverage_plan()
-        && let Some(download_id) = existing_release_download_id(state, &submission).await?
+        && let Some(reuse) = existing_release_reuse(state, &submission).await?
     {
         persist_release_submission(
             state,
@@ -2150,7 +2841,8 @@ async fn submit_selected_candidate(
             target,
             &submission,
             &route_logical_id,
-            Some(download_id),
+            Some(reuse.download_id),
+            reuse.selected_provider_id.unwrap_or(submission.provider_id),
             "Reused existing pack-aware acquisition release.",
         )
         .await?;
@@ -2174,7 +2866,7 @@ async fn submit_selected_candidate(
     match submit_candidate_to_route(state, subscription, target, &submission, &route_logical_id)
         .await
     {
-        Ok(download_id) => {
+        Ok(response) => {
             let reason = if route_override == Some(TORRENT_DEFAULT_LOGICAL_ID) {
                 "Submitted through torrent fallback."
             } else {
@@ -2187,7 +2879,8 @@ async fn submit_selected_candidate(
                     target,
                     &submission,
                     &route_logical_id,
-                    download_id,
+                    response.download_id,
+                    response.provider_id,
                     reason,
                 )
                 .await?;
@@ -2197,7 +2890,8 @@ async fn submit_selected_candidate(
                     target,
                     &submission,
                     &route_logical_id,
-                    download_id,
+                    response.download_id,
+                    response.provider_id,
                     reason,
                 )
                 .await?;
@@ -2231,7 +2925,7 @@ async fn submit_selected_candidate(
                 target_id = %target.target_id,
                 "debrid submission failed, trying torrent fallback: {err}"
             );
-            let torrent_download_id = match submit_candidate_to_route(
+            let torrent_response = match submit_candidate_to_route(
                 state,
                 subscription,
                 target,
@@ -2277,7 +2971,8 @@ async fn submit_selected_candidate(
                     target,
                     &submission,
                     TORRENT_DEFAULT_LOGICAL_ID,
-                    torrent_download_id,
+                    torrent_response.download_id,
+                    torrent_response.provider_id,
                     "Debrid rejected the candidate; submitted torrent fallback.",
                 )
                 .await?;
@@ -2287,7 +2982,8 @@ async fn submit_selected_candidate(
                     target,
                     &submission,
                     TORRENT_DEFAULT_LOGICAL_ID,
-                    torrent_download_id,
+                    torrent_response.download_id,
+                    torrent_response.provider_id,
                     "Debrid rejected the candidate; submitted torrent fallback.",
                 )
                 .await?;
@@ -2327,7 +3023,7 @@ async fn submit_candidate_to_route(
     target: &AcquisitionTarget,
     submission: &CandidateSubmission,
     route_logical_id: &str,
-) -> Result<Option<String>> {
+) -> Result<DownloadBrokerSubmitResponse> {
     let store = ExtensionStore::new(&state.db_pool);
     let request = DownloadBrokerSubmitRequest {
         source: submission.candidate.source.clone(),
@@ -2342,8 +3038,9 @@ async fn submit_candidate_to_route(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(submission.candidate.clone()),
+        release_fingerprint: None,
     };
-    let response = submit_to_broker(
+    submit_to_broker(
         state,
         &store,
         route_logical_id,
@@ -2351,10 +3048,7 @@ async fn submit_candidate_to_route(
         request,
     )
     .await
-    .map_err(api_error_to_anyhow)?;
-    Ok(response
-        .download_id
-        .or_else(|| submission.candidate.info_hash.clone()))
+    .map_err(api_error_to_anyhow)
 }
 
 async fn mark_target_submitted(
@@ -2363,12 +3057,14 @@ async fn mark_target_submitted(
     submission: &CandidateSubmission,
     route_logical_id: &str,
     download_id: Option<String>,
+    route_provider_id: Uuid,
     reason: &str,
 ) -> Result<()> {
     let selected_candidate = selected_candidate_provenance_with_submission(
         submission,
         route_logical_id,
         &download_id,
+        route_provider_id,
         reason,
     )?;
     update_target_state(
@@ -2390,10 +3086,10 @@ async fn mark_target_submitted(
     Ok(())
 }
 
-async fn existing_release_download_id(
+async fn existing_release_reuse(
     state: &AppState,
     submission: &CandidateSubmission,
-) -> Result<Option<String>> {
+) -> Result<Option<ExistingReleaseReuse>> {
     let fingerprint =
         candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
     let Some(release) = get_release_by_fingerprint(
@@ -2412,7 +3108,13 @@ async fn existing_release_download_id(
     ) {
         return Ok(None);
     }
-    Ok(release.download_id)
+    let Some(download_id) = release.download_id else {
+        return Ok(None);
+    };
+    Ok(Some(ExistingReleaseReuse {
+        download_id,
+        selected_provider_id: release.selected_provider_id,
+    }))
 }
 
 async fn persist_release_submission(
@@ -2422,6 +3124,7 @@ async fn persist_release_submission(
     submission: &CandidateSubmission,
     route_logical_id: &str,
     download_id: Option<String>,
+    route_provider_id: Uuid,
     reason: &str,
 ) -> Result<()> {
     if submission.anime_coverage_plan.is_some() {
@@ -2432,6 +3135,7 @@ async fn persist_release_submission(
             submission,
             route_logical_id,
             download_id,
+            route_provider_id,
             reason,
         )
         .await
@@ -2443,6 +3147,7 @@ async fn persist_release_submission(
             submission,
             route_logical_id,
             download_id,
+            route_provider_id,
             reason,
         )
         .await
@@ -2453,6 +3158,7 @@ async fn persist_release_submission(
             submission,
             route_logical_id,
             download_id,
+            route_provider_id,
             reason,
         )
         .await
@@ -2466,6 +3172,7 @@ async fn persist_anime_release_submission(
     submission: &CandidateSubmission,
     route_logical_id: &str,
     download_id: Option<String>,
+    route_provider_id: Uuid,
     reason: &str,
 ) -> Result<()> {
     let Some(plan) = submission.anime_coverage_plan.as_ref() else {
@@ -2475,6 +3182,7 @@ async fn persist_anime_release_submission(
             submission,
             route_logical_id,
             download_id,
+            route_provider_id,
             reason,
         )
         .await;
@@ -2485,6 +3193,7 @@ async fn persist_anime_release_submission(
         submission,
         route_logical_id,
         &download_id,
+        route_provider_id,
         reason,
     )?;
     let release = upsert_release(
@@ -2508,7 +3217,7 @@ async fn persist_anime_release_submission(
             confidence: plan.confidence,
             score: submission.candidate.score,
             selected_route_logical_id: Some(route_logical_id.to_string()),
-            selected_provider_id: Some(submission.provider_id),
+            selected_provider_id: Some(route_provider_id),
             download_id: download_id.clone(),
             remote_release_id: None,
             state: AcquisitionReleaseState::Submitted,
@@ -2647,6 +3356,7 @@ async fn persist_anime_release_submission(
             submission,
             route_logical_id,
             download_id.clone(),
+            route_provider_id,
             reason,
         )
         .await?;
@@ -2658,7 +3368,7 @@ async fn persist_anime_release_submission(
             release_job_id: None,
             release_id: release.release_id,
             route_logical_id: route_logical_id.to_string(),
-            provider_id: Some(submission.provider_id),
+            provider_id: Some(route_provider_id),
             download_id,
             remote_release_id: None,
             state: ReleaseJobState::Submitted,
@@ -2685,6 +3395,7 @@ async fn persist_tv_release_submission(
     submission: &CandidateSubmission,
     route_logical_id: &str,
     download_id: Option<String>,
+    route_provider_id: Uuid,
     reason: &str,
 ) -> Result<()> {
     let Some(plan) = submission.tv_coverage_plan.as_ref() else {
@@ -2694,6 +3405,7 @@ async fn persist_tv_release_submission(
             submission,
             route_logical_id,
             download_id,
+            route_provider_id,
             reason,
         )
         .await;
@@ -2704,6 +3416,7 @@ async fn persist_tv_release_submission(
         submission,
         route_logical_id,
         &download_id,
+        route_provider_id,
         reason,
     )?;
     let release = upsert_release(
@@ -2727,7 +3440,7 @@ async fn persist_tv_release_submission(
             confidence: plan.confidence,
             score: submission.candidate.score,
             selected_route_logical_id: Some(route_logical_id.to_string()),
-            selected_provider_id: Some(submission.provider_id),
+            selected_provider_id: Some(route_provider_id),
             download_id: download_id.clone(),
             remote_release_id: None,
             state: AcquisitionReleaseState::Submitted,
@@ -2841,6 +3554,7 @@ async fn persist_tv_release_submission(
             submission,
             route_logical_id,
             download_id.clone(),
+            route_provider_id,
             reason,
         )
         .await?;
@@ -2852,7 +3566,7 @@ async fn persist_tv_release_submission(
             release_job_id: None,
             release_id: release.release_id,
             route_logical_id: route_logical_id.to_string(),
-            provider_id: Some(submission.provider_id),
+            provider_id: Some(route_provider_id),
             download_id,
             remote_release_id: None,
             state: ReleaseJobState::Submitted,
@@ -2962,6 +3676,17 @@ async fn expand_series_subscription(
     let Some(tvdb_series_id) = tvdb_series_id else {
         return Ok(Vec::new());
     };
+    if state
+        .settings
+        .classifier
+        .tvdb_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        bail!("TVDB API key is required to expand TV series acquisition targets");
+    }
     ids.tvdb_series = Some(tvdb_series_id.clone());
     if ids.tvdb.is_none() {
         ids.tvdb = Some(tvdb_series_id.clone());
@@ -2971,7 +3696,9 @@ async fn expand_series_subscription(
         .linkers
         .fetch_tvdb_series_seasons(&tvdb_series_id)
         .await
-        .unwrap_or_default();
+        .with_context(|| {
+            format!("fetching TVDB seasons for acquisition series {tvdb_series_id}")
+        })?;
     let mut season_numbers = seasons
         .iter()
         .filter_map(extract_season_number)
@@ -2986,7 +3713,11 @@ async fn expand_series_subscription(
             .linkers
             .fetch_tvdb_season_episodes(&tvdb_series_id, season_number)
             .await
-            .unwrap_or_default();
+            .with_context(|| {
+                format!(
+                    "fetching TVDB season {season_number} episodes for acquisition series {tvdb_series_id}"
+                )
+            })?;
         for episode in episodes {
             let Some(episode_number) = episode.episode_number else {
                 continue;
@@ -3482,7 +4213,7 @@ fn compare_candidates(
 fn candidate_score_tuple(
     candidate: &AcquisitionCandidate,
     route_policy: AcquisitionRoutePolicy,
-) -> (i32, i32, i32, i32, i64, i32, i32) {
+) -> (i32, i32, i32, i32, i32, i64, i32, i32) {
     let route_score = match route_policy {
         AcquisitionRoutePolicy::TorrentOnly => {
             if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
@@ -3511,6 +4242,7 @@ fn candidate_score_tuple(
         Some(false) => 0,
         None => 1,
     };
+    let freshness = candidate_freshness_score(candidate);
     let score = (candidate.score.unwrap_or(0.0) * 1000.0).round() as i32;
     let quality = quality_score(candidate.quality.as_deref());
     let seeders = candidate.seeders.unwrap_or_default() as i64;
@@ -3522,6 +4254,7 @@ fn candidate_score_tuple(
     (
         route_score,
         cached_score,
+        freshness,
         score,
         quality,
         seeders,
@@ -3766,12 +4499,14 @@ fn selected_candidate_provenance_with_submission(
     submission: &CandidateSubmission,
     route_logical_id: &str,
     download_id: &Option<String>,
+    route_provider_id: Uuid,
     reason: &str,
 ) -> Result<JsonValue> {
     selected_candidate_provenance_inner(
         submission,
         Some(json!({
             "routeLogicalId": route_logical_id,
+            "routeProviderId": route_provider_id,
             "downloadId": download_id,
             "reason": reason,
             "recordedAt": Utc::now().to_rfc3339(),
@@ -4126,7 +4861,13 @@ fn jitter_seconds(seed: &Uuid, max_seconds: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::handlers::acquisition_sources::AcquisitionCandidateFile;
+    use crate::acquisition::{
+        release_resolution::store::{ReleaseListFilter, list_releases},
+        subscriptions::{NewAcquisitionSubscription, create_subscription},
+    };
+    use crate::http::handlers::acquisition_sources::{
+        AcquisitionCandidateFile, CandidateProviderSummary, normalize_acquisition_candidate,
+    };
     use crate::{
         artwork::ArtworkService,
         auth::AuthService,
@@ -4236,6 +4977,17 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let candidates = match (media_type, title, intent_kind) {
+            ("series", "Empty Source Show", _) => Vec::new(),
+            ("series", "Ambiguous Review Show", _) => vec![candidate_json(
+                "Ambiguous.Review.Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+                "te10btvreview",
+                &[],
+            )],
+            ("anime", "Ambiguous Anime", _) => vec![candidate_json(
+                "[SubsPlease] Different Anime - 01 [1080p]",
+                "te10banimereview",
+                &[],
+            )],
             ("movie", _, _) => vec![candidate_json(
                 "Movie.2026.1080p.WEB-DL-GROUP",
                 "te10bmovie",
@@ -4308,6 +5060,32 @@ mod tests {
                 "selectable": true
             })).collect::<Vec<_>>()
         })
+    }
+
+    fn candidate_search_response_for_test(
+        provider_id: Uuid,
+        extension_id: &str,
+        media_types: Vec<&str>,
+        candidates: Vec<AcquisitionCandidate>,
+    ) -> CandidateSearchResponse {
+        CandidateSearchResponse {
+            schema_version: 1,
+            provider: CandidateProviderSummary {
+                provider_id,
+                extension_id: extension_id.to_string(),
+                extension_name: "Test Candidate Source".to_string(),
+                instance_id: Uuid::new_v4(),
+                instance_name: "Default".to_string(),
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                implementation: Some("test_candidate_source".to_string()),
+                health_state: ProviderHealthState::Healthy,
+                media_types: media_types.into_iter().map(ToString::to_string).collect(),
+                actions: vec!["search".to_string()],
+            },
+            route_options: available_route_options(),
+            candidates,
+            warnings: Vec::new(),
+        }
     }
 
     async fn seed_te10b_candidate_provider(state: &AppState, port: u16) -> Result<Uuid> {
@@ -4471,6 +5249,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn series_expansion_fails_when_tvdb_key_is_missing() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Series,
+            external_ids: Some(ExternalIds {
+                tvdb: Some("338186".to_string()),
+                tvdb_series: Some("338186".to_string()),
+                ..ExternalIds::default()
+            }),
+            ..test_subscription()
+        };
+        let mut ids = subscription.external_ids.clone().unwrap_or_default();
+
+        let err = expand_series_subscription(&state, &subscription, &mut ids, Utc::now())
+            .await
+            .expect_err("series expansion should fail without TVDB config");
+
+        assert!(
+            err.to_string().contains("TVDB API key is required"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
     fn candidate(
         title: &str,
         routes: Vec<&str>,
@@ -4496,6 +5299,69 @@ mod tests {
             supported_routes: routes.into_iter().map(ToString::to_string).collect(),
             default_route: None,
             raw: None,
+        }
+    }
+
+    #[test]
+    fn asr6_selected_candidate_provenance_records_route_provider_id() -> Result<()> {
+        let source_provider_id = Uuid::new_v4();
+        let route_provider_id = Uuid::new_v4();
+        let submission = CandidateSubmission {
+            provider_id: source_provider_id,
+            source_extension_id: "elixir.sources.torrentio".to_string(),
+            candidate: candidate(
+                "Example.Series.S01E01.1080p-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(false),
+                Some(12),
+            ),
+            provider_warnings: Vec::new(),
+            anime_coverage_plan: None,
+            tv_coverage_plan: None,
+            dispatch: None,
+        };
+
+        let provenance = selected_candidate_provenance_with_submission(
+            &submission,
+            TORRENT_DEFAULT_LOGICAL_ID,
+            &Some("qb-fallback".to_string()),
+            route_provider_id,
+            "Submitted through torrent fallback.",
+        )?;
+
+        assert_eq!(
+            provenance
+                .get("sourceProviderId")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            Some(source_provider_id.to_string())
+        );
+        assert_eq!(
+            provenance
+                .pointer("/submissionResult/routeProviderId")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            Some(route_provider_id.to_string())
+        );
+        assert_eq!(
+            provenance
+                .pointer("/submissionResult/routeLogicalId")
+                .and_then(JsonValue::as_str),
+            Some(TORRENT_DEFAULT_LOGICAL_ID)
+        );
+        Ok(())
+    }
+
+    fn failed_debrid_status(failure_class: &str) -> crate::debrid::DebridJobStatus {
+        crate::debrid::DebridJobStatus {
+            job_id: Uuid::new_v4(),
+            status: "failed".to_string(),
+            remote_status: Some("stalled".to_string()),
+            source_kind: "magnet".to_string(),
+            release_id: Some(Uuid::new_v4()),
+            failure_class: Some(failure_class.to_string()),
+            last_error: None,
+            selection_error: None,
         }
     }
 
@@ -4621,6 +5487,54 @@ mod tests {
         target.episode_number = None;
         target.absolute_episode_number = Some(absolute_episode_number);
         target
+    }
+
+    fn new_series_episode_target(
+        title: &str,
+        season_number: i32,
+        episode_number: i32,
+    ) -> NewAcquisitionTarget {
+        NewAcquisitionTarget {
+            target_key: Some(format!("S{season_number:02}E{episode_number:02}")),
+            media_type: Some(MediaType::Series),
+            title: Some(title.to_string()),
+            season_number: Some(season_number),
+            episode_number: Some(episode_number),
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: Some(Utc::now() - ChronoDuration::days(1)),
+            metadata: None,
+            state: Some(AcquisitionTargetState::Pending),
+            next_search_after: Some(Utc::now()),
+        }
+    }
+
+    fn new_anime_episode_target(
+        title: &str,
+        season_number: i32,
+        episode_number: i32,
+        absolute_episode_number: i32,
+    ) -> NewAcquisitionTarget {
+        NewAcquisitionTarget {
+            target_key: Some(format!("S{season_number:02}E{episode_number:02}")),
+            media_type: Some(MediaType::Anime),
+            title: Some(title.to_string()),
+            season_number: Some(season_number),
+            episode_number: Some(episode_number),
+            absolute_episode_number: Some(absolute_episode_number),
+            air_date: None,
+            air_time: Some(Utc::now() - ChronoDuration::days(1)),
+            metadata: Some(json!({
+                "source": "amr1_test",
+                "aliases": [title],
+                "graphFingerprint": format!("{title}:graph:v1"),
+                "targetCanonicalKey": format!("anime:{title}:S{season_number:02}E{episode_number:02}"),
+                "tvdbEpisodeId": format!("tvdb-{season_number}-{episode_number}"),
+                "anidbEpisodeId": format!("anidb-{absolute_episode_number}")
+            })),
+            state: Some(AcquisitionTargetState::Pending),
+            next_search_after: Some(Utc::now()),
+        }
     }
 
     fn anime_scoring_context(target_count: i32) -> AnimeCandidateScoringContext {
@@ -5047,6 +5961,284 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn amr1_tv_resolver_rejection_persists_manual_review_candidate() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49152).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Ambiguous Review Show".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("9001".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![
+                new_series_episode_target("Ambiguous Review Show", 1, 1),
+                new_series_episode_target("Ambiguous Review Show", 1, 2),
+            ],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "amr1-tv-review".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: Some(search_intent_for_targets(&targets, RetryBucket::Cold)),
+        };
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "elixir.sources.amr1.tv",
+            vec!["series"],
+            vec![candidate(
+                "Ambiguous.Review.Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::ReviewRequired),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.source_provider_id, Some(provider_id));
+        assert_eq!(release.selected_provider_id, None);
+        assert_eq!(release.download_id, None);
+        assert_eq!(release.resolver_kind, ReleaseResolverKind::TvSonarrStyle);
+        assert_eq!(release.confidence, ReleaseConfidence::ReviewRequired);
+        assert!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/resolverEvidence/rejectionCodes"))
+                .and_then(Value::as_array)
+                .is_some_and(|codes| !codes.is_empty())
+        );
+
+        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 2);
+        assert!(
+            coverage
+                .iter()
+                .all(|item| item.state == ReleaseCoverageState::ReviewRequired)
+        );
+
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert!(updated_targets.iter().all(|target| {
+            target.state == AcquisitionTargetState::Pending
+                && target.state_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("awaiting manual release selection")
+                        && !reason.contains("review required")
+                })
+                && target.next_search_after.is_some()
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr1_anime_ambiguity_persists_manual_review_candidate() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49153).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Anime,
+                title: "Ambiguous Anime".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("9101".to_string()),
+                    tvdb_series: Some("9102".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_anime_episode_target("Ambiguous Anime", 1, 1, 1)],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "amr1-anime-review".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: None,
+        };
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "elixir.sources.amr1.anime",
+            vec!["anime"],
+            vec![candidate(
+                "[SubsPlease] Different Anime - 01 [1080p]",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::ReviewRequired),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.source_provider_id, Some(provider_id));
+        assert_eq!(release.resolver_kind, ReleaseResolverKind::AnimeShokoStyle);
+        assert_eq!(release.selected_provider_id, None);
+        assert_eq!(release.download_id, None);
+        assert!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/resolverEvidence/rejectionCodes"))
+                .and_then(Value::as_array)
+                .is_some_and(|codes| !codes.is_empty())
+        );
+        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].state, ReleaseCoverageState::ReviewRequired);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr1_no_candidates_remains_pending_retry_without_review_release() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49154).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Empty Source Show".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("9201".to_string()),
+                    ..Default::default()
+                }),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_series_episode_target("Empty Source Show", 1, 1)],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "amr1-empty-source".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: None,
+        };
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "elixir.sources.amr1.empty",
+            vec!["series"],
+            Vec::new(),
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::ReviewRequired),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert!(releases.is_empty());
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(updated_targets.len(), 1);
+        assert_eq!(updated_targets[0].state, AcquisitionTargetState::Pending);
+        assert_eq!(updated_targets[0].selected_provider_id, Some(provider_id));
+        assert!(
+            updated_targets[0]
+                .state_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("No acquisition candidates were returned"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn best_candidate_prefers_cached_debrid_for_debrid_first() {
         let torrent = candidate("torrent", vec![TORRENT_DEFAULT_LOGICAL_ID], None, Some(500));
@@ -5063,6 +6255,31 @@ mod tests {
         )
         .expect("best candidate");
         assert_eq!(best.candidate.title, "cached");
+    }
+
+    #[test]
+    fn best_candidate_demotes_trackerless_uncached_magnets() {
+        let trackerless = candidate(
+            "trackerless",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            None,
+            Some(80),
+        );
+        let mut tracked = candidate(
+            "tracked",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            None,
+            Some(20),
+        );
+        tracked.source = "magnet:?xt=urn:btih:tracked&tr=udp%3A%2F%2Ftracker-a.example%2Fannounce&tr=udp%3A%2F%2Ftracker-b.example%2Fannounce&tr=https%3A%2F%2Ftracker-c.example%2Fannounce".to_string();
+
+        let best = select_best_candidate(
+            &[trackerless, tracked],
+            AcquisitionRoutePolicy::DebridFirst,
+            None,
+        )
+        .expect("best candidate");
+        assert_eq!(best.candidate.title, "tracked");
     }
 
     #[test]
@@ -5718,6 +6935,208 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn asr8_uncached_trackerless_candidate_ranks_below_healthier_tracked_candidate() {
+        let target = episode_target(&test_subscription(), 1, 1);
+        let mut trackerless = candidate(
+            "Show.S01E01.1080p.Trackerless-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(100),
+        );
+        trackerless.score = Some(1.0);
+        trackerless.source =
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+        let mut tracked = candidate(
+            "Show.S01E01.1080p.Tracked-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(20),
+        );
+        tracked.score = Some(0.1);
+        tracked.source = concat!(
+            "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce",
+            "&tr=udp%3A%2F%2Ftracker2.example%3A1337%2Fannounce"
+        )
+        .to_string();
+
+        let trackerless_plan = release_plan_for_test(
+            trackerless,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let tracked_plan = release_plan_for_test(
+            tracked,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            &[target],
+        );
+
+        assert!(
+            compare_release_plans(
+                &tracked_plan,
+                &trackerless_plan,
+                AcquisitionRoutePolicy::DebridFirst,
+            ) == Ordering::Greater,
+            "server freshness scoring should prefer healthier tracker evidence over stale source seeder hints"
+        );
+    }
+
+    #[test]
+    fn asr8_selected_candidate_provenance_exposes_tracker_and_weak_swarm_evidence() -> Result<()> {
+        let provider_id = Uuid::new_v4();
+        let candidate = normalize_acquisition_candidate(AcquisitionCandidate {
+            id: None,
+            title: "Show.S01E01.1080p.Trackerless-GROUP".to_string(),
+            source: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            source_kind: "magnet".to_string(),
+            info_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            file_index: None,
+            quality: Some("1080p".to_string()),
+            size_bytes: None,
+            seeders: None,
+            language: None,
+            cached_debrid: Some(false),
+            rank: None,
+            score: Some(0.99),
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: vec![DEBRID_DEFAULT_LOGICAL_ID.to_string()],
+            default_route: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            raw: None,
+        })?;
+        let submission = CandidateSubmission {
+            provider_id,
+            source_extension_id: "elixir.sources.torrentio".to_string(),
+            candidate,
+            provider_warnings: Vec::new(),
+            anime_coverage_plan: None,
+            tv_coverage_plan: None,
+            dispatch: None,
+        };
+
+        let provenance = selected_candidate_provenance(&submission)?;
+        assert_eq!(
+            provenance
+                .pointer("/raw/serverEvidence/torrentHealth/trackerCount")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            provenance
+                .pointer(
+                    "/raw/serverEvidence/torrentHealth/liveDownloaderEvidenceOverridesSourceHints"
+                )
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            provenance
+                .get("scoreBadges")
+                .and_then(Value::as_array)
+                .is_some_and(|badges| badges.iter().any(|badge| {
+                    badge.get("label").and_then(Value::as_str) == Some("Weak swarm")
+                        && badge
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .is_some_and(|detail| detail.contains("no tracker URLs"))
+                }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn asr8_live_zero_seed_retry_suppression_skips_dead_fingerprint() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = Uuid::new_v4();
+        let mut subscription = test_subscription();
+        subscription.route_policy = AcquisitionRoutePolicy::TorrentOnly;
+        let target = episode_target(&subscription, 1, 1);
+
+        let mut dead = candidate(
+            "Show.S01E01.1080p.Dead-GROUP",
+            vec![TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+        dead.source = "magnet:?xt=urn:btih:dddddddddddddddddddddddddddddddddddddddd".to_string();
+        let mut healthy = candidate(
+            "Show.S01E01.1080p.Healthier-GROUP",
+            vec![TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(25),
+        );
+        healthy.source = concat!(
+            "magnet:?xt=urn:btih:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce"
+        )
+        .to_string();
+
+        let dead_fingerprint = candidate_release_fingerprint(&dead, Some(provider_id));
+        let mut failed_release = release_for_test(
+            &subscription,
+            &dead,
+            TORRENT_DEFAULT_LOGICAL_ID,
+            AcquisitionReleaseState::Failed,
+        );
+        failed_release.subscription_id = None;
+        failed_release.source_extension_id = "elixir.sources.torrentio".to_string();
+        failed_release.fingerprint = dead_fingerprint;
+        failed_release.coverage_plan = Some(json!({
+            "torrentRuntime": {
+                "runtimeState": "failed",
+                "failureState": "no_seeds",
+                "connectedSeeds": 0,
+                "completeSeeds": 0,
+                "availability": 0.0
+            },
+            "retrySuppression": {
+                "status": "rejected",
+                "suppressAutomaticRediscovery": true,
+                "reason": "no_seeds"
+            }
+        }));
+        upsert_release(&state.db_pool, failed_release).await?;
+
+        let response = CandidateSearchResponse {
+            schema_version: 1,
+            provider: CandidateProviderSummary {
+                provider_id,
+                extension_id: "elixir.sources.torrentio".to_string(),
+                extension_name: "Torrentio".to_string(),
+                instance_id: Uuid::new_v4(),
+                instance_name: "Default".to_string(),
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                implementation: Some("torrentio".to_string()),
+                health_state: ProviderHealthState::Healthy,
+                media_types: vec!["series".to_string()],
+                actions: Vec::new(),
+            },
+            route_options: available_route_options(),
+            candidates: vec![dead, healthy.clone()],
+            warnings: Vec::new(),
+        };
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert_eq!(batch.plans[0].selection.candidate.title, healthy.title);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rr6b_debrid_first_uses_torrent_when_debrid_capacity_is_full() -> Result<()> {
         let database = setup_test_db().await?;
@@ -5779,6 +7198,148 @@ mod tests {
 
         assert!(result.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn asr3_debrid_failure_fallback_uses_only_qbittorrent_route() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![
+                DEBRID_DEFAULT_LOGICAL_ID,
+                "acquisition.debrid.provider.premiumize",
+                TORRENT_DEFAULT_LOGICAL_ID,
+            ],
+            Some(false),
+            Some(0),
+        );
+        let status = failed_debrid_status("no_seeds");
+
+        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+
+        assert_eq!(
+            action,
+            DebridFailureFallbackAction::SubmitTorrent {
+                route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
+            }
+        );
+    }
+
+    #[test]
+    fn debrid_rate_limit_retries_provider_later_without_qbittorrent_fallback() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+        let status = failed_debrid_status("rate_limited");
+
+        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+
+        match action {
+            DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
+                assert!(reason.contains("retry provider-backed acquisition later"));
+                assert!(reason.contains("rate limiting"));
+            }
+            other => panic!("expected retry-later action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debrid_account_or_quota_failures_block_automatic_fallback() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+
+        for failure_class in ["provider_auth_missing", "quota_exhausted"] {
+            let status = failed_debrid_status(failure_class);
+            let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+            match action {
+                DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
+                    assert!(reason.contains("Check the active debrid account"));
+                }
+                other => panic!("expected account-action block, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn debrid_source_rejections_still_use_allowed_torrent_fallback() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+        let status = failed_debrid_status("content_blocked");
+
+        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+
+        assert_eq!(
+            action,
+            DebridFailureFallbackAction::SubmitTorrent {
+                route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
+            }
+        );
+    }
+
+    #[test]
+    fn asr3_debrid_failure_without_torrent_route_retries_source_candidate() {
+        let subscription = test_subscription();
+        let candidate = AcquisitionCandidate {
+            source: "https://hoster.example/file".to_string(),
+            source_kind: "hoster".to_string(),
+            supported_routes: vec![DEBRID_DEFAULT_LOGICAL_ID.to_string()],
+            ..candidate(
+                "Show.S01E01.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(false),
+                None,
+            )
+        };
+        let status = failed_debrid_status("provider_stalled");
+
+        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+
+        match action {
+            DebridFailureFallbackAction::RetryNextCandidate { reason } => {
+                assert!(reason.contains("no qBittorrent fallback"));
+                assert!(reason.contains("provider transfer is stalled"));
+            }
+            other => panic!("expected source retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asr3_debrid_only_policy_does_not_use_torrent_fallback() {
+        let subscription = AcquisitionSubscription {
+            route_policy: AcquisitionRoutePolicy::DebridOnly,
+            ..test_subscription()
+        };
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+        let status = failed_debrid_status("no_seeds");
+
+        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+
+        match action {
+            DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
+                assert!(reason.contains("debrid_only"));
+                assert!(reason.contains("has no seeds"));
+            }
+            other => panic!("expected blocked fallback, got {other:?}"),
+        }
     }
 
     #[test]

@@ -21,7 +21,10 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::download_broker::generic_debrid_error_message;
+use super::{
+    acquisition_sources::ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+    download_broker::generic_debrid_error_message,
+};
 use crate::{
     acquisition::{
         AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView,
@@ -69,6 +72,9 @@ use crate::{
 const MANAGER_PREF_MOVIE: &str = "manager_preference.movie";
 const MANAGER_PREF_SERIES: &str = "manager_preference.series";
 const MANAGER_PREF_ANIME: &str = "manager_preference.anime";
+const SOURCE_PREF_MOVIE: &str = "acquisition_source_preference.movie";
+const SOURCE_PREF_SERIES: &str = "acquisition_source_preference.series";
+const SOURCE_PREF_ANIME: &str = "acquisition_source_preference.anime";
 const CONTROL_DEFAULTS_SETTING_PREFIX: &str = "extensions.control_defaults.instance.";
 const NZBGET_DRONE_DOWNLOAD_ID_PARAM: &str = "drone";
 const TORRENT_METADATA_STALL_TIMEOUT_SECONDS: i64 = 10 * 60;
@@ -82,6 +88,8 @@ const ADD_DEBRID_ACCOUNT_ACTION_ID: &str = "add_debrid_account";
 const OPEN_REVIEW_ACTION_ID: &str = "open_review";
 const FIND_ANOTHER_RELEASE_ACTION_ID: &str = "find_another_release";
 const RETRY_IMPORT_ACTION_ID: &str = "retry_import";
+const REMOVE_ACQUISITION_REQUEST_ACTION_ID: &str = "remove_acquisition_request";
+const CANCEL_ACQUISITION_DOWNLOADS_ACTION_ID: &str = "cancel_acquisition_downloads";
 
 #[derive(Debug, Clone)]
 struct ManagerControlDefaults {
@@ -202,10 +210,21 @@ pub struct ManagerPreferenceState {
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SourcePreferenceState {
+    pub movie_provider_id: Option<Uuid>,
+    pub series_provider_id: Option<Uuid>,
+    pub anime_provider_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FindMediaPreferencesState {
     pub tv_default_manager_provider_id: Option<Uuid>,
     pub movies_default_manager_provider_id: Option<Uuid>,
     pub anime_default_manager_provider_id: Option<Uuid>,
+    pub tv_default_source_provider_id: Option<Uuid>,
+    pub movies_default_source_provider_id: Option<Uuid>,
+    pub anime_default_source_provider_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,8 +278,11 @@ pub struct FindMediaResponse {
     pub media_type: MediaType,
     pub search_providers: Vec<ProviderSummary>,
     pub manager_providers: Vec<ProviderSummary>,
+    pub source_providers: Vec<ProviderSummary>,
     pub preferred_manager_provider_id: Option<Uuid>,
     pub default_manager_provider_id: Option<Uuid>,
+    pub preferred_source_provider_id: Option<Uuid>,
+    pub default_source_provider_id: Option<Uuid>,
     pub results: Vec<FindMediaResult>,
     pub provider_errors: Vec<ProviderSearchError>,
 }
@@ -271,8 +293,11 @@ pub struct FindMediaTargetsResponse {
     pub media_type: String,
     pub search_providers: Vec<ProviderSummary>,
     pub manager_candidates: Vec<ProviderSummary>,
+    pub source_candidates: Vec<ProviderSummary>,
     pub default_manager_provider_id: Option<Uuid>,
     pub preferred_manager_provider_id: Option<Uuid>,
+    pub default_source_provider_id: Option<Uuid>,
+    pub preferred_source_provider_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,6 +381,16 @@ pub struct FindMediaAcquisitionChildItem {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_provider_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_provider_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_provider_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_provider_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_logical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,6 +634,8 @@ pub struct FindMediaAcquisitionAction {
     pub subscription_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -687,6 +724,8 @@ struct AcquisitionUxContext {
 #[derive(Debug, Clone)]
 struct SourceTargetReleaseRuntime {
     release_id: Uuid,
+    source_provider_id: Option<Uuid>,
+    route_provider_id: Option<Uuid>,
     release_title: String,
     release_state: AcquisitionReleaseState,
     release_state_reason: Option<String>,
@@ -818,6 +857,9 @@ pub struct FindMediaPreferencesResponse {
     pub tv_manager_candidates: Vec<ProviderSummary>,
     pub movies_manager_candidates: Vec<ProviderSummary>,
     pub anime_manager_candidates: Vec<ProviderSummary>,
+    pub tv_source_candidates: Vec<ProviderSummary>,
+    pub movies_source_candidates: Vec<ProviderSummary>,
+    pub anime_source_candidates: Vec<ProviderSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -841,6 +883,24 @@ pub struct PatchFindMediaPreferencesRequest {
         deserialize_with = "deserialize_optional_json_value"
     )]
     pub anime_default_manager_provider_id: Option<Value>,
+    #[serde(
+        default,
+        alias = "tv_default_source_provider_id",
+        deserialize_with = "deserialize_optional_json_value"
+    )]
+    pub tv_default_source_provider_id: Option<Value>,
+    #[serde(
+        default,
+        alias = "movies_default_source_provider_id",
+        deserialize_with = "deserialize_optional_json_value"
+    )]
+    pub movies_default_source_provider_id: Option<Value>,
+    #[serde(
+        default,
+        alias = "anime_default_source_provider_id",
+        deserialize_with = "deserialize_optional_json_value"
+    )]
+    pub anime_default_source_provider_id: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -965,6 +1025,9 @@ pub async fn find_media_targets(
     let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let source_preferences = load_source_preferences(&store, &providers)
+        .await
+        .map_err(ApiError::from)?;
 
     let (search_contexts, _search_errors) = filter_search_providers(
         &state,
@@ -980,6 +1043,13 @@ pub async fn find_media_targets(
     )
     .await
     .map_err(ApiError::from)?;
+    let (source_contexts, _source_errors) = filter_search_providers(
+        &state,
+        &store,
+        collect_source_providers(&providers, media_type),
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     let preferred = preferred_manager_for_type(&preferences, media_type);
     let blueprint_preferred =
@@ -987,18 +1057,25 @@ pub async fn find_media_targets(
             .await
             .map_err(ApiError::from)?;
     let default = resolve_default_manager(preferred, blueprint_preferred, &manager_contexts);
+    let preferred_source = preferred_source_for_type(&source_preferences, media_type);
+    let default_source = resolve_default_source(preferred_source, &source_contexts);
 
     let manager_candidates: Vec<ProviderSummary> =
         manager_contexts.iter().map(provider_summary).collect();
     let search_providers: Vec<ProviderSummary> =
         search_contexts.iter().map(provider_summary).collect();
+    let source_candidates: Vec<ProviderSummary> =
+        source_contexts.iter().map(provider_summary).collect();
 
     Ok(Json(FindMediaTargetsResponse {
         media_type: media_type_api_name(media_type).to_string(),
         search_providers,
         manager_candidates,
+        source_candidates,
         default_manager_provider_id: default,
         preferred_manager_provider_id: preferred,
+        default_source_provider_id: default_source,
+        preferred_source_provider_id: preferred_source,
     }))
 }
 
@@ -1692,9 +1769,6 @@ async fn build_source_acquisition_items(
             .into_iter()
             .filter(|target| target.state != AcquisitionTargetState::Excluded)
             .collect::<Vec<_>>();
-        if visible_targets.is_empty() {
-            continue;
-        }
         let Some(item) = build_source_acquisition_item(
             &subscription,
             &visible_targets,
@@ -1788,6 +1862,11 @@ async fn load_source_release_runtime_by_target(
 
             let runtime = SourceTargetReleaseRuntime {
                 release_id: release.release_id,
+                source_provider_id: release.source_provider_id,
+                route_provider_id: latest_job
+                    .as_ref()
+                    .and_then(|job| job.provider_id)
+                    .or(release.selected_provider_id),
                 release_title: release.release_title.clone(),
                 release_state: release.state,
                 release_state_reason: release.state_reason.clone(),
@@ -1848,11 +1927,22 @@ fn build_source_acquisition_item(
         .map(provider_label)
         .unwrap_or_else(|| "Acquisition source".to_string());
 
+    if targets.is_empty() {
+        return Some(build_empty_source_acquisition_item(
+            subscription,
+            manager_provider_id,
+            source_label,
+            ux_context,
+        ));
+    }
+
     let mut children = targets
         .iter()
         .map(|target| {
             build_source_acquisition_child(
                 target,
+                source_provider_id,
+                provider_map,
                 target
                     .download_id
                     .as_deref()
@@ -1867,9 +1957,6 @@ fn build_source_acquisition_item(
             )
         })
         .collect::<Vec<_>>();
-    if children.is_empty() {
-        return None;
-    }
     children.sort_by(|left, right| {
         let left_phase = acquisition_phase_from_str(&left.phase);
         let right_phase = acquisition_phase_from_str(&right.phase);
@@ -1914,6 +2001,13 @@ fn build_source_acquisition_item(
     evidence.extend(source_status_count_evidence(counts));
     if let Some(route) = subscription_route_evidence(targets) {
         evidence.push(acquisition_evidence("Route", route, Some("neutral")));
+    }
+    if let Some(route_provider) = source_route_provider_evidence(&children) {
+        evidence.push(acquisition_evidence(
+            "Route provider",
+            route_provider,
+            Some("neutral"),
+        ));
     }
     if debrid_account_missing {
         evidence.push(acquisition_evidence(
@@ -1962,8 +2056,126 @@ fn build_source_acquisition_item(
     })
 }
 
+fn build_empty_source_acquisition_item(
+    subscription: &AcquisitionSubscription,
+    manager_provider_id: Uuid,
+    source_label: String,
+    ux_context: &AcquisitionUxContext,
+) -> FindMediaAcquisitionItem {
+    let blocker = empty_source_acquisition_blocker(subscription);
+    let phase = if blocker.is_some() {
+        AcquisitionPhase::NeedsAttention
+    } else {
+        AcquisitionPhase::Requested
+    };
+    let debrid_account_missing =
+        ux_context.debrid_account_missing && route_policy_allows_debrid(subscription.route_policy);
+    let blocker =
+        blocker.or_else(|| debrid_account_missing.then(build_missing_debrid_account_blocker));
+    let mut actions = if debrid_account_missing {
+        vec![build_add_debrid_account_action()]
+    } else {
+        Vec::new()
+    };
+    actions.push(build_remove_acquisition_request_action(
+        subscription.subscription_id,
+    ));
+    let headline = if phase == AcquisitionPhase::NeedsAttention {
+        "Metadata target expansion needs attention.".to_string()
+    } else {
+        "Resolving episodes before source search.".to_string()
+    };
+    let detail = if subscription.last_metadata_refresh_at.is_some() {
+        "Elixir has not created any acquisition targets for this request yet.".to_string()
+    } else {
+        "Elixir accepted the request and is waiting for the metadata expansion pass.".to_string()
+    };
+    let mut evidence = vec![
+        acquisition_evidence("Source", source_label.clone(), Some("neutral")),
+        acquisition_evidence("Targets", "0".to_string(), Some("warning")),
+        acquisition_evidence(
+            "Metadata",
+            if subscription.last_metadata_refresh_at.is_some() {
+                "No targets created".to_string()
+            } else {
+                "Waiting".to_string()
+            },
+            Some(if phase == AcquisitionPhase::NeedsAttention {
+                "warning"
+            } else {
+                "neutral"
+            }),
+        ),
+    ];
+    if debrid_account_missing {
+        evidence.push(acquisition_evidence(
+            "Debrid account",
+            "Add debrid account",
+            Some("warning"),
+        ));
+    }
+
+    FindMediaAcquisitionItem {
+        intent_id: subscription.subscription_id,
+        title: subscription.title.clone(),
+        media_type: media_type_api_name(subscription.media_type).to_string(),
+        year: subscription.year,
+        external_ids: subscription.external_ids.clone(),
+        manager_provider_id,
+        manager_label: source_label,
+        manager_item_id: Some(subscription.subscription_id.to_string()),
+        source: SOURCE_ACQUISITION_INTENT_SOURCE.to_string(),
+        phase: phase.as_str().to_string(),
+        phase_label: phase.label().to_string(),
+        headline: headline.clone(),
+        detail: Some(detail.clone()),
+        target_count: 0,
+        displayed_child_count: 0,
+        hidden_child_count: 0,
+        blocker,
+        evidence,
+        actions,
+        stage: phase.legacy_stage().to_string(),
+        stage_label: phase.legacy_stage_label().to_string(),
+        description: detail,
+        progress_percent: None,
+        eta_seconds: None,
+        downloader_label: None,
+        protocol: None,
+        last_matched_at: None,
+        created_at: subscription.created_at.clone(),
+        updated_at: subscription
+            .last_metadata_refresh_at
+            .clone()
+            .unwrap_or_else(|| subscription.updated_at.clone()),
+        children: Vec::new(),
+    }
+}
+
+fn empty_source_acquisition_blocker(
+    subscription: &AcquisitionSubscription,
+) -> Option<FindMediaAcquisitionBlocker> {
+    subscription.last_metadata_refresh_at.as_ref()?;
+    if subscription.media_type == MediaType::Series {
+        return Some(FindMediaAcquisitionBlocker {
+            code: "metadata_tvdb_targets_missing".to_string(),
+            title: "TV series metadata did not produce episodes".to_string(),
+            detail: "The running server accepted the acquisition request, but it has not expanded this TV series into episode targets. Check TVDB metadata configuration and external IDs, then retry or wait for metadata refresh.".to_string(),
+            severity: "warning".to_string(),
+        });
+    }
+    Some(FindMediaAcquisitionBlocker {
+        code: "metadata_targets_missing".to_string(),
+        title: "No acquisition targets were created".to_string(),
+        detail: "The metadata refresh completed without creating movie, episode, or anime targets. Check the metadata provider configuration and external IDs for this item.".to_string(),
+        severity: "warning".to_string(),
+    })
+}
+
 fn build_source_acquisition_child(
     target: &AcquisitionTarget,
+    subscription_source_provider_id: Option<Uuid>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
     progress: Option<&AcquisitionDownloaderProgress>,
     release_runtime: Option<&SourceTargetReleaseRuntime>,
 ) -> FindMediaAcquisitionChildItem {
@@ -1976,13 +2188,26 @@ fn build_source_acquisition_child(
     let route = target.selected_route_logical_id.as_deref().or_else(|| {
         release_runtime.and_then(|runtime| runtime.selected_route_logical_id.as_deref())
     });
+    let route_logical_id = route.map(str::to_string);
     let downloader_label = source_route_downloader_label(route);
     let protocol = source_route_protocol(route);
+    let source_provider_id =
+        source_provider_id_for_target(subscription_source_provider_id, target, release_runtime);
+    let route_provider_id = route_provider_id_for_target(target, release_runtime);
+    let source_provider_label = source_provider_id
+        .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+    let route_provider_label = route_provider_id
+        .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
 
     FindMediaAcquisitionChildItem {
         id: target.target_id.to_string(),
         title,
         release_id: release_runtime.map(|runtime| runtime.release_id),
+        source_provider_id,
+        source_provider_label,
+        route_provider_id,
+        route_provider_label,
+        route_logical_id,
         subtitle,
         download_id: target
             .download_id
@@ -2003,11 +2228,7 @@ fn build_source_acquisition_child(
         ),
         detail: source_target_detail(target, release_runtime, phase, selected_title.as_deref()),
         blocker,
-        progress_percent: if target.state == AcquisitionTargetState::Imported {
-            Some(100.0)
-        } else {
-            progress.and_then(|item| item.progress_percent)
-        },
+        progress_percent: source_target_progress_percent(target, phase, progress),
         eta_seconds: progress.and_then(|item| item.eta_seconds),
         downloader_label,
         protocol,
@@ -2032,8 +2253,59 @@ fn source_provider_id_for_subscription(
     subscription.source_provider_id.or_else(|| {
         targets
             .iter()
-            .find_map(|target| target.selected_provider_id)
+            .find_map(|target| selected_candidate_source_provider_id(target))
+            .or_else(|| {
+                targets
+                    .iter()
+                    .find_map(|target| target.selected_provider_id)
+            })
     })
+}
+
+fn source_provider_id_for_target(
+    subscription_source_provider_id: Option<Uuid>,
+    target: &AcquisitionTarget,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
+) -> Option<Uuid> {
+    subscription_source_provider_id
+        .or_else(|| release_runtime.and_then(|runtime| runtime.source_provider_id))
+        .or_else(|| selected_candidate_source_provider_id(target))
+        .or(target.selected_provider_id)
+}
+
+fn route_provider_id_for_target(
+    target: &AcquisitionTarget,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
+) -> Option<Uuid> {
+    release_runtime
+        .and_then(|runtime| runtime.route_provider_id)
+        .or_else(|| selected_candidate_route_provider_id(target))
+}
+
+fn selected_candidate_source_provider_id(target: &AcquisitionTarget) -> Option<Uuid> {
+    selected_candidate_uuid_at(target.selected_candidate.as_ref(), &["sourceProviderId"])
+}
+
+fn selected_candidate_route_provider_id(target: &AcquisitionTarget) -> Option<Uuid> {
+    selected_candidate_uuid_at(
+        target.selected_candidate.as_ref(),
+        &["submissionResult", "routeProviderId"],
+    )
+    .or_else(|| {
+        selected_candidate_uuid_at(target.selected_candidate.as_ref(), &["routeProviderId"])
+    })
+}
+
+fn selected_candidate_uuid_at(candidate: Option<&Value>, path: &[&str]) -> Option<Uuid> {
+    let mut value = candidate?;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| Uuid::parse_str(text).ok())
 }
 
 fn select_source_import_file(
@@ -2313,6 +2585,14 @@ fn source_target_phase(
         AcquisitionTargetState::Pending | AcquisitionTargetState::Submitted => {}
     }
 
+    if target.state == AcquisitionTargetState::Pending
+        && target
+            .state_reason
+            .as_deref()
+            .is_some_and(source_reason_finding_next_release)
+    {
+        return AcquisitionPhase::FindingAnotherRelease;
+    }
     if target
         .state_reason
         .as_deref()
@@ -2406,6 +2686,34 @@ fn source_downloader_progress_phase(
         return Some(AcquisitionPhase::Downloading);
     }
     None
+}
+
+fn source_target_progress_percent(
+    target: &AcquisitionTarget,
+    phase: AcquisitionPhase,
+    progress: Option<&AcquisitionDownloaderProgress>,
+) -> Option<f64> {
+    if target.state == AcquisitionTargetState::Imported || phase == AcquisitionPhase::Completed {
+        return Some(100.0);
+    }
+
+    let live_progress = progress
+        .and_then(|item| item.progress_percent)
+        .and_then(normalize_progress_percent);
+
+    match phase {
+        AcquisitionPhase::Downloading | AcquisitionPhase::Materializing => {
+            Some(live_progress.unwrap_or(0.0))
+        }
+        AcquisitionPhase::PostProcessing | AcquisitionPhase::Importing => {
+            Some(live_progress.unwrap_or(100.0))
+        }
+        _ => live_progress,
+    }
+}
+
+fn normalize_progress_percent(value: f64) -> Option<f64> {
+    value.is_finite().then(|| value.clamp(0.0, 100.0))
 }
 
 fn source_release_runtime_phase(runtime: &SourceTargetReleaseRuntime) -> Option<AcquisitionPhase> {
@@ -2523,6 +2831,24 @@ fn source_target_blocker(
         "torrent_route_blocked_by_network_protection"
     } else if normalized.contains("protected local acquisition requires") {
         "torrent_route_not_selected_for_protection"
+    } else if normalized.contains("qbittorrent could not fetch torrent metadata")
+        || normalized.contains("qbittorrent_metadata_timeout")
+    {
+        "qbittorrent_metadata_timeout"
+    } else if normalized.contains("swarm has no complete seeds")
+        || normalized.contains("qbittorrent_zero_seed_stall")
+        || normalized.contains("no useful seed availability")
+    {
+        "qbittorrent_zero_seed_stall"
+    } else if normalized.contains("torbox accepted this torrent")
+        || normalized.contains("no_seeds")
+        || normalized.contains("no seeds")
+    {
+        "debrid_no_seeds"
+    } else if normalized.contains("acquisition route blocked")
+        || normalized.contains("route/provider status")
+    {
+        "acquisition_route_unavailable"
     } else if phase == AcquisitionPhase::ReviewRequired {
         "acquisition_review_required"
     } else if phase == AcquisitionPhase::Quarantined {
@@ -2546,6 +2872,10 @@ fn source_target_blocker(
             "torrent_route_not_selected_for_protection" => {
                 "Torrent route not selected for protected downloads".to_string()
             }
+            "qbittorrent_metadata_timeout" => "Torrent metadata did not resolve".to_string(),
+            "qbittorrent_zero_seed_stall" => "Torrent swarm has no complete seeds".to_string(),
+            "debrid_no_seeds" => "Debrid release has no seeds".to_string(),
+            "acquisition_route_unavailable" => "Acquisition route unavailable".to_string(),
             "acquisition_review_required" => "Review required".to_string(),
             "acquisition_import_quarantined" => "Import quarantined".to_string(),
             "source_import_failed" => "Acquisition failed".to_string(),
@@ -2589,7 +2919,7 @@ fn source_target_headline(
 ) -> String {
     match phase {
         AcquisitionPhase::Requested => "Waiting for source search.".to_string(),
-        AcquisitionPhase::FindingAnotherRelease => "Searching for a release.".to_string(),
+        AcquisitionPhase::FindingAnotherRelease => "Trying next release.".to_string(),
         AcquisitionPhase::Staged => "Release staged for routing.".to_string(),
         AcquisitionPhase::Submitted => downloader_label
             .map(|label| format!("Submitted to {label}."))
@@ -2608,11 +2938,16 @@ fn source_target_headline(
         AcquisitionPhase::Completed => "Imported.".to_string(),
         AcquisitionPhase::ReviewRequired => "Review required before import.".to_string(),
         AcquisitionPhase::Quarantined => "Import quarantined after verification.".to_string(),
-        AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed => target
-            .state_reason
-            .clone()
-            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::state_reason))
-            .unwrap_or_else(|| "Acquisition needs attention.".to_string()),
+        AcquisitionPhase::NeedsAttention | AcquisitionPhase::Failed => {
+            let raw_reason = target
+                .state_reason
+                .clone()
+                .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::state_reason));
+            source_user_attention_headline(phase, raw_reason.as_deref(), release_runtime)
+                .unwrap_or_else(|| {
+                    raw_reason.unwrap_or_else(|| "Acquisition needs attention.".to_string())
+                })
+        }
         AcquisitionPhase::AcceptedByManager => "Accepted.".to_string(),
     }
 }
@@ -2639,6 +2974,13 @@ fn source_target_detail(
             release_runtime,
         ));
     }
+    if phase == AcquisitionPhase::FindingAnotherRelease {
+        let raw_detail = target
+            .state_reason
+            .clone()
+            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::state_reason));
+        return Some(source_finding_another_release_detail(raw_detail.as_deref()));
+    }
     if let Some(title) = selected_title.filter(|value| !value.trim().is_empty()) {
         return Some(format!("Selected release: {}.", title.trim()));
     }
@@ -2652,6 +2994,9 @@ fn source_user_attention_detail(
     raw_reason: Option<&str>,
     release_runtime: Option<&SourceTargetReleaseRuntime>,
 ) -> String {
+    if let Some(detail) = raw_reason.and_then(source_safe_failure_detail) {
+        return detail;
+    }
     if let Some(detail) = raw_reason.and_then(source_debrid_attention_detail) {
         return detail;
     }
@@ -2683,6 +3028,157 @@ fn source_user_attention_detail(
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "This acquisition target needs attention.".to_string()),
+    }
+}
+
+fn source_user_attention_headline(
+    phase: AcquisitionPhase,
+    raw_reason: Option<&str>,
+    _release_runtime: Option<&SourceTargetReleaseRuntime>,
+) -> Option<String> {
+    let raw = raw_reason?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = raw.to_ascii_lowercase();
+    if source_reason_finding_next_release(raw) {
+        return Some("Trying next release.".to_string());
+    }
+    if normalized.contains("falling back to qbittorrent")
+        || normalized.contains("torrent fallback")
+        || normalized.contains("qbittorrent fallback")
+    {
+        return Some("Falling back to qBittorrent.".to_string());
+    }
+    if normalized.contains("torbox accepted this torrent")
+        || normalized.contains("no_seeds")
+        || normalized.contains("no seeds")
+        || normalized.contains("provider_stalled")
+    {
+        return Some("Debrid release stalled.".to_string());
+    }
+    if normalized.contains("qbittorrent could not fetch torrent metadata")
+        || normalized.contains("qbittorrent_metadata_timeout")
+    {
+        return Some("Torrent metadata did not resolve.".to_string());
+    }
+    if normalized.contains("swarm has no complete seeds")
+        || normalized.contains("qbittorrent_zero_seed_stall")
+        || normalized.contains("no useful seed availability")
+    {
+        return Some("Torrent swarm has no complete seeds.".to_string());
+    }
+    if normalized.contains("acquisition route blocked")
+        || normalized.contains("route/provider status")
+    {
+        return Some("Acquisition route unavailable.".to_string());
+    }
+    if normalized.contains("candidate automation failed") {
+        return Some("Acquisition automation failed.".to_string());
+    }
+    if phase == AcquisitionPhase::Failed && normalized.contains("debrid could not complete") {
+        return Some("Debrid release failed.".to_string());
+    }
+    None
+}
+
+fn source_finding_another_release_detail(raw_reason: Option<&str>) -> String {
+    if let Some(detail) = raw_reason.and_then(source_safe_failure_detail) {
+        return detail;
+    }
+    "Elixir is trying the next ranked release.".to_string()
+}
+
+fn source_reason_finding_next_release(reason: &str) -> bool {
+    let normalized = reason.trim().to_ascii_lowercase();
+    normalized.contains("trying the next ranked release")
+        || normalized.contains("trying next release")
+        || normalized.contains("try the next release")
+        || normalized.contains("try another release")
+}
+
+fn source_safe_failure_detail(raw_reason: &str) -> Option<String> {
+    let cleaned = strip_internal_failure_prefix(raw_reason);
+    let normalized = cleaned.to_ascii_lowercase();
+    let trying_next = source_reason_finding_next_release(raw_reason);
+
+    if normalized.contains("parsing torbox torrent") {
+        return Some(action_suffix(
+            "TorBox returned an incomplete torrent response. Elixir kept the provider diagnostics in server logs and release provenance.",
+            trying_next,
+        ));
+    }
+    if normalized.contains("torbox accepted this torrent") {
+        return Some(action_suffix(cleaned.trim_end_matches('.'), trying_next));
+    }
+    if normalized.contains("qbittorrent could not fetch torrent metadata")
+        || normalized.contains("qbittorrent_metadata_timeout")
+    {
+        return Some(action_suffix(
+            "qBittorrent could not fetch torrent metadata.",
+            trying_next,
+        ));
+    }
+    if normalized.contains("qbittorrent found metadata but the swarm has no complete seeds")
+        || normalized.contains("qbittorrent_zero_seed_stall")
+        || normalized.contains("no useful seed availability")
+    {
+        return Some(action_suffix(
+            "qBittorrent found metadata but the swarm has no complete seeds.",
+            trying_next,
+        ));
+    }
+    if normalized.contains("debrid could not complete this release")
+        || normalized.contains("the debrid provider accepted this torrent")
+        || normalized.contains("the debrid provider rejected this magnet")
+    {
+        return Some(action_suffix(cleaned.trim_end_matches('.'), trying_next));
+    }
+    if normalized.contains("acquisition route blocked") {
+        return Some(
+            "The selected acquisition route is unavailable. Check the route/provider status, then retry or choose another release."
+                .to_string(),
+        );
+    }
+    if normalized.contains("candidate automation failed") {
+        return Some(
+            "Acquisition automation failed while processing this item. Check server logs, then retry the request."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn strip_internal_failure_prefix(raw_reason: &str) -> &str {
+    let trimmed = raw_reason.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.starts_with("debrid failure [")
+        && let Some((_, rest)) = trimmed.split_once("]:")
+    {
+        return rest.trim();
+    }
+    if normalized.starts_with("acquisition route blocked:")
+        && let Some((_, rest)) = trimmed.split_once(':')
+    {
+        return rest.trim();
+    }
+    trimmed
+}
+
+fn action_suffix(base: &str, trying_next: bool) -> String {
+    let base = base
+        .trim()
+        .trim_end_matches('.')
+        .replace(" Trying the next ranked release", "")
+        .replace(" Trying next release", "")
+        .replace(" Try the next release", "");
+    let base = base.trim().trim_end_matches('.');
+    if trying_next {
+        format!("{base}. Trying next release.")
+    } else {
+        format!(
+            "{base}. Elixir will try another release or use qBittorrent fallback when policy allows."
+        )
     }
 }
 
@@ -2827,6 +3323,7 @@ fn build_add_debrid_account_action() -> FindMediaAcquisitionAction {
         release_id: None,
         subscription_id: None,
         retry_mode: None,
+        cancel_mode: None,
     }
 }
 
@@ -2889,7 +3386,30 @@ fn build_source_acquisition_actions(
         ));
     }
 
+    if children.iter().any(child_has_active_download_work) {
+        actions.push(build_cancel_acquisition_downloads_action(
+            subscription.subscription_id,
+        ));
+    } else {
+        actions.push(build_remove_acquisition_request_action(
+            subscription.subscription_id,
+        ));
+    }
+
     actions
+}
+
+fn child_has_active_download_work(child: &FindMediaAcquisitionChildItem) -> bool {
+    matches!(
+        acquisition_phase_from_str(&child.phase),
+        AcquisitionPhase::Staged
+            | AcquisitionPhase::Submitted
+            | AcquisitionPhase::QueuedInDownloader
+            | AcquisitionPhase::Downloading
+            | AcquisitionPhase::Materializing
+            | AcquisitionPhase::PostProcessing
+            | AcquisitionPhase::Importing
+    )
 }
 
 fn build_release_review_action(
@@ -2907,6 +3427,7 @@ fn build_release_review_action(
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: None,
+        cancel_mode: None,
     }
 }
 
@@ -2926,6 +3447,7 @@ fn build_retry_import_action(
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: Some("import".to_string()),
+        cancel_mode: None,
     }
 }
 
@@ -2943,6 +3465,43 @@ fn build_find_another_release_for_release_action(
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: Some("source_discovery".to_string()),
+        cancel_mode: None,
+    }
+}
+
+fn build_remove_acquisition_request_action(subscription_id: Uuid) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: REMOVE_ACQUISITION_REQUEST_ACTION_ID.to_string(),
+        label: "Remove request".to_string(),
+        kind: "secondary".to_string(),
+        confirm_text: Some(
+            "Remove this acquisition request from the active queue? History is preserved."
+                .to_string(),
+        ),
+        navigate_extension_id: None,
+        navigate_view: None,
+        release_id: None,
+        subscription_id: Some(subscription_id),
+        retry_mode: None,
+        cancel_mode: Some("dismiss".to_string()),
+    }
+}
+
+fn build_cancel_acquisition_downloads_action(subscription_id: Uuid) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: CANCEL_ACQUISITION_DOWNLOADS_ACTION_ID.to_string(),
+        label: "Cancel download".to_string(),
+        kind: "danger".to_string(),
+        confirm_text: Some(
+            "Cancel active download work and remove this acquisition request? Imported library files are not deleted."
+                .to_string(),
+        ),
+        navigate_extension_id: None,
+        navigate_view: None,
+        release_id: None,
+        subscription_id: Some(subscription_id),
+        retry_mode: None,
+        cancel_mode: Some("cancel_downloads".to_string()),
     }
 }
 
@@ -3051,14 +3610,33 @@ fn build_source_acquisition_blocker(
 }
 
 fn source_parent_progress(children: &[FindMediaAcquisitionChildItem]) -> Option<f64> {
-    let values = children
-        .iter()
-        .filter_map(|child| child.progress_percent)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
+    if children.is_empty() {
         return None;
     }
+    let values = children
+        .iter()
+        .map(source_child_progress_contribution)
+        .collect::<Vec<_>>();
     Some((values.iter().sum::<f64>() / values.len() as f64).clamp(0.0, 100.0))
+}
+
+fn source_child_progress_contribution(child: &FindMediaAcquisitionChildItem) -> f64 {
+    let phase = acquisition_phase_from_str(&child.phase);
+    match phase {
+        AcquisitionPhase::Completed => 100.0,
+        AcquisitionPhase::PostProcessing | AcquisitionPhase::Importing => child
+            .progress_percent
+            .and_then(normalize_progress_percent)
+            .unwrap_or(100.0),
+        AcquisitionPhase::Downloading | AcquisitionPhase::Materializing => child
+            .progress_percent
+            .and_then(normalize_progress_percent)
+            .unwrap_or(0.0),
+        _ => child
+            .progress_percent
+            .and_then(normalize_progress_percent)
+            .unwrap_or(0.0),
+    }
 }
 
 fn format_source_acquisition_headline(
@@ -3167,6 +3745,23 @@ fn subscription_route_evidence(targets: &[AcquisitionTarget]) -> Option<String> 
         routes.into_iter().next()
     } else {
         Some(format!("{} routes", routes.len()))
+    }
+}
+
+fn source_route_provider_evidence(children: &[FindMediaAcquisitionChildItem]) -> Option<String> {
+    let mut providers = children
+        .iter()
+        .filter_map(|child| child.route_provider_label.as_deref())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    if providers.is_empty() {
+        None
+    } else if providers.len() == 1 {
+        providers.into_iter().next()
+    } else {
+        Some(format!("{} route providers", providers.len()))
     }
 }
 
@@ -3802,12 +4397,40 @@ async fn load_acquisition_downloader_totals(
     let mut has_upload_rate = false;
 
     for detail in providers {
+        if detail.provider.health_state == ProviderHealthState::Unhealthy {
+            continue;
+        }
+        if detail.provider.capability == "debrid.resolver" {
+            let implementation = detail
+                .provider
+                .implementation
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if !is_debrid_service_implementation(implementation) {
+                continue;
+            }
+            let Ok(items) = load_debrid_progress(
+                state,
+                store,
+                detail.provider.provider_id,
+                detail.provider.instance_id,
+            )
+            .await
+            else {
+                continue;
+            };
+            for item in items {
+                if let Some(rate) = item.download_rate_bps {
+                    total_download_rate = total_download_rate.saturating_add(rate);
+                    has_download_rate = true;
+                }
+            }
+            continue;
+        }
         if detail.provider.capability != "downloader.torrent"
             && detail.provider.capability != "downloader.nzb"
         {
-            continue;
-        }
-        if detail.provider.health_state == ProviderHealthState::Unhealthy {
             continue;
         }
         let Some(instance) = instance_map.get(&detail.provider.instance_id) else {
@@ -4670,6 +5293,11 @@ fn build_download_attempt_child(
         id,
         title,
         release_id: None,
+        source_provider_id: None,
+        source_provider_label: None,
+        route_provider_id: None,
+        route_provider_label: None,
+        route_logical_id: None,
         subtitle,
         download_id,
         status: progress
@@ -5393,9 +6021,9 @@ fn qbittorrent_torrent_issue(
     {
         return Some(AcquisitionDownloaderIssue {
             code: "qbittorrent_release_metadata_stalled".to_string(),
-            title: "Torrent metadata never resolved".to_string(),
+            title: "qBittorrent is waiting for torrent metadata".to_string(),
             detail: format!(
-                "qBittorrent has been waiting on torrent metadata for over {} minutes with no connected peers. Elixir will remove it and ask the manager for another release. Known swarm: {} seeders, {} peers.",
+                "qBittorrent is waiting for torrent metadata. It has had over {} minutes with no connected peers; Elixir will remove it and try the next release. Known swarm: {} seeders, {} peers.",
                 TORRENT_METADATA_STALL_TIMEOUT_SECONDS / 60,
                 known_seeds,
                 known_peers
@@ -5411,9 +6039,9 @@ fn qbittorrent_torrent_issue(
     {
         return Some(AcquisitionDownloaderIssue {
             code: "qbittorrent_release_zero_progress".to_string(),
-            title: "Torrent never became reachable".to_string(),
+            title: "qBittorrent swarm has no complete seeds".to_string(),
             detail: format!(
-                "qBittorrent has had this torrent for over {} minutes with no progress, no connected peers, and no download speed. Elixir will remove it and ask the manager for another release. Known swarm: {} seeders, {} peers.",
+                "qBittorrent found metadata but the swarm has no complete seeds. It has had over {} minutes with no progress, no connected peers, and no download speed; Elixir will remove it and try the next release. Known swarm: {} seeders, {} peers.",
                 TORRENT_ZERO_PROGRESS_TIMEOUT_SECONDS / 60,
                 known_seeds,
                 known_peers
@@ -5610,12 +6238,18 @@ pub async fn find_media_preferences(
     let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let source_preferences = load_source_preferences(&store, &providers)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(FindMediaPreferencesResponse {
         preferences: FindMediaPreferencesState {
             tv_default_manager_provider_id: preferences.series_provider_id,
             movies_default_manager_provider_id: preferences.movie_provider_id,
             anime_default_manager_provider_id: preferences.anime_provider_id,
+            tv_default_source_provider_id: source_preferences.series_provider_id,
+            movies_default_source_provider_id: source_preferences.movie_provider_id,
+            anime_default_source_provider_id: source_preferences.anime_provider_id,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -5626,6 +6260,18 @@ pub async fn find_media_preferences(
             .map(provider_summary)
             .collect(),
         anime_manager_candidates: collect_manager_providers(&providers, MediaType::Anime)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        tv_source_candidates: collect_source_providers(&providers, MediaType::Series)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        movies_source_candidates: collect_source_providers(&providers, MediaType::Movie)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        anime_source_candidates: collect_source_providers(&providers, MediaType::Anime)
             .iter()
             .map(provider_summary)
             .collect(),
@@ -5660,8 +6306,29 @@ pub async fn patch_find_media_preferences(
             .await
             .map_err(ApiError::from)?;
     }
+    if let Some(value) = parse_provider_patch_value(payload.movies_default_source_provider_id)? {
+        validate_source_preference_provider(value, MediaType::Movie, &providers)?;
+        save_source_preference(&store, MediaType::Movie, value)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    if let Some(value) = parse_provider_patch_value(payload.tv_default_source_provider_id)? {
+        validate_source_preference_provider(value, MediaType::Series, &providers)?;
+        save_source_preference(&store, MediaType::Series, value)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    if let Some(value) = parse_provider_patch_value(payload.anime_default_source_provider_id)? {
+        validate_source_preference_provider(value, MediaType::Anime, &providers)?;
+        save_source_preference(&store, MediaType::Anime, value)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     let preferences = load_manager_preferences(&store, &providers)
+        .await
+        .map_err(ApiError::from)?;
+    let source_preferences = load_source_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
 
@@ -5670,6 +6337,9 @@ pub async fn patch_find_media_preferences(
             tv_default_manager_provider_id: preferences.series_provider_id,
             movies_default_manager_provider_id: preferences.movie_provider_id,
             anime_default_manager_provider_id: preferences.anime_provider_id,
+            tv_default_source_provider_id: source_preferences.series_provider_id,
+            movies_default_source_provider_id: source_preferences.movie_provider_id,
+            anime_default_source_provider_id: source_preferences.anime_provider_id,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -5680,6 +6350,18 @@ pub async fn patch_find_media_preferences(
             .map(provider_summary)
             .collect(),
         anime_manager_candidates: collect_manager_providers(&providers, MediaType::Anime)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        tv_source_candidates: collect_source_providers(&providers, MediaType::Series)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        movies_source_candidates: collect_source_providers(&providers, MediaType::Movie)
+            .iter()
+            .map(provider_summary)
+            .collect(),
+        anime_source_candidates: collect_source_providers(&providers, MediaType::Anime)
             .iter()
             .map(provider_summary)
             .collect(),
@@ -5862,6 +6544,17 @@ fn preferred_manager_for_type(
     }
 }
 
+fn preferred_source_for_type(
+    preferences: &SourcePreferenceState,
+    media_type: MediaType,
+) -> Option<Uuid> {
+    match media_type {
+        MediaType::Movie => preferences.movie_provider_id,
+        MediaType::Series => preferences.series_provider_id,
+        MediaType::Anime => preferences.anime_provider_id,
+    }
+}
+
 fn resolve_default_manager(
     preferred: Option<Uuid>,
     blueprint_preferred: Option<Uuid>,
@@ -5902,6 +6595,22 @@ fn resolve_default_manager(
     Some(first.detail.provider.provider_id)
 }
 
+fn resolve_default_source(preferred: Option<Uuid>, providers: &[ProviderContext]) -> Option<Uuid> {
+    if let Some(preferred) = preferred {
+        if providers
+            .iter()
+            .any(|provider| provider.detail.provider.provider_id == preferred)
+        {
+            return Some(preferred);
+        }
+    }
+    let mut ordered = providers.to_vec();
+    ordered.sort_by(compare_source_candidates);
+    ordered
+        .first()
+        .map(|provider| provider.detail.provider.provider_id)
+}
+
 fn collect_manager_providers(
     providers: &[ProviderContext],
     media_type: MediaType,
@@ -5915,6 +6624,29 @@ fn collect_manager_providers(
         .cloned()
         .collect();
     out.sort_by(compare_manager_candidates);
+    out
+}
+
+fn collect_source_providers(
+    providers: &[ProviderContext],
+    media_type: MediaType,
+) -> Vec<ProviderContext> {
+    let mut out: Vec<_> = providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .detail
+                .provider
+                .capability
+                .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+        })
+        .filter(|provider| provider.media_types.contains(&media_type))
+        .filter(|provider| provider_supports_action(provider, "search"))
+        .filter(|provider| provider.detail.provider.health_state == ProviderHealthState::Healthy)
+        .filter(|provider| provider.detail.provider.endpoint_json.is_some())
+        .cloned()
+        .collect();
+    out.sort_by(compare_source_candidates);
     out
 }
 
@@ -5961,6 +6693,30 @@ fn collect_search_providers(
         }
     }
     out
+}
+
+fn compare_source_candidates(
+    left: &ProviderContext,
+    right: &ProviderContext,
+) -> std::cmp::Ordering {
+    let by_trust = trust_rank(left.detail.trust_level).cmp(&trust_rank(right.detail.trust_level));
+    if by_trust != std::cmp::Ordering::Equal {
+        return by_trust;
+    }
+    let by_extension = left.detail.extension_id.cmp(&right.detail.extension_id);
+    if by_extension == std::cmp::Ordering::Equal {
+        let by_instance = left.instance_name.cmp(&right.instance_name);
+        if by_instance == std::cmp::Ordering::Equal {
+            left.detail
+                .provider
+                .provider_id
+                .cmp(&right.detail.provider.provider_id)
+        } else {
+            by_instance
+        }
+    } else {
+        by_extension
+    }
 }
 
 fn parse_provider_scope(capability: &str, scope_json: Option<&Value>) -> ProviderScopeDocument {
@@ -6029,6 +6785,9 @@ fn infer_media_types_from_capability(capability: &str) -> Vec<MediaType> {
         "media.search.movie" | "media.search.movies" => vec![MediaType::Movie],
         "media.search.series" | "media.search.tv" => vec![MediaType::Series],
         "media.search.anime" => vec![MediaType::Anime],
+        ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY => {
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime]
+        }
         _ => Vec::new(),
     }
 }
@@ -6039,6 +6798,7 @@ fn infer_actions_from_capability(capability: &str) -> Vec<&'static str> {
             vec!["add", "monitor", "search"]
         }
         value if value.starts_with("media.search.") => vec!["search"],
+        ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY => vec!["search"],
         _ => Vec::new(),
     }
 }
@@ -6136,6 +6896,9 @@ async fn execute_find_media_search(
     let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let source_preferences = load_source_preferences(&store, &providers)
+        .await
+        .map_err(ApiError::from)?;
 
     let (search_contexts, search_errors) = filter_search_providers(
         state,
@@ -6148,6 +6911,13 @@ async fn execute_find_media_search(
         state,
         &store,
         collect_manager_providers(&providers, media_type),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let (source_contexts, _source_errors) = filter_search_providers(
+        state,
+        &store,
+        collect_source_providers(&providers, media_type),
     )
     .await
     .map_err(ApiError::from)?;
@@ -6164,6 +6934,8 @@ async fn execute_find_media_search(
         search_contexts.iter().map(provider_summary).collect();
     let manager_providers: Vec<ProviderSummary> =
         manager_contexts.iter().map(provider_summary).collect();
+    let source_providers: Vec<ProviderSummary> =
+        source_contexts.iter().map(provider_summary).collect();
 
     let preferred_manager_provider_id = preferred_manager_for_type(&preferences, media_type);
     let blueprint_preferred =
@@ -6175,6 +6947,9 @@ async fn execute_find_media_search(
         blueprint_preferred,
         &manager_contexts,
     );
+    let preferred_source_provider_id = preferred_source_for_type(&source_preferences, media_type);
+    let default_source_provider_id =
+        resolve_default_source(preferred_source_provider_id, &source_contexts);
     let has_requested_provider_filter = !requested_provider_ids.is_empty();
 
     let filtered_search_contexts = if requested_provider_ids.is_empty() {
@@ -6312,8 +7087,11 @@ async fn execute_find_media_search(
         media_type,
         search_providers,
         manager_providers,
+        source_providers,
         preferred_manager_provider_id,
         default_manager_provider_id,
+        preferred_source_provider_id,
+        default_source_provider_id,
         results,
         provider_errors,
     })
@@ -6522,6 +7300,24 @@ async fn load_manager_preferences(
     })
 }
 
+async fn load_source_preferences(
+    store: &ExtensionStore<'_>,
+    providers: &[ProviderContext],
+) -> AnyResult<SourcePreferenceState> {
+    let movie_provider_id =
+        sanitize_source_preference(store, SOURCE_PREF_MOVIE, MediaType::Movie, providers).await?;
+    let series_provider_id =
+        sanitize_source_preference(store, SOURCE_PREF_SERIES, MediaType::Series, providers).await?;
+    let anime_provider_id =
+        sanitize_source_preference(store, SOURCE_PREF_ANIME, MediaType::Anime, providers).await?;
+
+    Ok(SourcePreferenceState {
+        movie_provider_id,
+        series_provider_id,
+        anime_provider_id,
+    })
+}
+
 async fn load_manager_preference(store: &ExtensionStore<'_>, key: &str) -> AnyResult<Option<Uuid>> {
     let value = store.get_extension_setting(key).await?;
     let Some(value) = value else {
@@ -6567,6 +7363,34 @@ async fn sanitize_manager_preference(
     Ok(None)
 }
 
+async fn sanitize_source_preference(
+    store: &ExtensionStore<'_>,
+    key: &str,
+    media_type: MediaType,
+    providers: &[ProviderContext],
+) -> AnyResult<Option<Uuid>> {
+    let provider_id = load_manager_preference(store, key).await?;
+    let Some(provider_id) = provider_id else {
+        return Ok(None);
+    };
+
+    let is_valid = collect_source_providers(providers, media_type)
+        .iter()
+        .any(|provider| provider.detail.provider.provider_id == provider_id);
+    if is_valid {
+        return Ok(Some(provider_id));
+    }
+
+    store.delete_extension_setting(key).await?;
+    info!(
+        setting_key = key,
+        media_type = media_type_api_name(media_type),
+        stale_provider_id = %provider_id,
+        "cleared stale acquisition source preference"
+    );
+    Ok(None)
+}
+
 async fn save_manager_preference(
     store: &ExtensionStore<'_>,
     media_type: MediaType,
@@ -6576,6 +7400,22 @@ async fn save_manager_preference(
         MediaType::Movie => MANAGER_PREF_MOVIE,
         MediaType::Series => MANAGER_PREF_SERIES,
         MediaType::Anime => MANAGER_PREF_ANIME,
+    };
+    let value = provider_id.map(|value| value.to_string());
+    store
+        .upsert_extension_setting(key, &serde_json::json!(value))
+        .await
+}
+
+async fn save_source_preference(
+    store: &ExtensionStore<'_>,
+    media_type: MediaType,
+    provider_id: Option<Uuid>,
+) -> AnyResult<()> {
+    let key = match media_type {
+        MediaType::Movie => SOURCE_PREF_MOVIE,
+        MediaType::Series => SOURCE_PREF_SERIES,
+        MediaType::Anime => SOURCE_PREF_ANIME,
     };
     let value = provider_id.map(|value| value.to_string());
     store
@@ -6597,6 +7437,25 @@ fn validate_manager_preference_provider(
     if !valid {
         return Err(ApiError::bad_request(
             "provider is not a valid manager for the selected media type",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_preference_provider(
+    provider_id: Option<Uuid>,
+    media_type: MediaType,
+    providers: &[ProviderContext],
+) -> ApiResult<()> {
+    let Some(provider_id) = provider_id else {
+        return Ok(());
+    };
+    let valid = collect_source_providers(providers, media_type)
+        .iter()
+        .any(|provider| provider.detail.provider.provider_id == provider_id);
+    if !valid {
+        return Err(ApiError::bad_request(
+            "provider is not a valid acquisition source for the selected media type",
         ));
     }
     Ok(())
@@ -7719,6 +8578,423 @@ mod tests {
                 .any(|evidence| evidence.label == "Source"
                     && evidence.value == "External Source (test_source)")
         );
+        assert!(item.actions.iter().any(|action| {
+            action.id == CANCEL_ACQUISITION_DOWNLOADS_ACTION_ID
+                && action.subscription_id == Some(subscription.subscription_id)
+                && action.cancel_mode.as_deref() == Some("cancel_downloads")
+        }));
+    }
+
+    #[test]
+    fn source_acquisition_status_exposes_source_and_route_provider_attribution() {
+        let source_provider_id = Uuid::new_v4();
+        let route_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "Example Series S01E01 1080p",
+                "sourceProviderId": source_provider_id.to_string(),
+                "submissionResult": {
+                    "routeLogicalId": TORRENT_DEFAULT_LOGICAL_ID,
+                    "routeProviderId": route_provider_id.to_string(),
+                    "downloadId": "qb-fallback"
+                }
+            })),
+            download_id: Some("qb-fallback".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+        let runtime = SourceTargetReleaseRuntime {
+            release_id: Uuid::new_v4(),
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: Some(route_provider_id),
+            release_title: "Example Series S01E01 1080p".to_string(),
+            release_state: AcquisitionReleaseState::Submitted,
+            release_state_reason: Some("submitted through torrent fallback".to_string()),
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("qb-fallback".to_string()),
+            job_state: Some(ReleaseJobState::Submitted),
+            job_state_reason: None,
+            import_state: None,
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let provider_map = HashMap::from([
+            (
+                source_provider_id,
+                test_provider_context(source_provider_id, "Torrentio", "torrentio"),
+            ),
+            (
+                route_provider_id,
+                test_provider_context(route_provider_id, "qBittorrent", "qbittorrent"),
+            ),
+        ]);
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.manager_label, "Torrentio (torrentio)");
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Source" && evidence.value == "Torrentio (torrentio)"
+        }));
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Route provider" && evidence.value == "qBittorrent (qbittorrent)"
+        }));
+        let child = item.children.first().expect("child");
+        assert_eq!(child.source_provider_id, Some(source_provider_id));
+        assert_eq!(
+            child.source_provider_label.as_deref(),
+            Some("Torrentio (torrentio)")
+        );
+        assert_eq!(child.route_provider_id, Some(route_provider_id));
+        assert_eq!(
+            child.route_provider_label.as_deref(),
+            Some("qBittorrent (qbittorrent)")
+        );
+        assert_eq!(
+            child.route_logical_id.as_deref(),
+            Some(TORRENT_DEFAULT_LOGICAL_ID)
+        );
+    }
+
+    #[test]
+    fn asr9_source_failure_language_hides_internal_torbox_parse_context() {
+        let detail = source_user_attention_detail(
+            AcquisitionPhase::Failed,
+            Some("Debrid failure [no_seeds]: parsing TorBox torrent '12345'"),
+            None,
+        );
+
+        assert!(!detail.to_ascii_lowercase().contains("parsing torbox"));
+        assert!(!detail.contains("12345"));
+        assert!(detail.contains("TorBox returned an incomplete torrent response."));
+    }
+
+    #[test]
+    fn asr9_pending_retry_target_surfaces_trying_next_release() {
+        let subscription = test_source_subscription(MediaType::Series);
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Pending,
+            state_reason: Some(
+                "qBittorrent found metadata but the swarm has no complete seeds. Trying the next ranked release."
+                    .to_string(),
+            ),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+
+        let child = build_source_acquisition_child(&target, None, &HashMap::new(), None, None);
+
+        assert_eq!(child.phase, "finding_another_release");
+        assert_eq!(child.headline, "Trying next release.");
+        assert_eq!(
+            child.detail.as_deref(),
+            Some(
+                "qBittorrent found metadata but the swarm has no complete seeds. Trying next release."
+            )
+        );
+    }
+
+    #[test]
+    fn asr9_blocked_debrid_target_uses_safe_no_seed_language() {
+        let subscription = test_source_subscription(MediaType::Series);
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Blocked,
+            state_reason: Some(
+                "Debrid failure [no_seeds]: TorBox accepted this torrent, but it is not cached and has no seeds."
+                    .to_string(),
+            ),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+
+        let child = build_source_acquisition_child(&target, None, &HashMap::new(), None, None);
+
+        assert_eq!(child.phase, "needs_attention");
+        assert_eq!(child.headline, "Debrid release stalled.");
+        assert_eq!(
+            child.blocker.as_ref().map(|blocker| blocker.code.as_str()),
+            Some("debrid_no_seeds")
+        );
+        let detail = child.detail.as_deref().expect("detail");
+        assert!(detail.contains("TorBox accepted this torrent"));
+        assert!(!detail.contains("Debrid failure"));
+    }
+
+    #[test]
+    fn source_acquisition_parent_progress_includes_pending_and_completed_targets() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let mut active = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("debrid-active".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+        active.target_key = "S01E01".to_string();
+        let mut pending = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(2),
+            None,
+        );
+        pending.target_key = "S01E02".to_string();
+        let mut imported = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(3),
+            None,
+        );
+        imported.target_key = "S01E03".to_string();
+        imported.state = AcquisitionTargetState::Imported;
+
+        let mut progress_index = AcquisitionDownloaderProgressIndex::default();
+        progress_index.insert(
+            "debrid-active",
+            AcquisitionDownloaderProgress {
+                status: Some("materializing".to_string()),
+                progress_percent: Some(50.0),
+                ..Default::default()
+            },
+        );
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[active, pending, imported],
+            &provider_map,
+            &progress_index,
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.progress_percent, Some(50.0));
+    }
+
+    #[test]
+    fn source_acquisition_active_progress_has_phase_stable_bounds() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+
+        let materializing = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+        let runtime = SourceTargetReleaseRuntime {
+            release_id: Uuid::new_v4(),
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: None,
+            release_title: "Example Series S01E01 1080p".to_string(),
+            release_state: AcquisitionReleaseState::Materializing,
+            release_state_reason: None,
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("debrid-materializing".to_string()),
+            job_state: Some(ReleaseJobState::Materializing),
+            job_state_reason: None,
+            import_state: None,
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let release_runtime = HashMap::from([(materializing.target_id, runtime)]);
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[materializing],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, "materializing");
+        assert_eq!(item.progress_percent, Some(0.0));
+        assert_eq!(item.children[0].phase, "materializing");
+        assert_eq!(item.children[0].progress_percent, Some(0.0));
+    }
+
+    #[test]
+    fn source_acquisition_importing_target_keeps_completed_download_progress() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+
+        let importing = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                None,
+            )
+        };
+        let mut pending = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(2),
+            None,
+        );
+        pending.state = AcquisitionTargetState::Pending;
+        let mut imported = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(3),
+            None,
+        );
+        imported.state = AcquisitionTargetState::Imported;
+        let runtime = SourceTargetReleaseRuntime {
+            release_id: Uuid::new_v4(),
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: None,
+            release_title: "Example Series S01E01 1080p".to_string(),
+            release_state: AcquisitionReleaseState::Completed,
+            release_state_reason: None,
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("debrid-complete".to_string()),
+            job_state: Some(ReleaseJobState::Completed),
+            job_state_reason: None,
+            import_state: Some(AcquisitionImportRunState::Pending),
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let release_runtime = HashMap::from([(importing.target_id, runtime)]);
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[importing, pending, imported],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, "importing");
+        assert!((item.progress_percent.unwrap_or_default() - 66.666_666).abs() < 0.001);
+        let importing_child = item
+            .children
+            .iter()
+            .find(|child| child.phase == "importing")
+            .expect("importing child");
+        assert_eq!(importing_child.progress_percent, Some(100.0));
+    }
+
+    #[test]
+    fn source_acquisition_status_shows_subscription_before_targets_exist() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            last_metadata_refresh_at: Some(Utc::now()),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(source_provider_id, "External Source", "test_source"),
+        )]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.manager_label, "External Source (test_source)");
+        assert_eq!(item.target_count, 0);
+        assert_eq!(item.phase, "needs_attention");
+        assert_eq!(
+            item.blocker.as_ref().map(|blocker| blocker.code.as_str()),
+            Some("metadata_tvdb_targets_missing")
+        );
+        assert!(item.actions.iter().any(|action| {
+            action.id == REMOVE_ACQUISITION_REQUEST_ACTION_ID
+                && action.subscription_id == Some(subscription.subscription_id)
+                && action.cancel_mode.as_deref() == Some("dismiss")
+        }));
+        assert!(item.children.is_empty());
     }
 
     #[test]
@@ -7738,6 +9014,8 @@ mod tests {
         );
         let runtime = SourceTargetReleaseRuntime {
             release_id,
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: Some(source_provider_id),
             release_title: "Example Series S01E01 1080p".to_string(),
             release_state: AcquisitionReleaseState::ReviewRequired,
             release_state_reason: Some("Pack coverage is ambiguous.".to_string()),
@@ -7864,6 +9142,8 @@ mod tests {
         );
         let runtime = SourceTargetReleaseRuntime {
             release_id,
+            source_provider_id: None,
+            route_provider_id: None,
             release_title: "Example Anime 007 1080p".to_string(),
             release_state: AcquisitionReleaseState::Completed,
             release_state_reason: None,

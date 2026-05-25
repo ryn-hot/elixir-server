@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,9 +10,13 @@ use uuid::Uuid;
 
 use crate::config::{DownloaderPerformanceProfile, Settings};
 use crate::db::models::{
-    BindingStatus, ExtensionKind, ProviderHealthState, ProviderReadinessPhase,
+    BindingStatus, ExtensionKind, ProviderHealthState, ProviderReadinessPhase, SlotCardinality,
 };
+use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::required_secrets::{
+    missing_required_secrets_for_instance, required_secrets_from_runtime,
+};
 use crate::extensions::store::{ExtensionStore, NewBinding, ProviderDetails};
 use crate::metrics;
 use crate::orchestrator::executor::{Executor, ExecutorAction, deferred_dependency_message};
@@ -21,7 +25,10 @@ use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::orchestrator::plan_validation::{
     has_unresolved_conflicts, missing_required_secrets_for_plan,
 };
-use crate::orchestrator::planner::{Plan, PlanAction, PlanStage, Planner};
+use crate::orchestrator::planner::{
+    Plan, PlanAction, PlanStage, Planner, ProviderSpec, RuntimeSpec, build_provider_endpoint,
+    stable_provider_id,
+};
 use crate::runtime::docker::classify_docker_runtime_failure;
 use crate::runtime::docker::describe_docker_runtime_failure;
 use crate::runtime::health::DockerRuntimeSupervisor;
@@ -306,7 +313,7 @@ impl<'a> Reconciler<'a> {
             self.reconcile_explicit_repairs(run_id, &mut step_index)
                 .await?;
         }
-        let providers = self.store.list_provider_details().await?;
+        let mut providers = self.store.list_provider_details().await?;
         let instances = self.store.list_instances(None).await?;
         let extensions = self.store.list_extensions().await?;
         let bindings = self.store.list_bindings().await?;
@@ -321,6 +328,20 @@ impl<'a> Reconciler<'a> {
             .collect();
 
         let mut manifest_cache: HashMap<String, ExtensionManifest> = HashMap::new();
+
+        let activated_standalone_providers = self
+            .reconcile_standalone_module_instances(
+                run_id,
+                &mut step_index,
+                &providers,
+                &instance_map,
+                &extension_map,
+                &mut manifest_cache,
+            )
+            .await?;
+        if activated_standalone_providers {
+            providers = self.store.list_provider_details().await?;
+        }
 
         self.reconcile_providers(
             run_id,
@@ -346,6 +367,226 @@ impl<'a> Reconciler<'a> {
             .await?;
 
         Ok(())
+    }
+
+    async fn reconcile_standalone_module_instances(
+        &self,
+        run_id: Uuid,
+        step_index: &mut i32,
+        providers: &[ProviderDetails],
+        instances: &HashMap<Uuid, crate::db::models::ExtensionInstance>,
+        extensions: &HashMap<String, crate::db::models::Extension>,
+        manifests: &mut HashMap<String, ExtensionManifest>,
+    ) -> Result<bool> {
+        let mut provider_instances = HashSet::new();
+        for detail in providers {
+            provider_instances.insert(detail.provider.instance_id);
+        }
+
+        let mut ordered: Vec<_> = instances.values().collect();
+        ordered.sort_by(|left, right| {
+            self.core_extension_order(&left.extension_id)
+                .cmp(&self.core_extension_order(&right.extension_id))
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+
+        let executor = Executor::new(
+            self.pool,
+            self.probe,
+            self.drivers,
+            self.runtime,
+            self.runtime_paths.clone(),
+            self.secrets,
+        )
+        .with_wireguard_gateway_image(self.wireguard_gateway_image.clone())
+        .with_default_wireguard_config_secret(self.default_wireguard_config_secret.clone())
+        .with_default_downloader_profile(self.default_downloader_profile);
+
+        let mut activated = false;
+        for instance in ordered {
+            if let Some((until, reason)) = self.runtime_health.circuit_open_until() {
+                warn!(
+                    "reconcile: deferring standalone module activation while docker runtime is degraded until {}: {}",
+                    until.to_rfc3339(),
+                    reason
+                );
+                break;
+            }
+            if !instance.enabled || provider_instances.contains(&instance.instance_id) {
+                continue;
+            }
+
+            let Some(extension) = extensions.get(&instance.extension_id) else {
+                warn!(
+                    "reconcile: standalone instance {} missing extension {}",
+                    instance.instance_id, instance.extension_id
+                );
+                continue;
+            };
+            if !extension.enabled || extension.kind != ExtensionKind::Module {
+                continue;
+            }
+
+            let manifest = if let Some(manifest) = manifests.get(&extension.extension_id) {
+                manifest.clone()
+            } else {
+                let manifest: ExtensionManifest =
+                    match serde_json::from_value(extension.manifest_json.clone()) {
+                        Ok(manifest) => manifest,
+                        Err(err) => {
+                            warn!(
+                                "reconcile: failed to parse standalone module manifest {}: {}",
+                                extension.extension_id, err
+                            );
+                            continue;
+                        }
+                    };
+                if let Err(err) = manifest.validate() {
+                    warn!(
+                        "reconcile: standalone module manifest {} is invalid: {}",
+                        extension.extension_id, err
+                    );
+                    continue;
+                }
+                manifests.insert(extension.extension_id.clone(), manifest.clone());
+                manifest
+            };
+
+            let Some(runtime) = manifest.runtime.clone() else {
+                continue;
+            };
+            if manifest.provides.is_empty() {
+                continue;
+            }
+
+            let required = required_secrets_from_runtime(&runtime)?;
+            if !required.is_empty() {
+                let missing = filter_auto_managed_runtime_missing(
+                    &extension.extension_id,
+                    missing_required_secrets_for_instance(
+                        &self.store,
+                        instance.instance_id,
+                        &required,
+                    )
+                    .await?,
+                );
+                if !missing.is_empty() {
+                    warn!(
+                        "reconcile: standalone module {} instance {} is missing required runtime secrets: {}",
+                        extension.extension_id,
+                        instance.instance_id,
+                        missing.join(", ")
+                    );
+                    continue;
+                }
+            }
+
+            let networking = manifest.networking.clone();
+            let (aliases, primary_alias) = build_aliases(
+                &extension.extension_id,
+                &instance.instance_name,
+                instance.instance_id,
+                runtime.service_name.clone(),
+            );
+
+            let mut provider_specs = Vec::new();
+            for provide in &manifest.provides {
+                let endpoint = match build_provider_endpoint(provide, &networking, &primary_alias) {
+                    Ok(endpoint) => endpoint,
+                    Err(err) => {
+                        warn!(
+                            "reconcile: standalone module {} provider {}:{} has invalid endpoint: {}",
+                            extension.extension_id, provide.capability, provide.slot, err
+                        );
+                        continue;
+                    }
+                };
+                provider_specs.push(ProviderSpec {
+                    provider_id: stable_provider_id(
+                        instance.instance_id,
+                        &provide.capability,
+                        &provide.slot,
+                    ),
+                    instance_id: instance.instance_id,
+                    capability: provide.capability.clone(),
+                    slot_id: provide.slot.clone(),
+                    cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
+                    implementation: provide.implementation.clone(),
+                    scope_json: provide
+                        .scope
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|err| anyhow::anyhow!("serializing provider scope: {err}"))?,
+                    endpoint,
+                });
+            }
+            if provider_specs.is_empty() {
+                continue;
+            }
+
+            let runtime_action = PlanAction::EnsureRuntimeRunning {
+                runtime: RuntimeSpec {
+                    instance_id: instance.instance_id,
+                    extension_id: extension.extension_id.clone(),
+                    instance_name: instance.instance_name.clone(),
+                    runtime,
+                    networking: networking.clone(),
+                    aliases,
+                },
+            };
+            let action_type = runtime_action.action_type().to_string();
+            let action_json = serde_json::to_value(&runtime_action)
+                .context("serializing standalone runtime action")?;
+            let executor_action: ExecutorAction = runtime_action.try_into()?;
+            let runtime_result = self
+                .run_step(run_id, step_index, &action_type, action_json, || {
+                    executor.apply(executor_action)
+                })
+                .await;
+            if let Err(err) = runtime_result {
+                warn!(
+                    "reconcile: standalone module runtime activation failed for {} instance {}: {}",
+                    extension.extension_id, instance.instance_id, err
+                );
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&[action_type.as_str(), "error"])
+                    .inc();
+                continue;
+            }
+            metrics::RECONCILE_ACTIONS
+                .with_label_values(&[action_type.as_str(), "ok"])
+                .inc();
+
+            for provider in provider_specs {
+                let provider_action = PlanAction::CreateOrUpdateProvider { provider };
+                let action_type = provider_action.action_type().to_string();
+                let action_json = serde_json::to_value(&provider_action)
+                    .context("serializing standalone provider action")?;
+                let executor_action: ExecutorAction = provider_action.try_into()?;
+                let provider_result = self
+                    .run_step(run_id, step_index, &action_type, action_json, || {
+                        executor.apply(executor_action)
+                    })
+                    .await;
+                if let Err(err) = provider_result {
+                    warn!(
+                        "reconcile: standalone module provider registration failed for {} instance {}: {}",
+                        extension.extension_id, instance.instance_id, err
+                    );
+                    metrics::RECONCILE_ACTIONS
+                        .with_label_values(&[action_type.as_str(), "error"])
+                        .inc();
+                    continue;
+                }
+                metrics::RECONCILE_ACTIONS
+                    .with_label_values(&[action_type.as_str(), "ok"])
+                    .inc();
+                activated = true;
+            }
+        }
+
+        Ok(activated)
     }
 
     async fn reconcile_explicit_repairs(&self, run_id: Uuid, step_index: &mut i32) -> Result<()> {
@@ -2782,6 +3023,271 @@ mod tests {
                 .iter()
                 .any(|instance| instance.instance_id == instance_id)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_activates_standalone_module_when_provider_rows_are_missing() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let extension_id = "ext.standalone.source";
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "Standalone Source".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "Standalone Source",
+                    "provides": [
+                        {
+                            "capability": "source.test",
+                            "slot": "default",
+                            "implementation": "standalone_source"
+                        }
+                    ],
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/source:1",
+                        "service_name": "elx-standalone-source"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 8097
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("standalone instance");
+        assert_eq!(instance.runtime_version.as_deref(), Some("1.0.0"));
+
+        let providers = store.list_providers(Some(instance_id)).await?;
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].capability, "source.test");
+        assert_eq!(providers[0].health_state, ProviderHealthState::Healthy);
+
+        let runs = store.list_runs(Some(1)).await?;
+        let run = runs.first().expect("reconcile run");
+        let action_types = store
+            .list_steps(run.run_id)
+            .await?
+            .into_iter()
+            .map(|step| step.action_type)
+            .collect::<Vec<_>>();
+        assert!(
+            action_types.contains(&"ensure_runtime_running".to_string()),
+            "standalone activation should start the runtime: {action_types:?}"
+        );
+        assert!(
+            action_types.contains(&"create_or_update_provider".to_string()),
+            "standalone activation should register declared providers: {action_types:?}"
+        );
+        assert!(
+            action_types.contains(&"health_check".to_string()),
+            "newly registered provider should enter normal health reconciliation: {action_types:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_activate_instances_that_already_have_providers() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let extension_id = "elixir.modules.nzbget";
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "NZBGet".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "NZBGet",
+                    "provides": [
+                        {
+                            "capability": "downloader.nzb",
+                            "slot": "default",
+                            "implementation": "nzbget"
+                        }
+                    ],
+                    "runtime": {
+                        "type": "container",
+                        "image": "lscr.io/linuxserver/nzbget:latest",
+                        "service_name": "elx-nzbget"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 6789
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let provider_id = Uuid::new_v4();
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "elx-nzbget".to_string(),
+            6789,
+            None,
+            Some("elixir_net".to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: Some(serde_json::to_value(&endpoint)?),
+                health_state: ProviderHealthState::Unknown,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let runtime = StubRuntime;
+        let drivers = DriverRegistry::new();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::from_secs(1),
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
+        };
+
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            runtime_paths,
+            &secrets,
+            "qmcgaw/gluetun:v3.39.0".to_string(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+        );
+        reconciler.run_once().await?;
+
+        let runs = store.list_runs(Some(1)).await?;
+        let run = runs.first().expect("reconcile run");
+        let action_types = store
+            .list_steps(run.run_id)
+            .await?
+            .into_iter()
+            .map(|step| step.action_type)
+            .collect::<Vec<_>>();
+        assert!(
+            !action_types.contains(&"ensure_runtime_running".to_string()),
+            "existing provider-backed instances must remain on the normal provider repair path: {action_types:?}"
+        );
+        assert!(
+            !action_types.contains(&"create_or_update_provider".to_string()),
+            "existing provider-backed instances must not be re-registered by standalone activation: {action_types:?}"
+        );
+        assert_eq!(action_types, vec!["health_check".to_string()]);
+
+        let providers = store.list_providers(Some(instance_id)).await?;
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, provider_id);
+        assert_eq!(providers[0].health_state, ProviderHealthState::Healthy);
 
         Ok(())
     }

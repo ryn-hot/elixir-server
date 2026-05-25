@@ -235,6 +235,19 @@ pub async fn list_releases(
     rows.into_iter().map(|row| map_release(&row)).collect()
 }
 
+pub async fn list_active_releases_by_route(
+    pool: &AnyPool,
+    route_logical_id: &str,
+    limit: i64,
+) -> Result<Vec<AcquisitionRelease>> {
+    let rows = sqlx::query(RELEASE_SELECT_ACTIVE_BY_ROUTE)
+        .bind(route_logical_id.trim())
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(|row| map_release(&row)).collect()
+}
+
 pub async fn update_release_review_state(
     pool: &AnyPool,
     release_id: Uuid,
@@ -2534,6 +2547,16 @@ const RELEASE_SELECT_BY_SUBSCRIPTION_AND_STATE: &str = concat!(
     "SELECT ",
     release_columns!(),
     " FROM acquisition_releases WHERE subscription_id = ? AND state = ? ORDER BY updated_at DESC LIMIT ?"
+);
+const RELEASE_SELECT_ACTIVE_BY_ROUTE: &str = concat!(
+    "SELECT ",
+    release_columns!(),
+    " FROM acquisition_releases
+         WHERE selected_route_logical_id = ?
+           AND download_id IS NOT NULL
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+         ORDER BY created_at ASC
+         LIMIT ?"
 );
 
 macro_rules! release_file_columns {

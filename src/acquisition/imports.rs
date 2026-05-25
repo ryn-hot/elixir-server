@@ -15,6 +15,10 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::{
+        audit::{
+            EVENT_MANUAL_IMPORT_COMPLETED, EVENT_MANUAL_IMPORT_QUARANTINED,
+            NewAcquisitionAuditEvent, record_acquisition_audit_event,
+        },
         release_resolution::{
             anidb::{
                 AniDbChannel, AniDbChannelGateDecision, AniDbFileReconciliationInput,
@@ -383,7 +387,8 @@ async fn prepare_import_run_for_completed_job(
     pool: &AnyPool,
     candidate: &CompletedReleaseJobForImport,
 ) -> Result<PreparedImportRun> {
-    let provenance = import_run_provenance(&candidate.release, &candidate.job);
+    let coverage = list_release_coverage(pool, candidate.release.release_id).await?;
+    let provenance = import_run_provenance(&candidate.release, &candidate.job, &coverage);
     let (run, created) = create_or_get_import_run(
         pool,
         NewAcquisitionImportRun {
@@ -416,7 +421,6 @@ async fn prepare_import_run_for_completed_job(
         .iter()
         .filter(|file| file.selected == Some(true))
         .count();
-    let coverage = list_release_coverage(pool, candidate.release.release_id).await?;
     let mut links_upserted = 0;
     let mut blocked_reasons = Vec::new();
 
@@ -448,6 +452,7 @@ async fn prepare_import_run_for_completed_job(
                         None,
                         Some(coverage.target_id),
                         None,
+                        Some(coverage),
                         reason,
                     )),
                 },
@@ -482,6 +487,7 @@ async fn prepare_import_run_for_completed_job(
                         None,
                         Some(coverage.target_id),
                         None,
+                        Some(coverage),
                         reason,
                     )),
                 },
@@ -522,6 +528,7 @@ async fn prepare_import_run_for_completed_job(
                         Some(file),
                         Some(coverage.target_id),
                         None,
+                        Some(coverage),
                         reason,
                     )),
                 },
@@ -571,6 +578,7 @@ async fn prepare_import_run_for_completed_job(
                     Some(file),
                     Some(coverage.target_id),
                     Some(&local_path),
+                    Some(coverage),
                     &reason,
                 )),
             },
@@ -727,6 +735,7 @@ async fn finalize_import_run_inner(
                 None,
             )
             .await?;
+            record_manual_import_completed_if_applicable(pool, &candidate.release, run, 0).await?;
             return Ok(FinalizedImportRun {
                 imported: true,
                 blocked: false,
@@ -942,6 +951,9 @@ async fn finalize_import_run_inner(
             )
             .await;
         };
+        if let Some(episode_id) = result.episode_id {
+            apply_target_episode_metadata(pool, episode_id, target).await?;
+        }
         mark_import_file_link_imported(pool, &link, result, run).await?;
         mark_release_coverage_imported(
             pool,
@@ -985,6 +997,8 @@ async fn finalize_import_run_inner(
         None,
     )
     .await?;
+    record_manual_import_completed_if_applicable(pool, &candidate.release, run, links_imported)
+        .await?;
 
     Ok(FinalizedImportRun {
         imported: true,
@@ -1062,22 +1076,22 @@ async fn verify_anime_import_links(
             .push(link.clone());
     }
 
-    let user_approved = anime_import_user_approved(release.coverage_plan.as_ref());
+    let explicit_verification_override =
+        anime_import_allows_manual_verification_override(release.coverage_plan.as_ref());
     let require_hash = anime_import_requires_hash_verification(release.coverage_plan.as_ref());
     for (group_key, group_links) in groups {
-        let manual_override = user_approved
-            || group_links.iter().all(|link| {
-                link.target_id
-                    .and_then(|target_id| {
-                        coverage_by_file_target
-                            .get(&(group_key.release_file_id, target_id))
-                            .map(|coverage| {
-                                coverage.coverage_kind == ReleaseCoverageKind::ManualOverride
-                            })
-                    })
-                    .unwrap_or(false)
-            });
-        if manual_override {
+        let all_links_are_manual_override = group_links.iter().all(|link| {
+            link.target_id
+                .and_then(|target_id| {
+                    coverage_by_file_target
+                        .get(&(group_key.release_file_id, target_id))
+                        .map(|coverage| {
+                            coverage.coverage_kind == ReleaseCoverageKind::ManualOverride
+                        })
+                })
+                .unwrap_or(false)
+        });
+        if explicit_verification_override && all_links_are_manual_override {
             for link in mark_anime_group_verification(
                 pool,
                 run,
@@ -1088,7 +1102,7 @@ async fn verify_anime_import_links(
                 json!({
                     "phase": "rr8c",
                     "verificationState": "manual_override",
-                    "userApproved": user_approved,
+                    "explicitVerificationOverride": explicit_verification_override,
                     "releaseFileId": group_key.release_file_id,
                     "localPath": group_key.local_path,
                     "previousEvidence": group_links.iter().map(|link| link.evidence.clone()).collect::<Vec<_>>(),
@@ -1459,7 +1473,77 @@ async fn quarantine_anime_import_mismatch(
     .execute(pool)
     .await
     .context("quarantining mismatched anime acquisition release")?;
+    if let Some(release) = get_release(pool, release_id).await?
+        && release_has_manual_review_approval(&release)
+    {
+        record_acquisition_audit_event(
+            pool,
+            NewAcquisitionAuditEvent {
+                event_type: EVENT_MANUAL_IMPORT_QUARANTINED.to_string(),
+                release_id: Some(release_id),
+                subscription_id: release.subscription_id,
+                import_run_id: Some(import_run_id),
+                state: Some(AcquisitionImportRunState::Mismatched.as_str().to_string()),
+                reason: Some(reason.to_string()),
+                evidence: Some(json!({
+                    "releaseFingerprint": release.fingerprint,
+                    "mismatchClass": mismatch_class,
+                    "manualReview": release.coverage_plan.as_ref().and_then(|plan| plan.get("manualReview")),
+                    "animeVerification": release.coverage_plan.as_ref().and_then(|plan| plan.get("animeVerification")),
+                })),
+                ..NewAcquisitionAuditEvent::default()
+            },
+        )
+        .await?;
+    }
     Ok(())
+}
+
+async fn record_manual_import_completed_if_applicable(
+    pool: &AnyPool,
+    release: &AcquisitionRelease,
+    run: &AcquisitionImportRun,
+    links_imported: usize,
+) -> Result<()> {
+    if !release_has_manual_review_approval(release) {
+        return Ok(());
+    }
+    record_acquisition_audit_event(
+        pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_MANUAL_IMPORT_COMPLETED.to_string(),
+            release_id: Some(release.release_id),
+            subscription_id: release.subscription_id,
+            release_job_id: Some(run.release_job_id),
+            import_run_id: Some(run.import_run_id),
+            state: Some(AcquisitionImportRunState::Imported.as_str().to_string()),
+            reason: Some("Manual acquisition review import completed.".to_string()),
+            evidence: Some(json!({
+                "releaseFingerprint": release.fingerprint,
+                "routeLogicalId": run.route_logical_id,
+                "providerId": run.provider_id,
+                "downloadId": run.download_id,
+                "remoteReleaseId": run.remote_release_id,
+                "linksImported": links_imported,
+                "manualReview": release.coverage_plan.as_ref().and_then(|plan| plan.get("manualReview")),
+                "provenance": run.provenance.clone(),
+            })),
+            ..NewAcquisitionAuditEvent::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn release_has_manual_review_approval(release: &AcquisitionRelease) -> bool {
+    json_bool_path(
+        release.coverage_plan.as_ref(),
+        &["manualReview", "userApproved"],
+    ) == Some(true)
+        || json_bool_path(
+            release.coverage_plan.as_ref(),
+            &["priorityPolicy", "userApproved"],
+        ) == Some(true)
 }
 
 fn anime_planned_targets_for_links(
@@ -1520,9 +1604,12 @@ fn anime_hash_evidence(
     })
 }
 
-fn anime_import_user_approved(plan: Option<&JsonValue>) -> bool {
-    json_bool_path(plan, &["manualReview", "userApproved"]) == Some(true)
-        || json_bool_path(plan, &["animeVerification", "userApprovedImportOverride"]) == Some(true)
+fn anime_import_allows_manual_verification_override(plan: Option<&JsonValue>) -> bool {
+    json_bool_path(plan, &["animeVerification", "userApprovedImportOverride"]) == Some(true)
+        || json_bool_path(
+            plan,
+            &["animeVerification", "manualImportVerificationOverride"],
+        ) == Some(true)
 }
 
 fn anime_import_requires_hash_verification(plan: Option<&JsonValue>) -> bool {
@@ -1654,6 +1741,65 @@ fn library_import_file_from_link(
         absolute_episode_number: target.absolute_episode_number,
         episode_title: Some(target.title.clone()).filter(|title| !title.trim().is_empty()),
     })
+}
+
+async fn apply_target_episode_metadata(
+    pool: &AnyPool,
+    episode_id: Uuid,
+    target: &AcquisitionTarget,
+) -> Result<()> {
+    let Some(metadata) = target.metadata.as_ref() else {
+        return Ok(());
+    };
+    let episode_metadata = metadata
+        .get("raw")
+        .cloned()
+        .unwrap_or_else(|| metadata.clone());
+    let metadata_json = serde_json::to_string(&episode_metadata).ok();
+    let runtime_seconds = target_episode_runtime_seconds(&episode_metadata);
+    let title = episode_metadata
+        .get("name")
+        .or_else(|| episode_metadata.get("title"))
+        .and_then(JsonValue::as_str)
+        .or(Some(target.title.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE episodes
+         SET title = COALESCE(title, ?),
+             runtime_seconds = COALESCE(runtime_seconds, ?),
+             metadata_json = COALESCE(metadata_json, ?),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(title)
+    .bind(runtime_seconds)
+    .bind(metadata_json)
+    .bind(episode_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn target_episode_runtime_seconds(metadata: &JsonValue) -> Option<i32> {
+    let direct_seconds = metadata
+        .get("runtimeSeconds")
+        .or_else(|| metadata.get("durationSeconds"))
+        .and_then(JsonValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0);
+    if direct_seconds.is_some() {
+        return direct_seconds;
+    }
+
+    metadata
+        .get("runtime")
+        .or_else(|| metadata.get("duration"))
+        .and_then(JsonValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .map(|value| if value < 1_000 { value * 60 } else { value })
 }
 
 fn library_result_key(result: &AcquisitionLibraryImportFileResult) -> String {
@@ -2302,6 +2448,47 @@ pub async fn reset_import_runs_for_release(
     Ok(result.rows_affected() as usize)
 }
 
+pub async fn cancel_import_runs_for_release(
+    pool: &AnyPool,
+    release_id: Uuid,
+    reason: &str,
+) -> Result<usize> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_import_file_links
+         SET state = ?,
+             state_reason = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?
+           AND state <> ?",
+    )
+    .bind(AcquisitionImportFileLinkState::Skipped.as_str())
+    .bind(reason)
+    .bind(release_id.to_string())
+    .bind(AcquisitionImportFileLinkState::Imported.as_str())
+    .execute(pool)
+    .await
+    .context("cancelling acquisition import file links")?;
+
+    let result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_import_runs
+         SET state = ?,
+             state_reason = ?,
+             completed_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?
+           AND state NOT IN (?, ?)",
+    )
+    .bind(AcquisitionImportRunState::Cancelled.as_str())
+    .bind(reason)
+    .bind(release_id.to_string())
+    .bind(AcquisitionImportRunState::Imported.as_str())
+    .bind(AcquisitionImportRunState::Cancelled.as_str())
+    .execute(pool)
+    .await
+    .context("cancelling acquisition import runs")?;
+    Ok(result.rows_affected() as usize)
+}
+
 async fn find_import_file_link(
     pool: &AnyPool,
     data: &NewAcquisitionImportFileLink,
@@ -2354,7 +2541,47 @@ fn validate_import_file_link_input(data: &NewAcquisitionImportFileLink) -> Resul
     Ok(())
 }
 
-fn import_run_provenance(release: &AcquisitionRelease, job: &AcquisitionReleaseJob) -> JsonValue {
+fn import_run_provenance(
+    release: &AcquisitionRelease,
+    job: &AcquisitionReleaseJob,
+    coverage: &[AcquisitionReleaseCoverage],
+) -> JsonValue {
+    let coverage_rows = coverage
+        .iter()
+        .map(|row| {
+            json!({
+                "coverageId": row.coverage_id,
+                "releaseFileId": row.release_file_id,
+                "targetId": row.target_id,
+                "coverageKind": row.coverage_kind.as_str(),
+                "confidence": row.confidence.as_str(),
+                "state": row.state.as_str(),
+                "verifiedBy": row.verified_by,
+                "reason": row.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let manual_mappings = coverage
+        .iter()
+        .filter(|row| {
+            row.coverage_kind == ReleaseCoverageKind::ManualOverride
+                || row
+                    .verified_by
+                    .as_deref()
+                    .map(|value| value.starts_with("user:"))
+                    .unwrap_or(false)
+        })
+        .map(|row| {
+            json!({
+                "coverageId": row.coverage_id,
+                "releaseFileId": row.release_file_id,
+                "targetId": row.target_id,
+                "coverageKind": row.coverage_kind.as_str(),
+                "verifiedBy": row.verified_by,
+                "reason": row.reason,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "phase": "rr8a",
         "releaseId": release.release_id,
@@ -2372,6 +2599,9 @@ fn import_run_provenance(release: &AcquisitionRelease, job: &AcquisitionReleaseJ
         "resolverKind": release.resolver_kind.as_str(),
         "resolverVersion": release.resolver_version,
         "coveragePlan": release.coverage_plan,
+        "coverage": coverage_rows,
+        "manualCoverageMappings": manual_mappings,
+        "manualReview": release.coverage_plan.as_ref().and_then(|plan| plan.get("manualReview")),
     })
 }
 
@@ -2381,6 +2611,7 @@ fn import_link_evidence(
     file: Option<&AcquisitionReleaseFile>,
     target_id: Option<Uuid>,
     local_path: Option<&str>,
+    coverage: Option<&AcquisitionReleaseCoverage>,
     reason: &str,
 ) -> JsonValue {
     json!({
@@ -2394,6 +2625,14 @@ fn import_link_evidence(
         "routeLogicalId": job.route_logical_id,
         "downloadId": job.download_id,
         "remoteReleaseId": job.remote_release_id,
+        "coverage": coverage.map(|row| json!({
+            "coverageId": row.coverage_id,
+            "coverageKind": row.coverage_kind.as_str(),
+            "confidence": row.confidence.as_str(),
+            "state": row.state.as_str(),
+            "verifiedBy": row.verified_by,
+            "reason": row.reason,
+        })),
         "reason": reason,
     })
 }
@@ -2686,6 +2925,7 @@ mod tests {
     use super::*;
     use crate::{
         acquisition::{
+            audit::count_acquisition_audit_events,
             release_resolution::{
                 anidb::{
                     AniDbChannel, AniDbRateLimiterConfig, build_lookup_key,
@@ -3410,7 +3650,21 @@ mod tests {
                     absolute_episode_number: None,
                     air_date: None,
                     air_time: None,
-                    metadata: None,
+                    metadata: if episode == 1 {
+                        Some(json!({
+                            "source": "tvdb",
+                            "tvdbEpisodeId": "tvdb-episode-1",
+                            "raw": {
+                                "id": 1001,
+                                "name": "Episode 1",
+                                "overview": "The first imported episode.",
+                                "image": "https://example.invalid/episode-1.jpg",
+                                "runtime": 42
+                            }
+                        }))
+                    } else {
+                        None
+                    },
                     state: Some(AcquisitionTargetState::Submitted),
                     next_search_after: None,
                 })
@@ -3461,6 +3715,26 @@ mod tests {
             .await?;
         assert_eq!(media_files, 3);
         assert_eq!(episode_files, 3);
+        let episode_metadata: String = sqlx::query_scalar(
+            "SELECT metadata_json FROM episodes WHERE season_number = 1 AND episode_number = 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        let episode_metadata: JsonValue = serde_json::from_str(&episode_metadata)?;
+        assert_eq!(
+            episode_metadata.get("overview").and_then(JsonValue::as_str),
+            Some("The first imported episode.")
+        );
+        assert_eq!(
+            episode_metadata.get("image").and_then(JsonValue::as_str),
+            Some("https://example.invalid/episode-1.jpg")
+        );
+        let runtime_seconds: i64 = sqlx::query_scalar(
+            "SELECT runtime_seconds FROM episodes WHERE season_number = 1 AND episode_number = 1",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(runtime_seconds, 2520);
         for target in targets {
             let imported = get_target(&database.pool, target.target_id)
                 .await?
@@ -3909,7 +4183,10 @@ mod tests {
             Some(json!({
                 "fingerprint": "anime-override-1",
                 "manualReview": { "userApproved": true },
-                "animeVerification": { "requireHashBeforeImport": true }
+                "animeVerification": {
+                    "requireHashBeforeImport": true,
+                    "userApprovedImportOverride": true
+                }
             })),
         )
         .await?;
@@ -3925,10 +4202,112 @@ mod tests {
             links[0].verification_state.as_deref(),
             Some("manual_override")
         );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.get("manualCoverageMappings"))
+                .and_then(JsonValue::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.get("manualReview"))
+                .and_then(|value| value.get("userApproved"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            count_acquisition_audit_events(
+                &database.pool,
+                _release_id,
+                EVENT_MANUAL_IMPORT_COMPLETED,
+            )
+            .await?,
+            1
+        );
         let file_hashes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition_file_hashes")
             .fetch_one(&database.pool)
             .await?;
         assert_eq!(file_hashes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr4_manual_anime_mapping_without_verification_override_quarantines_wrong_file()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let path = dir.path().join("Anime.Show.S01E01.manual-wrong.mkv");
+        tokio::fs::write(&path, b"anime manual wrong episode").await?;
+        seed_anidb_hit_for_file(&database, &path, vec![2999]).await?;
+        let (subscription, targets) =
+            create_anime_subscription_with_targets(&database, "Anime Show", &[2001]).await?;
+
+        let (release_id, job_id) = insert_completed_release_with_files_and_plan(
+            &database,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Anime.Show.01.1080p.WEB-DL-GRP",
+            ReleaseKind::Single,
+            ReleaseResolverKind::AnimeShokoStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "anime-manual-mismatch-1",
+            vec![TestReleaseFile {
+                local_path: path.to_string_lossy().to_string(),
+                basename: "Anime.Show.S01E01.manual-wrong.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: Some(1),
+                parsed_episode: Some(1),
+                coverage: vec![(
+                    targets[0].target_id,
+                    ReleaseCoverageKind::ManualOverride,
+                    ReleaseCoverageState::Submitted,
+                )],
+            }],
+            Some(json!({
+                "fingerprint": "anime-manual-mismatch-1",
+                "manualReview": { "userApproved": true },
+                "animeVerification": { "requireHashBeforeImport": true }
+            })),
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 0);
+        assert_eq!(stats.blocked_runs, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        assert_eq!(run.state, AcquisitionImportRunState::Mismatched);
+        assert_eq!(
+            run.mismatch_class.as_deref(),
+            Some("anime_hash_identity_mismatch")
+        );
+        let release_state: String =
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+                .bind(release_id.to_string())
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(
+            release_state,
+            AcquisitionReleaseState::ReviewRequired.as_str()
+        );
+        let media_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(media_files, 0);
+        assert_eq!(
+            count_acquisition_audit_events(
+                &database.pool,
+                release_id,
+                EVENT_MANUAL_IMPORT_QUARANTINED,
+            )
+            .await?,
+            1
+        );
         Ok(())
     }
 

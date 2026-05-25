@@ -7467,6 +7467,13 @@ fn build_extension_ui_proxy_url(
     path: &str,
     query: Option<&str>,
 ) -> anyhow::Result<Url> {
+    let (path, inline_query) = if query.is_none() {
+        path.split_once('?')
+            .map(|(path, query)| (path, Some(query)))
+            .unwrap_or((path, None))
+    } else {
+        (path, None)
+    };
     let normalized_path = path.trim_matches('/');
     let upstream_path = if normalized_path.is_empty() {
         "/".to_string()
@@ -7474,7 +7481,7 @@ fn build_extension_ui_proxy_url(
         format!("/{normalized_path}")
     };
     let mut url = build_extension_control_url(base_url, &upstream_path)?;
-    url.set_query(query);
+    url.set_query(query.or(inline_query));
     Ok(url)
 }
 
@@ -7745,9 +7752,9 @@ mod extension_ui_proxy_tests {
         ExtensionControlBinding, ExtensionControlContext, ExtensionStatusSummaryItem,
         ExtensionUiProxyTarget, ExtensionUiUpstreamAuth,
         build_extension_control_open_service_ui_action, build_extension_ui_proxy_client,
-        build_extension_ui_start_html, build_extension_ui_upstream_request,
-        control_transport_container_candidates, parse_control_published_host_port,
-        rewrite_extension_ui_initialize_json,
+        build_extension_ui_proxy_url, build_extension_ui_start_html,
+        build_extension_ui_upstream_request, control_transport_container_candidates,
+        parse_control_published_host_port, rewrite_extension_ui_initialize_json,
     };
     use crate::db::models::{
         Extension, ExtensionInstance, ExtensionKind, ExtensionTrustLevel, Provider,
@@ -7797,6 +7804,52 @@ mod extension_ui_proxy_tests {
         assert_eq!(
             value.get("apiRoot").and_then(Value::as_str),
             Some("/api/v1/extensions/instances/test-instance/ui/api/v1")
+        );
+    }
+
+    #[test]
+    fn service_proxy_url_preserves_inline_query_strings() {
+        let url = build_extension_ui_proxy_url(
+            "http://svc-elixir-modules-qbittorrent-default:8080",
+            "api/v2/torrents/files?hash=abc123",
+            None,
+        )
+        .expect("proxy url");
+        assert_eq!(
+            url.as_str(),
+            "http://svc-elixir-modules-qbittorrent-default:8080/api/v2/torrents/files?hash=abc123"
+        );
+    }
+
+    #[test]
+    fn service_proxy_url_preserves_qbittorrent_hash_query_without_path_pollution() {
+        let url = build_extension_ui_proxy_url(
+            "http://svc-elixir-modules-qbittorrent-default:8080/",
+            "/api/v2/torrents/files?hash=0123456789abcdef0123456789abcdef01234567",
+            None,
+        )
+        .expect("proxy url");
+
+        assert_eq!(url.path(), "/api/v2/torrents/files");
+        assert_eq!(
+            url.query(),
+            Some("hash=0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(!url.path().contains('?'));
+    }
+
+    #[test]
+    fn service_proxy_url_prefers_explicit_query_over_inline_query() {
+        let url = build_extension_ui_proxy_url(
+            "http://svc-elixir-modules-qbittorrent-default:8080",
+            "api/v2/torrents/files?hash=lost",
+            Some("hash=kept"),
+        )
+        .expect("proxy url");
+
+        assert_eq!(
+            url.as_str(),
+            "http://svc-elixir-modules-qbittorrent-default:8080/api/v2/torrents/files?hash=kept"
         );
     }
 

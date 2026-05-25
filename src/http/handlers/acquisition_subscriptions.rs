@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -10,12 +11,13 @@ use uuid::Uuid;
 use crate::{
     acquisition::subscriptions::{
         AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionDetail,
-        AcquisitionSubscriptionFilter, AcquisitionSubscriptionUpdate, AcquisitionTarget,
-        AcquisitionTargetState, AcquisitionTargetStateUpdate, CreateAcquisitionIntent,
-        NewAcquisitionSubscription, NewAcquisitionTarget, create_or_update_acquisition_intent,
-        create_subscription, get_subscription, get_subscription_detail, get_target,
-        list_subscriptions, update_subscription, update_target_state, upsert_subscription_targets,
-        validate_new_targets,
+        AcquisitionSubscriptionFilter, AcquisitionSubscriptionStopTrackingResult,
+        AcquisitionSubscriptionUpdate, AcquisitionTarget, AcquisitionTargetState,
+        AcquisitionTargetStateUpdate, CreateAcquisitionIntent, NewAcquisitionSubscription,
+        NewAcquisitionTarget, create_or_update_acquisition_intent, create_subscription,
+        get_subscription, get_subscription_detail, get_target, list_subscriptions,
+        stop_subscription_tracking, update_subscription, update_target_state,
+        upsert_subscription_targets, validate_new_targets,
     },
     db::models::ProviderHealthState,
     download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
@@ -29,12 +31,14 @@ use crate::{
                 normalize_acquisition_candidate,
             },
             download_broker::{
-                DownloadBrokerSubmitRequest, generic_debrid_error_message, submit_to_broker,
+                DownloadBrokerSubmitRequest, cancel_download_item, generic_debrid_error_message,
+                submit_to_broker,
             },
         },
     },
     state::AppState,
 };
+use sqlx::Row;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +105,82 @@ pub struct AcquisitionTargetSubmitResponse {
     broker_provider_id: Uuid,
     accepted: bool,
     download_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelAcquisitionSubscriptionMode {
+    Dismiss,
+    StopTracking,
+    CancelDownloads,
+}
+
+impl Default for CancelAcquisitionSubscriptionMode {
+    fn default() -> Self {
+        Self::Dismiss
+    }
+}
+
+impl CancelAcquisitionSubscriptionMode {
+    fn default_reason(self) -> &'static str {
+        match self {
+            Self::Dismiss => "User removed acquisition request.",
+            Self::StopTracking => "User stopped acquisition tracking.",
+            Self::CancelDownloads => "User cancelled acquisition downloads.",
+        }
+    }
+
+    fn message(self, failures: usize) -> String {
+        match (self, failures) {
+            (Self::CancelDownloads, 0) => {
+                "Acquisition request removed and active downloads were cancelled.".to_string()
+            }
+            (Self::CancelDownloads, count) => format!(
+                "Acquisition request removed. {count} downloader cancellation attempt(s) need attention."
+            ),
+            (Self::StopTracking, _) => {
+                "Acquisition tracking stopped without deleting downloader data.".to_string()
+            }
+            (Self::Dismiss, _) => "Acquisition request removed.".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelAcquisitionSubscriptionRequest {
+    #[serde(default)]
+    pub mode: CancelAcquisitionSubscriptionMode,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub delete_files: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelAcquisitionDownloadFailure {
+    pub route_logical_id: String,
+    pub download_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelAcquisitionSubscriptionResponse {
+    pub mode: CancelAcquisitionSubscriptionMode,
+    pub message: String,
+    pub result: AcquisitionSubscriptionStopTrackingResult,
+    pub downloads_cancel_attempted: usize,
+    pub downloads_cancelled: usize,
+    pub download_cancel_failures: Vec<CancelAcquisitionDownloadFailure>,
+}
+
+#[derive(Debug)]
+struct ActiveSubscriptionDownloadJob {
+    route_logical_id: String,
+    owner_id: String,
+    download_id: String,
 }
 
 pub async fn list_acquisition_subscriptions(
@@ -295,6 +375,70 @@ pub async fn patch_acquisition_subscription(
     Ok(Json(detail))
 }
 
+pub async fn cancel_acquisition_subscription(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(subscription_id): Path<Uuid>,
+    Json(request): Json<CancelAcquisitionSubscriptionRequest>,
+) -> ApiResult<Json<CancelAcquisitionSubscriptionResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let jobs = if request.mode == CancelAcquisitionSubscriptionMode::CancelDownloads {
+        list_active_subscription_download_jobs(&state.db_pool, subscription_id)
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        Vec::new()
+    };
+    let mut failures = Vec::new();
+    let mut downloads_cancelled = 0usize;
+    for job in &jobs {
+        match cancel_download_item(
+            &state,
+            &store,
+            &job.route_logical_id,
+            Some(&job.owner_id),
+            &job.download_id,
+            request.delete_files.unwrap_or(false),
+        )
+        .await
+        {
+            Ok(response) if response.removed => {
+                downloads_cancelled += 1;
+            }
+            Ok(_) => failures.push(CancelAcquisitionDownloadFailure {
+                route_logical_id: job.route_logical_id.clone(),
+                download_id: job.download_id.clone(),
+                error: "Downloader did not report an active item for this id.".to_string(),
+            }),
+            Err(err) => failures.push(CancelAcquisitionDownloadFailure {
+                route_logical_id: job.route_logical_id.clone(),
+                download_id: job.download_id.clone(),
+                error: api_error_message(&err).to_string(),
+            }),
+        }
+    }
+
+    let reason = request
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| request.mode.default_reason());
+    let result = stop_subscription_tracking(&state.db_pool, subscription_id, reason)
+        .await
+        .map_err(map_acquisition_input_error)?
+        .ok_or_else(|| ApiError::not_found("acquisition subscription not found"))?;
+
+    Ok(Json(CancelAcquisitionSubscriptionResponse {
+        mode: request.mode,
+        message: request.mode.message(failures.len()),
+        result,
+        downloads_cancel_attempted: jobs.len(),
+        downloads_cancelled,
+        download_cancel_failures: failures,
+    }))
+}
+
 pub async fn upsert_acquisition_targets(
     _user: CurrentUser,
     State(state): State<AppState>,
@@ -368,6 +512,7 @@ pub async fn submit_acquisition_target_candidate(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(candidate.clone()),
+        release_fingerprint: None,
     };
 
     let mut state_reason = format!("Submitted through '{}'.", route_logical_id);
@@ -468,6 +613,38 @@ pub async fn submit_acquisition_target_candidate(
         accepted: broker_response.accepted,
         download_id,
     }))
+}
+
+async fn list_active_subscription_download_jobs(
+    pool: &sqlx::AnyPool,
+    subscription_id: Uuid,
+) -> anyhow::Result<Vec<ActiveSubscriptionDownloadJob>> {
+    let rows = sqlx::query(
+        "SELECT
+            j.route_logical_id,
+            j.download_id,
+            r.owner_id
+         FROM acquisition_release_jobs j
+         JOIN acquisition_releases r ON r.release_id = j.release_id
+         WHERE r.subscription_id = ?
+           AND j.active = 1
+           AND j.download_id IS NOT NULL
+           AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_all(pool)
+    .await
+    .context("listing active acquisition download jobs")?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(ActiveSubscriptionDownloadJob {
+                route_logical_id: row.try_get::<String, _>("route_logical_id")?,
+                owner_id: row.try_get::<String, _>("owner_id")?,
+                download_id: row.try_get::<String, _>("download_id")?,
+            })
+        })
+        .collect()
 }
 
 async fn source_extension_id_for_candidate_provider(

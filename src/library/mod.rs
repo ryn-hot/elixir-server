@@ -1618,7 +1618,10 @@ pub async fn run_full_scan_with_metadata_and_linkers(
             .await?;
     }
 
-    // Mark missing
+    // Mark missing. A scan source can only prove that a file is absent when the
+    // stored path is gone. Acquisition imports and other managed files may live
+    // outside the local scan root, so do not mark them missing just because this
+    // scan did not rediscover them.
     let existing_paths: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT path FROM media_files WHERE scan_state = 'ok'",
     )
@@ -1626,7 +1629,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
     .await?;
 
     for path in existing_paths {
-        if !seen_paths.contains(&path) {
+        if !seen_paths.contains(&path) && media_file_path_is_missing(&path).await {
             sqlx::query::<sqlx::Any>(
                 "UPDATE media_files SET scan_state = 'missing' WHERE path = ?",
             )
@@ -1639,6 +1642,21 @@ pub async fn run_full_scan_with_metadata_and_linkers(
     refresh_episode_file_state(pool).await?;
 
     Ok(())
+}
+
+async fn media_file_path_is_missing(path: &str) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => !metadata.is_file(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path,
+                error = %err,
+                "failed to stat media file during missing-file reconciliation"
+            );
+            false
+        }
+    }
 }
 
 struct AggregatedFile {
@@ -6529,6 +6547,76 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await?;
         assert_eq!(count_missing, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_missing_pass_preserves_existing_unseen_files() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let temp = tempdir()?;
+        let scan_path = temp.path().join("media").join("visible.mkv");
+        let imported_path = temp.path().join("downloads").join("imported.mkv");
+        std::fs::create_dir_all(scan_path.parent().unwrap())?;
+        std::fs::create_dir_all(imported_path.parent().unwrap())?;
+        std::fs::write(&scan_path, b"not-real-video")?;
+        std::fs::write(&imported_path, b"not-real-video")?;
+
+        let scan_path = scan_path.to_string_lossy().to_string();
+        let imported_path = imported_path.to_string_lossy().to_string();
+        let candidate_for = |path: &str, title: &str, tmdb: &str| MediaFileCandidate {
+            identity: MediaIdentity {
+                r#type: MediaType::Movie,
+                external_ids: ExtIds {
+                    tmdb: Some(tmdb.to_string()),
+                    ..Default::default()
+                },
+                title: title.to_string(),
+                year: Some(2024),
+                season: None,
+                episode: None,
+            },
+            files: vec![FD {
+                path: path.to_string(),
+                size_bytes: Some(1024),
+                hash: None,
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            }],
+            extension_metadata: HashMap::new(),
+            source_config_id: None,
+        };
+
+        run_full_scan(
+            &database.pool,
+            vec![
+                candidate_for(&scan_path, "Visible Movie", "100"),
+                candidate_for(&imported_path, "Imported Movie", "200"),
+            ],
+            false,
+        )
+        .await?;
+
+        run_full_scan(
+            &database.pool,
+            vec![candidate_for(&scan_path, "Visible Movie", "100")],
+            false,
+        )
+        .await?;
+
+        let imported_state: String =
+            sqlx::query_scalar("SELECT scan_state FROM media_files WHERE path = ?")
+                .bind(&imported_path)
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(imported_state, "ok");
 
         Ok(())
     }

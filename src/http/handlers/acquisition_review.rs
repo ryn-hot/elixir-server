@@ -17,9 +17,14 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::{
+        audit::{
+            EVENT_INSPECT_REQUESTED, EVENT_MANUAL_APPROVAL, EVENT_MANUAL_REJECTION,
+            NewAcquisitionAuditEvent, record_acquisition_audit_event,
+        },
         imports::{
             AcquisitionImportFileLink, AcquisitionImportRun, AcquisitionImportRunState,
-            list_import_file_links, list_import_file_links_by_release, list_import_runs_by_release,
+            cancel_import_runs_for_release, list_import_file_links,
+            list_import_file_links_by_release, list_import_runs_by_release,
             reset_import_runs_for_release,
         },
         release_resolution::{
@@ -44,9 +49,19 @@ use crate::{
             get_target, list_subscription_targets, update_target_state,
         },
     },
+    download_broker::{
+        DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
+    },
+    extensions::store::ExtensionStore,
     http::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
+        handlers::{
+            acquisition_sources::AcquisitionCandidate,
+            download_broker::{
+                DownloadBrokerSubmitRequest, DownloadBrokerSubmitResponse, submit_to_broker,
+            },
+        },
     },
     state::AppState,
 };
@@ -66,6 +81,8 @@ pub struct ListAcquisitionReleasesQuery {
 #[serde(rename_all = "camelCase")]
 pub struct ApproveAcquisitionReleaseRequest {
     #[serde(default)]
+    route_logical_id: Option<String>,
+    #[serde(default)]
     selected_release_file_ids: Vec<Uuid>,
     #[serde(default)]
     skipped_release_file_ids: Vec<Uuid>,
@@ -79,6 +96,15 @@ pub struct ApproveAcquisitionReleaseRequest {
     reason: Option<String>,
     #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectAcquisitionReleaseRequest {
+    #[serde(default)]
+    route_logical_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,8 +136,8 @@ pub struct RejectAcquisitionReleaseRequest {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectTargetPolicy {
-    #[default]
     Blocked,
+    #[default]
     Pending,
     Unchanged,
 }
@@ -125,6 +151,8 @@ pub struct RetryAcquisitionReleaseRequest {
     reason: Option<String>,
     #[serde(default)]
     next_search_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    clear_suppression: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -247,6 +275,13 @@ pub struct ReleaseReviewCounts {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseReviewEvidence {
+    source_candidate: Option<JsonValue>,
+    resolver_evidence: Option<JsonValue>,
+    route_policy: Option<JsonValue>,
+    target_scope: Option<JsonValue>,
+    source_provider_id: Option<Uuid>,
+    route_provider_id: Option<Uuid>,
+    route_logical_id: Option<String>,
     selected_candidate: Option<JsonValue>,
     coverage_plan: Option<JsonValue>,
     scheduler_dispatch: Option<JsonValue>,
@@ -412,7 +447,25 @@ pub async fn approve_acquisition_release(
     Path(release_id): Path<Uuid>,
     Json(request): Json<ApproveAcquisitionReleaseRequest>,
 ) -> ApiResult<Json<AcquisitionReleaseDetailResponse>> {
-    approve_release_for_review(&state.db_pool, user.user_id, release_id, request).await?;
+    approve_release_for_review(
+        Some(&state),
+        &state.db_pool,
+        user.user_id,
+        release_id,
+        request,
+    )
+    .await?;
+    let detail = load_release_detail(&state.db_pool, release_id).await?;
+    Ok(Json(detail))
+}
+
+pub async fn inspect_acquisition_release(
+    user: CurrentUser,
+    State(state): State<AppState>,
+    Path(release_id): Path<Uuid>,
+    Json(request): Json<InspectAcquisitionReleaseRequest>,
+) -> ApiResult<Json<AcquisitionReleaseDetailResponse>> {
+    inspect_release_for_review(&state, user.user_id, release_id, request).await?;
     let detail = load_release_detail(&state.db_pool, release_id).await?;
     Ok(Json(detail))
 }
@@ -582,6 +635,7 @@ async fn targets_for_release(
 }
 
 async fn approve_release_for_review(
+    broker_state: Option<&AppState>,
     pool: &AnyPool,
     user_id: Uuid,
     release_id: Uuid,
@@ -603,6 +657,27 @@ async fn approve_release_for_review(
         .await
         .map_err(ApiError::from)?;
     let file_selection = resolve_manual_file_selection(&files, &coverage, &request)?;
+    let active_release = if let Some(state) = broker_state
+        && release.download_id.is_none()
+        && !matches!(
+            release.state,
+            AcquisitionReleaseState::Submitted
+                | AcquisitionReleaseState::Downloading
+                | AcquisitionReleaseState::Materializing
+                | AcquisitionReleaseState::Completed
+        ) {
+        submit_review_release_to_broker(
+            state,
+            user_id,
+            release_id,
+            request.route_logical_id.as_deref(),
+            "Approved by acquisition release review.",
+            true,
+        )
+        .await?
+    } else {
+        release.clone()
+    };
     for file in &files {
         let selected = if file_selection.explicit {
             Some(
@@ -631,7 +706,7 @@ async fn approve_release_for_review(
     }
 
     let reviewer = reviewer_id(user_id);
-    let selected_coverage_state = selected_coverage_state(&release);
+    let selected_coverage_state = selected_coverage_state(&active_release);
     for row in &coverage {
         let state = match row.release_file_id {
             Some(release_file_id)
@@ -703,7 +778,7 @@ async fn approve_release_for_review(
         request.reason.as_deref(),
         request.note.as_deref(),
     );
-    let merged_plan = merge_review_policy(release.coverage_plan.as_ref(), policy);
+    let merged_plan = merge_review_policy(active_release.coverage_plan.as_ref(), policy);
     update_release_review_state(
         pool,
         release_id,
@@ -713,16 +788,10 @@ async fn approve_release_for_review(
     )
     .await
     .map_err(ApiError::from)?;
-    mark_approved_release_targets_submitted(
-        pool,
-        &release,
-        "Approved by acquisition release review.",
-    )
-    .await?;
-    for job in list_release_jobs(pool, release_id)
+    let jobs = list_release_jobs(pool, release_id)
         .await
-        .map_err(ApiError::from)?
-    {
+        .map_err(ApiError::from)?;
+    for job in jobs {
         update_release_job_state(
             pool,
             job.release_job_id,
@@ -733,6 +802,388 @@ async fn approve_release_for_review(
                 download_id: job.download_id,
                 remote_release_id: job.remote_release_id,
                 completed_at: None,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
+
+    let active_release = get_release(pool, release_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
+
+    mark_approved_release_targets_submitted(
+        pool,
+        &active_release,
+        "Approved by acquisition release review.",
+    )
+    .await?;
+    record_acquisition_audit_event(
+        pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_MANUAL_APPROVAL.to_string(),
+            release_id: Some(release_id),
+            subscription_id: active_release.subscription_id,
+            actor_user_id: Some(user_id),
+            state: Some(AcquisitionReleaseState::Ready.as_str().to_string()),
+            reason: request
+                .reason
+                .clone()
+                .or_else(|| Some("Approved by acquisition release review.".to_string())),
+            evidence: Some(json!({
+                "releaseFingerprint": active_release.fingerprint,
+                "routeLogicalId": active_release.selected_route_logical_id,
+                "routeProviderId": active_release.selected_provider_id,
+                "downloadId": active_release.download_id,
+                "selectedReleaseFileIds": file_selection
+                    .selected_release_file_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "skippedReleaseFileIds": file_selection
+                    .skipped_release_file_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "mappingCount": request.mappings.len(),
+                "note": request.note,
+            })),
+            ..NewAcquisitionAuditEvent::default()
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn inspect_release_for_review(
+    state: &AppState,
+    user_id: Uuid,
+    release_id: Uuid,
+    request: InspectAcquisitionReleaseRequest,
+) -> ApiResult<()> {
+    let release = get_release(&state.db_pool, release_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
+    if release.state == AcquisitionReleaseState::Cancelled {
+        return Err(ApiError::conflict(
+            "cancelled acquisition release cannot be inspected",
+        ));
+    }
+    if release.download_id.is_some() {
+        mark_existing_release_inspection_requested(
+            &state.db_pool,
+            user_id,
+            &release,
+            request
+                .reason
+                .as_deref()
+                .unwrap_or("Inspect release files before approval."),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    submit_review_release_to_broker(
+        state,
+        user_id,
+        release_id,
+        request.route_logical_id.as_deref(),
+        request
+            .reason
+            .as_deref()
+            .unwrap_or("Inspect release files before approval."),
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mark_existing_release_inspection_requested(
+    pool: &AnyPool,
+    user_id: Uuid,
+    release: &AcquisitionRelease,
+    reason: &str,
+) -> ApiResult<()> {
+    let merged_plan = merge_review_policy(
+        release.coverage_plan.as_ref(),
+        json!({
+            "manualReview": {
+                "status": "inspection_requested",
+                "reviewerUserId": user_id,
+                "reviewedAt": Utc::now(),
+                "reason": reason,
+                "previousState": release.state.as_str()
+            }
+        }),
+    );
+    update_release_review_state(
+        pool,
+        release.release_id,
+        release.state,
+        Some("Inspecting release files before approval.".to_string()),
+        Some(merged_plan),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    record_acquisition_audit_event(
+        pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_INSPECT_REQUESTED.to_string(),
+            release_id: Some(release.release_id),
+            subscription_id: release.subscription_id,
+            actor_user_id: Some(user_id),
+            state: Some(release.state.as_str().to_string()),
+            reason: Some(reason.to_string()),
+            evidence: Some(json!({
+                "releaseFingerprint": release.fingerprint,
+                "downloadId": release.download_id,
+                "remoteReleaseId": release.remote_release_id,
+                "routeLogicalId": release.selected_route_logical_id,
+                "alreadySubmitted": true,
+            })),
+            ..NewAcquisitionAuditEvent::default()
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn submit_review_release_to_broker(
+    state: &AppState,
+    user_id: Uuid,
+    release_id: Uuid,
+    requested_route_logical_id: Option<&str>,
+    reason: &str,
+    approved: bool,
+) -> ApiResult<AcquisitionRelease> {
+    let release = get_release(&state.db_pool, release_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
+    let candidate = release_candidate(&release)?;
+    let route_logical_id = select_review_route_logical_id(&release, requested_route_logical_id)?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let broker_response = submit_to_broker(
+        state,
+        &store,
+        &route_logical_id,
+        Some(DEFAULT_ROUTE_OWNER_ID),
+        DownloadBrokerSubmitRequest {
+            source: release.source.clone(),
+            category: None,
+            paused: Some(false),
+            name: Some(release.release_title.clone()),
+            priority: None,
+            add_to_top: None,
+            subscription_id: release.subscription_id,
+            source_provider_id: release.source_provider_id,
+            source_extension_id: Some(release.source_extension_id.clone()),
+            media_type: Some(release.media_type),
+            media_title: Some(release.title.clone()),
+            selected_candidate: Some(candidate),
+            release_fingerprint: Some(release.fingerprint.clone()),
+        },
+    )
+    .await?;
+    let submitted = get_release(&state.db_pool, release_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
+    let merged_plan = merge_review_policy(
+        submitted.coverage_plan.as_ref(),
+        review_submission_policy_json(&release, &broker_response, user_id, reason, approved),
+    );
+    let state_reason = if approved {
+        "Approved by acquisition release review and submitted to acquisition route."
+    } else {
+        "Release staged for file inspection before approval."
+    };
+    let state_after_submit = submitted.state;
+    update_release_review_state(
+        &state.db_pool,
+        release_id,
+        state_after_submit,
+        Some(state_reason.to_string()),
+        Some(merged_plan),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let refreshed = get_release(&state.db_pool, release_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
+    if !approved {
+        mark_review_release_targets_inspecting(&state.db_pool, &refreshed, reason).await?;
+        record_acquisition_audit_event(
+            &state.db_pool,
+            NewAcquisitionAuditEvent {
+                event_type: EVENT_INSPECT_REQUESTED.to_string(),
+                release_id: Some(release_id),
+                subscription_id: refreshed.subscription_id,
+                actor_user_id: Some(user_id),
+                state: Some(refreshed.state.as_str().to_string()),
+                reason: Some(reason.to_string()),
+                evidence: Some(json!({
+                    "releaseFingerprint": refreshed.fingerprint,
+                    "routeLogicalId": broker_response.logical_id,
+                    "routeProviderId": broker_response.provider_id,
+                    "downloadId": broker_response.download_id,
+                    "accepted": broker_response.accepted,
+                    "alreadySubmitted": false,
+                })),
+                ..NewAcquisitionAuditEvent::default()
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
+    Ok(refreshed)
+}
+
+fn release_candidate(release: &AcquisitionRelease) -> ApiResult<AcquisitionCandidate> {
+    let candidate_value = release
+        .selected_candidate
+        .clone()
+        .ok_or_else(|| ApiError::bad_request("release has no source candidate to submit"))?;
+    serde_json::from_value(candidate_value)
+        .map_err(|err| ApiError::bad_request(format!("release source candidate is invalid: {err}")))
+}
+
+fn select_review_route_logical_id(
+    release: &AcquisitionRelease,
+    requested_route_logical_id: Option<&str>,
+) -> ApiResult<String> {
+    if let Some(route) = requested_route_logical_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(route.to_string());
+    }
+    if let Some(route) = release
+        .selected_route_logical_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(route.to_string());
+    }
+    let allowed = release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.get("routePolicy"))
+        .and_then(|policy| policy.get("allowedRoutes"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if let Some(route) = allowed
+        .iter()
+        .find(|route| route.as_str() == DEBRID_DEFAULT_LOGICAL_ID)
+        .or_else(|| {
+            allowed
+                .iter()
+                .find(|route| route.as_str() == TORRENT_DEFAULT_LOGICAL_ID)
+        })
+        .or_else(|| allowed.first())
+    {
+        return Ok(route.clone());
+    }
+    Err(ApiError::bad_request(
+        "release has no review route; choose a route before submitting",
+    ))
+}
+
+fn review_submission_policy_json(
+    release: &AcquisitionRelease,
+    broker_response: &DownloadBrokerSubmitResponse,
+    user_id: Uuid,
+    reason: &str,
+    approved: bool,
+) -> JsonValue {
+    let status = if approved {
+        "approved"
+    } else {
+        "inspection_requested"
+    };
+    let mut manual_review = release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.get("manualReview"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    merge_json_object(
+        &mut manual_review,
+        json!({
+            "status": status,
+            "userApproved": approved,
+            "reviewerUserId": user_id,
+            "reviewedAt": Utc::now(),
+            "reason": reason,
+            "previousState": release.state.as_str()
+        }),
+    );
+    let mut patch = json!({
+        "manualReview": {
+        },
+        "submissionResult": {
+            "accepted": broker_response.accepted,
+            "routeLogicalId": broker_response.logical_id,
+            "routeProviderId": broker_response.provider_id,
+            "downloadId": broker_response.download_id
+        }
+    });
+    if let JsonValue::Object(map) = &mut patch {
+        map.insert("manualReview".to_string(), manual_review);
+        if approved {
+            for key in ["priorityPolicy", "animeVerification"] {
+                if let Some(value) = release
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.get(key))
+                    .cloned()
+                {
+                    map.insert(key.to_string(), value);
+                }
+            }
+        }
+    }
+    patch
+}
+
+async fn mark_review_release_targets_inspecting(
+    pool: &AnyPool,
+    release: &AcquisitionRelease,
+    reason: &str,
+) -> ApiResult<()> {
+    let coverage = list_release_coverage(pool, release.release_id)
+        .await
+        .map_err(ApiError::from)?;
+    let mut target_ids = BTreeSet::new();
+    for row in coverage {
+        if !target_ids.insert(row.target_id) {
+            continue;
+        }
+        update_target_state(
+            pool,
+            row.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Pending,
+                state_reason: Some(reason.to_string()),
+                selected_provider_id: release.selected_provider_id.or(release.source_provider_id),
+                selected_route_logical_id: release.selected_route_logical_id.clone(),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: release.download_id.clone(),
+                import_event_id: None,
+                next_search_after: None,
+                increment_search_attempts: false,
             },
         )
         .await
@@ -766,7 +1217,7 @@ async fn mark_approved_release_targets_submitted(
             AcquisitionTargetStateUpdate {
                 state: AcquisitionTargetState::Submitted,
                 state_reason: Some(reason.to_string()),
-                selected_provider_id: release.source_provider_id.or(release.selected_provider_id),
+                selected_provider_id: release.selected_provider_id.or(release.source_provider_id),
                 selected_route_logical_id: release.selected_route_logical_id.clone(),
                 selected_candidate: release.selected_candidate.clone(),
                 download_id: release.download_id.clone(),
@@ -806,10 +1257,11 @@ async fn reject_release_for_review(
         .await
         .map_err(ApiError::from)?;
     }
-    for job in list_release_jobs(pool, release_id)
+    let jobs = list_release_jobs(pool, release_id)
         .await
-        .map_err(ApiError::from)?
-    {
+        .map_err(ApiError::from)?;
+    let job_count = jobs.len();
+    for job in jobs {
         update_release_job_state(
             pool,
             job.release_job_id,
@@ -825,6 +1277,10 @@ async fn reject_release_for_review(
         .await
         .map_err(ApiError::from)?;
     }
+    let cancelled_import_runs =
+        cancel_import_runs_for_release(pool, release_id, "Rejected by acquisition release review.")
+            .await
+            .map_err(ApiError::from)?;
     if request.target_policy != RejectTargetPolicy::Unchanged {
         let target_state = match request.target_policy {
             RejectTargetPolicy::Blocked => AcquisitionTargetState::Blocked,
@@ -891,6 +1347,34 @@ async fn reject_release_for_review(
     )
     .await
     .map_err(ApiError::from)?;
+    record_acquisition_audit_event(
+        pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_MANUAL_REJECTION.to_string(),
+            release_id: Some(release_id),
+            subscription_id: release.subscription_id,
+            actor_user_id: Some(user_id),
+            state: Some(AcquisitionReleaseState::Cancelled.as_str().to_string()),
+            reason: Some(request.reason.clone()),
+            evidence: Some(json!({
+                "releaseFingerprint": release.fingerprint,
+                "targetPolicy": match request.target_policy {
+                    RejectTargetPolicy::Blocked => "blocked",
+                    RejectTargetPolicy::Pending => "pending",
+                    RejectTargetPolicy::Unchanged => "unchanged",
+                },
+                "note": request.note,
+                "cancelledReleaseJobs": job_count,
+                "cancelledImportRuns": cancelled_import_runs,
+                "downloadId": release.download_id,
+                "remoteReleaseId": release.remote_release_id,
+                "cleanupPolicy": "database_safe_state_no_downloader_delete",
+            })),
+            ..NewAcquisitionAuditEvent::default()
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
     Ok(())
 }
 
@@ -919,10 +1403,16 @@ async fn retry_release_for_review(
             "requestedBy": reviewer_id(user_id),
             "requestedAt": Utc::now(),
             "reason": reason.clone(),
-            "nextSearchAfter": request.next_search_after
+            "nextSearchAfter": request.next_search_after,
+            "clearSuppression": request.clear_suppression
         }
     });
-    let merged_plan = merge_review_policy(release.coverage_plan.as_ref(), retry_policy);
+    let base_plan = if request.clear_suppression {
+        clear_review_suppression(release.coverage_plan.as_ref())
+    } else {
+        release.coverage_plan.clone()
+    };
+    let merged_plan = merge_review_policy(base_plan.as_ref(), retry_policy);
     match request.mode {
         RetryMode::SameRelease => {
             let next_release_state = if release_has_approval(&release) {
@@ -1067,8 +1557,8 @@ async fn retry_release_for_review(
                             state: AcquisitionTargetState::Submitted,
                             state_reason: Some(reason.clone()),
                             selected_provider_id: release
-                                .source_provider_id
-                                .or(release.selected_provider_id),
+                                .selected_provider_id
+                                .or(release.source_provider_id),
                             selected_route_logical_id: release.selected_route_logical_id.clone(),
                             selected_candidate: release.selected_candidate.clone(),
                             download_id: release.download_id.clone(),
@@ -1312,8 +1802,9 @@ fn approval_policy_json(
             "userApproved": true
         },
         "animeVerification": {
-            "userApprovedImportOverride": true,
+            "manualReviewApproved": true,
             "manualRemapApproved": !selection.selected_release_file_ids.is_empty(),
+            "manualApprovalRequiresImportVerification": true,
             "approvedAt": Utc::now(),
             "reviewerUserId": user_id,
             "reason": reason,
@@ -1372,6 +1863,26 @@ fn merge_json_object(target: &mut JsonValue, patch: JsonValue) {
             target_object.insert(key, value);
         }
     }
+}
+
+fn clear_review_suppression(existing: Option<&JsonValue>) -> Option<JsonValue> {
+    let Some(existing) = existing else {
+        return None;
+    };
+    let mut value = existing.clone();
+    if let JsonValue::Object(map) = &mut value {
+        map.remove("retrySuppression");
+        if let Some(JsonValue::Object(manual_review)) = map.get_mut("manualReview")
+            && manual_review.get("status").and_then(JsonValue::as_str) == Some("rejected")
+        {
+            manual_review.insert(
+                "status".to_string(),
+                JsonValue::String("retry_requested".to_string()),
+            );
+            manual_review.insert("suppressionClearedAt".to_string(), json!(Utc::now()));
+        }
+    }
+    Some(value)
 }
 
 fn release_has_approval(release: &AcquisitionRelease) -> bool {
@@ -1662,6 +2173,26 @@ fn release_evidence(
         })
     });
     ReleaseReviewEvidence {
+        source_candidate: plan
+            .as_ref()
+            .and_then(|value| value.get("sourceCandidate"))
+            .cloned()
+            .or_else(|| candidate.clone()),
+        resolver_evidence: plan
+            .as_ref()
+            .and_then(|value| value.get("resolverEvidence"))
+            .cloned(),
+        route_policy: plan
+            .as_ref()
+            .and_then(|value| value.get("routePolicy"))
+            .cloned(),
+        target_scope: plan
+            .as_ref()
+            .and_then(|value| value.get("targetScope"))
+            .cloned(),
+        source_provider_id: release.source_provider_id,
+        route_provider_id: release.selected_provider_id,
+        route_logical_id: release.selected_route_logical_id.clone(),
         selected_candidate: candidate.clone(),
         coverage_plan: plan.clone(),
         scheduler_dispatch: candidate
@@ -1770,6 +2301,7 @@ mod tests {
     use super::*;
     use crate::{
         acquisition::{
+            audit::count_acquisition_audit_events,
             imports::{
                 AcquisitionImportFileLinkState, AcquisitionImportRunState,
                 NewAcquisitionImportFileLink, NewAcquisitionImportRun, create_or_get_import_run,
@@ -1780,6 +2312,11 @@ mod tests {
                     AnimeFileHashStatus, NewAcquisitionFileHash, NewAcquisitionRelease,
                     NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseKind,
                     ReleaseResolverKind,
+                },
+                review_candidates::{
+                    ManualReviewResolverEvidence, ManualReviewRoutePolicyEvidence,
+                    ManualReviewTargetScope, NewManualReviewCandidateRelease,
+                    upsert_manual_review_candidate_release,
                 },
                 store::{
                     upsert_file_hash, upsert_release, upsert_release_file, upsert_release_job,
@@ -1940,6 +2477,118 @@ mod tests {
                 active: true,
                 started_at: Some(Utc::now()),
                 completed_at: None,
+            },
+        )
+        .await?;
+        Ok((release.release_id, targets[0].target_id))
+    }
+
+    async fn setup_prejob_review_candidate(database: &Database) -> Result<(Uuid, Uuid)> {
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Ambiguous Show".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Pilot".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Searching),
+                next_search_after: Some(Utc::now()),
+            }],
+        )
+        .await?;
+        let candidate = AcquisitionCandidate {
+            id: Some("torrentio:ambiguous-show:s1".to_string()),
+            title: "Ambiguous.Show.S01.Pack.1080p-GROUP".to_string(),
+            source: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&dn=Ambiguous.Show.S01.Pack.1080p-GROUP".to_string(),
+            source_kind: "magnet".to_string(),
+            info_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            file_index: None,
+            quality: Some("1080p".to_string()),
+            size_bytes: Some(4_000_000_000),
+            seeders: Some(12),
+            language: Some("en".to_string()),
+            cached_debrid: Some(false),
+            rank: Some(1),
+            score: Some(61.0),
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: vec![
+                DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                TORRENT_DEFAULT_LOGICAL_ID.to_string(),
+            ],
+            default_route: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            raw: Some(json!({
+                "provider": "torrentio",
+                "streamName": "Ambiguous Show S01"
+            })),
+        };
+        let release = upsert_manual_review_candidate_release(
+            &database.pool,
+            NewManualReviewCandidateRelease {
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: None,
+                source_extension_id: "elixir.sources.torrentio_stremio".to_string(),
+                owner_id: "default".to_string(),
+                media_type: MediaType::Series,
+                title: "Ambiguous Show".to_string(),
+                candidate,
+                target_scope: ManualReviewTargetScope {
+                    subscription_id: Some(subscription.subscription_id),
+                    media_type: MediaType::Series,
+                    targets: vec![targets[0].target_id],
+                    target_keys: vec!["S01E01".to_string()],
+                    season_number: Some(1),
+                    episode_numbers: vec![1],
+                    absolute_episode_numbers: Vec::new(),
+                },
+                resolver_evidence: ManualReviewResolverEvidence {
+                    resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                    resolver_version: "amr2-test".to_string(),
+                    parsed_release: Some(json!({
+                        "title": "Ambiguous Show",
+                        "seasonNumber": 1,
+                        "episodeNumber": null
+                    })),
+                    rejection_codes: vec![
+                        "ambiguous_episode_numbering".to_string(),
+                        "pack_shape_not_proven".to_string(),
+                    ],
+                    candidate_score: Some(61.0),
+                    reason: Some("Pack shape cannot be proven before inspection.".to_string()),
+                },
+                route_policy: ManualReviewRoutePolicyEvidence {
+                    preferred: Some("debrid_first".to_string()),
+                    allowed_routes: vec![
+                        DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                        TORRENT_DEFAULT_LOGICAL_ID.to_string(),
+                    ],
+                },
+                release_kind: ReleaseKind::Unknown,
+                score: Some(61.0),
+                state_reason: None,
             },
         )
         .await?;
@@ -2381,6 +3030,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn amr2_prejob_detail_exposes_source_candidate_evidence() -> Result<()> {
+        let database = setup_db().await?;
+        let (release_id, target_id) = setup_prejob_review_candidate(&database).await?;
+        let detail = load_release_detail(&database.pool, release_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        assert_eq!(detail.release.download_id, None);
+        assert!(detail.jobs.is_empty());
+        assert!(detail.files.is_empty());
+        assert_eq!(detail.coverage.len(), 1);
+        assert_eq!(detail.coverage[0].coverage.target_id, target_id);
+        assert_eq!(
+            detail.coverage[0].coverage.state,
+            ReleaseCoverageState::ReviewRequired
+        );
+        assert_eq!(detail.evidence.source_provider_id, None);
+        assert_eq!(detail.evidence.route_provider_id, None);
+        assert_eq!(detail.evidence.route_logical_id, None);
+        assert_eq!(
+            detail
+                .evidence
+                .source_candidate
+                .as_ref()
+                .and_then(|value| value.get("extensionId"))
+                .and_then(JsonValue::as_str),
+            Some("elixir.sources.torrentio_stremio")
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .resolver_evidence
+                .as_ref()
+                .and_then(|value| value.get("rejectionCodes"))
+                .and_then(JsonValue::as_array)
+                .map(|values| values.len()),
+            Some(2)
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .target_scope
+                .as_ref()
+                .and_then(|value| value.get("targetKeys"))
+                .and_then(JsonValue::as_array)
+                .and_then(|values| values.first())
+                .and_then(JsonValue::as_str),
+            Some("S01E01")
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .route_policy
+                .as_ref()
+                .and_then(|value| value.get("preferred"))
+                .and_then(JsonValue::as_str),
+            Some("debrid_first")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr2_prejob_route_selection_prefers_debrid_and_allows_override() -> Result<()> {
+        let database = setup_db().await?;
+        let (release_id, _) = setup_prejob_review_candidate(&database).await?;
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+
+        assert_eq!(
+            select_review_route_logical_id(&release, None)
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?,
+            DEBRID_DEFAULT_LOGICAL_ID
+        );
+        assert_eq!(
+            select_review_route_logical_id(&release, Some(TORRENT_DEFAULT_LOGICAL_ID))
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?,
+            TORRENT_DEFAULT_LOGICAL_ID
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr2_approve_prejob_candidate_persists_manual_policy_without_existing_job()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let (release_id, target_id) = setup_prejob_review_candidate(&database).await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            release_id,
+            ApproveAcquisitionReleaseRequest {
+                reason: Some("user verified source candidate".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, AcquisitionReleaseState::Ready);
+        assert_eq!(release.download_id, None);
+        let plan = release.coverage_plan.as_ref().expect("coverage plan");
+        assert_eq!(
+            plan.get("manualReview")
+                .and_then(|value| value.get("status"))
+                .and_then(JsonValue::as_str),
+            Some("approved")
+        );
+        let coverage = list_release_coverage(&database.pool, release_id).await?;
+        assert_eq!(coverage[0].state, ReleaseCoverageState::Selected);
+        let target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Submitted);
+        assert!(
+            list_release_jobs(&database.pool, release_id)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            count_acquisition_audit_events(&database.pool, release_id, EVENT_MANUAL_APPROVAL)
+                .await?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr2_inspect_existing_release_marks_inspection_requested() -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let (release_id, target_id) = setup_release(&database).await?;
+        let before = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+
+        mark_existing_release_inspection_requested(
+            &database.pool,
+            user_id,
+            &before,
+            "inspect files before approving",
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, before.state);
+        assert_eq!(release.download_id, before.download_id);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.get("manualReview"))
+                .and_then(|value| value.get("status"))
+                .and_then(JsonValue::as_str),
+            Some("inspection_requested")
+        );
+        let target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Searching);
+        assert_eq!(
+            count_acquisition_audit_events(&database.pool, release_id, EVENT_INSPECT_REQUESTED)
+                .await?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr2_reject_defaults_pending_and_retry_clears_suppression_only_when_requested()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let (release_id, target_id) = setup_prejob_review_candidate(&database).await?;
+
+        reject_release_for_review(
+            &database.pool,
+            user_id,
+            release_id,
+            RejectAcquisitionReleaseRequest {
+                reason: "wrong release".to_string(),
+                note: None,
+                target_policy: RejectTargetPolicy::default(),
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let rejected = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let plan = rejected.coverage_plan.as_ref().expect("coverage plan");
+        assert_eq!(rejected.state, AcquisitionReleaseState::Cancelled);
+        assert!(plan.get("retrySuppression").is_some());
+        assert_eq!(
+            plan.get("manualReview")
+                .and_then(|value| value.get("targetPolicy"))
+                .and_then(JsonValue::as_str),
+            Some("pending")
+        );
+        let target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert_eq!(
+            count_acquisition_audit_events(&database.pool, release_id, EVENT_MANUAL_REJECTION)
+                .await?,
+            1
+        );
+
+        retry_release_for_review(
+            &database.pool,
+            user_id,
+            release_id,
+            RetryAcquisitionReleaseRequest {
+                mode: RetryMode::SourceDiscovery,
+                reason: Some("retry without clearing suppression".to_string()),
+                next_search_after: None,
+                clear_suppression: false,
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let still_suppressed = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let plan = still_suppressed
+            .coverage_plan
+            .as_ref()
+            .expect("coverage plan");
+        assert!(plan.get("retrySuppression").is_some());
+        assert_eq!(
+            plan.get("retryPolicy")
+                .and_then(|value| value.get("clearSuppression"))
+                .and_then(JsonValue::as_bool),
+            Some(false)
+        );
+
+        retry_release_for_review(
+            &database.pool,
+            user_id,
+            release_id,
+            RetryAcquisitionReleaseRequest {
+                mode: RetryMode::SourceDiscovery,
+                reason: Some("retry and allow rediscovery".to_string()),
+                next_search_after: None,
+                clear_suppression: true,
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let unsuppressed = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let plan = unsuppressed.coverage_plan.as_ref().expect("coverage plan");
+        assert!(plan.get("retrySuppression").is_none());
+        assert_eq!(
+            plan.get("manualReview")
+                .and_then(|value| value.get("status"))
+                .and_then(JsonValue::as_str),
+            Some("retry_requested")
+        );
+        assert_eq!(
+            plan.get("retryPolicy")
+                .and_then(|value| value.get("clearSuppression"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rr8d_detail_response_exposes_import_state_and_links() -> Result<()> {
         let database = setup_db().await?;
         let (release_id, target_id) = setup_release(&database).await?;
@@ -2504,6 +3434,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let (release_id, _) = setup_release(&database).await?;
         approve_release_for_review(
+            None,
             &database.pool,
             user_id,
             release_id,
@@ -2539,6 +3470,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let fixture = setup_tv_review_pack(&database).await?;
         approve_release_for_review(
+            None,
             &database.pool,
             user_id,
             fixture.release_id,
@@ -2604,6 +3536,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let fixture = setup_anime_review_pack(&database).await?;
         approve_release_for_review(
+            None,
             &database.pool,
             user_id,
             fixture.release_id,
@@ -2632,6 +3565,7 @@ mod tests {
                 mode: RetryMode::SameRelease,
                 reason: Some("refresh provider state after approval".to_string()),
                 next_search_after: None,
+                clear_suppression: false,
             },
         )
         .await
@@ -2695,6 +3629,7 @@ mod tests {
                 mode: RetryMode::Import,
                 reason: Some("retry local import".to_string()),
                 next_search_after: None,
+                clear_suppression: false,
             },
         )
         .await
@@ -2764,6 +3699,7 @@ mod tests {
                 mode: RetryMode::Verification,
                 reason: Some("retry anime identity verification".to_string()),
                 next_search_after: None,
+                clear_suppression: false,
             },
         )
         .await
@@ -2789,6 +3725,13 @@ mod tests {
         let database = setup_db().await?;
         let user_id = Uuid::new_v4();
         let (release_id, target_id) = setup_release(&database).await?;
+        let run_id = seed_blocked_import_run(
+            &database,
+            release_id,
+            target_id,
+            "/tmp/elixir-amr4/Example.Show.S01E01.mkv",
+        )
+        .await?;
         reject_release_for_review(
             &database.pool,
             user_id,
@@ -2813,6 +3756,20 @@ mod tests {
             .await?
             .expect("target");
         assert_eq!(target.state, AcquisitionTargetState::Blocked);
+        let run_state: String =
+            sqlx::query_scalar("SELECT state FROM acquisition_import_runs WHERE import_run_id = ?")
+                .bind(run_id.to_string())
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(run_state, AcquisitionImportRunState::Cancelled.as_str());
+        let links = list_import_file_links(&database.pool, run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].state, AcquisitionImportFileLinkState::Skipped);
+        assert_eq!(
+            count_acquisition_audit_events(&database.pool, release_id, EVENT_MANUAL_REJECTION)
+                .await?,
+            1
+        );
         Ok(())
     }
 
@@ -2829,6 +3786,7 @@ mod tests {
                 mode: RetryMode::SourceDiscovery,
                 reason: Some("try another release".to_string()),
                 next_search_after: None,
+                clear_suppression: false,
             },
         )
         .await

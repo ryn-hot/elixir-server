@@ -7,7 +7,7 @@ use axum::{
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -359,7 +359,7 @@ async fn available_candidate_providers(
             if !media_types.is_empty()
                 && !media_types
                     .iter()
-                    .any(|item| item.eq_ignore_ascii_case(media_type.trim()))
+                    .any(|item| candidate_media_type_matches(item, media_type))
             {
                 continue;
             }
@@ -559,7 +559,157 @@ pub(crate) fn normalize_acquisition_candidate(
         .filter_map(normalize_candidate_file)
         .collect();
     candidate.raw = candidate.raw.map(redact_sensitive_value);
+    enrich_torrent_candidate_health_evidence(&mut candidate);
     Ok(candidate)
+}
+
+pub(crate) fn acquisition_candidate_tracker_count(candidate: &AcquisitionCandidate) -> usize {
+    let mut count = magnet_tracker_count(&candidate.source);
+    for path in [
+        "/parsedHints/trackerCount",
+        "/serverEvidence/torrentHealth/trackerCount",
+    ] {
+        if let Some(raw_count) = candidate
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.pointer(path))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            count = count.max(raw_count);
+        }
+    }
+    count
+}
+
+fn enrich_torrent_candidate_health_evidence(candidate: &mut AcquisitionCandidate) {
+    if !candidate.source_kind.eq_ignore_ascii_case("magnet") {
+        return;
+    }
+    let tracker_count = acquisition_candidate_tracker_count(candidate);
+    let seeder_state = match candidate.seeders {
+        Some(0) => "zero",
+        Some(1..=4) => "very_low",
+        Some(5..=14) => "low",
+        Some(15..) => "reported",
+        None => "unknown",
+    };
+    upsert_candidate_server_evidence(
+        candidate,
+        "torrentHealth",
+        json!({
+            "policyVersion": "asr8-candidate-quality-v1",
+            "sourceKind": candidate.source_kind.as_str(),
+            "cachedDebrid": candidate.cached_debrid,
+            "trackerCount": tracker_count,
+            "seeders": candidate.seeders,
+            "seederState": seeder_state,
+            "seedersAreSourceHints": true,
+            "liveDownloaderEvidenceOverridesSourceHints": true,
+        }),
+    );
+
+    ensure_score_badge(
+        candidate,
+        "Tracker evidence",
+        format!(
+            "{} tracker URL{} detected before submission.",
+            tracker_count,
+            if tracker_count == 1 { "" } else { "s" }
+        ),
+        Some(match tracker_count {
+            3.. => 0.05,
+            1..=2 => 0.02,
+            _ => -0.08,
+        }),
+    );
+
+    if candidate.cached_debrid == Some(true) {
+        return;
+    }
+
+    let mut weak_reasons = Vec::new();
+    if tracker_count == 0 {
+        weak_reasons.push("no tracker URLs".to_string());
+    }
+    match candidate.seeders {
+        Some(0) => weak_reasons.push("zero reported seeders".to_string()),
+        Some(1..=4) => weak_reasons.push("very low reported seeders".to_string()),
+        None => weak_reasons.push("unknown reported seeders".to_string()),
+        Some(_) => {}
+    }
+    if weak_reasons.is_empty() {
+        return;
+    }
+    ensure_score_badge(
+        candidate,
+        "Weak swarm",
+        format!(
+            "Uncached magnet has {}; source seeder hints are advisory until live downloader evidence is available.",
+            weak_reasons.join(" and ")
+        ),
+        Some(-0.12),
+    );
+}
+
+fn upsert_candidate_server_evidence(candidate: &mut AcquisitionCandidate, key: &str, value: Value) {
+    let mut root = match candidate.raw.take() {
+        Some(Value::Object(object)) => object,
+        Some(previous_raw) => {
+            let mut object = JsonMap::new();
+            object.insert("sourceRaw".to_string(), previous_raw);
+            object
+        }
+        None => JsonMap::new(),
+    };
+    let server_evidence = root
+        .entry("serverEvidence".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    if !server_evidence.is_object() {
+        *server_evidence = Value::Object(JsonMap::new());
+    }
+    if let Some(object) = server_evidence.as_object_mut() {
+        object.insert(key.to_string(), value);
+    }
+    candidate.raw = Some(Value::Object(root));
+}
+
+fn ensure_score_badge(
+    candidate: &mut AcquisitionCandidate,
+    label: &str,
+    detail: String,
+    score: Option<f64>,
+) {
+    if candidate
+        .score_badges
+        .iter()
+        .any(|badge| badge.label.eq_ignore_ascii_case(label))
+    {
+        return;
+    }
+    candidate.score_badges.push(CandidateScoreBadge {
+        label: label.to_string(),
+        detail: Some(detail),
+        score,
+    });
+}
+
+fn magnet_tracker_count(source: &str) -> usize {
+    let Some((scheme, query)) = source.split_once('?') else {
+        return 0;
+    };
+    if !scheme.eq_ignore_ascii_case("magnet:") {
+        return 0;
+    }
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').map(|(key, _)| key).or(Some(pair)))
+        .filter(|key| {
+            urlencoding::decode(key)
+                .map(|decoded| decoded.eq_ignore_ascii_case("tr"))
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 fn normalize_upstream_candidates(values: Vec<Value>) -> (Vec<AcquisitionCandidate>, Vec<String>) {
@@ -770,6 +920,25 @@ fn provider_scope(provider: &Provider) -> (Vec<String>, Vec<String>) {
     (media_types, actions)
 }
 
+fn candidate_media_type_matches(provider_value: &str, requested_value: &str) -> bool {
+    let Some(provider_type) = normalize_candidate_media_type(provider_value) else {
+        return false;
+    };
+    let Some(requested_type) = normalize_candidate_media_type(requested_value) else {
+        return false;
+    };
+    provider_type == requested_type
+}
+
+fn normalize_candidate_media_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "movie" | "movies" => Some("movie"),
+        "series" | "tv" | "show" | "shows" => Some("series"),
+        "anime" => Some("anime"),
+        _ => None,
+    }
+}
+
 fn string_array(values: &[Value]) -> Vec<String> {
     values
         .iter()
@@ -928,6 +1097,62 @@ mod tests {
                 .and_then(Value::as_str),
             Some("[REDACTED]")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_candidate_adds_server_torrent_health_evidence() -> Result<()> {
+        let candidate = normalize_acquisition_candidate(AcquisitionCandidate {
+            id: None,
+            title: "Weak Release".to_string(),
+            source: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string(),
+            source_kind: "magnet".to_string(),
+            info_hash: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            file_index: None,
+            quality: Some("1080p".to_string()),
+            size_bytes: Some(1_000_000),
+            seeders: None,
+            language: None,
+            cached_debrid: Some(false),
+            rank: None,
+            score: Some(0.95),
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: vec!["acquisition.debrid.default".to_string()],
+            default_route: Some("acquisition.debrid.default".to_string()),
+            raw: None,
+        })?;
+
+        let raw = candidate.raw.as_ref().expect("server evidence raw");
+        assert_eq!(
+            raw.pointer("/serverEvidence/torrentHealth/trackerCount")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            raw.pointer("/serverEvidence/torrentHealth/seederState")
+                .and_then(Value::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            raw.pointer("/serverEvidence/torrentHealth/liveDownloaderEvidenceOverridesSourceHints")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(candidate.score_badges.iter().any(|badge| {
+            badge.label == "Tracker evidence"
+                && badge
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("0 tracker URLs"))
+        }));
+        assert!(candidate.score_badges.iter().any(|badge| {
+            badge.label == "Weak swarm"
+                && badge
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("unknown reported seeders"))
+        }));
         Ok(())
     }
 
@@ -1141,6 +1366,10 @@ mod tests {
             preferences: CandidateSearchPreferences::default(),
             limit: Some(10),
         };
+        let selected_for_series =
+            select_candidate_provider(&store, request.provider_id, Some("series")).await?;
+        assert_eq!(selected_for_series.summary.provider_id, provider_id);
+
         let selected =
             select_candidate_provider(&store, request.provider_id, Some("movie")).await?;
         let route_options = candidate_route_options(&database.pool, &store, extension_id).await?;

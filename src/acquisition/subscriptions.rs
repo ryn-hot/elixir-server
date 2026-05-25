@@ -97,6 +97,7 @@ pub enum AcquisitionSubscriptionStatus {
     Active,
     Paused,
     Completed,
+    Cancelled,
 }
 
 impl Default for AcquisitionSubscriptionStatus {
@@ -111,6 +112,7 @@ impl AcquisitionSubscriptionStatus {
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -123,6 +125,7 @@ impl FromStr for AcquisitionSubscriptionStatus {
             "active" => Ok(Self::Active),
             "paused" => Ok(Self::Paused),
             "completed" => Ok(Self::Completed),
+            "cancelled" | "canceled" => Ok(Self::Cancelled),
             other => bail!("unknown acquisition subscription status '{other}'"),
         }
     }
@@ -329,6 +332,16 @@ pub struct AcquisitionTarget {
 pub struct AcquisitionSubscriptionDetail {
     pub subscription: AcquisitionSubscription,
     pub targets: Vec<AcquisitionTarget>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionSubscriptionStopTrackingResult {
+    pub subscription: AcquisitionSubscription,
+    pub targets_excluded: u64,
+    pub releases_cancelled: u64,
+    pub release_jobs_cancelled: u64,
+    pub coverage_rejected: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -600,6 +613,115 @@ pub async fn update_subscription_external_ids(
     .context("updating acquisition subscription external ids")?;
 
     get_subscription(pool, subscription_id).await
+}
+
+pub async fn stop_subscription_tracking(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    reason: &str,
+) -> Result<Option<AcquisitionSubscriptionStopTrackingResult>> {
+    if get_subscription(pool, subscription_id).await?.is_none() {
+        return Ok(None);
+    }
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "User removed acquisition request."
+    } else {
+        reason
+    };
+
+    let target_result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = 'excluded',
+             state_reason = ?,
+             next_search_after = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?
+           AND state IN ('pending', 'searching', 'blocked', 'submitted')",
+    )
+    .bind(reason)
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("excluding acquisition targets for stopped subscription")?;
+
+    let coverage_result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_coverage
+         SET state = 'rejected',
+             reason = ?,
+             verified_by = 'user_cancelled',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id IN (
+             SELECT release_id
+             FROM acquisition_releases
+             WHERE subscription_id = ?
+         )
+           AND state NOT IN ('imported', 'rejected')",
+    )
+    .bind(reason)
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("rejecting acquisition release coverage for stopped subscription")?;
+
+    let job_result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = 'cancelled',
+             state_reason = ?,
+             active = 0,
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id IN (
+             SELECT release_id
+             FROM acquisition_releases
+             WHERE subscription_id = ?
+         )
+           AND state NOT IN ('completed', 'cancelled')",
+    )
+    .bind(reason)
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("cancelling acquisition release jobs for stopped subscription")?;
+
+    let release_result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = 'cancelled',
+             state_reason = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?
+           AND state NOT IN ('completed', 'cancelled')",
+    )
+    .bind(reason)
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("cancelling acquisition releases for stopped subscription")?;
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_subscriptions
+         SET status = 'cancelled',
+             active = 0,
+             candidate_search_after = CURRENT_TIMESTAMP,
+             metadata_refresh_after = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("stopping acquisition subscription tracking")?;
+
+    let subscription = get_subscription(pool, subscription_id)
+        .await?
+        .ok_or_else(|| anyhow!("stopped acquisition subscription was not readable"))?;
+    Ok(Some(AcquisitionSubscriptionStopTrackingResult {
+        subscription,
+        targets_excluded: target_result.rows_affected(),
+        releases_cancelled: release_result.rows_affected(),
+        release_jobs_cancelled: job_result.rows_affected(),
+        coverage_rejected: coverage_result.rows_affected(),
+    }))
 }
 
 pub async fn list_subscriptions(
@@ -966,6 +1088,35 @@ pub async fn update_target_state(
     .execute(pool)
     .await
     .context("updating acquisition target state")?;
+
+    get_target(pool, target_id).await
+}
+
+pub async fn reset_target_for_candidate_retry(
+    pool: &AnyPool,
+    target_id: Uuid,
+    state_reason: String,
+    next_search_after: DateTime<Utc>,
+) -> Result<Option<AcquisitionTarget>> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = ?,
+             state_reason = ?,
+             selected_provider_id = NULL,
+             selected_route_logical_id = NULL,
+             selected_candidate_json = NULL,
+             download_id = NULL,
+             next_search_after = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE target_id = ?",
+    )
+    .bind(AcquisitionTargetState::Pending.as_str())
+    .bind(state_reason)
+    .bind(db_datetime_string(next_search_after))
+    .bind(target_id.to_string())
+    .execute(pool)
+    .await
+    .context("resetting acquisition target for candidate retry")?;
 
     get_target(pool, target_id).await
 }
@@ -2753,6 +2904,140 @@ mod tests {
         )
         .await?;
         assert_eq!(subscriptions.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_subscription_tracking_hides_request_and_cancels_active_work() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription =
+            create_subscription(&database.pool, series_subscription("Stale Show")).await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                season_number: Some(1),
+                episode_number: Some(1),
+                title: Some("Pilot".to_string()),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        let target = update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                selected_route_logical_id: Some("acquisition.debrid.default".to_string()),
+                download_id: Some("debrid-job".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .expect("submitted target");
+        let release_id = Uuid::new_v4();
+        let release_job_id = Uuid::new_v4();
+        let coverage_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_releases (
+                release_id,
+                subscription_id,
+                source_extension_id,
+                owner_id,
+                media_type,
+                title,
+                release_title,
+                source,
+                source_kind,
+                fingerprint,
+                release_kind,
+                resolver_kind,
+                resolver_version,
+                confidence,
+                selected_route_logical_id,
+                download_id,
+                state
+            ) VALUES (?, ?, 'test.source', 'default', 'series', 'Stale Show',
+                'Stale.Show.S01E01', 'magnet:?xt=urn:btih:test', 'magnet',
+                'fingerprint-stale-show', 'single', 'tv_sonarr_style', 'test',
+                'high', 'acquisition.debrid.default', 'debrid-job', 'submitted')",
+        )
+        .bind(release_id.to_string())
+        .bind(subscription.subscription_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_release_jobs (
+                release_job_id,
+                release_id,
+                route_logical_id,
+                download_id,
+                state,
+                active
+            ) VALUES (?, ?, 'acquisition.debrid.default', 'debrid-job', 'submitted', 1)",
+        )
+        .bind(release_job_id.to_string())
+        .bind(release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_release_coverage (
+                coverage_id,
+                release_id,
+                target_id,
+                coverage_kind,
+                confidence,
+                state
+            ) VALUES (?, ?, ?, 'single_episode', 'high', 'submitted')",
+        )
+        .bind(coverage_id.to_string())
+        .bind(release_id.to_string())
+        .bind(target.target_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let result = stop_subscription_tracking(
+            &database.pool,
+            subscription.subscription_id,
+            "User removed acquisition request.",
+        )
+        .await?
+        .expect("stopped subscription");
+
+        assert!(!result.subscription.active);
+        assert_eq!(
+            result.subscription.status,
+            AcquisitionSubscriptionStatus::Cancelled
+        );
+        assert_eq!(result.targets_excluded, 1);
+        assert_eq!(result.releases_cancelled, 1);
+        assert_eq!(result.release_jobs_cancelled, 1);
+        assert_eq!(result.coverage_rejected, 1);
+
+        let active = list_subscriptions(
+            &database.pool,
+            AcquisitionSubscriptionFilter { active: Some(true) },
+        )
+        .await?;
+        assert!(active.is_empty());
+
+        let target = get_target(&database.pool, target.target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Excluded);
+        let release_state: String =
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+                .bind(release_id.to_string())
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(release_state, "cancelled");
+        let job_state: String = sqlx::query_scalar(
+            "SELECT state FROM acquisition_release_jobs WHERE release_job_id = ?",
+        )
+        .bind(release_job_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(job_state, "cancelled");
         Ok(())
     }
 

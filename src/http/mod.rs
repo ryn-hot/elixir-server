@@ -128,6 +128,10 @@ pub fn router(state: AppState) -> Router {
                 .patch(handlers::acquisition_subscriptions::patch_acquisition_subscription),
         )
         .route(
+            "/api/v1/acquisition/subscriptions/:subscription_id/cancel",
+            post(handlers::acquisition_subscriptions::cancel_acquisition_subscription),
+        )
+        .route(
             "/api/v1/acquisition/subscriptions/:subscription_id/coverage",
             get(handlers::acquisition_review::acquisition_subscription_coverage),
         )
@@ -146,6 +150,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/acquisition/releases/:release_id/approve",
             post(handlers::acquisition_review::approve_acquisition_release),
+        )
+        .route(
+            "/api/v1/acquisition/releases/:release_id/inspect",
+            post(handlers::acquisition_review::inspect_acquisition_release),
         )
         .route(
             "/api/v1/acquisition/releases/:release_id/reject",

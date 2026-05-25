@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod automation;
 pub mod imports;
 pub mod release_resolution;

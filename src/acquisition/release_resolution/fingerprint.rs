@@ -2,7 +2,7 @@ use reqwest::Url;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::http::handlers::acquisition_sources::AcquisitionCandidate;
+use crate::{db::models::MediaType, http::handlers::acquisition_sources::AcquisitionCandidate};
 
 const SIZE_BUCKET_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -28,6 +28,37 @@ pub fn candidate_release_fingerprint(
         size_bytes: candidate.size_bytes,
         source_provider_id,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewCandidateFingerprintInput<'a> {
+    pub candidate: &'a AcquisitionCandidate,
+    pub source_provider_id: Option<Uuid>,
+    pub subscription_id: Option<Uuid>,
+    pub media_type: MediaType,
+}
+
+pub fn review_candidate_release_fingerprint(input: &ReviewCandidateFingerprintInput<'_>) -> String {
+    let candidate_fingerprint =
+        candidate_release_fingerprint(input.candidate, input.source_provider_id);
+    let provider = input
+        .source_provider_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown-provider".to_string());
+    let subscription = input
+        .subscription_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown-subscription".to_string());
+    let scope = format!(
+        "provider:{provider}:subscription:{subscription}:media:{}",
+        input.media_type.as_str()
+    );
+    format!(
+        "review:v1:{}:{}:{}",
+        input.media_type.as_str(),
+        short_hash(&scope),
+        candidate_fingerprint
+    )
 }
 
 pub fn build_release_fingerprint(input: &ReleaseFingerprintInput<'_>) -> String {
@@ -304,5 +335,63 @@ mod tests {
                 source_provider_id: None,
             })
         );
+    }
+
+    #[test]
+    fn review_candidate_fingerprint_is_scoped_to_subscription_and_media_type() {
+        let provider_id = Uuid::new_v4();
+        let subscription_id = Uuid::new_v4();
+        let candidate = AcquisitionCandidate {
+            id: Some("candidate-1".to_string()),
+            title: "Example.Show.Episode.1".to_string(),
+            source: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            source_kind: "magnet".to_string(),
+            info_hash: None,
+            file_index: None,
+            quality: Some("1080p".to_string()),
+            size_bytes: Some(1024),
+            seeders: Some(3),
+            language: Some("en".to_string()),
+            cached_debrid: None,
+            rank: None,
+            score: None,
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: Vec::new(),
+            default_route: None,
+            raw: None,
+        };
+
+        let first = review_candidate_release_fingerprint(&ReviewCandidateFingerprintInput {
+            candidate: &candidate,
+            source_provider_id: Some(provider_id),
+            subscription_id: Some(subscription_id),
+            media_type: MediaType::Series,
+        });
+        let second = review_candidate_release_fingerprint(&ReviewCandidateFingerprintInput {
+            candidate: &candidate,
+            source_provider_id: Some(provider_id),
+            subscription_id: Some(subscription_id),
+            media_type: MediaType::Series,
+        });
+        let other_media_type =
+            review_candidate_release_fingerprint(&ReviewCandidateFingerprintInput {
+                candidate: &candidate,
+                source_provider_id: Some(provider_id),
+                subscription_id: Some(subscription_id),
+                media_type: MediaType::Anime,
+            });
+        let other_subscription =
+            review_candidate_release_fingerprint(&ReviewCandidateFingerprintInput {
+                candidate: &candidate,
+                source_provider_id: Some(provider_id),
+                subscription_id: Some(Uuid::new_v4()),
+                media_type: MediaType::Series,
+            });
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_media_type);
+        assert_ne!(first, other_subscription);
+        assert!(first.starts_with("review:v1:series:"));
     }
 }

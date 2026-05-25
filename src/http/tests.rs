@@ -1110,6 +1110,15 @@ async fn debrid_control_surface_redacts_tokens_and_lists_all_services() -> Resul
         Some("real_debrid")
     );
     assert_eq!(
+        control_section_field(
+            accounts,
+            crate::debrid::DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY
+        )
+        .get("value")
+        .and_then(Value::as_i64),
+        Some(crate::debrid::DEFAULT_DEBRID_CONCURRENT_DOWNLOADS)
+    );
+    assert_eq!(
         control_section_field(accounts, "token.real_debrid")
             .get("value")
             .and_then(Value::as_str),
@@ -1238,6 +1247,69 @@ async fn debrid_control_surface_updates_multiple_account_tokens() -> Result<()> 
             .get("value")
             .and_then(Value::as_str),
         Some("saved")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn debrid_control_surface_updates_concurrency_cap() -> Result<()> {
+    let (app, state, instance_id) = setup_debrid_control_surface_extension().await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/extensions/elixir.modules.debrid/control-surface")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "values": {
+                            "maxConcurrentDownloads": 3
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .context("debrid instance should exist")?;
+    assert_eq!(
+        instance
+            .config_json
+            .as_ref()
+            .and_then(|config| config.get(crate::debrid::DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY))
+            .and_then(Value::as_i64),
+        Some(3)
+    );
+
+    let providers = store.list_providers(Some(instance_id)).await?;
+    let provider = providers
+        .iter()
+        .find(|provider| provider.capability == "debrid.resolver" && provider.slot_id == "default")
+        .context("debrid provider should exist")?;
+    assert_eq!(
+        provider
+            .scope_json
+            .as_ref()
+            .and_then(|scope| scope.pointer("/download_broker/maxConcurrentDownloads"))
+            .and_then(Value::as_i64),
+        Some(3)
+    );
+
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        control_section_field(
+            control_surface_section(&payload, "debridAccounts"),
+            crate::debrid::DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY
+        )
+        .get("value")
+        .and_then(Value::as_i64),
+        Some(3)
     );
     Ok(())
 }
@@ -6434,6 +6506,9 @@ async fn discovery_manager_preferences_round_trip() -> Result<()> {
             health_state: ProviderHealthState::Healthy,
         })
         .await?;
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.test_candidate_provider")
+            .await?;
 
     let initial_resp = app
         .clone()
@@ -6561,6 +6636,13 @@ async fn discovery_manager_preferences_round_trip() -> Result<()> {
             .and_then(Value::as_str),
         Some(sonarr_provider_id_text.as_str())
     );
+    assert_eq!(
+        new_prefs_json
+            .get("moviesSourceCandidates")
+            .and_then(Value::as_array)
+            .map(|value| value.len()),
+        Some(1)
+    );
 
     let patch_resp = app
         .oneshot(
@@ -6571,7 +6653,10 @@ async fn discovery_manager_preferences_round_trip() -> Result<()> {
                     json!({
                         "moviesDefaultManagerProviderId": Value::Null,
                         "tvDefaultManagerProviderId": sonarr_provider_id,
-                        "animeDefaultManagerProviderId": sonarr_provider_id
+                        "animeDefaultManagerProviderId": sonarr_provider_id,
+                        "moviesDefaultSourceProviderId": source_provider_id,
+                        "tvDefaultSourceProviderId": source_provider_id,
+                        "animeDefaultSourceProviderId": source_provider_id
                     })
                     .to_string(),
                 ))?,
@@ -6585,6 +6670,21 @@ async fn discovery_manager_preferences_round_trip() -> Result<()> {
             .get("preferences")
             .and_then(|value| value.get("moviesDefaultManagerProviderId")),
         Some(&Value::Null)
+    );
+    let source_provider_id_text = source_provider_id.to_string();
+    assert_eq!(
+        patch_json
+            .get("preferences")
+            .and_then(|value| value.get("moviesDefaultSourceProviderId"))
+            .and_then(Value::as_str),
+        Some(source_provider_id_text.as_str())
+    );
+    assert_eq!(
+        patch_json
+            .get("preferences")
+            .and_then(|value| value.get("tvDefaultSourceProviderId"))
+            .and_then(Value::as_str),
+        Some(source_provider_id_text.as_str())
     );
 
     Ok(())
@@ -6818,6 +6918,8 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             health_state: ProviderHealthState::Healthy,
         })
         .await?;
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.find_media_source").await?;
 
     let response = app
         .clone()
@@ -6835,6 +6937,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
     let payload: Value = serde_json::from_slice(&body)?;
     let sonarr_manager_provider_id_text = sonarr_manager_provider_id.to_string();
     let sonarr_anime_search_provider_id_text = sonarr_anime_search_provider_id.to_string();
+    let source_provider_id_text = source_provider_id.to_string();
 
     assert_eq!(
         payload.get("mediaType").and_then(Value::as_str),
@@ -6852,11 +6955,23 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         .cloned()
         .unwrap_or_default();
     assert_eq!(manager_providers.len(), 1);
+    let source_providers = payload
+        .get("sourceProviders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(source_providers.len(), 1);
     assert_eq!(
         payload
             .get("defaultManagerProviderId")
             .and_then(Value::as_str),
         Some(sonarr_manager_provider_id_text.as_str())
+    );
+    assert_eq!(
+        payload
+            .get("defaultSourceProviderId")
+            .and_then(Value::as_str),
+        Some(source_provider_id_text.as_str())
     );
 
     let provider_ids: Vec<_> = search_providers
@@ -6907,6 +7022,19 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
             .and_then(Value::as_array)
             .map(|items| items.len()),
         Some(1)
+    );
+    assert_eq!(
+        targets_json
+            .get("sourceCandidates")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(1)
+    );
+    assert_eq!(
+        targets_json
+            .get("defaultSourceProviderId")
+            .and_then(Value::as_str),
+        Some(source_provider_id_text.as_str())
     );
 
     let managers_alias_resp = app

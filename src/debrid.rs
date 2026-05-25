@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
+use reqwest::header::RANGE;
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,14 +76,16 @@ const ALL_DEBRID_API_BASE: &str = "https://api.alldebrid.com/v4";
 #[allow(dead_code)]
 const PREMIUMIZE_API_BASE: &str = "https://www.premiumize.me/api";
 const REAL_DEBRID_POLL_INTERVAL_SECONDS: u64 = 20;
-const DEBRID_ACTIVE_JOB_CAP: i64 = 1;
-const DEBRID_MATERIALIZER_ACTIVE_JOB_LIMIT: i64 = 1;
+pub const DEFAULT_DEBRID_CONCURRENT_DOWNLOADS: i64 = 1;
+pub const MIN_DEBRID_CONCURRENT_DOWNLOADS: i64 = 1;
+pub const MAX_DEBRID_CONCURRENT_DOWNLOADS: i64 = 16;
 const REAL_DEBRID_USER_AGENT: &str = "Elixir/0.1 Real-Debrid";
 const TORBOX_USER_AGENT: &str = "Elixir/0.1 TorBox";
 const ALL_DEBRID_USER_AGENT: &str = "Elixir/0.1 AllDebrid";
 const MAX_DOWNLOAD_FILE_NAME_LEN: usize = 180;
 const DEBRID_SELECTION_POLICY_VERSION: &str = "rr4f-deterministic-selection-v1";
 const DEBRID_ACTIVE_SERVICE_CONFIG_KEY: &str = "activeService";
+pub const DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY: &str = "maxConcurrentDownloads";
 const TORBOX_CREATE_TORRENT_MINUTE_LIMIT: usize = 10;
 const TORBOX_CREATE_TORRENT_HOUR_LIMIT: usize = 60;
 const TORBOX_CREATE_TORRENT_MINUTE_WINDOW: Duration = Duration::from_secs(60);
@@ -218,6 +221,52 @@ pub fn active_debrid_service_from_config(config_json: Option<&Value>) -> Result<
     DebridServiceKind::from_str(value)
 }
 
+pub fn debrid_concurrent_downloads_from_config(config_json: Option<&Value>) -> i64 {
+    let Some(config) = config_json else {
+        return DEFAULT_DEBRID_CONCURRENT_DOWNLOADS;
+    };
+    config
+        .get(DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY)
+        .or_else(|| config.get("concurrentDownloads"))
+        .or_else(|| config.get("concurrencyCap"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+                .or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|number| number.fract() == 0.0)
+                        .map(|number| number as i64)
+                })
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .and_then(|text| text.parse::<i64>().ok())
+                })
+        })
+        .map(normalize_debrid_concurrent_downloads)
+        .unwrap_or(DEFAULT_DEBRID_CONCURRENT_DOWNLOADS)
+}
+
+pub fn normalize_debrid_concurrent_downloads(value: i64) -> i64 {
+    value.clamp(
+        MIN_DEBRID_CONCURRENT_DOWNLOADS,
+        MAX_DEBRID_CONCURRENT_DOWNLOADS,
+    )
+}
+
+pub fn validate_debrid_concurrent_downloads(value: i64) -> Result<i64> {
+    if !(MIN_DEBRID_CONCURRENT_DOWNLOADS..=MAX_DEBRID_CONCURRENT_DOWNLOADS).contains(&value) {
+        bail!(
+            "Debrid concurrent downloads must be between {MIN_DEBRID_CONCURRENT_DOWNLOADS} and {MAX_DEBRID_CONCURRENT_DOWNLOADS}"
+        );
+    }
+    Ok(value)
+}
+
 pub fn is_debrid_extension_id(value: &str) -> bool {
     value.trim().eq_ignore_ascii_case(DEBRID_EXTENSION_ID)
         || value
@@ -245,6 +294,7 @@ pub struct DebridBrokerProgressEvidence {
     pub provider_name: Option<String>,
     pub provider_implementation: Option<String>,
     pub provider_capabilities: Option<Value>,
+    pub provider_status: Option<Value>,
     pub remote_status: Option<String>,
     pub selection_mode: Option<String>,
     pub selected_file_count: usize,
@@ -277,9 +327,19 @@ impl DebridJobStatus {
 #[serde(rename_all = "snake_case")]
 pub enum DebridFailureClass {
     ProviderAuthMissing,
+    ProviderAccountRestricted,
+    ProviderAccountLimitReached,
     ProviderUnavailable,
     ProviderUnsupported,
+    RateLimited,
+    TooManyActiveDownloads,
+    QuotaExhausted,
     MagnetRejected,
+    InvalidSource,
+    ContentBlocked,
+    NotFoundExpired,
+    NoSeeds,
+    ProviderStalled,
     StagingTimeout,
     FileListUnavailable,
     SelectionFailed,
@@ -294,9 +354,19 @@ impl DebridFailureClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProviderAuthMissing => "provider_auth_missing",
+            Self::ProviderAccountRestricted => "provider_account_restricted",
+            Self::ProviderAccountLimitReached => "provider_account_limit_reached",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderUnsupported => "provider_unsupported",
+            Self::RateLimited => "rate_limited",
+            Self::TooManyActiveDownloads => "too_many_active_downloads",
+            Self::QuotaExhausted => "quota_exhausted",
             Self::MagnetRejected => "magnet_rejected",
+            Self::InvalidSource => "invalid_source",
+            Self::ContentBlocked => "content_blocked",
+            Self::NotFoundExpired => "not_found_or_expired",
+            Self::NoSeeds => "no_seeds",
+            Self::ProviderStalled => "provider_stalled",
             Self::StagingTimeout => "staging_timeout",
             Self::FileListUnavailable => "file_list_unavailable",
             Self::SelectionFailed => "selection_failed",
@@ -305,6 +375,93 @@ impl DebridFailureClass {
             Self::MaterializerFailed => "materializer_failed",
             Self::ProviderDeleteFailed => "provider_delete_failed",
             Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "provider_auth_missing" | "unauthorized" | "auth_failed" => {
+                Some(Self::ProviderAuthMissing)
+            }
+            "provider_account_restricted" | "account_restricted" | "permission_denied" => {
+                Some(Self::ProviderAccountRestricted)
+            }
+            "provider_account_limit_reached" | "account_limit_reached" => {
+                Some(Self::ProviderAccountLimitReached)
+            }
+            "provider_unavailable" => Some(Self::ProviderUnavailable),
+            "provider_unsupported" => Some(Self::ProviderUnsupported),
+            "rate_limited" | "rate_limit_reached" => Some(Self::RateLimited),
+            "too_many_active_downloads" => Some(Self::TooManyActiveDownloads),
+            "quota_exhausted" | "traffic_exhausted" | "fair_usage_limit" => {
+                Some(Self::QuotaExhausted)
+            }
+            "magnet_rejected" => Some(Self::MagnetRejected),
+            "invalid_source" | "invalid_magnet_or_torrent" => Some(Self::InvalidSource),
+            "content_blocked" | "infringing_or_filtered" => Some(Self::ContentBlocked),
+            "not_found_or_expired" | "not_found" | "expired" => Some(Self::NotFoundExpired),
+            "no_seeds" => Some(Self::NoSeeds),
+            "provider_stalled" => Some(Self::ProviderStalled),
+            "staging_timeout" => Some(Self::StagingTimeout),
+            "file_list_unavailable" => Some(Self::FileListUnavailable),
+            "selection_failed" => Some(Self::SelectionFailed),
+            "transfer_failed" => Some(Self::TransferFailed),
+            "unrestrict_failed" => Some(Self::UnrestrictFailed),
+            "materializer_failed" => Some(Self::MaterializerFailed),
+            "provider_delete_failed" => Some(Self::ProviderDeleteFailed),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn response_policy(self) -> DebridFailureResponsePolicy {
+        match self {
+            Self::ProviderAuthMissing
+            | Self::ProviderAccountRestricted
+            | Self::ProviderAccountLimitReached
+            | Self::QuotaExhausted => DebridFailureResponsePolicy::AccountActionRequired,
+            Self::RateLimited | Self::TooManyActiveDownloads | Self::ProviderUnavailable => {
+                DebridFailureResponsePolicy::RetryProviderLater
+            }
+            Self::NoSeeds
+            | Self::ProviderStalled
+            | Self::StagingTimeout
+            | Self::FileListUnavailable
+            | Self::MagnetRejected
+            | Self::InvalidSource
+            | Self::ContentBlocked
+            | Self::NotFoundExpired
+            | Self::SelectionFailed
+            | Self::TransferFailed => DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            Self::ProviderUnsupported => DebridFailureResponsePolicy::ProviderUnsupported,
+            Self::UnrestrictFailed | Self::MaterializerFailed => {
+                DebridFailureResponsePolicy::RetryOrReview
+            }
+            Self::ProviderDeleteFailed | Self::Unknown => DebridFailureResponsePolicy::Review,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebridFailureResponsePolicy {
+    TryAlternateRouteOrCandidate,
+    RetryProviderLater,
+    AccountActionRequired,
+    ProviderUnsupported,
+    RetryOrReview,
+    Review,
+}
+
+impl DebridFailureResponsePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TryAlternateRouteOrCandidate => "try_alternate_route_or_candidate",
+            Self::RetryProviderLater => "retry_provider_later",
+            Self::AccountActionRequired => "account_action_required",
+            Self::ProviderUnsupported => "provider_unsupported",
+            Self::RetryOrReview => "retry_or_review",
+            Self::Review => "review",
         }
     }
 }
@@ -498,10 +655,11 @@ impl DebridProviderErrorKind {
     pub fn failure_class(self) -> DebridFailureClass {
         match self {
             Self::Unauthorized => DebridFailureClass::ProviderAuthMissing,
-            Self::NotFound => DebridFailureClass::FileListUnavailable,
-            Self::RateLimited | Self::Temporary => DebridFailureClass::ProviderUnavailable,
+            Self::NotFound => DebridFailureClass::NotFoundExpired,
+            Self::RateLimited => DebridFailureClass::RateLimited,
+            Self::Temporary => DebridFailureClass::ProviderUnavailable,
             Self::SelectionUnsupported => DebridFailureClass::ProviderUnsupported,
-            Self::Permanent => DebridFailureClass::TransferFailed,
+            Self::Permanent => DebridFailureClass::InvalidSource,
             Self::Unknown => DebridFailureClass::Unknown,
         }
     }
@@ -567,6 +725,7 @@ struct DebridDownloadJob {
     remote_release_id: Option<String>,
     remote_release_status: Option<String>,
     provider_capabilities: Option<Value>,
+    provider_status: Option<Value>,
     selection_mode: Option<String>,
     selected_file_ids: Vec<String>,
     skipped_file_ids: Vec<String>,
@@ -960,7 +1119,7 @@ struct TorBoxTorrent {
     download_present: Option<bool>,
     #[serde(default)]
     cached: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_torbox_torrent_files")]
     files: Vec<TorBoxTorrentFile>,
 }
 
@@ -984,6 +1143,26 @@ struct TorBoxTorrentFile {
     infected: Option<bool>,
     #[serde(default)]
     mimetype: Option<String>,
+}
+
+fn deserialize_torbox_torrent_files<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<TorBoxTorrentFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom),
+        Value::Null => Ok(Vec::new()),
+        other => Err(serde::de::Error::custom(format!(
+            "expected TorBox files array or null, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4329,6 +4508,11 @@ fn torbox_torrent_to_inspection(
     let mut selected_file_ids = selected_file_ids.into_iter().collect::<Vec<_>>();
     selected_file_ids.sort();
     let status = torbox_torrent_status(torrent);
+    let provider_status = torbox_torrent_provider_status(torrent, status);
+    let raw = json!({
+        "torrent": torrent,
+        "providerStatus": provider_status,
+    });
     Ok(DebridReleaseInspection {
         release: DebridRemoteRelease {
             provider_implementation: DebridServiceKind::TorBox.implementation_id().to_string(),
@@ -4337,7 +4521,7 @@ fn torbox_torrent_to_inspection(
             display_name: torrent.name.clone().or_else(|| torrent.hash.clone()),
             status,
             raw_status: torrent.download_state.clone(),
-            raw: Some(serde_json::to_value(torrent)?),
+            raw: Some(raw.clone()),
         },
         capabilities: torbox_lifecycle_capabilities(),
         files,
@@ -4348,7 +4532,7 @@ fn torbox_torrent_to_inspection(
             selected_file_ids,
             skipped_file_ids,
         }),
-        raw: Some(serde_json::to_value(torrent)?),
+        raw: Some(raw),
     })
 }
 
@@ -4389,15 +4573,19 @@ fn torbox_torrent_files(torrent: &TorBoxTorrent) -> Result<Vec<DebridRemoteFile>
 fn torbox_torrent_progress(torrent: &TorBoxTorrent) -> DebridReleaseProgress {
     let total = torrent.size;
     let progress = torbox_progress_fraction(torrent.progress, torrent.total_downloaded, total);
+    let status = torbox_torrent_status(torrent);
     DebridReleaseProgress {
-        status: torbox_torrent_status(torrent),
+        status,
         progress,
         downloaded_bytes: torrent
             .total_downloaded
             .or_else(|| progress.map(|progress| (progress * total.unwrap_or(0) as f64) as u64)),
         total_bytes: total,
         download_rate_bps: torrent.download_speed,
-        raw: serde_json::to_value(torrent).ok(),
+        raw: Some(json!({
+            "torrent": torrent,
+            "providerStatus": torbox_torrent_provider_status(torrent, status),
+        })),
     }
 }
 
@@ -4427,6 +4615,83 @@ fn torbox_torrent_status(torrent: &TorBoxTorrent) -> DebridReleaseStatus {
         }
         "cancelled" | "canceled" => DebridReleaseStatus::Cancelled,
         _ => DebridReleaseStatus::Staging,
+    }
+}
+
+fn torbox_torrent_provider_status(torrent: &TorBoxTorrent, status: DebridReleaseStatus) -> Value {
+    let raw_status = torrent
+        .download_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let raw_status_lower = raw_status.unwrap_or_default().to_ascii_lowercase();
+    let no_seeds = raw_status_lower.contains("no seeds");
+    let provider_stalled = raw_status_lower.contains("stalled");
+    let not_cached = torrent.cached == Some(false);
+    let file_list_unavailable =
+        torrent.files.is_empty() && status != DebridReleaseStatus::Downloaded;
+    let provider_failure_class = if no_seeds {
+        Some("no_seeds")
+    } else if provider_stalled {
+        Some("provider_stalled")
+    } else if file_list_unavailable {
+        Some("file_list_unavailable")
+    } else {
+        None
+    };
+    let message = torbox_torrent_user_message(
+        no_seeds,
+        provider_stalled,
+        not_cached,
+        file_list_unavailable,
+    );
+    json!({
+        "providerImplementation": DebridServiceKind::TorBox.implementation_id(),
+        "providerName": DebridServiceKind::TorBox.display_name(),
+        "status": status.as_str(),
+        "providerState": raw_status,
+        "rawStatus": raw_status,
+        "providerFailureClass": provider_failure_class,
+        "retryable": matches!(provider_failure_class, Some("no_seeds" | "provider_stalled" | "file_list_unavailable")),
+        "cached": torrent.cached,
+        "notCached": not_cached,
+        "downloadPresent": torrent.download_present,
+        "downloadFinished": torrent.download_finished,
+        "filesAvailable": !torrent.files.is_empty(),
+        "fileCount": torrent.files.len(),
+        "fileListUnavailable": file_list_unavailable,
+        "providerStalled": provider_stalled,
+        "noSeeds": no_seeds,
+        "progress": torbox_progress_fraction(torrent.progress, torrent.total_downloaded, torrent.size),
+        "downloadedBytes": torrent.total_downloaded,
+        "totalBytes": torrent.size,
+        "downloadRateBps": torrent.download_speed,
+        "message": message,
+    })
+}
+
+fn torbox_torrent_user_message(
+    no_seeds: bool,
+    provider_stalled: bool,
+    not_cached: bool,
+    file_list_unavailable: bool,
+) -> Option<&'static str> {
+    if no_seeds && not_cached {
+        Some("TorBox accepted this torrent, but it is not cached and has no seeds.")
+    } else if no_seeds {
+        Some("TorBox accepted this torrent, but the transfer has no seeds.")
+    } else if provider_stalled && not_cached {
+        Some(
+            "TorBox accepted this torrent, but it is not cached and the provider transfer is stalled.",
+        )
+    } else if provider_stalled {
+        Some("TorBox accepted this torrent, but the provider transfer is stalled.")
+    } else if file_list_unavailable && not_cached {
+        Some(
+            "TorBox accepted this torrent, but it is not cached and no file list is available yet.",
+        )
+    } else {
+        None
     }
 }
 
@@ -4628,6 +4893,7 @@ pub async fn reconcile_debrid_provider_for_instance(
     instance_id: Uuid,
 ) -> Result<Uuid> {
     let service = active_debrid_service_for_instance(store, instance_id).await?;
+    let concurrent_downloads = debrid_concurrent_downloads_for_instance(pool, instance_id).await?;
     let provider_id = store
         .list_providers(Some(instance_id))
         .await?
@@ -4651,7 +4917,8 @@ pub async fn reconcile_debrid_provider_for_instance(
                     "enabled": true,
                     "provider_kind": "debrid",
                     "logical_id": DEBRID_DEFAULT_LOGICAL_ID,
-                    "activeService": service.implementation_id()
+                    "activeService": service.implementation_id(),
+                    "maxConcurrentDownloads": concurrent_downloads
                 }
             })),
             endpoint_json: Some(serde_json::to_value(endpoint)?),
@@ -4783,6 +5050,12 @@ fn normalized_debrid_instance_config(config_json: Option<Value>) -> Value {
     config
         .entry("materialize".to_string())
         .or_insert_with(|| json!(true));
+    let concurrent_downloads =
+        debrid_concurrent_downloads_from_config(Some(&Value::Object(config.clone())));
+    config.insert(
+        DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY.to_string(),
+        json!(concurrent_downloads),
+    );
     config.insert(
         DEBRID_ACTIVE_SERVICE_CONFIG_KEY.to_string(),
         json!(active_service),
@@ -4867,6 +5140,54 @@ pub async fn active_debrid_service_for_instance(
         .await?
         .ok_or_else(|| anyhow!("debrid extension instance '{instance_id}' does not exist"))?;
     active_debrid_service_from_config(instance.config_json.as_ref())
+}
+
+pub async fn debrid_concurrent_downloads_for_instance(
+    pool: &sqlx::AnyPool,
+    instance_id: Uuid,
+) -> Result<i64> {
+    let raw_config = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT CAST(config_json AS TEXT) AS config_json
+         FROM extension_instances
+         WHERE instance_id = ?
+         LIMIT 1",
+    )
+    .bind(instance_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .context("loading Debrid instance concurrency cap")?
+    .flatten();
+    let parsed_config = raw_config
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    Ok(debrid_concurrent_downloads_from_config(
+        parsed_config.as_ref(),
+    ))
+}
+
+pub async fn active_debrid_concurrent_downloads(pool: &sqlx::AnyPool) -> Result<i64> {
+    let raw_config = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT CAST(config_json AS TEXT) AS config_json
+         FROM extension_instances
+         WHERE (extension_id = ? OR extension_id = ?)
+           AND enabled = ?
+         ORDER BY CASE WHEN LOWER(instance_name) = 'default' THEN 0 ELSE 1 END,
+                  instance_name ASC
+         LIMIT 1",
+    )
+    .bind(DEBRID_EXTENSION_ID)
+    .bind(LEGACY_REAL_DEBRID_EXTENSION_ID)
+    .bind(true)
+    .fetch_optional(pool)
+    .await
+    .context("loading active Debrid concurrency cap")?
+    .flatten();
+    let parsed_config = raw_config
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    Ok(debrid_concurrent_downloads_from_config(
+        parsed_config.as_ref(),
+    ))
 }
 
 #[allow(dead_code)]
@@ -5029,11 +5350,10 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
 ) -> Result<Uuid> {
     let source_kind = debrid_source_kind(source)?;
     if !options.paused {
+        let cap = debrid_concurrent_downloads_for_instance(pool, instance_id).await?;
         let active_jobs = count_active_debrid_jobs_for_instance(pool, instance_id).await?;
-        if active_jobs >= DEBRID_ACTIVE_JOB_CAP {
-            bail!(
-                "Debrid route capacity reached: active Debrid jobs {active_jobs}/{DEBRID_ACTIVE_JOB_CAP}"
-            );
+        if active_jobs >= cap {
+            bail!("Debrid route capacity reached: active Debrid jobs {active_jobs}/{cap}");
         }
     }
     let job_id = Uuid::new_v4();
@@ -5182,6 +5502,7 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
             remote_release_id: remote_release_id.clone(),
             remote_release_status: remote_release_status.clone(),
             provider_capabilities: Some(json!(provider_capabilities.clone())),
+            provider_status: None,
             selection_mode: Some(
                 provider_capabilities
                     .file_selection_mode
@@ -6121,6 +6442,16 @@ struct DebridFileSelectionDecision {
     select_all_approved: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DebridCoverageTarget {
+    target_id: Uuid,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    episode_end_number: Option<i32>,
+    absolute_episode_number: Option<i32>,
+    absolute_episode_end_number: Option<i32>,
+}
+
 impl DebridFileSelectionDecision {
     fn is_approved(&self) -> bool {
         self.status == DebridSelectionDecisionStatus::Approved
@@ -6208,6 +6539,7 @@ fn decide_debrid_file_selection(
     let mut selected_file_ids = coverage
         .iter()
         .filter(|coverage| coverage.confidence == ReleaseConfidence::High)
+        .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
         .filter_map(|coverage| coverage.release_file_id)
         .filter_map(|release_file_id| files_by_release_file_id.get(&release_file_id))
         .filter(|file| file.selectable)
@@ -6217,6 +6549,22 @@ fn decide_debrid_file_selection(
                 .or_else(|| file.file_id.clone())
         })
         .collect::<BTreeSet<_>>();
+
+    if selected_file_ids.is_empty() && release.confidence == ReleaseConfidence::High {
+        let targets = debrid_targets_from_coverage_plan(release, coverage);
+        for file in &selectable_media_files {
+            if targets
+                .iter()
+                .any(|target| debrid_file_matches_target(file, target))
+                && let Some(file_id) = file
+                    .provider_file_id
+                    .clone()
+                    .or_else(|| file.file_id.clone())
+            {
+                selected_file_ids.insert(file_id);
+            }
+        }
+    }
 
     if selected_file_ids.is_empty()
         && matches!(release.release_kind, ReleaseKind::Single)
@@ -6302,6 +6650,129 @@ fn decide_debrid_file_selection(
         select_all,
         select_all_approved,
     }
+}
+
+fn debrid_targets_from_coverage_plan(
+    release: &AcquisitionRelease,
+    coverage: &[AcquisitionReleaseCoverage],
+) -> Vec<DebridCoverageTarget> {
+    let covered_target_ids = coverage
+        .iter()
+        .filter(|coverage| coverage.confidence == ReleaseConfidence::High)
+        .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+        .map(|coverage| coverage.target_id)
+        .collect::<BTreeSet<_>>();
+    if covered_target_ids.is_empty() {
+        return Vec::new();
+    }
+
+    debrid_coverage_plan_entries(release.coverage_plan.as_ref())
+        .into_iter()
+        .filter_map(debrid_target_from_coverage_plan_entry)
+        .filter(|target| covered_target_ids.contains(&target.target_id))
+        .collect::<Vec<_>>()
+}
+
+fn debrid_coverage_plan_entries(coverage_plan: Option<&Value>) -> Vec<&Value> {
+    let mut entries = Vec::new();
+    if let Some(value) = coverage_plan {
+        collect_debrid_coverage_plan_entries(value, &mut entries, 0);
+    }
+    entries
+}
+
+fn collect_debrid_coverage_plan_entries<'a>(
+    value: &'a Value,
+    entries: &mut Vec<&'a Value>,
+    depth: usize,
+) {
+    if depth > 3 {
+        return;
+    }
+
+    if let Some(array) = value.get("entries").and_then(Value::as_array) {
+        entries.extend(array.iter());
+    }
+
+    for key in [
+        "tv",
+        "anime",
+        "tvCoveragePlan",
+        "animeCoveragePlan",
+        "coveragePlan",
+        "previousCoveragePlan",
+    ] {
+        if let Some(nested) = value.get(key) {
+            collect_debrid_coverage_plan_entries(nested, entries, depth + 1);
+        }
+    }
+}
+
+fn debrid_target_from_coverage_plan_entry(entry: &Value) -> Option<DebridCoverageTarget> {
+    let target_id = entry
+        .get("targetId")
+        .or_else(|| entry.get("target_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    Some(DebridCoverageTarget {
+        target_id,
+        season_number: coverage_plan_i32(entry, &["seasonNumber", "season_number"]),
+        episode_number: coverage_plan_i32(entry, &["episodeNumber", "episode_number"]),
+        episode_end_number: coverage_plan_i32(entry, &["episodeEndNumber", "episode_end_number"]),
+        absolute_episode_number: coverage_plan_i32(
+            entry,
+            &["absoluteEpisodeNumber", "absolute_episode_number"],
+        ),
+        absolute_episode_end_number: coverage_plan_i32(
+            entry,
+            &["absoluteEpisodeEndNumber", "absolute_episode_end_number"],
+        ),
+    })
+}
+
+fn coverage_plan_i32(entry: &Value, keys: &[&str]) -> Option<i32> {
+    keys.iter()
+        .find_map(|key| entry.get(*key))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn debrid_file_matches_target(
+    file: &AcquisitionReleaseFile,
+    target: &DebridCoverageTarget,
+) -> bool {
+    if let Some(target_absolute) = target.absolute_episode_number {
+        if let Some(file_absolute) = file.parsed_absolute_episode_number {
+            let file_end = file
+                .parsed_absolute_episode_end_number
+                .unwrap_or(file_absolute);
+            let target_end = target
+                .absolute_episode_end_number
+                .unwrap_or(target_absolute);
+            if ranges_overlap(file_absolute, file_end, target_absolute, target_end) {
+                return true;
+            }
+        }
+    }
+
+    let Some(target_episode) = target.episode_number else {
+        return false;
+    };
+    if let Some(target_season) = target.season_number
+        && file.parsed_season_number != Some(target_season)
+    {
+        return false;
+    }
+    let Some(file_episode) = file.parsed_episode_number else {
+        return false;
+    };
+    let file_end = file.parsed_episode_end_number.unwrap_or(file_episode);
+    let target_end = target.episode_end_number.unwrap_or(target_episode);
+    ranges_overlap(file_episode, file_end, target_episode, target_end)
+}
+
+fn ranges_overlap(left_start: i32, left_end: i32, right_start: i32, right_end: i32) -> bool {
+    left_start <= right_end && right_start <= left_end
 }
 
 fn approved_debrid_user_override(
@@ -6654,6 +7125,7 @@ fn merge_debrid_failure_evidence(coverage_plan: Option<Value>, job: &DebridDownl
     let evidence = json!({
         "status": "failed",
         "failureClass": failure_class.as_str(),
+        "responsePolicy": failure_class.response_policy().as_str(),
         "message": job
             .last_error
             .as_deref()
@@ -6667,7 +7139,46 @@ fn merge_debrid_failure_evidence(coverage_plan: Option<Value>, job: &DebridDownl
         "sourceKind": job.source_kind,
         "fallbackState": debrid_fallback_state(job, Some(failure_class)),
     });
-    merge_debrid_evidence_object(coverage_plan, "debridFailure", evidence)
+    let coverage_plan = merge_debrid_evidence_object(coverage_plan, "debridFailure", evidence);
+    if debrid_failure_suppresses_automatic_rediscovery(failure_class) {
+        merge_debrid_evidence_object(
+            Some(coverage_plan),
+            "retrySuppression",
+            json!({
+                "status": "rejected",
+                "suppressAutomaticRediscovery": true,
+                "reason": failure_class.as_str(),
+                "responsePolicy": failure_class.response_policy().as_str(),
+                "message": job
+                    .last_error
+                    .as_deref()
+                    .or(job.selection_error.as_deref())
+                    .unwrap_or("Debrid provider reported a failed release."),
+                "jobId": job.job_id,
+                "providerId": job.provider_id,
+                "providerImplementation": job.provider_implementation,
+                "remoteReleaseId": job.remote_release_id,
+                "remoteStatus": job.remote_release_status,
+            }),
+        )
+    } else {
+        coverage_plan
+    }
+}
+
+fn debrid_failure_suppresses_automatic_rediscovery(failure_class: DebridFailureClass) -> bool {
+    matches!(
+        failure_class,
+        DebridFailureClass::NoSeeds
+            | DebridFailureClass::ProviderStalled
+            | DebridFailureClass::StagingTimeout
+            | DebridFailureClass::FileListUnavailable
+            | DebridFailureClass::MagnetRejected
+            | DebridFailureClass::InvalidSource
+            | DebridFailureClass::ContentBlocked
+            | DebridFailureClass::NotFoundExpired
+            | DebridFailureClass::SelectionFailed
+    )
 }
 
 fn debrid_provider_provenance_evidence(
@@ -6849,6 +7360,7 @@ fn debrid_progress_evidence_for_job(job: &DebridDownloadJob) -> DebridBrokerProg
             .map(debrid_provider_display_name),
         provider_implementation: job.provider_implementation.clone(),
         provider_capabilities: job.provider_capabilities.clone(),
+        provider_status: job.provider_status.clone(),
         remote_status: job.remote_release_status.clone(),
         selection_mode: job.selection_mode.clone(),
         selected_file_count: job.selected_file_ids.len(),
@@ -6894,12 +7406,35 @@ fn debrid_fallback_state(
 ) -> String {
     if job.status == "review_required" {
         "not_attempted_review_required".to_string()
-    } else if failure_class.is_some() && job.source_kind == "magnet" {
-        "eligible_if_candidate_supports_torrent_route".to_string()
-    } else if failure_class.is_some() {
-        "not_available_for_hoster_source".to_string()
+    } else if let Some(failure_class) = failure_class {
+        debrid_fallback_state_for_source_kind(&job.source_kind, failure_class)
     } else {
         "not_needed".to_string()
+    }
+}
+
+fn debrid_fallback_state_for_source_kind(
+    source_kind: &str,
+    failure_class: DebridFailureClass,
+) -> String {
+    match failure_class.response_policy() {
+        DebridFailureResponsePolicy::TryAlternateRouteOrCandidate
+            if source_kind.eq_ignore_ascii_case("magnet") =>
+        {
+            "eligible_if_candidate_supports_torrent_route".to_string()
+        }
+        DebridFailureResponsePolicy::TryAlternateRouteOrCandidate => {
+            "try_next_candidate".to_string()
+        }
+        DebridFailureResponsePolicy::RetryProviderLater => "retry_provider_later".to_string(),
+        DebridFailureResponsePolicy::AccountActionRequired => {
+            "blocked_account_action_required".to_string()
+        }
+        DebridFailureResponsePolicy::ProviderUnsupported => {
+            "blocked_provider_unsupported".to_string()
+        }
+        DebridFailureResponsePolicy::RetryOrReview => "retry_or_review".to_string(),
+        DebridFailureResponsePolicy::Review => "review_required".to_string(),
     }
 }
 
@@ -6943,11 +7478,59 @@ fn classify_debrid_failure(
         return None;
     }
 
-    if message.contains("api token")
+    if message.contains("error_code\":35")
+        || message.contains("error_code:35")
+        || message.contains("infringing file")
+        || message.contains("infringing_file")
+        || message.contains("file not allowed")
+        || message.contains("file_not_allowed")
+        || message.contains("content blocked")
+        || message.contains("dmca")
+        || message.contains("copyright")
+    {
+        Some(DebridFailureClass::ContentBlocked)
+    } else if message.contains("error_code\":21")
+        || message.contains("error_code:21")
+        || message.contains("too many active downloads")
+        || message.contains("too many active")
+        || message.contains("maximum allowed active")
+        || message.contains("magnet_too_many_active")
+    {
+        Some(DebridFailureClass::TooManyActiveDownloads)
+    } else if message.contains("account_limit_reached")
+        || message.contains("service_limit_reached")
+        || message.contains("account limit")
+        || message.contains("service limit")
+    {
+        Some(DebridFailureClass::ProviderAccountLimitReached)
+    } else if message.contains("error_code\":23")
+        || message.contains("error_code:23")
+        || message.contains("error_code\":36")
+        || message.contains("error_code:36")
+        || message.contains("traffic exhausted")
+        || message.contains("fair usage limit")
+        || message.contains("fair-use")
+        || message.contains("fairuse")
+        || message.contains("quota")
+    {
+        Some(DebridFailureClass::QuotaExhausted)
+    } else if message.contains("not premium")
+        || message.contains("must be premium")
+        || message.contains("free users")
+        || message.contains("magnet_must_be_premium")
+        || message.contains("magnet_no_server")
+        || message.contains("permission_denied")
+        || message.contains("account locked")
+        || message.contains("account restricted")
+    {
+        Some(DebridFailureClass::ProviderAccountRestricted)
+    } else if message.contains("api token")
         || message.contains("apikey")
         || message.contains("api key")
         || message.contains("unauthorized")
         || message.contains("forbidden")
+        || message.contains("bad token")
+        || message.contains("invalid token")
         || message.contains("401")
         || message.contains("403")
     {
@@ -6961,16 +7544,23 @@ fn classify_debrid_failure(
     } else if message.contains("rate limit")
         || message.contains("ratelimit")
         || message.contains("too many requests")
+        || message.contains("slow down")
         || message.contains("429")
-        || message.contains("provider unavailable")
-        || message.contains("account_limit_reached")
-        || message.contains("service_limit_reached")
         || message.contains("rate_limit_reached")
+    {
+        Some(DebridFailureClass::RateLimited)
+    } else if message.contains("provider unavailable")
         || message.contains("service_down")
         || message.contains("semi_permanent_error")
         || message.contains("link_generation_failed")
         || message.contains("transient_error")
-        || message.contains("fair-use")
+        || message.contains("service unavailable")
+        || message.contains("temporar")
+        || message.contains("unknown_error")
+        || message.contains("503")
+        || message.contains("502")
+        || message.contains("504")
+        || message.contains("500")
     {
         Some(DebridFailureClass::ProviderUnavailable)
     } else if message.contains("timed out") || message.contains("timeout") {
@@ -6991,27 +7581,68 @@ fn classify_debrid_failure(
         Some(DebridFailureClass::MaterializerFailed)
     } else if message.contains("delete") {
         Some(DebridFailureClass::ProviderDeleteFailed)
+    } else if message.contains("no_seeds")
+        || message.contains("no seeds")
+        || message.contains("0 seeds")
+        || message.contains("no seeders")
+        || message.contains("low seeders")
+        || message.contains("no peer")
+        || message.contains("no peers")
+        || message.contains("file not available - no peer")
+    {
+        Some(DebridFailureClass::NoSeeds)
+    } else if message.contains("provider_stalled")
+        || message.contains("stalled")
+        || message.contains("no progress")
+    {
+        Some(DebridFailureClass::ProviderStalled)
     } else if message.contains("file list")
         || message.contains("no files")
         || message.contains("torrent info")
+        || message.contains("magnet_invalid_id")
         || message.contains("not_found")
         || message.contains("not found")
         || message.contains("not cached")
+        || message.contains("expired")
+        || message.contains("not_found_or_expired")
     {
-        Some(DebridFailureClass::FileListUnavailable)
+        if message.contains("not found")
+            || message.contains("not_found")
+            || message.contains("expired")
+        {
+            Some(DebridFailureClass::NotFoundExpired)
+        } else {
+            Some(DebridFailureClass::FileListUnavailable)
+        }
     } else if message.contains("magnet_error")
         || message.contains("magnet_invalid")
+        || message.contains("magnet_invalid_file")
         || message.contains("magnet rejected")
         || message.contains("invalid magnet")
         || message.contains("bad magnet")
+        || message.contains("torrent file invalid")
+        || message.contains("torrent invalid")
+        || message.contains("invalid torrent")
+        || message.contains("error_code\":30")
+        || message.contains("error_code:30")
+        || message.contains("error_code\":29")
+        || message.contains("error_code:29")
         || message.contains("service_unsupported")
+        || message.contains("service unsupported")
+        || message.contains("unsupported hoster")
+        || message.contains("unsupported_hoster")
+        || message.contains("invalid_request")
+        || message.contains("permanent_error")
     {
-        Some(DebridFailureClass::MagnetRejected)
-    } else if message.contains("503")
-        || message.contains("502")
-        || message.contains("504")
-        || message.contains("service unavailable")
-        || message.contains("connection")
+        if message.contains("magnet")
+            || message.contains("torrent")
+            || message.contains("invalid_request")
+        {
+            Some(DebridFailureClass::InvalidSource)
+        } else {
+            Some(DebridFailureClass::MagnetRejected)
+        }
+    } else if message.contains("connection")
         || message.contains("connect")
         || message.contains("network")
     {
@@ -7142,21 +7773,36 @@ pub async fn cancel_real_debrid_job(
 }
 
 async fn process_debrid_jobs_once(state: &AppState) -> Result<()> {
-    let jobs =
-        list_active_debrid_jobs(&state.db_pool, DEBRID_MATERIALIZER_ACTIVE_JOB_LIMIT).await?;
+    let cap = active_debrid_concurrent_downloads(&state.db_pool).await?;
+    let jobs = list_active_debrid_jobs(&state.db_pool, cap).await?;
     if jobs.is_empty() {
         return Ok(());
     }
-    let store = ExtensionStore::new(&state.db_pool);
-    let paths = RuntimePaths::from_roots(
-        &state.settings.extensions.storage_root,
-        &state.settings.library.local_root,
-    );
+    let mut handles = Vec::with_capacity(jobs.len());
     for job in jobs {
-        if let Err(err) = process_debrid_job(state, &store, &paths, job.clone()).await {
-            mark_debrid_job_status(&state.db_pool, job.job_id, "failed", Some(&err.to_string()))
+        let worker_state = state.clone();
+        handles.push(tokio::spawn(async move {
+            let store = ExtensionStore::new(&worker_state.db_pool);
+            let paths = RuntimePaths::from_roots(
+                &worker_state.settings.extensions.storage_root,
+                &worker_state.settings.library.local_root,
+            );
+            if let Err(err) = process_debrid_job(&worker_state, &store, &paths, job.clone()).await {
+                mark_debrid_job_status(
+                    &worker_state.db_pool,
+                    job.job_id,
+                    "failed",
+                    Some(&err.to_string()),
+                )
                 .await?;
-        }
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    for handle in handles {
+        handle
+            .await
+            .map_err(|err| anyhow!("Debrid materializer worker panicked: {err}"))??;
     }
     Ok(())
 }
@@ -7464,26 +8110,75 @@ async fn download_url_to_file(
         .timeout(Duration::from_secs(30 * 60))
         .build()
         .context("building debrid materializer HTTP client")?;
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .context("requesting debrid provider download")?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("Debrid provider download returned {status}");
-    }
-    let total = expected_size.or_else(|| response.content_length());
+
     if let Some(parent) = target_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let tmp_path = target_path.with_extension("elixir-part");
-    let mut file = tokio::fs::File::create(&tmp_path)
+    let resume_from = tokio::fs::metadata(&tmp_path)
         .await
-        .with_context(|| format!("creating '{}'", tmp_path.display()))?;
-    let mut downloaded = 0_u64;
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(RANGE, format!("bytes={resume_from}-"));
+    }
+    let mut response = request
+        .send()
+        .await
+        .context("requesting debrid provider download")?;
+    let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE
+        && expected_size.is_some_and(|size| resume_from >= size)
+    {
+        tokio::fs::rename(&tmp_path, target_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "moving completed debrid partial '{}' to '{}'",
+                    tmp_path.display(),
+                    target_path.display()
+                )
+            })?;
+        update_debrid_job_download_progress(pool, job_id, resume_from, expected_size, Some(0))
+            .await?;
+        update_debrid_job_local_path(pool, job_id, &target_path.to_string_lossy()).await?;
+        return Ok(());
+    }
+    if !status.is_success() {
+        bail!("Debrid provider download returned {status}");
+    }
+    let append_existing = resume_from > 0 && status == StatusCode::PARTIAL_CONTENT;
+    let total = expected_size.or_else(|| {
+        response.content_length().map(|content_length| {
+            if append_existing {
+                resume_from.saturating_add(content_length)
+            } else {
+                content_length
+            }
+        })
+    });
+    let mut file = if append_existing {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| format!("opening '{}' for resume", tmp_path.display()))?
+    } else {
+        tokio::fs::File::create(&tmp_path)
+            .await
+            .with_context(|| format!("creating '{}'", tmp_path.display()))?
+    };
+    let mut downloaded = if append_existing { resume_from } else { 0 };
     let mut last_update = Instant::now();
-    let mut last_downloaded = 0_u64;
+    let mut last_downloaded = downloaded;
+    if downloaded > 0 {
+        update_debrid_job_download_progress(pool, job_id, downloaded, total, Some(0)).await?;
+    }
     while let Some(chunk) = response.chunk().await.context("reading debrid download")? {
         file.write_all(&chunk).await?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
@@ -7575,6 +8270,7 @@ async fn handle_debrid_refresh_error(
 async fn insert_debrid_job(pool: &sqlx::AnyPool, job: &DebridDownloadJob) -> Result<()> {
     let links_json = serde_json::to_string(&job.links)?;
     let provider_capabilities_json = json_value_to_string(job.provider_capabilities.as_ref())?;
+    let provider_status_json = json_value_to_string(job.provider_status.as_ref())?;
     let selected_file_ids_json = serde_json::to_string(&job.selected_file_ids)?;
     let skipped_file_ids_json = serde_json::to_string(&job.skipped_file_ids)?;
     sqlx::query::<sqlx::Any>(
@@ -7583,9 +8279,9 @@ async fn insert_debrid_job(pool: &sqlx::AnyPool, job: &DebridDownloadJob) -> Res
             display_name, remote_torrent_id, remote_download_id, status, local_path,
             links_json, progress, downloaded_bytes, total_bytes, download_rate_bps, last_error,
             provider_implementation, remote_release_id, remote_release_status,
-            provider_capabilities_json, selection_mode, selected_file_ids_json,
-            skipped_file_ids_json, selection_error, release_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            provider_capabilities_json, provider_status_json, selection_mode,
+            selected_file_ids_json, skipped_file_ids_json, selection_error, release_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.job_id.to_string())
     .bind(job.provider_id.to_string())
@@ -7609,6 +8305,7 @@ async fn insert_debrid_job(pool: &sqlx::AnyPool, job: &DebridDownloadJob) -> Res
     .bind(job.remote_release_id.as_deref())
     .bind(job.remote_release_status.as_deref())
     .bind(provider_capabilities_json.as_deref())
+    .bind(provider_status_json.as_deref())
     .bind(job.selection_mode.as_deref())
     .bind(selected_file_ids_json)
     .bind(skipped_file_ids_json)
@@ -7635,6 +8332,7 @@ COALESCE(CAST(provider_implementation AS TEXT), '') as provider_implementation,
 COALESCE(CAST(remote_release_id AS TEXT), '') as remote_release_id,
 COALESCE(CAST(remote_release_status AS TEXT), '') as remote_release_status,
 COALESCE(CAST(provider_capabilities_json AS TEXT), '') as provider_capabilities_json,
+COALESCE(CAST(provider_status_json AS TEXT), '') as provider_status_json,
 COALESCE(CAST(selection_mode AS TEXT), '') as selection_mode,
 COALESCE(CAST(selected_file_ids_json AS TEXT), '[]') as selected_file_ids_json,
 COALESCE(CAST(skipped_file_ids_json AS TEXT), '[]') as skipped_file_ids_json,
@@ -7677,7 +8375,7 @@ async fn list_active_debrid_jobs(
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required')
+         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
          ORDER BY updated_at ASC
          LIMIT ?"
     ))
@@ -7714,7 +8412,7 @@ async fn list_refreshable_debrid_jobs(
         " FROM debrid_download_jobs
          WHERE provider_id = ?
            AND (remote_torrent_id IS NOT NULL OR remote_release_id IS NOT NULL)
-           AND status NOT IN ('completed', 'failed', 'cancelled', 'review_required')
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
          ORDER BY updated_at DESC
          LIMIT 50"
     ))
@@ -7761,6 +8459,65 @@ async fn load_debrid_job(pool: &sqlx::AnyPool, job_id: Uuid) -> Result<Option<De
     row.map(|row| map_debrid_job(&row)).transpose()
 }
 
+fn debrid_provider_status_from_inspection(inspection: &DebridReleaseInspection) -> Value {
+    let provider_status = inspection
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("providerStatus"))
+        .or_else(|| {
+            inspection
+                .release
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.get("providerStatus"))
+        })
+        .or_else(|| {
+            inspection
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.raw.as_ref())
+                .and_then(|raw| raw.get("providerStatus"))
+        });
+    if let Some(provider_status) = provider_status {
+        return provider_status.clone();
+    }
+    json!({
+        "providerImplementation": inspection.release.provider_implementation.clone(),
+        "providerName": debrid_provider_display_name(&inspection.release.provider_implementation),
+        "status": inspection.release.status.as_str(),
+        "providerState": inspection.release.raw_status.clone(),
+        "rawStatus": inspection.release.raw_status.clone(),
+        "remoteReleaseId": inspection.release.remote_release_id.clone(),
+        "progress": inspection.progress.as_ref().and_then(|progress| progress.progress),
+        "downloadedBytes": inspection.progress.as_ref().and_then(|progress| progress.downloaded_bytes),
+        "totalBytes": inspection.progress.as_ref().and_then(|progress| progress.total_bytes),
+        "downloadRateBps": inspection.progress.as_ref().and_then(|progress| progress.download_rate_bps),
+        "fileCount": inspection.files.len(),
+    })
+}
+
+fn debrid_failure_message_from_inspection(inspection: &DebridReleaseInspection) -> Option<String> {
+    if inspection.release.status != DebridReleaseStatus::Failed {
+        return None;
+    }
+    let provider_status = debrid_provider_status_from_inspection(inspection);
+    if let Some(message) = provider_status
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+    {
+        return Some(message.to_string());
+    }
+    let provider_name = debrid_provider_display_name(&inspection.release.provider_implementation);
+    let raw_status = inspection.release.raw_status.as_deref().and_then(non_empty);
+    Some(match raw_status {
+        Some(raw_status) => {
+            format!("{provider_name} reported failed provider state: {raw_status}.")
+        }
+        None => format!("{provider_name} reported a failed release."),
+    })
+}
+
 async fn update_debrid_job_from_inspection(
     pool: &sqlx::AnyPool,
     job_id: Uuid,
@@ -7770,6 +8527,9 @@ async fn update_debrid_job_from_inspection(
     let links = selected_link_urls_from_inspection(inspection);
     let links_json = serde_json::to_string(&links)?;
     let provider_capabilities_json = serde_json::to_string(&inspection.capabilities)?;
+    let provider_status = debrid_provider_status_from_inspection(inspection);
+    let provider_status_json = serde_json::to_string(&provider_status)?;
+    let failure_message = debrid_failure_message_from_inspection(inspection);
     let (selected_file_ids, skipped_file_ids) = inspection
         .selection
         .as_ref()
@@ -7792,6 +8552,8 @@ async fn update_debrid_job_from_inspection(
              provider_implementation = ?,
              remote_release_id = COALESCE(remote_release_id, ?),
              provider_capabilities_json = ?,
+             provider_status_json = ?,
+             last_error = ?,
              selection_mode = ?,
              selected_file_ids_json = CASE WHEN ? != '[]' THEN ? ELSE selected_file_ids_json END,
              skipped_file_ids_json = CASE WHEN ? != '[]' THEN ? ELSE skipped_file_ids_json END,
@@ -7822,6 +8584,8 @@ async fn update_debrid_job_from_inspection(
     .bind(&inspection.release.provider_implementation)
     .bind(&inspection.release.remote_release_id)
     .bind(provider_capabilities_json)
+    .bind(provider_status_json)
+    .bind(failure_message.as_deref())
     .bind(
         inspection
             .capabilities
@@ -7999,8 +8763,9 @@ async fn record_debrid_release_failure_without_job(
     let evidence = json!({
         "status": "failed",
         "failureClass": failure_class.as_str(),
+        "responsePolicy": failure_class.response_policy().as_str(),
         "message": message,
-        "fallbackState": "eligible_if_candidate_supports_torrent_route",
+        "fallbackState": debrid_fallback_state_for_source_kind(source_kind, failure_class),
         "stage": "provider_submit",
         "providerId": provider_id,
         "providerImplementation": adapter.implementation(),
@@ -8192,6 +8957,8 @@ fn map_debrid_job(row: &sqlx::any::AnyRow) -> Result<DebridDownloadJob> {
     let links_raw: String = row.try_get("links_json")?;
     let provider_capabilities_raw =
         empty_string_to_none(row.try_get::<String, _>("provider_capabilities_json")?);
+    let provider_status_raw =
+        empty_string_to_none(row.try_get::<String, _>("provider_status_json")?);
     let release_id = empty_string_to_none(row.try_get::<String, _>("release_id")?)
         .map(|value| Uuid::parse_str(&value).context("debrid release_id is invalid"))
         .transpose()?;
@@ -8215,6 +8982,9 @@ fn map_debrid_job(row: &sqlx::any::AnyRow) -> Result<DebridDownloadJob> {
         ),
         provider_capabilities: provider_capabilities_raw
             .map(|value| serde_json::from_str(&value).context("parsing provider capabilities"))
+            .transpose()?,
+        provider_status: provider_status_raw
+            .map(|value| serde_json::from_str(&value).context("parsing provider status"))
             .transpose()?,
         selection_mode: empty_string_to_none(row.try_get::<String, _>("selection_mode")?),
         selected_file_ids: parse_string_vec(row.try_get("selected_file_ids_json")?),
@@ -8950,7 +9720,7 @@ mod tests {
         assert!(message.contains("rate_limit_reached"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&message), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::RateLimited)
         );
 
         let adapter = PremiumizeClient::with_base_url("account-limit-token", base_url)?;
@@ -8963,7 +9733,7 @@ mod tests {
         assert!(message.contains("account_limit_reached"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&message), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::ProviderAccountLimitReached)
         );
 
         let _ = shutdown.send(());
@@ -9162,7 +9932,7 @@ mod tests {
         assert!(rejected.to_string().contains("service_unsupported"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&rejected.to_string()), None),
-            Some(DebridFailureClass::MagnetRejected)
+            Some(DebridFailureClass::InvalidSource)
         );
 
         let service_down = adapter
@@ -9182,7 +9952,7 @@ mod tests {
         assert!(account_limit.to_string().contains("account_limit_reached"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&account_limit.to_string()), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::ProviderAccountLimitReached)
         );
 
         let no_content = adapter
@@ -9789,21 +10559,24 @@ mod tests {
             reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id).await?;
         let subscription_id = create_series_subscription_with_targets(&state.db_pool).await?;
 
-        for (source, fingerprint, expected_failure) in [
+        for (source, fingerprint, expected_failure, expected_fallback_state) in [
             (
                 "magnet:?xt=urn:btih:account-limit",
                 "premiumize-dp7d-account-limit",
-                "provider_unavailable",
+                "provider_account_limit_reached",
+                "blocked_account_action_required",
             ),
             (
                 "magnet:?xt=urn:btih:service-down",
                 "premiumize-dp7d-service-down",
                 "provider_unavailable",
+                "retry_provider_later",
             ),
             (
                 "magnet:?xt=urn:btih:bad-magnet",
                 "premiumize-dp7d-bad-magnet",
-                "magnet_rejected",
+                "invalid_source",
+                "eligible_if_candidate_supports_torrent_route",
             ),
         ] {
             let err = submit_debrid(
@@ -9877,7 +10650,7 @@ mod tests {
                     .and_then(|plan| plan.get("debridFailure"))
                     .and_then(|failure| failure.get("fallbackState"))
                     .and_then(Value::as_str),
-                Some("eligible_if_candidate_supports_torrent_route")
+                Some(expected_fallback_state)
             );
             assert_eq!(
                 release
@@ -10033,7 +10806,7 @@ mod tests {
         assert!(message.contains("TorBox API rate limit"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&message), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::RateLimited)
         );
 
         let _ = shutdown.send(());
@@ -10054,7 +10827,7 @@ mod tests {
         assert!(message.contains("TorBox API rate limit"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&message), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::RateLimited)
         );
         limiter.try_acquire(start + TORBOX_CREATE_TORRENT_MINUTE_WINDOW)?;
 
@@ -10187,7 +10960,7 @@ mod tests {
         assert!(message.contains("AllDebrid API rate limit"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&message), None),
-            Some(DebridFailureClass::ProviderUnavailable)
+            Some(DebridFailureClass::RateLimited)
         );
 
         let _ = shutdown.send(());
@@ -10263,7 +11036,7 @@ mod tests {
         assert!(rejected.to_string().contains("MAGNET_INVALID_URI"));
         assert_eq!(
             classify_debrid_failure("failed", None, Some(&rejected.to_string()), None),
-            Some(DebridFailureClass::MagnetRejected)
+            Some(DebridFailureClass::InvalidSource)
         );
 
         let inspection = adapter.inspect_release("88").await?;
@@ -10462,6 +11235,272 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn torbox_stalled_torrent_with_null_files_is_provider_failure_not_parse_failure() -> Result<()>
+    {
+        let torrent: TorBoxTorrent = serde_json::from_value(json!({
+            "id": 30589564,
+            "hash": "29638f38523bf01f688fd524ffd2c21b17ea3792",
+            "name": "Show.S03E02.2160p.WEB-DL.mkv",
+            "size": 9_948_770_661_u64,
+            "download_state": "stalled (no seeds)",
+            "progress": 0.999157,
+            "download_speed": 0,
+            "total_downloaded": 9_940_390_158_u64,
+            "download_finished": false,
+            "download_present": false,
+            "cached": false,
+            "files": null
+        }))?;
+
+        let inspection = torbox_torrent_to_inspection(&torrent, Vec::new(), None)?;
+
+        assert_eq!(inspection.release.status, DebridReleaseStatus::Failed);
+        assert_eq!(
+            inspection.release.raw_status.as_deref(),
+            Some("stalled (no seeds)")
+        );
+        assert!(inspection.files.is_empty());
+        assert_eq!(
+            inspection
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.progress),
+            Some(0.999157)
+        );
+        let provider_status = debrid_provider_status_from_inspection(&inspection);
+        assert_eq!(
+            provider_status.get("providerState").and_then(Value::as_str),
+            Some("stalled (no seeds)")
+        );
+        assert_eq!(
+            provider_status
+                .get("providerFailureClass")
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            provider_status.get("cached").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            provider_status
+                .get("downloadPresent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            provider_status.get("noSeeds").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status.get("message").and_then(Value::as_str),
+            Some("TorBox accepted this torrent, but it is not cached and has no seeds.")
+        );
+        assert_eq!(
+            classify_debrid_failure(
+                "failed",
+                Some("failed"),
+                debrid_failure_message_from_inspection(&inspection).as_deref(),
+                None,
+            ),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn torbox_stalled_no_seed_inspection_persists_retryable_failure_evidence() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
+        let adapter = FakeDebridAdapter::new();
+        let source = "magnet:?xt=urn:btih:29638f38523bf01f688fd524ffd2c21b17ea3792";
+        let job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S03E02.2160p.WEB-DL"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Series,
+                    title: "Show".to_string(),
+                    release_title: "Show.S03E02.2160p.WEB-DL".to_string(),
+                    info_hash: Some("29638f38523bf01f688fd524ffd2c21b17ea3792".to_string()),
+                    fingerprint: Some("torbox-stalled-no-seeds-evidence".to_string()),
+                    score: Some(91.0),
+                    selected_candidate: Some(json!({
+                        "title": "Show.S03E02.2160p.WEB-DL",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "supportedRoutes": [
+                            "acquisition.debrid.default",
+                            "acquisition.torrent.default"
+                        ],
+                        "defaultRoute": "acquisition.debrid.default"
+                    })),
+                }),
+            },
+            &adapter,
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs SET remote_release_id = NULL WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let torrent: TorBoxTorrent = serde_json::from_value(json!({
+            "id": 30589564,
+            "hash": "29638f38523bf01f688fd524ffd2c21b17ea3792",
+            "name": "Show.S03E02.2160p.WEB-DL.mkv",
+            "size": 9_948_770_661_u64,
+            "download_state": "stalled (no seeds)",
+            "progress": 0.999157,
+            "download_speed": 0,
+            "total_downloaded": 9_940_390_158_u64,
+            "download_finished": false,
+            "download_present": false,
+            "cached": false,
+            "files": null
+        }))?;
+        let inspection = torbox_torrent_to_inspection(&torrent, Vec::new(), None)?;
+
+        update_debrid_job_from_inspection(&database.pool, job_id, &inspection).await?;
+
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("TorBox stalled job should load")?;
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.provider_implementation.as_deref(), Some("torbox"));
+        assert_eq!(job.remote_release_id.as_deref(), Some("30589564"));
+        assert_eq!(
+            job.last_error.as_deref(),
+            Some("TorBox accepted this torrent, but it is not cached and has no seeds.")
+        );
+        assert_eq!(
+            classify_debrid_job_failure(&job),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        assert_eq!(job.progress, Some(0.999157));
+        assert!(job.downloaded_bytes.is_some());
+        assert!(job.total_bytes.is_some());
+        let provider_status = job
+            .provider_status
+            .as_ref()
+            .context("provider status evidence should persist")?;
+        assert_eq!(
+            provider_status.get("providerState").and_then(Value::as_str),
+            Some("stalled (no seeds)")
+        );
+        assert_eq!(
+            provider_status
+                .get("providerFailureClass")
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            provider_status.get("notCached").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status
+                .get("downloadPresent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            provider_status
+                .get("downloadedBytes")
+                .and_then(Value::as_u64),
+            Some(9_940_390_158)
+        );
+        assert_eq!(
+            provider_status.get("totalBytes").and_then(Value::as_u64),
+            Some(9_948_770_661)
+        );
+
+        let status = get_debrid_job_status(&database.pool, job_id)
+            .await?
+            .context("debrid job status should load")?;
+        assert!(status.is_failed());
+        assert_eq!(status.failure_class.as_deref(), Some("no_seeds"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("TorBox accepted this torrent, but it is not cached and has no seeds.")
+        );
+
+        let evidence = debrid_progress_evidence_for_job(&job);
+        assert_eq!(evidence.provider_name.as_deref(), Some("TorBox"));
+        assert_eq!(
+            evidence
+                .provider_status
+                .as_ref()
+                .and_then(|status| status.get("noSeeds"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(evidence.failure_class.as_deref(), Some("no_seeds"));
+        assert_eq!(
+            evidence.fallback_state,
+            "eligible_if_candidate_supports_torrent_route"
+        );
+
+        let release = get_release(
+            &database.pool,
+            job.release_id
+                .context("job should be linked to a release")?,
+        )
+        .await?
+        .context("failed TorBox release should load")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        let failure = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("debridFailure"))
+            .context("debrid failure evidence should persist")?;
+        assert_eq!(
+            failure.get("failureClass").and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            failure.get("message").and_then(Value::as_str),
+            Some("TorBox accepted this torrent, but it is not cached and has no seeds.")
+        );
+        assert_eq!(
+            failure.get("fallbackState").and_then(Value::as_str),
+            Some("eligible_if_candidate_supports_torrent_route")
+        );
+        let retry_suppression = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("retrySuppression"))
+            .context("retry suppression evidence should persist")?;
+        assert_eq!(
+            retry_suppression.get("status").and_then(Value::as_str),
+            Some("rejected")
+        );
+        assert_eq!(
+            retry_suppression
+                .get("suppressAutomaticRediscovery")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            retry_suppression.get("reason").and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn debrid_adapter_factory_persisted_job_implementation_overrides_active_service()
     -> Result<()> {
@@ -10526,7 +11565,7 @@ mod tests {
         );
         assert_eq!(
             DebridProviderErrorKind::RateLimited.failure_class(),
-            DebridFailureClass::ProviderUnavailable
+            DebridFailureClass::RateLimited
         );
         assert_eq!(
             DebridProviderErrorKind::SelectionUnsupported.failure_class(),
@@ -10534,7 +11573,7 @@ mod tests {
         );
         assert_eq!(
             DebridProviderErrorKind::Permanent.failure_class(),
-            DebridFailureClass::TransferFailed
+            DebridFailureClass::InvalidSource
         );
         let error = DebridProviderError {
             kind: DebridProviderErrorKind::Temporary,
@@ -11285,6 +12324,7 @@ mod tests {
                 remote_release_id: Some("remote-release-1".to_string()),
                 remote_release_status: Some(DebridReleaseStatus::Staging.as_str().to_string()),
                 provider_capabilities: Some(json!(unsupported_debrid_capabilities())),
+                provider_status: None,
                 selection_mode: Some(
                     DebridFileSelectionMode::Unsupported
                         .as_persistence_value()
@@ -13081,6 +14121,79 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn debrid_submit_respects_configured_active_job_cap() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_instances
+             SET config_json = ?
+             WHERE instance_id = ?",
+        )
+        .bind(json!({ "maxConcurrentDownloads": 2 }).to_string())
+        .bind(instance_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let adapter = FakeDebridAdapter::new();
+        let first_source = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let second_source = "magnet:?xt=urn:btih:89abcdef012345670123456789abcdef01234567";
+        let third_source = "magnet:?xt=urn:btih:fedcba98765432100123456789abcdef01234567";
+
+        submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            first_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E01.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+        submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            second_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E02.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+
+        let err = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            third_source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E03.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await
+        .expect_err("third active Debrid submit should hit configured capacity");
+        assert!(
+            err.to_string()
+                .contains("Debrid route capacity reached: active Debrid jobs 2/2")
+        );
+        Ok(())
+    }
+
     fn test_debrid_release(
         release_kind: ReleaseKind,
         confidence: ReleaseConfidence,
@@ -13241,6 +14354,84 @@ mod tests {
         assert!(decision.skipped_file_ids.is_empty());
         assert!(!decision.select_all);
         assert!(decision.select_all_approved);
+    }
+
+    #[test]
+    fn debrid_selection_policy_maps_post_transfer_pack_file_to_single_episode_target() {
+        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+        let target_id = Uuid::new_v4();
+        release.coverage_plan = Some(json!({
+            "source": "debrid_provider_file_list",
+            "remoteReleaseId": "remote-pack-1",
+            "tv": {
+                "entries": [{
+                    "targetId": target_id.to_string(),
+                    "targetKey": "S01E02",
+                    "coverageKind": "single_episode",
+                    "seasonNumber": 1,
+                    "episodeNumber": 2,
+                    "releaseFileId": null,
+                    "state": "planned"
+                }],
+                "releaseKind": "single",
+                "confidence": "high"
+            },
+            "debridProvider": {
+                "providerImplementation": "torbox",
+                "remoteStatus": "downloaded"
+            }
+        }));
+        let mut first = test_release_file(
+            release.release_id,
+            "file-1",
+            "Show/Show.S01E01.1080p.WEB-DL.mkv",
+            true,
+        );
+        first.parsed_episode_number = Some(1);
+        first.parsed_episode_end_number = Some(1);
+        let mut second = test_release_file(
+            release.release_id,
+            "file-2",
+            "Show/Show.S01E02.1080p.WEB-DL.mkv",
+            true,
+        );
+        second.parsed_episode_number = Some(2);
+        second.parsed_episode_end_number = Some(2);
+        let mut third = test_release_file(
+            release.release_id,
+            "file-3",
+            "Show/Show.S01E03.1080p.WEB-DL.mkv",
+            true,
+        );
+        third.parsed_episode_number = Some(3);
+        third.parsed_episode_end_number = Some(3);
+        let files = vec![first, second, third];
+        let now = Utc::now();
+        let coverage = vec![AcquisitionReleaseCoverage {
+            coverage_id: Uuid::new_v4(),
+            release_id: release.release_id,
+            release_file_id: None,
+            target_id,
+            coverage_kind: ReleaseCoverageKind::SingleEpisode,
+            confidence: ReleaseConfidence::High,
+            score: Some(100.0),
+            reason: Some("TV Sonarr-style S01E02".to_string()),
+            state: ReleaseCoverageState::Submitted,
+            verified_by: Some("test".to_string()),
+            created_at: now,
+            updated_at: now,
+        }];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &coverage, &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.provider_selection_ids, vec!["file-2".to_string()]);
+        assert_eq!(
+            decision.skipped_file_ids,
+            vec!["file-1".to_string(), "file-3".to_string()]
+        );
+        assert!(decision.review_reasons.is_empty());
     }
 
     #[test]
@@ -13489,7 +14680,7 @@ mod tests {
                 Some("Real-Debrid magnet rejected the source"),
                 None,
             ),
-            Some(DebridFailureClass::MagnetRejected)
+            Some(DebridFailureClass::InvalidSource)
         );
         assert_eq!(
             classify_debrid_failure(
@@ -13500,6 +14691,83 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn classifies_documented_debrid_provider_errors_to_response_policies() {
+        let cases = [
+            (
+                r#"Real-Debrid API returned 401: {"error":"Bad token","error_code":8}"#,
+                DebridFailureClass::ProviderAuthMissing,
+                DebridFailureResponsePolicy::AccountActionRequired,
+            ),
+            (
+                r#"Real-Debrid API returned 403: {"error":"infringing_file","error_code":35}"#,
+                DebridFailureClass::ContentBlocked,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                r#"Real-Debrid API returned 403: {"error":"traffic exhausted","error_code":23}"#,
+                DebridFailureClass::QuotaExhausted,
+                DebridFailureResponsePolicy::AccountActionRequired,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_INVALID_URI): Magnet is not valid",
+                DebridFailureClass::InvalidSource,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_MUST_BE_PREMIUM): You must be premium",
+                DebridFailureClass::ProviderAccountRestricted,
+                DebridFailureResponsePolicy::AccountActionRequired,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_TOO_MANY_ACTIVE): maximum allowed active magnets",
+                DebridFailureClass::TooManyActiveDownloads,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_NO_SERVER): Server are not allowed to use this feature",
+                DebridFailureClass::ProviderAccountRestricted,
+                DebridFailureResponsePolicy::AccountActionRequired,
+            ),
+            (
+                "Premiumize API provider unavailable (rate_limit_reached): too many API requests",
+                DebridFailureClass::RateLimited,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+            (
+                "Premiumize API provider unavailable (account_limit_reached): fair-use points exhausted",
+                DebridFailureClass::ProviderAccountLimitReached,
+                DebridFailureResponsePolicy::AccountActionRequired,
+            ),
+            (
+                "Premiumize API rejected request (invalid_request): missing malformed parameter",
+                DebridFailureClass::InvalidSource,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "TorBox status: Stalled (No seeds)",
+                DebridFailureClass::NoSeeds,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "TorBox API rate limit (429): too many requests",
+                DebridFailureClass::RateLimited,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+        ];
+
+        for (message, expected_class, expected_policy) in cases {
+            let failure_class =
+                classify_debrid_failure("failed", Some("failed"), Some(message), None);
+            assert_eq!(failure_class, Some(expected_class), "{message}");
+            assert_eq!(
+                expected_class.response_policy(),
+                expected_policy,
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -13521,6 +14789,10 @@ mod tests {
             provider_capabilities: Some(json!({
                 "supportsFileSelection": true,
                 "fileSelectionMode": "before_transfer"
+            })),
+            provider_status: Some(json!({
+                "providerImplementation": REAL_DEBRID_IMPLEMENTATION,
+                "status": "failed"
             })),
             selection_mode: Some("before_transfer".to_string()),
             selected_file_ids: vec!["1".to_string()],
@@ -13574,6 +14846,7 @@ mod tests {
                 remote_release_id: Some("remote-1".to_string()),
                 remote_release_status: Some("downloading".to_string()),
                 provider_capabilities: None,
+                provider_status: None,
                 selection_mode: Some("before_transfer".to_string()),
                 selected_file_ids: vec!["1".to_string()],
                 skipped_file_ids: Vec::new(),
@@ -13903,7 +15176,8 @@ mod tests {
                 "testRealDebridApiBaseUrl": rd_base_url.clone(),
                 "testTorBoxApiBaseUrl": torbox_base_url.clone(),
                 "testAllDebridApiBaseUrl": all_debrid_base_url.clone(),
-                "testPremiumizeApiBaseUrl": premiumize_base_url.clone()
+                "testPremiumizeApiBaseUrl": premiumize_base_url.clone(),
+                "maxConcurrentDownloads": 4
             }),
         )
         .await?;
@@ -13986,7 +15260,8 @@ mod tests {
                         "testRealDebridApiBaseUrl": rd_base_url.clone(),
                         "testTorBoxApiBaseUrl": torbox_base_url.clone(),
                         "testAllDebridApiBaseUrl": all_debrid_base_url.clone(),
-                        "testPremiumizeApiBaseUrl": premiumize_base_url.clone()
+                        "testPremiumizeApiBaseUrl": premiumize_base_url.clone(),
+                        "maxConcurrentDownloads": 4
                     })))),
                 )
                 .await?;
@@ -14446,7 +15721,16 @@ mod tests {
                 .and_then(|plan| plan.get("debridFailure"))
                 .and_then(|failure| failure.get("failureClass"))
                 .and_then(Value::as_str),
-            Some("provider_unavailable")
+            Some("rate_limited")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("debridFailure"))
+                .and_then(|failure| failure.get("responsePolicy"))
+                .and_then(Value::as_str),
+            Some("retry_provider_later")
         );
         assert_eq!(
             release
@@ -14455,7 +15739,7 @@ mod tests {
                 .and_then(|plan| plan.get("debridFailure"))
                 .and_then(|failure| failure.get("fallbackState"))
                 .and_then(Value::as_str),
-            Some("eligible_if_candidate_supports_torrent_route")
+            Some("retry_provider_later")
         );
         assert_eq!(
             release
@@ -14897,7 +16181,16 @@ mod tests {
                 .and_then(|plan| plan.get("debridFailure"))
                 .and_then(|failure| failure.get("failureClass"))
                 .and_then(Value::as_str),
-            Some("provider_unavailable")
+            Some("rate_limited")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("debridFailure"))
+                .and_then(|failure| failure.get("responsePolicy"))
+                .and_then(Value::as_str),
+            Some("retry_provider_later")
         );
         assert_eq!(
             release
@@ -14906,7 +16199,7 @@ mod tests {
                 .and_then(|plan| plan.get("debridFailure"))
                 .and_then(|failure| failure.get("fallbackState"))
                 .and_then(Value::as_str),
-            Some("eligible_if_candidate_supports_torrent_route")
+            Some("retry_provider_later")
         );
         assert_eq!(
             release
@@ -15042,6 +16335,10 @@ mod tests {
                     "supportsFileSelection": true,
                     "fileSelectionMode": "before_transfer"
                 })),
+                provider_status: Some(json!({
+                    "providerImplementation": "test_debrid",
+                    "status": "waiting_files"
+                })),
                 selection_mode: Some("before_transfer".to_string()),
                 selected_file_ids: vec!["file-1".to_string()],
                 skipped_file_ids: vec!["file-2".to_string()],
@@ -15076,6 +16373,13 @@ mod tests {
             Some(json!({
                 "supportsFileSelection": true,
                 "fileSelectionMode": "before_transfer"
+            }))
+        );
+        assert_eq!(
+            generic.provider_status,
+            Some(json!({
+                "providerImplementation": "test_debrid",
+                "status": "waiting_files"
             }))
         );
         Ok(())
@@ -15618,6 +16922,49 @@ mod tests {
         .fetch_one(&database.pool)
         .await?;
         assert_eq!(imported_targets, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debrid_materializer_does_not_requeue_in_flight_jobs() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let adapter = FakeDebridAdapter::new();
+        let job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E01.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+
+        mark_debrid_job_status(&database.pool, job_id, "materializing", None).await?;
+
+        let active = list_active_debrid_jobs(&database.pool, 10).await?;
+        assert!(
+            active.iter().all(|job| job.job_id != job_id),
+            "materializing jobs must not be started again by a later materializer tick"
+        );
+        let refreshable = list_refreshable_debrid_jobs(&database.pool, provider_id).await?;
+        assert!(
+            refreshable.iter().all(|job| job.job_id != job_id),
+            "UI/remote refresh must not overwrite local materializer byte progress"
+        );
+
+        mark_debrid_job_status(&database.pool, job_id, "debrid_downloaded", None).await?;
+        let active = list_active_debrid_jobs(&database.pool, 10).await?;
+        assert!(
+            active.iter().any(|job| job.job_id == job_id),
+            "downloaded debrid jobs should still be materialized"
+        );
         Ok(())
     }
 
