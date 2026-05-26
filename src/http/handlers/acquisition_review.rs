@@ -35,6 +35,9 @@ use crate::{
                 NewAcquisitionReleaseCoverage, ReleaseConfidence, ReleaseCoverageKind,
                 ReleaseCoverageState, ReleaseJobState, ReleaseJobStateUpdate,
             },
+            review_candidates::{
+                SYNTHETIC_SOURCE_CANDIDATE_FILE_ID, ensure_manual_review_release_files,
+            },
             store::{
                 ReleaseListFilter, get_file_hash_by_path, get_release,
                 list_anime_identity_mismatches_by_release, list_anime_match_attempts_by_release,
@@ -335,15 +338,24 @@ pub struct AnimeImportVerificationReview {
 }
 
 pub async fn list_acquisition_releases(
-    _user: CurrentUser,
+    user: CurrentUser,
     State(state): State<AppState>,
     Query(query): Query<ListAcquisitionReleasesQuery>,
 ) -> ApiResult<Json<AcquisitionReleaseListResponse>> {
+    let requested_state = parse_optional_release_state(query.state.as_deref())?;
+    if requested_state == Some(AcquisitionReleaseState::ReviewRequired) {
+        prune_review_candidates_for_covered_targets(
+            &state.db_pool,
+            user.user_id,
+            query.subscription_id,
+        )
+        .await?;
+    }
     let releases = list_releases(
         &state.db_pool,
         ReleaseListFilter {
             subscription_id: query.subscription_id,
-            state: parse_optional_release_state(query.state.as_deref())?,
+            state: requested_state,
             limit: query.limit,
         },
     )
@@ -359,10 +371,11 @@ pub async fn list_acquisition_releases(
 }
 
 pub async fn get_acquisition_release(
-    _user: CurrentUser,
+    user: CurrentUser,
     State(state): State<AppState>,
     Path(release_id): Path<Uuid>,
 ) -> ApiResult<Json<AcquisitionReleaseDetailResponse>> {
+    prune_review_candidates_for_covered_targets(&state.db_pool, user.user_id, None).await?;
     let detail = load_release_detail(&state.db_pool, release_id).await?;
     Ok(Json(detail))
 }
@@ -500,7 +513,7 @@ async fn load_release_detail(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("acquisition release not found"))?;
-    let files = list_release_files(pool, release_id)
+    let files = ensure_manual_review_release_files(pool, &release)
         .await
         .map_err(ApiError::from)?;
     let coverage = list_release_coverage(pool, release_id)
@@ -724,6 +737,11 @@ async fn approve_release_for_review(
             {
                 ReleaseCoverageState::Rejected
             }
+            None if file_selection.explicit
+                && !file_selection.selected_release_file_ids.is_empty() =>
+            {
+                ReleaseCoverageState::Rejected
+            }
             _ => selected_coverage_state,
         };
         let reason = if state == ReleaseCoverageState::Rejected {
@@ -745,12 +763,19 @@ async fn approve_release_for_review(
         .map_err(ApiError::from)?;
     }
     for mapping in &request.mappings {
+        let release_file_id = mapping.release_file_id.map(|release_file_id| {
+            file_selection
+                .release_file_aliases
+                .get(&release_file_id)
+                .copied()
+                .unwrap_or(release_file_id)
+        });
         upsert_release_coverage(
             pool,
             NewAcquisitionReleaseCoverage {
                 coverage_id: None,
                 release_id,
-                release_file_id: mapping.release_file_id,
+                release_file_id,
                 target_id: mapping.target_id,
                 coverage_kind: mapping
                     .coverage_kind
@@ -769,6 +794,9 @@ async fn approve_release_for_review(
         .await
         .map_err(ApiError::from)?;
     }
+    reconcile_manual_review_file_mappings(pool, release_id)
+        .await
+        .map_err(ApiError::from)?;
 
     let policy = approval_policy_json(
         &release,
@@ -788,6 +816,9 @@ async fn approve_release_for_review(
     )
     .await
     .map_err(ApiError::from)?;
+    resume_debrid_job_after_manual_approval(pool, release_id)
+        .await
+        .map_err(ApiError::from)?;
     let jobs = list_release_jobs(pool, release_id)
         .await
         .map_err(ApiError::from)?;
@@ -819,6 +850,8 @@ async fn approve_release_for_review(
         "Approved by acquisition release review.",
     )
     .await?;
+    let prune_summary =
+        prune_competing_review_candidates_after_approval(pool, user_id, &active_release).await?;
     record_acquisition_audit_event(
         pool,
         NewAcquisitionAuditEvent {
@@ -848,6 +881,8 @@ async fn approve_release_for_review(
                     .collect::<Vec<_>>(),
                 "mappingCount": request.mappings.len(),
                 "note": request.note,
+                "prunedCompetingReviewReleases": prune_summary.cancelled_releases,
+                "prunedCompetingCoverageRows": prune_summary.rejected_coverage_rows,
             })),
             ..NewAcquisitionAuditEvent::default()
         },
@@ -1232,6 +1267,430 @@ async fn mark_approved_release_targets_submitted(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct ManualReviewPruneSummary {
+    rejected_coverage_rows: usize,
+    cancelled_releases: usize,
+}
+
+async fn prune_competing_review_candidates_after_approval(
+    pool: &AnyPool,
+    user_id: Uuid,
+    approved_release: &AcquisitionRelease,
+) -> ApiResult<ManualReviewPruneSummary> {
+    let Some(subscription_id) = approved_release.subscription_id else {
+        return Ok(ManualReviewPruneSummary::default());
+    };
+    let approved_coverage = list_release_coverage(pool, approved_release.release_id)
+        .await
+        .map_err(ApiError::from)?;
+    let approved_target_ids = approved_coverage
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.state,
+                ReleaseCoverageState::Selected
+                    | ReleaseCoverageState::Submitted
+                    | ReleaseCoverageState::Imported
+            )
+        })
+        .map(|row| row.target_id)
+        .collect::<BTreeSet<_>>();
+    if approved_target_ids.is_empty() {
+        return Ok(ManualReviewPruneSummary::default());
+    }
+
+    let reviewer = reviewer_id(user_id);
+    let prune_reason = format!(
+        "Removed from manual review because target was covered by approved release {}.",
+        approved_release.release_id
+    );
+    let competing_releases = list_releases(
+        pool,
+        ReleaseListFilter {
+            subscription_id: Some(subscription_id),
+            state: Some(AcquisitionReleaseState::ReviewRequired),
+            limit: Some(500),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let mut summary = ManualReviewPruneSummary::default();
+
+    for competing in competing_releases {
+        if competing.release_id == approved_release.release_id {
+            continue;
+        }
+        let coverage = list_release_coverage(pool, competing.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let mut rejected_this_release = 0usize;
+        for row in &coverage {
+            if !approved_target_ids.contains(&row.target_id)
+                || row.state == ReleaseCoverageState::Rejected
+            {
+                continue;
+            }
+            update_release_coverage_review_state(
+                pool,
+                row.coverage_id,
+                ReleaseCoverageState::Rejected,
+                Some(prune_reason.clone()),
+                Some(reviewer.clone()),
+            )
+            .await
+            .map_err(ApiError::from)?;
+            rejected_this_release += 1;
+        }
+        if rejected_this_release == 0 {
+            continue;
+        }
+        summary.rejected_coverage_rows += rejected_this_release;
+
+        let remaining_coverage = list_release_coverage(pool, competing.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let has_remaining_candidate_targets = remaining_coverage
+            .iter()
+            .any(|row| row.state != ReleaseCoverageState::Rejected);
+        if has_remaining_candidate_targets {
+            continue;
+        }
+
+        let jobs = list_release_jobs(pool, competing.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let job_count = jobs.len();
+        for job in jobs {
+            update_release_job_state(
+                pool,
+                job.release_job_id,
+                ReleaseJobStateUpdate {
+                    state: ReleaseJobState::Cancelled,
+                    state_reason: Some(prune_reason.clone()),
+                    active: Some(false),
+                    download_id: job.download_id,
+                    remote_release_id: job.remote_release_id,
+                    completed_at: Some(Utc::now()),
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
+        let cancelled_import_runs =
+            cancel_import_runs_for_release(pool, competing.release_id, &prune_reason)
+                .await
+                .map_err(ApiError::from)?;
+        let merged_plan = merge_review_policy(
+            competing.coverage_plan.as_ref(),
+            json!({
+                "manualReview": {
+                    "status": "auto_pruned",
+                    "userApproved": false,
+                    "reviewerUserId": user_id,
+                    "reviewedAt": Utc::now(),
+                    "reason": prune_reason.clone(),
+                    "approvedReleaseId": approved_release.release_id,
+                    "previousState": competing.state.as_str()
+                },
+                "retrySuppression": {
+                    "status": "covered_by_approved_release",
+                    "fingerprint": competing.fingerprint.clone(),
+                    "sourceExtensionId": competing.source_extension_id.clone(),
+                    "suppressAutomaticRediscovery": true,
+                    "recordedAt": Utc::now()
+                }
+            }),
+        );
+        update_release_review_state(
+            pool,
+            competing.release_id,
+            AcquisitionReleaseState::Cancelled,
+            Some(
+                "Removed from review because all targets were covered by another approved release."
+                    .to_string(),
+            ),
+            Some(merged_plan),
+        )
+        .await
+        .map_err(ApiError::from)?;
+        record_acquisition_audit_event(
+            pool,
+            NewAcquisitionAuditEvent {
+                event_type: EVENT_MANUAL_REJECTION.to_string(),
+                release_id: Some(competing.release_id),
+                subscription_id: competing.subscription_id,
+                actor_user_id: Some(user_id),
+                state: Some(AcquisitionReleaseState::Cancelled.as_str().to_string()),
+                reason: Some(
+                    "Auto-removed from manual review after another release covered every target."
+                        .to_string(),
+                ),
+                evidence: Some(json!({
+                    "approvedReleaseId": approved_release.release_id,
+                    "releaseFingerprint": competing.fingerprint,
+                    "cancelledReleaseJobs": job_count,
+                    "cancelledImportRuns": cancelled_import_runs,
+                    "downloadId": competing.download_id,
+                    "remoteReleaseId": competing.remote_release_id,
+                    "cleanupPolicy": "database_safe_state_no_downloader_delete",
+                })),
+                ..NewAcquisitionAuditEvent::default()
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+        summary.cancelled_releases += 1;
+    }
+
+    Ok(summary)
+}
+
+async fn prune_review_candidates_for_covered_targets(
+    pool: &AnyPool,
+    user_id: Uuid,
+    subscription_id: Option<Uuid>,
+) -> ApiResult<ManualReviewPruneSummary> {
+    let review_releases = list_releases(
+        pool,
+        ReleaseListFilter {
+            subscription_id,
+            state: Some(AcquisitionReleaseState::ReviewRequired),
+            limit: Some(500),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let reviewer = reviewer_id(user_id);
+    let prune_reason =
+        "Removed from manual review because this target is already covered by another acquisition."
+            .to_string();
+    let mut summary = ManualReviewPruneSummary::default();
+
+    for release in review_releases {
+        let coverage = list_release_coverage(pool, release.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let mut rejected_this_release = 0usize;
+        for row in &coverage {
+            if row.state == ReleaseCoverageState::Rejected {
+                continue;
+            }
+            let Some(target) = get_target(pool, row.target_id)
+                .await
+                .map_err(ApiError::from)?
+            else {
+                continue;
+            };
+            if !matches!(
+                target.state,
+                AcquisitionTargetState::Submitted | AcquisitionTargetState::Imported
+            ) {
+                continue;
+            }
+            update_release_coverage_review_state(
+                pool,
+                row.coverage_id,
+                ReleaseCoverageState::Rejected,
+                Some(prune_reason.clone()),
+                Some(reviewer.clone()),
+            )
+            .await
+            .map_err(ApiError::from)?;
+            rejected_this_release += 1;
+        }
+        if rejected_this_release == 0 {
+            continue;
+        }
+        summary.rejected_coverage_rows += rejected_this_release;
+        let remaining_coverage = list_release_coverage(pool, release.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        if remaining_coverage
+            .iter()
+            .any(|row| row.state != ReleaseCoverageState::Rejected)
+        {
+            continue;
+        }
+
+        let jobs = list_release_jobs(pool, release.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let job_count = jobs.len();
+        for job in jobs {
+            update_release_job_state(
+                pool,
+                job.release_job_id,
+                ReleaseJobStateUpdate {
+                    state: ReleaseJobState::Cancelled,
+                    state_reason: Some(prune_reason.clone()),
+                    active: Some(false),
+                    download_id: job.download_id,
+                    remote_release_id: job.remote_release_id,
+                    completed_at: Some(Utc::now()),
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
+        let cancelled_import_runs =
+            cancel_import_runs_for_release(pool, release.release_id, &prune_reason)
+                .await
+                .map_err(ApiError::from)?;
+        let merged_plan = merge_review_policy(
+            release.coverage_plan.as_ref(),
+            json!({
+                "manualReview": {
+                    "status": "auto_pruned",
+                    "userApproved": false,
+                    "reviewerUserId": user_id,
+                    "reviewedAt": Utc::now(),
+                    "reason": prune_reason.clone(),
+                    "previousState": release.state.as_str()
+                },
+                "retrySuppression": {
+                    "status": "target_already_covered",
+                    "fingerprint": release.fingerprint.clone(),
+                    "sourceExtensionId": release.source_extension_id.clone(),
+                    "suppressAutomaticRediscovery": true,
+                    "recordedAt": Utc::now()
+                }
+            }),
+        );
+        update_release_review_state(
+            pool,
+            release.release_id,
+            AcquisitionReleaseState::Cancelled,
+            Some("Removed from review because all targets are already covered.".to_string()),
+            Some(merged_plan),
+        )
+        .await
+        .map_err(ApiError::from)?;
+        record_acquisition_audit_event(
+            pool,
+            NewAcquisitionAuditEvent {
+                event_type: EVENT_MANUAL_REJECTION.to_string(),
+                release_id: Some(release.release_id),
+                subscription_id: release.subscription_id,
+                actor_user_id: Some(user_id),
+                state: Some(AcquisitionReleaseState::Cancelled.as_str().to_string()),
+                reason: Some(
+                    "Auto-removed from manual review because all targets are already covered."
+                        .to_string(),
+                ),
+                evidence: Some(json!({
+                    "releaseFingerprint": release.fingerprint,
+                    "cancelledReleaseJobs": job_count,
+                    "cancelledImportRuns": cancelled_import_runs,
+                    "downloadId": release.download_id,
+                    "remoteReleaseId": release.remote_release_id,
+                    "cleanupPolicy": "database_safe_state_no_downloader_delete",
+                })),
+                ..NewAcquisitionAuditEvent::default()
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+        summary.cancelled_releases += 1;
+    }
+
+    Ok(summary)
+}
+
+async fn reconcile_manual_review_file_mappings(pool: &AnyPool, release_id: Uuid) -> Result<()> {
+    let files = list_release_files(pool, release_id).await?;
+    let aliases = synthetic_source_candidate_aliases(&files);
+    if !aliases.is_empty() {
+        for (synthetic_file_id, provider_file_id) in &aliases {
+            update_release_file_selection(pool, *synthetic_file_id, Some(false)).await?;
+            update_release_file_selection(pool, *provider_file_id, Some(true)).await?;
+        }
+        let coverage = list_release_coverage(pool, release_id).await?;
+        for row in coverage {
+            let Some(release_file_id) = row.release_file_id else {
+                continue;
+            };
+            let Some(provider_file_id) = aliases.get(&release_file_id).copied() else {
+                continue;
+            };
+            upsert_release_coverage(
+                pool,
+                NewAcquisitionReleaseCoverage {
+                    coverage_id: Some(row.coverage_id),
+                    release_id: row.release_id,
+                    release_file_id: Some(provider_file_id),
+                    target_id: row.target_id,
+                    coverage_kind: row.coverage_kind,
+                    confidence: row.confidence,
+                    score: row.score,
+                    reason: row.reason.clone(),
+                    state: row.state,
+                    verified_by: row.verified_by.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+    reject_superseded_placeholder_coverage(pool, release_id).await
+}
+
+async fn reject_superseded_placeholder_coverage(pool: &AnyPool, release_id: Uuid) -> Result<()> {
+    let coverage = list_release_coverage(pool, release_id).await?;
+    let selected_file_targets = coverage
+        .iter()
+        .filter(|row| row.release_file_id.is_some())
+        .filter(|row| {
+            matches!(
+                row.state,
+                ReleaseCoverageState::Selected | ReleaseCoverageState::Submitted
+            )
+        })
+        .map(|row| row.target_id)
+        .collect::<BTreeSet<_>>();
+    if selected_file_targets.is_empty() {
+        return Ok(());
+    }
+    for row in coverage {
+        if row.release_file_id.is_some()
+            || !selected_file_targets.contains(&row.target_id)
+            || row.state == ReleaseCoverageState::Rejected
+        {
+            continue;
+        }
+        update_release_coverage_review_state(
+            pool,
+            row.coverage_id,
+            ReleaseCoverageState::Rejected,
+            Some("Superseded by manual file mapping.".to_string()),
+            row.verified_by.clone(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn resume_debrid_job_after_manual_approval(pool: &AnyPool, release_id: Uuid) -> Result<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET status = 'submitted',
+             remote_release_status = CASE
+                 WHEN remote_release_status = 'review_required' THEN 'submitted'
+                 ELSE remote_release_status
+             END,
+             selected_file_ids_json = '[]',
+             skipped_file_ids_json = '[]',
+             selection_error = NULL,
+             last_error = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?
+           AND status = 'review_required'",
+    )
+    .bind(release_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn reject_release_for_review(
     pool: &AnyPool,
     user_id: Uuid,
@@ -1586,6 +2045,7 @@ struct ResolvedManualFileSelection {
     skipped_release_file_ids: BTreeSet<Uuid>,
     selected_file_ids: Vec<String>,
     skipped_file_ids: Vec<String>,
+    release_file_aliases: BTreeMap<Uuid, Uuid>,
 }
 
 fn resolve_manual_file_selection(
@@ -1609,6 +2069,8 @@ fn resolve_manual_file_selection(
         .collect::<BTreeSet<_>>();
     selected.extend(resolve_file_key_ids(files, &request.selected_file_ids)?);
     skipped.extend(resolve_file_key_ids(files, &request.skipped_file_ids)?);
+    let release_file_aliases = synthetic_source_candidate_aliases(files);
+    apply_release_file_aliases(&release_file_aliases, &mut selected, &mut skipped);
     if !selected.is_disjoint(&skipped) {
         return Err(ApiError::bad_request(
             "manual file selection cannot select and skip the same release file",
@@ -1682,7 +2144,87 @@ fn resolve_manual_file_selection(
         skipped_release_file_ids: skipped,
         selected_file_ids,
         skipped_file_ids,
+        release_file_aliases,
     })
+}
+
+fn apply_release_file_aliases(
+    aliases: &BTreeMap<Uuid, Uuid>,
+    selected: &mut BTreeSet<Uuid>,
+    skipped: &mut BTreeSet<Uuid>,
+) {
+    for (synthetic_id, provider_id) in aliases {
+        if selected.remove(synthetic_id) {
+            selected.insert(*provider_id);
+            skipped.remove(provider_id);
+            skipped.insert(*synthetic_id);
+        }
+        if skipped.remove(provider_id) && !selected.contains(provider_id) {
+            skipped.insert(*provider_id);
+        }
+    }
+}
+
+fn synthetic_source_candidate_aliases(files: &[AcquisitionReleaseFile]) -> BTreeMap<Uuid, Uuid> {
+    let mut aliases = BTreeMap::new();
+    for file in files
+        .iter()
+        .filter(|file| is_synthetic_source_candidate_file(file))
+    {
+        if let Some(provider_file_id) = matching_inspected_provider_file(files, file) {
+            aliases.insert(file.release_file_id, provider_file_id);
+        }
+    }
+    aliases
+}
+
+fn matching_inspected_provider_file(
+    files: &[AcquisitionReleaseFile],
+    synthetic: &AcquisitionReleaseFile,
+) -> Option<Uuid> {
+    let synthetic_basename = normalized_review_basename(&synthetic.basename);
+    if synthetic_basename.is_empty() {
+        return None;
+    }
+    let matches = files
+        .iter()
+        .filter(|file| !is_synthetic_source_candidate_file(file))
+        .filter(|file| file.selectable)
+        .filter(|file| {
+            file.provider_file_id.as_deref().is_some_and(|value| {
+                !value.is_empty() && value != SYNTHETIC_SOURCE_CANDIDATE_FILE_ID
+            })
+        })
+        .filter(|file| normalized_review_basename(&file.basename) == synthetic_basename)
+        .map(|file| file.release_file_id)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn is_synthetic_source_candidate_file(file: &AcquisitionReleaseFile) -> bool {
+    file.file_id.as_deref() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID)
+        || file.provider_file_id.as_deref() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID)
+        || file
+            .raw
+            .as_ref()
+            .and_then(|value| value.get("source"))
+            .and_then(JsonValue::as_str)
+            == Some("manual_review_source_candidate")
+}
+
+fn normalized_review_basename(value: &str) -> String {
+    value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn resolve_file_key_ids(
@@ -2299,6 +2841,8 @@ fn string_json_path(value: &JsonValue, path: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
+
     use crate::{
         acquisition::{
             audit::count_acquisition_audit_events,
@@ -2340,6 +2884,52 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    async fn setup_provider_refs(pool: &AnyPool) -> Result<(Uuid, Uuid)> {
+        let instance_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let extension_id = format!("test.review.debrid.{instance_id}");
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extensions (
+                extension_id, name, version, kind, trust_level, manifest_json, enabled
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&extension_id)
+        .bind("Test Review Debrid")
+        .bind("0.1.0")
+        .bind("module")
+        .bind("verified")
+        .bind("{}")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_instances (
+                instance_id, extension_id, instance_name, config_json, enabled
+             ) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(instance_id.to_string())
+        .bind(&extension_id)
+        .bind("default")
+        .bind("{}")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO providers (
+                provider_id, instance_id, capability, slot_id, cardinality, implementation
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(provider_id.to_string())
+        .bind(instance_id.to_string())
+        .bind("debrid.resolver")
+        .bind("default")
+        .bind("one")
+        .bind("test_debrid")
+        .execute(pool)
+        .await?;
+        Ok((provider_id, instance_id))
     }
 
     async fn setup_release(database: &Database) -> Result<(Uuid, Uuid)> {
@@ -2839,6 +3429,126 @@ mod tests {
         })
     }
 
+    async fn setup_competing_review_pack(
+        database: &Database,
+        subscription_id: Uuid,
+        target_ids: &[Uuid],
+        suffix: &str,
+    ) -> Result<ReviewPackFixture> {
+        let release = upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                release_id: None,
+                subscription_id: Some(subscription_id),
+                source_provider_id: None,
+                source_extension_id: "elixir.extensions.test-source".to_string(),
+                owner_id: "test".to_string(),
+                media_type: MediaType::Series,
+                title: "Example Show".to_string(),
+                release_title: format!("Example.Show.S01.COMPLETE.1080p.{suffix}"),
+                source: format!("magnet:?xt=urn:btih:{suffix}"),
+                source_kind: "magnet".to_string(),
+                info_hash: Some(format!("{suffix:0<40}").chars().take(40).collect()),
+                fingerprint: format!("sha256:competing-{suffix}"),
+                release_kind: ReleaseKind::SeasonPack,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                resolver_version: "review-prune-test".to_string(),
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(75.0),
+                selected_route_logical_id: Some("acquisition.torrent.default".to_string()),
+                selected_provider_id: None,
+                download_id: Some(format!("competing-download-{suffix}")),
+                remote_release_id: Some(format!("competing-remote-{suffix}")),
+                state: AcquisitionReleaseState::ReviewRequired,
+                state_reason: Some("competing pack requires manual file review".to_string()),
+                selected_candidate: Some(json!({
+                    "title": format!("Example.Show.S01.COMPLETE.1080p.{suffix}"),
+                    "source": format!("magnet:?xt=urn:btih:{suffix}")
+                })),
+                coverage_plan: Some(json!({
+                    "priorityPolicy": {
+                        "status": "review_required",
+                        "reviewReasons": ["competing ambiguous season pack"]
+                    }
+                })),
+            },
+        )
+        .await?;
+        let mut file_ids = Vec::new();
+        for (index, target_id) in target_ids.iter().enumerate() {
+            let episode_number = (index + 1) as i32;
+            let file = upsert_release_file(
+                &database.pool,
+                NewAcquisitionReleaseFile {
+                    release_file_id: None,
+                    release_id: release.release_id,
+                    file_index: Some(index as i64),
+                    file_id: Some(format!("{suffix}-ep{episode_number}")),
+                    provider_file_id: Some(format!("{suffix}-ep{episode_number}")),
+                    path: format!("Example.Show.S01E{:02}.1080p.{suffix}.mkv", episode_number),
+                    basename: None,
+                    size_bytes: Some(1_000_000),
+                    selectable: true,
+                    selected: None,
+                    parsed_title: Some("Example Show".to_string()),
+                    parsed_season_number: Some(1),
+                    parsed_episode_number: Some(episode_number),
+                    parsed_episode_end_number: Some(episode_number),
+                    parsed_absolute_episode_number: None,
+                    parsed_absolute_episode_end_number: None,
+                    parsed_air_date: None,
+                    parsed_quality: Some("1080p WEB-DL".to_string()),
+                    parsed_language: Some("eng".to_string()),
+                    parsed_release_group: Some("GROUP".to_string()),
+                    parser_confidence: ReleaseConfidence::ReviewRequired,
+                    parser_reason: Some("competing file needs review".to_string()),
+                    raw: None,
+                    provider_metadata: None,
+                },
+            )
+            .await?;
+            upsert_release_coverage(
+                &database.pool,
+                NewAcquisitionReleaseCoverage {
+                    coverage_id: None,
+                    release_id: release.release_id,
+                    release_file_id: Some(file.release_file_id),
+                    target_id: *target_id,
+                    coverage_kind: ReleaseCoverageKind::SeasonPack,
+                    confidence: ReleaseConfidence::ReviewRequired,
+                    score: Some(70.0),
+                    reason: Some("competing pack needs review".to_string()),
+                    state: ReleaseCoverageState::ReviewRequired,
+                    verified_by: None,
+                },
+            )
+            .await?;
+            file_ids.push(file.release_file_id);
+        }
+        upsert_release_job(
+            &database.pool,
+            NewAcquisitionReleaseJob {
+                release_job_id: None,
+                release_id: release.release_id,
+                route_logical_id: "acquisition.torrent.default".to_string(),
+                provider_id: None,
+                download_id: Some(format!("competing-download-{suffix}")),
+                remote_release_id: Some(format!("competing-remote-{suffix}")),
+                state: ReleaseJobState::Staging,
+                state_reason: Some("waiting review".to_string()),
+                active: true,
+                started_at: Some(Utc::now()),
+                completed_at: None,
+            },
+        )
+        .await?;
+        Ok(ReviewPackFixture {
+            release_id: release.release_id,
+            target_ids: target_ids.to_vec(),
+            file_ids,
+        })
+    }
+
     async fn setup_anime_review_pack(database: &Database) -> Result<ReviewPackFixture> {
         let subscription = create_subscription(
             &database.pool,
@@ -3087,6 +3797,124 @@ mod tests {
                 .and_then(|value| value.get("preferred"))
                 .and_then(JsonValue::as_str),
             Some("debrid_first")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amr5_file_like_review_candidate_exposes_mapping_file() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Star Wars Clone Wars".to_string(),
+                year: Some(2003),
+                external_ids: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Chapter I".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Searching),
+                next_search_after: Some(Utc::now()),
+            }],
+        )
+        .await?;
+        let candidate_title = "Star Wars Clone Wars [2003] Volume 01.mkv";
+        let release = upsert_manual_review_candidate_release(
+            &database.pool,
+            NewManualReviewCandidateRelease {
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: None,
+                source_extension_id: "elixir.sources.torrentio_stremio".to_string(),
+                owner_id: "default".to_string(),
+                media_type: MediaType::Series,
+                title: "Star Wars Clone Wars".to_string(),
+                candidate: AcquisitionCandidate {
+                    id: Some("torrentio:clone-wars-volume-01".to_string()),
+                    title: candidate_title.to_string(),
+                    source: "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&dn=Star%20Wars%20Clone%20Wars%20Volume%2001".to_string(),
+                    source_kind: "magnet".to_string(),
+                    info_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                    file_index: None,
+                    quality: Some("480p".to_string()),
+                    size_bytes: Some(900_000_000),
+                    seeders: Some(5),
+                    language: Some("en".to_string()),
+                    cached_debrid: Some(false),
+                    rank: Some(1),
+                    score: Some(42.0),
+                    score_badges: Vec::new(),
+                    files: Vec::new(),
+                    supported_routes: vec![
+                        DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                        TORRENT_DEFAULT_LOGICAL_ID.to_string(),
+                    ],
+                    default_route: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                    raw: Some(json!({ "provider": "torrentio" })),
+                },
+                target_scope: ManualReviewTargetScope {
+                    subscription_id: Some(subscription.subscription_id),
+                    media_type: MediaType::Series,
+                    targets: vec![targets[0].target_id],
+                    target_keys: vec!["S01E01".to_string()],
+                    season_number: Some(1),
+                    episode_numbers: vec![1],
+                    absolute_episode_numbers: Vec::new(),
+                },
+                resolver_evidence: ManualReviewResolverEvidence {
+                    resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                    resolver_version: "amr5-test".to_string(),
+                    parsed_release: Some(json!({ "title": candidate_title })),
+                    rejection_codes: vec!["unknown_numbering".to_string()],
+                    candidate_score: Some(42.0),
+                    reason: Some("Candidate title needs manual mapping.".to_string()),
+                },
+                route_policy: ManualReviewRoutePolicyEvidence {
+                    preferred: Some("debrid_first".to_string()),
+                    allowed_routes: vec![
+                        DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                        TORRENT_DEFAULT_LOGICAL_ID.to_string(),
+                    ],
+                },
+                release_kind: ReleaseKind::Unknown,
+                score: Some(42.0),
+                state_reason: None,
+            },
+        )
+        .await?;
+
+        let detail = load_release_detail(&database.pool, release.release_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].path, candidate_title);
+        assert!(detail.files[0].selectable);
+        assert_eq!(detail.files[0].size_bytes, Some(900_000_000));
+        assert_eq!(detail.coverage.len(), 1);
+        assert_eq!(
+            detail.coverage[0].target.as_ref().unwrap().title,
+            "Chapter I"
         );
         Ok(())
     }
@@ -3465,6 +4293,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_resolves_synthetic_source_candidate_to_inspected_provider_file() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let (release_id, target_id) = setup_release(&database).await?;
+        let synthetic = upsert_release_file(
+            &database.pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id,
+                file_index: Some(8),
+                file_id: Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID.to_string()),
+                provider_file_id: Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID.to_string()),
+                path: "Star Wars Clone Wars [2003] Volume 01.mkv".to_string(),
+                basename: None,
+                size_bytes: Some(906_970_000),
+                selectable: true,
+                selected: None,
+                parsed_title: None,
+                parsed_season_number: None,
+                parsed_episode_number: None,
+                parsed_episode_end_number: None,
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: None,
+                parsed_quality: Some("DVDRip".to_string()),
+                parsed_language: None,
+                parsed_release_group: None,
+                parser_confidence: ReleaseConfidence::ReviewRequired,
+                parser_reason: Some(
+                    "Source candidate file row created for manual review mapping.".to_string(),
+                ),
+                raw: Some(json!({
+                    "source": "manual_review_source_candidate",
+                    "synthetic": true
+                })),
+                provider_metadata: None,
+            },
+        )
+        .await?;
+        let inspected = upsert_release_file(
+            &database.pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id,
+                file_index: Some(6),
+                file_id: Some("6".to_string()),
+                provider_file_id: Some("6".to_string()),
+                path: "/completed/hash/Star Wars Clone Wars [2003] Volume 01.mkv".to_string(),
+                basename: None,
+                size_bytes: Some(951_026_048),
+                selectable: true,
+                selected: None,
+                parsed_title: None,
+                parsed_season_number: None,
+                parsed_episode_number: None,
+                parsed_episode_end_number: None,
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: None,
+                parsed_quality: Some("DVDRip".to_string()),
+                parsed_language: None,
+                parsed_release_group: None,
+                parser_confidence: ReleaseConfidence::ReviewRequired,
+                parser_reason: Some("manual mapping required".to_string()),
+                raw: None,
+                provider_metadata: None,
+            },
+        )
+        .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: vec![synthetic.release_file_id],
+                skipped_release_file_ids: vec![inspected.release_file_id],
+                mappings: vec![ManualCoverageMappingRequest {
+                    target_id,
+                    release_file_id: Some(synthetic.release_file_id),
+                    coverage_kind: Some(ReleaseCoverageKind::ManualOverride),
+                    confidence: Some(ReleaseConfidence::High),
+                    score: Some(100.0),
+                    reason: Some("manual volume mapping".to_string()),
+                }],
+                reason: Some("verified inspected provider file".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let plan = release.coverage_plan.expect("coverage plan");
+        assert_eq!(
+            plan.pointer("/manualReview/selectedFileIds/0")
+                .and_then(JsonValue::as_str),
+            Some("6")
+        );
+        assert!(
+            plan.pointer("/manualReview/skippedFileIds")
+                .and_then(JsonValue::as_array)
+                .expect("skipped ids")
+                .iter()
+                .any(|value| value.as_str() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID))
+        );
+
+        let files = list_release_files(&database.pool, release_id).await?;
+        let selected = files
+            .iter()
+            .map(|file| (file.release_file_id, file.selected))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(selected.get(&inspected.release_file_id), Some(&Some(true)));
+        assert_eq!(selected.get(&synthetic.release_file_id), Some(&Some(false)));
+
+        let coverage = list_release_coverage(&database.pool, release_id).await?;
+        assert!(coverage.iter().any(|row| {
+            row.target_id == target_id
+                && row.release_file_id == Some(inspected.release_file_id)
+                && row.confidence == ReleaseConfidence::High
+                && row.state == ReleaseCoverageState::Selected
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_resumes_review_required_debrid_job_for_post_transfer_selection() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let (release_id, _) = setup_release(&database).await?;
+        let job_id = Uuid::new_v4();
+        let (provider_id, instance_id) = setup_provider_refs(&database.pool).await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO debrid_download_jobs (
+                job_id, provider_id, instance_id, owner_id, source, source_kind,
+                status, remote_release_status, selected_file_ids_json,
+                skipped_file_ids_json, selection_error, last_error, release_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job_id.to_string())
+        .bind(provider_id.to_string())
+        .bind(instance_id.to_string())
+        .bind("default")
+        .bind("magnet:?xt=urn:btih:review")
+        .bind("magnet")
+        .bind("review_required")
+        .bind("review_required")
+        .bind("[]")
+        .bind("[\"0\",\"1\",\"source-candidate\"]")
+        .bind("coverage_not_high_confidence,no_selected_files")
+        .bind("manual review required")
+        .bind(release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_file_ids: vec!["0".to_string()],
+                reason: Some("verified debrid file".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let row = sqlx::query::<sqlx::Any>(
+            "SELECT status, remote_release_status, selected_file_ids_json,
+                    skipped_file_ids_json,
+                    CASE WHEN selection_error IS NULL THEN 1 ELSE 0 END AS selection_error_null,
+                    CASE WHEN last_error IS NULL THEN 1 ELSE 0 END AS last_error_null
+             FROM debrid_download_jobs
+             WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(row.try_get::<String, _>("status")?, "submitted");
+        assert_eq!(
+            row.try_get::<Option<String>, _>("remote_release_status")?
+                .as_deref(),
+            Some("submitted")
+        );
+        assert_eq!(row.try_get::<String, _>("selected_file_ids_json")?, "[]");
+        assert_eq!(row.try_get::<String, _>("skipped_file_ids_json")?, "[]");
+        assert_eq!(row.try_get::<i64, _>("selection_error_null")?, 1);
+        assert_eq!(row.try_get::<i64, _>("last_error_null")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rr7c_tv_pack_approval_submits_targets_and_preserves_exact_files() -> Result<()> {
         let database = setup_db().await?;
         let user_id = Uuid::new_v4();
@@ -3526,6 +4553,191 @@ mod tests {
         assert!(
             due.is_empty(),
             "approved targets must not be searched again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_approval_prunes_depleted_competing_review_candidate() -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let fixture = setup_tv_review_pack(&database).await?;
+        let approved_release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("approved release");
+        let competing = setup_competing_review_pack(
+            &database,
+            approved_release.subscription_id.expect("subscription"),
+            &fixture.target_ids,
+            "aaaaaaaa",
+        )
+        .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            fixture.release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: fixture.file_ids[0..2].to_vec(),
+                skipped_release_file_ids: vec![fixture.file_ids[2]],
+                reason: Some("verified exact TV pack files".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let competing_release = get_release(&database.pool, competing.release_id)
+            .await?
+            .expect("competing release");
+        assert_eq!(competing_release.state, AcquisitionReleaseState::Cancelled);
+        assert_eq!(
+            competing_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/manualReview/status"))
+                .and_then(JsonValue::as_str),
+            Some("auto_pruned")
+        );
+        let competing_coverage =
+            list_release_coverage(&database.pool, competing.release_id).await?;
+        assert!(
+            competing_coverage
+                .iter()
+                .all(|row| row.state == ReleaseCoverageState::Rejected)
+        );
+        let competing_jobs = list_release_jobs(&database.pool, competing.release_id).await?;
+        assert!(
+            competing_jobs
+                .iter()
+                .all(|job| job.state == ReleaseJobState::Cancelled && !job.active)
+        );
+        assert_eq!(
+            count_acquisition_audit_events(
+                &database.pool,
+                competing.release_id,
+                EVENT_MANUAL_REJECTION
+            )
+            .await?,
+            1
+        );
+        let review_queue = list_releases(
+            &database.pool,
+            ReleaseListFilter {
+                subscription_id: approved_release.subscription_id,
+                state: Some(AcquisitionReleaseState::ReviewRequired),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert!(
+            review_queue
+                .iter()
+                .all(|release| release.release_id != competing.release_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_approval_only_prunes_overlapping_targets_from_competing_candidate() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let fixture = setup_tv_review_pack(&database).await?;
+        let approved_release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("approved release");
+        let competing = setup_competing_review_pack(
+            &database,
+            approved_release.subscription_id.expect("subscription"),
+            &fixture.target_ids,
+            "bbbbbbbb",
+        )
+        .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            fixture.release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: vec![fixture.file_ids[0]],
+                skipped_release_file_ids: fixture.file_ids[1..].to_vec(),
+                reason: Some("verified only first episode file".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let competing_release = get_release(&database.pool, competing.release_id)
+            .await?
+            .expect("competing release");
+        assert_eq!(
+            competing_release.state,
+            AcquisitionReleaseState::ReviewRequired
+        );
+        let competing_coverage =
+            list_release_coverage(&database.pool, competing.release_id).await?;
+        let rejected_targets = competing_coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::Rejected)
+            .map(|row| row.target_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(rejected_targets, BTreeSet::from([fixture.target_ids[0]]));
+        let remaining_review_targets = competing_coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::ReviewRequired)
+            .map(|row| row.target_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            remaining_review_targets,
+            BTreeSet::from([fixture.target_ids[1]])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_queue_reconcile_prunes_candidates_for_already_submitted_targets() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let fixture = setup_tv_review_pack(&database).await?;
+        for target_id in &fixture.target_ids {
+            update_target_state(
+                &database.pool,
+                *target_id,
+                AcquisitionTargetStateUpdate {
+                    state: AcquisitionTargetState::Submitted,
+                    state_reason: Some("covered before queue reconciliation".to_string()),
+                    selected_provider_id: None,
+                    selected_route_logical_id: Some("acquisition.debrid.default".to_string()),
+                    selected_candidate: Some(json!({ "title": "already covered" })),
+                    download_id: Some("already-covered-download".to_string()),
+                    import_event_id: None,
+                    next_search_after: None,
+                    increment_search_attempts: false,
+                },
+            )
+            .await?;
+        }
+
+        let summary = prune_review_candidates_for_covered_targets(&database.pool, user_id, None)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        assert_eq!(summary.rejected_coverage_rows, 2);
+        assert_eq!(summary.cancelled_releases, 1);
+        let release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, AcquisitionReleaseState::Cancelled);
+        let coverage = list_release_coverage(&database.pool, fixture.release_id).await?;
+        assert!(
+            coverage
+                .iter()
+                .all(|row| row.state == ReleaseCoverageState::Rejected)
         );
         Ok(())
     }

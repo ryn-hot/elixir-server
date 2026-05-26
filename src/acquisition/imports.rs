@@ -42,18 +42,37 @@ use crate::{
             start_subscription_tracking_if_initial_download_complete, update_target_state,
         },
     },
+    artwork::ArtworkService,
     db::models::MediaType,
     extensions::store::ExtensionStore,
     library::{
         AcquisitionLibraryImport, AcquisitionLibraryImportFile, AcquisitionLibraryImportFileResult,
-        ingest_acquisition_library_import,
+        LinkerService, ingest_acquisition_library_import_with_metadata,
     },
+    metadata::MetadataService,
     runtime::RuntimePaths,
     state::AppState,
 };
 
 const IMPORT_COORDINATOR_INTERVAL_SECONDS: u64 = 30;
 const IMPORT_COORDINATOR_BATCH_LIMIT: i64 = 25;
+
+#[derive(Clone, Copy, Default)]
+pub struct AcquisitionImportRuntimeServices<'a> {
+    pub metadata: Option<&'a MetadataService>,
+    pub linkers: Option<&'a LinkerService>,
+    pub artwork: Option<&'a ArtworkService>,
+}
+
+impl<'a> AcquisitionImportRuntimeServices<'a> {
+    fn from_state(state: &'a AppState) -> Self {
+        Self {
+            metadata: Some(state.metadata.as_ref()),
+            linkers: Some(state.linkers.as_ref()),
+            artwork: Some(state.artwork.as_ref()),
+        }
+    }
+}
 
 macro_rules! string_enum {
     (
@@ -260,10 +279,11 @@ pub async fn start_acquisition_import_loop(state: AppState) {
 
     loop {
         interval.tick().await;
-        if let Err(err) = run_acquisition_import_iteration_with_policy(
+        if let Err(err) = run_acquisition_import_iteration_with_services(
             &state.db_pool,
             IMPORT_COORDINATOR_BATCH_LIMIT,
             &path_policy,
+            AcquisitionImportRuntimeServices::from_state(&state),
         )
         .await
         {
@@ -290,6 +310,21 @@ pub async fn run_acquisition_import_iteration_with_policy(
     limit: i64,
     path_policy: &AcquisitionImportPathPolicy,
 ) -> Result<ImportCoordinatorStats> {
+    run_acquisition_import_iteration_with_services(
+        pool,
+        limit,
+        path_policy,
+        AcquisitionImportRuntimeServices::default(),
+    )
+    .await
+}
+
+pub async fn run_acquisition_import_iteration_with_services(
+    pool: &AnyPool,
+    limit: i64,
+    path_policy: &AcquisitionImportPathPolicy,
+    services: AcquisitionImportRuntimeServices<'_>,
+) -> Result<ImportCoordinatorStats> {
     let candidates = list_import_pending_release_jobs(pool, limit).await?;
     let mut stats = ImportCoordinatorStats {
         candidates: candidates.len(),
@@ -311,7 +346,7 @@ pub async fn run_acquisition_import_iteration_with_policy(
             continue;
         }
 
-        let finalize = finalize_import_run(pool, &candidate, &run, path_policy).await?;
+        let finalize = finalize_import_run(pool, &candidate, &run, path_policy, services).await?;
         if finalize.imported {
             stats.runs_imported += 1;
         }
@@ -351,7 +386,7 @@ pub async fn list_import_pending_release_jobs(
                 SELECT 1
                 FROM acquisition_import_runs ir
                 WHERE ir.release_job_id = j.release_job_id
-                  AND ir.state = ?
+                  AND ir.state IN (?, ?, ?, ?, ?)
            )
          ORDER BY COALESCE(j.completed_at, j.updated_at), j.release_job_id
          LIMIT ?",
@@ -359,6 +394,10 @@ pub async fn list_import_pending_release_jobs(
     .bind(ReleaseJobState::Completed.as_str())
     .bind("completed")
     .bind(AcquisitionImportRunState::Imported.as_str())
+    .bind(AcquisitionImportRunState::Blocked.as_str())
+    .bind(AcquisitionImportRunState::Failed.as_str())
+    .bind(AcquisitionImportRunState::Cancelled.as_str())
+    .bind(AcquisitionImportRunState::Mismatched.as_str())
     .bind(limit.max(1))
     .fetch_all(pool)
     .await
@@ -423,12 +462,21 @@ async fn prepare_import_run_for_completed_job(
         .count();
     let mut links_upserted = 0;
     let mut blocked_reasons = Vec::new();
+    let targets_with_importable_files = coverage
+        .iter()
+        .filter(|entry| importable_coverage_state(entry.state))
+        .filter(|entry| entry.release_file_id.is_some())
+        .map(|entry| entry.target_id)
+        .collect::<HashSet<_>>();
 
     for coverage in coverage
         .iter()
         .filter(|entry| importable_coverage_state(entry.state))
     {
         let Some(release_file_id) = coverage.release_file_id else {
+            if targets_with_importable_files.contains(&coverage.target_id) {
+                continue;
+            }
             let reason = "selected coverage has no release file mapping";
             upsert_import_file_link(
                 pool,
@@ -644,6 +692,7 @@ async fn finalize_import_run(
     candidate: &CompletedReleaseJobForImport,
     run: &AcquisitionImportRun,
     path_policy: &AcquisitionImportPathPolicy,
+    services: AcquisitionImportRuntimeServices<'_>,
 ) -> Result<FinalizedImportRun> {
     if run.state == AcquisitionImportRunState::Imported {
         return Ok(FinalizedImportRun {
@@ -662,7 +711,7 @@ async fn finalize_import_run(
     )
     .await?;
 
-    let result = finalize_import_run_inner(pool, candidate, run, path_policy).await;
+    let result = finalize_import_run_inner(pool, candidate, run, path_policy, services).await;
     match result {
         Ok(finalized) => Ok(finalized),
         Err(err) => {
@@ -684,6 +733,7 @@ async fn finalize_import_run_inner(
     candidate: &CompletedReleaseJobForImport,
     run: &AcquisitionImportRun,
     path_policy: &AcquisitionImportPathPolicy,
+    services: AcquisitionImportRuntimeServices<'_>,
 ) -> Result<FinalizedImportRun> {
     let Some(subscription_id) = candidate.release.subscription_id else {
         block_import_run(
@@ -916,7 +966,14 @@ async fn finalize_import_run_inner(
     }
 
     let request = build_library_import_request(&subscription, &candidate.release, library_files)?;
-    let import_result = ingest_acquisition_library_import(pool, request).await?;
+    let import_result = ingest_acquisition_library_import_with_metadata(
+        pool,
+        services.metadata,
+        services.linkers,
+        services.artwork,
+        request,
+    )
+    .await?;
     ExtensionStore::new(pool)
         .upsert_acquisition_media_ownership(
             import_result.media_item_id,
@@ -3516,6 +3573,186 @@ mod tests {
             .fetch_one(&fixture.database.pool)
             .await?;
         assert_eq!(media_file_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_preparation_ignores_placeholder_coverage_when_concrete_mapping_exists()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("Show.S01E01.mkv");
+        let fixture = setup_completed_release(
+            DEBRID_DEFAULT_LOGICAL_ID,
+            Some(path.to_string_lossy().to_string()),
+            ReleaseCoverageState::Submitted,
+            Some(true),
+        )
+        .await?;
+        upsert_release_coverage(
+            &fixture.database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: fixture.release_id,
+                release_file_id: None,
+                target_id: fixture.target_id,
+                coverage_kind: ReleaseCoverageKind::ManualOverride,
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: None,
+                reason: Some("stale placeholder row".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("test".to_string()),
+            },
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&fixture.database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+        assert_eq!(stats.blocked_runs, 0);
+        let run = get_import_run_by_release_job(&fixture.database.pool, fixture.job_id)
+            .await?
+            .expect("import run");
+        assert_eq!(run.state, AcquisitionImportRunState::Imported);
+        let links = list_import_file_links(&fixture.database.pool, run.import_run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert!(links[0].release_file_id.is_some());
+        assert_eq!(links[0].state, AcquisitionImportFileLinkState::Imported);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_coordinator_skips_terminal_import_runs_without_starving_new_jobs() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let blocked_path = dir.path().join("Show.S01E01.Blocked.mkv");
+        let ready_path = dir.path().join("Show.S01E01.Ready.mkv");
+        tokio::fs::write(&blocked_path, b"blocked").await?;
+        tokio::fs::write(&ready_path, b"ready").await?;
+
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Show".to_string(),
+                year: Some(2024),
+                external_ids: None,
+                monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Episode 1".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Submitted),
+                next_search_after: None,
+            }],
+        )
+        .await?;
+        let target_id = targets
+            .first()
+            .map(|target| target.target_id)
+            .ok_or_else(|| anyhow!("missing test target"))?;
+
+        let (blocked_release_id, blocked_job_id) = insert_completed_release_with_files(
+            &database,
+            subscription.subscription_id,
+            MediaType::Series,
+            "Show",
+            ReleaseKind::Single,
+            ReleaseResolverKind::TvSonarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "blocked",
+            vec![TestReleaseFile {
+                local_path: blocked_path.to_string_lossy().to_string(),
+                basename: "Show.S01E01.Blocked.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: Some(1),
+                parsed_episode: Some(1),
+                coverage: vec![(
+                    target_id,
+                    ReleaseCoverageKind::SingleEpisode,
+                    ReleaseCoverageState::Submitted,
+                )],
+            }],
+        )
+        .await?;
+        create_or_get_import_run(
+            &database.pool,
+            NewAcquisitionImportRun {
+                import_run_id: None,
+                release_id: blocked_release_id,
+                release_job_id: blocked_job_id,
+                route_logical_id: DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                provider_id: None,
+                download_id: Some("download-blocked".to_string()),
+                remote_release_id: Some("remote-blocked".to_string()),
+                state: AcquisitionImportRunState::Blocked,
+                state_reason: Some("Blocked before this coordinator pass.".to_string()),
+                mismatch_class: Some("test_blocked".to_string()),
+                retry_count: 0,
+                provenance: None,
+                started_at: None,
+                completed_at: Some(Utc::now()),
+            },
+        )
+        .await?;
+
+        let (_ready_release_id, ready_job_id) = insert_completed_release_with_files(
+            &database,
+            subscription.subscription_id,
+            MediaType::Series,
+            "Show",
+            ReleaseKind::Single,
+            ReleaseResolverKind::TvSonarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "ready",
+            vec![TestReleaseFile {
+                local_path: ready_path.to_string_lossy().to_string(),
+                basename: "Show.S01E01.Ready.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: Some(1),
+                parsed_episode: Some(1),
+                coverage: vec![(
+                    target_id,
+                    ReleaseCoverageKind::SingleEpisode,
+                    ReleaseCoverageState::Submitted,
+                )],
+            }],
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 1).await?;
+        assert_eq!(stats.candidates, 1);
+        assert_eq!(stats.runs_created, 1);
+        assert_eq!(stats.runs_imported, 1);
+        assert_eq!(stats.blocked_runs, 0);
+
+        let blocked_run = get_import_run_by_release_job(&database.pool, blocked_job_id)
+            .await?
+            .expect("blocked import run");
+        assert_eq!(blocked_run.state, AcquisitionImportRunState::Blocked);
+        let ready_run = get_import_run_by_release_job(&database.pool, ready_job_id)
+            .await?
+            .expect("ready import run");
+        assert_eq!(ready_run.state, AcquisitionImportRunState::Imported);
         Ok(())
     }
 

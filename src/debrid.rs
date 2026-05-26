@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -31,6 +31,7 @@ use crate::acquisition::release_resolution::{
         ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
         ReleaseResolverKind,
     },
+    review_candidates::SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
     store::{
         get_release, get_release_by_download_id, list_release_coverage, list_release_files,
         update_release_coverage_review_state, upsert_release, upsert_release_coverage,
@@ -6794,11 +6795,15 @@ fn approved_debrid_user_override(
         return None;
     }
 
-    let selected_file_ids = json_string_array(policy.get("selectedFileIds"));
+    let selected_file_ids =
+        resolve_approved_debrid_file_ids(json_string_array(policy.get("selectedFileIds")), files);
     if selected_file_ids.is_empty() {
         return None;
     }
-    let skipped_file_ids = json_string_array(policy.get("skippedFileIds"));
+    let selected_set = selected_file_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut skipped_file_ids =
+        resolve_approved_debrid_file_ids(json_string_array(policy.get("skippedFileIds")), files);
+    skipped_file_ids.retain(|file_id| !selected_set.contains(file_id));
     let known_provider_ids = files
         .iter()
         .filter_map(|file| {
@@ -6814,7 +6819,6 @@ fn approved_debrid_user_override(
         }
     }
     let select_all = selected_file_ids.iter().any(|value| value == "all");
-    let selected_set = selected_file_ids.iter().cloned().collect::<BTreeSet<_>>();
     let select_all_approved =
         select_all || (!known_provider_ids.is_empty() && known_provider_ids == selected_set);
     let status = if review_reasons.is_empty() {
@@ -6846,6 +6850,113 @@ fn approved_debrid_user_override(
         select_all,
         select_all_approved,
     })
+}
+
+fn resolve_approved_debrid_file_ids(
+    file_ids: Vec<String>,
+    files: &[AcquisitionReleaseFile],
+) -> Vec<String> {
+    file_ids
+        .into_iter()
+        .flat_map(|file_id| {
+            if file_id == SYNTHETIC_SOURCE_CANDIDATE_FILE_ID
+                && let Some(provider_file_id) =
+                    matching_provider_file_id_for_synthetic_source_candidate(files)
+            {
+                return vec![provider_file_id];
+            }
+            vec![file_id]
+        })
+        .collect()
+}
+
+fn matching_provider_file_id_for_synthetic_source_candidate(
+    files: &[AcquisitionReleaseFile],
+) -> Option<String> {
+    let synthetic = files
+        .iter()
+        .find(|file| is_synthetic_source_candidate_file(file))?;
+    let synthetic_basename = normalized_debrid_review_basename(&synthetic.basename);
+    if synthetic_basename.is_empty() {
+        return None;
+    }
+    let matches = files
+        .iter()
+        .filter(|file| !is_synthetic_source_candidate_file(file))
+        .filter(|file| file.selectable)
+        .filter_map(|file| {
+            let provider_file_id = file
+                .provider_file_id
+                .clone()
+                .or_else(|| file.file_id.clone())?;
+            (!provider_file_id.is_empty()
+                && provider_file_id != SYNTHETIC_SOURCE_CANDIDATE_FILE_ID
+                && normalized_debrid_review_basename(&file.basename) == synthetic_basename)
+                .then_some(provider_file_id)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn synthetic_source_candidate_release_file_aliases(
+    files: &[AcquisitionReleaseFile],
+) -> BTreeMap<Uuid, Uuid> {
+    let mut aliases = BTreeMap::new();
+    for synthetic in files
+        .iter()
+        .filter(|file| is_synthetic_source_candidate_file(file))
+    {
+        let synthetic_basename = normalized_debrid_review_basename(&synthetic.basename);
+        if synthetic_basename.is_empty() {
+            continue;
+        }
+        let matches = files
+            .iter()
+            .filter(|file| !is_synthetic_source_candidate_file(file))
+            .filter(|file| file.selectable)
+            .filter(|file| {
+                file.provider_file_id
+                    .as_deref()
+                    .or(file.file_id.as_deref())
+                    .is_some_and(|provider_file_id| {
+                        !provider_file_id.is_empty()
+                            && provider_file_id != SYNTHETIC_SOURCE_CANDIDATE_FILE_ID
+                    })
+            })
+            .filter(|file| normalized_debrid_review_basename(&file.basename) == synthetic_basename)
+            .map(|file| file.release_file_id)
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            aliases.insert(synthetic.release_file_id, matches[0]);
+        }
+    }
+    aliases
+}
+
+fn is_synthetic_source_candidate_file(file: &AcquisitionReleaseFile) -> bool {
+    file.file_id.as_deref() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID)
+        || file.provider_file_id.as_deref() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID)
+        || file
+            .raw
+            .as_ref()
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            == Some("manual_review_source_candidate")
+}
+
+fn normalized_debrid_review_basename(value: &str) -> String {
+    value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn json_string_array(value: Option<&Value>) -> Vec<String> {
@@ -6887,9 +6998,32 @@ async fn persist_debrid_selection_decision(
         )
         .await?;
     }
+    let file_aliases = synthetic_source_candidate_release_file_aliases(files);
+    let selected_target_ids = coverage
+        .iter()
+        .filter_map(|entry| {
+            let release_file_id = entry.release_file_id.and_then(|release_file_id| {
+                file_aliases
+                    .get(&release_file_id)
+                    .copied()
+                    .or(Some(release_file_id))
+            })?;
+            let file = files
+                .iter()
+                .find(|file| file.release_file_id == release_file_id)?;
+            let provider_id = file.provider_file_id.as_ref().or(file.file_id.as_ref())?;
+            (decision.is_approved() && selected_ids.contains(provider_id))
+                .then_some(entry.target_id)
+        })
+        .collect::<HashSet<_>>();
     for entry in coverage {
-        let selected = entry
-            .release_file_id
+        let release_file_id = entry.release_file_id.and_then(|release_file_id| {
+            file_aliases
+                .get(&release_file_id)
+                .copied()
+                .or(Some(release_file_id))
+        });
+        let selected = release_file_id
             .and_then(|release_file_id| {
                 files
                     .iter()
@@ -6903,7 +7037,7 @@ async fn persist_debrid_selection_decision(
             NewAcquisitionReleaseCoverage {
                 coverage_id: Some(entry.coverage_id),
                 release_id: entry.release_id,
-                release_file_id: entry.release_file_id,
+                release_file_id,
                 target_id: entry.target_id,
                 coverage_kind: entry.coverage_kind,
                 confidence: entry.confidence,
@@ -6911,6 +7045,11 @@ async fn persist_debrid_selection_decision(
                 reason: entry.reason.clone(),
                 state: if decision.is_approved() && selected {
                     ReleaseCoverageState::Selected
+                } else if decision.is_approved()
+                    && entry.release_file_id.is_none()
+                    && selected_target_ids.contains(&entry.target_id)
+                {
+                    ReleaseCoverageState::Rejected
                 } else if decision.is_approved() {
                     entry.state
                 } else {
@@ -7225,6 +7364,24 @@ fn merge_debrid_provider_provenance(
             job_id,
         ),
     )
+}
+
+fn merge_debrid_coverage_plans(existing: Option<Value>, update: Option<Value>) -> Option<Value> {
+    match (existing, update) {
+        (Some(Value::Object(mut existing)), Some(Value::Object(update))) => {
+            for (key, value) in update {
+                existing.insert(key, value);
+            }
+            Some(Value::Object(existing))
+        }
+        (Some(existing), Some(update)) => Some(json!({
+            "previousCoveragePlan": existing,
+            "debridCoveragePlan": update
+        })),
+        (Some(existing), None) => Some(existing),
+        (None, Some(update)) => Some(update),
+        (None, None) => None,
+    }
 }
 
 fn merge_debrid_evidence_object(
@@ -7896,7 +8053,10 @@ async fn process_debrid_job(
             let refinement_state = refinement.state;
             let refinement_state_reason = refinement.state_reason.clone();
             let refinement_shape = refinement.shape.clone();
-            let refinement_coverage_plan = refinement.coverage_plan.clone();
+            let refinement_coverage_plan = merge_debrid_coverage_plans(
+                release.coverage_plan.clone(),
+                refinement.coverage_plan.clone(),
+            );
             let refinement_job_state = refinement.job_state;
             let refinement_job_state_reason = refinement.job_state_reason.clone();
             let updated_release = upsert_debrid_acquisition_release(
@@ -8877,6 +9037,9 @@ async fn sync_debrid_release_runtime_state(
     if let Some(coverage_state) = coverage_state {
         for entry in &coverage {
             target_ids.insert(entry.target_id);
+            if !should_update_debrid_runtime_coverage(entry, coverage_state) {
+                continue;
+            }
             update_release_coverage_review_state(
                 pool,
                 entry.coverage_id,
@@ -8930,6 +9093,24 @@ async fn sync_debrid_release_runtime_state(
         .await?;
     }
     Ok(())
+}
+
+fn should_update_debrid_runtime_coverage(
+    entry: &AcquisitionReleaseCoverage,
+    next_state: ReleaseCoverageState,
+) -> bool {
+    if entry.state == ReleaseCoverageState::Rejected {
+        return false;
+    }
+    if entry.release_file_id.is_none()
+        && matches!(
+            next_state,
+            ReleaseCoverageState::Submitted | ReleaseCoverageState::Imported
+        )
+    {
+        return false;
+    }
+    true
 }
 
 async fn target_ids_for_download_id(pool: &sqlx::AnyPool, download_id: &str) -> Result<Vec<Uuid>> {
@@ -14285,6 +14466,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debrid_runtime_coverage_update_does_not_resurrect_rejected_or_placeholder_rows() {
+        let release_id = Uuid::new_v4();
+        let release_file_id = Uuid::new_v4();
+
+        let concrete = test_coverage(release_id, release_file_id);
+        assert!(should_update_debrid_runtime_coverage(
+            &concrete,
+            ReleaseCoverageState::Submitted
+        ));
+
+        let mut rejected = test_coverage(release_id, release_file_id);
+        rejected.state = ReleaseCoverageState::Rejected;
+        assert!(!should_update_debrid_runtime_coverage(
+            &rejected,
+            ReleaseCoverageState::Submitted
+        ));
+
+        let mut placeholder = test_coverage(release_id, release_file_id);
+        placeholder.release_file_id = None;
+        placeholder.state = ReleaseCoverageState::ReviewRequired;
+        assert!(!should_update_debrid_runtime_coverage(
+            &placeholder,
+            ReleaseCoverageState::Submitted
+        ));
+        assert!(should_update_debrid_runtime_coverage(
+            &placeholder,
+            ReleaseCoverageState::ReviewRequired
+        ));
+    }
+
     fn test_debrid_inspection(
         supports_file_selection: bool,
         files: Vec<DebridRemoteFile>,
@@ -14550,6 +14762,116 @@ mod tests {
         assert_eq!(decision.skipped_file_ids, vec!["file-2".to_string()]);
         assert_eq!(decision.coverage_fingerprint, "sha256:user-approved-debrid");
         assert!(decision.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn debrid_selection_policy_translates_synthetic_review_file_to_provider_file() {
+        let mut release =
+            test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::ReviewRequired);
+        release.coverage_plan = Some(json!({
+            "manualReview": {
+                "status": "approved",
+                "userApproved": true,
+                "selectedFileIds": [SYNTHETIC_SOURCE_CANDIDATE_FILE_ID],
+                "skippedFileIds": ["6"],
+                "coverageFingerprint": "sha256:user-approved-synthetic"
+            }
+        }));
+        let mut synthetic = test_release_file(
+            release.release_id,
+            SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
+            "Star Wars Clone Wars [2003] Volume 01.mkv",
+            true,
+        );
+        synthetic.raw = Some(json!({
+            "source": "manual_review_source_candidate",
+            "synthetic": true
+        }));
+        let provider = test_release_file(
+            release.release_id,
+            "6",
+            "/completed/hash/Star Wars Clone Wars [2003] Volume 01.mkv",
+            true,
+        );
+        let files = vec![synthetic, provider];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &[], &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.selected_file_ids, vec!["6".to_string()]);
+        assert_eq!(decision.provider_selection_ids, vec!["6".to_string()]);
+        assert!(decision.skipped_file_ids.is_empty());
+        assert_eq!(
+            decision.coverage_fingerprint,
+            "sha256:user-approved-synthetic"
+        );
+        assert!(decision.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn debrid_synthetic_review_alias_maps_to_unique_provider_release_file() {
+        let release =
+            test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::ReviewRequired);
+        let mut synthetic = test_release_file(
+            release.release_id,
+            SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
+            "Star Wars Clone Wars [2003] Volume 01.mkv",
+            true,
+        );
+        synthetic.raw = Some(json!({
+            "source": "manual_review_source_candidate",
+            "synthetic": true
+        }));
+        let provider = test_release_file(
+            release.release_id,
+            "6",
+            "/completed/hash/Star Wars Clone Wars [2003] Volume 01.mkv",
+            true,
+        );
+
+        let aliases =
+            synthetic_source_candidate_release_file_aliases(&[synthetic.clone(), provider.clone()]);
+
+        assert_eq!(
+            aliases.get(&synthetic.release_file_id),
+            Some(&provider.release_file_id)
+        );
+    }
+
+    #[test]
+    fn debrid_coverage_plan_merge_preserves_manual_review_evidence() {
+        let merged = merge_debrid_coverage_plans(
+            Some(json!({
+                "manualReview": {
+                    "status": "approved",
+                    "userApproved": true,
+                    "selectedFileIds": [SYNTHETIC_SOURCE_CANDIDATE_FILE_ID]
+                },
+                "priorityPolicy": {
+                    "status": "approved",
+                    "userApproved": true
+                }
+            })),
+            Some(json!({
+                "tv": {
+                    "confidence": "review_required",
+                    "rejectionReasons": ["unknown_numbering"]
+                }
+            })),
+        )
+        .expect("merged plan");
+
+        assert_eq!(
+            merged
+                .pointer("/manualReview/status")
+                .and_then(Value::as_str),
+            Some("approved")
+        );
+        assert_eq!(
+            merged.pointer("/tv/confidence").and_then(Value::as_str),
+            Some("review_required")
+        );
     }
 
     #[test]

@@ -193,11 +193,21 @@ pub async fn ingest_acquisition_library_import(
     pool: &AnyPool,
     request: AcquisitionLibraryImport,
 ) -> Result<AcquisitionLibraryImportResult> {
+    ingest_acquisition_library_import_with_metadata(pool, None, None, None, request).await
+}
+
+pub async fn ingest_acquisition_library_import_with_metadata(
+    pool: &AnyPool,
+    metadata: Option<&MetadataService>,
+    linkers: Option<&LinkerService>,
+    artwork: Option<&ArtworkService>,
+    request: AcquisitionLibraryImport,
+) -> Result<AcquisitionLibraryImportResult> {
     if request.files.is_empty() {
         anyhow::bail!("acquisition library import requires at least one file");
     }
 
-    let identity = MediaIdentity {
+    let mut identity = MediaIdentity {
         r#type: request.media_type,
         external_ids: request.external_ids.clone(),
         title: request.title.clone(),
@@ -218,16 +228,38 @@ pub async fn ingest_acquisition_library_import(
             let Some(descriptor) = descriptor_from_acquisition_import_file(file).await? else {
                 anyhow::bail!("movie acquisition import file is missing or not a regular file");
             };
-            let movie_id = upsert_movie(pool, &identity, &request.external_ids, None).await?;
-            persist_movie_external_ids(pool, movie_id, &request.external_ids, "acquisition")
-                .await?;
-            upsert_legacy_media_item(pool, movie_id, &identity, &request.external_ids, None)
-                .await?;
+            let mut merged_ids = request.external_ids.clone();
+            let movie_hydration = fetch_movie_metadata_for_identity(
+                metadata,
+                linkers,
+                &identity,
+                "acquisition movie import",
+            )
+            .await;
+            let meta = movie_hydration.meta;
+            if let Some(meta_ids) = meta.as_ref().and_then(|value| value.external_ids.clone()) {
+                merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
+                identity.external_ids = merged_ids.clone();
+            }
+
+            let movie_id = upsert_movie(pool, &identity, &merged_ids, meta.as_ref()).await?;
+            persist_movie_external_ids(pool, movie_id, &merged_ids, "acquisition").await?;
+            upsert_legacy_media_item(pool, movie_id, &identity, &merged_ids, meta.as_ref()).await?;
             let media_file =
                 upsert_media_file(pool, movie_id, None, &descriptor, None, false).await?;
             link_movie_file(pool, movie_id, media_file.id).await?;
             if let Some(duration) = media_file.duration_seconds {
                 update_movie_runtime_if_missing(pool, movie_id, duration).await?;
+            }
+            if let Some(artwork_service) = artwork {
+                sync_movie_artwork(
+                    pool,
+                    artwork_service,
+                    movie_id,
+                    meta.as_ref(),
+                    movie_hydration.tvdb_movie_meta.as_ref(),
+                )
+                .await?;
             }
             Ok(AcquisitionLibraryImportResult {
                 media_item_id: movie_id,
@@ -242,13 +274,24 @@ pub async fn ingest_acquisition_library_import(
             })
         }
         MediaType::Series | MediaType::Anime => {
-            let series_ids = if request.media_type == MediaType::Anime {
-                strip_anime_ids(&request.external_ids)
+            let mut merged_ids = request.external_ids.clone();
+            let meta = if let Some(service) = metadata {
+                fetch_metadata_for_identity(service, &identity, "acquisition series import").await
             } else {
-                request.external_ids.clone()
+                None
             };
-            let series_id = upsert_series(pool, &identity, &series_ids, None).await?;
-            upsert_legacy_media_item(pool, series_id, &identity, &series_ids, None).await?;
+            if let Some(meta_ids) = meta.as_ref().and_then(|value| value.external_ids.clone()) {
+                merged_ids = merge_external_ids(&merged_ids, Some(meta_ids));
+                identity.external_ids = merged_ids.clone();
+            }
+            let series_ids = if request.media_type == MediaType::Anime {
+                strip_anime_ids(&merged_ids)
+            } else {
+                merged_ids.clone()
+            };
+            let series_id = upsert_series(pool, &identity, &series_ids, meta.as_ref()).await?;
+            upsert_legacy_media_item(pool, series_id, &identity, &series_ids, meta.as_ref())
+                .await?;
             persist_series_external_ids(pool, series_id, &series_ids, "acquisition").await?;
             if request.media_type == MediaType::Anime {
                 mark_series_as_anime(pool, series_id).await?;
@@ -323,6 +366,21 @@ pub async fn ingest_acquisition_library_import(
 
             if results.is_empty() {
                 anyhow::bail!("series acquisition import did not link any files");
+            }
+            if let Some(artwork_service) = artwork {
+                sync_series_artwork(
+                    pool,
+                    artwork_service,
+                    series_id,
+                    meta.as_ref(),
+                    &series_ids,
+                    request.media_type == MediaType::Anime,
+                    linkers,
+                    &season_ids,
+                    metadata.map(|service| service.ttl_seconds()).unwrap_or(0),
+                    false,
+                )
+                .await?;
             }
             refresh_episode_file_state(pool).await?;
             Ok(AcquisitionLibraryImportResult {
@@ -6485,6 +6543,125 @@ mod tests {
         Ok((base_url, shutdown_tx))
     }
 
+    async fn start_mock_tvdb_series_artwork_server() -> Result<(String, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let series_base_url = base_url.clone();
+        let artwork_base_url = base_url.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let app = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(serde_json::json!({ "data": { "token": "test-token" } })) }),
+            )
+            .route(
+                "/series/:id",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let series_base_url = series_base_url.clone();
+                    async move {
+                        let data = if id == "72244" {
+                            serde_json::json!({
+                                "id": 72244,
+                                "name": "Star Wars: Clone Wars",
+                                "year": "2003",
+                                "overview": "Animated micro-series following the Clone Wars.",
+                                "image": format!("{series_base_url}/tvdb-series-poster.jpg"),
+                                "banner": format!("{series_base_url}/tvdb-series-banner.jpg")
+                            })
+                        } else {
+                            serde_json::json!(null)
+                        };
+                        Json(serde_json::json!({ "data": data }))
+                    }
+                }),
+            )
+            .route(
+                "/series/:id/extended",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    let data = if id == "72244" {
+                        serde_json::json!({
+                            "id": 72244,
+                            "seasons": [
+                                { "id": 1, "number": 1, "name": "Season 1" }
+                            ]
+                        })
+                    } else {
+                        serde_json::json!({ "id": id, "seasons": [] })
+                    };
+                    Json(serde_json::json!({ "data": data }))
+                }),
+            )
+            .route(
+                "/series/:id/artworks",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let artwork_base_url = artwork_base_url.clone();
+                    async move {
+                        let data = if id == "72244" {
+                            serde_json::json!([
+                                {
+                                    "image": format!("{artwork_base_url}/tvdb-series-poster.jpg"),
+                                    "typeName": "Poster",
+                                    "language": "eng",
+                                    "width": 680,
+                                    "height": 1000,
+                                    "score": 9.3
+                                },
+                                {
+                                    "image": format!("{artwork_base_url}/tvdb-series-backdrop.jpg"),
+                                    "typeName": "Background",
+                                    "language": "eng",
+                                    "width": 1920,
+                                    "height": 1080,
+                                    "score": 8.8
+                                },
+                                {
+                                    "image": format!("{artwork_base_url}/tvdb-series-banner.jpg"),
+                                    "typeName": "Banner",
+                                    "language": "eng",
+                                    "width": 758,
+                                    "height": 140,
+                                    "score": 8.4
+                                }
+                            ])
+                        } else {
+                            serde_json::json!([])
+                        };
+                        Json(serde_json::json!({ "data": data }))
+                    }
+                }),
+            )
+            .route(
+                "/tvdb-series-poster.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            )
+            .route(
+                "/tvdb-series-banner.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            )
+            .route(
+                "/tvdb-series-backdrop.jpg",
+                get(|| async {
+                    (StatusCode::OK, Body::from(vec![0xff, 0xd8, 0xff, 0xd9])).into_response()
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok((base_url, shutdown_tx))
+    }
+
     #[tokio::test]
     async fn upsert_and_mark_missing() -> Result<()> {
         let config = DatabaseConfig {
@@ -7374,6 +7551,113 @@ mod tests {
             .fetch_one(&database.pool)
             .await?;
         assert_eq!(status, "linked");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquisition_import_hydrates_series_metadata_and_artwork_from_tvdb() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let file_dir = tempdir()?;
+        let file_path = file_dir.path().join("Star Wars Clone Wars 2003 S01E01.mkv");
+        std::fs::write(&file_path, b"dummy")?;
+        let artwork_dir = tempdir()?;
+        let (tvdb_base_url, tvdb_shutdown_tx) = start_mock_tvdb_series_artwork_server().await?;
+
+        let mut classifier_config = ClassifierConfig::default();
+        classifier_config.tvdb_base_url = tvdb_base_url;
+        classifier_config.tvdb_api_key = Some("test-key".to_string());
+        classifier_config.request_timeout_seconds = 2;
+        let linkers = LinkerService::new(classifier_config)?;
+        let artwork = ArtworkService::new(artwork_dir.path(), 2)?;
+
+        let result = ingest_acquisition_library_import_with_metadata(
+            &database.pool,
+            None,
+            Some(&linkers),
+            Some(&artwork),
+            AcquisitionLibraryImport {
+                media_type: MediaType::Series,
+                title: "Star Wars: Clone Wars".to_string(),
+                year: Some(2003),
+                external_ids: ExtIds {
+                    tvdb: Some("72244".to_string()),
+                    tvdb_series: Some("72244".to_string()),
+                    ..Default::default()
+                },
+                files: vec![AcquisitionLibraryImportFile {
+                    path: file_path.to_string_lossy().to_string(),
+                    size_bytes: None,
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    episode_title: Some("Chapter I".to_string()),
+                }],
+            },
+        )
+        .await?;
+        let _ = tvdb_shutdown_tx.send(());
+
+        let row = sqlx::query(
+            "SELECT external_tvdb_series, metadata_json FROM series WHERE id = ? LIMIT 1",
+        )
+        .bind(result.media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            row.try_get::<String, _>("external_tvdb_series")
+                .ok()
+                .as_deref(),
+            Some("72244")
+        );
+        let metadata_json: String = row.get("metadata_json");
+        let metadata_json: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(
+            metadata_json.get("overview").and_then(Value::as_str),
+            Some("Animated micro-series following the Clone Wars.")
+        );
+
+        let season_row = sqlx::query(
+            "SELECT title, metadata_json FROM seasons WHERE series_id = ? AND season_number = 1 LIMIT 1",
+        )
+        .bind(result.media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            season_row.try_get::<String, _>("title").ok().as_deref(),
+            Some("Season 1")
+        );
+        let season_metadata: String = season_row.get("metadata_json");
+        let season_metadata: serde_json::Value = serde_json::from_str(&season_metadata)?;
+        assert_eq!(
+            season_metadata
+                .get("tvdb")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("Season 1")
+        );
+
+        let artwork_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'series' AND owner_id = ? AND provider = 'tvdb'",
+        )
+        .bind(result.media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(artwork_count, 3);
+
+        let cached_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artwork_cache c INNER JOIN artwork_refs r ON r.id = c.artwork_id WHERE r.owner_type = 'series' AND r.owner_id = ?",
+        )
+        .bind(result.media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(cached_count >= 3);
 
         Ok(())
     }

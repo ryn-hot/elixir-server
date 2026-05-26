@@ -3345,7 +3345,7 @@ fn build_source_acquisition_actions(
         actions.push(build_release_review_action(
             release_id,
             subscription.subscription_id,
-            "Review selection",
+            "Review needed",
         ));
     }
 

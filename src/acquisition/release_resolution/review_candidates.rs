@@ -19,13 +19,14 @@ use crate::{
                 review_candidate_release_fingerprint,
             },
             models::{
-                AcquisitionRelease, AcquisitionReleaseState, NewAcquisitionRelease,
-                NewAcquisitionReleaseCoverage, ReleaseConfidence, ReleaseCoverageKind,
-                ReleaseCoverageState, ReleaseKind, ReleaseResolverKind,
+                AcquisitionRelease, AcquisitionReleaseFile, AcquisitionReleaseState,
+                NewAcquisitionRelease, NewAcquisitionReleaseCoverage, NewAcquisitionReleaseFile,
+                ReleaseConfidence, ReleaseCoverageKind, ReleaseCoverageState, ReleaseKind,
+                ReleaseResolverKind,
             },
             store::{
-                get_release_by_fingerprint, list_release_coverage, upsert_release,
-                upsert_release_coverage,
+                get_release_by_fingerprint, list_release_coverage, list_release_files,
+                upsert_release, upsert_release_coverage, upsert_release_file,
             },
         },
     },
@@ -36,6 +37,7 @@ use crate::{
 pub const MANUAL_REVIEW_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MANUAL_REVIEW_REASON_RESOLVER_REJECTED: &str = "resolver_rejected_source_candidate";
 pub const MANUAL_REVIEW_VERIFIER: &str = "manual_review";
+pub const SYNTHETIC_SOURCE_CANDIDATE_FILE_ID: &str = "source-candidate";
 
 #[derive(Debug, Clone)]
 pub struct NewManualReviewCandidateRelease {
@@ -319,6 +321,8 @@ pub async fn upsert_manual_review_candidate_release(
         .await?;
     }
 
+    ensure_manual_review_release_files(pool, &release).await?;
+
     if existing.is_none() {
         record_acquisition_audit_event(
             pool,
@@ -344,6 +348,111 @@ pub async fn upsert_manual_review_candidate_release(
     }
 
     Ok(release)
+}
+
+pub async fn ensure_manual_review_release_files(
+    pool: &AnyPool,
+    release: &AcquisitionRelease,
+) -> Result<Vec<AcquisitionReleaseFile>> {
+    let existing = list_release_files(pool, release.release_id).await?;
+    if !existing.is_empty() || release.confidence != ReleaseConfidence::ReviewRequired {
+        return Ok(existing);
+    }
+
+    let Some(candidate) = release
+        .selected_candidate
+        .clone()
+        .and_then(|value| serde_json::from_value::<AcquisitionCandidate>(value).ok())
+    else {
+        return Ok(existing);
+    };
+
+    let mut files = candidate
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            let path = file.path.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(ReviewCandidateFileInput {
+                file_id: file
+                    .file_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                file_index: file.file_index.or_else(|| i64::try_from(index).ok()),
+                path: path.to_string(),
+                size_bytes: file.size_bytes.and_then(|value| i64::try_from(value).ok()),
+                selectable: file.selectable.unwrap_or(true),
+                synthetic: false,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if files.is_empty()
+        && let Some(path) = synthetic_candidate_path(&release.release_title, &candidate)
+    {
+        files.push(ReviewCandidateFileInput {
+            file_id: Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID.to_string()),
+            file_index: candidate.file_index,
+            path,
+            size_bytes: candidate
+                .size_bytes
+                .and_then(|value| i64::try_from(value).ok()),
+            selectable: true,
+            synthetic: true,
+        });
+    }
+
+    for file in files {
+        upsert_release_file(
+            pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id: release.release_id,
+                file_index: file.file_index,
+                file_id: file.file_id.clone(),
+                provider_file_id: file
+                    .synthetic
+                    .then_some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID.to_string()),
+                path: file.path.clone(),
+                basename: None,
+                size_bytes: file.size_bytes,
+                selectable: file.selectable,
+                selected: None,
+                parsed_title: None,
+                parsed_season_number: None,
+                parsed_episode_number: None,
+                parsed_episode_end_number: None,
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: None,
+                parsed_quality: candidate.quality.clone(),
+                parsed_language: candidate.language.clone(),
+                parsed_release_group: None,
+                parser_confidence: ReleaseConfidence::ReviewRequired,
+                parser_reason: Some(
+                    "Source candidate file row created for manual review mapping.".to_string(),
+                ),
+                raw: Some(json!({
+                    "source": "manual_review_source_candidate",
+                    "synthetic": file.synthetic,
+                    "candidateId": candidate.id.clone(),
+                    "candidateTitle": candidate.title.clone(),
+                    "infoHash": candidate.info_hash.clone(),
+                })),
+                provider_metadata: Some(json!({
+                    "sourceCandidateFile": true,
+                    "synthetic": file.synthetic,
+                    "selectable": file.selectable,
+                })),
+            },
+        )
+        .await?;
+    }
+
+    list_release_files(pool, release.release_id).await
 }
 
 pub async fn count_manual_review_coverage(pool: &AnyPool, release_id: Uuid) -> Result<usize> {
@@ -377,6 +486,37 @@ fn validate_manual_review_input(input: &NewManualReviewCandidateRelease) -> Resu
         bail!("resolver_version is required");
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ReviewCandidateFileInput {
+    file_id: Option<String>,
+    file_index: Option<i64>,
+    path: String,
+    size_bytes: Option<i64>,
+    selectable: bool,
+    synthetic: bool,
+}
+
+fn synthetic_candidate_path(
+    release_title: &str,
+    candidate: &AcquisitionCandidate,
+) -> Option<String> {
+    for value in [&candidate.title, release_title] {
+        let path = value.trim();
+        if looks_like_media_file(path) {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn looks_like_media_file(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("mkv" | "mp4" | "m4v" | "avi" | "mov" | "wmv" | "ts" | "m2ts" | "webm")
+    )
 }
 
 fn coverage_kind_for_release_kind(release_kind: ReleaseKind) -> ReleaseCoverageKind {
