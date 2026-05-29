@@ -9,6 +9,8 @@ pub const EVENT_MANUAL_APPROVAL: &str = "manual_approval";
 pub const EVENT_MANUAL_REJECTION: &str = "manual_rejection";
 pub const EVENT_MANUAL_IMPORT_QUARANTINED: &str = "manual_import_quarantined";
 pub const EVENT_MANUAL_IMPORT_COMPLETED: &str = "manual_import_completed";
+pub const EVENT_ACQUISITION_SEARCH_SCHEDULED: &str = "acquisition_search_scheduled";
+pub const EVENT_ACQUISITION_REQUEST_COMPLETED: &str = "acquisition_request_completed";
 
 #[derive(Debug, Clone, Default)]
 pub struct NewAcquisitionAuditEvent {
@@ -88,4 +90,23 @@ pub async fn count_acquisition_audit_events(
     .fetch_one(pool)
     .await
     .context("counting acquisition audit events")
+}
+
+#[cfg(test)]
+pub async fn count_acquisition_audit_events_for_subscription(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    event_type: &str,
+) -> Result<i64> {
+    sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_audit_events
+         WHERE subscription_id = ?
+           AND event_type = ?",
+    )
+    .bind(subscription_id.to_string())
+    .bind(event_type)
+    .fetch_one(pool)
+    .await
+    .context("counting acquisition subscription audit events")
 }

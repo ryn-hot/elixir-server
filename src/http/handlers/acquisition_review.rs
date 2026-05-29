@@ -2867,8 +2867,10 @@ mod tests {
                 },
             },
             subscriptions::{
-                AcquisitionRoutePolicy, NewAcquisitionSubscription, NewAcquisitionTarget,
-                create_subscription, list_due_candidate_targets, upsert_subscription_targets,
+                AcquisitionCompletionPolicy, AcquisitionMetadataPolicy, AcquisitionMonitorPolicy,
+                AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
+                NewAcquisitionSubscription, NewAcquisitionTarget, create_subscription,
+                list_due_candidate_targets, upsert_subscription_targets,
             },
         },
         config::DatabaseConfig,
@@ -2940,6 +2942,12 @@ mod tests {
                 title: "Example Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3081,6 +3089,12 @@ mod tests {
                 title: "Ambiguous Show".to_string(),
                 year: Some(2026),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3260,6 +3274,12 @@ mod tests {
                 title: "Example Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3557,6 +3577,12 @@ mod tests {
                 title: "Example Anime".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3811,6 +3837,12 @@ mod tests {
                 title: "Star Wars Clone Wars".to_string(),
                 year: Some(2003),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -4553,6 +4585,243 @@ mod tests {
         assert!(
             due.is_empty(),
             "approved targets must not be searched again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr4_manual_review_approval_selects_only_requested_episode_from_pack() -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Scoped Show".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                idempotency_key: Some("osr4-manual-scope".to_string()),
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: Some(json!({
+                    "kind": "episode",
+                    "seasonNumber": 1,
+                    "episodeNumber": 1,
+                    "targetKey": "S01E01"
+                })),
+                metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Episode 1".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Searching),
+                next_search_after: Some(Utc::now()),
+            }],
+        )
+        .await?;
+        let target_id = targets[0].target_id;
+        let release = upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                release_id: None,
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: None,
+                source_extension_id: "elixir.extensions.test-source".to_string(),
+                owner_id: "test".to_string(),
+                media_type: MediaType::Series,
+                title: "Scoped Show".to_string(),
+                release_title: "Scoped.Show.S01.COMPLETE.1080p.WEB-DL-GROUP".to_string(),
+                source: "magnet:?xt=urn:btih:osr4manualscope".to_string(),
+                source_kind: "magnet".to_string(),
+                info_hash: Some("1111111111111111111111111111111111111111".to_string()),
+                fingerprint: "sha256:osr4-manual-scope-pack".to_string(),
+                release_kind: ReleaseKind::SeasonPack,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                resolver_version: "osr4-test".to_string(),
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(92.0),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_provider_id: None,
+                download_id: Some("osr4-manual-download".to_string()),
+                remote_release_id: Some("osr4-manual-download".to_string()),
+                state: AcquisitionReleaseState::ReviewRequired,
+                state_reason: Some("one-shot pack requires manual scoped selection".to_string()),
+                selected_candidate: Some(json!({
+                    "title": "Scoped.Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+                    "source": "magnet:?xt=urn:btih:osr4manualscope"
+                })),
+                coverage_plan: Some(json!({
+                    "requestScopeEvidence": {
+                        "requestMode": "one_shot",
+                        "requestScope": "episode",
+                        "metadataPolicy": "initial_only",
+                        "completionPolicy": "terminal_selected_targets",
+                        "monitorPolicy": "selected_targets",
+                        "targetCount": 1,
+                        "targetIds": [target_id],
+                        "targetKeys": ["S01E01"]
+                    },
+                    "priorityPolicy": {
+                        "status": "review_required",
+                        "reviewReasons": ["scoped pack needs manual file selection"]
+                    }
+                })),
+            },
+        )
+        .await?;
+        let file_specs = [
+            ("ep1", "Scoped.Show.S01E01.1080p.mkv", Some(1)),
+            ("ep2", "Scoped.Show.S01E02.1080p.mkv", Some(2)),
+            ("sample", "Sample.mkv", None),
+        ];
+        let mut file_ids = Vec::new();
+        for (index, (file_id, path, episode)) in file_specs.into_iter().enumerate() {
+            let file = upsert_release_file(
+                &database.pool,
+                NewAcquisitionReleaseFile {
+                    release_file_id: None,
+                    release_id: release.release_id,
+                    file_index: Some(index as i64),
+                    file_id: Some(file_id.to_string()),
+                    provider_file_id: Some(file_id.to_string()),
+                    path: path.to_string(),
+                    basename: None,
+                    size_bytes: Some(1_000_000),
+                    selectable: true,
+                    selected: None,
+                    parsed_title: Some("Scoped Show".to_string()),
+                    parsed_season_number: episode.map(|_| 1),
+                    parsed_episode_number: episode,
+                    parsed_episode_end_number: episode,
+                    parsed_absolute_episode_number: None,
+                    parsed_absolute_episode_end_number: None,
+                    parsed_air_date: None,
+                    parsed_quality: Some("1080p WEB-DL".to_string()),
+                    parsed_language: Some("eng".to_string()),
+                    parsed_release_group: Some("GROUP".to_string()),
+                    parser_confidence: episode
+                        .map(|_| ReleaseConfidence::High)
+                        .unwrap_or(ReleaseConfidence::Low),
+                    parser_reason: episode.is_none().then(|| "sample file".to_string()),
+                    raw: None,
+                    provider_metadata: None,
+                },
+            )
+            .await?;
+            file_ids.push(file.release_file_id);
+        }
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: Some(file_ids[0]),
+                target_id,
+                coverage_kind: ReleaseCoverageKind::SeasonPack,
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(80.0),
+                reason: Some("episode request matched a season pack".to_string()),
+                state: ReleaseCoverageState::ReviewRequired,
+                verified_by: None,
+            },
+        )
+        .await?;
+        upsert_release_job(
+            &database.pool,
+            NewAcquisitionReleaseJob {
+                release_job_id: None,
+                release_id: release.release_id,
+                route_logical_id: DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                provider_id: None,
+                download_id: Some("osr4-manual-download".to_string()),
+                remote_release_id: Some("osr4-manual-download".to_string()),
+                state: ReleaseJobState::Staging,
+                state_reason: Some("waiting review".to_string()),
+                active: true,
+                started_at: Some(Utc::now()),
+                completed_at: None,
+            },
+        )
+        .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            release.release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: vec![file_ids[0]],
+                skipped_release_file_ids: file_ids[1..].to_vec(),
+                reason: Some("verified requested episode only".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let approved_release = get_release(&database.pool, release.release_id)
+            .await?
+            .expect("release");
+        assert_eq!(approved_release.state, AcquisitionReleaseState::Ready);
+        let plan = approved_release
+            .coverage_plan
+            .as_ref()
+            .expect("coverage plan");
+        assert_eq!(
+            plan.pointer("/requestScopeEvidence/requestMode")
+                .and_then(JsonValue::as_str),
+            Some("one_shot")
+        );
+        assert_eq!(
+            plan.pointer("/manualReview/status")
+                .and_then(JsonValue::as_str),
+            Some("approved")
+        );
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let selected = files
+            .iter()
+            .map(|file| (file.release_file_id, file.selected))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(selected.get(&file_ids[0]), Some(&Some(true)));
+        assert_eq!(selected.get(&file_ids[1]), Some(&Some(false)));
+        assert_eq!(selected.get(&file_ids[2]), Some(&Some(false)));
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].target_id, target_id);
+        assert_eq!(coverage[0].release_file_id, Some(file_ids[0]));
+        assert_eq!(coverage[0].state, ReleaseCoverageState::Selected);
+        let target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Submitted);
+        assert_eq!(
+            target.selected_route_logical_id.as_deref(),
+            Some(DEBRID_DEFAULT_LOGICAL_ID)
+        );
+        let due = list_due_candidate_targets(&database.pool, Utc::now(), 10).await?;
+        assert!(
+            due.is_empty(),
+            "approved scoped target must not be searched again"
         );
         Ok(())
     }

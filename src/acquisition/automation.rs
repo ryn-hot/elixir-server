@@ -13,6 +13,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    acquisition::audit::{
+        EVENT_ACQUISITION_SEARCH_SCHEDULED, NewAcquisitionAuditEvent,
+        record_acquisition_audit_event,
+    },
     acquisition::release_resolution::{
         anime::{
             ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
@@ -46,11 +50,13 @@ use crate::{
         },
     },
     acquisition::subscriptions::{
+        AcquisitionCompletionPolicy, AcquisitionRequestMode, AcquisitionRequestScope,
         AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionFilter,
         AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
-        NewAcquisitionTarget, get_target, list_due_candidate_targets,
-        list_due_metadata_subscriptions, list_submitted_debrid_targets, list_subscription_targets,
-        list_subscriptions, record_metadata_refresh, reset_target_for_candidate_retry,
+        NewAcquisitionTarget, complete_terminal_acquisition_requests, get_target,
+        list_due_candidate_targets, list_due_metadata_subscriptions, list_submitted_debrid_targets,
+        list_subscription_targets, list_subscriptions, record_metadata_refresh,
+        reset_target_for_candidate_retry, start_subscription_tracking_if_initial_download_complete,
         update_subscription_external_ids, update_target_state, upsert_subscription_targets,
     },
     db::models::{MediaType, ProviderHealthState},
@@ -95,6 +101,7 @@ const COLD_RETRY_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const METADATA_BATCH_LIMIT: i64 = 5;
 const SEARCH_BATCH_LIMIT: i64 = 20;
 const FALLBACK_BATCH_LIMIT: i64 = 50;
+const COMPLETION_RECONCILIATION_BATCH_LIMIT: i64 = 50;
 const DEFAULT_CANDIDATE_LIMIT: u32 = 25;
 const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 1;
@@ -103,6 +110,7 @@ const DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP: i64 = 2;
 const DEFAULT_GLOBAL_RELEASE_JOB_CAP: i64 = 12;
 const DEFAULT_SUBSCRIPTION_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK: usize = SEARCH_BATCH_LIMIT as usize;
+const INITIAL_BACKFILL_NO_CANDIDATE_TERMINAL_ATTEMPTS: i64 = 3;
 const DEFAULT_MAX_SUBMISSIONS_PER_TICK: usize = 5;
 const DEFAULT_STAGED_INSPECTION_JOB_CAP: i64 = 10;
 const DEFAULT_STALE_ACTIVE_JOB_SECONDS: i64 = 6 * 60 * 60;
@@ -110,6 +118,7 @@ const PACK_BACKFILL_TARGET_THRESHOLD: usize = 3;
 const QUEUE_CAPACITY_RETRY_SECONDS: i64 = 5 * 60;
 const FALLBACK_NEXT_CANDIDATE_RETRY_SECONDS: i64 = 30;
 const MAX_MANUAL_REVIEW_CANDIDATES_PER_GROUP: usize = 5;
+const ONE_SHOT_METADATA_BLOCKER_TARGET_KEY: &str = "METADATA_BLOCKED";
 
 #[derive(Debug, Clone)]
 struct CandidateSubmission {
@@ -119,6 +128,7 @@ struct CandidateSubmission {
     provider_warnings: Vec<String>,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
     tv_coverage_plan: Option<TvCoveragePlan>,
+    request_scope_evidence: Option<JsonValue>,
     dispatch: Option<SchedulerDispatchEvidence>,
 }
 
@@ -156,6 +166,7 @@ struct CandidateReleasePlan {
     covered_target_ids: BTreeSet<Uuid>,
     covered_target_keys: BTreeSet<String>,
     overfetch_count: usize,
+    request_scope_evidence: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +263,7 @@ impl CandidateReleasePlan {
             provider_warnings: self.provider_warnings,
             anime_coverage_plan: self.selection.anime_coverage_plan,
             tv_coverage_plan: self.selection.tv_coverage_plan,
+            request_scope_evidence: self.request_scope_evidence,
             dispatch: Some(dispatch),
         }
     }
@@ -797,6 +809,7 @@ pub(crate) async fn run_acquisition_automation_iteration(state: &AppState) -> Re
     process_stale_qbittorrent_acquisition_releases(state, FALLBACK_BATCH_LIMIT).await?;
     search_due_targets(state).await?;
     retry_failed_debrid_targets_with_torrent(state).await?;
+    reconcile_terminal_acquisition_requests(state).await?;
     Ok(())
 }
 
@@ -822,6 +835,9 @@ async fn refresh_due_metadata(state: &AppState) -> Result<()> {
                         expansion.targets,
                     )
                     .await?;
+                    if subscription.request_mode == AcquisitionRequestMode::OneShot {
+                        clear_one_shot_metadata_blocker(state, &subscription).await?;
+                    }
                 }
                 if let Some(graph_snapshot) = expansion.anime_graph_snapshot {
                     upsert_anime_graph_snapshot(&state.db_pool, graph_snapshot).await?;
@@ -838,6 +854,10 @@ async fn refresh_due_metadata(state: &AppState) -> Result<()> {
                 );
             }
             Err(err) => {
+                if subscription.request_mode == AcquisitionRequestMode::OneShot {
+                    persist_one_shot_metadata_blocker(state, &subscription, &err.to_string())
+                        .await?;
+                }
                 let next_after = now
                     + ChronoDuration::minutes(30)
                     + jitter_duration(&subscription.subscription_id, 15 * 60);
@@ -923,6 +943,27 @@ async fn search_due_targets(state: &AppState) -> Result<()> {
                 "candidate automation failed: {err}"
             );
         }
+    }
+    Ok(())
+}
+
+async fn reconcile_terminal_acquisition_requests(state: &AppState) -> Result<()> {
+    let completed = complete_terminal_acquisition_requests(
+        &state.db_pool,
+        COMPLETION_RECONCILIATION_BATCH_LIMIT,
+        "All scoped acquisition targets reached a terminal state.",
+    )
+    .await?;
+    for item in completed {
+        debug!(
+            subscription_id = %item.subscription_id,
+            request_mode = item.request_mode.as_str(),
+            request_scope = item.request_scope.as_str(),
+            target_count = item.target_count,
+            imported_count = item.imported_count,
+            excluded_count = item.excluded_count,
+            "completed terminal acquisition request"
+        );
     }
     Ok(())
 }
@@ -1030,16 +1071,31 @@ async fn search_and_submit_group(
     ) {
         return Ok(());
     }
-    update_target_state(
-        &state.db_pool,
-        target.target_id,
-        AcquisitionTargetStateUpdate {
-            state: AcquisitionTargetState::Searching,
-            state_reason: Some("Searching acquisition source provider.".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let searching_targets = if group.targets.is_empty() {
+        vec![target.clone()]
+    } else {
+        group.targets.clone()
+    };
+    for grouped_target in &searching_targets {
+        if matches!(
+            grouped_target.state,
+            AcquisitionTargetState::Pending
+                | AcquisitionTargetState::Searching
+                | AcquisitionTargetState::Blocked
+        ) {
+            update_target_state(
+                &state.db_pool,
+                grouped_target.target_id,
+                AcquisitionTargetStateUpdate {
+                    state: AcquisitionTargetState::Searching,
+                    state_reason: Some("Searching acquisition source provider.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+    }
+    record_scheduler_search_audit_event(state, subscription, group, &target).await?;
 
     let request =
         candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
@@ -1104,8 +1160,24 @@ async fn process_candidate_search_response_for_group(
             .await?;
             return Ok(());
         }
-        let next_after = next_candidate_retry_after(subscription, &target, now);
         let state_reason = no_matching_candidates_reason(&batch, group);
+        if should_mark_no_candidate_group_terminal(subscription, target) {
+            update_group_targets_terminal_no_results(
+                state,
+                &grouped_targets,
+                response.provider.provider_id,
+                state_reason,
+            )
+            .await?;
+            start_subscription_tracking_if_initial_download_complete(
+                &state.db_pool,
+                subscription.subscription_id,
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
+        let next_after = next_candidate_retry_after(subscription, &target, now);
         update_group_targets_for_retry(
             state,
             subscription,
@@ -1264,6 +1336,10 @@ async fn build_candidate_release_plans(
                 covered_target_ids: coverage.covered_target_ids,
                 covered_target_keys: coverage.covered_target_keys,
                 overfetch_count: coverage.overfetch_count,
+                request_scope_evidence: Some(request_scope_resolution_evidence(
+                    subscription,
+                    grouped_targets,
+                )),
             }),
             Err(block) => {
                 batch.capacity_block.get_or_insert(block);
@@ -1575,6 +1651,66 @@ fn manual_review_target_scope(
     }
 }
 
+fn request_scope_resolution_evidence(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+) -> JsonValue {
+    json!({
+        "requestMode": subscription.request_mode.as_str(),
+        "requestScope": subscription.request_scope.as_str(),
+        "metadataPolicy": subscription.metadata_policy.as_str(),
+        "completionPolicy": subscription.completion_policy.as_str(),
+        "monitorPolicy": subscription.monitor_policy.as_str(),
+        "scope": subscription.scope.clone(),
+        "targetCount": targets.len(),
+        "targetIds": targets
+            .iter()
+            .map(|target| target.target_id.to_string())
+            .collect::<Vec<_>>(),
+        "targetKeys": targets
+            .iter()
+            .map(|target| target.target_key.clone())
+            .collect::<Vec<_>>(),
+        "seasonNumbers": targets
+            .iter()
+            .filter_map(|target| target.season_number)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "episodeNumbers": targets
+            .iter()
+            .filter_map(|target| target.episode_number)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "absoluteEpisodeNumbers": targets
+            .iter()
+            .filter_map(|target| target.absolute_episode_number)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn coverage_plan_with_request_scope(
+    plan: JsonValue,
+    request_scope_evidence: Option<&JsonValue>,
+) -> JsonValue {
+    let Some(evidence) = request_scope_evidence else {
+        return plan;
+    };
+    match plan {
+        JsonValue::Object(mut object) => {
+            object.insert("requestScopeEvidence".to_string(), evidence.clone());
+            JsonValue::Object(object)
+        }
+        other => json!({
+            "coveragePlan": other,
+            "requestScopeEvidence": evidence,
+        }),
+    }
+}
+
 fn manual_review_route_policy_evidence(
     subscription: &AcquisitionSubscription,
     response: &CandidateSearchResponse,
@@ -1656,6 +1792,48 @@ fn scheduler_dispatch_evidence(
             reason: route_decision_reason(subscription.route_policy, &plan.route_logical_id),
         },
     }
+}
+
+async fn record_scheduler_search_audit_event(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    group: &TargetSearchGroup,
+    target: &AcquisitionTarget,
+) -> Result<()> {
+    let grouped_targets = if group.targets.is_empty() {
+        vec![target.clone()]
+    } else {
+        group.targets.clone()
+    };
+    record_acquisition_audit_event(
+        &state.db_pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_ACQUISITION_SEARCH_SCHEDULED.to_string(),
+            subscription_id: Some(subscription.subscription_id),
+            target_id: Some(target.target_id),
+            state: Some(AcquisitionTargetState::Searching.as_str().to_string()),
+            reason: Some(
+                "Scheduler selected scoped acquisition targets for provider search.".to_string(),
+            ),
+            evidence: Some(json!({
+                "requestMode": subscription.request_mode.as_str(),
+                "requestScope": subscription.request_scope.as_str(),
+                "metadataPolicy": subscription.metadata_policy.as_str(),
+                "completionPolicy": subscription.completion_policy.as_str(),
+                "routePolicy": subscription.route_policy.as_str(),
+                "groupKey": group.group_key.as_str(),
+                "searchIntent": group.search_intent.as_ref(),
+                "targetCount": grouped_targets.len(),
+                "targetKeys": grouped_targets
+                    .iter()
+                    .map(|item| item.target_key.clone())
+                    .collect::<Vec<_>>(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn compare_review_candidate_plans(
@@ -2394,6 +2572,21 @@ fn search_intent_kind(targets: &[AcquisitionTarget], season_number: Option<i32>)
     }
 }
 
+fn should_mark_no_candidate_group_terminal(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+) -> bool {
+    if subscription.request_mode == AcquisitionRequestMode::OneShot
+        && subscription.completion_policy == AcquisitionCompletionPolicy::TerminalSelectedTargets
+    {
+        return true;
+    }
+
+    subscription.request_mode == AcquisitionRequestMode::Monitored
+        && subscription.tracking_started_at.is_none()
+        && representative.search_attempts + 1 >= INITIAL_BACKFILL_NO_CANDIDATE_TERMINAL_ATTEMPTS
+}
+
 fn common_season_number(targets: &[AcquisitionTarget]) -> Option<i32> {
     let mut seasons = targets
         .iter()
@@ -2404,6 +2597,33 @@ fn common_season_number(targets: &[AcquisitionTarget]) -> Option<i32> {
     } else {
         None
     }
+}
+
+async fn update_group_targets_terminal_no_results(
+    state: &AppState,
+    targets: &[AcquisitionTarget],
+    provider_id: Uuid,
+    state_reason: String,
+) -> Result<()> {
+    let Some(first) = targets.first() else {
+        return Ok(());
+    };
+    for target in targets {
+        update_target_state(
+            &state.db_pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Excluded,
+                state_reason: Some(state_reason.clone()),
+                selected_provider_id: Some(provider_id),
+                next_search_after: None,
+                increment_search_attempts: target.target_id == first.target_id,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn update_group_targets_for_retry(
@@ -2558,6 +2778,10 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                     provider_warnings: Vec::new(),
                     anime_coverage_plan: None,
                     tv_coverage_plan: None,
+                    request_scope_evidence: Some(request_scope_resolution_evidence(
+                        subscription,
+                        &[target.clone()],
+                    )),
                     dispatch: None,
                 };
                 match submit_selected_candidate(
@@ -3226,7 +3450,10 @@ async fn persist_anime_release_submission(
                 plan.entries.len()
             )),
             selected_candidate: Some(selected_candidate.clone()),
-            coverage_plan: Some(serde_json::to_value(plan)?),
+            coverage_plan: Some(coverage_plan_with_request_scope(
+                serde_json::to_value(plan)?,
+                submission.request_scope_evidence.as_ref(),
+            )),
         },
     )
     .await?;
@@ -3449,7 +3676,10 @@ async fn persist_tv_release_submission(
                 plan.entries.len()
             )),
             selected_candidate: Some(selected_candidate.clone()),
-            coverage_plan: Some(serde_json::to_value(plan)?),
+            coverage_plan: Some(coverage_plan_with_request_scope(
+                serde_json::to_value(plan)?,
+                submission.request_scope_evidence.as_ref(),
+            )),
         },
     )
     .await?;
@@ -3599,6 +3829,10 @@ async fn expand_subscription_targets(
     subscription: &AcquisitionSubscription,
     now: DateTime<Utc>,
 ) -> Result<SubscriptionExpansion> {
+    if subscription.request_mode == AcquisitionRequestMode::OneShot {
+        return expand_one_shot_subscription_targets(state, subscription, now).await;
+    }
+
     if subscription.monitor_policy
         == crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets
     {
@@ -3641,6 +3875,384 @@ async fn expand_subscription_targets(
         season_chain,
         anime_graph_snapshot,
     })
+}
+
+async fn expand_one_shot_subscription_targets(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    now: DateTime<Utc>,
+) -> Result<SubscriptionExpansion> {
+    let existing_targets =
+        list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+    if existing_targets
+        .iter()
+        .any(|target| !is_metadata_snapshot_blocker_key(&target.target_key))
+    {
+        return Ok(SubscriptionExpansion::default());
+    }
+
+    validate_one_shot_snapshot_scope(subscription)?;
+
+    let original_ids = subscription.external_ids.clone().unwrap_or_default();
+    let mut ids = original_ids.clone();
+    let (mut targets, anime_graph_snapshot) = match subscription.media_type {
+        MediaType::Movie => (expand_movie_subscription(subscription, &ids, now), None),
+        MediaType::Series => (
+            expand_series_subscription(state, subscription, &mut ids, now).await?,
+            None,
+        ),
+        MediaType::Anime => {
+            expand_anime_subscription_with_options(
+                state,
+                subscription,
+                &mut ids,
+                now,
+                AnimeExpansionOptions { strict: true },
+            )
+            .await?
+        }
+    };
+
+    targets.retain(|target| one_shot_scope_allows_target(subscription, target));
+    annotate_one_shot_snapshot_targets(subscription, &mut targets);
+    let season_chain = targets
+        .iter()
+        .filter_map(|target| {
+            target
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("anilistSeason"))
+                .and_then(|value| {
+                    serde_json::from_value::<AniListSeasonChainEntryEnvelope>(value.clone()).ok()
+                })
+                .map(Into::into)
+        })
+        .collect::<Vec<_>>();
+    let target_count = targets.len();
+    if target_count == 0 {
+        bail!(
+            "one-shot metadata snapshot produced no acquisition targets for {} scope '{}'; check metadata provider configuration and external IDs",
+            media_type_name(subscription.media_type),
+            subscription.request_scope.as_str()
+        );
+    }
+
+    Ok(SubscriptionExpansion {
+        targets,
+        target_count,
+        external_ids_changed: if ids != original_ids {
+            ids
+        } else {
+            ExternalIds::default()
+        },
+        season_chain,
+        anime_graph_snapshot,
+    })
+}
+
+async fn persist_one_shot_metadata_blocker(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    message: &str,
+) -> Result<()> {
+    let reason = format!("One-shot metadata snapshot failed: {message}");
+    let targets = upsert_subscription_targets(
+        &state.db_pool,
+        subscription.subscription_id,
+        vec![NewAcquisitionTarget {
+            target_key: Some(ONE_SHOT_METADATA_BLOCKER_TARGET_KEY.to_string()),
+            media_type: Some(subscription.media_type),
+            title: Some(format!("{} metadata snapshot", subscription.title)),
+            season_number: None,
+            episode_number: None,
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: None,
+            metadata: Some(json!({
+                "source": "one_shot_metadata_snapshot",
+                "blocker": "metadata_snapshot_failed",
+                "requestMode": subscription.request_mode.as_str(),
+                "requestScope": subscription.request_scope.as_str(),
+                "metadataPolicy": subscription.metadata_policy.as_str(),
+                "scope": subscription.scope.clone(),
+                "error": message,
+            })),
+            state: Some(AcquisitionTargetState::Blocked),
+            next_search_after: None,
+        }],
+    )
+    .await?;
+
+    if let Some(target) = targets
+        .iter()
+        .find(|target| is_metadata_snapshot_blocker_key(&target.target_key))
+    {
+        update_target_state(
+            &state.db_pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Blocked,
+                state_reason: Some(reason),
+                next_search_after: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn clear_one_shot_metadata_blocker(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+) -> Result<()> {
+    let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+    for target in targets {
+        if is_metadata_snapshot_blocker_key(&target.target_key)
+            && target.state == AcquisitionTargetState::Blocked
+        {
+            update_target_state(
+                &state.db_pool,
+                target.target_id,
+                AcquisitionTargetStateUpdate {
+                    state: AcquisitionTargetState::Excluded,
+                    state_reason: Some(
+                        "Metadata snapshot recovered and created scoped targets".to_string(),
+                    ),
+                    next_search_after: None,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_one_shot_snapshot_scope(subscription: &AcquisitionSubscription) -> Result<()> {
+    let scope = subscription.scope.as_ref();
+    match subscription.request_scope {
+        AcquisitionRequestScope::Subscription | AcquisitionRequestScope::Movie => Ok(()),
+        AcquisitionRequestScope::Episode => {
+            if !scope_target_keys(scope).is_empty()
+                || (scope_i32(scope, &["seasonNumber", "season_number"]).is_some()
+                    && scope_i32(scope, &["episodeNumber", "episode_number"]).is_some())
+                || scope_i32(scope, &["absoluteEpisodeNumber", "absolute_episode_number"]).is_some()
+            {
+                Ok(())
+            } else {
+                bail!(
+                    "one-shot episode request requires targetKey, targetKeys, seasonNumber plus episodeNumber, or absoluteEpisodeNumber"
+                )
+            }
+        }
+        AcquisitionRequestScope::Season => {
+            if scope_i32(scope, &["seasonNumber", "season_number"]).is_some() {
+                Ok(())
+            } else {
+                bail!("one-shot season request requires seasonNumber in scope")
+            }
+        }
+        AcquisitionRequestScope::Range => {
+            if !scope_target_keys(scope).is_empty()
+                || (scope_i32(scope, &["seasonNumber", "season_number"]).is_some()
+                    && (scope_i32(scope, &["episodeStart", "episode_start"]).is_some()
+                        || scope_i32(scope, &["episodeEnd", "episode_end"]).is_some()))
+                || scope_i32(scope, &["absoluteEpisodeStart", "absolute_episode_start"]).is_some()
+                || scope_i32(scope, &["absoluteEpisodeEnd", "absolute_episode_end"]).is_some()
+            {
+                Ok(())
+            } else {
+                bail!(
+                    "one-shot range request requires targetKeys, seasonNumber plus episodeStart/episodeEnd, or absoluteEpisodeStart/absoluteEpisodeEnd"
+                )
+            }
+        }
+        AcquisitionRequestScope::Missing => Ok(()),
+        AcquisitionRequestScope::SelectedTargets => {
+            if !scope_target_keys(scope).is_empty() {
+                Ok(())
+            } else {
+                bail!("one-shot selected-target request requires targetKey or targetKeys in scope")
+            }
+        }
+    }
+}
+
+fn one_shot_scope_allows_target(
+    subscription: &AcquisitionSubscription,
+    target: &NewAcquisitionTarget,
+) -> bool {
+    let scope = subscription.scope.as_ref();
+    let target_keys = scope_target_keys(scope);
+    if !target_keys.is_empty() {
+        let target_key = generated_one_shot_target_key(subscription.media_type, target);
+        return target_keys.contains(&target_key);
+    }
+
+    match subscription.request_scope {
+        AcquisitionRequestScope::Subscription | AcquisitionRequestScope::Movie => true,
+        AcquisitionRequestScope::Missing => true,
+        AcquisitionRequestScope::SelectedTargets => false,
+        AcquisitionRequestScope::Season => scope_i32(scope, &["seasonNumber", "season_number"])
+            .map(|season| target.season_number == Some(season))
+            .unwrap_or(false),
+        AcquisitionRequestScope::Episode => {
+            if let Some(absolute) =
+                scope_i32(scope, &["absoluteEpisodeNumber", "absolute_episode_number"])
+            {
+                return target.absolute_episode_number == Some(absolute);
+            }
+            let season = scope_i32(scope, &["seasonNumber", "season_number"]);
+            let episode = scope_i32(scope, &["episodeNumber", "episode_number"]);
+            season.is_some()
+                && episode.is_some()
+                && target.season_number == season
+                && target.episode_number == episode
+        }
+        AcquisitionRequestScope::Range => {
+            if let Some(absolute) = target.absolute_episode_number
+                && let Some((start, end)) = scope_range(
+                    scope,
+                    &["absoluteEpisodeStart", "absolute_episode_start"],
+                    &["absoluteEpisodeEnd", "absolute_episode_end"],
+                )
+            {
+                return number_in_range(absolute, start, end);
+            }
+            let Some(season) = scope_i32(scope, &["seasonNumber", "season_number"]) else {
+                return false;
+            };
+            let Some(episode) = target.episode_number else {
+                return false;
+            };
+            if target.season_number != Some(season) {
+                return false;
+            }
+            scope_range(
+                scope,
+                &["episodeStart", "episode_start"],
+                &["episodeEnd", "episode_end"],
+            )
+            .map(|(start, end)| number_in_range(episode, start, end))
+            .unwrap_or(false)
+        }
+    }
+}
+
+fn annotate_one_shot_snapshot_targets(
+    subscription: &AcquisitionSubscription,
+    targets: &mut [NewAcquisitionTarget],
+) {
+    for target in targets {
+        let mut metadata = match target.metadata.take() {
+            Some(JsonValue::Object(object)) => object,
+            Some(value) => {
+                let mut object = serde_json::Map::new();
+                object.insert("sourceMetadata".to_string(), value);
+                object
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "acquisitionRequest".to_string(),
+            json!({
+                "mode": subscription.request_mode.as_str(),
+                "scope": subscription.request_scope.as_str(),
+                "metadataPolicy": subscription.metadata_policy.as_str(),
+                "completionPolicy": subscription.completion_policy.as_str(),
+                "requestedScope": subscription.scope.clone(),
+            }),
+        );
+        target.metadata = Some(JsonValue::Object(metadata));
+    }
+}
+
+fn scope_target_keys(scope: Option<&JsonValue>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let Some(scope) = scope else {
+        return keys;
+    };
+    if let Some(value) = scope.get("targetKey").and_then(JsonValue::as_str) {
+        if let Some(key) = normalize_scope_target_key(value) {
+            keys.insert(key);
+        }
+    }
+    for key in ["targetKeys", "targets"] {
+        if let Some(values) = scope.get(key).and_then(JsonValue::as_array) {
+            for value in values {
+                if let Some(value) = value.as_str() {
+                    if let Some(key) = normalize_scope_target_key(value) {
+                        keys.insert(key);
+                    }
+                } else if let Some(value) = value.get("targetKey").and_then(JsonValue::as_str)
+                    && let Some(key) = normalize_scope_target_key(value)
+                {
+                    keys.insert(key);
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn scope_i32(scope: Option<&JsonValue>, keys: &[&str]) -> Option<i32> {
+    let scope = scope?;
+    keys.iter().find_map(|key| {
+        let value = scope.get(*key)?;
+        value
+            .as_i64()
+            .map(|value| value as i32)
+            .or_else(|| value.as_str()?.trim().parse::<i32>().ok())
+    })
+}
+
+fn scope_range(
+    scope: Option<&JsonValue>,
+    start_keys: &[&str],
+    end_keys: &[&str],
+) -> Option<(i32, i32)> {
+    let start = scope_i32(scope, start_keys);
+    let end = scope_i32(scope, end_keys);
+    match (start, end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        (Some(start), None) => Some((start, start)),
+        (None, Some(end)) => Some((end, end)),
+        (None, None) => None,
+    }
+}
+
+fn number_in_range(value: i32, start: i32, end: i32) -> bool {
+    value >= start.min(end) && value <= start.max(end)
+}
+
+fn generated_one_shot_target_key(media_type: MediaType, target: &NewAcquisitionTarget) -> String {
+    target
+        .target_key
+        .as_deref()
+        .and_then(normalize_scope_target_key)
+        .unwrap_or_else(|| {
+            if let (Some(season), Some(episode)) = (target.season_number, target.episode_number) {
+                format!("S{season:02}E{episode:02}")
+            } else if let Some(absolute) = target.absolute_episode_number {
+                format!("A{absolute:04}")
+            } else if let Some(air_date) = target.air_date.as_deref() {
+                format!("DATE:{}", air_date.trim().to_ascii_uppercase())
+            } else if media_type == MediaType::Movie {
+                "MOVIE".to_string()
+            } else {
+                "SERIES".to_string()
+            }
+        })
+}
+
+fn normalize_scope_target_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase())
+}
+
+fn is_metadata_snapshot_blocker_key(value: &str) -> bool {
+    value.eq_ignore_ascii_case(ONE_SHOT_METADATA_BLOCKER_TARGET_KEY)
 }
 
 fn expand_movie_subscription(
@@ -3768,6 +4380,31 @@ async fn expand_anime_subscription(
     Vec<NewAcquisitionTarget>,
     Option<NewAcquisitionAnimeGraphSnapshot>,
 )> {
+    expand_anime_subscription_with_options(
+        state,
+        subscription,
+        ids,
+        now,
+        AnimeExpansionOptions { strict: false },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnimeExpansionOptions {
+    strict: bool,
+}
+
+async fn expand_anime_subscription_with_options(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    ids: &mut ExternalIds,
+    now: DateTime<Utc>,
+    options: AnimeExpansionOptions,
+) -> Result<(
+    Vec<NewAcquisitionTarget>,
+    Option<NewAcquisitionAnimeGraphSnapshot>,
+)> {
     let Some(seed_anilist_id) = ids.anilist.clone() else {
         return Ok((
             expand_series_subscription(state, subscription, ids, now).await?,
@@ -3775,23 +4412,14 @@ async fn expand_anime_subscription(
         ));
     };
 
-    let seed_mapping = state
-        .linkers
-        .fetch_anizip_mapping(&seed_anilist_id)
-        .await
-        .unwrap_or(None);
+    let seed_mapping = fetch_anizip_mapping_for_expansion(state, &seed_anilist_id, options).await?;
     let seed_season = seed_mapping
         .as_ref()
         .and_then(infer_anizip_season_number)
         .unwrap_or(1);
-    let mut season_chain = resolve_anilist_season_chain(
-        Some(&state.settings.classifier),
-        seed_season,
-        &seed_anilist_id,
-        1.0,
-    )
-    .await
-    .unwrap_or_default();
+    let mut season_chain =
+        resolve_anilist_season_chain_for_expansion(&seed_anilist_id, seed_season, state, options)
+            .await?;
     if season_chain.is_empty() {
         season_chain.push(AniListSeasonChainEntry {
             season_number: seed_season,
@@ -3817,11 +4445,7 @@ async fn expand_anime_subscription(
         let mapping = if season.anilist_id == seed_anilist_id {
             seed_mapping.clone()
         } else {
-            state
-                .linkers
-                .fetch_anizip_mapping(&season.anilist_id)
-                .await
-                .unwrap_or(None)
+            fetch_anizip_mapping_for_expansion(state, &season.anilist_id, options).await?
         };
         season_mappings.push(AnimeSeasonMapping {
             season: season.clone(),
@@ -3844,6 +4468,41 @@ async fn expand_anime_subscription(
         DEFAULT_ROUTE_OWNER_ID.to_string(),
     );
     Ok((targets, Some(snapshot)))
+}
+
+async fn fetch_anizip_mapping_for_expansion(
+    state: &AppState,
+    anilist_id: &str,
+    options: AnimeExpansionOptions,
+) -> Result<Option<crate::library::AniZipMapping>> {
+    let result = state.linkers.fetch_anizip_mapping(anilist_id).await;
+    if options.strict {
+        result.with_context(|| format!("fetching ani.zip mapping for AniList id {anilist_id}"))
+    } else {
+        Ok(result.unwrap_or(None))
+    }
+}
+
+async fn resolve_anilist_season_chain_for_expansion(
+    seed_anilist_id: &str,
+    seed_season: i32,
+    state: &AppState,
+    options: AnimeExpansionOptions,
+) -> Result<Vec<AniListSeasonChainEntry>> {
+    let result = resolve_anilist_season_chain(
+        Some(&state.settings.classifier),
+        seed_season,
+        seed_anilist_id,
+        1.0,
+    )
+    .await;
+    if options.strict {
+        result.with_context(|| {
+            format!("resolving AniList season chain for AniList id {seed_anilist_id}")
+        })
+    } else {
+        Ok(result.unwrap_or_default())
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -4534,6 +5193,9 @@ fn selected_candidate_provenance_inner(
         if let Some(plan) = submission.tv_coverage_plan.as_ref() {
             object.insert("tvCoveragePlan".to_string(), serde_json::to_value(plan)?);
         }
+        if let Some(evidence) = submission.request_scope_evidence.as_ref() {
+            object.insert("requestScopeEvidence".to_string(), evidence.clone());
+        }
         if let Some(dispatch) = submission.dispatch.as_ref() {
             object.insert(
                 "schedulerDispatch".to_string(),
@@ -4862,8 +5524,15 @@ fn jitter_seconds(seed: &Uuid, max_seconds: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::acquisition::{
+        audit::{
+            EVENT_ACQUISITION_SEARCH_SCHEDULED, count_acquisition_audit_events_for_subscription,
+        },
         release_resolution::store::{ReleaseListFilter, list_releases},
-        subscriptions::{NewAcquisitionSubscription, create_subscription},
+        subscriptions::{
+            AcquisitionCompletionPolicy, AcquisitionMetadataPolicy, AcquisitionRequestMode,
+            AcquisitionRequestScope, NewAcquisitionSubscription, NewAcquisitionTarget,
+            create_subscription, upsert_subscription_targets,
+        },
     };
     use crate::http::handlers::acquisition_sources::{
         AcquisitionCandidateFile, CandidateProviderSummary, normalize_acquisition_candidate,
@@ -4888,7 +5557,11 @@ mod tests {
         },
         library::LinkerService,
     };
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{
+        Json, Router,
+        extract::{Path as AxumPath, Query, State},
+        routing::{get, post},
+    };
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tokio::{net::TcpListener, task::JoinHandle};
@@ -4911,6 +5584,10 @@ mod tests {
             max_connections: 1,
             connect_timeout_seconds: 5,
         };
+        setup_test_state_with_settings(settings).await
+    }
+
+    async fn setup_test_state_with_settings(settings: Settings) -> Result<AppState> {
         let database = Database::connect(&settings.database).await?;
         database.run_migrations().await?;
         let auth_service = AuthService::new(settings.auth.clone())?;
@@ -4931,6 +5608,110 @@ mod tests {
             artwork,
             secrets,
         ))
+    }
+
+    async fn setup_test_state_with_tvdb_fixture() -> Result<(AppState, JoinHandle<()>)> {
+        let (base_url, handle) = start_osr1_tvdb_fixture().await?;
+        let mut settings = Settings::default();
+        settings.database = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        settings.classifier.tvdb_base_url = base_url;
+        settings.classifier.tvdb_api_key = Some("test-tvdb-key".to_string());
+        setup_test_state_with_settings(settings)
+            .await
+            .map(|state| (state, handle))
+    }
+
+    async fn start_osr1_tvdb_fixture() -> Result<(String, JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let app = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(json!({ "data": { "token": "test-token" } })) }),
+            )
+            .route(
+                "/series/:series_id/extended",
+                get(|AxumPath(series_id): AxumPath<String>| async move {
+                    Json(json!({
+                        "data": {
+                            "id": series_id.parse::<i64>().unwrap_or_default(),
+                            "seasons": [
+                                { "id": 10, "number": 0 },
+                                { "id": 11, "number": 1 },
+                                { "id": 12, "number": 2 }
+                            ]
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/series/:series_id/episodes/default",
+                get(
+                    |AxumPath(series_id): AxumPath<String>,
+                     Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                        let season = query
+                            .get("season")
+                            .and_then(|value| value.parse::<i32>().ok())
+                            .unwrap_or(1);
+                        let episodes = match season {
+                            1 => vec![
+                                json!({
+                                    "id": 101,
+                                    "seasonNumber": 1,
+                                    "number": 1,
+                                    "absoluteNumber": 1,
+                                    "name": format!("Fixture {series_id} S01E01"),
+                                    "aired": "2026-01-01"
+                                }),
+                                json!({
+                                    "id": 102,
+                                    "seasonNumber": 1,
+                                    "number": 2,
+                                    "absoluteNumber": 2,
+                                    "name": format!("Fixture {series_id} S01E02"),
+                                    "aired": "2026-01-08"
+                                }),
+                            ],
+                            2 => vec![
+                                json!({
+                                    "id": 201,
+                                    "seasonNumber": 2,
+                                    "number": 1,
+                                    "absoluteNumber": 3,
+                                    "name": format!("Fixture {series_id} S02E01"),
+                                    "aired": "2026-02-01"
+                                }),
+                                json!({
+                                    "id": 202,
+                                    "seasonNumber": 2,
+                                    "number": 2,
+                                    "absoluteNumber": 4,
+                                    "name": format!("Fixture {series_id} S02E02"),
+                                    "aired": "2026-02-08"
+                                }),
+                                json!({
+                                    "id": 203,
+                                    "seasonNumber": 2,
+                                    "number": 3,
+                                    "absoluteNumber": 5,
+                                    "name": format!("Fixture {series_id} S02E03"),
+                                    "aired": "2026-02-15"
+                                }),
+                            ],
+                            _ => Vec::new(),
+                        };
+                        Json(json!({ "data": { "episodes": episodes } }))
+                    },
+                ),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("tvdb fixture");
+        });
+        Ok((base_url, handle))
     }
 
     #[derive(Clone)]
@@ -5274,6 +6055,281 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn osr1_one_shot_season_snapshot_hydrates_tvdb_targets_once() -> Result<()> {
+        let (state, fixture) = setup_test_state_with_tvdb_fixture().await?;
+        let now = Utc::now();
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "OSR One Shot Season".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("338186".to_string()),
+                    tvdb: Some("338186".to_string()),
+                    ..ExternalIds::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: Some(json!({ "kind": "season", "seasonNumber": 1 })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: Default::default(),
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                candidate_search_after: Some(now),
+            },
+        )
+        .await?;
+
+        refresh_due_metadata(&state).await?;
+        fixture.abort();
+
+        let targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S01E01", "S01E02"]
+        );
+        assert!(targets.iter().all(|target| {
+            target
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/acquisitionRequest/mode"))
+                .and_then(JsonValue::as_str)
+                == Some("one_shot")
+        }));
+
+        let due = list_due_metadata_subscriptions(&state.db_pool, Utc::now(), 10).await?;
+        assert!(
+            due.iter()
+                .all(|item| item.subscription_id != subscription.subscription_id),
+            "one-shot season snapshots must not be scheduled for recurring refresh"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr1_one_shot_range_snapshot_filters_tvdb_targets() -> Result<()> {
+        let (state, fixture) = setup_test_state_with_tvdb_fixture().await?;
+        let now = Utc::now();
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "OSR One Shot Range".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("338186".to_string()),
+                    tvdb: Some("338186".to_string()),
+                    ..ExternalIds::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Range),
+                scope: Some(json!({
+                    "kind": "range",
+                    "seasonNumber": 2,
+                    "episodeStart": 2,
+                    "episodeEnd": 3
+                })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: Default::default(),
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                candidate_search_after: Some(now),
+            },
+        )
+        .await?;
+
+        refresh_due_metadata(&state).await?;
+        fixture.abort();
+
+        let targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S02E02", "S02E03"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr1_one_shot_missing_snapshot_uses_provider_scope_without_recurring_refresh()
+    -> Result<()> {
+        let (state, fixture) = setup_test_state_with_tvdb_fixture().await?;
+        let now = Utc::now();
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "OSR Missing Scope".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("338186".to_string()),
+                    tvdb: Some("338186".to_string()),
+                    ..ExternalIds::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Missing),
+                scope: Some(json!({ "kind": "missing" })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: Default::default(),
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                candidate_search_after: Some(now),
+            },
+        )
+        .await?;
+
+        refresh_due_metadata(&state).await?;
+        fixture.abort();
+
+        let targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(targets.len(), 5);
+        assert!(targets.iter().any(|target| target.target_key == "S01E01"));
+        assert!(targets.iter().any(|target| target.target_key == "S02E03"));
+        let subscription = crate::acquisition::subscriptions::get_subscription(
+            &state.db_pool,
+            subscription.subscription_id,
+        )
+        .await?
+        .expect("subscription");
+        assert_eq!(
+            subscription.metadata_policy,
+            AcquisitionMetadataPolicy::InitialOnly
+        );
+        assert!(subscription.last_metadata_refresh_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr1_one_shot_metadata_failure_persists_blocker_target() -> Result<()> {
+        let state = setup_test_state().await?;
+        let now = Utc::now();
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "OSR Blocked Metadata".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("338186".to_string()),
+                    tvdb: Some("338186".to_string()),
+                    ..ExternalIds::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: Some(json!({ "kind": "season", "seasonNumber": 1 })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: Default::default(),
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                candidate_search_after: Some(now),
+            },
+        )
+        .await?;
+
+        refresh_due_metadata(&state).await?;
+
+        let targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_key, ONE_SHOT_METADATA_BLOCKER_TARGET_KEY);
+        assert_eq!(targets[0].state, AcquisitionTargetState::Blocked);
+        assert!(
+            targets[0]
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("TVDB API key is required"),
+            "unexpected blocker reason: {:?}",
+            targets[0].state_reason
+        );
+        assert_eq!(
+            targets[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("blocker"))
+                .and_then(JsonValue::as_str),
+            Some("metadata_snapshot_failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn osr1_one_shot_anime_mapped_scope_uses_canonical_target_keys() -> Result<()> {
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Anime,
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::SelectedTargets,
+            scope: Some(json!({
+                "kind": "selected_targets",
+                "targetKeys": ["S03E02"]
+            })),
+            ..test_subscription()
+        };
+        let wanted = NewAcquisitionTarget {
+            target_key: None,
+            media_type: Some(MediaType::Anime),
+            title: Some("Mapped Anime Episode".to_string()),
+            season_number: Some(3),
+            episode_number: Some(2),
+            absolute_episode_number: Some(24),
+            air_date: None,
+            air_time: None,
+            metadata: Some(json!({
+                "source": "anizip",
+                "tvdbSeason": 3,
+                "tvdbEpisode": 2,
+                "anilistSeason": {
+                    "seasonNumber": 3,
+                    "anilistId": "1003",
+                    "title": "Mapped Anime S3",
+                    "confidence": 1.0
+                }
+            })),
+            state: Some(AcquisitionTargetState::Pending),
+            next_search_after: None,
+        };
+        let extra = NewAcquisitionTarget {
+            season_number: Some(3),
+            episode_number: Some(3),
+            absolute_episode_number: Some(25),
+            ..wanted.clone()
+        };
+
+        assert!(one_shot_scope_allows_target(&subscription, &wanted));
+        assert!(!one_shot_scope_allows_target(&subscription, &extra));
+        Ok(())
+    }
+
     fn candidate(
         title: &str,
         routes: Vec<&str>,
@@ -5318,6 +6374,7 @@ mod tests {
             provider_warnings: Vec::new(),
             anime_coverage_plan: None,
             tv_coverage_plan: None,
+            request_scope_evidence: None,
             dispatch: None,
         };
 
@@ -5373,6 +6430,12 @@ mod tests {
             normalized_title: "show".to_string(),
             year: Some(2026),
             external_ids: None,
+            idempotency_key: None,
+            request_mode: AcquisitionRequestMode::Monitored,
+            request_scope: AcquisitionRequestScope::Subscription,
+            scope: None,
+            metadata_policy: AcquisitionMetadataPolicy::Recurring,
+            completion_policy: AcquisitionCompletionPolicy::Manual,
             monitor_policy: Default::default(),
             route_policy: AcquisitionRoutePolicy::DebridFirst,
             source_provider_id: None,
@@ -5608,6 +6671,7 @@ mod tests {
                 .map(|target| target.target_key.clone())
                 .collect(),
             overfetch_count: 0,
+            request_scope_evidence: None,
         }
     }
 
@@ -5975,6 +7039,12 @@ mod tests {
                     tvdb_series: Some("9001".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: Some(provider_id),
@@ -6085,6 +7155,12 @@ mod tests {
                     tvdb_series: Some("9102".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: Some(provider_id),
@@ -6174,6 +7250,12 @@ mod tests {
                     tvdb_series: Some("9201".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: Some(provider_id),
@@ -6236,6 +7318,197 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("No acquisition candidates were returned"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mmr1_one_shot_no_candidates_marks_targets_terminal_no_results() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49155).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "One Shot Empty Source".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("9301".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: Some(json!({
+                    "kind": "season",
+                    "seasonNumber": 1
+                })),
+                metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy:
+                    crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![
+                new_series_episode_target("One Shot Empty Source", 1, 1),
+                new_series_episode_target("One Shot Empty Source", 1, 2),
+            ],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "mmr1-one-shot-empty-source".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: Some(search_intent_for_targets(&targets, RetryBucket::Cold)),
+        };
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "elixir.sources.mmr1.empty",
+            vec!["series"],
+            Vec::new(),
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(updated_targets.len(), 2);
+        assert!(updated_targets.iter().all(|target| {
+            target.state == AcquisitionTargetState::Excluded
+                && target.selected_provider_id == Some(provider_id)
+                && target.state_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("No acquisition candidates were returned")
+                })
+        }));
+        assert_eq!(updated_targets[0].search_attempts, 1);
+        assert_eq!(updated_targets[1].search_attempts, 0);
+
+        let completed = complete_terminal_acquisition_requests(
+            &state.db_pool,
+            10,
+            "All scoped acquisition targets reached a terminal state.",
+        )
+        .await?;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].target_count, 2);
+        assert_eq!(completed[0].excluded_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mmr_live_initial_backfill_no_candidates_terminalizes_after_retry_budget() -> Result<()>
+    {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49156).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Initial Empty Source".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("9401".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::Monitored),
+                request_scope: Some(AcquisitionRequestScope::Subscription),
+                scope: None,
+                metadata_policy: Some(AcquisitionMetadataPolicy::Recurring),
+                completion_policy: Some(AcquisitionCompletionPolicy::Manual),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![
+                new_series_episode_target("Initial Empty Source", 1, 1),
+                new_series_episode_target("Initial Empty Source", 1, 2),
+            ],
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_targets SET search_attempts = 2 WHERE target_id = ?",
+        )
+        .bind(targets[0].target_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+        let refreshed_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        let group = TargetSearchGroup {
+            group_key: "mmr-live-initial-empty-source".to_string(),
+            representative: refreshed_targets[0].clone(),
+            targets: refreshed_targets.clone(),
+            search_intent: Some(search_intent_for_targets(
+                &refreshed_targets,
+                RetryBucket::Cold,
+            )),
+        };
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "elixir.sources.mmr-live.empty",
+            vec!["series"],
+            Vec::new(),
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &refreshed_targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert!(updated_targets.iter().all(|target| {
+            target.state == AcquisitionTargetState::Excluded
+                && target.selected_provider_id == Some(provider_id)
+                && target.next_search_after.is_none()
+                && target.state_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("No acquisition candidates were returned")
+                })
+        }));
+        let tracking_started_at: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(tracking_started_at AS TEXT)
+             FROM acquisition_subscriptions
+             WHERE subscription_id = ?",
+        )
+        .bind(subscription.subscription_id.to_string())
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert!(tracking_started_at.is_some());
         Ok(())
     }
 
@@ -7017,6 +8290,7 @@ mod tests {
             provider_warnings: Vec::new(),
             anime_coverage_plan: None,
             tv_coverage_plan: None,
+            request_scope_evidence: None,
             dispatch: None,
         };
 
@@ -7412,6 +8686,300 @@ mod tests {
     }
 
     #[test]
+    fn osr3_large_one_shot_groups_are_interleaved_with_other_requests() {
+        let one_shot = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Season,
+            metadata_policy: AcquisitionMetadataPolicy::InitialOnly,
+            completion_policy: AcquisitionCompletionPolicy::TerminalSelectedTargets,
+            monitor_policy:
+                crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets,
+            scope: Some(json!({ "kind": "season", "seasonNumber": 1 })),
+            ..test_subscription()
+        };
+        let monitored = AcquisitionSubscription {
+            subscription_id: Uuid::new_v4(),
+            title: "Monitored".to_string(),
+            normalized_title: "monitored".to_string(),
+            ..test_subscription()
+        };
+        let group = |subscription: &AcquisitionSubscription, episode: i32| TargetSearchGroup {
+            group_key: format!(
+                "{}:series:{}:episode:{episode}",
+                subscription.subscription_id,
+                subscription.request_mode.as_str()
+            ),
+            representative: episode_target(subscription, 1, episode),
+            targets: vec![episode_target(subscription, 1, episode)],
+            search_intent: Some(search_intent_for_targets(
+                &[episode_target(subscription, 1, episode)],
+                RetryBucket::Cold,
+            )),
+        };
+
+        let ordered = fair_order_search_groups(vec![
+            group(&one_shot, 1),
+            group(&one_shot, 2),
+            group(&one_shot, 3),
+            group(&one_shot, 4),
+            group(&monitored, 1),
+            group(&monitored, 2),
+        ]);
+        let ids = ordered
+            .iter()
+            .map(|group| group.representative.subscription_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 6);
+        assert_ne!(
+            ids[0], ids[1],
+            "large one-shot scopes must not monopolize the scheduler lane"
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == one_shot.subscription_id)
+                .count(),
+            4
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == monitored.subscription_id)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn osr3_scheduler_audit_records_one_shot_mode_scope_and_targets() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: Some(json!({ "kind": "season", "seasonNumber": 1 })),
+                metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                ..NewAcquisitionSubscription {
+                    media_type: MediaType::Series,
+                    title: "Audit Show".to_string(),
+                    year: Some(2026),
+                    external_ids: None,
+                    idempotency_key: None,
+                    request_mode: None,
+                    request_scope: None,
+                    scope: None,
+                    metadata_policy: None,
+                    completion_policy: None,
+                    monitor_policy: Default::default(),
+                    route_policy: AcquisitionRoutePolicy::DebridFirst,
+                    source_provider_id: None,
+                    release_delay_seconds: Some(0),
+                    quality_profile: None,
+                    metadata_refresh_after: Some(Utc::now()),
+                    candidate_search_after: Some(Utc::now()),
+                }
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![
+                new_series_episode_target("Audit Show", 1, 1),
+                new_series_episode_target("Audit Show", 1, 2),
+            ],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "osr3-audit-group".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: Some(search_intent_for_targets(&targets, RetryBucket::Cold)),
+        };
+
+        record_scheduler_search_audit_event(&state, &subscription, &group, &targets[0]).await?;
+
+        assert_eq!(
+            count_acquisition_audit_events_for_subscription(
+                &state.db_pool,
+                subscription.subscription_id,
+                EVENT_ACQUISITION_SEARCH_SCHEDULED,
+            )
+            .await?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr4_one_shot_episode_accepts_season_pack_with_scoped_file_selection() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Episode,
+            scope: Some(json!({
+                "kind": "episode",
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "targetKey": "S01E01"
+            })),
+            metadata_policy:
+                crate::acquisition::subscriptions::AcquisitionMetadataPolicy::InitialOnly,
+            completion_policy:
+                crate::acquisition::subscriptions::AcquisitionCompletionPolicy::TerminalSelectedTargets,
+            monitor_policy:
+                crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets,
+            source_provider_id: Some(Uuid::new_v4()),
+            ..test_subscription()
+        };
+        let target = episode_target(&subscription, 1, 1);
+        let candidate: AcquisitionCandidate = serde_json::from_value(candidate_json(
+            "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+            "osr4seasonpack",
+            &[
+                ("1", "Show.S01.COMPLETE/Show.S01E01.1080p.mkv"),
+                ("2", "Show.S01.COMPLETE/Show.S01E02.1080p.mkv"),
+            ],
+        ))?;
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.source",
+            vec!["series"],
+            vec![candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        let plan = &batch.plans[0];
+        assert_eq!(plan.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(
+            plan.covered_target_keys,
+            BTreeSet::from(["S01E01".to_string()])
+        );
+        assert_eq!(plan.overfetch_count, 1);
+        assert_eq!(
+            plan.request_scope_evidence
+                .as_ref()
+                .and_then(|value| value.get("requestMode"))
+                .and_then(JsonValue::as_str),
+            Some("one_shot")
+        );
+
+        let group = TargetSearchGroup {
+            group_key: "osr4-one-shot-episode".to_string(),
+            representative: target.clone(),
+            targets: vec![target],
+            search_intent: Some(CandidateSearchIntent {
+                kind: "episode".to_string(),
+                target_count: 1,
+                target_keys: vec!["S01E01".to_string()],
+                season_number: Some(1),
+                episode_start: Some(1),
+                episode_end: Some(1),
+                ..Default::default()
+            }),
+        };
+        let dispatch = scheduler_dispatch_evidence(
+            &subscription,
+            &group,
+            plan,
+            governor.capacity_snapshot(subscription.subscription_id, &plan.route_logical_id),
+        );
+        let provenance = selected_candidate_provenance(&plan.clone().into_submission(dispatch))?;
+        assert_eq!(
+            provenance
+                .pointer("/requestScopeEvidence/requestScope")
+                .and_then(JsonValue::as_str),
+            Some("episode")
+        );
+        assert_eq!(
+            provenance
+                .pointer("/requestScopeEvidence/targetKeys/0")
+                .and_then(JsonValue::as_str),
+            Some("S01E01")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr4_one_shot_season_accepts_multiseason_pack_by_selecting_requested_files()
+    -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Season,
+            scope: Some(json!({ "kind": "season", "seasonNumber": 2 })),
+            metadata_policy:
+                crate::acquisition::subscriptions::AcquisitionMetadataPolicy::InitialOnly,
+            completion_policy:
+                crate::acquisition::subscriptions::AcquisitionCompletionPolicy::TerminalSelectedTargets,
+            monitor_policy:
+                crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets,
+            source_provider_id: Some(Uuid::new_v4()),
+            ..test_subscription()
+        };
+        let targets = vec![
+            episode_target(&subscription, 2, 1),
+            episode_target(&subscription, 2, 2),
+        ];
+        let candidate: AcquisitionCandidate = serde_json::from_value(candidate_json(
+            "Show.S01-S03.1080p.BluRay-GROUP",
+            "osr4multiseason",
+            &[
+                ("s1e1", "Show.S01-S03/Show.S01E01.1080p.mkv"),
+                ("s2e1", "Show.S01-S03/Show.S02E01.1080p.mkv"),
+                ("s2e2", "Show.S01-S03/Show.S02E02.1080p.mkv"),
+                ("s3e1", "Show.S01-S03/Show.S03E01.1080p.mkv"),
+            ],
+        ))?;
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.source",
+            vec!["series"],
+            vec![candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &targets[0],
+            &targets,
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        let plan = &batch.plans[0];
+        assert_eq!(plan.release_kind, ReleaseKind::MultiSeasonPack);
+        assert_eq!(plan.covered_target_keys.len(), 2);
+        assert_eq!(plan.overfetch_count, 2);
+        assert_eq!(
+            plan.request_scope_evidence
+                .as_ref()
+                .and_then(|value| value.get("requestScope"))
+                .and_then(JsonValue::as_str),
+            Some("season")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rr6c_dispatch_evidence_records_plan_route_capacity_and_search_context() {
         let subscription = test_subscription();
         let targets = vec![
@@ -7618,6 +9186,12 @@ mod tests {
             normalized_title: "show".to_string(),
             year: None,
             external_ids: None,
+            idempotency_key: None,
+            request_mode: AcquisitionRequestMode::Monitored,
+            request_scope: AcquisitionRequestScope::Subscription,
+            scope: None,
+            metadata_policy: AcquisitionMetadataPolicy::Recurring,
+            completion_policy: AcquisitionCompletionPolicy::Manual,
             monitor_policy: Default::default(),
             route_policy: AcquisitionRoutePolicy::DebridFirst,
             source_provider_id: None,

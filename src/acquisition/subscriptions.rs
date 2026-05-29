@@ -3,12 +3,19 @@ use std::{collections::BTreeSet, str::FromStr};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use sqlx::{AnyPool, Row, TypeInfo, Value as SqlxValue, ValueRef, any::AnyRow};
 use uuid::Uuid;
 
 use crate::{
-    db::models::MediaType, download_broker::DEBRID_DEFAULT_LOGICAL_ID, extensions::ExternalIds,
+    acquisition::audit::{
+        EVENT_ACQUISITION_REQUEST_COMPLETED, NewAcquisitionAuditEvent,
+        record_acquisition_audit_event,
+    },
+    acquisition::episode_state::sync_library_episode_acquisition_state_for_target,
+    db::models::MediaType,
+    download_broker::DEBRID_DEFAULT_LOGICAL_ID,
+    extensions::ExternalIds,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +166,10 @@ impl AcquisitionTargetState {
             Self::Excluded => "excluded",
         }
     }
+
+    fn clears_next_search_after(self) -> bool {
+        matches!(self, Self::Submitted | Self::Imported | Self::Excluded)
+    }
 }
 
 impl FromStr for AcquisitionTargetState {
@@ -177,6 +188,166 @@ impl FromStr for AcquisitionTargetState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionRequestMode {
+    Monitored,
+    OneShot,
+}
+
+impl Default for AcquisitionRequestMode {
+    fn default() -> Self {
+        Self::Monitored
+    }
+}
+
+impl AcquisitionRequestMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Monitored => "monitored",
+            Self::OneShot => "one_shot",
+        }
+    }
+
+    pub fn is_one_shot(self) -> bool {
+        matches!(self, Self::OneShot)
+    }
+}
+
+impl FromStr for AcquisitionRequestMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "monitored" | "subscription" => Ok(Self::Monitored),
+            "one_shot" | "oneshot" | "one-shot" => Ok(Self::OneShot),
+            other => bail!("unknown acquisition request mode '{other}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionRequestScope {
+    Subscription,
+    Movie,
+    Episode,
+    Season,
+    Range,
+    Missing,
+    SelectedTargets,
+}
+
+impl Default for AcquisitionRequestScope {
+    fn default() -> Self {
+        Self::Subscription
+    }
+}
+
+impl AcquisitionRequestScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Movie => "movie",
+            Self::Episode => "episode",
+            Self::Season => "season",
+            Self::Range => "range",
+            Self::Missing => "missing",
+            Self::SelectedTargets => "selected_targets",
+        }
+    }
+}
+
+impl FromStr for AcquisitionRequestScope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "subscription" | "monitor" | "monitored" => Ok(Self::Subscription),
+            "movie" => Ok(Self::Movie),
+            "episode" | "singleton_episode" => Ok(Self::Episode),
+            "season" | "season_slice" => Ok(Self::Season),
+            "range" | "episode_range" => Ok(Self::Range),
+            "missing" | "all_missing" => Ok(Self::Missing),
+            "selected_targets" | "selected" | "targets" => Ok(Self::SelectedTargets),
+            other => bail!("unknown acquisition request scope '{other}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionMetadataPolicy {
+    Recurring,
+    InitialOnly,
+    None,
+}
+
+impl Default for AcquisitionMetadataPolicy {
+    fn default() -> Self {
+        Self::Recurring
+    }
+}
+
+impl AcquisitionMetadataPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recurring => "recurring",
+            Self::InitialOnly => "initial_only",
+            Self::None => "none",
+        }
+    }
+}
+
+impl FromStr for AcquisitionMetadataPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "recurring" => Ok(Self::Recurring),
+            "initial_only" | "initial" | "snapshot" => Ok(Self::InitialOnly),
+            "none" | "disabled" => Ok(Self::None),
+            other => bail!("unknown acquisition metadata policy '{other}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionCompletionPolicy {
+    Manual,
+    TerminalSelectedTargets,
+}
+
+impl Default for AcquisitionCompletionPolicy {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+impl AcquisitionCompletionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::TerminalSelectedTargets => "terminal_selected_targets",
+        }
+    }
+}
+
+impl FromStr for AcquisitionCompletionPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "manual" => Ok(Self::Manual),
+            "terminal_selected_targets" | "selected_targets" | "terminal" => {
+                Ok(Self::TerminalSelectedTargets)
+            }
+            other => bail!("unknown acquisition completion policy '{other}'"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAcquisitionSubscription {
@@ -186,6 +357,18 @@ pub struct NewAcquisitionSubscription {
     pub year: Option<i32>,
     #[serde(default)]
     pub external_ids: Option<ExternalIds>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub request_mode: Option<AcquisitionRequestMode>,
+    #[serde(default)]
+    pub request_scope: Option<AcquisitionRequestScope>,
+    #[serde(default)]
+    pub scope: Option<JsonValue>,
+    #[serde(default)]
+    pub metadata_policy: Option<AcquisitionMetadataPolicy>,
+    #[serde(default)]
+    pub completion_policy: Option<AcquisitionCompletionPolicy>,
     #[serde(default)]
     pub monitor_policy: AcquisitionMonitorPolicy,
     #[serde(default)]
@@ -205,6 +388,18 @@ pub struct NewAcquisitionSubscription {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionSubscriptionUpdate {
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub request_mode: Option<AcquisitionRequestMode>,
+    #[serde(default)]
+    pub request_scope: Option<AcquisitionRequestScope>,
+    #[serde(default)]
+    pub scope: Option<JsonValue>,
+    #[serde(default)]
+    pub metadata_policy: Option<AcquisitionMetadataPolicy>,
+    #[serde(default)]
+    pub completion_policy: Option<AcquisitionCompletionPolicy>,
     #[serde(default)]
     pub monitor_policy: Option<AcquisitionMonitorPolicy>,
     #[serde(default)]
@@ -234,6 +429,12 @@ pub struct AcquisitionSubscription {
     pub normalized_title: String,
     pub year: Option<i32>,
     pub external_ids: Option<ExternalIds>,
+    pub idempotency_key: Option<String>,
+    pub request_mode: AcquisitionRequestMode,
+    pub request_scope: AcquisitionRequestScope,
+    pub scope: Option<JsonValue>,
+    pub metadata_policy: AcquisitionMetadataPolicy,
+    pub completion_policy: AcquisitionCompletionPolicy,
     pub monitor_policy: AcquisitionMonitorPolicy,
     pub route_policy: AcquisitionRoutePolicy,
     pub source_provider_id: Option<Uuid>,
@@ -349,6 +550,16 @@ pub struct AcquisitionSubscriptionFilter {
     pub active: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+struct AcquisitionRequestContract {
+    request_mode: AcquisitionRequestMode,
+    request_scope: AcquisitionRequestScope,
+    scope: Option<JsonValue>,
+    metadata_policy: AcquisitionMetadataPolicy,
+    completion_policy: AcquisitionCompletionPolicy,
+    monitor_policy: AcquisitionMonitorPolicy,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAcquisitionIntent {
@@ -358,6 +569,18 @@ pub struct CreateAcquisitionIntent {
     pub year: Option<i32>,
     #[serde(default)]
     pub external_ids: Option<ExternalIds>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub request_mode: Option<AcquisitionRequestMode>,
+    #[serde(default)]
+    pub request_scope: Option<AcquisitionRequestScope>,
+    #[serde(default)]
+    pub scope: Option<JsonValue>,
+    #[serde(default)]
+    pub metadata_policy: Option<AcquisitionMetadataPolicy>,
+    #[serde(default)]
+    pub completion_policy: Option<AcquisitionCompletionPolicy>,
     #[serde(default)]
     pub monitor_policy: Option<AcquisitionMonitorPolicy>,
     #[serde(default)]
@@ -417,8 +640,107 @@ pub struct AcquisitionIntentTarget {
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionIntentCreation {
     pub created: bool,
+    pub existing: bool,
     pub expanded_target_count: usize,
+    pub target_counts: AcquisitionRequestTargetCounts,
+    pub blockers: Vec<AcquisitionRequestBlocker>,
     pub detail: AcquisitionSubscriptionDetail,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionRequestTargetCounts {
+    pub pending: usize,
+    pub searching: usize,
+    pub submitted: usize,
+    pub blocked: usize,
+    pub imported: usize,
+    pub excluded: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionRequestBlocker {
+    pub target_id: Uuid,
+    pub target_key: String,
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionRequestRetryResult {
+    pub metadata_retry_scheduled: bool,
+    pub targets_reset: usize,
+    pub target_counts: AcquisitionRequestTargetCounts,
+    pub blockers: Vec<AcquisitionRequestBlocker>,
+    pub detail: AcquisitionSubscriptionDetail,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalAcquisitionRequestCompletion {
+    pub subscription_id: Uuid,
+    pub request_mode: AcquisitionRequestMode,
+    pub request_scope: AcquisitionRequestScope,
+    pub target_count: usize,
+    pub imported_count: usize,
+    pub excluded_count: usize,
+}
+
+impl AcquisitionIntentCreation {
+    fn from_detail(
+        created: bool,
+        expanded_target_count: usize,
+        detail: AcquisitionSubscriptionDetail,
+    ) -> Self {
+        Self {
+            created,
+            existing: !created,
+            expanded_target_count,
+            target_counts: acquisition_request_target_counts(&detail.targets),
+            blockers: acquisition_request_blockers(&detail.targets),
+            detail,
+        }
+    }
+}
+
+pub fn acquisition_request_target_counts(
+    targets: &[AcquisitionTarget],
+) -> AcquisitionRequestTargetCounts {
+    let mut counts = AcquisitionRequestTargetCounts {
+        total: targets.len(),
+        ..AcquisitionRequestTargetCounts::default()
+    };
+    for target in targets {
+        match target.state {
+            AcquisitionTargetState::Pending => counts.pending += 1,
+            AcquisitionTargetState::Searching => counts.searching += 1,
+            AcquisitionTargetState::Submitted => counts.submitted += 1,
+            AcquisitionTargetState::Blocked => counts.blocked += 1,
+            AcquisitionTargetState::Imported => counts.imported += 1,
+            AcquisitionTargetState::Excluded => counts.excluded += 1,
+        }
+    }
+    counts
+}
+
+pub fn acquisition_request_blockers(
+    targets: &[AcquisitionTarget],
+) -> Vec<AcquisitionRequestBlocker> {
+    targets
+        .iter()
+        .filter(|target| target.state == AcquisitionTargetState::Blocked)
+        .map(|target| AcquisitionRequestBlocker {
+            target_id: target.target_id,
+            target_key: target.target_key.clone(),
+            title: target.title.clone(),
+            reason: target
+                .state_reason
+                .clone()
+                .unwrap_or_else(|| "Acquisition target is blocked.".to_string()),
+        })
+        .collect()
 }
 
 pub async fn create_or_update_acquisition_intent(
@@ -431,9 +753,19 @@ pub async fn create_or_update_acquisition_intent(
     let has_explicit_targets = !explicit_targets.is_empty();
     let subscription_data = intent_subscription_data(&intent, has_explicit_targets, now);
 
-    let existing = find_subscription_by_intent_identity(pool, &subscription_data).await?;
+    let existing = find_subscription_by_request_identity(pool, &subscription_data).await?;
     let (subscription, created) = if let Some(existing) = existing {
+        let idempotency_key = existing
+            .idempotency_key
+            .clone()
+            .or_else(|| subscription_data.idempotency_key.clone());
         let update = AcquisitionSubscriptionUpdate {
+            idempotency_key,
+            request_mode: subscription_data.request_mode,
+            request_scope: subscription_data.request_scope,
+            scope: subscription_data.scope.clone(),
+            metadata_policy: subscription_data.metadata_policy,
+            completion_policy: subscription_data.completion_policy,
             monitor_policy: Some(subscription_data.monitor_policy),
             route_policy: Some(subscription_data.route_policy),
             source_provider_id: subscription_data.source_provider_id,
@@ -463,13 +795,13 @@ pub async fn create_or_update_acquisition_intent(
     let detail = get_subscription_detail(pool, subscription.subscription_id)
         .await?
         .ok_or_else(|| anyhow!("acquisition subscription was not readable"))?;
-    Ok(AcquisitionIntentCreation {
+    Ok(AcquisitionIntentCreation::from_detail(
         created,
-        expanded_target_count: has_explicit_targets
+        has_explicit_targets
             .then_some(detail.targets.len())
             .unwrap_or(0),
         detail,
-    })
+    ))
 }
 
 pub async fn create_subscription(
@@ -477,11 +809,14 @@ pub async fn create_subscription(
     data: NewAcquisitionSubscription,
 ) -> Result<AcquisitionSubscription> {
     validate_subscription_input(&data)?;
+    let request_contract = subscription_request_contract(&data)?;
     let now = Utc::now();
     let subscription_id = Uuid::new_v4();
     let normalized_title = normalize_acquisition_title(&data.title);
     let external_ids_json = external_ids_json(data.external_ids.as_ref())?;
+    let idempotency_key = normalize_idempotency_key(data.idempotency_key.as_deref())?;
     let quality_profile_json = json_to_string(data.quality_profile.as_ref())?;
+    let scope_json = json_to_string(request_contract.scope.as_ref())?;
     let metadata_refresh_after = data.metadata_refresh_after.unwrap_or(now);
     let candidate_search_after = data.candidate_search_after.unwrap_or(now);
     let release_delay_seconds = data.release_delay_seconds.unwrap_or_default();
@@ -494,6 +829,12 @@ pub async fn create_subscription(
             normalized_title,
             year,
             external_ids_json,
+            idempotency_key,
+            request_mode,
+            request_scope,
+            scope_json,
+            metadata_policy,
+            completion_policy,
             monitor_policy,
             route_policy,
             source_provider_id,
@@ -503,7 +844,7 @@ pub async fn create_subscription(
             candidate_search_after,
             status,
             active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)",
     )
     .bind(subscription_id.to_string())
     .bind(data.media_type.as_str())
@@ -511,7 +852,13 @@ pub async fn create_subscription(
     .bind(&normalized_title)
     .bind(data.year)
     .bind(external_ids_json.as_deref())
-    .bind(data.monitor_policy.as_str())
+    .bind(idempotency_key.as_deref())
+    .bind(request_contract.request_mode.as_str())
+    .bind(request_contract.request_scope.as_str())
+    .bind(scope_json.as_deref())
+    .bind(request_contract.metadata_policy.as_str())
+    .bind(request_contract.completion_policy.as_str())
+    .bind(request_contract.monitor_policy.as_str())
     .bind(data.route_policy.as_str())
     .bind(data.source_provider_id.map(|value| value.to_string()))
     .bind(release_delay_seconds)
@@ -541,8 +888,47 @@ pub async fn update_subscription(
     if release_delay_seconds < 0 {
         bail!("releaseDelaySeconds cannot be negative");
     }
+    let request_mode = update.request_mode.unwrap_or(existing.request_mode);
+    let request_scope = update.request_scope.unwrap_or(existing.request_scope);
+    let scope = update.scope.or(existing.scope);
+    let metadata_policy = update.metadata_policy.unwrap_or_else(|| {
+        if update.request_mode == Some(AcquisitionRequestMode::OneShot)
+            && existing.metadata_policy == AcquisitionMetadataPolicy::Recurring
+        {
+            AcquisitionMetadataPolicy::InitialOnly
+        } else {
+            existing.metadata_policy
+        }
+    });
+    let completion_policy = update.completion_policy.unwrap_or_else(|| {
+        if update.request_mode == Some(AcquisitionRequestMode::OneShot)
+            && existing.completion_policy == AcquisitionCompletionPolicy::Manual
+        {
+            AcquisitionCompletionPolicy::TerminalSelectedTargets
+        } else {
+            existing.completion_policy
+        }
+    });
+    let mut monitor_policy = update.monitor_policy.unwrap_or(existing.monitor_policy);
+    if request_mode.is_one_shot() {
+        monitor_policy = AcquisitionMonitorPolicy::SelectedTargets;
+    }
+    validate_request_contract(
+        request_mode,
+        request_scope,
+        metadata_policy,
+        completion_policy,
+        monitor_policy,
+    )?;
     let quality_profile = update.quality_profile.or(existing.quality_profile);
+    let idempotency_key = normalize_idempotency_key(
+        update
+            .idempotency_key
+            .or(existing.idempotency_key)
+            .as_deref(),
+    )?;
     let quality_profile_json = json_to_string(quality_profile.as_ref())?;
+    let scope_json = json_to_string(scope.as_ref())?;
     let source_provider_id = update.source_provider_id.or(existing.source_provider_id);
     let metadata_refresh_after = update
         .metadata_refresh_after
@@ -556,6 +942,12 @@ pub async fn update_subscription(
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_subscriptions
          SET monitor_policy = ?,
+             request_mode = ?,
+             idempotency_key = ?,
+             request_scope = ?,
+             scope_json = ?,
+             metadata_policy = ?,
+             completion_policy = ?,
              route_policy = ?,
              source_provider_id = ?,
              release_delay_seconds = ?,
@@ -567,12 +959,13 @@ pub async fn update_subscription(
              updated_at = CURRENT_TIMESTAMP
          WHERE subscription_id = ?",
     )
-    .bind(
-        update
-            .monitor_policy
-            .unwrap_or(existing.monitor_policy)
-            .as_str(),
-    )
+    .bind(monitor_policy.as_str())
+    .bind(request_mode.as_str())
+    .bind(idempotency_key.as_deref())
+    .bind(request_scope.as_str())
+    .bind(scope_json.as_deref())
+    .bind(metadata_policy.as_str())
+    .bind(completion_policy.as_str())
     .bind(
         update
             .route_policy
@@ -712,6 +1105,10 @@ pub async fn stop_subscription_tracking(
     .await
     .context("stopping acquisition subscription tracking")?;
 
+    for target in list_subscription_targets(pool, subscription_id).await? {
+        sync_library_episode_acquisition_state_for_target(pool, &target).await?;
+    }
+
     let subscription = get_subscription(pool, subscription_id)
         .await?
         .ok_or_else(|| anyhow!("stopped acquisition subscription was not readable"))?;
@@ -737,6 +1134,12 @@ pub async fn list_subscriptions(
                 normalized_title,
                 year,
                 CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+                request_scope,
+                CAST(scope_json AS TEXT) AS scope_json,
+                metadata_policy,
+                completion_policy,
                 monitor_policy,
                 route_policy,
                 CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -767,6 +1170,12 @@ pub async fn list_subscriptions(
                 normalized_title,
                 year,
                 CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+                request_scope,
+                CAST(scope_json AS TEXT) AS scope_json,
+                metadata_policy,
+                completion_policy,
                 monitor_policy,
                 route_policy,
                 CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -803,6 +1212,12 @@ pub async fn get_subscription(
             normalized_title,
             year,
             CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+            request_scope,
+            CAST(scope_json AS TEXT) AS scope_json,
+            metadata_policy,
+            completion_policy,
             monitor_policy,
             route_policy,
             CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -827,11 +1242,28 @@ pub async fn get_subscription(
     row.map(|row| map_subscription(&row)).transpose()
 }
 
-async fn find_subscription_by_intent_identity(
+async fn find_subscription_by_request_identity(
     pool: &AnyPool,
     data: &NewAcquisitionSubscription,
 ) -> Result<Option<AcquisitionSubscription>> {
     let normalized_title = normalize_acquisition_title(&data.title);
+    let request_contract = subscription_request_contract(data)?;
+    let scope_json = json_to_string(request_contract.scope.as_ref())?;
+    if let Some(idempotency_key) = normalize_idempotency_key(data.idempotency_key.as_deref())?
+        && let Some(existing) =
+            find_active_subscription_by_idempotency_key(pool, &idempotency_key).await?
+    {
+        if subscription_matches_request_identity(
+            &existing,
+            data,
+            &normalized_title,
+            &request_contract,
+            scope_json.as_deref(),
+        ) {
+            return Ok(Some(existing));
+        }
+        bail!("idempotencyKey is already associated with another active acquisition request");
+    }
     let rows = if let Some(year) = data.year {
         sqlx::query(
             "SELECT
@@ -841,6 +1273,12 @@ async fn find_subscription_by_intent_identity(
                 normalized_title,
                 year,
                 CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+                request_scope,
+                CAST(scope_json AS TEXT) AS scope_json,
+                metadata_policy,
+                completion_policy,
                 monitor_policy,
                 route_policy,
                 CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -859,6 +1297,11 @@ async fn find_subscription_by_intent_identity(
              WHERE media_type = ?
                AND normalized_title = ?
                AND year = ?
+               AND request_mode = ?
+               AND request_scope = ?
+               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE(?, '')
+               AND route_policy = ?
+               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE(?, '')
                AND active = 1
              ORDER BY created_at ASC
              LIMIT 25",
@@ -866,6 +1309,11 @@ async fn find_subscription_by_intent_identity(
         .bind(data.media_type.as_str())
         .bind(&normalized_title)
         .bind(year)
+        .bind(request_contract.request_mode.as_str())
+        .bind(request_contract.request_scope.as_str())
+        .bind(scope_json.as_deref())
+        .bind(data.route_policy.as_str())
+        .bind(data.source_provider_id.map(|value| value.to_string()))
         .fetch_all(pool)
         .await?
     } else {
@@ -877,6 +1325,12 @@ async fn find_subscription_by_intent_identity(
                 normalized_title,
                 year,
                 CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+                request_scope,
+                CAST(scope_json AS TEXT) AS scope_json,
+                metadata_policy,
+                completion_policy,
                 monitor_policy,
                 route_policy,
                 CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -895,12 +1349,22 @@ async fn find_subscription_by_intent_identity(
              WHERE media_type = ?
                AND normalized_title = ?
                AND year IS NULL
+               AND request_mode = ?
+               AND request_scope = ?
+               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE(?, '')
+               AND route_policy = ?
+               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE(?, '')
                AND active = 1
              ORDER BY created_at ASC
              LIMIT 25",
         )
         .bind(data.media_type.as_str())
         .bind(&normalized_title)
+        .bind(request_contract.request_mode.as_str())
+        .bind(request_contract.request_scope.as_str())
+        .bind(scope_json.as_deref())
+        .bind(data.route_policy.as_str())
+        .bind(data.source_provider_id.map(|value| value.to_string()))
         .fetch_all(pool)
         .await?
     };
@@ -932,6 +1396,79 @@ async fn find_subscription_by_intent_identity(
             }),
         _ => subscriptions.into_iter().next(),
     })
+}
+
+async fn find_active_subscription_by_idempotency_key(
+    pool: &AnyPool,
+    idempotency_key: &str,
+) -> Result<Option<AcquisitionSubscription>> {
+    let row = sqlx::query(
+        "SELECT
+            subscription_id,
+            media_type,
+            title,
+            normalized_title,
+            year,
+            CAST(external_ids_json AS TEXT) AS external_ids_json,
+            CAST(idempotency_key AS TEXT) AS idempotency_key,
+            request_mode,
+            request_scope,
+            CAST(scope_json AS TEXT) AS scope_json,
+            metadata_policy,
+            completion_policy,
+            monitor_policy,
+            route_policy,
+            CAST(source_provider_id AS TEXT) AS source_provider_id,
+            release_delay_seconds,
+            CAST(quality_profile_json AS TEXT) AS quality_profile_json,
+            CAST(metadata_refresh_after AS TEXT) AS metadata_refresh_after,
+            CAST(candidate_search_after AS TEXT) AS candidate_search_after,
+            CAST(last_metadata_refresh_at AS TEXT) AS last_metadata_refresh_at,
+            CAST(last_candidate_search_at AS TEXT) AS last_candidate_search_at,
+            CAST(tracking_started_at AS TEXT) AS tracking_started_at,
+            status,
+            CAST(active AS INTEGER) AS active,
+            CAST(created_at AS TEXT) AS created_at,
+            CAST(updated_at AS TEXT) AS updated_at
+         FROM acquisition_subscriptions
+         WHERE idempotency_key = ?
+           AND active = 1
+         ORDER BY created_at ASC
+         LIMIT 1",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| map_subscription(&row)).transpose()
+}
+
+fn subscription_matches_request_identity(
+    existing: &AcquisitionSubscription,
+    data: &NewAcquisitionSubscription,
+    normalized_title: &str,
+    request_contract: &AcquisitionRequestContract,
+    scope_json: Option<&str>,
+) -> bool {
+    let existing_scope_json = existing
+        .scope
+        .as_ref()
+        .and_then(|scope| json_to_string(Some(scope)).ok())
+        .flatten();
+    existing.media_type == data.media_type
+        && existing.normalized_title == normalized_title
+        && existing.year == data.year
+        && existing.request_mode == request_contract.request_mode
+        && existing.request_scope == request_contract.request_scope
+        && existing.route_policy == data.route_policy
+        && existing.source_provider_id == data.source_provider_id
+        && existing_scope_json.as_deref().unwrap_or_default() == scope_json.unwrap_or_default()
+        && match data.external_ids.as_ref() {
+            Some(request_ids) if external_ids_has_value(request_ids) => existing
+                .external_ids
+                .as_ref()
+                .is_some_and(|existing_ids| external_ids_overlap(existing_ids, request_ids)),
+            _ => true,
+        }
 }
 
 pub async fn get_subscription_detail(
@@ -1081,7 +1618,13 @@ pub async fn update_target_state(
     .bind(
         update
             .next_search_after
-            .or(existing.next_search_after)
+            .or_else(|| {
+                if update.state.clears_next_search_after() {
+                    None
+                } else {
+                    existing.next_search_after
+                }
+            })
             .map(db_datetime_string),
     )
     .bind(target_id.to_string())
@@ -1089,7 +1632,11 @@ pub async fn update_target_state(
     .await
     .context("updating acquisition target state")?;
 
-    get_target(pool, target_id).await
+    let updated = get_target(pool, target_id).await?;
+    if let Some(target) = updated.as_ref() {
+        sync_library_episode_acquisition_state_for_target(pool, target).await?;
+    }
+    Ok(updated)
 }
 
 pub async fn reset_target_for_candidate_retry(
@@ -1118,7 +1665,11 @@ pub async fn reset_target_for_candidate_retry(
     .await
     .context("resetting acquisition target for candidate retry")?;
 
-    get_target(pool, target_id).await
+    let updated = get_target(pool, target_id).await?;
+    if let Some(target) = updated.as_ref() {
+        sync_library_episode_acquisition_state_for_target(pool, target).await?;
+    }
+    Ok(updated)
 }
 
 pub async fn clear_target_next_search_after(pool: &AnyPool, target_id: Uuid) -> Result<()> {
@@ -1135,6 +1686,236 @@ pub async fn clear_target_next_search_after(pool: &AnyPool, target_id: Uuid) -> 
     Ok(())
 }
 
+pub async fn retry_acquisition_request(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    now: DateTime<Utc>,
+    reason: Option<&str>,
+) -> Result<Option<AcquisitionRequestRetryResult>> {
+    let Some(subscription) = get_subscription(pool, subscription_id).await? else {
+        return Ok(None);
+    };
+    let retry_reason = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("User retried acquisition request.")
+        .to_string();
+    let metadata_retry_scheduled = subscription.request_mode == AcquisitionRequestMode::OneShot
+        && subscription.metadata_policy == AcquisitionMetadataPolicy::InitialOnly;
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_subscriptions
+         SET status = 'active',
+             active = 1,
+             metadata_refresh_after = ?,
+             candidate_search_after = ?,
+             last_metadata_refresh_at = CASE
+                 WHEN request_mode = 'one_shot' AND metadata_policy = 'initial_only' THEN NULL
+                 ELSE last_metadata_refresh_at
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?",
+    )
+    .bind(db_datetime_string(now))
+    .bind(db_datetime_string(now))
+    .bind(subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("retrying acquisition request")?;
+
+    let targets = list_subscription_targets(pool, subscription_id).await?;
+    let mut targets_reset = 0usize;
+    for target in targets {
+        if retryable_target_state(target.state) && !is_metadata_snapshot_blocker_target(&target) {
+            reset_target_for_candidate_retry(pool, target.target_id, retry_reason.clone(), now)
+                .await?;
+            targets_reset += 1;
+        }
+    }
+
+    let detail = get_subscription_detail(pool, subscription_id)
+        .await?
+        .ok_or_else(|| anyhow!("retried acquisition subscription was not readable"))?;
+    Ok(Some(AcquisitionRequestRetryResult {
+        metadata_retry_scheduled,
+        targets_reset,
+        target_counts: acquisition_request_target_counts(&detail.targets),
+        blockers: acquisition_request_blockers(&detail.targets),
+        detail,
+    }))
+}
+
+fn retryable_target_state(state: AcquisitionTargetState) -> bool {
+    matches!(
+        state,
+        AcquisitionTargetState::Blocked
+            | AcquisitionTargetState::Excluded
+            | AcquisitionTargetState::Searching
+    )
+}
+
+fn is_metadata_snapshot_blocker_target(target: &AcquisitionTarget) -> bool {
+    target
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("source"))
+        .and_then(JsonValue::as_str)
+        .is_some_and(|source| source == "one_shot_metadata_snapshot")
+}
+
+pub async fn complete_terminal_acquisition_request_if_ready(
+    pool: &AnyPool,
+    subscription_id: Uuid,
+    reason: &str,
+) -> Result<Option<TerminalAcquisitionRequestCompletion>> {
+    let row = sqlx::query(
+        "SELECT
+            s.subscription_id,
+            s.request_mode,
+            s.request_scope,
+            COUNT(t.target_id) AS target_count,
+            SUM(CASE WHEN t.state = 'imported' THEN 1 ELSE 0 END) AS imported_count,
+            SUM(CASE WHEN t.state = 'excluded' THEN 1 ELSE 0 END) AS excluded_count
+         FROM acquisition_subscriptions s
+         JOIN acquisition_targets t ON t.subscription_id = s.subscription_id
+         WHERE s.subscription_id = ?
+           AND s.active = 1
+           AND s.status = 'active'
+           AND s.completion_policy = 'terminal_selected_targets'
+         GROUP BY s.subscription_id, s.request_mode, s.request_scope
+         HAVING COUNT(t.target_id) > 0
+            AND SUM(CASE WHEN t.state NOT IN ('imported', 'excluded') THEN 1 ELSE 0 END) = 0",
+    )
+    .bind(subscription_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .context("checking terminal acquisition request completion")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let completion = map_terminal_completion(&row)?;
+    mark_terminal_acquisition_request_completed(pool, &completion, reason).await
+}
+
+pub async fn complete_terminal_acquisition_requests(
+    pool: &AnyPool,
+    limit: i64,
+    reason: &str,
+) -> Result<Vec<TerminalAcquisitionRequestCompletion>> {
+    let rows = sqlx::query(
+        "SELECT
+            s.subscription_id,
+            s.request_mode,
+            s.request_scope,
+            COUNT(t.target_id) AS target_count,
+            SUM(CASE WHEN t.state = 'imported' THEN 1 ELSE 0 END) AS imported_count,
+            SUM(CASE WHEN t.state = 'excluded' THEN 1 ELSE 0 END) AS excluded_count
+         FROM acquisition_subscriptions s
+         JOIN acquisition_targets t ON t.subscription_id = s.subscription_id
+         WHERE s.active = 1
+           AND s.status = 'active'
+           AND s.completion_policy = 'terminal_selected_targets'
+         GROUP BY s.subscription_id, s.request_mode, s.request_scope
+         HAVING COUNT(t.target_id) > 0
+            AND SUM(CASE WHEN t.state NOT IN ('imported', 'excluded') THEN 1 ELSE 0 END) = 0
+         ORDER BY s.updated_at ASC
+         LIMIT ?",
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await
+    .context("listing terminal acquisition request completions")?;
+
+    let mut completed = Vec::new();
+    for row in rows {
+        let completion = map_terminal_completion(&row)?;
+        if let Some(completion) =
+            mark_terminal_acquisition_request_completed(pool, &completion, reason).await?
+        {
+            completed.push(completion);
+        }
+    }
+    Ok(completed)
+}
+
+async fn mark_terminal_acquisition_request_completed(
+    pool: &AnyPool,
+    completion: &TerminalAcquisitionRequestCompletion,
+    reason: &str,
+) -> Result<Option<TerminalAcquisitionRequestCompletion>> {
+    let result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_subscriptions
+         SET status = 'completed',
+             active = 0,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?
+           AND active = 1
+           AND status = 'active'
+           AND completion_policy = 'terminal_selected_targets'",
+    )
+    .bind(completion.subscription_id.to_string())
+    .execute(pool)
+    .await
+    .context("marking terminal acquisition request completed")?;
+
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "All scoped acquisition targets reached a terminal state."
+    } else {
+        reason
+    };
+    record_acquisition_audit_event(
+        pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_ACQUISITION_REQUEST_COMPLETED.to_string(),
+            subscription_id: Some(completion.subscription_id),
+            state: Some(
+                AcquisitionSubscriptionStatus::Completed
+                    .as_str()
+                    .to_string(),
+            ),
+            reason: Some(reason.to_string()),
+            evidence: Some(json!({
+                "requestMode": completion.request_mode.as_str(),
+                "requestScope": completion.request_scope.as_str(),
+                "completionPolicy": AcquisitionCompletionPolicy::TerminalSelectedTargets.as_str(),
+                "targetCount": completion.target_count,
+                "importedCount": completion.imported_count,
+                "excludedCount": completion.excluded_count,
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    Ok(Some(completion.clone()))
+}
+
+fn map_terminal_completion(row: &AnyRow) -> Result<TerminalAcquisitionRequestCompletion> {
+    let subscription_id_raw: String = row.try_get("subscription_id")?;
+    let request_mode_raw: String = row.try_get("request_mode")?;
+    let request_scope_raw: String = row.try_get("request_scope")?;
+    let target_count: i64 = row.try_get("target_count")?;
+    let imported_count: i64 = row.try_get("imported_count")?;
+    let excluded_count: i64 = row.try_get("excluded_count")?;
+    Ok(TerminalAcquisitionRequestCompletion {
+        subscription_id: parse_uuid(
+            &subscription_id_raw,
+            "acquisition_subscriptions.subscription_id",
+        )?,
+        request_mode: AcquisitionRequestMode::from_str(&request_mode_raw)?,
+        request_scope: AcquisitionRequestScope::from_str(&request_scope_raw)?,
+        target_count: usize::try_from(target_count.max(0)).unwrap_or(usize::MAX),
+        imported_count: usize::try_from(imported_count.max(0)).unwrap_or(usize::MAX),
+        excluded_count: usize::try_from(excluded_count.max(0)).unwrap_or(usize::MAX),
+    })
+}
+
 pub async fn list_due_metadata_subscriptions(
     pool: &AnyPool,
     now: DateTime<Utc>,
@@ -1148,6 +1929,12 @@ pub async fn list_due_metadata_subscriptions(
             normalized_title,
             year,
             CAST(external_ids_json AS TEXT) AS external_ids_json,
+                CAST(idempotency_key AS TEXT) AS idempotency_key,
+                request_mode,
+            request_scope,
+            CAST(scope_json AS TEXT) AS scope_json,
+            metadata_policy,
+            completion_policy,
             monitor_policy,
             route_policy,
             CAST(source_provider_id AS TEXT) AS source_provider_id,
@@ -1165,6 +1952,15 @@ pub async fn list_due_metadata_subscriptions(
          FROM acquisition_subscriptions
          WHERE active = 1
            AND status = 'active'
+           AND metadata_policy != 'none'
+           AND (
+                request_mode = 'monitored'
+                OR (
+                    request_mode = 'one_shot'
+                    AND metadata_policy = 'initial_only'
+                    AND last_metadata_refresh_at IS NULL
+                )
+           )
            AND metadata_refresh_after <= ?
            AND (
                 tracking_started_at IS NOT NULL
@@ -1448,7 +2244,7 @@ async fn upsert_subscription_target(
         )
         .bind(target_id.to_string())
         .bind(subscription.subscription_id.to_string())
-        .bind(target_key)
+        .bind(&target_key)
         .bind(media_type.as_str())
         .bind(title)
         .bind(target.season_number)
@@ -1468,6 +2264,10 @@ async fn upsert_subscription_target(
         .execute(pool)
         .await
         .context("creating acquisition target")?;
+    }
+    if let Some(target) = get_target_by_key(pool, subscription.subscription_id, &target_key).await?
+    {
+        sync_library_episode_acquisition_state_for_target(pool, &target).await?;
     }
     Ok(())
 }
@@ -1570,6 +2370,84 @@ fn validate_subscription_input(data: &NewAcquisitionSubscription) -> Result<()> 
     if data.release_delay_seconds.unwrap_or_default() < 0 {
         bail!("releaseDelaySeconds cannot be negative");
     }
+    normalize_idempotency_key(data.idempotency_key.as_deref())?;
+    subscription_request_contract(data)?;
+    Ok(())
+}
+
+fn subscription_request_contract(
+    data: &NewAcquisitionSubscription,
+) -> Result<AcquisitionRequestContract> {
+    let request_mode = data.request_mode.unwrap_or_default();
+    let request_scope = data.request_scope.unwrap_or_else(|| {
+        if request_mode.is_one_shot() {
+            match data.media_type {
+                MediaType::Movie => AcquisitionRequestScope::Movie,
+                _ => AcquisitionRequestScope::SelectedTargets,
+            }
+        } else {
+            AcquisitionRequestScope::Subscription
+        }
+    });
+    let metadata_policy = data.metadata_policy.unwrap_or_else(|| {
+        if request_mode.is_one_shot() {
+            AcquisitionMetadataPolicy::InitialOnly
+        } else {
+            AcquisitionMetadataPolicy::Recurring
+        }
+    });
+    let completion_policy = data.completion_policy.unwrap_or_else(|| {
+        if request_mode.is_one_shot() {
+            AcquisitionCompletionPolicy::TerminalSelectedTargets
+        } else {
+            AcquisitionCompletionPolicy::Manual
+        }
+    });
+    let mut monitor_policy = data.monitor_policy;
+    if request_mode.is_one_shot() {
+        monitor_policy = AcquisitionMonitorPolicy::SelectedTargets;
+    }
+    validate_request_contract(
+        request_mode,
+        request_scope,
+        metadata_policy,
+        completion_policy,
+        monitor_policy,
+    )?;
+    Ok(AcquisitionRequestContract {
+        request_mode,
+        request_scope,
+        scope: data.scope.clone(),
+        metadata_policy,
+        completion_policy,
+        monitor_policy,
+    })
+}
+
+fn validate_request_contract(
+    request_mode: AcquisitionRequestMode,
+    request_scope: AcquisitionRequestScope,
+    metadata_policy: AcquisitionMetadataPolicy,
+    completion_policy: AcquisitionCompletionPolicy,
+    monitor_policy: AcquisitionMonitorPolicy,
+) -> Result<()> {
+    if request_mode.is_one_shot() {
+        if metadata_policy == AcquisitionMetadataPolicy::Recurring {
+            bail!("one-shot acquisition requests cannot use recurring metadata policy");
+        }
+        if monitor_policy != AcquisitionMonitorPolicy::SelectedTargets {
+            bail!("one-shot acquisition requests must use selected-target monitoring");
+        }
+        if request_scope == AcquisitionRequestScope::Subscription {
+            bail!("one-shot acquisition requests require an explicit request scope");
+        }
+    }
+    if completion_policy == AcquisitionCompletionPolicy::TerminalSelectedTargets
+        && request_scope == AcquisitionRequestScope::Subscription
+        && !request_mode.is_one_shot()
+    {
+        bail!("terminal selected-target completion requires an explicit request scope");
+    }
     Ok(())
 }
 
@@ -1580,6 +2458,7 @@ fn validate_intent_input(intent: &CreateAcquisitionIntent) -> Result<()> {
     if intent.release_delay_seconds.unwrap_or_default() < 0 {
         bail!("releaseDelaySeconds cannot be negative");
     }
+    normalize_idempotency_key(intent.idempotency_key.as_deref())?;
     Ok(())
 }
 
@@ -1588,13 +2467,37 @@ fn intent_subscription_data(
     has_explicit_targets: bool,
     now: DateTime<Utc>,
 ) -> NewAcquisitionSubscription {
+    let request_mode = intent.request_mode;
     NewAcquisitionSubscription {
         media_type: intent.media_type,
         title: intent.title.trim().to_string(),
         year: intent.year,
         external_ids: intent.external_ids.clone(),
+        idempotency_key: intent.idempotency_key.clone(),
+        request_mode,
+        request_scope: intent.request_scope.or_else(|| {
+            request_mode
+                .is_some_and(AcquisitionRequestMode::is_one_shot)
+                .then(|| intent_request_scope(intent, has_explicit_targets))
+        }),
+        scope: intent.scope.clone().or_else(|| {
+            request_mode
+                .is_some_and(AcquisitionRequestMode::is_one_shot)
+                .then(|| intent_scope_evidence(intent))
+        }),
+        metadata_policy: intent.metadata_policy.or_else(|| {
+            request_mode
+                .is_some_and(AcquisitionRequestMode::is_one_shot)
+                .then_some(AcquisitionMetadataPolicy::InitialOnly)
+        }),
+        completion_policy: intent.completion_policy.or_else(|| {
+            request_mode
+                .is_some_and(AcquisitionRequestMode::is_one_shot)
+                .then_some(AcquisitionCompletionPolicy::TerminalSelectedTargets)
+        }),
         monitor_policy: intent.monitor_policy.unwrap_or_else(|| {
-            if has_explicit_targets {
+            if request_mode.is_some_and(AcquisitionRequestMode::is_one_shot) || has_explicit_targets
+            {
                 AcquisitionMonitorPolicy::SelectedTargets
             } else {
                 AcquisitionMonitorPolicy::AllMissing
@@ -1609,14 +2512,82 @@ fn intent_subscription_data(
     }
 }
 
+fn intent_request_scope(
+    intent: &CreateAcquisitionIntent,
+    has_explicit_targets: bool,
+) -> AcquisitionRequestScope {
+    let Some(target) = intent.target.as_ref() else {
+        return if intent.media_type == MediaType::Movie {
+            AcquisitionRequestScope::Movie
+        } else if has_explicit_targets {
+            AcquisitionRequestScope::SelectedTargets
+        } else {
+            AcquisitionRequestScope::Missing
+        };
+    };
+    match target
+        .kind
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("movie") => AcquisitionRequestScope::Movie,
+        Some("episode") | Some("absolute_episode") => AcquisitionRequestScope::Episode,
+        Some("season") => AcquisitionRequestScope::Season,
+        Some("range") => AcquisitionRequestScope::Range,
+        Some("missing") | Some("backlog") => AcquisitionRequestScope::Missing,
+        Some("selected_targets") | Some("selected") => AcquisitionRequestScope::SelectedTargets,
+        _ if target.episode_start.is_some()
+            || target.episode_end.is_some()
+            || target.absolute_episode_start.is_some()
+            || target.absolute_episode_end.is_some() =>
+        {
+            AcquisitionRequestScope::Range
+        }
+        _ if target.season_number.is_some() && target.episode_number.is_none() => {
+            AcquisitionRequestScope::Season
+        }
+        _ if target.episode_number.is_some() || target.absolute_episode_number.is_some() => {
+            AcquisitionRequestScope::Episode
+        }
+        _ if !target.target_keys.is_empty() || !target.targets.is_empty() => {
+            AcquisitionRequestScope::SelectedTargets
+        }
+        _ => AcquisitionRequestScope::SelectedTargets,
+    }
+}
+
+fn intent_scope_evidence(intent: &CreateAcquisitionIntent) -> JsonValue {
+    let Some(target) = intent.target.as_ref() else {
+        return json!({
+            "kind": if intent.media_type == MediaType::Movie { "movie" } else { "selected_targets" },
+            "explicitTargetCount": intent.targets.len()
+        });
+    };
+    json!({
+        "kind": target.kind,
+        "targetKey": target.target_key,
+        "targetKeys": target.target_keys,
+        "seasonNumber": target.season_number,
+        "episodeNumber": target.episode_number,
+        "episodeStart": target.episode_start,
+        "episodeEnd": target.episode_end,
+        "absoluteEpisodeNumber": target.absolute_episode_number,
+        "absoluteEpisodeStart": target.absolute_episode_start,
+        "absoluteEpisodeEnd": target.absolute_episode_end,
+        "explicitTargetCount": intent.targets.len() + target.targets.len()
+    })
+}
+
 fn intent_explicit_targets(
     intent: &CreateAcquisitionIntent,
     now: DateTime<Utc>,
 ) -> Result<Vec<NewAcquisitionTarget>> {
     let mut targets = intent.targets.clone();
     if let Some(scope) = intent.target.as_ref() {
+        let has_payload_targets = !targets.is_empty() || !scope.targets.is_empty();
         targets.extend(scope.targets.clone());
-        targets.extend(targets_from_scope(intent, scope, now)?);
+        targets.extend(targets_from_scope(intent, scope, now, has_payload_targets)?);
     }
     if targets.is_empty() && intent.media_type == MediaType::Movie {
         targets.push(movie_intent_target(intent, now));
@@ -1629,6 +2600,7 @@ fn targets_from_scope(
     intent: &CreateAcquisitionIntent,
     scope: &AcquisitionIntentTarget,
     now: DateTime<Utc>,
+    has_payload_targets: bool,
 ) -> Result<Vec<NewAcquisitionTarget>> {
     let mut targets = Vec::new();
     if let Some(key) = scope.target_key.as_deref() {
@@ -1666,7 +2638,7 @@ fn targets_from_scope(
     if targets.is_empty() && is_movie_scope(intent, scope) {
         targets.push(movie_intent_target(intent, now));
     }
-    if targets.is_empty() && is_explicit_scope_without_targets(scope) {
+    if targets.is_empty() && is_explicit_scope_without_targets(scope) && !has_payload_targets {
         bail!(
             "target scope '{}' requires targetKey, targetKeys, episodeNumber, episode range, absoluteEpisodeNumber, absolute episode range, or targets",
             scope.kind.as_deref().unwrap_or("selected")
@@ -1691,13 +2663,7 @@ fn is_explicit_scope_without_targets(scope: &AcquisitionIntentTarget) -> bool {
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "episode"
-                    | "season"
-                    | "season_pack"
-                    | "backlog"
-                    | "selected"
-                    | "selected_targets"
-                    | "absolute_episode"
+                "episode" | "selected" | "selected_targets" | "absolute_episode"
             )
         })
         .unwrap_or(false)
@@ -1997,9 +2963,26 @@ pub fn normalize_acquisition_title(value: &str) -> String {
         .replace([' ', '-', '_', ':'], "")
 }
 
+fn normalize_idempotency_key(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 256 {
+        bail!("idempotencyKey cannot exceed 256 characters");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("idempotencyKey cannot contain control characters");
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn map_subscription(row: &AnyRow) -> Result<AcquisitionSubscription> {
     let subscription_id_raw: String = row.try_get("subscription_id")?;
     let media_type_raw: String = row.try_get("media_type")?;
+    let request_mode_raw: String = row.try_get("request_mode")?;
+    let request_scope_raw: String = row.try_get("request_scope")?;
+    let metadata_policy_raw: String = row.try_get("metadata_policy")?;
+    let completion_policy_raw: String = row.try_get("completion_policy")?;
     let monitor_policy_raw: String = row.try_get("monitor_policy")?;
     let route_policy_raw: String = row.try_get("route_policy")?;
     let source_provider_id_raw = row_get_opt_string(row, "source_provider_id")?;
@@ -2016,6 +2999,10 @@ fn map_subscription(row: &AnyRow) -> Result<AcquisitionSubscription> {
         row_get_opt_string(row, "quality_profile_json")?,
         "acquisition_subscriptions.quality_profile_json",
     )?;
+    let scope = parse_json_opt(
+        row_get_opt_string(row, "scope_json")?,
+        "acquisition_subscriptions.scope_json",
+    )?;
     let status_raw: String = row.try_get("status")?;
     let year = row_get_i64_opt(row, "year")?;
 
@@ -2029,6 +3016,12 @@ fn map_subscription(row: &AnyRow) -> Result<AcquisitionSubscription> {
         normalized_title: row.try_get("normalized_title")?,
         year: year.map(|value| value as i32),
         external_ids,
+        idempotency_key: row_get_opt_string(row, "idempotency_key")?,
+        request_mode: AcquisitionRequestMode::from_str(&request_mode_raw)?,
+        request_scope: AcquisitionRequestScope::from_str(&request_scope_raw)?,
+        scope,
+        metadata_policy: AcquisitionMetadataPolicy::from_str(&metadata_policy_raw)?,
+        completion_policy: AcquisitionCompletionPolicy::from_str(&completion_policy_raw)?,
         monitor_policy: AcquisitionMonitorPolicy::from_str(&monitor_policy_raw)?,
         route_policy: AcquisitionRoutePolicy::from_str(&route_policy_raw)?,
         source_provider_id: source_provider_id_raw
@@ -2235,6 +3228,9 @@ fn row_get_bool(row: &AnyRow, field: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::{
+        acquisition::audit::{
+            EVENT_ACQUISITION_REQUEST_COMPLETED, count_acquisition_audit_events_for_subscription,
+        },
         config::DatabaseConfig,
         db::{Database, models::MediaType},
     };
@@ -2258,6 +3254,12 @@ mod tests {
             title: title.to_string(),
             year: Some(2026),
             external_ids: None,
+            idempotency_key: None,
+            request_mode: None,
+            request_scope: None,
+            scope: None,
+            metadata_policy: None,
+            completion_policy: None,
             monitor_policy: AcquisitionMonitorPolicy::AllMissing,
             route_policy: AcquisitionRoutePolicy::DebridFirst,
             source_provider_id: None,
@@ -2373,6 +3375,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_pending_targets_are_candidate_due_without_recurring_metadata() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let one_shot = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: Some(json!({
+                    "kind": "episode",
+                    "seasonNumber": 1,
+                    "episodeNumber": 2
+                })),
+                metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(30)),
+                candidate_search_after: Some(now - ChronoDuration::minutes(1)),
+                ..series_subscription("One Shot Due")
+            },
+        )
+        .await?;
+        record_metadata_refresh(
+            &database.pool,
+            one_shot.subscription_id,
+            now - ChronoDuration::minutes(5),
+        )
+        .await?;
+        upsert_subscription_targets(
+            &database.pool,
+            one_shot.subscription_id,
+            vec![NewAcquisitionTarget {
+                season_number: Some(1),
+                episode_number: Some(2),
+                air_time: Some(now - ChronoDuration::hours(1)),
+                next_search_after: Some(now - ChronoDuration::seconds(1)),
+                ..empty_target()
+            }],
+        )
+        .await?;
+
+        let metadata_due = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
+        assert!(
+            !metadata_due
+                .iter()
+                .any(|item| item.subscription_id == one_shot.subscription_id),
+            "one-shot metadata must not become recurring after the initial snapshot"
+        );
+
+        let candidates_due = list_due_candidate_targets(&database.pool, now, 10).await?;
+        assert!(
+            candidates_due
+                .iter()
+                .any(|target| target.subscription_id == one_shot.subscription_id
+                    && target.target_key == "S01E02"),
+            "one-shot scoped targets still flow through the normal candidate scheduler"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_one_shot_completion_marks_request_inactive_and_audits() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let one_shot = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Range),
+                scope: Some(json!({
+                    "kind": "range",
+                    "seasonNumber": 1,
+                    "episodeStart": 1,
+                    "episodeEnd": 2
+                })),
+                candidate_search_after: Some(now),
+                ..series_subscription("Terminal One Shot")
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            one_shot.subscription_id,
+            vec![
+                NewAcquisitionTarget {
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    state: Some(AcquisitionTargetState::Imported),
+                    ..empty_target()
+                },
+                NewAcquisitionTarget {
+                    season_number: Some(1),
+                    episode_number: Some(2),
+                    state: Some(AcquisitionTargetState::Excluded),
+                    ..empty_target()
+                },
+            ],
+        )
+        .await?;
+        assert_eq!(targets.len(), 2);
+
+        let completed = complete_terminal_acquisition_request_if_ready(
+            &database.pool,
+            one_shot.subscription_id,
+            "test completion",
+        )
+        .await?
+        .expect("one-shot should complete");
+        assert_eq!(completed.target_count, 2);
+        assert_eq!(completed.imported_count, 1);
+        assert_eq!(completed.excluded_count, 1);
+
+        let persisted = get_subscription(&database.pool, one_shot.subscription_id)
+            .await?
+            .expect("subscription");
+        assert_eq!(persisted.status, AcquisitionSubscriptionStatus::Completed);
+        assert!(!persisted.active);
+        assert_eq!(
+            count_acquisition_audit_events_for_subscription(
+                &database.pool,
+                one_shot.subscription_id,
+                EVENT_ACQUISITION_REQUEST_COMPLETED,
+            )
+            .await?,
+            1
+        );
+
+        let second = complete_terminal_acquisition_request_if_ready(
+            &database.pool,
+            one_shot.subscription_id,
+            "test completion",
+        )
+        .await?;
+        assert!(
+            second.is_none(),
+            "completion reconciliation must be idempotent after the request is inactive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn metadata_due_list_respects_active_status() -> Result<()> {
         let database = setup_db().await?;
         let now = Utc::now();
@@ -2406,6 +3547,207 @@ mod tests {
         let items = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].subscription_id, due.subscription_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscriptions_default_to_monitored_recurring_contract() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription =
+            create_subscription(&database.pool, series_subscription("Default Contract")).await?;
+
+        assert_eq!(subscription.request_mode, AcquisitionRequestMode::Monitored);
+        assert_eq!(
+            subscription.request_scope,
+            AcquisitionRequestScope::Subscription
+        );
+        assert_eq!(
+            subscription.metadata_policy,
+            AcquisitionMetadataPolicy::Recurring
+        );
+        assert_eq!(
+            subscription.completion_policy,
+            AcquisitionCompletionPolicy::Manual
+        );
+        assert_eq!(
+            subscription.monitor_policy,
+            AcquisitionMonitorPolicy::AllMissing
+        );
+        assert!(subscription.scope.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_subscriptions_get_initial_only_contract_defaults() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: Some(json!({
+                    "kind": "episode",
+                    "seasonNumber": 2,
+                    "episodeNumber": 3
+                })),
+                metadata_policy: None,
+                completion_policy: None,
+                ..series_subscription("One Shot Contract")
+            },
+        )
+        .await?;
+
+        assert_eq!(subscription.request_mode, AcquisitionRequestMode::OneShot);
+        assert_eq!(subscription.request_scope, AcquisitionRequestScope::Episode);
+        assert_eq!(
+            subscription.metadata_policy,
+            AcquisitionMetadataPolicy::InitialOnly
+        );
+        assert_eq!(
+            subscription.completion_policy,
+            AcquisitionCompletionPolicy::TerminalSelectedTargets
+        );
+        assert_eq!(
+            subscription.monitor_policy,
+            AcquisitionMonitorPolicy::SelectedTargets
+        );
+        assert_eq!(
+            subscription
+                .scope
+                .as_ref()
+                .and_then(|value| value.get("seasonNumber")),
+            Some(&json!(2))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_metadata_is_due_only_for_initial_snapshot() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let one_shot = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: Some(json!({ "kind": "season", "seasonNumber": 1 })),
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                ..series_subscription("One Shot Snapshot")
+            },
+        )
+        .await?;
+        let monitored = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                ..series_subscription("Recurring Snapshot")
+            },
+        )
+        .await?;
+
+        let due = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
+        let due_ids = due
+            .iter()
+            .map(|item| item.subscription_id)
+            .collect::<BTreeSet<_>>();
+        assert!(due_ids.contains(&one_shot.subscription_id));
+        assert!(due_ids.contains(&monitored.subscription_id));
+
+        record_metadata_refresh(
+            &database.pool,
+            one_shot.subscription_id,
+            now - ChronoDuration::minutes(1),
+        )
+        .await?;
+        record_metadata_refresh(
+            &database.pool,
+            monitored.subscription_id,
+            now - ChronoDuration::minutes(1),
+        )
+        .await?;
+
+        let due = list_due_metadata_subscriptions(&database.pool, now, 10).await?;
+        let due_ids = due
+            .iter()
+            .map(|item| item.subscription_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !due_ids.contains(&one_shot.subscription_id),
+            "one-shot requests must not reschedule recurring metadata refresh after the initial snapshot"
+        );
+        assert!(
+            due_ids.contains(&monitored.subscription_id),
+            "monitored subscriptions must keep existing recurring metadata behavior"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_season_intent_defers_target_creation_to_metadata_snapshot() -> Result<()> {
+        let database = setup_db().await?;
+        let now = Utc::now();
+        let result = create_or_update_acquisition_intent(
+            &database.pool,
+            CreateAcquisitionIntent {
+                media_type: MediaType::Series,
+                title: "Scoped Season".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    tvdb_series: Some("338186".to_string()),
+                    tvdb: Some("338186".to_string()),
+                    ..ExternalIds::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Season),
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: None,
+                route_policy: None,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
+                candidate_search_after: Some(now),
+                target: Some(AcquisitionIntentTarget {
+                    kind: Some("season".to_string()),
+                    season_number: Some(2),
+                    ..Default::default()
+                }),
+                targets: Vec::new(),
+            },
+            now,
+        )
+        .await?;
+
+        assert!(result.created);
+        assert_eq!(result.detail.targets.len(), 0);
+        assert_eq!(
+            result.detail.subscription.request_mode,
+            AcquisitionRequestMode::OneShot
+        );
+        assert_eq!(
+            result.detail.subscription.request_scope,
+            AcquisitionRequestScope::Season
+        );
+        assert_eq!(
+            result
+                .detail
+                .subscription
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.get("seasonNumber")),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            result.detail.subscription.metadata_policy,
+            AcquisitionMetadataPolicy::InitialOnly
+        );
+        assert_eq!(
+            result.detail.subscription.monitor_policy,
+            AcquisitionMonitorPolicy::SelectedTargets
+        );
         Ok(())
     }
 
@@ -2506,6 +3848,12 @@ mod tests {
                     imdb: Some("tt1234567".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
@@ -2557,6 +3905,12 @@ mod tests {
                     tvdb_series: Some("321".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: Some(AcquisitionRoutePolicy::DebridOnly),
                 source_provider_id: None,
@@ -2593,6 +3947,12 @@ mod tests {
                 title: "Example Season".to_string(),
                 year: Some(2026),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
@@ -2632,6 +3992,12 @@ mod tests {
                     anilist: Some("42".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
@@ -2659,6 +4025,12 @@ mod tests {
                 title: "Backlog Anime".to_string(),
                 year: Some(2026),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
@@ -2701,6 +4073,12 @@ mod tests {
             title: "Idempotent Show".to_string(),
             year: Some(2026),
             external_ids: None,
+            idempotency_key: None,
+            request_mode: None,
+            request_scope: None,
+            scope: None,
+            metadata_policy: None,
+            completion_policy: None,
             monitor_policy: None,
             route_policy: None,
             source_provider_id: None,
@@ -2772,6 +4150,12 @@ mod tests {
                     tvdb_series: Some("111".to_string()),
                     ..Default::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
@@ -2798,6 +4182,12 @@ mod tests {
                 tvdb_series: Some("222".to_string()),
                 ..Default::default()
             }),
+            idempotency_key: None,
+            request_mode: None,
+            request_scope: None,
+            scope: None,
+            metadata_policy: None,
+            completion_policy: None,
             monitor_policy: None,
             route_policy: None,
             source_provider_id: None,
@@ -2871,6 +4261,12 @@ mod tests {
                 title: "Arr Show".to_string(),
                 year: Some(2026),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,

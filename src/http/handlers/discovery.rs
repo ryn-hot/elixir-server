@@ -35,7 +35,8 @@ use crate::{
             store::{ReleaseListFilter, list_release_coverage, list_release_jobs, list_releases},
         },
         subscriptions::{
-            AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionFilter,
+            AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
+            AcquisitionSubscription, AcquisitionSubscriptionFilter, AcquisitionSubscriptionStatus,
             AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
             list_subscription_targets, list_subscriptions, update_target_state,
         },
@@ -86,6 +87,8 @@ const SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON: &str =
     "Downloaded file is waiting for library visibility.";
 const ADD_DEBRID_ACCOUNT_ACTION_ID: &str = "add_debrid_account";
 const OPEN_REVIEW_ACTION_ID: &str = "open_review";
+const OPEN_SHOW_ACTION_ID: &str = "open_show";
+const RETRY_MISSING_ACTION_ID: &str = "retry_missing";
 const FIND_ANOTHER_RELEASE_ACTION_ID: &str = "find_another_release";
 const RETRY_IMPORT_ACTION_ID: &str = "retry_import";
 const REMOVE_ACQUISITION_REQUEST_ACTION_ID: &str = "remove_acquisition_request";
@@ -345,7 +348,13 @@ pub struct FindMediaAcquisitionItem {
     pub manager_provider_id: Uuid,
     pub manager_label: String,
     pub manager_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_item_id: Option<String>,
     pub source: String,
+    pub request_mode: String,
+    pub request_scope: String,
+    pub request_label: String,
+    pub one_shot: bool,
     pub phase: String,
     pub phase_label: String,
     pub headline: String,
@@ -498,15 +507,15 @@ impl AcquisitionPhase {
 
     fn sort_priority(self) -> i32 {
         match self {
-            Self::NeedsAttention => 0,
-            Self::Failed => 1,
-            Self::ReviewRequired => 2,
-            Self::Quarantined => 3,
-            Self::FindingAnotherRelease => 4,
-            Self::Downloading => 5,
-            Self::Materializing => 6,
-            Self::PostProcessing => 7,
-            Self::Importing => 8,
+            Self::Downloading => 0,
+            Self::Materializing => 1,
+            Self::PostProcessing => 2,
+            Self::Importing => 3,
+            Self::NeedsAttention => 4,
+            Self::Failed => 5,
+            Self::ReviewRequired => 6,
+            Self::Quarantined => 7,
+            Self::FindingAnotherRelease => 8,
             Self::QueuedInDownloader => 9,
             Self::Submitted => 10,
             Self::Staged => 11,
@@ -522,6 +531,20 @@ impl AcquisitionPhase {
 
     fn counts_as_downloading(self) -> bool {
         matches!(self, Self::Downloading | Self::Materializing)
+    }
+
+    fn is_route_work(self) -> bool {
+        matches!(
+            self,
+            Self::Staged
+                | Self::Submitted
+                | Self::QueuedInDownloader
+                | Self::Downloading
+                | Self::Materializing
+                | Self::PostProcessing
+                | Self::Importing
+                | Self::Completed
+        )
     }
 
     fn legacy_stage(self) -> &'static str {
@@ -629,6 +652,8 @@ pub struct FindMediaAcquisitionAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub navigate_view: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigate_media_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub release_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<Uuid>,
@@ -710,6 +735,7 @@ struct SourceAcquisitionCounts {
     post_processing: usize,
     importing: usize,
     completed: usize,
+    no_results: usize,
     review_required: usize,
     quarantined: usize,
     needs_attention: usize,
@@ -1486,7 +1512,12 @@ async fn build_find_media_acquisition_item(
         manager_provider_id: intent.manager_provider_id,
         manager_label,
         manager_item_id: intent.manager_item_id.clone(),
+        media_item_id: None,
         source: intent.source.clone(),
+        request_mode: "managed".to_string(),
+        request_scope: "library_item".to_string(),
+        request_label: "Manager add".to_string(),
+        one_shot: false,
         phase: state_view.phase.as_str().to_string(),
         phase_label: state_view.phase.label().to_string(),
         headline: state_view.headline.clone(),
@@ -1754,24 +1785,23 @@ async fn build_source_acquisition_items(
 ) -> AnyResult<Vec<FindMediaAcquisitionItem>> {
     let subscriptions = list_subscriptions(
         &state.db_pool,
-        AcquisitionSubscriptionFilter { active: Some(true) },
+        AcquisitionSubscriptionFilter { active: None },
     )
     .await?;
     let mut items = Vec::new();
 
     for subscription in subscriptions {
+        if !source_subscription_can_surface_in_acquisition_log(&subscription) {
+            continue;
+        }
         let targets =
             list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
         let release_runtime =
             load_source_release_runtime_by_target(&state.db_pool, subscription.subscription_id)
                 .await?;
-        let visible_targets = targets
-            .into_iter()
-            .filter(|target| target.state != AcquisitionTargetState::Excluded)
-            .collect::<Vec<_>>();
         let Some(item) = build_source_acquisition_item(
             &subscription,
-            &visible_targets,
+            &targets,
             provider_map,
             downloader_progress,
             &release_runtime,
@@ -1779,16 +1809,39 @@ async fn build_source_acquisition_items(
         ) else {
             continue;
         };
-        if item.phase == AcquisitionPhase::Completed.as_str() {
-            let reference = item.last_matched_at.unwrap_or(item.updated_at);
-            if reference < recent_cutoff {
-                continue;
-            }
+        if !source_acquisition_item_should_remain_visible(&subscription, &item, recent_cutoff) {
+            continue;
         }
         items.push(item);
     }
 
     Ok(items)
+}
+
+fn source_subscription_can_surface_in_acquisition_log(
+    subscription: &AcquisitionSubscription,
+) -> bool {
+    subscription.active
+        || (subscription.request_mode.is_one_shot()
+            && subscription.status == AcquisitionSubscriptionStatus::Completed)
+}
+
+fn source_acquisition_item_should_remain_visible(
+    subscription: &AcquisitionSubscription,
+    item: &FindMediaAcquisitionItem,
+    recent_cutoff: DateTime<Utc>,
+) -> bool {
+    if subscription.active {
+        return true;
+    }
+    if subscription.updated_at < recent_cutoff {
+        return false;
+    }
+    if item.phase == AcquisitionPhase::Completed.as_str() {
+        let reference = item.last_matched_at.unwrap_or(item.updated_at);
+        return reference >= recent_cutoff;
+    }
+    true
 }
 
 async fn load_acquisition_ux_context(
@@ -1993,7 +2046,14 @@ fn build_source_acquisition_item(
         ux_context.debrid_account_missing && route_policy_allows_debrid(subscription.route_policy);
     let blocker = build_source_acquisition_blocker(&children)
         .or_else(|| debrid_account_missing.then(build_missing_debrid_account_blocker));
-    let actions = build_source_acquisition_actions(subscription, &children, debrid_account_missing);
+    let media_item_id = source_acquisition_media_item_id(subscription, targets);
+    let actions = build_source_acquisition_actions(
+        subscription,
+        &children,
+        counts,
+        media_item_id.as_deref(),
+        debrid_account_missing,
+    );
     let mut evidence = vec![
         acquisition_evidence("Source", source_label.clone(), Some("neutral")),
         acquisition_evidence("Targets", target_count.to_string(), Some("neutral")),
@@ -2031,7 +2091,12 @@ fn build_source_acquisition_item(
         manager_provider_id,
         manager_label: source_label,
         manager_item_id: Some(subscription.subscription_id.to_string()),
+        media_item_id,
         source: SOURCE_ACQUISITION_INTENT_SOURCE.to_string(),
+        request_mode: subscription.request_mode.as_str().to_string(),
+        request_scope: subscription.request_scope.as_str().to_string(),
+        request_label: source_acquisition_request_label(subscription),
+        one_shot: subscription.request_mode.is_one_shot(),
         phase: phase.as_str().to_string(),
         phase_label: phase.label().to_string(),
         headline: format_source_acquisition_headline(counts, targets.len()),
@@ -2056,6 +2121,58 @@ fn build_source_acquisition_item(
     })
 }
 
+fn source_acquisition_request_label(subscription: &AcquisitionSubscription) -> String {
+    if subscription.request_mode != AcquisitionRequestMode::OneShot {
+        return "Monitored acquisition".to_string();
+    }
+    match subscription.request_scope {
+        AcquisitionRequestScope::Movie => "One-time movie request",
+        AcquisitionRequestScope::Episode => "One-time episode request",
+        AcquisitionRequestScope::Season => "One-time season request",
+        AcquisitionRequestScope::Range => "One-time range request",
+        AcquisitionRequestScope::Missing => "One-time missing request",
+        AcquisitionRequestScope::SelectedTargets => "One-time selected targets request",
+        AcquisitionRequestScope::Subscription => "One-time request",
+    }
+    .to_string()
+}
+
+fn source_acquisition_media_item_id(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+) -> Option<String> {
+    json_string_at(subscription.scope.as_ref(), &["mediaItemId"])
+        .or_else(|| json_string_at(subscription.scope.as_ref(), &["media_item_id"]))
+        .or_else(|| {
+            targets.iter().find_map(|target| {
+                json_string_at(target.metadata.as_ref(), &["mediaItemId"])
+                    .or_else(|| json_string_at(target.metadata.as_ref(), &["media_item_id"]))
+                    .or_else(|| {
+                        json_string_at(target.metadata.as_ref(), &["scopeMetadata", "mediaItemId"])
+                    })
+                    .or_else(|| {
+                        json_string_at(
+                            target.metadata.as_ref(),
+                            &["scopeMetadata", "media_item_id"],
+                        )
+                    })
+            })
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn json_string_at(value: Option<&Value>, path: &[&str]) -> Option<String> {
+    let mut current = value?;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value: &&str| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn build_empty_source_acquisition_item(
     subscription: &AcquisitionSubscription,
     manager_provider_id: Uuid,
@@ -2072,11 +2189,13 @@ fn build_empty_source_acquisition_item(
         ux_context.debrid_account_missing && route_policy_allows_debrid(subscription.route_policy);
     let blocker =
         blocker.or_else(|| debrid_account_missing.then(build_missing_debrid_account_blocker));
-    let mut actions = if debrid_account_missing {
-        vec![build_add_debrid_account_action()]
-    } else {
-        Vec::new()
-    };
+    let mut actions = Vec::new();
+    if let Some(media_item_id) = source_acquisition_media_item_id(subscription, &[]) {
+        actions.push(build_open_show_action(&media_item_id));
+    }
+    if debrid_account_missing {
+        actions.push(build_add_debrid_account_action());
+    }
     actions.push(build_remove_acquisition_request_action(
         subscription.subscription_id,
     ));
@@ -2124,7 +2243,12 @@ fn build_empty_source_acquisition_item(
         manager_provider_id,
         manager_label: source_label,
         manager_item_id: Some(subscription.subscription_id.to_string()),
+        media_item_id: source_acquisition_media_item_id(subscription, &[]),
         source: SOURCE_ACQUISITION_INTENT_SOURCE.to_string(),
+        request_mode: subscription.request_mode.as_str().to_string(),
+        request_scope: subscription.request_scope.as_str().to_string(),
+        request_label: source_acquisition_request_label(subscription),
+        one_shot: subscription.request_mode.is_one_shot(),
         phase: phase.as_str().to_string(),
         phase_label: phase.label().to_string(),
         headline: headline.clone(),
@@ -2198,6 +2322,15 @@ fn build_source_acquisition_child(
         .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
     let route_provider_label = route_provider_id
         .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+    let no_results = source_target_is_no_results(target);
+    let status = if no_results {
+        Some("no_results".to_string())
+    } else {
+        progress
+            .and_then(|item| item.status.clone())
+            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::status_text))
+            .or_else(|| Some(target.state.as_str().to_string()))
+    };
 
     FindMediaAcquisitionChildItem {
         id: target.target_id.to_string(),
@@ -2213,13 +2346,14 @@ fn build_source_acquisition_child(
             .download_id
             .clone()
             .or_else(|| release_runtime.and_then(|runtime| runtime.download_id.clone())),
-        status: progress
-            .and_then(|item| item.status.clone())
-            .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::status_text))
-            .or_else(|| Some(target.state.as_str().to_string())),
+        status,
         category: progress.and_then(|item| item.category.clone()),
         phase: phase.as_str().to_string(),
-        phase_label: phase.label().to_string(),
+        phase_label: if no_results {
+            "No results".to_string()
+        } else {
+            phase.label().to_string()
+        },
         headline: source_target_headline(
             target,
             release_runtime,
@@ -2244,6 +2378,23 @@ fn build_source_acquisition_child(
         availability: progress.and_then(|item| item.availability),
         seen_complete_at: progress.and_then(|item| item.seen_complete_at),
     }
+}
+
+fn source_target_is_no_results(target: &AcquisitionTarget) -> bool {
+    let Some(reason) = target
+        .state_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    else {
+        return target.state == AcquisitionTargetState::Excluded;
+    };
+    let normalized = reason.to_ascii_lowercase();
+    normalized.contains("no results")
+        || normalized.contains("no safe candidate")
+        || normalized.contains("no matching acquisition candidates")
+        || normalized.contains("search exhausted")
+        || normalized.contains("no acquisition candidates")
 }
 
 fn source_provider_id_for_subscription(
@@ -2593,6 +2744,34 @@ fn source_target_phase(
     {
         return AcquisitionPhase::FindingAnotherRelease;
     }
+    if target.import_event_id.is_some()
+        && target
+            .state_reason
+            .as_deref()
+            .is_some_and(|reason| reason == SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON)
+    {
+        return AcquisitionPhase::Importing;
+    }
+
+    if let Some(phase) = release_runtime
+        .and_then(source_release_runtime_phase)
+        .filter(|phase| *phase == AcquisitionPhase::Completed)
+    {
+        return phase;
+    }
+    if let Some(phase) = release_runtime.and_then(source_release_runtime_hard_attention_phase) {
+        return phase;
+    }
+    if let Some(progress_phase) = progress.and_then(source_downloader_progress_phase) {
+        return progress_phase;
+    }
+    if let Some(phase) = release_runtime
+        .and_then(source_release_runtime_phase)
+        .filter(|phase| phase.is_route_work())
+    {
+        return phase;
+    }
+
     if target
         .state_reason
         .as_deref()
@@ -2602,17 +2781,6 @@ fn source_target_phase(
     }
     if let Some(phase) = release_runtime.and_then(source_release_runtime_attention_phase) {
         return phase;
-    }
-    if target.import_event_id.is_some()
-        && target
-            .state_reason
-            .as_deref()
-            .is_some_and(|reason| reason == SOURCE_ACQUISITION_WAITING_FOR_FILE_REASON)
-    {
-        return AcquisitionPhase::Importing;
-    }
-    if let Some(progress_phase) = progress.and_then(source_downloader_progress_phase) {
-        return progress_phase;
     }
     if let Some(phase) = release_runtime.and_then(source_release_runtime_phase) {
         return phase;
@@ -2647,6 +2815,33 @@ fn source_release_runtime_attention_phase(
     ) || runtime.release_state == AcquisitionReleaseState::ReviewRequired
     {
         return Some(AcquisitionPhase::ReviewRequired);
+    }
+    if matches!(
+        runtime.job_state,
+        Some(ReleaseJobState::Failed | ReleaseJobState::Cancelled)
+    ) || matches!(
+        runtime.release_state,
+        AcquisitionReleaseState::Failed | AcquisitionReleaseState::Cancelled
+    ) {
+        return Some(AcquisitionPhase::Failed);
+    }
+    None
+}
+
+fn source_release_runtime_hard_attention_phase(
+    runtime: &SourceTargetReleaseRuntime,
+) -> Option<AcquisitionPhase> {
+    if matches!(
+        runtime.import_state,
+        Some(AcquisitionImportRunState::Blocked | AcquisitionImportRunState::Mismatched)
+    ) {
+        return Some(AcquisitionPhase::Quarantined);
+    }
+    if matches!(
+        runtime.import_state,
+        Some(AcquisitionImportRunState::Failed | AcquisitionImportRunState::Cancelled)
+    ) {
+        return Some(AcquisitionPhase::Failed);
     }
     if matches!(
         runtime.job_state,
@@ -2697,9 +2892,11 @@ fn source_target_progress_percent(
         return Some(100.0);
     }
 
-    let live_progress = progress
-        .and_then(|item| item.progress_percent)
-        .and_then(normalize_progress_percent);
+    let live_progress = progress.and_then(|item| {
+        item.progress_percent
+            .and_then(normalize_progress_percent)
+            .or_else(|| source_downloader_progress_percent_from_bytes(item))
+    });
 
     match phase {
         AcquisitionPhase::Downloading | AcquisitionPhase::Materializing => {
@@ -2714,6 +2911,21 @@ fn source_target_progress_percent(
 
 fn normalize_progress_percent(value: f64) -> Option<f64> {
     value.is_finite().then(|| value.clamp(0.0, 100.0))
+}
+
+fn source_downloader_progress_percent_from_bytes(
+    progress: &AcquisitionDownloaderProgress,
+) -> Option<f64> {
+    let size = progress.size_bytes?;
+    if size == 0 {
+        return None;
+    }
+    let downloaded = progress.downloaded_bytes.or_else(|| {
+        progress
+            .remaining_bytes
+            .map(|remaining| size.saturating_sub(remaining))
+    })?;
+    normalize_progress_percent(downloaded as f64 * 100.0 / size as f64)
 }
 
 fn source_release_runtime_phase(runtime: &SourceTargetReleaseRuntime) -> Option<AcquisitionPhase> {
@@ -2917,6 +3129,9 @@ fn source_target_headline(
     phase: AcquisitionPhase,
     downloader_label: Option<&str>,
 ) -> String {
+    if source_target_is_no_results(target) {
+        return "No safe release was found.".to_string();
+    }
     match phase {
         AcquisitionPhase::Requested => "Waiting for source search.".to_string(),
         AcquisitionPhase::FindingAnotherRelease => "Trying next release.".to_string(),
@@ -2958,6 +3173,15 @@ fn source_target_detail(
     phase: AcquisitionPhase,
     selected_title: Option<&str>,
 ) -> Option<String> {
+    if source_target_is_no_results(target) {
+        return Some(
+            target
+                .state_reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "Source search finished with no safe candidate.".to_string()),
+        );
+    }
     if matches!(
         phase,
         AcquisitionPhase::NeedsAttention
@@ -3320,6 +3544,7 @@ fn build_add_debrid_account_action() -> FindMediaAcquisitionAction {
         confirm_text: None,
         navigate_extension_id: Some(DEBRID_EXTENSION_ID.to_string()),
         navigate_view: Some("extension_control".to_string()),
+        navigate_media_item_id: None,
         release_id: None,
         subscription_id: None,
         retry_mode: None,
@@ -3330,9 +3555,14 @@ fn build_add_debrid_account_action() -> FindMediaAcquisitionAction {
 fn build_source_acquisition_actions(
     subscription: &AcquisitionSubscription,
     children: &[FindMediaAcquisitionChildItem],
+    counts: SourceAcquisitionCounts,
+    media_item_id: Option<&str>,
     debrid_account_missing: bool,
 ) -> Vec<FindMediaAcquisitionAction> {
     let mut actions = Vec::new();
+    if let Some(media_item_id) = media_item_id {
+        actions.push(build_open_show_action(media_item_id));
+    }
     if debrid_account_missing || children.iter().any(child_needs_debrid_account) {
         actions.push(build_add_debrid_account_action());
     }
@@ -3386,6 +3616,13 @@ fn build_source_acquisition_actions(
         ));
     }
 
+    if subscription.request_mode.is_one_shot()
+        && counts.no_results + counts.failed + counts.needs_attention > 0
+        && !children.iter().any(child_has_active_download_work)
+    {
+        actions.push(build_retry_missing_action(subscription.subscription_id));
+    }
+
     if children.iter().any(child_has_active_download_work) {
         actions.push(build_cancel_acquisition_downloads_action(
             subscription.subscription_id,
@@ -3424,9 +3661,45 @@ fn build_release_review_action(
         confirm_text: None,
         navigate_extension_id: None,
         navigate_view: Some("acquisition_review".to_string()),
+        navigate_media_item_id: None,
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: None,
+        cancel_mode: None,
+    }
+}
+
+fn build_open_show_action(media_item_id: &str) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: OPEN_SHOW_ACTION_ID.to_string(),
+        label: "Open show".to_string(),
+        kind: "secondary".to_string(),
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: Some("media_detail".to_string()),
+        navigate_media_item_id: Some(media_item_id.to_string()),
+        release_id: None,
+        subscription_id: None,
+        retry_mode: None,
+        cancel_mode: None,
+    }
+}
+
+fn build_retry_missing_action(subscription_id: Uuid) -> FindMediaAcquisitionAction {
+    FindMediaAcquisitionAction {
+        id: RETRY_MISSING_ACTION_ID.to_string(),
+        label: "Retry missing".to_string(),
+        kind: "secondary".to_string(),
+        confirm_text: Some(
+            "Retry missing or failed targets from this acquisition request? Imported files are not touched."
+                .to_string(),
+        ),
+        navigate_extension_id: None,
+        navigate_view: None,
+        navigate_media_item_id: None,
+        release_id: None,
+        subscription_id: Some(subscription_id),
+        retry_mode: Some("missing_targets".to_string()),
         cancel_mode: None,
     }
 }
@@ -3444,6 +3717,7 @@ fn build_retry_import_action(
         ),
         navigate_extension_id: None,
         navigate_view: None,
+        navigate_media_item_id: None,
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: Some("import".to_string()),
@@ -3462,6 +3736,7 @@ fn build_find_another_release_for_release_action(
         confirm_text: Some("Search for another release for the affected target?".to_string()),
         navigate_extension_id: None,
         navigate_view: None,
+        navigate_media_item_id: None,
         release_id: Some(release_id),
         subscription_id: Some(subscription_id),
         retry_mode: Some("source_discovery".to_string()),
@@ -3480,6 +3755,7 @@ fn build_remove_acquisition_request_action(subscription_id: Uuid) -> FindMediaAc
         ),
         navigate_extension_id: None,
         navigate_view: None,
+        navigate_media_item_id: None,
         release_id: None,
         subscription_id: Some(subscription_id),
         retry_mode: None,
@@ -3498,6 +3774,7 @@ fn build_cancel_acquisition_downloads_action(subscription_id: Uuid) -> FindMedia
         ),
         navigate_extension_id: None,
         navigate_view: None,
+        navigate_media_item_id: None,
         release_id: None,
         subscription_id: Some(subscription_id),
         retry_mode: None,
@@ -3527,6 +3804,10 @@ fn source_acquisition_counts(
 ) -> SourceAcquisitionCounts {
     let mut counts = SourceAcquisitionCounts::default();
     for child in children {
+        if child.status.as_deref() == Some("no_results") {
+            counts.no_results += 1;
+            continue;
+        }
         match acquisition_phase_from_str(&child.phase) {
             AcquisitionPhase::Requested => counts.requested += 1,
             AcquisitionPhase::Staged => counts.staged += 1,
@@ -3565,6 +3846,7 @@ fn source_status_count_evidence(
     push("Materializing", counts.materializing, Some("success"));
     push("Importing", counts.importing, Some("success"));
     push("Imported", counts.completed, Some("success"));
+    push("No results", counts.no_results, Some("warning"));
     push("Review", counts.review_required, Some("warning"));
     push("Quarantined", counts.quarantined, Some("warning"));
     push(
@@ -3576,13 +3858,7 @@ fn source_status_count_evidence(
 }
 
 fn summarize_source_acquisition_phase(counts: SourceAcquisitionCounts) -> AcquisitionPhase {
-    if counts.needs_attention > 0 || counts.failed > 0 {
-        AcquisitionPhase::NeedsAttention
-    } else if counts.review_required > 0 {
-        AcquisitionPhase::ReviewRequired
-    } else if counts.quarantined > 0 {
-        AcquisitionPhase::Quarantined
-    } else if counts.downloading > 0 {
+    if counts.downloading > 0 {
         AcquisitionPhase::Downloading
     } else if counts.materializing > 0 {
         AcquisitionPhase::Materializing
@@ -3590,6 +3866,12 @@ fn summarize_source_acquisition_phase(counts: SourceAcquisitionCounts) -> Acquis
         AcquisitionPhase::PostProcessing
     } else if counts.importing > 0 {
         AcquisitionPhase::Importing
+    } else if counts.needs_attention > 0 || counts.failed > 0 {
+        AcquisitionPhase::NeedsAttention
+    } else if counts.review_required > 0 {
+        AcquisitionPhase::ReviewRequired
+    } else if counts.quarantined > 0 {
+        AcquisitionPhase::Quarantined
     } else if counts.queued > 0 {
         AcquisitionPhase::QueuedInDownloader
     } else if counts.submitted > 0 {
@@ -3695,12 +3977,30 @@ fn format_source_acquisition_headline(
     if counts.staged > 0 {
         parts.push(format!("{} staged", format_transfer_count(counts.staged)));
     }
-    if parts.is_empty() && counts.completed >= total_targets {
-        "All targets imported.".to_string()
+    if parts.is_empty() && counts.completed + counts.no_results >= total_targets {
+        if counts.no_results > 0 && counts.completed > 0 {
+            format!(
+                "{} imported, {} no results.",
+                format_source_target_count(counts.completed),
+                format_source_target_count(counts.no_results)
+            )
+        } else if counts.no_results > 0 {
+            "No safe results found.".to_string()
+        } else {
+            "All targets imported.".to_string()
+        }
     } else if parts.is_empty() {
         "Waiting for source search.".to_string()
     } else {
         format!("{}.", parts.join(", "))
+    }
+}
+
+fn format_source_target_count(count: usize) -> String {
+    if count == 1 {
+        "1 target".to_string()
+    } else {
+        format!("{count} targets")
     }
 }
 
@@ -3722,6 +4022,7 @@ fn format_source_acquisition_detail(
     push("downloaded", counts.post_processing);
     push("importing", counts.importing);
     push("imported", counts.completed);
+    push("with no results", counts.no_results);
     push("needing review", counts.review_required);
     push("quarantined", counts.quarantined);
     push("failed", counts.failed + counts.needs_attention);
@@ -9071,6 +9372,174 @@ mod tests {
     }
 
     #[test]
+    fn source_acquisition_manual_review_transfer_overrides_stale_review_marker() {
+        let source_provider_id = Uuid::new_v4();
+        let route_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let release_id = Uuid::new_v4();
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "Example Series Pack 1080p",
+                "sourceProviderId": source_provider_id.to_string(),
+                "submissionResult": {
+                    "routeLogicalId": DEBRID_DEFAULT_LOGICAL_ID,
+                    "routeProviderId": route_provider_id.to_string(),
+                    "downloadId": "manual-review-download"
+                }
+            })),
+            download_id: Some("manual-review-download".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            state_reason: Some(
+                "TV candidate needs manual review before download: ambiguous_release.".to_string(),
+            ),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(3),
+                Some(1),
+                None,
+            )
+        };
+        let runtime = SourceTargetReleaseRuntime {
+            release_id,
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: Some(route_provider_id),
+            release_title: "Example Series Pack 1080p".to_string(),
+            release_state: AcquisitionReleaseState::ReviewRequired,
+            release_state_reason: Some("manual review required".to_string()),
+            coverage_state: Some(ReleaseCoverageState::ReviewRequired),
+            coverage_reason: Some("coverage needed review".to_string()),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("manual-review-download".to_string()),
+            job_state: Some(ReleaseJobState::Downloading),
+            job_state_reason: Some("manual review approved selected files".to_string()),
+            import_state: None,
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let mut progress_index = AcquisitionDownloaderProgressIndex::default();
+        progress_index.insert(
+            "manual-review-download",
+            AcquisitionDownloaderProgress {
+                status: Some("downloading".to_string()),
+                size_bytes: Some(1_000),
+                downloaded_bytes: Some(250),
+                download_rate_bps: Some(10_000),
+                ..Default::default()
+            },
+        );
+        let provider_map = HashMap::from([
+            (
+                source_provider_id,
+                test_provider_context(source_provider_id, "Torrentio", "torrentio"),
+            ),
+            (
+                route_provider_id,
+                test_provider_context(route_provider_id, "TorBox", "torbox"),
+            ),
+        ]);
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &progress_index,
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, "downloading");
+        assert_eq!(item.phase_label, "Downloading");
+        assert!(item.blocker.is_none());
+        assert_eq!(item.progress_percent, Some(25.0));
+        assert!(
+            item.evidence
+                .iter()
+                .any(|evidence| { evidence.label == "Downloading" && evidence.value == "1" })
+        );
+        assert!(
+            !item
+                .evidence
+                .iter()
+                .any(|evidence| { evidence.label == "Review" && evidence.value == "1" })
+        );
+
+        let child = item.children.first().expect("child");
+        assert_eq!(child.phase, "downloading");
+        assert_eq!(child.phase_label, "Downloading");
+        assert_eq!(child.progress_percent, Some(25.0));
+        assert_eq!(child.download_rate_bps, Some(10_000));
+        assert!(child.blocker.is_none());
+        assert_eq!(
+            child.route_provider_label.as_deref(),
+            Some("TorBox (torbox)")
+        );
+    }
+
+    #[test]
+    fn active_source_acquisition_completed_history_stays_visible_after_recent_window() {
+        let now = Utc::now();
+        let old = now - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS + 2);
+        let cutoff = now - ChronoDuration::hours(ACQUISITION_RECENT_WINDOW_HOURS);
+        let mut subscription = test_source_subscription(MediaType::Series);
+        subscription.updated_at = old;
+        subscription.created_at = old;
+        let mut target = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(1),
+            Some(1),
+            None,
+        );
+        target.state = AcquisitionTargetState::Imported;
+        target.state_reason = Some("Imported into the Elixir library.".to_string());
+        target.updated_at = old;
+        target.created_at = old;
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, AcquisitionPhase::Completed.as_str());
+        assert!(
+            item.last_matched_at
+                .as_ref()
+                .is_some_and(|value| value < &cutoff)
+        );
+        assert!(source_acquisition_item_should_remain_visible(
+            &subscription,
+            &item,
+            cutoff
+        ));
+
+        subscription.active = false;
+        subscription.request_mode = AcquisitionRequestMode::OneShot;
+        subscription.status = AcquisitionSubscriptionStatus::Completed;
+        assert!(source_subscription_can_surface_in_acquisition_log(
+            &subscription
+        ));
+        assert!(!source_acquisition_item_should_remain_visible(
+            &subscription,
+            &item,
+            cutoff
+        ));
+    }
+
+    #[test]
     fn source_acquisition_large_backfill_summarizes_all_targets_before_truncation() {
         let subscription = test_source_subscription(MediaType::Anime);
         let mut targets = Vec::new();
@@ -9266,6 +9735,40 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn osr5_source_acquisition_item_exposes_one_shot_request_context() {
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Season,
+            ..test_source_subscription(MediaType::Series)
+        };
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Pending,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(1),
+                Some(1),
+                Some(json!({ "title": "Example Series S01E01 1080p" })),
+            )
+        };
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.request_mode, "one_shot");
+        assert_eq!(item.request_scope, "season");
+        assert_eq!(item.request_label, "One-time season request");
+        assert!(item.one_shot);
+    }
+
     fn test_source_subscription(media_type: MediaType) -> AcquisitionSubscription {
         let now = Utc::now();
         AcquisitionSubscription {
@@ -9280,6 +9783,14 @@ mod tests {
             normalized_title: "example".to_string(),
             year: Some(2026),
             external_ids: None,
+            idempotency_key: None,
+            request_mode: crate::acquisition::subscriptions::AcquisitionRequestMode::Monitored,
+            request_scope: crate::acquisition::subscriptions::AcquisitionRequestScope::Subscription,
+            scope: None,
+            metadata_policy:
+                crate::acquisition::subscriptions::AcquisitionMetadataPolicy::Recurring,
+            completion_policy:
+                crate::acquisition::subscriptions::AcquisitionCompletionPolicy::Manual,
             monitor_policy: crate::acquisition::subscriptions::AcquisitionMonitorPolicy::AllMissing,
             route_policy: crate::acquisition::subscriptions::AcquisitionRoutePolicy::DebridFirst,
             source_provider_id: None,

@@ -123,6 +123,26 @@ pub fn router(state: AppState) -> Router {
             post(handlers::acquisition_subscriptions::create_acquisition_intent),
         )
         .route(
+            "/api/v1/acquisition/requests",
+            post(handlers::acquisition_subscriptions::create_acquisition_request),
+        )
+        .route(
+            "/api/v1/acquisition/requests/:subscription_id",
+            get(handlers::acquisition_subscriptions::get_acquisition_request),
+        )
+        .route(
+            "/api/v1/acquisition/requests/:subscription_id/cancel",
+            post(handlers::acquisition_subscriptions::cancel_acquisition_subscription),
+        )
+        .route(
+            "/api/v1/acquisition/requests/:subscription_id/retry",
+            post(handlers::acquisition_subscriptions::retry_acquisition_request),
+        )
+        .route(
+            "/api/v1/acquisition/requests/:subscription_id/coverage",
+            get(handlers::acquisition_review::acquisition_subscription_coverage),
+        )
+        .route(
             "/api/v1/acquisition/subscriptions/:subscription_id",
             get(handlers::acquisition_subscriptions::get_acquisition_subscription)
                 .patch(handlers::acquisition_subscriptions::patch_acquisition_subscription),

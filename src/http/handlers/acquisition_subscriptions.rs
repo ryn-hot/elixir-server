@@ -10,14 +10,17 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::subscriptions::{
+        AcquisitionRequestBlocker, AcquisitionRequestRetryResult, AcquisitionRequestTargetCounts,
         AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionDetail,
         AcquisitionSubscriptionFilter, AcquisitionSubscriptionStopTrackingResult,
         AcquisitionSubscriptionUpdate, AcquisitionTarget, AcquisitionTargetState,
         AcquisitionTargetStateUpdate, CreateAcquisitionIntent, NewAcquisitionSubscription,
-        NewAcquisitionTarget, create_or_update_acquisition_intent, create_subscription,
-        get_subscription, get_subscription_detail, get_target, list_subscriptions,
-        stop_subscription_tracking, update_subscription, update_target_state,
-        upsert_subscription_targets, validate_new_targets,
+        NewAcquisitionTarget, acquisition_request_blockers, acquisition_request_target_counts,
+        create_or_update_acquisition_intent, create_subscription, get_subscription,
+        get_subscription_detail, get_target, list_subscriptions,
+        retry_acquisition_request as retry_acquisition_request_store, stop_subscription_tracking,
+        update_subscription, update_target_state, upsert_subscription_targets,
+        validate_new_targets,
     },
     db::models::ProviderHealthState,
     download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
@@ -73,6 +76,22 @@ pub struct AcquisitionSubscriptionsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionTargetsResponse {
     targets: Vec<AcquisitionTarget>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionRequestResponse {
+    request: AcquisitionSubscription,
+    targets: Vec<AcquisitionTarget>,
+    target_counts: AcquisitionRequestTargetCounts,
+    blockers: Vec<AcquisitionRequestBlocker>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryAcquisitionRequestRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +257,19 @@ pub async fn create_acquisition_intent(
     Ok(Json(result))
 }
 
+pub async fn create_acquisition_request(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Json(mut request): Json<CreateAcquisitionIntent>,
+) -> ApiResult<Json<crate::acquisition::subscriptions::AcquisitionIntentCreation>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    apply_source_provider_config_defaults(&store, &mut request).await?;
+    let result = create_or_update_acquisition_intent(&state.db_pool, request, chrono::Utc::now())
+        .await
+        .map_err(map_acquisition_input_error)?;
+    Ok(Json(result))
+}
+
 async fn apply_source_provider_config_defaults(
     store: &ExtensionStore<'_>,
     request: &mut CreateAcquisitionIntent,
@@ -346,6 +378,19 @@ fn max_size_bytes_from_config(config: &JsonMap<String, JsonValue>) -> Option<u64
     Some((max_size_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
 }
 
+fn acquisition_request_response(
+    detail: AcquisitionSubscriptionDetail,
+) -> AcquisitionRequestResponse {
+    let target_counts = acquisition_request_target_counts(&detail.targets);
+    let blockers = acquisition_request_blockers(&detail.targets);
+    AcquisitionRequestResponse {
+        request: detail.subscription,
+        targets: detail.targets,
+        target_counts,
+        blockers,
+    }
+}
+
 pub async fn get_acquisition_subscription(
     _user: CurrentUser,
     State(state): State<AppState>,
@@ -356,6 +401,18 @@ pub async fn get_acquisition_subscription(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("acquisition subscription not found"))?;
     Ok(Json(detail))
+}
+
+pub async fn get_acquisition_request(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(subscription_id): Path<Uuid>,
+) -> ApiResult<Json<AcquisitionRequestResponse>> {
+    let detail = get_subscription_detail(&state.db_pool, subscription_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("acquisition request not found"))?;
+    Ok(Json(acquisition_request_response(detail)))
 }
 
 pub async fn patch_acquisition_subscription(
@@ -437,6 +494,24 @@ pub async fn cancel_acquisition_subscription(
         downloads_cancelled,
         download_cancel_failures: failures,
     }))
+}
+
+pub async fn retry_acquisition_request(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(subscription_id): Path<Uuid>,
+    Json(request): Json<RetryAcquisitionRequestRequest>,
+) -> ApiResult<Json<AcquisitionRequestRetryResult>> {
+    let result = retry_acquisition_request_store(
+        &state.db_pool,
+        subscription_id,
+        chrono::Utc::now(),
+        request.reason.as_deref(),
+    )
+    .await
+    .map_err(map_acquisition_input_error)?
+    .ok_or_else(|| ApiError::not_found("acquisition request not found"))?;
+    Ok(Json(result))
 }
 
 pub async fn upsert_acquisition_targets(

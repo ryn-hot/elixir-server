@@ -4275,6 +4275,563 @@ async fn acquisition_intent_endpoints_create_and_reuse_native_subscription() -> 
 }
 
 #[tokio::test]
+async fn osr2_acquisition_request_endpoints_are_idempotent_cancelable_and_retryable() -> Result<()>
+{
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let request = json!({
+        "mediaType": "series",
+        "title": "OSR API Show",
+        "year": 2026,
+        "idempotencyKey": "osr2-api-show-season-1",
+        "requestMode": "one_shot",
+        "target": {
+            "kind": "range",
+            "seasonNumber": 1,
+            "episodeStart": 1,
+            "episodeEnd": 2
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let first: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "create response: {first}");
+    assert_eq!(first.get("created").and_then(Value::as_bool), Some(true));
+    assert_eq!(first.get("existing").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/requestMode")
+            .and_then(Value::as_str),
+        Some("one_shot")
+    );
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/idempotencyKey")
+            .and_then(Value::as_str),
+        Some("osr2-api-show-season-1")
+    );
+    assert_eq!(
+        first
+            .pointer("/targetCounts/pending")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    let subscription_id = first
+        .pointer("/detail/subscription/subscriptionId")
+        .and_then(Value::as_str)
+        .context("created subscription id")?
+        .to_string();
+
+    let duplicate_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let body = body::to_bytes(duplicate_response.into_body(), 1_048_576).await?;
+    let duplicate: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        duplicate.get("created").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        duplicate.get("existing").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        duplicate
+            .pointer("/detail/subscription/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/acquisition/requests/{subscription_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let body = body::to_bytes(get_response.into_body(), 1_048_576).await?;
+    let request_detail: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        request_detail
+            .pointer("/request/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+    assert_eq!(
+        request_detail
+            .pointer("/targetCounts/total")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/acquisition/requests/{subscription_id}/cancel"
+            ))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(r#"{"mode":"stop_tracking"}"#))?,
+        )
+        .await?;
+    assert_eq!(cancel_response.status(), StatusCode::OK);
+    let cancelled_active: i64 = sqlx::query_scalar(
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+    )
+    .bind(&subscription_id)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(cancelled_active, 0);
+
+    let retry_response = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/acquisition/requests/{subscription_id}/retry"
+            ))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(r#"{"reason":"retry OSR-2 request"}"#))?,
+        )
+        .await?;
+    let status = retry_response.status();
+    let body = body::to_bytes(retry_response.into_body(), 1_048_576).await?;
+    let retry: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "retry response: {retry}");
+    assert_eq!(retry.get("targetsReset").and_then(Value::as_u64), Some(2));
+    assert_eq!(
+        retry
+            .pointer("/targetCounts/pending")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        retry
+            .pointer("/detail/subscription/status")
+            .and_then(Value::as_str),
+        Some("active")
+    );
+
+    sqlx::query(
+        "UPDATE acquisition_subscriptions
+         SET status = 'completed', active = 0
+         WHERE subscription_id = ?",
+    )
+    .bind(&subscription_id)
+    .execute(&db_pool)
+    .await?;
+
+    let requeue_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let status = requeue_response.status();
+    let body = body::to_bytes(requeue_response.into_body(), 1_048_576).await?;
+    let requeue: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "requeue response: {requeue}");
+    assert_eq!(requeue.get("created").and_then(Value::as_bool), Some(true));
+    assert_ne!(
+        requeue
+            .pointer("/detail/subscription/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mmr4_selected_episode_retry_uses_explicit_targets_and_idempotency() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let request = json!({
+        "mediaType": "series",
+        "title": "MMR4 Selected Show",
+        "year": 2026,
+        "idempotencyKey": "mmr4-selected-s01e01-s01e03",
+        "requestMode": "one_shot",
+        "requestScope": "selected_targets",
+        "metadataPolicy": "initial_only",
+        "completionPolicy": "terminal_selected_targets",
+        "monitorPolicy": "selected_targets",
+        "target": {
+            "kind": "selected_targets",
+            "seasonNumber": 1,
+            "metadata": {
+                "requestedFrom": "media_detail",
+                "mediaItemId": "library-series-1",
+                "targetKeys": ["S01E01", "S01E03"]
+            }
+        },
+        "targets": [
+            {
+                "targetKey": "S01E01",
+                "mediaType": "series",
+                "title": "Episode 1",
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "state": "pending",
+                "metadata": {
+                    "mediaItemId": "library-series-1",
+                    "libraryEpisodeId": "episode-1"
+                }
+            },
+            {
+                "targetKey": "S01E03",
+                "mediaType": "series",
+                "title": "Episode 3",
+                "seasonNumber": 1,
+                "episodeNumber": 3,
+                "state": "pending",
+                "metadata": {
+                    "mediaItemId": "library-series-1",
+                    "libraryEpisodeId": "episode-3"
+                }
+            }
+        ],
+        "scope": {
+            "requestedFrom": "media_detail",
+            "requestScope": "selected_targets",
+            "targetCount": 2
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let first: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "create response: {first}");
+    assert_eq!(first.get("created").and_then(Value::as_bool), Some(true));
+    assert_eq!(first.get("existing").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/requestScope")
+            .and_then(Value::as_str),
+        Some("selected_targets")
+    );
+    assert_eq!(
+        first
+            .pointer("/detail/subscription/idempotencyKey")
+            .and_then(Value::as_str),
+        Some("mmr4-selected-s01e01-s01e03")
+    );
+    assert_eq!(
+        first
+            .pointer("/targetCounts/pending")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    let subscription_id = first
+        .pointer("/detail/subscription/subscriptionId")
+        .and_then(Value::as_str)
+        .context("created subscription id")?
+        .to_string();
+    let target_keys = first
+        .pointer("/detail/targets")
+        .and_then(Value::as_array)
+        .context("created targets")?
+        .iter()
+        .map(|target| target.get("targetKey").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(target_keys, vec![Some("S01E01"), Some("S01E03")]);
+
+    let duplicate_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let body = body::to_bytes(duplicate_response.into_body(), 1_048_576).await?;
+    let duplicate: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        duplicate.get("created").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        duplicate.get("existing").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        duplicate
+            .pointer("/detail/subscription/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acquisition_subscriptions
+         WHERE idempotency_key = ? AND active = 1",
+    )
+    .bind("mmr4-selected-s01e01-s01e03")
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(active_count, 1);
+
+    sqlx::query(
+        "UPDATE acquisition_subscriptions
+         SET status = 'completed', active = 0
+         WHERE subscription_id = ?",
+    )
+    .bind(&subscription_id)
+    .execute(&db_pool)
+    .await?;
+
+    let retry_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let status = retry_response.status();
+    let body = body::to_bytes(retry_response.into_body(), 1_048_576).await?;
+    let retry: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "retry response: {retry}");
+    assert_eq!(retry.get("created").and_then(Value::as_bool), Some(true));
+    assert_ne!(
+        retry
+            .pointer("/detail/subscription/subscriptionId")
+            .and_then(Value::as_str),
+        Some(subscription_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_counts() -> Result<()>
+{
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.mmr5").await?;
+    let media_item_id = Uuid::new_v4().to_string();
+    let request = json!({
+        "mediaType": "series",
+        "title": "MMR5 History Show",
+        "year": 2026,
+        "idempotencyKey": "mmr5-history-show-s01",
+        "requestMode": "one_shot",
+        "requestScope": "selected_targets",
+        "metadataPolicy": "initial_only",
+        "completionPolicy": "terminal_selected_targets",
+        "monitorPolicy": "selected_targets",
+        "sourceProviderId": source_provider_id,
+        "target": {
+            "kind": "selected_targets",
+            "seasonNumber": 1,
+            "metadata": {
+                "requestedFrom": "media_detail",
+                "mediaItemId": media_item_id,
+                "targetKeys": ["S01E01", "S01E02"]
+            }
+        },
+        "targets": [
+            {
+                "targetKey": "S01E01",
+                "mediaType": "series",
+                "title": "Episode 1",
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "state": "pending",
+                "metadata": {
+                    "mediaItemId": media_item_id,
+                    "libraryEpisodeId": "episode-1"
+                }
+            },
+            {
+                "targetKey": "S01E02",
+                "mediaType": "series",
+                "title": "Episode 2",
+                "seasonNumber": 1,
+                "episodeNumber": 2,
+                "state": "pending",
+                "metadata": {
+                    "mediaItemId": media_item_id,
+                    "libraryEpisodeId": "episode-2"
+                }
+            }
+        ],
+        "scope": {
+            "requestedFrom": "media_detail",
+            "mediaItemId": media_item_id,
+            "requestScope": "selected_targets",
+            "targetCount": 2
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/acquisition/requests")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let created: Value = serde_json::from_slice(&body)?;
+    let subscription_id = created
+        .pointer("/detail/subscription/subscriptionId")
+        .and_then(Value::as_str)
+        .context("subscription id")?;
+    let targets = created
+        .pointer("/detail/targets")
+        .and_then(Value::as_array)
+        .context("targets")?;
+    let imported_target_id = targets[0]
+        .get("targetId")
+        .and_then(Value::as_str)
+        .context("imported target id")?;
+    let no_results_target_id = targets[1]
+        .get("targetId")
+        .and_then(Value::as_str)
+        .context("no-results target id")?;
+
+    sqlx::query(
+        "UPDATE acquisition_targets
+         SET state = 'imported', state_reason = 'Imported into library.'
+         WHERE target_id = ?",
+    )
+    .bind(imported_target_id)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "UPDATE acquisition_targets
+         SET state = 'excluded', state_reason = 'No matching acquisition candidates were returned.'
+         WHERE target_id = ?",
+    )
+    .bind(no_results_target_id)
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "UPDATE acquisition_subscriptions
+         SET status = 'completed', active = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id)
+    .execute(&db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/find/acquisition?limit=50")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "history response: {payload}");
+    assert_eq!(
+        payload.get("recentCompletedCount").and_then(Value::as_u64),
+        Some(1),
+        "payload: {payload}"
+    );
+    let item = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("intentId").and_then(Value::as_str) == Some(subscription_id))
+        })
+        .context("completed acquisition item")?;
+    assert_eq!(item.get("phase").and_then(Value::as_str), Some("completed"));
+    assert_eq!(
+        item.get("mediaItemId").and_then(Value::as_str),
+        Some(media_item_id.as_str())
+    );
+    assert_eq!(
+        item.get("headline").and_then(Value::as_str),
+        Some("1 target imported, 1 target no results.")
+    );
+    let evidence = item
+        .get("evidence")
+        .and_then(Value::as_array)
+        .context("evidence")?;
+    assert!(evidence.iter().any(|entry| {
+        entry.get("label").and_then(Value::as_str) == Some("Imported")
+            && entry.get("value").and_then(Value::as_str) == Some("1")
+    }));
+    assert!(evidence.iter().any(|entry| {
+        entry.get("label").and_then(Value::as_str) == Some("No results")
+            && entry.get("value").and_then(Value::as_str) == Some("1")
+    }));
+    let actions = item
+        .get("actions")
+        .and_then(Value::as_array)
+        .context("actions")?;
+    assert!(actions.iter().any(|action| {
+        action.get("id").and_then(Value::as_str) == Some("open_show")
+            && action.get("navigateMediaItemId").and_then(Value::as_str)
+                == Some(media_item_id.as_str())
+    }));
+    assert!(actions.iter().any(|action| {
+        action.get("id").and_then(Value::as_str) == Some("retry_missing")
+            && action.get("subscriptionId").and_then(Value::as_str) == Some(subscription_id)
+    }));
+    let children = item
+        .get("children")
+        .and_then(Value::as_array)
+        .context("children")?;
+    assert!(children.iter().any(|child| {
+        child.get("title").and_then(Value::as_str) == Some("S01E02")
+            && child.get("status").and_then(Value::as_str) == Some("no_results")
+            && child.get("phaseLabel").and_then(Value::as_str) == Some("No results")
+    }));
+    let active_after_read: i64 = sqlx::query_scalar(
+        "SELECT CAST(active AS INTEGER)
+         FROM acquisition_subscriptions
+         WHERE subscription_id = ?",
+    )
+    .bind(subscription_id)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(
+        active_after_read, 0,
+        "completed one-shot history reads must not reactivate requests"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn acquisition_intent_uses_source_provider_advanced_defaults() -> Result<()> {
     let (app, db_pool, token) = setup_download_broker_test_app().await?;
     let store = ExtensionStore::new(&db_pool);
@@ -13466,16 +14023,398 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: Value =
         serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
-    let blocked = payload
+    let blocked_episode = payload
         .as_array()
         .and_then(|items| items.first())
-        .and_then(|item| item.get("lifecycle"))
+        .expect("blocked episode payload");
+    let blocked = blocked_episode
+        .get("lifecycle")
         .and_then(|value| value.get("blockedInElixir"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     assert!(
         blocked,
         "expected episode lifecycle to reflect blocked state"
+    );
+    assert_eq!(
+        blocked_episode
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        blocked_episode
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("allow_again")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mmr2_library_episode_api_exposes_compact_acquisition_recovery_states() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO series (
+            id, title, year, library_type, external_tvdb_series, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, NULL)",
+    )
+    .bind(series_id.to_string())
+    .bind("MMR Show")
+    .bind(2026)
+    .bind("series")
+    .bind("998877")
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
+         VALUES (?, ?, 1, ?, NULL)",
+    )
+    .bind(season_id.to_string())
+    .bind(series_id.to_string())
+    .bind("Season 1")
+    .execute(&db_pool)
+    .await?;
+
+    let episode_ids = (1..=5).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    for (index, episode_id) in episode_ids.iter().enumerate() {
+        let episode_number = (index + 1) as i32;
+        sqlx::query(
+            "INSERT INTO episodes (
+                id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
+             ) VALUES (?, ?, ?, 1, ?, ?, ?, NULL)",
+        )
+        .bind(episode_id.to_string())
+        .bind(series_id.to_string())
+        .bind(season_id.to_string())
+        .bind(episode_number)
+        .bind(format!("Episode {episode_number}"))
+        .bind(if episode_number == 5 { 1 } else { 0 })
+        .execute(&db_pool)
+        .await?;
+    }
+
+    let projection_rows = [
+        (
+            episode_ids[1],
+            "S01E02",
+            "no_results",
+            Some("no_safe_candidates"),
+            Some("Torrentio"),
+            None,
+            Some(0_i64),
+        ),
+        (
+            episode_ids[2],
+            "S01E03",
+            "review_needed",
+            Some("review_required"),
+            Some("Torrentio"),
+            None,
+            Some(3_i64),
+        ),
+        (
+            episode_ids[3],
+            "S01E04",
+            "downloading",
+            Some("submitted"),
+            Some("Torrentio"),
+            Some("TorBox"),
+            Some(1_i64),
+        ),
+        (
+            episode_ids[4],
+            "S01E05",
+            "imported",
+            Some("imported"),
+            Some("Torrentio"),
+            Some("TorBox"),
+            Some(1_i64),
+        ),
+    ];
+    for (
+        episode_id,
+        target_key,
+        state,
+        reason_code,
+        source_provider_label,
+        route_provider_label,
+        candidate_count,
+    ) in projection_rows
+    {
+        sqlx::query(
+            "INSERT INTO library_episode_acquisition_state (
+                episode_id,
+                media_item_id,
+                season_id,
+                target_key,
+                state,
+                reason_code,
+                source_provider_label,
+                route_provider_label,
+                candidate_count,
+                selected_release_title,
+                last_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(episode_id.to_string())
+        .bind(series_id.to_string())
+        .bind(season_id.to_string())
+        .bind(target_key)
+        .bind(state)
+        .bind(reason_code)
+        .bind(source_provider_label)
+        .bind(route_provider_label)
+        .bind(candidate_count)
+        .bind(format!("Release {target_key}"))
+        .execute(&db_pool)
+        .await?;
+    }
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/library/seasons/{}/episodes", season_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    let episodes = payload.as_array().expect("episode list");
+    assert_eq!(episodes.len(), 5);
+
+    assert_eq!(
+        episodes[0]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("missing")
+    );
+    assert_eq!(
+        episodes[0]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("get_episode")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("no_results")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("search_again")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/sourceProviderLabel")
+            .and_then(Value::as_str),
+        Some("Torrentio")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/candidateCount")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        episodes[2]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("review_needed")
+    );
+    assert_eq!(
+        episodes[2]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("review")
+    );
+    assert_eq!(
+        episodes[3]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("downloading")
+    );
+    assert_eq!(
+        episodes[3]
+            .pointer("/acquisition/routeProviderLabel")
+            .and_then(Value::as_str),
+        Some("TorBox")
+    );
+    assert_eq!(
+        episodes[3]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("view_progress")
+    );
+    assert_eq!(
+        episodes[4]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("available")
+    );
+    assert_eq!(
+        episodes[4].pointer("/has_file").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        episodes[4]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("play")
+    );
+    assert_eq!(
+        episodes[4]
+            .pointer("/lifecycle/canDeleteLocally")
+            .and_then(Value::as_bool),
+        Some(true),
+        "existing episode lifecycle fields must remain available with acquisition state present"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mmr2_library_episode_api_exposes_post_processing_and_failed_recovery_states() -> Result<()>
+{
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let series_id = Uuid::new_v4();
+    let season_id = Uuid::new_v4();
+    let episode_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES (?, ?, ?, ?)")
+        .bind(series_id.to_string())
+        .bind("MMR State Show")
+        .bind(2026)
+        .bind("series")
+        .execute(&db_pool)
+        .await?;
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+        .bind(season_id.to_string())
+        .bind(series_id.to_string())
+        .bind("Season 1")
+        .execute(&db_pool)
+        .await?;
+    for (index, episode_id) in episode_ids.iter().enumerate() {
+        let episode_number = (index + 1) as i32;
+        sqlx::query(
+            "INSERT INTO episodes (
+                id, series_id, season_id, season_number, episode_number, title, has_file
+             ) VALUES (?, ?, ?, 1, ?, ?, 0)",
+        )
+        .bind(episode_id.to_string())
+        .bind(series_id.to_string())
+        .bind(season_id.to_string())
+        .bind(episode_number)
+        .bind(format!("Episode {episode_number}"))
+        .execute(&db_pool)
+        .await?;
+    }
+    for (episode_id, target_key, state, reason_code) in [
+        (
+            episode_ids[0],
+            "S01E01",
+            "post_processing",
+            "post_processing",
+        ),
+        (episode_ids[1], "S01E02", "failed", "route_failed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_episode_acquisition_state (
+                episode_id, media_item_id, season_id, target_key, state, reason_code, last_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(episode_id.to_string())
+        .bind(series_id.to_string())
+        .bind(season_id.to_string())
+        .bind(target_key)
+        .bind(state)
+        .bind(reason_code)
+        .execute(&db_pool)
+        .await?;
+    }
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/library/seasons/{}/episodes", season_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    let episodes = payload.as_array().expect("episode list");
+    assert_eq!(
+        episodes[0]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("post_processing")
+    );
+    assert_eq!(
+        episodes[0]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("view_progress")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/state")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/action")
+            .and_then(Value::as_str),
+        Some("try_again")
+    );
+    assert_eq!(
+        episodes[1]
+            .pointer("/acquisition/reasonCode")
+            .and_then(Value::as_str),
+        Some("route_failed")
     );
 
     Ok(())

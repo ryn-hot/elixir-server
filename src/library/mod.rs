@@ -189,6 +189,606 @@ pub struct AcquisitionLibraryImportResult {
     pub files: Vec<AcquisitionLibraryImportFileResult>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AcquisitionLibraryTargetScaffold {
+    pub media_type: MediaType,
+    pub title: String,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+    pub absolute_episode_number: Option<i32>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesEpisodeCatalogEnsureResult {
+    pub scaffolded_targets: usize,
+    pub subscription_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSeriesCatalogIdentity {
+    title: String,
+    year: Option<i32>,
+    media_type: MediaType,
+    external_ids: ExternalIds,
+    metadata: Option<serde_json::Value>,
+}
+
+pub async fn ensure_series_episode_catalog_from_local_metadata(
+    pool: &AnyPool,
+    artwork: Option<&ArtworkService>,
+    media_item_id: Uuid,
+) -> Result<SeriesEpisodeCatalogEnsureResult> {
+    let Some(series) = load_local_series_catalog_identity(pool, media_item_id).await? else {
+        return Ok(SeriesEpisodeCatalogEnsureResult::default());
+    };
+    if !matches!(series.media_type, MediaType::Series | MediaType::Anime) {
+        return Ok(SeriesEpisodeCatalogEnsureResult::default());
+    }
+
+    let mut scaffolds_by_slot: HashMap<(i32, i32), AcquisitionLibraryTargetScaffold> =
+        HashMap::new();
+    collect_series_metadata_video_scaffolds(&series, &mut scaffolds_by_slot);
+
+    let mut matched_subscription_ids = HashSet::new();
+    for row in load_local_acquisition_target_scaffold_rows(pool, &series).await? {
+        let Some(subscription_id) = row.subscription_id else {
+            continue;
+        };
+        if !local_acquisition_target_matches_series(&series, &row) {
+            continue;
+        }
+        let Some(scaffold) = row.into_scaffold() else {
+            continue;
+        };
+        let Some(season_number) = scaffold.season_number else {
+            continue;
+        };
+        let Some(episode_number) = scaffold.episode_number else {
+            continue;
+        };
+        matched_subscription_ids.insert(subscription_id);
+        merge_local_episode_scaffold(
+            &mut scaffolds_by_slot,
+            (season_number, episode_number),
+            scaffold,
+        );
+    }
+
+    let mut scaffolds = scaffolds_by_slot.into_values().collect::<Vec<_>>();
+    scaffolds.sort_by_key(|target| {
+        (
+            target.season_number.unwrap_or_default(),
+            target.episode_number.unwrap_or_default(),
+            target.title.clone(),
+        )
+    });
+    let scaffolded_targets =
+        scaffold_acquisition_library_targets(pool, artwork, media_item_id, &scaffolds).await?;
+    let mut subscription_ids = matched_subscription_ids.into_iter().collect::<Vec<_>>();
+    subscription_ids.sort();
+
+    Ok(SeriesEpisodeCatalogEnsureResult {
+        scaffolded_targets,
+        subscription_ids,
+    })
+}
+
+pub async fn scaffold_acquisition_library_targets(
+    pool: &AnyPool,
+    artwork: Option<&ArtworkService>,
+    media_item_id: Uuid,
+    targets: &[AcquisitionLibraryTargetScaffold],
+) -> Result<usize> {
+    let mut season_ids: HashMap<i32, Uuid> = HashMap::new();
+    let mut scaffolded = 0usize;
+
+    for target in targets {
+        if !matches!(target.media_type, MediaType::Series | MediaType::Anime) {
+            continue;
+        }
+        let Some(season_number) = target.season_number else {
+            continue;
+        };
+        let Some(episode_number) = target.episode_number else {
+            continue;
+        };
+        if season_number <= 0 || episode_number <= 0 {
+            continue;
+        }
+
+        let season_id = if let Some(season_id) = season_ids.get(&season_number).copied() {
+            season_id
+        } else {
+            let season_id = upsert_season(pool, media_item_id, season_number).await?;
+            season_ids.insert(season_number, season_id);
+            season_id
+        };
+        let episode_id = upsert_episode(
+            pool,
+            media_item_id,
+            season_id,
+            season_number,
+            episode_number,
+            target.absolute_episode_number,
+        )
+        .await?;
+
+        let episode_metadata = target
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("raw").cloned())
+            .or_else(|| target.metadata.clone());
+        if let Some(metadata) = episode_metadata.as_ref() {
+            let title = metadata
+                .get("name")
+                .or_else(|| metadata.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .or(Some(target.title.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if local_episode_metadata_has_display_content(metadata) {
+                update_episode_details(
+                    pool,
+                    episode_id,
+                    title,
+                    target_episode_runtime_seconds(metadata),
+                    metadata,
+                )
+                .await?;
+            } else if let Some(title) = title {
+                update_episode_title_if_missing(pool, episode_id, title).await?;
+            }
+
+            if let (Some(artwork_service), Some(url)) = (
+                artwork,
+                metadata
+                    .get("image")
+                    .or_else(|| metadata.get("thumbnail"))
+                    .or_else(|| metadata.get("still"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                sync_episode_artwork(pool, artwork_service, episode_id, url, "acquisition").await?;
+            }
+
+            if let Some(tvdb_episode_id) = target
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("tvdbEpisodeId"))
+                .or_else(|| metadata.get("tvdb_id"))
+                .or_else(|| metadata.get("tvdbId"))
+                .or_else(|| metadata.get("id"))
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| value.as_i64().map(|id| id.to_string()))
+                })
+                .filter(|value| !value.trim().is_empty())
+            {
+                insert_episode_external_id(
+                    pool,
+                    episode_id,
+                    "tvdb_episode",
+                    &tvdb_episode_id,
+                    "acquisition",
+                )
+                .await?;
+            }
+        } else {
+            let title = target.title.trim();
+            if !title.is_empty() {
+                update_episode_title_if_missing(pool, episode_id, title).await?;
+            }
+        }
+
+        scaffolded += 1;
+    }
+
+    Ok(scaffolded)
+}
+
+async fn load_local_series_catalog_identity(
+    pool: &AnyPool,
+    media_item_id: Uuid,
+) -> Result<Option<LocalSeriesCatalogIdentity>> {
+    let row = sqlx::query(
+        "SELECT title, year, library_type, external_imdb, external_tvdb_series, external_anilist,
+                CAST(metadata_json AS TEXT) AS metadata_json
+         FROM series
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind(media_item_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let library_type = row.get::<String, _>("library_type");
+    let tvdb_series = row.try_get::<String, _>("external_tvdb_series").ok();
+    Ok(Some(LocalSeriesCatalogIdentity {
+        title: row.get::<String, _>("title"),
+        year: row.try_get::<i64, _>("year").ok().map(|value| value as i32),
+        media_type: if library_type == "anime" {
+            MediaType::Anime
+        } else {
+            MediaType::Series
+        },
+        external_ids: ExternalIds {
+            imdb: row.try_get::<String, _>("external_imdb").ok(),
+            tvdb: tvdb_series.clone(),
+            tvdb_series,
+            anilist: row.try_get::<String, _>("external_anilist").ok(),
+            ..Default::default()
+        },
+        metadata: row
+            .try_get::<String, _>("metadata_json")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok()),
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct LocalAcquisitionTargetScaffoldRow {
+    subscription_id: Option<Uuid>,
+    subscription_title: String,
+    subscription_year: Option<i32>,
+    subscription_external_ids: ExternalIds,
+    media_type: MediaType,
+    title: String,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    absolute_episode_number: Option<i32>,
+    metadata: Option<serde_json::Value>,
+}
+
+impl LocalAcquisitionTargetScaffoldRow {
+    fn into_scaffold(self) -> Option<AcquisitionLibraryTargetScaffold> {
+        if self.season_number.unwrap_or_default() <= 0
+            || self.episode_number.unwrap_or_default() <= 0
+        {
+            return None;
+        }
+        Some(AcquisitionLibraryTargetScaffold {
+            media_type: self.media_type,
+            title: self.title,
+            season_number: self.season_number,
+            episode_number: self.episode_number,
+            absolute_episode_number: self.absolute_episode_number,
+            metadata: self.metadata,
+        })
+    }
+}
+
+async fn load_local_acquisition_target_scaffold_rows(
+    pool: &AnyPool,
+    series: &LocalSeriesCatalogIdentity,
+) -> Result<Vec<LocalAcquisitionTargetScaffoldRow>> {
+    let imdb_like = local_external_id_like(series.external_ids.imdb.as_deref());
+    let tvdb_like = local_external_id_like(
+        series
+            .external_ids
+            .tvdb_series
+            .as_deref()
+            .or(series.external_ids.tvdb.as_deref()),
+    );
+    let anilist_like = local_external_id_like(series.external_ids.anilist.as_deref());
+
+    let rows = sqlx::query(
+        "SELECT
+            CAST(s.subscription_id AS TEXT) AS subscription_id,
+            s.title AS subscription_title,
+            s.year AS subscription_year,
+            CAST(s.external_ids_json AS TEXT) AS subscription_external_ids_json,
+            t.media_type,
+            t.title,
+            t.season_number,
+            t.episode_number,
+            t.absolute_episode_number,
+            CAST(t.metadata_json AS TEXT) AS metadata_json
+         FROM acquisition_targets t
+         JOIN acquisition_subscriptions s ON s.subscription_id = t.subscription_id
+         WHERE t.media_type IN ('series', 'anime')
+           AND (
+                LOWER(s.title) = LOWER(?)
+                OR CAST(s.external_ids_json AS TEXT) LIKE ?
+                OR CAST(s.external_ids_json AS TEXT) LIKE ?
+                OR CAST(s.external_ids_json AS TEXT) LIKE ?
+           )",
+    )
+    .bind(&series.title)
+    .bind(imdb_like)
+    .bind(tvdb_like)
+    .bind(anilist_like)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let media_type = match row.get::<String, _>("media_type").as_str() {
+            "anime" => MediaType::Anime,
+            "series" => MediaType::Series,
+            _ => continue,
+        };
+        let subscription_id = row
+            .try_get::<String, _>("subscription_id")
+            .ok()
+            .and_then(|value| Uuid::parse_str(&value).ok());
+        let subscription_external_ids = row
+            .try_get::<String, _>("subscription_external_ids_json")
+            .ok()
+            .and_then(|value| serde_json::from_str::<ExternalIds>(&value).ok())
+            .unwrap_or_default();
+        out.push(LocalAcquisitionTargetScaffoldRow {
+            subscription_id,
+            subscription_title: row.get::<String, _>("subscription_title"),
+            subscription_year: row
+                .try_get::<i64, _>("subscription_year")
+                .ok()
+                .map(|value| value as i32),
+            subscription_external_ids,
+            media_type,
+            title: row.get::<String, _>("title"),
+            season_number: row
+                .try_get::<i64, _>("season_number")
+                .ok()
+                .map(|value| value as i32),
+            episode_number: row
+                .try_get::<i64, _>("episode_number")
+                .ok()
+                .map(|value| value as i32),
+            absolute_episode_number: row
+                .try_get::<i64, _>("absolute_episode_number")
+                .ok()
+                .map(|value| value as i32),
+            metadata: row
+                .try_get::<String, _>("metadata_json")
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok()),
+        });
+    }
+    Ok(out)
+}
+
+fn collect_series_metadata_video_scaffolds(
+    series: &LocalSeriesCatalogIdentity,
+    scaffolds_by_slot: &mut HashMap<(i32, i32), AcquisitionLibraryTargetScaffold>,
+) {
+    let Some(videos) = series
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("videos"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for video in videos {
+        let season_number = json_i32(video.get("season"))
+            .or_else(|| json_i32(video.get("seasonNumber")))
+            .or_else(|| json_i32(video.get("season_number")));
+        let episode_number = json_i32(video.get("episode"))
+            .or_else(|| json_i32(video.get("episodeNumber")))
+            .or_else(|| json_i32(video.get("episode_number")))
+            .or_else(|| json_i32(video.get("number")));
+        let (Some(season_number), Some(episode_number)) = (season_number, episode_number) else {
+            continue;
+        };
+        if season_number <= 0 || episode_number <= 0 {
+            continue;
+        }
+
+        let title = video
+            .get("name")
+            .or_else(|| video.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("S{season_number:02}E{episode_number:02}"));
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "source".to_string(),
+            serde_json::Value::String("series_metadata".to_string()),
+        );
+        metadata.insert("raw".to_string(), video.clone());
+        if let Some(tvdb_episode_id) = json_id_string(
+            video
+                .get("tvdb_id")
+                .or_else(|| video.get("tvdbId"))
+                .or_else(|| video.get("tvdbEpisodeId")),
+        ) {
+            metadata.insert(
+                "tvdbEpisodeId".to_string(),
+                serde_json::Value::String(tvdb_episode_id),
+            );
+        }
+
+        scaffolds_by_slot
+            .entry((season_number, episode_number))
+            .or_insert_with(|| AcquisitionLibraryTargetScaffold {
+                media_type: series.media_type,
+                title,
+                season_number: Some(season_number),
+                episode_number: Some(episode_number),
+                absolute_episode_number: json_i32(video.get("absoluteNumber"))
+                    .or_else(|| json_i32(video.get("absolute_episode_number"))),
+                metadata: Some(serde_json::Value::Object(metadata)),
+            });
+    }
+}
+
+fn merge_local_episode_scaffold(
+    scaffolds_by_slot: &mut HashMap<(i32, i32), AcquisitionLibraryTargetScaffold>,
+    slot: (i32, i32),
+    candidate: AcquisitionLibraryTargetScaffold,
+) {
+    match scaffolds_by_slot.entry(slot) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if local_episode_scaffold_score(&candidate)
+                > local_episode_scaffold_score(entry.get())
+            {
+                entry.insert(candidate);
+            }
+        }
+    }
+}
+
+fn local_episode_scaffold_score(scaffold: &AcquisitionLibraryTargetScaffold) -> usize {
+    let mut score = 0usize;
+    if scaffold.absolute_episode_number.is_some() {
+        score += 4;
+    }
+    if !scaffold.title.trim().is_empty()
+        && !scaffold
+            .title
+            .trim()
+            .eq_ignore_ascii_case(&format!(
+                "S{:02}E{:02}",
+                scaffold.season_number.unwrap_or_default(),
+                scaffold.episode_number.unwrap_or_default()
+            ))
+    {
+        score += 2;
+    }
+
+    let Some(metadata) = local_episode_scaffold_content_metadata(scaffold) else {
+        return score;
+    };
+    if json_non_empty_string(
+        metadata
+            .get("overview")
+            .or_else(|| metadata.get("description"))
+            .or_else(|| metadata.get("summary")),
+    )
+    .is_some()
+    {
+        score += 80;
+    }
+    if json_non_empty_string(
+        metadata
+            .get("image")
+            .or_else(|| metadata.get("thumbnail"))
+            .or_else(|| metadata.get("still")),
+    )
+    .is_some()
+    {
+        score += 40;
+    }
+    if target_episode_runtime_seconds(metadata).is_some() {
+        score += 8;
+    }
+    if json_i32(metadata.get("absoluteNumber"))
+        .or_else(|| json_i32(metadata.get("absolute_episode_number")))
+        .is_some()
+    {
+        score += 4;
+    }
+    score
+}
+
+fn local_episode_scaffold_content_metadata(
+    scaffold: &AcquisitionLibraryTargetScaffold,
+) -> Option<&serde_json::Value> {
+    let metadata = scaffold.metadata.as_ref()?;
+    metadata.get("raw").or(Some(metadata))
+}
+
+fn local_episode_metadata_has_display_content(metadata: &serde_json::Value) -> bool {
+    json_non_empty_string(
+        metadata
+            .get("overview")
+            .or_else(|| metadata.get("description"))
+            .or_else(|| metadata.get("summary")),
+    )
+    .is_some()
+        || json_non_empty_string(
+            metadata
+                .get("image")
+                .or_else(|| metadata.get("thumbnail"))
+                .or_else(|| metadata.get("still")),
+        )
+        .is_some()
+        || target_episode_runtime_seconds(metadata).is_some()
+        || json_i32(metadata.get("absoluteNumber"))
+            .or_else(|| json_i32(metadata.get("absolute_episode_number")))
+            .is_some()
+}
+
+fn json_non_empty_string(value: Option<&serde_json::Value>) -> Option<&str> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn local_acquisition_target_matches_series(
+    series: &LocalSeriesCatalogIdentity,
+    row: &LocalAcquisitionTargetScaffoldRow,
+) -> bool {
+    if series.media_type != row.media_type {
+        return false;
+    }
+    if local_external_ids_overlap(&series.external_ids, &row.subscription_external_ids) {
+        return true;
+    }
+    local_title_year_match(
+        &series.title,
+        series.year,
+        &row.subscription_title,
+        row.subscription_year,
+    )
+}
+
+fn local_title_year_match(
+    left_title: &str,
+    left_year: Option<i32>,
+    right_title: &str,
+    right_year: Option<i32>,
+) -> bool {
+    if !left_title.trim().eq_ignore_ascii_case(right_title.trim()) {
+        return false;
+    }
+    match (left_year, right_year) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn local_external_ids_overlap(left: &ExternalIds, right: &ExternalIds) -> bool {
+    local_id_eq(left.imdb.as_deref(), right.imdb.as_deref())
+        || local_id_eq(left.tvdb_series.as_deref(), right.tvdb_series.as_deref())
+        || local_id_eq(left.tvdb_series.as_deref(), right.tvdb.as_deref())
+        || local_id_eq(left.tvdb.as_deref(), right.tvdb_series.as_deref())
+        || local_id_eq(left.tvdb.as_deref(), right.tvdb.as_deref())
+        || local_id_eq(left.anilist.as_deref(), right.anilist.as_deref())
+}
+
+fn local_id_eq(left: Option<&str>, right: Option<&str>) -> bool {
+    let Some(left) = left.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(right) = right.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    left.eq_ignore_ascii_case(right)
+}
+
+fn local_external_id_like(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{value}%"))
+        .unwrap_or_else(|| "__elixir_no_external_id_match__".to_string())
+}
+
 pub async fn ingest_acquisition_library_import(
     pool: &AnyPool,
     request: AcquisitionLibraryImport,
@@ -5711,7 +6311,12 @@ async fn update_episode_details(
 ) -> Result<()> {
     let raw_json = serde_json::to_string(raw).ok();
     sqlx::query::<sqlx::Any>(
-        "UPDATE episodes SET title = COALESCE(?, title), runtime_seconds = COALESCE(?, runtime_seconds), metadata_json = COALESCE(?, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE episodes
+         SET title = COALESCE(?, NULLIF(TRIM(title), ''), title),
+             runtime_seconds = COALESCE(?, runtime_seconds),
+             metadata_json = COALESCE(?, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
     )
     .bind(title)
     .bind(runtime_seconds)
@@ -6276,6 +6881,26 @@ fn minutes_to_seconds(runtime_minutes: Option<i32>) -> Option<i32> {
     runtime_minutes.and_then(|m| if m > 0 { Some(m * 60) } else { None })
 }
 
+fn target_episode_runtime_seconds(metadata: &serde_json::Value) -> Option<i32> {
+    let direct_seconds = metadata
+        .get("runtimeSeconds")
+        .or_else(|| metadata.get("durationSeconds"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0);
+    if direct_seconds.is_some() {
+        return direct_seconds;
+    }
+
+    metadata
+        .get("runtime")
+        .or_else(|| metadata.get("duration"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .map(|value| if value < 1_000 { value * 60 } else { value })
+}
+
 #[derive(Debug)]
 struct ManagedIdentityLock {
     media_type: MediaType,
@@ -6327,6 +6952,11 @@ async fn load_managed_identity_lock(
 mod tests {
     use super::*;
     use crate::{
+        acquisition::subscriptions::{
+            AcquisitionMonitorPolicy, AcquisitionRoutePolicy, AcquisitionTargetState,
+            NewAcquisitionSubscription, NewAcquisitionTarget, create_subscription,
+            upsert_subscription_targets,
+        },
         config::{ClassifierConfig, DatabaseConfig, MetadataConfig},
         db::Database,
         db::models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality},
@@ -7878,6 +8508,267 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await?;
         assert_eq!(pending_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_acquisition_target_metadata_rehydrates_series_episode_catalog() -> Result<()> {
+        let config = DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let database = Database::connect(&config).await?;
+        database.run_migrations().await?;
+        let media_item_id = Uuid::new_v4();
+        let external_ids = ExtIds {
+            imdb: Some("tt0361243".to_string()),
+            tvdb: Some("72244".to_string()),
+            tvdb_series: Some("72244".to_string()),
+            ..Default::default()
+        };
+        let external_ids_json = serde_json::to_string(&external_ids)?;
+        let series_metadata = serde_json::json!({
+            "id": "tt0361243",
+            "name": "Star Wars: Clone Wars",
+            "videos": [
+                {
+                    "id": "tt0361243:1:1",
+                    "season": 1,
+                    "episode": 1,
+                    "number": 1,
+                    "name": "Chapter 1",
+                    "thumbnail": "https://episodes.example.invalid/s1e1.jpg",
+                    "tvdb_id": 79050
+                },
+                {
+                    "id": "tt0361243:2:1",
+                    "season": 2,
+                    "episode": 1,
+                    "number": 1,
+                    "name": "Chapter 11",
+                    "thumbnail": "https://episodes.example.invalid/s2e1.jpg",
+                    "tvdb_id": 79060
+                },
+                {
+                    "id": "tt0361243:3:1",
+                    "season": 3,
+                    "episode": 1,
+                    "number": 1,
+                    "name": "Chapter 21",
+                    "overview": "Captain Fordo returns to Coruscant.",
+                    "thumbnail": "https://episodes.example.invalid/s3e1.jpg",
+                    "tvdb_id": 79070
+                }
+            ]
+        });
+        let series_metadata_json = serde_json::to_string(&series_metadata)?;
+
+        sqlx::query(
+            "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
+             VALUES (?, 'series', ?, 'Star Wars: Clone Wars', 2003, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_item_id.to_string())
+        .bind(&external_ids_json)
+        .bind(&series_metadata_json)
+        .execute(&database.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at)
+             VALUES (?, 'Star Wars: Clone Wars', 2003, 'series', 'tt0361243', '72244', NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_item_id.to_string())
+        .bind(&series_metadata_json)
+        .execute(&database.pool)
+        .await?;
+
+        let existing_season_id = Uuid::new_v4();
+        let existing_episode_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO seasons (id, series_id, season_number, created_at, updated_at)
+             VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(existing_season_id.to_string())
+        .bind(media_item_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, title, metadata_json, has_file, created_at, updated_at)
+             VALUES (?, ?, ?, 1, 1, '', '', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(existing_episode_id.to_string())
+        .bind(media_item_id.to_string())
+        .bind(existing_season_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Star Wars: Clone Wars".to_string(),
+                year: Some(2003),
+                external_ids: Some(external_ids),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: AcquisitionMonitorPolicy::AllMissing,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![
+                NewAcquisitionTarget {
+                    target_key: Some("S01E01".to_string()),
+                    media_type: Some(MediaType::Series),
+                    title: Some("Chapter I".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    air_date: None,
+                    air_time: None,
+                    metadata: Some(serde_json::json!({
+                        "source": "tvdb",
+                        "tvdbEpisodeId": "79050",
+                        "raw": {
+                            "id": 79050,
+                            "name": "Chapter I",
+                            "number": 1,
+                            "seasonNumber": 1,
+                            "absoluteNumber": 1,
+                            "overview": "Like fire across the galaxy, the Clone Wars spread.",
+                            "image": "https://artworks.example.invalid/s1e1.jpg",
+                            "runtime": 4
+                        }
+                    })),
+                    state: Some(AcquisitionTargetState::Imported),
+                    next_search_after: None,
+                },
+                NewAcquisitionTarget {
+                    target_key: Some("S02E01".to_string()),
+                    media_type: Some(MediaType::Series),
+                    title: Some("Chapter XI".to_string()),
+                    season_number: Some(2),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(11),
+                    air_date: None,
+                    air_time: None,
+                    metadata: Some(serde_json::json!({
+                        "source": "tvdb",
+                        "tvdbEpisodeId": "79060",
+                        "raw": {
+                            "id": 79060,
+                            "name": "Chapter XI",
+                            "number": 1,
+                            "seasonNumber": 2,
+                            "absoluteNumber": 11,
+                            "overview": "Anakin continues his pursuit of Dark Jedi Asajj Ventress.",
+                            "image": "https://artworks.example.invalid/s2e1.jpg",
+                            "runtime": 4
+                        }
+                    })),
+                    state: Some(AcquisitionTargetState::Pending),
+                    next_search_after: None,
+                },
+                NewAcquisitionTarget {
+                    target_key: Some("S03E01".to_string()),
+                    media_type: Some(MediaType::Series),
+                    title: Some("Chapter XXI".to_string()),
+                    season_number: Some(3),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(21),
+                    air_date: None,
+                    air_time: None,
+                    metadata: Some(serde_json::json!({
+                        "mediaItemId": media_item_id,
+                        "libraryEpisodeId": Uuid::new_v4(),
+                        "acquisitionRequest": {
+                            "mode": "one_shot",
+                            "scope": "season",
+                            "metadataPolicy": "initial_only"
+                        }
+                    })),
+                    state: Some(AcquisitionTargetState::Pending),
+                    next_search_after: None,
+                },
+            ],
+        )
+        .await?;
+
+        let result =
+            ensure_series_episode_catalog_from_local_metadata(&database.pool, None, media_item_id)
+                .await?;
+        assert_eq!(result.subscription_ids, vec![subscription.subscription_id]);
+
+        let season_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM seasons WHERE series_id = ?")
+                .bind(media_item_id.to_string())
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(season_count, 3);
+
+        let s1: (String, String, i64) = sqlx::query_as(
+            "SELECT title, metadata_json, runtime_seconds
+             FROM episodes
+             WHERE series_id = ? AND season_number = 1 AND episode_number = 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(s1.0, "Chapter I");
+        assert_eq!(s1.2, 240);
+        let s1_metadata: Value = serde_json::from_str(&s1.1)?;
+        assert_eq!(
+            s1_metadata.get("overview").and_then(Value::as_str),
+            Some("Like fire across the galaxy, the Clone Wars spread.")
+        );
+
+        let s2: (String, String, i64) = sqlx::query_as(
+            "SELECT title, metadata_json, runtime_seconds
+             FROM episodes
+             WHERE series_id = ? AND season_number = 2 AND episode_number = 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(s2.0, "Chapter XI");
+        assert_eq!(s2.2, 240);
+        let s2_metadata: Value = serde_json::from_str(&s2.1)?;
+        assert_eq!(
+            s2_metadata.get("overview").and_then(Value::as_str),
+            Some("Anakin continues his pursuit of Dark Jedi Asajj Ventress.")
+        );
+
+        let s3: (String, String) = sqlx::query_as(
+            "SELECT title, metadata_json
+             FROM episodes
+             WHERE series_id = ? AND season_number = 3 AND episode_number = 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(s3.0, "Chapter 21");
+        let s3_metadata: Value = serde_json::from_str(&s3.1)?;
+        assert_eq!(
+            s3_metadata.get("overview").and_then(Value::as_str),
+            Some("Captain Fordo returns to Coruscant.")
+        );
+        assert!(
+            s3_metadata.get("libraryEpisodeId").is_none(),
+            "sparse one-shot target metadata must not replace richer episode metadata"
+        );
 
         Ok(())
     }

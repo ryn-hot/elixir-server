@@ -6603,6 +6603,7 @@ fn decide_debrid_file_selection(
                 | ReleaseKind::MultiSeasonPack
                 | ReleaseKind::SeriesPack
         )
+        && !release_allows_scoped_overfetch_skip(release)
     {
         review_reasons.insert("file_list_does_not_cover_all_selectable_media".to_string());
     }
@@ -6651,6 +6652,58 @@ fn decide_debrid_file_selection(
         select_all,
         select_all_approved,
     }
+}
+
+fn release_allows_scoped_overfetch_skip(release: &AcquisitionRelease) -> bool {
+    let Some(evidence) = release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| find_request_scope_evidence(plan, 0))
+    else {
+        return false;
+    };
+    let request_mode = evidence
+        .get("requestMode")
+        .or_else(|| evidence.get("request_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if request_mode != "one_shot" {
+        return false;
+    }
+    let target_count = evidence
+        .get("targetCount")
+        .or_else(|| evidence.get("target_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    target_count > 0
+}
+
+fn find_request_scope_evidence(value: &Value, depth: usize) -> Option<&Value> {
+    if depth > 4 {
+        return None;
+    }
+    if let Some(evidence) = value
+        .get("requestScopeEvidence")
+        .or_else(|| value.get("request_scope_evidence"))
+        && evidence.is_object()
+    {
+        return Some(evidence);
+    }
+    for key in [
+        "tv",
+        "anime",
+        "tvCoveragePlan",
+        "animeCoveragePlan",
+        "coveragePlan",
+        "previousCoveragePlan",
+    ] {
+        if let Some(nested) = value.get(key)
+            && let Some(evidence) = find_request_scope_evidence(nested, depth + 1)
+        {
+            return Some(evidence);
+        }
+    }
+    None
 }
 
 fn debrid_targets_from_coverage_plan(
@@ -14724,6 +14777,53 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "file_list_does_not_cover_all_selectable_media")
         );
+    }
+
+    #[test]
+    fn osr4_debrid_selection_skips_out_of_scope_files_for_one_shot_pack() {
+        let mut release = test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::High);
+        release.coverage_plan = Some(json!({
+            "resolverKind": "tv_sonarr_style",
+            "releaseKind": "season_pack",
+            "confidence": "high",
+            "entries": [{
+                "targetId": Uuid::new_v4().to_string(),
+                "targetKey": "S01E01",
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "releaseFileId": "file-1",
+                "coverageKind": "season_pack",
+                "state": "submitted"
+            }],
+            "requestScopeEvidence": {
+                "requestMode": "one_shot",
+                "requestScope": "episode",
+                "targetCount": 1,
+                "targetKeys": ["S01E01"]
+            }
+        }));
+        let covered = test_release_file(
+            release.release_id,
+            "file-1",
+            "Show/Season 01/Show.S01E01.mkv",
+            true,
+        );
+        let out_of_scope = test_release_file(
+            release.release_id,
+            "file-2",
+            "Show/Season 01/Show.S01E02.mkv",
+            true,
+        );
+        let files = vec![covered.clone(), out_of_scope];
+        let coverage = vec![test_coverage(release.release_id, covered.release_file_id)];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &coverage, &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.provider_selection_ids, vec!["file-1".to_string()]);
+        assert_eq!(decision.skipped_file_ids, vec!["file-2".to_string()]);
+        assert!(decision.review_reasons.is_empty());
     }
 
     #[test]

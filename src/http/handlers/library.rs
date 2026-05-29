@@ -14,6 +14,11 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    acquisition::episode_state::{
+        LibraryEpisodeAcquisitionProjection, LibraryEpisodeAcquisitionState,
+        list_library_episode_acquisition_projections,
+        rebuild_library_episode_acquisition_states_for_subscription,
+    },
     db::models::MediaType,
     extensions::{
         ExternalIds, MediaIdentity,
@@ -26,6 +31,7 @@ use crate::{
     },
     http::error::{ApiError, ApiResult},
     library::{
+        ensure_series_episode_catalog_from_local_metadata,
         managed_episode_tombstone_matches_series, match_managed_episode_tombstone,
         match_managed_ingest_intent, normalize_managed_intent_title,
         run_full_scan_with_metadata_and_linkers,
@@ -660,6 +666,29 @@ pub struct EpisodeResponse {
     pub thumbnail_url: Option<String>,
     pub has_file: bool,
     pub lifecycle: EpisodeLifecycleResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition: Option<EpisodeAcquisitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeAcquisitionResponse {
+    pub state: String,
+    pub label: String,
+    pub message: String,
+    pub action: String,
+    pub target_key: Option<String>,
+    pub reason_code: Option<String>,
+    pub source_provider_label: Option<String>,
+    pub route_provider_label: Option<String>,
+    pub subscription_id: Option<String>,
+    pub target_id: Option<String>,
+    pub release_id: Option<String>,
+    pub job_id: Option<String>,
+    pub candidate_count: Option<i64>,
+    pub selected_release_title: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -701,6 +730,31 @@ pub struct ExternalSubtitleResponse {
     pub is_forced: bool,
 }
 
+async fn ensure_series_episode_catalog_for_read(
+    state: &AppState,
+    series_id: &str,
+) -> ApiResult<()> {
+    let media_item_id =
+        Uuid::parse_str(series_id).map_err(|_| ApiError::bad_request("series id is invalid"))?;
+    let result =
+        ensure_series_episode_catalog_from_local_metadata(&state.db_pool, None, media_item_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    if result.scaffolded_targets > 0 {
+        for subscription_id in result.subscription_ids {
+            rebuild_library_episode_acquisition_states_for_subscription(
+                &state.db_pool,
+                subscription_id,
+            )
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn list_seasons(
     State(state): State<AppState>,
     Path(series_id): Path<String>,
@@ -716,6 +770,8 @@ pub async fn list_seasons(
     if exists.is_none() {
         return Err(crate::http::error::ApiError::not_found("series not found"));
     }
+
+    ensure_series_episode_catalog_for_read(&state, &series_id).await?;
 
     let rows = sqlx::query(
         "SELECT s.id, s.season_number, s.title, COUNT(e.id) as episode_count, COALESCE(SUM(CASE WHEN e.has_file THEN 1 ELSE 0 END), 0) as file_count FROM seasons s LEFT JOIN episodes e ON e.season_id = s.id WHERE s.series_id = ? GROUP BY s.id ORDER BY s.season_number",
@@ -780,6 +836,7 @@ pub async fn list_episodes(
 ) -> ApiResult<Json<Vec<EpisodeResponse>>> {
     let preferred_languages = parse_language_header(&headers);
     let series = load_series_identity_for_season(&state.db_pool, &season_id).await?;
+    ensure_series_episode_catalog_for_read(&state, &series.series_id).await?;
     let store = ExtensionStore::new(&state.db_pool);
     let active_episode_tombstones = load_series_episode_tombstones(
         &store,
@@ -799,6 +856,10 @@ pub async fn list_episodes(
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
     let episode_ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
+    let acquisition_projections =
+        list_library_episode_acquisition_projections(&state.db_pool, &episode_ids)
+            .await
+            .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
     let thumbnails = load_primary_artwork(
         &state.db_pool,
         "episode",
@@ -843,6 +904,11 @@ pub async fn list_episodes(
                 .cloned()
                 .or_else(|| snapshot_url)
                 .or_else(|| extract_episode_thumbnail(metadata_json.as_ref()));
+            let has_file = row
+                .try_get::<i64, _>("has_file")
+                .ok()
+                .map(|v| v != 0)
+                .unwrap_or(false);
             let season_number = row
                 .try_get::<i64, _>("season_number")
                 .ok()
@@ -871,6 +937,11 @@ pub async fn list_episodes(
                 &active_episode_tombstones,
             )
             .is_some();
+            let acquisition = Some(episode_acquisition_response(
+                has_file,
+                blocked_in_elixir,
+                acquisition_projections.get(&id),
+            ));
 
             EpisodeResponse {
                 id,
@@ -881,30 +952,141 @@ pub async fn list_episodes(
                 runtime_seconds,
                 description,
                 thumbnail_url,
-                has_file: row
-                    .try_get::<i64, _>("has_file")
-                    .ok()
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
+                has_file,
                 lifecycle: EpisodeLifecycleResponse {
                     blocked_in_elixir,
-                    can_delete_locally: row
-                        .try_get::<i64, _>("has_file")
-                        .ok()
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                    can_block_in_elixir: row
-                        .try_get::<i64, _>("has_file")
-                        .ok()
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
+                    can_delete_locally: has_file,
+                    can_block_in_elixir: has_file,
                     can_restore: blocked_in_elixir,
                 },
+                acquisition,
             }
         })
         .collect();
 
     Ok(Json(episodes))
+}
+
+fn episode_acquisition_response(
+    has_file: bool,
+    blocked_in_elixir: bool,
+    projection: Option<&LibraryEpisodeAcquisitionProjection>,
+) -> EpisodeAcquisitionResponse {
+    let state = if blocked_in_elixir {
+        "blocked"
+    } else if has_file {
+        "available"
+    } else if let Some(projection) = projection {
+        match projection.state {
+            LibraryEpisodeAcquisitionState::Queued => "queued",
+            LibraryEpisodeAcquisitionState::Searching => "searching",
+            LibraryEpisodeAcquisitionState::Downloading => "downloading",
+            LibraryEpisodeAcquisitionState::PostProcessing => "post_processing",
+            LibraryEpisodeAcquisitionState::ReviewNeeded => "review_needed",
+            LibraryEpisodeAcquisitionState::NoResults => "no_results",
+            LibraryEpisodeAcquisitionState::Failed => "failed",
+            LibraryEpisodeAcquisitionState::Imported => "post_processing",
+        }
+    } else {
+        "missing"
+    };
+    let (label, action, message) = episode_acquisition_copy(
+        state,
+        projection.and_then(|item| item.source_provider_label.as_deref()),
+        projection.and_then(|item| item.route_provider_label.as_deref()),
+    );
+
+    EpisodeAcquisitionResponse {
+        state: state.to_string(),
+        label: label.to_string(),
+        message,
+        action: action.to_string(),
+        target_key: projection.map(|item| item.target_key.clone()),
+        reason_code: projection.and_then(|item| item.reason_code.clone()),
+        source_provider_label: projection.and_then(|item| item.source_provider_label.clone()),
+        route_provider_label: projection.and_then(|item| item.route_provider_label.clone()),
+        subscription_id: projection
+            .and_then(|item| item.subscription_id.map(|value| value.to_string())),
+        target_id: projection.and_then(|item| item.target_id.map(|value| value.to_string())),
+        release_id: projection.and_then(|item| item.release_id.map(|value| value.to_string())),
+        job_id: projection.and_then(|item| item.job_id.map(|value| value.to_string())),
+        candidate_count: projection.and_then(|item| item.candidate_count),
+        selected_release_title: projection.and_then(|item| item.selected_release_title.clone()),
+        last_attempt_at: projection
+            .and_then(|item| item.last_attempt_at.map(|value| value.to_rfc3339())),
+        updated_at: projection.map(|item| item.updated_at.to_rfc3339()),
+    }
+}
+
+fn episode_acquisition_copy(
+    state: &str,
+    source_provider_label: Option<&str>,
+    route_provider_label: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    match state {
+        "available" => ("Available", "play", "Ready to play.".to_string()),
+        "blocked" => (
+            "Blocked",
+            "allow_again",
+            "This episode is blocked in Elixir.".to_string(),
+        ),
+        "queued" => (
+            "Queued",
+            "view_progress",
+            "Queued for download.".to_string(),
+        ),
+        "searching" => (
+            "Searching",
+            "view_progress",
+            match non_empty_provider_label(source_provider_label) {
+                Some(label) => format!("Searching {label} for a safe release."),
+                None => "Searching for a safe release.".to_string(),
+            },
+        ),
+        "downloading" => (
+            "Downloading",
+            "view_progress",
+            match route_provider_label
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(label) => format!("Downloading through {label}."),
+                None => "Downloading through the selected route.".to_string(),
+            },
+        ),
+        "post_processing" => (
+            "Post-processing",
+            "view_progress",
+            "Download complete. Elixir is importing the file.".to_string(),
+        ),
+        "review_needed" => (
+            "Review needed",
+            "review",
+            "A release needs review before Elixir can import it.".to_string(),
+        ),
+        "no_results" => (
+            "No results found",
+            "search_again",
+            match non_empty_provider_label(source_provider_label) {
+                Some(label) => format!("No results found from {label}."),
+                None => "No safe results were found.".to_string(),
+            },
+        ),
+        "failed" => (
+            "Search failed",
+            "try_again",
+            "Search failed. Try again when ready.".to_string(),
+        ),
+        _ => (
+            "Missing",
+            "get_episode",
+            "No file is linked yet.".to_string(),
+        ),
+    }
+}
+
+fn non_empty_provider_label(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 pub async fn season_detail(

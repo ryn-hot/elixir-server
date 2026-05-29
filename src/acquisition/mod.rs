@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod automation;
+pub mod episode_state;
 pub mod imports;
 pub mod release_resolution;
 pub mod subscriptions;

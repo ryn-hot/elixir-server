@@ -19,6 +19,7 @@ use crate::{
             EVENT_MANUAL_IMPORT_COMPLETED, EVENT_MANUAL_IMPORT_QUARANTINED,
             NewAcquisitionAuditEvent, record_acquisition_audit_event,
         },
+        episode_state::rebuild_library_episode_acquisition_states_for_subscription,
         release_resolution::{
             anidb::{
                 AniDbChannel, AniDbChannelGateDecision, AniDbFileReconciliationInput,
@@ -37,9 +38,11 @@ use crate::{
             store::{get_anidb_file_cache, get_release, list_release_coverage, list_release_files},
         },
         subscriptions::{
-            AcquisitionMonitorPolicy, AcquisitionSubscription, AcquisitionTarget,
-            AcquisitionTargetState, AcquisitionTargetStateUpdate, get_subscription, get_target,
-            start_subscription_tracking_if_initial_download_complete, update_target_state,
+            AcquisitionCompletionPolicy, AcquisitionMonitorPolicy, AcquisitionSubscription,
+            AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
+            complete_terminal_acquisition_request_if_ready, get_subscription, get_target,
+            list_subscription_targets, start_subscription_tracking_if_initial_download_complete,
+            update_target_state,
         },
     },
     artwork::ArtworkService,
@@ -47,7 +50,8 @@ use crate::{
     extensions::store::ExtensionStore,
     library::{
         AcquisitionLibraryImport, AcquisitionLibraryImportFile, AcquisitionLibraryImportFileResult,
-        LinkerService, ingest_acquisition_library_import_with_metadata,
+        AcquisitionLibraryTargetScaffold, LinkerService,
+        ingest_acquisition_library_import_with_metadata, scaffold_acquisition_library_targets,
     },
     metadata::MetadataService,
     runtime::RuntimePaths,
@@ -982,6 +986,13 @@ async fn finalize_import_run_inner(
             Some(&candidate.release.source_extension_id),
         )
         .await?;
+    scaffold_subscription_targets_into_library(
+        pool,
+        services.artwork,
+        &subscription,
+        import_result.media_item_id,
+    )
+    .await?;
     let result_by_key = import_result
         .files
         .iter()
@@ -1062,6 +1073,43 @@ async fn finalize_import_run_inner(
         blocked: false,
         links_imported,
     })
+}
+
+async fn scaffold_subscription_targets_into_library(
+    pool: &AnyPool,
+    artwork: Option<&ArtworkService>,
+    subscription: &AcquisitionSubscription,
+    media_item_id: Uuid,
+) -> Result<()> {
+    if !matches!(
+        subscription.media_type,
+        MediaType::Series | MediaType::Anime
+    ) {
+        return Ok(());
+    }
+
+    let targets = list_subscription_targets(pool, subscription.subscription_id).await?;
+    let scaffolds = targets
+        .iter()
+        .map(|target| AcquisitionLibraryTargetScaffold {
+            media_type: target.media_type,
+            title: target.title.clone(),
+            season_number: target.season_number,
+            episode_number: target.episode_number,
+            absolute_episode_number: target.absolute_episode_number,
+            metadata: target.metadata.clone(),
+        })
+        .collect::<Vec<_>>();
+    let scaffolded =
+        scaffold_acquisition_library_targets(pool, artwork, media_item_id, &scaffolds).await?;
+    if scaffolded > 0 {
+        rebuild_library_episode_acquisition_states_for_subscription(
+            pool,
+            subscription.subscription_id,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn block_import_run_result(
@@ -1824,9 +1872,9 @@ async fn apply_target_episode_metadata(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE episodes
-         SET title = COALESCE(title, ?),
-             runtime_seconds = COALESCE(runtime_seconds, ?),
-             metadata_json = COALESCE(metadata_json, ?),
+         SET title = COALESCE(?, NULLIF(title, ''), title),
+             runtime_seconds = COALESCE(?, runtime_seconds),
+             metadata_json = COALESCE(?, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ?",
     )
@@ -2054,6 +2102,16 @@ async fn update_subscription_completion_if_ready(
     pool: &AnyPool,
     subscription: &AcquisitionSubscription,
 ) -> Result<()> {
+    if subscription.completion_policy == AcquisitionCompletionPolicy::TerminalSelectedTargets {
+        complete_terminal_acquisition_request_if_ready(
+            pool,
+            subscription.subscription_id,
+            "All scoped acquisition targets were imported or excluded.",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM acquisition_targets
@@ -3004,9 +3062,10 @@ mod tests {
                 },
             },
             subscriptions::{
-                AcquisitionMonitorPolicy, AcquisitionRoutePolicy, AcquisitionTargetState,
-                NewAcquisitionSubscription, NewAcquisitionTarget, create_subscription, get_target,
-                upsert_subscription_targets,
+                AcquisitionCompletionPolicy, AcquisitionMetadataPolicy, AcquisitionMonitorPolicy,
+                AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
+                AcquisitionTargetState, NewAcquisitionSubscription, NewAcquisitionTarget,
+                create_subscription, get_target, upsert_subscription_targets,
             },
         },
         config::DatabaseConfig,
@@ -3058,6 +3117,12 @@ mod tests {
                 title: "Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::AllMissing,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3363,6 +3428,12 @@ mod tests {
                     anilist: Some("100".to_string()),
                     ..ExternalIds::default()
                 }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3636,6 +3707,12 @@ mod tests {
                 title: "Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3769,6 +3846,12 @@ mod tests {
                 title: "Movie".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3864,6 +3947,12 @@ mod tests {
                 title: "Pack Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -3877,7 +3966,7 @@ mod tests {
         let targets = upsert_subscription_targets(
             &database.pool,
             subscription.subscription_id,
-            (1..=3)
+            (1..=4)
                 .map(|episode| NewAcquisitionTarget {
                     target_key: Some(format!("S01E{episode:02}")),
                     media_type: Some(MediaType::Series),
@@ -3887,29 +3976,36 @@ mod tests {
                     absolute_episode_number: None,
                     air_date: None,
                     air_time: None,
-                    metadata: if episode == 1 {
+                    metadata: if episode == 1 || episode == 4 {
                         Some(json!({
                             "source": "tvdb",
-                            "tvdbEpisodeId": "tvdb-episode-1",
+                            "tvdbEpisodeId": format!("tvdb-episode-{episode}"),
                             "raw": {
-                                "id": 1001,
-                                "name": "Episode 1",
-                                "overview": "The first imported episode.",
-                                "image": "https://example.invalid/episode-1.jpg",
+                                "id": 1000 + episode,
+                                "name": format!("Episode {episode}"),
+                                "overview": format!("Episode {episode} overview."),
+                                "image": format!("https://example.invalid/episode-{episode}.jpg"),
                                 "runtime": 42
                             }
                         }))
                     } else {
                         None
                     },
-                    state: Some(AcquisitionTargetState::Submitted),
+                    state: Some(if episode <= 3 {
+                        AcquisitionTargetState::Submitted
+                    } else {
+                        AcquisitionTargetState::Pending
+                    }),
                     next_search_after: None,
                 })
                 .collect(),
         )
         .await?;
         let mut files = Vec::new();
-        for target in &targets {
+        for target in targets
+            .iter()
+            .filter(|target| target.episode_number <= Some(3))
+        {
             let episode = target.episode_number.expect("episode");
             let basename = format!("Pack.Show.S01E{episode:02}.mkv");
             let path = dir.path().join(&basename);
@@ -3960,11 +4056,25 @@ mod tests {
         let episode_metadata: JsonValue = serde_json::from_str(&episode_metadata)?;
         assert_eq!(
             episode_metadata.get("overview").and_then(JsonValue::as_str),
-            Some("The first imported episode.")
+            Some("Episode 1 overview.")
         );
         assert_eq!(
             episode_metadata.get("image").and_then(JsonValue::as_str),
             Some("https://example.invalid/episode-1.jpg")
+        );
+        let scaffolded_missing: (i64, String, String) = sqlx::query_as(
+            "SELECT CAST(has_file AS INTEGER), title, metadata_json
+             FROM episodes
+             WHERE season_number = 1 AND episode_number = 4",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(scaffolded_missing.0, 0);
+        assert_eq!(scaffolded_missing.1, "Episode 4");
+        let missing_metadata: JsonValue = serde_json::from_str(&scaffolded_missing.2)?;
+        assert_eq!(
+            missing_metadata.get("overview").and_then(JsonValue::as_str),
+            Some("Episode 4 overview.")
         );
         let runtime_seconds: i64 = sqlx::query_scalar(
             "SELECT runtime_seconds FROM episodes WHERE season_number = 1 AND episode_number = 1",
@@ -3972,7 +4082,10 @@ mod tests {
         .fetch_one(&database.pool)
         .await?;
         assert_eq!(runtime_seconds, 2520);
-        for target in targets {
+        for target in targets
+            .iter()
+            .filter(|target| target.episode_number <= Some(3))
+        {
             let imported = get_target(&database.pool, target.target_id)
                 .await?
                 .expect("target");
@@ -3995,6 +4108,12 @@ mod tests {
                 title: "Double Show".to_string(),
                 year: Some(2024),
                 external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
                 monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: None,
@@ -4629,6 +4748,129 @@ mod tests {
         assert_eq!(run.state, AcquisitionImportRunState::Blocked);
         let links = list_import_file_links(&fixture.database.pool, run.import_run_id).await?;
         assert!(links.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn osr4_import_ignores_unselected_out_of_scope_pack_files() -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let wanted_path = dir.path().join("Show.S01E01.mkv");
+        let skipped_path = dir.path().join("Show.S01E02.mkv");
+        tokio::fs::write(&wanted_path, b"wanted episode").await?;
+        tokio::fs::write(&skipped_path, b"skipped episode").await?;
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Show".to_string(),
+                year: Some(2024),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: Some(json!({
+                    "kind": "episode",
+                    "seasonNumber": 1,
+                    "episodeNumber": 1,
+                    "targetKey": "S01E01"
+                })),
+                metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Episode 1".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Submitted),
+                next_search_after: None,
+            }],
+        )
+        .await?;
+        let target_id = targets[0].target_id;
+        let (_release_id, job_id) = insert_completed_release_with_files_and_plan(
+            &database,
+            subscription.subscription_id,
+            MediaType::Series,
+            "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
+            ReleaseKind::SeasonPack,
+            ReleaseResolverKind::TvSonarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "osr4-import-scope",
+            vec![
+                TestReleaseFile {
+                    local_path: wanted_path.to_string_lossy().to_string(),
+                    basename: "Show.S01E01.mkv".to_string(),
+                    file_index: 0,
+                    selected: Some(true),
+                    parsed_season: Some(1),
+                    parsed_episode: Some(1),
+                    coverage: vec![(
+                        target_id,
+                        ReleaseCoverageKind::SeasonPack,
+                        ReleaseCoverageState::Submitted,
+                    )],
+                },
+                TestReleaseFile {
+                    local_path: skipped_path.to_string_lossy().to_string(),
+                    basename: "Show.S01E02.mkv".to_string(),
+                    file_index: 1,
+                    selected: Some(false),
+                    parsed_season: Some(1),
+                    parsed_episode: Some(2),
+                    coverage: Vec::new(),
+                },
+            ],
+            Some(json!({
+                "requestScopeEvidence": {
+                    "requestMode": "one_shot",
+                    "requestScope": "episode",
+                    "targetCount": 1,
+                    "targetKeys": ["S01E01"]
+                },
+                "selectionPolicy": {
+                    "status": "approved",
+                    "selectedFileIds": ["0"],
+                    "skippedFileIds": ["1"]
+                }
+            })),
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        let links = list_import_file_links(&database.pool, run.import_run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_id, Some(target_id));
+        let media_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(media_files, 1);
+        let imported_target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(imported_target.state, AcquisitionTargetState::Imported);
         Ok(())
     }
 
