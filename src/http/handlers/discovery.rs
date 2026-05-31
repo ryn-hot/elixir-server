@@ -10,11 +10,11 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map as JsonMap, Value, json};
 use sqlx::Row;
 use tokio::net::lookup_host;
 use tokio::process::Command;
@@ -30,14 +30,28 @@ use crate::{
         AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView,
         imports::{AcquisitionImportRunState, list_import_runs_by_release},
         load_intent_recovery_views,
+        release_resolution::anime::{
+            AnimeMetadataGraphInput, AnimeSeasonMapping, build_anime_metadata_graph,
+            infer_anizip_season_number,
+        },
         release_resolution::{
             models::{AcquisitionReleaseState, ReleaseCoverageState, ReleaseJobState},
             store::{ReleaseListFilter, list_release_coverage, list_release_jobs, list_releases},
         },
+        scoped_add::{
+            AcquisitionRequestOrigin, FindMediaScopePreviewBlocker,
+            FindMediaScopePreviewCapabilities, FindMediaScopePreviewEpisode,
+            FindMediaScopePreviewRequest, FindMediaScopePreviewResponse,
+            FindMediaScopePreviewSeason, FindMediaScopedAddRequest, FindMediaScopedAddResponse,
+            ScopedAddMediaIdentity, ScopedAddScopeDocument, ScopedAddSelection,
+            ScopedAddSelectionType, canonical_target_keys,
+        },
         subscriptions::{
+            AcquisitionCompletionPolicy, AcquisitionIntentTarget, AcquisitionMetadataPolicy,
             AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
             AcquisitionSubscription, AcquisitionSubscriptionFilter, AcquisitionSubscriptionStatus,
             AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
+            CreateAcquisitionIntent, NewAcquisitionTarget, create_or_update_acquisition_intent,
             list_subscription_targets, list_subscriptions, update_target_state,
         },
     },
@@ -63,7 +77,11 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
     },
-    library::{ingest_managed_import_event, managed_episode_tombstone_matches_series},
+    library::{
+        AcquisitionLibraryTargetScaffold, AniListSeasonChainEntry, ingest_managed_import_event,
+        managed_episode_tombstone_matches_series, resolve_anilist_season_chain,
+        scaffold_acquisition_library_targets,
+    },
     metadata::DiscoveryResult,
     orchestrator::model::ProviderEndpoint,
     runtime::RuntimePaths,
@@ -1147,6 +1165,160 @@ pub async fn find_media_search(
     }))
 }
 
+pub async fn find_media_scope_preview(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Json(payload): Json<FindMediaScopePreviewRequest>,
+) -> ApiResult<Json<FindMediaScopePreviewResponse>> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let response = build_find_media_scope_preview(&state, &store, payload)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+pub async fn find_media_scoped_add(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Json(payload): Json<FindMediaScopedAddRequest>,
+) -> ApiResult<Json<FindMediaScopedAddResponse>> {
+    if payload.result.kind != payload.media_type {
+        return Err(ApiError::bad_request(
+            "scoped add media_type must match result.kind",
+        ));
+    }
+    let scope_document = payload
+        .scope_document()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let preview = build_find_media_scope_preview(
+        &state,
+        &store,
+        FindMediaScopePreviewRequest {
+            provider_id: Some(payload.provider_id),
+            media_type: payload.media_type,
+            result: payload.result.clone(),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    if !preview.blockers.is_empty() {
+        let first = &preview.blockers[0];
+        return Err(ApiError::bad_request(format!(
+            "{}{}",
+            first.message,
+            first
+                .detail
+                .as_deref()
+                .map(|detail| format!(" {detail}"))
+                .unwrap_or_default()
+        )));
+    }
+
+    let selected_targets =
+        select_scoped_add_targets_from_preview(&preview, &scope_document.selection)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if selected_targets.is_empty() {
+        return Err(ApiError::bad_request(
+            "scoped add selection did not match any preview targets",
+        ));
+    }
+
+    let catalog = ensure_find_media_scoped_catalog(&state, &preview, &selected_targets)
+        .await
+        .map_err(ApiError::from)?;
+    let now = Utc::now();
+    let mut scope_json = scoped_add_scope_json(
+        &scope_document,
+        catalog.media_item_id,
+        &selected_targets,
+        &catalog.episode_ids_by_target_key,
+    )
+    .map_err(ApiError::from)?;
+    let target =
+        scoped_add_intent_target(&scope_document.selection, &selected_targets, &scope_json);
+    let mut intent = CreateAcquisitionIntent {
+        media_type: payload.media_type,
+        title: preview.media.title.clone(),
+        year: preview.media.year,
+        external_ids: preview.media.external_ids.clone(),
+        idempotency_key: None,
+        request_mode: Some(AcquisitionRequestMode::OneShot),
+        request_scope: Some(scope_document.selection.request_scope()),
+        scope: Some(scope_json.clone()),
+        metadata_policy: Some(AcquisitionMetadataPolicy::InitialOnly),
+        completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+        monitor_policy: Some(
+            crate::acquisition::subscriptions::AcquisitionMonitorPolicy::SelectedTargets,
+        ),
+        route_policy: payload.route_policy.or(scope_document.route_policy),
+        source_provider_id: Some(payload.provider_id),
+        release_delay_seconds: None,
+        quality_profile: None,
+        metadata_refresh_after: Some(now),
+        candidate_search_after: Some(now),
+        target: Some(target),
+        targets: selected_targets
+            .iter()
+            .map(|target| {
+                scoped_add_new_acquisition_target(
+                    payload.media_type,
+                    &preview.media.title,
+                    target,
+                    catalog
+                        .episode_ids_by_target_key
+                        .get(&target.target_key)
+                        .copied(),
+                    catalog.media_item_id,
+                    now,
+                )
+            })
+            .collect(),
+    };
+    apply_find_media_source_provider_config_defaults(&store, &mut intent)
+        .await
+        .map_err(ApiError::from)?;
+    let route_policy = intent.route_policy.unwrap_or_default();
+    intent.route_policy = Some(route_policy);
+    if let Some(scope) = intent.scope.as_mut() {
+        add_scoped_add_effective_route_policy(scope, intent.route_policy);
+    }
+    scope_json = intent.scope.clone().unwrap_or(scope_json);
+    intent.idempotency_key = Some(scoped_add_idempotency_key(
+        payload.provider_id,
+        payload.media_type,
+        route_policy,
+        &scope_json,
+    ));
+
+    let result = create_or_update_acquisition_intent(&state.db_pool, intent, now)
+        .await
+        .map_err(ApiError::from)?;
+
+    info!(
+        media_type = media_type_api_name(payload.media_type),
+        title = %preview.media.title,
+        provider_id = %payload.provider_id,
+        subscription_id = %result.detail.subscription.subscription_id,
+        target_count = result.detail.targets.len(),
+        created = result.created,
+        scope = ?scope_document.selection.selection_type,
+        scope_hash = %stable_hash_hex(&serde_json::to_string(&scope_json).unwrap_or_default()),
+        "find media scoped add accepted"
+    );
+
+    Ok(Json(FindMediaScopedAddResponse {
+        accepted: true,
+        subscription_id: result.detail.subscription.subscription_id,
+        request_mode: AcquisitionRequestMode::OneShot,
+        request_origin: AcquisitionRequestOrigin::FindMedia,
+        request_scope: scope_document.selection.request_scope(),
+        target_count: result.detail.targets.len(),
+        status: "queued".to_string(),
+    }))
+}
+
 pub async fn find_media_acquisition(
     State(state): State<AppState>,
     _user: CurrentUser,
@@ -1288,6 +1460,1450 @@ pub async fn find_media_add(
     );
 
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+#[derive(Debug, Clone)]
+struct FindMediaScopedPreviewTarget {
+    target_key: String,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    absolute_episode_number: Option<i32>,
+    title: Option<String>,
+    air_date: Option<String>,
+    thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FindMediaScopedCatalog {
+    media_item_id: Uuid,
+    episode_ids_by_target_key: HashMap<String, Uuid>,
+}
+
+fn select_scoped_add_targets_from_preview(
+    preview: &FindMediaScopePreviewResponse,
+    selection: &ScopedAddSelection,
+) -> AnyResult<Vec<FindMediaScopedPreviewTarget>> {
+    let selection = selection.validated()?;
+    if preview.media.kind == MediaType::Movie {
+        if matches!(
+            selection.selection_type,
+            ScopedAddSelectionType::Movie | ScopedAddSelectionType::EntireTitle
+        ) {
+            return Ok(vec![FindMediaScopedPreviewTarget {
+                target_key: "MOVIE".to_string(),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: None,
+                title: Some(preview.media.title.clone()),
+                air_date: None,
+                thumbnail_url: None,
+            }]);
+        }
+        bail!("movie scoped add only supports movie or entire-title selection");
+    }
+
+    let preview_targets = flattened_scope_preview_targets(preview)?;
+    let order: HashMap<_, _> = preview_targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.target_key.clone(), index))
+        .collect();
+    let by_key: HashMap<_, _> = preview_targets
+        .iter()
+        .cloned()
+        .map(|target| (target.target_key.clone(), target))
+        .collect();
+    let mut selected = Vec::new();
+
+    match selection.selection_type {
+        ScopedAddSelectionType::Movie => {
+            bail!("movie selection is only valid for movie results");
+        }
+        ScopedAddSelectionType::EntireTitle => {
+            selected.extend(preview_targets);
+        }
+        ScopedAddSelectionType::Episode => {
+            if !selection.target_keys.is_empty() {
+                selected.extend(targets_for_keys(&by_key, &selection.target_keys)?);
+            } else if let (Some(season), Some(episode)) =
+                (selection.season_number, selection.episode_number)
+            {
+                selected.extend(preview_targets.into_iter().filter(|target| {
+                    target.season_number == Some(season) && target.episode_number == Some(episode)
+                }));
+            } else if let Some(absolute) = selection.absolute_episode_number {
+                selected.extend(
+                    preview_targets
+                        .into_iter()
+                        .filter(|target| target.absolute_episode_number == Some(absolute)),
+                );
+            }
+        }
+        ScopedAddSelectionType::Season => {
+            let season = selection
+                .season_number
+                .ok_or_else(|| anyhow::anyhow!("season scoped add requires seasonNumber"))?;
+            selected.extend(
+                preview_targets
+                    .into_iter()
+                    .filter(|target| target.season_number == Some(season)),
+            );
+        }
+        ScopedAddSelectionType::Range => {
+            if !selection.target_keys.is_empty() {
+                selected.extend(targets_for_keys(&by_key, &selection.target_keys)?);
+            } else if let Some(season) = selection.season_number {
+                let start = selection
+                    .episode_start
+                    .or(selection.episode_number)
+                    .ok_or_else(|| anyhow::anyhow!("range scoped add requires episodeStart"))?;
+                let end = selection.episode_end.unwrap_or(start);
+                selected.extend(preview_targets.into_iter().filter(|target| {
+                    target.season_number == Some(season)
+                        && target.episode_number.is_some_and(|episode| {
+                            episode >= start.min(end) && episode <= start.max(end)
+                        })
+                }));
+            } else {
+                let start = selection
+                    .absolute_episode_start
+                    .or(selection.absolute_episode_number)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("range scoped add requires absoluteEpisodeStart")
+                    })?;
+                let end = selection.absolute_episode_end.unwrap_or(start);
+                selected.extend(preview_targets.into_iter().filter(|target| {
+                    target.absolute_episode_number.is_some_and(|absolute| {
+                        absolute >= start.min(end) && absolute <= start.max(end)
+                    })
+                }));
+            }
+        }
+        ScopedAddSelectionType::SelectedTargets | ScopedAddSelectionType::AnimeArc => {
+            selected.extend(targets_for_keys(&by_key, &selection.target_keys)?);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    selected.retain(|target| seen.insert(target.target_key.clone()));
+    selected.sort_by_key(|target| order.get(&target.target_key).copied().unwrap_or(usize::MAX));
+    Ok(selected)
+}
+
+fn flattened_scope_preview_targets(
+    preview: &FindMediaScopePreviewResponse,
+) -> AnyResult<Vec<FindMediaScopedPreviewTarget>> {
+    let mut targets = Vec::new();
+    for season in &preview.seasons {
+        for episode in &season.episodes {
+            targets.push(FindMediaScopedPreviewTarget {
+                target_key: crate::acquisition::scoped_add::canonical_acquisition_target_key(
+                    &episode.target_key,
+                )?,
+                season_number: episode.season_number.or(Some(season.season_number)),
+                episode_number: episode.episode_number,
+                absolute_episode_number: episode.absolute_episode_number,
+                title: episode.title.clone(),
+                air_date: episode.air_date.clone(),
+                thumbnail_url: episode.thumbnail_url.clone(),
+            });
+        }
+    }
+    targets.sort_by_key(|target| {
+        (
+            target.season_number.unwrap_or(i32::MAX),
+            target.episode_number.unwrap_or(i32::MAX),
+            target.absolute_episode_number.unwrap_or(i32::MAX),
+            target.target_key.clone(),
+        )
+    });
+    Ok(targets)
+}
+
+fn targets_for_keys(
+    by_key: &HashMap<String, FindMediaScopedPreviewTarget>,
+    keys: &[String],
+) -> AnyResult<Vec<FindMediaScopedPreviewTarget>> {
+    let keys = canonical_target_keys(keys)?;
+    let mut targets = Vec::new();
+    for key in keys {
+        let Some(target) = by_key.get(&key) else {
+            bail!("selected targetKey {key} is not present in the canonical preview");
+        };
+        targets.push(target.clone());
+    }
+    Ok(targets)
+}
+
+async fn ensure_find_media_scoped_catalog(
+    state: &AppState,
+    preview: &FindMediaScopePreviewResponse,
+    targets: &[FindMediaScopedPreviewTarget],
+) -> AnyResult<FindMediaScopedCatalog> {
+    let media_item_id = match preview.media.kind {
+        MediaType::Movie => ensure_find_media_scoped_movie(&state.db_pool, &preview.media).await?,
+        MediaType::Series | MediaType::Anime => {
+            let media_item_id =
+                ensure_find_media_scoped_series(&state.db_pool, &preview.media).await?;
+            let scaffolds = targets
+                .iter()
+                .filter_map(|target| {
+                    let season = target.season_number?;
+                    let episode = target.episode_number?;
+                    Some(AcquisitionLibraryTargetScaffold {
+                        media_type: preview.media.kind,
+                        title: target
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| format!("Episode {episode}")),
+                        season_number: Some(season),
+                        episode_number: Some(episode),
+                        absolute_episode_number: target.absolute_episode_number,
+                        metadata: Some(scoped_add_episode_metadata(target)),
+                    })
+                })
+                .collect::<Vec<_>>();
+            scaffold_acquisition_library_targets(
+                &state.db_pool,
+                Some(state.artwork.as_ref()),
+                media_item_id,
+                &scaffolds,
+            )
+            .await?;
+            media_item_id
+        }
+    };
+    let episode_ids_by_target_key =
+        load_scoped_catalog_episode_ids(&state.db_pool, media_item_id, targets).await?;
+    Ok(FindMediaScopedCatalog {
+        media_item_id,
+        episode_ids_by_target_key,
+    })
+}
+
+async fn ensure_find_media_scoped_movie(
+    pool: &sqlx::AnyPool,
+    media: &ScopedAddMediaIdentity,
+) -> AnyResult<Uuid> {
+    let ids = media.external_ids.clone().unwrap_or_default();
+    let media_item_id = find_existing_movie_id(pool, &ids, &media.title, media.year)
+        .await?
+        .unwrap_or_else(Uuid::new_v4);
+    let external_ids_json = serde_json::to_string(&ids)?;
+    let metadata_json = serde_json::to_string(&scoped_add_media_metadata(media))?;
+
+    upsert_media_item_preserving_metadata(
+        pool,
+        media_item_id,
+        MediaType::Movie,
+        &media.title,
+        media.year,
+        &external_ids_json,
+        &metadata_json,
+    )
+    .await?;
+
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM movies WHERE id = ? LIMIT 1")
+        .bind(media_item_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE movies
+             SET title = COALESCE(NULLIF(TRIM(title), ''), ?),
+                 year = COALESCE(year, ?),
+                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), ?),
+                 external_tmdb = COALESCE(NULLIF(TRIM(external_tmdb), ''), ?),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(media.title.trim())
+        .bind(media.year)
+        .bind(trim_external_id(ids.imdb.as_deref()))
+        .bind(trim_external_id(ids.tmdb.as_deref()))
+        .bind(&metadata_json)
+        .bind(media_item_id.to_string())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO movies (id, title, year, external_imdb, external_tmdb, metadata_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_item_id.to_string())
+        .bind(media.title.trim())
+        .bind(media.year)
+        .bind(trim_external_id(ids.imdb.as_deref()))
+        .bind(trim_external_id(ids.tmdb.as_deref()))
+        .bind(&metadata_json)
+        .execute(pool)
+        .await?;
+    }
+    insert_movie_external_ids(pool, media_item_id, &ids).await?;
+    Ok(media_item_id)
+}
+
+async fn ensure_find_media_scoped_series(
+    pool: &sqlx::AnyPool,
+    media: &ScopedAddMediaIdentity,
+) -> AnyResult<Uuid> {
+    let ids = media.external_ids.clone().unwrap_or_default();
+    let media_item_id = find_existing_series_id(pool, media.kind, &ids, &media.title, media.year)
+        .await?
+        .unwrap_or_else(Uuid::new_v4);
+    let external_ids_json = serde_json::to_string(&ids)?;
+    let metadata_json = serde_json::to_string(&scoped_add_media_metadata(media))?;
+
+    upsert_media_item_preserving_metadata(
+        pool,
+        media_item_id,
+        media.kind,
+        &media.title,
+        media.year,
+        &external_ids_json,
+        &metadata_json,
+    )
+    .await?;
+
+    let library_type = match media.kind {
+        MediaType::Anime => "anime",
+        _ => "series",
+    };
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM series WHERE id = ? LIMIT 1")
+        .bind(media_item_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE series
+             SET title = COALESCE(NULLIF(TRIM(title), ''), ?),
+                 year = COALESCE(year, ?),
+                 library_type = ?,
+                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), ?),
+                 external_tvdb_series = COALESCE(NULLIF(TRIM(external_tvdb_series), ''), ?),
+                 external_anilist = COALESCE(NULLIF(TRIM(external_anilist), ''), ?),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(media.title.trim())
+        .bind(media.year)
+        .bind(library_type)
+        .bind(trim_external_id(ids.imdb.as_deref()))
+        .bind(trim_external_id(
+            ids.tvdb_series.as_deref().or(ids.tvdb.as_deref()),
+        ))
+        .bind(trim_external_id(ids.anilist.as_deref()))
+        .bind(&metadata_json)
+        .bind(media_item_id.to_string())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_item_id.to_string())
+        .bind(media.title.trim())
+        .bind(media.year)
+        .bind(library_type)
+        .bind(trim_external_id(ids.imdb.as_deref()))
+        .bind(trim_external_id(
+            ids.tvdb_series.as_deref().or(ids.tvdb.as_deref()),
+        ))
+        .bind(trim_external_id(ids.anilist.as_deref()))
+        .bind(&metadata_json)
+        .execute(pool)
+        .await?;
+    }
+    insert_series_external_ids(pool, media_item_id, &ids).await?;
+    Ok(media_item_id)
+}
+
+async fn upsert_media_item_preserving_metadata(
+    pool: &sqlx::AnyPool,
+    media_item_id: Uuid,
+    media_type: MediaType,
+    title: &str,
+    year: Option<i32>,
+    external_ids_json: &str,
+    metadata_json: &str,
+) -> AnyResult<()> {
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = ? LIMIT 1")
+        .bind(media_item_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE media_items
+             SET type = ?,
+                 title = COALESCE(NULLIF(TRIM(title), ''), ?),
+                 year = COALESCE(year, ?),
+                 external_ids = COALESCE(NULLIF(TRIM(external_ids), ''), ?),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(media_type.as_str())
+        .bind(title.trim())
+        .bind(year)
+        .bind(external_ids_json)
+        .bind(metadata_json)
+        .bind(media_item_id.to_string())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_item_id.to_string())
+        .bind(media_type.as_str())
+        .bind(external_ids_json)
+        .bind(title.trim())
+        .bind(year)
+        .bind(metadata_json)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn find_existing_movie_id(
+    pool: &sqlx::AnyPool,
+    ids: &ExternalIds,
+    title: &str,
+    year: Option<i32>,
+) -> AnyResult<Option<Uuid>> {
+    for (query, value) in [
+        (
+            "SELECT id FROM movies WHERE external_imdb = ? LIMIT 1",
+            trim_external_id(ids.imdb.as_deref()),
+        ),
+        (
+            "SELECT id FROM movies WHERE external_tmdb = ? LIMIT 1",
+            trim_external_id(ids.tmdb.as_deref()),
+        ),
+    ] {
+        if let Some(value) = value
+            && let Some(id) = query_uuid_scalar(pool, query, value).await?
+        {
+            return Ok(Some(id));
+        }
+    }
+    if let Some(id) =
+        find_existing_external_id_owner(pool, "movie_external_ids", "movie_id", ids).await?
+    {
+        return Ok(Some(id));
+    }
+    find_existing_media_by_title(pool, "movies", "id", title, year, None).await
+}
+
+async fn find_existing_series_id(
+    pool: &sqlx::AnyPool,
+    media_type: MediaType,
+    ids: &ExternalIds,
+    title: &str,
+    year: Option<i32>,
+) -> AnyResult<Option<Uuid>> {
+    for (query, value) in [
+        (
+            "SELECT id FROM series WHERE external_anilist = ? LIMIT 1",
+            trim_external_id(ids.anilist.as_deref()),
+        ),
+        (
+            "SELECT id FROM series WHERE external_tvdb_series = ? LIMIT 1",
+            trim_external_id(ids.tvdb_series.as_deref().or(ids.tvdb.as_deref())),
+        ),
+        (
+            "SELECT id FROM series WHERE external_imdb = ? LIMIT 1",
+            trim_external_id(ids.imdb.as_deref()),
+        ),
+    ] {
+        if let Some(value) = value
+            && let Some(id) = query_uuid_scalar(pool, query, value).await?
+        {
+            return Ok(Some(id));
+        }
+    }
+    if let Some(id) =
+        find_existing_external_id_owner(pool, "series_external_ids", "series_id", ids).await?
+    {
+        return Ok(Some(id));
+    }
+    let library_type = match media_type {
+        MediaType::Anime => Some("anime"),
+        MediaType::Series => Some("series"),
+        MediaType::Movie => None,
+    };
+    find_existing_media_by_title(pool, "series", "id", title, year, library_type).await
+}
+
+async fn query_uuid_scalar(
+    pool: &sqlx::AnyPool,
+    query: &str,
+    value: &str,
+) -> AnyResult<Option<Uuid>> {
+    sqlx::query_scalar::<sqlx::Any, String>(query)
+        .bind(value)
+        .fetch_optional(pool)
+        .await?
+        .map(|id| Uuid::parse_str(&id).context("parsing library item id"))
+        .transpose()
+}
+
+async fn find_existing_external_id_owner(
+    pool: &sqlx::AnyPool,
+    table: &str,
+    owner_column: &str,
+    ids: &ExternalIds,
+) -> AnyResult<Option<Uuid>> {
+    for (provider, external_id) in external_id_pairs(ids) {
+        let query = format!(
+            "SELECT {owner_column} FROM {table} WHERE provider = ? AND external_id = ? LIMIT 1"
+        );
+        if let Some(id) = sqlx::query_scalar::<sqlx::Any, String>(&query)
+            .bind(provider)
+            .bind(external_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|id| Uuid::parse_str(&id).context("parsing external id owner"))
+            .transpose()?
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_existing_media_by_title(
+    pool: &sqlx::AnyPool,
+    table: &str,
+    id_column: &str,
+    title: &str,
+    year: Option<i32>,
+    library_type: Option<&str>,
+) -> AnyResult<Option<Uuid>> {
+    let normalized = normalize_name(title);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let rows = if let Some(library_type) = library_type {
+        sqlx::query::<sqlx::Any>(&format!(
+            "SELECT {id_column} AS id, title, year FROM {table} WHERE library_type = ?"
+        ))
+        .bind(library_type)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query::<sqlx::Any>(&format!(
+            "SELECT {id_column} AS id, title, year FROM {table}"
+        ))
+        .fetch_all(pool)
+        .await?
+    };
+    for row in rows {
+        let row_title: String = row.try_get("title")?;
+        let row_year = row.try_get::<Option<i64>, _>("year").ok().flatten();
+        let year_matches = match (year, row_year) {
+            (Some(left), Some(right)) => left as i64 == right,
+            (None, _) | (_, None) => true,
+        };
+        if year_matches && normalize_name(&row_title) == normalized {
+            let id: String = row.try_get("id")?;
+            return Uuid::parse_str(&id)
+                .map(Some)
+                .context("parsing title-matched library id");
+        }
+    }
+    Ok(None)
+}
+
+async fn insert_movie_external_ids(
+    pool: &sqlx::AnyPool,
+    movie_id: Uuid,
+    ids: &ExternalIds,
+) -> AnyResult<()> {
+    for (provider, external_id) in external_id_pairs(ids) {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO movie_external_ids (id, movie_id, provider, external_id, confidence, source)
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(movie_id.to_string())
+        .bind(provider)
+        .bind(external_id)
+        .bind(1.0_f64)
+        .bind("find_media_scoped_add")
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn insert_series_external_ids(
+    pool: &sqlx::AnyPool,
+    series_id: Uuid,
+    ids: &ExternalIds,
+) -> AnyResult<()> {
+    for (provider, external_id) in external_id_pairs(ids) {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source)
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(series_id.to_string())
+        .bind(provider)
+        .bind(external_id)
+        .bind(1.0_f64)
+        .bind("find_media_scoped_add")
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn load_scoped_catalog_episode_ids(
+    pool: &sqlx::AnyPool,
+    media_item_id: Uuid,
+    targets: &[FindMediaScopedPreviewTarget],
+) -> AnyResult<HashMap<String, Uuid>> {
+    let mut out = HashMap::new();
+    for target in targets {
+        let (Some(season), Some(episode)) = (target.season_number, target.episode_number) else {
+            continue;
+        };
+        let Some(id) = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT id FROM episodes WHERE series_id = ? AND season_number = ? AND episode_number = ? LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .bind(season)
+        .bind(episode)
+        .fetch_optional(pool)
+        .await?
+        else {
+            continue;
+        };
+        out.insert(target.target_key.clone(), Uuid::parse_str(&id)?);
+    }
+    Ok(out)
+}
+
+fn scoped_add_media_metadata(media: &ScopedAddMediaIdentity) -> Value {
+    json_object_without_nulls_local(json!({
+        "source": "find_media_scoped_add",
+        "title": media.title,
+        "year": media.year,
+        "externalIds": media.external_ids,
+    }))
+}
+
+fn scoped_add_episode_metadata(target: &FindMediaScopedPreviewTarget) -> Value {
+    json_object_without_nulls_local(json!({
+        "source": "find_media_scope_preview",
+        "targetKey": target.target_key,
+        "name": target.title,
+        "title": target.title,
+        "seasonNumber": target.season_number,
+        "episodeNumber": target.episode_number,
+        "absoluteNumber": target.absolute_episode_number,
+        "airDate": target.air_date,
+        "image": target.thumbnail_url,
+        "thumbnail": target.thumbnail_url,
+    }))
+}
+
+fn scoped_add_scope_json(
+    document: &crate::acquisition::scoped_add::ScopedAddScopeDocument,
+    media_item_id: Uuid,
+    targets: &[FindMediaScopedPreviewTarget],
+    episode_ids_by_target_key: &HashMap<String, Uuid>,
+) -> AnyResult<Value> {
+    let mut value = serde_json::to_value(document)?;
+    let Some(map) = value.as_object_mut() else {
+        bail!("scoped add scope document did not serialize to an object");
+    };
+    map.insert("mediaItemId".to_string(), json!(media_item_id.to_string()));
+    map.insert(
+        "targetKeys".to_string(),
+        json!(
+            targets
+                .iter()
+                .map(|target| target.target_key.clone())
+                .collect::<Vec<_>>()
+        ),
+    );
+    map.insert("selectedTargetCount".to_string(), json!(targets.len()));
+    let mut target_map = JsonMap::new();
+    for target in targets {
+        target_map.insert(
+            target.target_key.clone(),
+            json_object_without_nulls_local(json!({
+                "seasonNumber": target.season_number,
+                "episodeNumber": target.episode_number,
+                "absoluteEpisodeNumber": target.absolute_episode_number,
+                "title": target.title,
+                "airDate": target.air_date,
+                "thumbnailUrl": target.thumbnail_url,
+                "libraryEpisodeId": episode_ids_by_target_key
+                    .get(&target.target_key)
+                    .map(|id| id.to_string()),
+            })),
+        );
+    }
+    map.insert("targets".to_string(), Value::Object(target_map));
+    Ok(value)
+}
+
+fn add_scoped_add_effective_route_policy(
+    scope: &mut Value,
+    route_policy: Option<AcquisitionRoutePolicy>,
+) {
+    if let (Some(map), Some(route_policy)) = (scope.as_object_mut(), route_policy) {
+        map.insert(
+            "effectiveRoutePolicy".to_string(),
+            json!(route_policy.as_str()),
+        );
+    }
+}
+
+fn scoped_add_intent_target(
+    selection: &ScopedAddSelection,
+    _targets: &[FindMediaScopedPreviewTarget],
+    scope_json: &Value,
+) -> AcquisitionIntentTarget {
+    AcquisitionIntentTarget {
+        kind: Some(scoped_selection_kind(selection.selection_type).to_string()),
+        title: None,
+        target_key: None,
+        target_keys: Vec::new(),
+        season_number: None,
+        episode_number: None,
+        episode_start: None,
+        episode_end: None,
+        absolute_episode_number: None,
+        absolute_episode_start: None,
+        absolute_episode_end: None,
+        air_date: None,
+        air_time: None,
+        metadata: Some(json_object_without_nulls_local(json!({
+            "source": "find_media_scoped_add",
+            "scope": scope_json,
+        }))),
+        targets: Vec::new(),
+    }
+}
+
+fn scoped_add_new_acquisition_target(
+    media_type: MediaType,
+    media_title: &str,
+    target: &FindMediaScopedPreviewTarget,
+    library_episode_id: Option<Uuid>,
+    media_item_id: Uuid,
+    now: DateTime<Utc>,
+) -> NewAcquisitionTarget {
+    let title =
+        target
+            .title
+            .clone()
+            .or_else(|| match (target.season_number, target.episode_number) {
+                (Some(season), Some(episode)) => {
+                    Some(format!("{media_title} S{season:02}E{episode:02}"))
+                }
+                _ => Some(media_title.to_string()),
+            });
+    NewAcquisitionTarget {
+        target_key: Some(target.target_key.clone()),
+        media_type: Some(media_type),
+        title,
+        season_number: target.season_number,
+        episode_number: target.episode_number,
+        absolute_episode_number: target.absolute_episode_number,
+        air_date: target.air_date.clone(),
+        air_time: None,
+        metadata: Some(json_object_without_nulls_local(json!({
+            "source": "find_media_scoped_add",
+            "mediaItemId": media_item_id.to_string(),
+            "libraryEpisodeId": library_episode_id.map(|id| id.to_string()),
+            "targetKey": target.target_key,
+            "title": target.title,
+            "seasonNumber": target.season_number,
+            "episodeNumber": target.episode_number,
+            "absoluteEpisodeNumber": target.absolute_episode_number,
+            "airDate": target.air_date,
+            "thumbnailUrl": target.thumbnail_url,
+            "scopeMetadata": {
+                "mediaItemId": media_item_id.to_string(),
+                "libraryEpisodeId": library_episode_id.map(|id| id.to_string()),
+                "targetKey": target.target_key,
+                "source": "find_media_scoped_add"
+            }
+        }))),
+        state: Some(AcquisitionTargetState::Pending),
+        next_search_after: Some(now),
+    }
+}
+
+fn scoped_selection_kind(selection_type: ScopedAddSelectionType) -> &'static str {
+    match selection_type {
+        ScopedAddSelectionType::Movie => "movie",
+        ScopedAddSelectionType::EntireTitle => "entire_title",
+        ScopedAddSelectionType::Episode => "episode",
+        ScopedAddSelectionType::Season => "season",
+        ScopedAddSelectionType::Range => "range",
+        ScopedAddSelectionType::SelectedTargets => "selected_targets",
+        ScopedAddSelectionType::AnimeArc => "anime_arc",
+    }
+}
+
+fn scoped_add_idempotency_key(
+    provider_id: Uuid,
+    media_type: MediaType,
+    route_policy: AcquisitionRoutePolicy,
+    scope_json: &Value,
+) -> String {
+    let material = serde_json::to_string(scope_json).unwrap_or_default();
+    format!(
+        "find-media:{}:{}:{}:{}",
+        provider_id,
+        media_type.as_str(),
+        route_policy.as_str(),
+        stable_hash_hex(&material)
+    )
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+async fn apply_find_media_source_provider_config_defaults(
+    store: &ExtensionStore<'_>,
+    request: &mut CreateAcquisitionIntent,
+) -> AnyResult<()> {
+    let Some(source_provider_id) = request.source_provider_id else {
+        return Ok(());
+    };
+    let provider = store
+        .get_provider(source_provider_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source provider was not found"))?;
+    if !provider
+        .capability
+        .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+    {
+        bail!("source provider must be an acquisition candidate provider");
+    }
+    let instance = store
+        .get_instance(provider.instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source provider instance was not found"))?;
+    let Some(config) = instance.config_json.as_ref().and_then(Value::as_object) else {
+        return Ok(());
+    };
+
+    if request.route_policy.is_none() {
+        if let Some(route_policy) = config
+            .get("routePolicy")
+            .and_then(Value::as_str)
+            .map(|value| value.parse::<AcquisitionRoutePolicy>())
+            .transpose()?
+        {
+            request.route_policy = Some(route_policy);
+        }
+    }
+    if request.release_delay_seconds.is_none()
+        && let Some(delay) = config.get("releaseDelaySeconds").and_then(Value::as_i64)
+    {
+        if delay < 0 {
+            bail!("releaseDelaySeconds cannot be negative");
+        }
+        request.release_delay_seconds = Some(delay);
+    }
+    if request.quality_profile.is_none() {
+        request.quality_profile = find_media_source_quality_profile_from_config(config);
+    }
+    Ok(())
+}
+
+fn find_media_source_quality_profile_from_config(config: &JsonMap<String, Value>) -> Option<Value> {
+    let mut profile = JsonMap::new();
+    if let Some(values) = string_list_config(config.get("allowedQualities"))
+        && !values.is_empty()
+    {
+        profile.insert("allowedQualities".to_string(), Value::Array(values));
+    }
+    if let Some(values) = string_list_config(config.get("requiredLanguages"))
+        && !values.is_empty()
+    {
+        profile.insert("requiredLanguages".to_string(), Value::Array(values));
+    }
+    if let Some(max_size_bytes) = max_size_bytes_from_config(config) {
+        profile.insert("maxSizeBytes".to_string(), json!(max_size_bytes));
+    }
+    (!profile.is_empty()).then_some(Value::Object(profile))
+}
+
+fn string_list_config(value: Option<&Value>) -> Option<Vec<Value>> {
+    let values = match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| json!(value))
+            .collect(),
+        Some(Value::String(text)) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| json!(value))
+            .collect(),
+        _ => return None,
+    };
+    Some(values)
+}
+
+fn max_size_bytes_from_config(config: &JsonMap<String, Value>) -> Option<u64> {
+    let raw_bytes = config.get("maxSizeBytes").and_then(Value::as_u64);
+    if raw_bytes.is_some() {
+        return raw_bytes;
+    }
+    let max_size_gb = config
+        .get("maxSizeGb")
+        .and_then(|value| value.as_f64().filter(|gb| *gb > 0.0))?;
+    Some((max_size_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
+}
+
+fn external_id_pairs(ids: &ExternalIds) -> Vec<(&'static str, String)> {
+    [
+        ("imdb", ids.imdb.as_deref()),
+        ("tmdb", ids.tmdb.as_deref()),
+        ("tvdb", ids.tvdb.as_deref()),
+        ("tvdb_series", ids.tvdb_series.as_deref()),
+        ("tvdb_movie", ids.tvdb_movie.as_deref()),
+        ("anilist", ids.anilist.as_deref()),
+        ("anidb", ids.anidb.as_deref()),
+        ("mal", ids.mal.as_deref()),
+        ("kitsu", ids.kitsu.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(provider, value)| {
+        trim_external_id(value).map(|value| (provider, value.to_string()))
+    })
+    .collect()
+}
+
+fn trim_external_id(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn json_object_without_nulls_local(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| (!value.is_null()).then_some((key, value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+async fn build_find_media_scope_preview(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    payload: FindMediaScopePreviewRequest,
+) -> AnyResult<FindMediaScopePreviewResponse> {
+    if payload.result.kind != payload.media_type {
+        bail!("scope preview media_type must match result.kind");
+    }
+
+    let mut media = payload.result.validated()?;
+    let blockers =
+        find_media_scope_provider_blockers(state, store, payload.media_type, payload.provider_id)
+            .await?;
+
+    let mut preview = match payload.media_type {
+        MediaType::Movie => FindMediaScopePreviewResponse {
+            media,
+            capabilities: FindMediaScopePreviewCapabilities {
+                entire_title: true,
+                ..Default::default()
+            },
+            seasons: Vec::new(),
+            arcs: Vec::new(),
+            blockers,
+        },
+        MediaType::Series => {
+            build_find_media_tv_scope_preview(state, media, MediaType::Series, blockers).await?
+        }
+        MediaType::Anime => build_find_media_anime_scope_preview(state, media, blockers).await?,
+    };
+
+    sort_scope_preview(&mut preview);
+    media = preview.media.validated()?;
+    preview.media = media;
+    Ok(preview)
+}
+
+async fn find_media_scope_provider_blockers(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    media_type: MediaType,
+    provider_id: Option<Uuid>,
+) -> AnyResult<Vec<FindMediaScopePreviewBlocker>> {
+    let providers = load_provider_contexts(store).await?;
+    let source_contexts = collect_source_providers(&providers, media_type);
+    let (available, unavailable) = filter_search_providers(state, store, source_contexts).await?;
+    let mut blockers = Vec::new();
+
+    if let Some(provider_id) = provider_id {
+        if available
+            .iter()
+            .any(|provider| provider.detail.provider.provider_id == provider_id)
+        {
+            return Ok(blockers);
+        }
+        if let Some(error) = unavailable
+            .iter()
+            .find(|error| error.provider.detail.provider.provider_id == provider_id)
+        {
+            blockers.push(FindMediaScopePreviewBlocker {
+                code: "source_provider_unavailable".to_string(),
+                message: "The selected acquisition source is not ready.".to_string(),
+                detail: Some(error.message.clone()),
+            });
+            return Ok(blockers);
+        }
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "missing_provider".to_string(),
+            message: "The selected acquisition source is not installed or enabled.".to_string(),
+            detail: Some(provider_id.to_string()),
+        });
+        return Ok(blockers);
+    }
+
+    if available.is_empty() {
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "missing_provider".to_string(),
+            message: "Install or enable an acquisition source before adding scoped media."
+                .to_string(),
+            detail: None,
+        });
+    }
+
+    Ok(blockers)
+}
+
+async fn build_find_media_tv_scope_preview(
+    state: &AppState,
+    mut media: ScopedAddMediaIdentity,
+    target_media_type: MediaType,
+    mut blockers: Vec<FindMediaScopePreviewBlocker>,
+) -> AnyResult<FindMediaScopePreviewResponse> {
+    let mut ids = media.external_ids.clone().unwrap_or_default();
+    let Some(tvdb_series_id) = resolve_scope_preview_tvdb_series_id(state, &ids).await? else {
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "ambiguous_identity".to_string(),
+            message: "Elixir needs a TVDB series id or IMDb id before scoped episode selection."
+                .to_string(),
+            detail: None,
+        });
+        return Ok(scope_preview_response(
+            media,
+            Vec::new(),
+            Vec::new(),
+            blockers,
+        ));
+    };
+
+    if !tvdb_api_key_configured(state) {
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "missing_metadata_credentials".to_string(),
+            message: "TVDB metadata is not configured, so Elixir cannot preview episode scopes."
+                .to_string(),
+            detail: Some("Configure the TVDB API key on the server.".to_string()),
+        });
+        return Ok(scope_preview_response(
+            media,
+            Vec::new(),
+            Vec::new(),
+            blockers,
+        ));
+    }
+
+    ids.tvdb_series = Some(tvdb_series_id.clone());
+    if ids.tvdb.is_none() {
+        ids.tvdb = Some(tvdb_series_id.clone());
+    }
+    media.external_ids = Some(ids);
+
+    let season_values = state
+        .linkers
+        .fetch_tvdb_series_seasons(&tvdb_series_id)
+        .await
+        .with_context(|| format!("fetching TVDB seasons for scope preview {tvdb_series_id}"))?;
+    let mut season_numbers = season_values
+        .iter()
+        .filter_map(extract_preview_season_number)
+        .filter(|season| *season > 0)
+        .collect::<Vec<_>>();
+    season_numbers.sort_unstable();
+    season_numbers.dedup();
+
+    let mut seasons = Vec::new();
+    for season_number in season_numbers {
+        let episodes = state
+            .linkers
+            .fetch_tvdb_season_episodes(&tvdb_series_id, season_number)
+            .await
+            .with_context(|| {
+                format!(
+                    "fetching TVDB season {season_number} episodes for scope preview {tvdb_series_id}"
+                )
+            })?
+            .into_iter()
+            .filter_map(|episode| {
+                let episode_number = episode.episode_number.filter(|value| *value > 0)?;
+                Some(FindMediaScopePreviewEpisode {
+                    target_key: format!("S{season_number:02}E{episode_number:02}"),
+                    season_number: Some(season_number),
+                    episode_number: Some(episode_number),
+                    absolute_episode_number: episode.absolute_number.filter(|value| *value > 0),
+                    title: episode.title,
+                    air_date: extract_preview_air_date(&episode.raw),
+                    thumbnail_url: episode.image,
+                })
+            })
+            .collect::<Vec<_>>();
+        if episodes.is_empty() {
+            continue;
+        }
+        seasons.push(FindMediaScopePreviewSeason {
+            season_number,
+            episode_count: episodes.len(),
+            episodes,
+        });
+    }
+
+    if seasons.is_empty() {
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "metadata_unavailable".to_string(),
+            message: "TVDB did not return selectable episodes for this title.".to_string(),
+            detail: Some(tvdb_series_id),
+        });
+    }
+
+    let mut response = scope_preview_response(media, seasons, Vec::new(), blockers);
+    if target_media_type == MediaType::Movie {
+        response.capabilities.entire_title = true;
+    }
+    Ok(response)
+}
+
+async fn build_find_media_anime_scope_preview(
+    state: &AppState,
+    mut media: ScopedAddMediaIdentity,
+    mut blockers: Vec<FindMediaScopePreviewBlocker>,
+) -> AnyResult<FindMediaScopePreviewResponse> {
+    let ids = media.external_ids.clone().unwrap_or_default();
+    let Some(seed_anilist_id) = ids.anilist.clone() else {
+        if ids.tvdb_series.is_some() || ids.tvdb.is_some() || ids.imdb.is_some() {
+            return build_find_media_tv_scope_preview(state, media, MediaType::Anime, blockers)
+                .await;
+        }
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "ambiguous_identity".to_string(),
+            message: "Elixir needs an AniList id before scoped anime episode selection."
+                .to_string(),
+            detail: None,
+        });
+        return Ok(scope_preview_response(
+            media,
+            Vec::new(),
+            Vec::new(),
+            blockers,
+        ));
+    };
+
+    let seed_mapping = state
+        .linkers
+        .fetch_anizip_mapping(&seed_anilist_id)
+        .await
+        .with_context(|| format!("fetching ani.zip mapping for scope preview {seed_anilist_id}"))?;
+    let seed_season = seed_mapping
+        .as_ref()
+        .and_then(infer_anizip_season_number)
+        .unwrap_or(1);
+    let mut chain = resolve_anilist_season_chain(
+        Some(&state.settings.classifier),
+        seed_season,
+        &seed_anilist_id,
+        1.0,
+    )
+    .await
+    .with_context(|| {
+        format!("resolving AniList season chain for scope preview {seed_anilist_id}")
+    })?;
+
+    if chain.is_empty() {
+        chain.push(AniListSeasonChainEntry {
+            season_number: seed_season,
+            anilist_id: seed_anilist_id.clone(),
+            title: media.title.clone(),
+            format: None,
+            season_year: media.year,
+            start_year: media.year,
+            status: None,
+            episodes: None,
+            next_airing_episode: None,
+            next_airing_at: None,
+            confidence: 1.0,
+        });
+    }
+
+    let mut season_mappings = Vec::new();
+    let mut seen = HashSet::new();
+    for season in chain {
+        if !seen.insert(season.anilist_id.clone()) {
+            continue;
+        }
+        let mapping = if season.anilist_id == seed_anilist_id {
+            seed_mapping.clone()
+        } else {
+            state
+                .linkers
+                .fetch_anizip_mapping(&season.anilist_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "fetching ani.zip mapping for scope preview season {}",
+                        season.anilist_id
+                    )
+                })?
+        };
+        season_mappings.push(AnimeSeasonMapping { season, mapping });
+    }
+
+    let graph = build_anime_metadata_graph(AnimeMetadataGraphInput {
+        title: media.title.clone(),
+        year: media.year,
+        seed_anilist_id,
+        seed_season_number: seed_season,
+        external_ids: ids,
+        seasons: season_mappings,
+    });
+
+    media.external_ids = Some(graph.external_ids.clone());
+    let seasons = anime_scope_preview_seasons_from_graph(&graph);
+
+    if seasons.is_empty() {
+        blockers.push(FindMediaScopePreviewBlocker {
+            code: "metadata_unavailable".to_string(),
+            message: "AniList and ani.zip did not return selectable episodes for this anime."
+                .to_string(),
+            detail: None,
+        });
+    }
+
+    Ok(scope_preview_response(media, seasons, Vec::new(), blockers))
+}
+
+fn anime_scope_preview_seasons_from_graph(
+    graph: &crate::acquisition::release_resolution::anime::AnimeMetadataGraph,
+) -> Vec<FindMediaScopePreviewSeason> {
+    anime_scope_preview_seasons_from_graph_at(graph, Utc::now())
+}
+
+fn anime_scope_preview_seasons_from_graph_at(
+    graph: &crate::acquisition::release_resolution::anime::AnimeMetadataGraph,
+    now: DateTime<Utc>,
+) -> Vec<FindMediaScopePreviewSeason> {
+    graph
+        .seasons
+        .iter()
+        .filter_map(|season| {
+            let episodes = graph
+                .targets
+                .iter()
+                .filter(|target| {
+                    anime_scope_target_is_selectable(target, now)
+                        && (target.season_number == Some(season.season_number)
+                            || (target.season_number.is_none()
+                                && target.anilist_season_id == season.anilist_id))
+                })
+                .map(|target| FindMediaScopePreviewEpisode {
+                    target_key: target.target_key.clone(),
+                    season_number: target.season_number.or(Some(season.season_number)),
+                    episode_number: target.episode_number,
+                    absolute_episode_number: target.absolute_episode_number,
+                    title: Some(target.title.clone()),
+                    air_date: target.air_date.clone(),
+                    thumbnail_url: preview_thumbnail_from_raw(&target.raw),
+                })
+                .collect::<Vec<_>>();
+            (!episodes.is_empty()).then_some(FindMediaScopePreviewSeason {
+                season_number: season.season_number,
+                episode_count: episodes.len(),
+                episodes,
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+fn anime_scope_target_is_selectable(
+    target: &crate::acquisition::release_resolution::anime::AnimeGraphTarget,
+    now: DateTime<Utc>,
+) -> bool {
+    if let Some(air_time) = target.air_time {
+        return air_time <= now;
+    }
+    if let Some(air_date) = target
+        .air_date
+        .as_deref()
+        .and_then(parse_scope_preview_air_date)
+    {
+        return air_date <= now.date_naive();
+    }
+    true
+}
+
+fn parse_scope_preview_air_date(value: &str) -> Option<NaiveDate> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .map(|value| value.with_timezone(&Utc).date_naive())
+        .ok()
+        .or_else(|| NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").ok())
+}
+
+fn scope_preview_response(
+    media: ScopedAddMediaIdentity,
+    seasons: Vec<FindMediaScopePreviewSeason>,
+    arcs: Vec<crate::acquisition::scoped_add::FindMediaScopePreviewArc>,
+    blockers: Vec<FindMediaScopePreviewBlocker>,
+) -> FindMediaScopePreviewResponse {
+    let has_episodes = seasons.iter().any(|season| !season.episodes.is_empty());
+    FindMediaScopePreviewResponse {
+        media,
+        capabilities: FindMediaScopePreviewCapabilities {
+            entire_title: true,
+            seasons: has_episodes,
+            episode_range: has_episodes,
+            selected_episodes: has_episodes,
+            anime_arcs: !arcs.is_empty(),
+        },
+        seasons,
+        arcs,
+        blockers,
+    }
+}
+
+fn sort_scope_preview(response: &mut FindMediaScopePreviewResponse) {
+    response.seasons.sort_by_key(|season| season.season_number);
+    for season in &mut response.seasons {
+        season.episodes.sort_by_key(|episode| {
+            (
+                episode.absolute_episode_number.unwrap_or(i32::MAX),
+                episode.episode_number.unwrap_or(i32::MAX),
+                episode.season_number.unwrap_or(i32::MAX),
+                episode.target_key.clone(),
+            )
+        });
+        season.episode_count = season.episodes.len();
+    }
+    response.arcs.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.arc_id.cmp(&right.arc_id))
+    });
+}
+
+async fn resolve_scope_preview_tvdb_series_id(
+    state: &AppState,
+    ids: &ExternalIds,
+) -> AnyResult<Option<String>> {
+    if let Some(value) = ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    if let Some(imdb) = ids
+        .imdb
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return state.linkers.link_tvdb_series_by_imdb(imdb).await;
+    }
+    Ok(None)
+}
+
+fn tvdb_api_key_configured(state: &AppState) -> bool {
+    state
+        .settings
+        .classifier
+        .tvdb_api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn extract_preview_season_number(value: &Value) -> Option<i32> {
+    for key in ["number", "seasonNumber", "season_number", "season"] {
+        if let Some(number) = json_i32(value.get(key)) {
+            return Some(number);
+        }
+    }
+    None
+}
+
+fn extract_preview_air_date(value: &Value) -> Option<String> {
+    for key in [
+        "airdate",
+        "aired",
+        "firstAired",
+        "first_aired",
+        "airDate",
+        "air_date",
+    ] {
+        if let Some(text) = value.get(key).and_then(Value::as_str).map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn preview_thumbnail_from_raw(value: &Value) -> Option<String> {
+    for key in ["image", "thumbnail", "thumbnailUrl", "thumbnail_url"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str).map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn json_i32(value: Option<&Value>) -> Option<i32> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return i32::try_from(number).ok();
+    }
+    value.as_str()?.trim().parse::<i32>().ok()
 }
 
 async fn persist_managed_ingest_intent(
@@ -2098,7 +3714,7 @@ fn build_source_acquisition_item(
         request_label: source_acquisition_request_label(subscription),
         one_shot: subscription.request_mode.is_one_shot(),
         phase: phase.as_str().to_string(),
-        phase_label: phase.label().to_string(),
+        phase_label: source_parent_phase_label(phase, counts, target_count),
         headline: format_source_acquisition_headline(counts, targets.len()),
         detail: Some(format_source_acquisition_detail(counts, targets.len())),
         target_count,
@@ -2125,6 +3741,9 @@ fn source_acquisition_request_label(subscription: &AcquisitionSubscription) -> S
     if subscription.request_mode != AcquisitionRequestMode::OneShot {
         return "Monitored acquisition".to_string();
     }
+    if let Some(label) = find_media_scoped_request_label(subscription) {
+        return label;
+    }
     match subscription.request_scope {
         AcquisitionRequestScope::Movie => "One-time movie request",
         AcquisitionRequestScope::Episode => "One-time episode request",
@@ -2132,9 +3751,143 @@ fn source_acquisition_request_label(subscription: &AcquisitionSubscription) -> S
         AcquisitionRequestScope::Range => "One-time range request",
         AcquisitionRequestScope::Missing => "One-time missing request",
         AcquisitionRequestScope::SelectedTargets => "One-time selected targets request",
+        AcquisitionRequestScope::AnimeArc => "One-time anime arc request",
         AcquisitionRequestScope::Subscription => "One-time request",
     }
     .to_string()
+}
+
+fn find_media_scoped_request_label(subscription: &AcquisitionSubscription) -> Option<String> {
+    let document = find_media_scoped_scope_document(subscription)?;
+    let selection = &document.selection;
+    Some(match selection.selection_type {
+        ScopedAddSelectionType::Movie => "Movie requested".to_string(),
+        ScopedAddSelectionType::EntireTitle => match document.media.kind {
+            MediaType::Movie => "Movie requested".to_string(),
+            MediaType::Series | MediaType::Anime => "Entire title requested".to_string(),
+        },
+        ScopedAddSelectionType::Episode => {
+            if let Some(key) = selection.target_keys.first() {
+                format!("{} requested", source_target_key_display(key))
+            } else if let (Some(season), Some(episode)) =
+                (selection.season_number, selection.episode_number)
+            {
+                format!("S{season:02}E{episode:02} requested")
+            } else if let Some(absolute) = selection.absolute_episode_number {
+                format!("Episode {absolute} requested")
+            } else {
+                "Episode requested".to_string()
+            }
+        }
+        ScopedAddSelectionType::Season => selection
+            .season_number
+            .map(|season| format!("Season {season} requested"))
+            .unwrap_or_else(|| "Season requested".to_string()),
+        ScopedAddSelectionType::Range => {
+            source_range_request_label(selection).unwrap_or_else(|| {
+                source_episode_count_request_label(selection_target_count(
+                    subscription.scope.as_ref(),
+                    selection,
+                ))
+            })
+        }
+        ScopedAddSelectionType::SelectedTargets => source_selected_targets_request_label(
+            selection_target_count(subscription.scope.as_ref(), selection),
+        ),
+        ScopedAddSelectionType::AnimeArc => selection
+            .arc_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(|label| format!("Arc: {label} requested"))
+            .unwrap_or_else(|| {
+                source_episode_count_request_label(selection_target_count(
+                    subscription.scope.as_ref(),
+                    selection,
+                ))
+            }),
+    })
+}
+
+fn find_media_scoped_scope_document(
+    subscription: &AcquisitionSubscription,
+) -> Option<ScopedAddScopeDocument> {
+    if subscription.request_mode != AcquisitionRequestMode::OneShot {
+        return None;
+    }
+    let document: ScopedAddScopeDocument =
+        serde_json::from_value(subscription.scope.as_ref()?.clone()).ok()?;
+    let document = document.validated().ok()?;
+    (document.origin == AcquisitionRequestOrigin::FindMedia).then_some(document)
+}
+
+fn selection_target_count(scope: Option<&Value>, selection: &ScopedAddSelection) -> usize {
+    json_usize_at(scope, &["selectedTargetCount"])
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| selection.target_keys.len())
+}
+
+fn source_range_request_label(selection: &ScopedAddSelection) -> Option<String> {
+    if let Some(season) = selection.season_number {
+        let start = selection.episode_start.or(selection.episode_number)?;
+        let end = selection.episode_end.unwrap_or(start);
+        return Some(if start == end {
+            format!("S{season:02}E{start:02} requested")
+        } else {
+            format!("S{season:02}E{start:02}-S{season:02}E{end:02} requested")
+        });
+    }
+
+    let start = selection
+        .absolute_episode_start
+        .or(selection.absolute_episode_number)?;
+    let end = selection.absolute_episode_end.unwrap_or(start);
+    Some(if start == end {
+        format!("Episode {start} requested")
+    } else {
+        format!("Episodes {start}-{end} requested")
+    })
+}
+
+fn source_selected_targets_request_label(count: usize) -> String {
+    match count {
+        0 => "Selected episodes requested".to_string(),
+        1 => "1 selected episode requested".to_string(),
+        _ => format!("{count} selected episodes requested"),
+    }
+}
+
+fn source_episode_count_request_label(count: usize) -> String {
+    match count {
+        0 => "Episodes requested".to_string(),
+        1 => "1 episode requested".to_string(),
+        _ => format!("{count} episodes requested"),
+    }
+}
+
+fn source_target_key_display(key: &str) -> String {
+    let normalized = key.trim().to_ascii_uppercase();
+    if normalized == "MOVIE" {
+        return "Movie".to_string();
+    }
+    if let Some((season, episode)) = parse_source_season_episode_key(&normalized) {
+        return format!("S{season:02}E{episode:02}");
+    }
+    if let Some(absolute) = normalized
+        .strip_prefix('A')
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        return format!("Episode {absolute}");
+    }
+    normalized
+}
+
+fn parse_source_season_episode_key(value: &str) -> Option<(i32, i32)> {
+    let rest = value.strip_prefix('S')?;
+    let (season, episode) = rest.split_once('E')?;
+    let season = season.parse::<i32>().ok()?;
+    let episode = episode.parse::<i32>().ok()?;
+    Some((season, episode))
 }
 
 fn source_acquisition_media_item_id(
@@ -2171,6 +3924,16 @@ fn json_string_at(value: Option<&Value>, path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value: &&str| !value.is_empty())
         .map(str::to_string)
+}
+
+fn json_usize_at(value: Option<&Value>, path: &[&str]) -> Option<usize> {
+    let mut current = value?;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn build_empty_source_acquisition_item(
@@ -3921,6 +5684,21 @@ fn source_child_progress_contribution(child: &FindMediaAcquisitionChildItem) -> 
     }
 }
 
+fn source_parent_phase_label(
+    phase: AcquisitionPhase,
+    counts: SourceAcquisitionCounts,
+    total_targets: usize,
+) -> String {
+    if phase == AcquisitionPhase::Completed
+        && total_targets > 0
+        && counts.completed == 0
+        && counts.no_results >= total_targets
+    {
+        return "Completed".to_string();
+    }
+    phase.label().to_string()
+}
+
 fn format_source_acquisition_headline(
     counts: SourceAcquisitionCounts,
     total_targets: usize,
@@ -3978,12 +5756,8 @@ fn format_source_acquisition_headline(
         parts.push(format!("{} staged", format_transfer_count(counts.staged)));
     }
     if parts.is_empty() && counts.completed + counts.no_results >= total_targets {
-        if counts.no_results > 0 && counts.completed > 0 {
-            format!(
-                "{} imported, {} no results.",
-                format_source_target_count(counts.completed),
-                format_source_target_count(counts.no_results)
-            )
+        if total_targets > 0 && counts.no_results > 0 {
+            format_terminal_source_summary(counts.completed, counts.no_results, total_targets)
         } else if counts.no_results > 0 {
             "No safe results found.".to_string()
         } else {
@@ -3996,12 +5770,19 @@ fn format_source_acquisition_headline(
     }
 }
 
-fn format_source_target_count(count: usize) -> String {
-    if count == 1 {
-        "1 target".to_string()
-    } else {
-        format!("{count} targets")
-    }
+fn format_terminal_source_summary(
+    imported: usize,
+    no_results: usize,
+    total_targets: usize,
+) -> String {
+    format!(
+        "{imported} imported, {no_results} no results out of {total_targets} {}.",
+        if total_targets == 1 {
+            "target"
+        } else {
+            "targets"
+        }
+    )
 }
 
 fn format_source_acquisition_detail(
@@ -8752,6 +10533,144 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn anime_scope_preview_includes_absolute_only_mainline_targets() {
+        let season_ref = crate::acquisition::release_resolution::anime::AnimeGraphSeasonRef {
+            season_number: 1,
+            anilist_id: "21".to_string(),
+            title: "Long Running Anime".to_string(),
+            format: Some("TV".to_string()),
+            season_year: Some(1999),
+            start_year: Some(1999),
+            status: Some("RELEASING".to_string()),
+            episodes: None,
+            next_airing_episode: None,
+            next_airing_at: None,
+            confidence: 1.0,
+        };
+        let graph = crate::acquisition::release_resolution::anime::AnimeMetadataGraph {
+            resolver_version: "test".to_string(),
+            seed_anilist_id: "21".to_string(),
+            root_anilist_id: "21".to_string(),
+            title: "Long Running Anime".to_string(),
+            year: Some(1999),
+            external_ids: ExternalIds {
+                anilist: Some("21".to_string()),
+                ..ExternalIds::default()
+            },
+            seasons: vec![crate::acquisition::release_resolution::anime::AnimeGraphSeason {
+                season_number: 1,
+                anilist_id: "21".to_string(),
+                title: "Long Running Anime".to_string(),
+                format: Some("TV".to_string()),
+                season_year: Some(1999),
+                start_year: Some(1999),
+                status: Some("RELEASING".to_string()),
+                episodes: None,
+                next_airing_episode: None,
+                next_airing_at: None,
+                confidence: 1.0,
+                mapping_available: true,
+                mapped_episode_count: 3,
+                target_count: 3,
+            }],
+            targets: vec![
+                crate::acquisition::release_resolution::anime::AnimeGraphTarget {
+                    source: crate::acquisition::release_resolution::anime::AnimeGraphTargetSource::AniZip,
+                    target_key: "S01E01".to_string(),
+                    canonical_key: "tvdb:81797:S01E01".to_string(),
+                    title: "Episode 1".to_string(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    air_date: None,
+                    air_time: None,
+                    anilist_season_id: "21".to_string(),
+                    anilist_status: Some("RELEASING".to_string()),
+                    tvdb_series_id: Some("81797".to_string()),
+                    tvdb_episode_id: Some("1001".to_string()),
+                    anidb_anime_id: None,
+                    anidb_episode_id: None,
+                    season: season_ref.clone(),
+                    raw: json!({ "episode": "1" }),
+                },
+                crate::acquisition::release_resolution::anime::AnimeGraphTarget {
+                    source: crate::acquisition::release_resolution::anime::AnimeGraphTargetSource::AniZip,
+                    target_key: "A0023".to_string(),
+                    canonical_key: "anilist:21:A0023".to_string(),
+                    title: "Episode 23".to_string(),
+                    season_number: None,
+                    episode_number: None,
+                    absolute_episode_number: Some(23),
+                    air_date: Some("2026-05-24".to_string()),
+                    air_time: None,
+                    anilist_season_id: "21".to_string(),
+                    anilist_status: Some("RELEASING".to_string()),
+                    tvdb_series_id: Some("81797".to_string()),
+                    tvdb_episode_id: None,
+                    anidb_anime_id: None,
+                    anidb_episode_id: None,
+                    season: season_ref.clone(),
+                    raw: json!({ "episode": "23" }),
+                },
+                crate::acquisition::release_resolution::anime::AnimeGraphTarget {
+                    source: crate::acquisition::release_resolution::anime::AnimeGraphTargetSource::AniZip,
+                    target_key: "A0024".to_string(),
+                    canonical_key: "anilist:21:A0024".to_string(),
+                    title: "Episode 24".to_string(),
+                    season_number: None,
+                    episode_number: None,
+                    absolute_episode_number: Some(24),
+                    air_date: Some("2026-05-31".to_string()),
+                    air_time: None,
+                    anilist_season_id: "21".to_string(),
+                    anilist_status: Some("RELEASING".to_string()),
+                    tvdb_series_id: Some("81797".to_string()),
+                    tvdb_episode_id: None,
+                    anidb_anime_id: None,
+                    anidb_episode_id: None,
+                    season: season_ref,
+                    raw: json!({ "episode": "24" }),
+                },
+            ],
+            aliases: vec![],
+            fingerprint: "test".to_string(),
+        };
+
+        let mut response = scope_preview_response(
+            ScopedAddMediaIdentity {
+                kind: MediaType::Anime,
+                title: "Long Running Anime".to_string(),
+                year: Some(1999),
+                external_ids: None,
+            },
+            anime_scope_preview_seasons_from_graph_at(
+                &graph,
+                DateTime::parse_from_rfc3339("2026-05-30T12:00:00Z")
+                    .expect("valid test now")
+                    .with_timezone(&Utc),
+            ),
+            Vec::new(),
+            Vec::new(),
+        );
+        sort_scope_preview(&mut response);
+
+        assert_eq!(response.seasons.len(), 1);
+        assert_eq!(response.seasons[0].episode_count, 2);
+        let target_keys = response.seasons[0]
+            .episodes
+            .iter()
+            .map(|episode| episode.target_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(target_keys, vec!["S01E01", "A0023"]);
+        assert!(!target_keys.contains(&"A0024"));
+        assert_eq!(response.seasons[0].episodes[1].season_number, Some(1));
+        assert_eq!(
+            response.seasons[0].episodes[1].absolute_episode_number,
+            Some(23)
+        );
+    }
+
+    #[test]
     fn source_import_pack_requires_file_selection_without_episode_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("Example Episode 01.mkv"), b"one").expect("write e1");
@@ -9767,6 +11686,145 @@ mod tests {
         assert_eq!(item.request_scope, "season");
         assert_eq!(item.request_label, "One-time season request");
         assert!(item.one_shot);
+    }
+
+    #[test]
+    fn fmsa5_find_media_scoped_request_label_is_user_facing() {
+        let scope = test_find_media_scope(
+            MediaType::Series,
+            ScopedAddSelection {
+                selection_type: ScopedAddSelectionType::Season,
+                season_number: Some(2),
+                target_keys: vec!["S02E01".to_string(), "S02E02".to_string()],
+                ..empty_scoped_selection(ScopedAddSelectionType::Season)
+            },
+            2,
+        );
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Season,
+            scope: Some(scope),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Pending,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Series,
+                Some(2),
+                Some(1),
+                None,
+            )
+        };
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.request_mode, "one_shot");
+        assert_eq!(item.request_scope, "season");
+        assert_eq!(item.request_label, "Season 2 requested");
+        assert!(item.one_shot);
+    }
+
+    #[test]
+    fn fmsa5_terminal_no_result_scoped_request_is_completed_not_downloaded() {
+        let scope = test_find_media_scope(
+            MediaType::Series,
+            ScopedAddSelection {
+                selection_type: ScopedAddSelectionType::Season,
+                season_number: Some(2),
+                target_keys: vec!["S02E01".to_string(), "S02E02".to_string()],
+                ..empty_scoped_selection(ScopedAddSelectionType::Season)
+            },
+            2,
+        );
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Season,
+            scope: Some(scope),
+            ..test_source_subscription(MediaType::Series)
+        };
+        let mut first = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(2),
+            Some(1),
+            None,
+        );
+        first.state = AcquisitionTargetState::Excluded;
+        first.state_reason = Some("No safe candidate found.".to_string());
+        let mut second = test_source_target(
+            subscription.subscription_id,
+            MediaType::Series,
+            Some(2),
+            Some(2),
+            None,
+        );
+        second.state = AcquisitionTargetState::Excluded;
+        second.state_reason = Some("No safe candidate found.".to_string());
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[first, second],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.phase, AcquisitionPhase::Completed.as_str());
+        assert_eq!(item.phase_label, "Completed");
+        assert_eq!(item.request_label, "Season 2 requested");
+        assert_eq!(item.headline, "0 imported, 2 no results out of 2 targets.");
+    }
+
+    fn test_find_media_scope(
+        media_type: MediaType,
+        selection: ScopedAddSelection,
+        selected_target_count: usize,
+    ) -> Value {
+        let document = ScopedAddScopeDocument::find_media(
+            None,
+            None,
+            ScopedAddMediaIdentity {
+                kind: media_type,
+                title: "Example Series".to_string(),
+                year: Some(2026),
+                external_ids: None,
+            },
+            selection,
+        )
+        .expect("scope document");
+        let mut value = serde_json::to_value(document).expect("scope json");
+        value.as_object_mut().expect("scope object").insert(
+            "selectedTargetCount".to_string(),
+            json!(selected_target_count),
+        );
+        value
+    }
+
+    fn empty_scoped_selection(selection_type: ScopedAddSelectionType) -> ScopedAddSelection {
+        ScopedAddSelection {
+            selection_type,
+            season_number: None,
+            episode_number: None,
+            episode_start: None,
+            episode_end: None,
+            absolute_episode_number: None,
+            absolute_episode_start: None,
+            absolute_episode_end: None,
+            target_keys: Vec::new(),
+            arc_id: None,
+            arc_label: None,
+        }
     }
 
     fn test_source_subscription(media_type: MediaType) -> AcquisitionSubscription {

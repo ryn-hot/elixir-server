@@ -4069,7 +4069,7 @@ fn validate_one_shot_snapshot_scope(subscription: &AcquisitionSubscription) -> R
             }
         }
         AcquisitionRequestScope::Missing => Ok(()),
-        AcquisitionRequestScope::SelectedTargets => {
+        AcquisitionRequestScope::SelectedTargets | AcquisitionRequestScope::AnimeArc => {
             if !scope_target_keys(scope).is_empty() {
                 Ok(())
             } else {
@@ -4093,7 +4093,7 @@ fn one_shot_scope_allows_target(
     match subscription.request_scope {
         AcquisitionRequestScope::Subscription | AcquisitionRequestScope::Movie => true,
         AcquisitionRequestScope::Missing => true,
-        AcquisitionRequestScope::SelectedTargets => false,
+        AcquisitionRequestScope::SelectedTargets | AcquisitionRequestScope::AnimeArc => false,
         AcquisitionRequestScope::Season => scope_i32(scope, &["seasonNumber", "season_number"])
             .map(|season| target.season_number == Some(season))
             .unwrap_or(false),

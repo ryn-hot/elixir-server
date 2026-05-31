@@ -632,8 +632,7 @@ fn merge_local_episode_scaffold(
             entry.insert(candidate);
         }
         std::collections::hash_map::Entry::Occupied(mut entry) => {
-            if local_episode_scaffold_score(&candidate)
-                > local_episode_scaffold_score(entry.get())
+            if local_episode_scaffold_score(&candidate) > local_episode_scaffold_score(entry.get())
             {
                 entry.insert(candidate);
             }
@@ -647,14 +646,11 @@ fn local_episode_scaffold_score(scaffold: &AcquisitionLibraryTargetScaffold) -> 
         score += 4;
     }
     if !scaffold.title.trim().is_empty()
-        && !scaffold
-            .title
-            .trim()
-            .eq_ignore_ascii_case(&format!(
-                "S{:02}E{:02}",
-                scaffold.season_number.unwrap_or_default(),
-                scaffold.episode_number.unwrap_or_default()
-            ))
+        && !scaffold.title.trim().eq_ignore_ascii_case(&format!(
+            "S{:02}E{:02}",
+            scaffold.season_number.unwrap_or_default(),
+            scaffold.episode_number.unwrap_or_default()
+        ))
     {
         score += 2;
     }

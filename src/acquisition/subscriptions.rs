@@ -236,6 +236,7 @@ pub enum AcquisitionRequestScope {
     Range,
     Missing,
     SelectedTargets,
+    AnimeArc,
 }
 
 impl Default for AcquisitionRequestScope {
@@ -254,6 +255,7 @@ impl AcquisitionRequestScope {
             Self::Range => "range",
             Self::Missing => "missing",
             Self::SelectedTargets => "selected_targets",
+            Self::AnimeArc => "anime_arc",
         }
     }
 }
@@ -270,6 +272,7 @@ impl FromStr for AcquisitionRequestScope {
             "range" | "episode_range" => Ok(Self::Range),
             "missing" | "all_missing" => Ok(Self::Missing),
             "selected_targets" | "selected" | "targets" => Ok(Self::SelectedTargets),
+            "anime_arc" | "anime-arc" | "arc" => Ok(Self::AnimeArc),
             other => bail!("unknown acquisition request scope '{other}'"),
         }
     }
@@ -384,6 +387,12 @@ pub struct NewAcquisitionSubscription {
     #[serde(default)]
     pub candidate_search_after: Option<DateTime<Utc>>,
 }
+
+// Request mode/scope describes acquisition lifecycle, not just target shape.
+// A Find Media scoped initial add is represented as a one-shot request with
+// explicit scope evidence in scope_json. It is intentionally distinct from
+// library-detail missing refetch, even though both reuse the same downstream
+// target/search/resolver/route/import pipeline.
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2537,6 +2546,7 @@ fn intent_request_scope(
         Some("range") => AcquisitionRequestScope::Range,
         Some("missing") | Some("backlog") => AcquisitionRequestScope::Missing,
         Some("selected_targets") | Some("selected") => AcquisitionRequestScope::SelectedTargets,
+        Some("anime_arc") | Some("anime-arc") | Some("arc") => AcquisitionRequestScope::AnimeArc,
         _ if target.episode_start.is_some()
             || target.episode_end.is_some()
             || target.absolute_episode_start.is_some()
@@ -2663,7 +2673,13 @@ fn is_explicit_scope_without_targets(scope: &AcquisitionIntentTarget) -> bool {
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "episode" | "selected" | "selected_targets" | "absolute_episode"
+                "episode"
+                    | "selected"
+                    | "selected_targets"
+                    | "absolute_episode"
+                    | "anime_arc"
+                    | "anime-arc"
+                    | "arc"
             )
         })
         .unwrap_or(false)

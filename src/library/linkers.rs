@@ -283,10 +283,19 @@ impl LinkerService {
         for (_key, raw) in payload.episodes.unwrap_or_default() {
             let parsed: AniZipEpisode = serde_json::from_value(raw.clone()).unwrap_or_default();
             let title = select_title(parsed.title.as_ref());
+            let episode_label = parsed
+                .episode
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let mainline_episode_number = parse_mainline_episode_label(episode_label.as_deref());
             episodes.push(AniZipEpisodeRecord {
                 season_number: parsed.season_number,
                 episode_number: parsed.episode_number,
-                absolute_episode_number: parsed.absolute_episode_number,
+                absolute_episode_number: parsed.absolute_episode_number.or(mainline_episode_number),
+                episode_label,
+                mainline_episode_number,
                 title,
                 overview: parsed.overview.clone(),
                 runtime_minutes: parsed.runtime.or(parsed.length),
@@ -487,6 +496,8 @@ pub struct AniZipEpisodeRecord {
     pub season_number: Option<i32>,
     pub episode_number: Option<i32>,
     pub absolute_episode_number: Option<i32>,
+    pub episode_label: Option<String>,
+    pub mainline_episode_number: Option<i32>,
     pub title: Option<String>,
     pub overview: Option<String>,
     pub runtime_minutes: Option<i32>,
@@ -563,6 +574,8 @@ struct TvdbEpisodeBaseRecord {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AniZipEpisode {
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
+    episode: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_i32")]
     season_number: Option<i32>,
     #[serde(default, deserialize_with = "deserialize_opt_i32")]
@@ -685,6 +698,14 @@ where
     })
 }
 
+fn parse_mainline_episode_label(value: Option<&str>) -> Option<i32> {
+    let value = value?.trim();
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<i32>().ok().filter(|episode| *episode > 0)
+}
+
 fn select_title(title_map: Option<&HashMap<String, String>>) -> Option<String> {
     let map = title_map?;
     if let Some(en) = map.get("en") {
@@ -702,10 +723,11 @@ mod tests {
 
     use axum::{
         Json, Router,
-        extract::Path as AxumPath,
+        extract::{Path as AxumPath, Query},
         routing::{get, post},
     };
     use serde_json::json;
+    use std::collections::HashMap as StdHashMap;
     use tokio::{net::TcpListener, sync::oneshot};
 
     async fn start_mock_tvdb_series_server() -> Result<(String, oneshot::Sender<()>)> {
@@ -746,6 +768,62 @@ mod tests {
         Ok((base_url, shutdown_tx))
     }
 
+    async fn start_mock_anizip_server() -> Result<(String, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let app = Router::new().route(
+            "/mappings",
+            get(
+                |Query(query): Query<StdHashMap<String, String>>| async move {
+                    assert_eq!(query.get("anilist_id").map(String::as_str), Some("21"));
+                    Json(json!({
+                        "mappings": {
+                            "anilist_id": "21",
+                            "thetvdb_id": "81797",
+                            "anidb_id": "69"
+                        },
+                        "episodes": {
+                            "1": {
+                                "episode": "1",
+                                "seasonNumber": 1,
+                                "episodeNumber": 1,
+                                "absoluteEpisodeNumber": 1,
+                                "title": { "en": "I'm Luffy!" }
+                            },
+                            "9": {
+                                "episode": "9",
+                                "airdate": "2000-01-12",
+                                "title": { "en": "Captain Usopp!" }
+                            },
+                            "23": {
+                                "episode": "23",
+                                "airdate": "2000-05-03",
+                                "title": { "en": "Protect Baratie!" }
+                            },
+                            "S4": {
+                                "episode": "S4",
+                                "title": { "en": "Special: Adventure in the Ocean's Navel" }
+                            }
+                        }
+                    }))
+                },
+            ),
+        );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok((base_url, shutdown_tx))
+    }
+
     #[tokio::test]
     async fn fetch_tvdb_series_seasons_uses_extended_endpoint() -> Result<()> {
         let (base_url, shutdown_tx) = start_mock_tvdb_series_server().await?;
@@ -762,6 +840,51 @@ mod tests {
             seasons[1].get("number").and_then(serde_json::Value::as_i64),
             Some(1)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_anizip_mapping_keeps_numeric_mainline_episode_labels() -> Result<()> {
+        let (base_url, shutdown_tx) = start_mock_anizip_server().await?;
+        let config = ClassifierConfig {
+            anizip_base_url: base_url,
+            ..ClassifierConfig::default()
+        };
+        let service = LinkerService::new(config)?;
+
+        let mapping = service
+            .fetch_anizip_mapping("21")
+            .await?
+            .context("ani.zip mapping")?;
+
+        let _ = shutdown_tx.send(());
+        let episode_23 = mapping
+            .episodes
+            .iter()
+            .find(|episode| episode.episode_label.as_deref() == Some("23"))
+            .context("numeric episode label")?;
+        assert_eq!(episode_23.mainline_episode_number, Some(23));
+        assert_eq!(episode_23.absolute_episode_number, Some(23));
+        assert_eq!(episode_23.season_number, None);
+        assert_eq!(episode_23.episode_number, None);
+
+        let episode_9 = mapping
+            .episodes
+            .iter()
+            .find(|episode| episode.episode_label.as_deref() == Some("9"))
+            .context("single digit numeric episode label")?;
+        assert_eq!(episode_9.mainline_episode_number, Some(9));
+        assert_eq!(episode_9.absolute_episode_number, Some(9));
+        assert_eq!(episode_9.season_number, None);
+        assert_eq!(episode_9.episode_number, None);
+
+        let special = mapping
+            .episodes
+            .iter()
+            .find(|episode| episode.episode_label.as_deref() == Some("S4"))
+            .context("prefixed special label")?;
+        assert_eq!(special.mainline_episode_number, None);
+        assert_eq!(special.absolute_episode_number, None);
         Ok(())
     }
 }

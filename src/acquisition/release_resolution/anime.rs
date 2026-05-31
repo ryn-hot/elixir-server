@@ -735,6 +735,7 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
             for title in mapping.titles.values() {
                 insert_alias(&mut aliases, title);
             }
+            let prefer_mainline_numbering = anizip_prefers_mainline_numbering(mapping);
             for episode in &mapping.episodes {
                 let Some(target) = graph_target_from_anizip(
                     &input,
@@ -742,6 +743,7 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
                     &season_input.season,
                     mapping,
                     episode,
+                    prefer_mainline_numbering,
                 ) else {
                     continue;
                 };
@@ -755,9 +757,11 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
         if let Some(target) =
             graph_target_from_next_airing(&input, &external_ids, &season_input.season)
         {
-            targets_by_key
-                .entry(target.target_key.clone())
-                .or_insert(target);
+            if !target_absolute_episode_already_mapped(&targets_by_key, &target) {
+                targets_by_key
+                    .entry(target.target_key.clone())
+                    .or_insert(target);
+            }
         }
     }
 
@@ -1172,18 +1176,38 @@ pub fn merge_external_ids(target: &mut ExternalIds, source: &ExternalIds) {
 
 pub fn infer_anizip_season_number(mapping: &AniZipMapping) -> Option<i32> {
     let mut counts: HashMap<i32, usize> = HashMap::new();
-    for season in mapping
-        .episodes
-        .iter()
-        .filter_map(|episode| episode.season_number)
-        .filter(|season| *season > 0)
-    {
-        *counts.entry(season).or_default() += 1;
+    let mut structured_count = 0_usize;
+    let mut absolute_only_count = 0_usize;
+    for episode in &mapping.episodes {
+        if episode.season_number.is_some() || episode.episode_number.is_some() {
+            structured_count += 1;
+            if let Some(season) = episode.season_number.filter(|season| *season > 0) {
+                *counts.entry(season).or_default() += 1;
+            }
+        } else if episode.mainline_episode_number.is_some() {
+            absolute_only_count += 1;
+        }
+    }
+    if absolute_only_count > structured_count {
+        return Some(1);
     }
     counts
         .into_iter()
         .max_by_key(|(_, count)| *count)
         .map(|(season, _)| season)
+}
+
+fn anizip_prefers_mainline_numbering(mapping: &AniZipMapping) -> bool {
+    let mut structured_count = 0_usize;
+    let mut absolute_only_count = 0_usize;
+    for episode in &mapping.episodes {
+        if episode.season_number.is_some() || episode.episode_number.is_some() {
+            structured_count += 1;
+        } else if episode.mainline_episode_number.is_some() {
+            absolute_only_count += 1;
+        }
+    }
+    absolute_only_count > structured_count
 }
 
 fn normalized_season_inputs(input: &AnimeMetadataGraphInput) -> Vec<AnimeSeasonMapping> {
@@ -1226,12 +1250,33 @@ fn graph_target_from_anizip(
     season: &AniListSeasonChainEntry,
     mapping: &AniZipMapping,
     episode: &crate::library::AniZipEpisodeRecord,
+    prefer_mainline_numbering: bool,
 ) -> Option<AnimeGraphTarget> {
-    let season_number = episode.season_number.or(Some(season.season_number));
-    let episode_number = episode.episode_number.filter(|episode| *episode > 0);
-    let absolute_episode_number = episode
-        .absolute_episode_number
+    let mainline_episode_number = episode
+        .mainline_episode_number
         .filter(|episode| *episode > 0);
+    let use_mainline_numbering = prefer_mainline_numbering && mainline_episode_number.is_some();
+    let has_structured_tv_numbering =
+        episode.season_number.is_some() || episode.episode_number.is_some();
+    let season_number = if use_mainline_numbering {
+        None
+    } else if has_structured_tv_numbering {
+        episode.season_number.or(Some(season.season_number))
+    } else {
+        None
+    };
+    let episode_number = if use_mainline_numbering {
+        None
+    } else {
+        episode.episode_number.filter(|episode| *episode > 0)
+    };
+    let absolute_episode_number = if use_mainline_numbering {
+        mainline_episode_number
+    } else {
+        episode
+            .absolute_episode_number
+            .filter(|episode| *episode > 0)
+    };
     let target_key = graph_target_key(season_number, episode_number, absolute_episode_number)?;
     let air_date = extract_air_date(&episode.raw);
     let air_time = air_date
@@ -1350,6 +1395,27 @@ fn insert_best_target(
             targets_by_key.insert(target.target_key.clone(), target);
         }
     }
+}
+
+fn target_absolute_episode_already_mapped(
+    targets_by_key: &BTreeMap<String, AnimeGraphTarget>,
+    candidate: &AnimeGraphTarget,
+) -> bool {
+    let Some(absolute_episode_number) = candidate
+        .absolute_episode_number
+        .or(candidate.episode_number)
+        .filter(|episode| *episode > 0)
+    else {
+        return false;
+    };
+
+    targets_by_key.values().any(|target| {
+        target.anilist_season_id == candidate.anilist_season_id
+            && target
+                .absolute_episode_number
+                .or(target.episode_number)
+                .is_some_and(|episode| episode == absolute_episode_number)
+    })
 }
 
 fn target_evidence_score(target: &AnimeGraphTarget) -> i32 {
@@ -1979,6 +2045,7 @@ fn next_search_after_for_air_time(
 
 fn extract_air_date(raw: &JsonValue) -> Option<String> {
     for key in [
+        "airdate",
         "airDate",
         "air_date",
         "firstAired",
@@ -3054,6 +3121,8 @@ mod tests {
                         season_number: episode.season_number,
                         episode_number: episode.episode_number,
                         absolute_episode_number: episode.absolute_episode_number,
+                        episode_label: None,
+                        mainline_episode_number: None,
                         title: episode.title.clone(),
                         overview: None,
                         runtime_minutes: None,
@@ -3585,6 +3654,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rr3_metadata_graph_keeps_numeric_anizip_mainline_episode_rows() {
+        let graph = build_anime_metadata_graph(AnimeMetadataGraphInput {
+            title: "Long Running Anime".to_string(),
+            year: Some(1999),
+            seed_anilist_id: "21".to_string(),
+            seed_season_number: 1,
+            external_ids: ExternalIds {
+                anilist: Some("21".to_string()),
+                ..ExternalIds::default()
+            },
+            seasons: vec![AnimeSeasonMapping {
+                season: AniListSeasonChainEntry {
+                    season_number: 1,
+                    anilist_id: "21".to_string(),
+                    title: "Long Running Anime".to_string(),
+                    format: Some("TV".to_string()),
+                    season_year: Some(1999),
+                    start_year: Some(1999),
+                    status: Some("RELEASING".to_string()),
+                    episodes: None,
+                    next_airing_episode: Some(23),
+                    next_airing_at: None,
+                    confidence: 1.0,
+                },
+                mapping: Some(AniZipMapping {
+                    ids: ExternalIds {
+                        anilist: Some("21".to_string()),
+                        tvdb_series: Some("81797".to_string()),
+                        ..ExternalIds::default()
+                    },
+                    episodes: vec![
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: Some(1),
+                            episode_number: Some(1),
+                            absolute_episode_number: Some(1),
+                            episode_label: Some("1".to_string()),
+                            mainline_episode_number: Some(1),
+                            title: Some("I'm Luffy!".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: Some("1001".to_string()),
+                            anidb_eid: None,
+                            raw: serde_json::json!({ "episode": "1" }),
+                        },
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: Some(2),
+                            episode_number: Some(9),
+                            absolute_episode_number: Some(17),
+                            episode_label: Some("9".to_string()),
+                            mainline_episode_number: Some(9),
+                            title: Some("Captain Usopp!".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: None,
+                            anidb_eid: None,
+                            raw: serde_json::json!({
+                                "episode": "9",
+                                "airdate": "2000-01-12"
+                            }),
+                        },
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: None,
+                            episode_number: None,
+                            absolute_episode_number: Some(23),
+                            episode_label: Some("23".to_string()),
+                            mainline_episode_number: Some(23),
+                            title: Some("Protect Baratie!".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: None,
+                            anidb_eid: None,
+                            raw: serde_json::json!({
+                                "episode": "23",
+                                "airdate": "2000-05-03"
+                            }),
+                        },
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: None,
+                            episode_number: None,
+                            absolute_episode_number: Some(24),
+                            episode_label: Some("24".to_string()),
+                            mainline_episode_number: Some(24),
+                            title: Some("Episode 24".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: None,
+                            anidb_eid: None,
+                            raw: serde_json::json!({
+                                "episode": "24",
+                                "airdate": "2000-05-10"
+                            }),
+                        },
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: None,
+                            episode_number: None,
+                            absolute_episode_number: Some(25),
+                            episode_label: Some("25".to_string()),
+                            mainline_episode_number: Some(25),
+                            title: Some("Episode 25".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: None,
+                            anidb_eid: None,
+                            raw: serde_json::json!({
+                                "episode": "25",
+                                "airdate": "2000-05-17"
+                            }),
+                        },
+                        crate::library::AniZipEpisodeRecord {
+                            season_number: None,
+                            episode_number: None,
+                            absolute_episode_number: None,
+                            episode_label: Some("S4".to_string()),
+                            mainline_episode_number: None,
+                            title: Some("Special".to_string()),
+                            overview: None,
+                            runtime_minutes: None,
+                            image: None,
+                            tvdb_id: None,
+                            anidb_eid: None,
+                            raw: serde_json::json!({ "episode": "S4" }),
+                        },
+                    ],
+                    images: Vec::new(),
+                    titles: HashMap::new(),
+                }),
+            }],
+        });
+
+        let target_keys = graph
+            .targets
+            .iter()
+            .map(|target| target.target_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_keys,
+            vec!["A0001", "A0009", "A0023", "A0024", "A0025"]
+        );
+
+        let single_digit = graph
+            .targets
+            .iter()
+            .find(|target| target.target_key == "A0009")
+            .expect("single digit numeric ani.zip episode target");
+        assert_eq!(single_digit.absolute_episode_number, Some(9));
+        assert_eq!(single_digit.season_number, None);
+        assert_eq!(single_digit.episode_number, None);
+        assert_eq!(single_digit.air_date.as_deref(), Some("2000-01-12"));
+        assert!(
+            !graph
+                .targets
+                .iter()
+                .any(|target| target.target_key == "S02E09"),
+            "majority absolute-only ani.zip mappings must not drop monolith rows into stray TVDB seasons"
+        );
+
+        let absolute = graph
+            .targets
+            .iter()
+            .find(|target| target.target_key == "A0023")
+            .expect("numeric ani.zip episode target");
+        assert_eq!(absolute.source, AnimeGraphTargetSource::AniZip);
+        assert_eq!(absolute.season_number, None);
+        assert_eq!(absolute.episode_number, None);
+        assert_eq!(absolute.absolute_episode_number, Some(23));
+        assert_eq!(absolute.title, "Protect Baratie!");
+        assert_eq!(absolute.air_date.as_deref(), Some("2000-05-03"));
+
+        assert!(
+            !graph.targets.iter().any(|target| target.title == "Special"),
+            "prefixed ani.zip specials must not become normal mainline targets"
+        );
     }
 
     #[test]

@@ -3193,6 +3193,143 @@ async fn seed_acquisition_candidate_provider(
     Ok(provider_id)
 }
 
+async fn start_scope_preview_tvdb_fixture() -> Result<(String, tokio::task::JoinHandle<()>)> {
+    async fn login() -> impl IntoResponse {
+        Json(json!({ "data": { "token": "scope-preview-token" } }))
+    }
+
+    async fn series_extended(AxumPath(series_id): AxumPath<String>) -> impl IntoResponse {
+        if series_id != "321" {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown series" })),
+            );
+        }
+        (
+            StatusCode::OK,
+            Json(json!({
+                "data": {
+                    "seasons": [
+                        { "number": 0, "type": { "type": "specials" } },
+                        { "number": 1, "type": { "type": "official" } },
+                        { "number": 2, "type": { "type": "official" } }
+                    ]
+                }
+            })),
+        )
+    }
+
+    async fn season_episodes(
+        AxumPath(series_id): AxumPath<String>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        if series_id != "321" {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown series" })),
+            );
+        }
+        let season = query
+            .get("season")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_default();
+        let episodes = match season {
+            1 => json!([
+                {
+                    "id": 101,
+                    "seasonNumber": 1,
+                    "number": 1,
+                    "absoluteNumber": 1,
+                    "name": "Chapter I",
+                    "overview": "A richer existing library row must survive preview.",
+                    "image": "https://example.invalid/s1e1.jpg"
+                },
+                {
+                    "id": 102,
+                    "seasonNumber": 1,
+                    "number": 2,
+                    "absoluteNumber": 2,
+                    "name": "Chapter II",
+                    "image": "https://example.invalid/s1e2.jpg"
+                }
+            ]),
+            2 => json!([
+                {
+                    "id": 201,
+                    "seasonNumber": 2,
+                    "number": 1,
+                    "absoluteNumber": 3,
+                    "name": "Chapter III",
+                    "image": "https://example.invalid/s2e1.jpg"
+                }
+            ]),
+            _ => json!([]),
+        };
+        (
+            StatusCode::OK,
+            Json(json!({ "data": { "episodes": episodes } })),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let app = Router::new()
+        .route("/login", post(login))
+        .route("/series/:series_id/extended", get(series_extended))
+        .route("/series/:series_id/episodes/default", get(season_episodes));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("scope preview tvdb fixture");
+    });
+    Ok((format!("http://{addr}"), handle))
+}
+
+async fn find_media_scope_test_app(
+    auth_secret: &str,
+    email: &str,
+    tvdb_base_url: String,
+    tvdb_api_key: Option<&str>,
+    extension_id: &str,
+) -> Result<(AppState, Router, String, Uuid)> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = auth_secret.to_string();
+    settings.classifier.tvdb_base_url = tvdb_base_url;
+    settings.classifier.tvdb_api_key = tvdb_api_key.map(str::to_string);
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+    let source_provider_id = seed_acquisition_candidate_provider(&store, extension_id).await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind(email)
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    Ok((state, app, token, source_provider_id))
+}
+
 #[tokio::test]
 async fn health_and_settings_endpoints_work() -> Result<()> {
     let settings = test_settings_with_db();
@@ -7668,6 +7805,554 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
         Some(0)
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scope_preview_tvdb_is_read_only_and_deterministic() -> Result<()> {
+    let (tvdb_base_url, fixture) = start_scope_preview_tvdb_fixture().await?;
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-scope-preview-secret".to_string();
+    settings.classifier.tvdb_base_url = tvdb_base_url;
+    settings.classifier.tvdb_api_key = Some("fixture-tvdb-key".to_string());
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.scope_preview").await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("scope-preview@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let media_item_id = Uuid::new_v4();
+    let rich_metadata = json!({
+        "overview": "Do not replace this rich local metadata",
+        "poster": "https://example.invalid/poster.jpg"
+    });
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, created_at, updated_at)
+         VALUES (?1, 'series', ?2, 'Fixture Series', 2003, NULL, NULL, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(media_item_id.to_string())
+    .bind(json!({ "tvdbSeries": "321" }).to_string())
+    .bind(rich_metadata.to_string())
+    .execute(&db_pool)
+    .await?;
+
+    let before_targets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition_targets")
+        .fetch_one(&db_pool)
+        .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scope-preview")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "providerId": source_provider_id,
+                        "mediaType": "series",
+                        "result": {
+                            "kind": "series",
+                            "title": "Fixture Series",
+                            "year": 2003,
+                            "externalIds": {
+                                "tvdbSeries": "321"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        payload
+            .get("blockers")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        payload
+            .get("capabilities")
+            .and_then(|value| value.get("seasons"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let seasons = payload
+        .get("seasons")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(seasons.len(), 2);
+    let target_keys: Vec<_> = seasons
+        .iter()
+        .flat_map(|season| {
+            season
+                .get("episodes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|episode| {
+            episode
+                .get("targetKey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(target_keys, vec!["S01E01", "S01E02", "S02E01"]);
+    assert_eq!(
+        payload
+            .get("media")
+            .and_then(|value| value.get("externalIds"))
+            .and_then(|value| value.get("tvdbSeries"))
+            .and_then(Value::as_str),
+        Some("321")
+    );
+
+    let after_targets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition_targets")
+        .fetch_one(&db_pool)
+        .await?;
+    assert_eq!(after_targets, before_targets);
+
+    let persisted_metadata: String =
+        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = ?1")
+            .bind(media_item_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(persisted_metadata, rich_metadata.to_string());
+
+    fixture.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scope_preview_reports_missing_metadata_credentials() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "find-media-scope-preview-missing-secret".to_string();
+    settings.classifier.tvdb_api_key = None;
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+    let store = ExtensionStore::new(&db_pool);
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.scope_preview_missing").await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("scope-preview-missing@example.com")
+        .bind("hashed")
+        .execute(&db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/find-media/scope-preview")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "providerId": source_provider_id,
+                        "mediaType": "anime",
+                        "result": {
+                            "kind": "anime",
+                            "title": "Anime With TVDB Fallback",
+                            "externalIds": {
+                                "tvdbSeries": "321"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    let blocker_codes: Vec<_> = payload
+        .get("blockers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|blocker| {
+            blocker
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(blocker_codes, vec!["missing_metadata_credentials"]);
+    assert_eq!(
+        payload
+            .get("seasons")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scoped_add_season_creates_only_selected_targets_and_is_idempotent() -> Result<()>
+{
+    let (tvdb_base_url, fixture) = start_scope_preview_tvdb_fixture().await?;
+    let (state, app, token, source_provider_id) = find_media_scope_test_app(
+        "find-media-scoped-add-season-secret",
+        "scoped-season@example.com",
+        tvdb_base_url,
+        Some("fixture-tvdb-key"),
+        "elixir.sources.scoped_add_season",
+    )
+    .await?;
+
+    let request = json!({
+        "providerId": source_provider_id,
+        "mediaType": "series",
+        "result": {
+            "kind": "series",
+            "title": "Fixture Series",
+            "year": 2003,
+            "externalIds": { "tvdbSeries": "321" }
+        },
+        "scope": {
+            "type": "season",
+            "seasonNumber": 2
+        }
+    });
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scoped-add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))?,
+        )
+        .await?;
+    let status = first.status();
+    let first_body = body::to_bytes(first.into_body(), 1_048_576).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&first_body)
+    );
+    let first_payload: Value = serde_json::from_slice(&first_body)?;
+    assert_eq!(first_payload["targetCount"], json!(1));
+    assert_eq!(first_payload["requestMode"], json!("one_shot"));
+    assert_eq!(first_payload["requestScope"], json!("season"));
+    let subscription_id = first_payload["subscriptionId"]
+        .as_str()
+        .context("subscription id")?
+        .to_string();
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scoped-add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))?,
+        )
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body::to_bytes(second.into_body(), 1_048_576).await?;
+    let second_payload: Value = serde_json::from_slice(&second_body)?;
+    assert_eq!(
+        second_payload["subscriptionId"].as_str(),
+        Some(subscription_id.as_str())
+    );
+
+    let target_rows = sqlx::query(
+        "SELECT target_key, state FROM acquisition_targets WHERE subscription_id = ? ORDER BY target_key",
+    )
+    .bind(&subscription_id)
+    .fetch_all(&state.db_pool)
+    .await?;
+    assert_eq!(target_rows.len(), 1);
+    assert_eq!(target_rows[0].try_get::<String, _>("target_key")?, "S02E01");
+    assert_eq!(target_rows[0].try_get::<String, _>("state")?, "pending");
+
+    let series_id: String =
+        sqlx::query_scalar("SELECT id FROM series WHERE external_tvdb_series = '321' LIMIT 1")
+            .fetch_one(&state.db_pool)
+            .await?;
+    let episode_slots = sqlx::query(
+        "SELECT season_number, episode_number FROM episodes WHERE series_id = ? ORDER BY season_number, episode_number",
+    )
+    .bind(series_id)
+    .fetch_all(&state.db_pool)
+    .await?;
+    assert_eq!(episode_slots.len(), 1);
+    assert_eq!(episode_slots[0].try_get::<i64, _>("season_number")?, 2);
+    assert_eq!(episode_slots[0].try_get::<i64, _>("episode_number")?, 1);
+
+    fixture.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scoped_add_selected_targets_preserves_rich_existing_metadata() -> Result<()> {
+    let (tvdb_base_url, fixture) = start_scope_preview_tvdb_fixture().await?;
+    let (state, app, token, source_provider_id) = find_media_scope_test_app(
+        "find-media-scoped-add-selected-secret",
+        "scoped-selected@example.com",
+        tvdb_base_url,
+        Some("fixture-tvdb-key"),
+        "elixir.sources.scoped_add_selected",
+    )
+    .await?;
+
+    let media_item_id = Uuid::new_v4();
+    let rich_metadata = json!({
+        "overview": "Existing rich metadata must survive a partial scoped add.",
+        "poster": "https://example.invalid/rich-poster.jpg"
+    });
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
+         VALUES (?, 'series', ?, 'Fixture Series', 2003, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(media_item_id.to_string())
+    .bind(json!({ "tvdbSeries": "321" }).to_string())
+    .bind(rich_metadata.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO series (id, title, year, library_type, external_tvdb_series, metadata_json, created_at, updated_at)
+         VALUES (?, 'Fixture Series', 2003, 'series', '321', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(media_item_id.to_string())
+    .bind(rich_metadata.to_string())
+    .execute(&state.db_pool)
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scoped-add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "providerId": source_provider_id,
+                        "mediaType": "series",
+                        "result": {
+                            "kind": "series",
+                            "title": "Fixture Series",
+                            "year": 2003,
+                            "externalIds": { "tvdbSeries": "321" }
+                        },
+                        "scope": {
+                            "type": "selected_targets",
+                            "targetKeys": ["S01E01", "S01E02"]
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload["targetCount"], json!(2));
+
+    let persisted_metadata: String =
+        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = ?")
+            .bind(media_item_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_eq!(persisted_metadata, rich_metadata.to_string());
+
+    let target_keys = sqlx::query_scalar::<_, String>(
+        "SELECT target_key FROM acquisition_targets ORDER BY target_key",
+    )
+    .fetch_all(&state.db_pool)
+    .await?;
+    assert_eq!(target_keys, vec!["S01E01", "S01E02"]);
+    let episode_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+            .bind(media_item_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_eq!(episode_count, 2);
+    let unselected_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM episodes WHERE series_id = ? AND season_number = 2",
+    )
+    .bind(media_item_id.to_string())
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(unselected_count, 0);
+
+    fixture.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scoped_add_episode_singleton_queues_one_target() -> Result<()> {
+    let (tvdb_base_url, fixture) = start_scope_preview_tvdb_fixture().await?;
+    let (state, app, token, source_provider_id) = find_media_scope_test_app(
+        "find-media-scoped-add-episode-secret",
+        "scoped-episode@example.com",
+        tvdb_base_url,
+        Some("fixture-tvdb-key"),
+        "elixir.sources.scoped_add_episode",
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scoped-add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "providerId": source_provider_id,
+                        "mediaType": "series",
+                        "result": {
+                            "kind": "series",
+                            "title": "Fixture Series",
+                            "year": 2003,
+                            "externalIds": { "tvdbSeries": "321" }
+                        },
+                        "scope": {
+                            "type": "episode",
+                            "seasonNumber": 1,
+                            "episodeNumber": 2
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload["targetCount"], json!(1));
+    assert_eq!(payload["requestScope"], json!("episode"));
+    let subscription_id = payload["subscriptionId"]
+        .as_str()
+        .context("subscription id")?;
+    let target_key: String = sqlx::query_scalar(
+        "SELECT target_key FROM acquisition_targets WHERE subscription_id = ? LIMIT 1",
+    )
+    .bind(subscription_id)
+    .fetch_one(&state.db_pool)
+    .await?;
+    assert_eq!(target_key, "S01E02");
+
+    fixture.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_media_scoped_add_anime_range_uses_anime_catalog_type() -> Result<()> {
+    let (tvdb_base_url, fixture) = start_scope_preview_tvdb_fixture().await?;
+    let (state, app, token, source_provider_id) = find_media_scope_test_app(
+        "find-media-scoped-add-anime-secret",
+        "scoped-anime@example.com",
+        tvdb_base_url,
+        Some("fixture-tvdb-key"),
+        "elixir.sources.scoped_add_anime",
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find-media/scoped-add")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "providerId": source_provider_id,
+                        "mediaType": "anime",
+                        "result": {
+                            "kind": "anime",
+                            "title": "Anime With TVDB Fallback",
+                            "year": 2003,
+                            "externalIds": { "tvdbSeries": "321" }
+                        },
+                        "scope": {
+                            "type": "range",
+                            "seasonNumber": 1,
+                            "episodeStart": 1,
+                            "episodeEnd": 2
+                        }
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload["targetCount"], json!(2));
+    assert_eq!(payload["requestScope"], json!("range"));
+
+    let library_type: String =
+        sqlx::query_scalar("SELECT library_type FROM series WHERE external_tvdb_series = '321'")
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_eq!(library_type, "anime");
+    let target_keys = sqlx::query_scalar::<_, String>(
+        "SELECT target_key FROM acquisition_targets ORDER BY target_key",
+    )
+    .fetch_all(&state.db_pool)
+    .await?;
+    assert_eq!(target_keys, vec!["S01E01", "S01E02"]);
+
+    fixture.abort();
     Ok(())
 }
 

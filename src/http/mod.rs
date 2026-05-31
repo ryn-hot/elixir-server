@@ -497,6 +497,30 @@ pub fn router(state: AppState) -> Router {
             post(handlers::discovery::find_media_search),
         )
         .route(
+            "/api/v1/find-media/scope-preview",
+            post(handlers::discovery::find_media_scope_preview),
+        )
+        .route(
+            "/api/v1/find/media/scope-preview",
+            post(handlers::discovery::find_media_scope_preview),
+        )
+        .route(
+            "/api/v1/find/scope-preview",
+            post(handlers::discovery::find_media_scope_preview),
+        )
+        .route(
+            "/api/v1/find-media/scoped-add",
+            post(handlers::discovery::find_media_scoped_add),
+        )
+        .route(
+            "/api/v1/find/media/scoped-add",
+            post(handlers::discovery::find_media_scoped_add),
+        )
+        .route(
+            "/api/v1/find/scoped-add",
+            post(handlers::discovery::find_media_scoped_add),
+        )
+        .route(
             "/api/v1/find-media/add",
             post(handlers::discovery::find_media_add),
         )

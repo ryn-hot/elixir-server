@@ -3,6 +3,7 @@ pub mod automation;
 pub mod episode_state;
 pub mod imports;
 pub mod release_resolution;
+pub mod scoped_add;
 pub mod subscriptions;
 
 use std::collections::{BTreeMap, HashMap};
