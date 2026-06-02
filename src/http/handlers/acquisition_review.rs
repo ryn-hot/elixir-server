@@ -33,7 +33,7 @@ use crate::{
                 AcquisitionFileHash, AcquisitionRelease, AcquisitionReleaseCoverage,
                 AcquisitionReleaseFile, AcquisitionReleaseJob, AcquisitionReleaseState,
                 NewAcquisitionReleaseCoverage, ReleaseConfidence, ReleaseCoverageKind,
-                ReleaseCoverageState, ReleaseJobState, ReleaseJobStateUpdate,
+                ReleaseCoverageState, ReleaseJobState, ReleaseJobStateUpdate, ReleaseResolverKind,
             },
             review_candidates::{
                 SYNTHETIC_SOURCE_CANDIDATE_FILE_ID, ensure_manual_review_release_files,
@@ -52,6 +52,7 @@ use crate::{
             get_target, list_subscription_targets, update_target_state,
         },
     },
+    db::models::MediaType,
     download_broker::{
         DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
     },
@@ -291,6 +292,10 @@ pub struct ReleaseReviewEvidence {
     submission_result: Option<JsonValue>,
     priority_policy: Option<JsonValue>,
     manual_review: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    movie_evidence: Option<JsonValue>,
     retry_policy: Option<JsonValue>,
     debrid_runtime: Option<JsonValue>,
     torrent_runtime: Option<JsonValue>,
@@ -2763,6 +2768,8 @@ fn release_evidence(
             .as_ref()
             .and_then(|value| value.get("manualReview"))
             .cloned(),
+        diagnostics: release_diagnostics(plan.as_ref()),
+        movie_evidence: release_movie_evidence(release),
         retry_policy: plan
             .as_ref()
             .and_then(|value| value.get("retryPolicy"))
@@ -2792,6 +2799,117 @@ fn release_evidence(
             .and_then(|value| value.get("animeVerification"))
             .cloned(),
     }
+}
+
+fn release_diagnostics(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    plan.get("diagnostics")
+        .or_else(|| plan.pointer("/resolverEvidence/parsedRelease/diagnostics"))
+        .or_else(|| plan.pointer("/movie/fileSelection/diagnostics"))
+        .cloned()
+}
+
+fn release_movie_evidence(release: &AcquisitionRelease) -> Option<JsonValue> {
+    if release.media_type != MediaType::Movie
+        && release.resolver_kind != ReleaseResolverKind::MovieRadarrStyle
+    {
+        return None;
+    }
+    let source_plan = review_movie_source_coverage_plan(release);
+    let parsed_release = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("parsedRelease"))
+        .cloned();
+    let graph = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("graph"))
+        .cloned();
+    let reconciliation = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("reconciliation"))
+        .cloned();
+    Some(json!({
+        "resolver": {
+            "kind": release.resolver_kind.as_str(),
+            "version": release.resolver_version,
+            "confidence": release.confidence.as_str(),
+        },
+        "route": {
+            "sourceProviderId": release.source_provider_id,
+            "routeProviderId": release.selected_provider_id,
+            "routeLogicalId": release.selected_route_logical_id,
+            "downloadId": release.download_id,
+            "remoteReleaseId": release.remote_release_id,
+        },
+        "sourceMovieCoveragePlan": source_plan,
+        "parsedRelease": parsed_release,
+        "graph": graph,
+        "reconciliation": reconciliation,
+        "fileSelection": review_movie_file_selection_evidence(release.coverage_plan.as_ref()),
+        "selectionPolicy": review_movie_selection_policy_evidence(release.coverage_plan.as_ref()),
+        "runtime": review_movie_runtime_evidence(release.coverage_plan.as_ref()),
+    }))
+}
+
+fn review_movie_source_coverage_plan(release: &AcquisitionRelease) -> Option<JsonValue> {
+    [
+        release
+            .selected_candidate
+            .as_ref()
+            .and_then(|value| value.get("movieCoveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.get("movieCoveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.get("coveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.pointer("/resolverEvidence/parsedRelease/coveragePlan")),
+        release.coverage_plan.as_ref().filter(|value| {
+            value.get("parsedRelease").is_some()
+                || value.get("graph").is_some()
+                || value.get("reconciliation").is_some()
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .cloned()
+}
+
+fn review_movie_file_selection_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    plan.pointer("/movie/fileSelection")
+        .or_else(|| plan.get("fileSelection"))
+        .cloned()
+}
+
+fn review_movie_selection_policy_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    plan.get("selectionPolicy")
+        .or_else(|| plan.get("priorityPolicy"))
+        .or_else(|| plan.get("manualReview"))
+        .cloned()
+}
+
+fn review_movie_runtime_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    let debrid = plan.get("debridRuntime").cloned();
+    let torrent = plan
+        .get("torrentRuntime")
+        .or_else(|| plan.get("qbittorrentRuntime"))
+        .cloned();
+    if debrid.is_none() && torrent.is_none() {
+        return None;
+    }
+    Some(json!({
+        "debrid": debrid,
+        "torrent": torrent,
+    }))
 }
 
 fn coverage_row_evidence(
@@ -3762,6 +3880,207 @@ mod tests {
         assert_eq!(detail.counts.review_required_coverage_count, 1);
         assert!(detail.evidence.scheduler_dispatch.is_some());
         assert_eq!(detail.review_status, "review_required");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm6_movie_detail_exposes_diagnostics_without_polluting_file_summary() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: "Movie".to_string(),
+                year: Some(2024),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("movie".to_string()),
+                media_type: Some(MediaType::Movie),
+                title: Some("Movie".to_string()),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Submitted),
+                next_search_after: None,
+            }],
+        )
+        .await?;
+        let source_plan = json!({
+            "parsedRelease": {
+                "movieTitle": "Movie",
+                "year": 2024
+            },
+            "graph": {
+                "targetTitle": "Movie",
+                "targetYear": 2024
+            },
+            "reconciliation": {
+                "outcome": "planned",
+                "confidence": "high"
+            }
+        });
+        let release = upsert_release(
+            &database.pool,
+            NewAcquisitionRelease {
+                release_id: None,
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: None,
+                source_extension_id: "test.source".to_string(),
+                owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                media_type: MediaType::Movie,
+                title: "Movie".to_string(),
+                release_title: "Movie.2024.1080p.WEB-DL-GROUP".to_string(),
+                source: "magnet:?xt=urn:btih:rrm6-review".to_string(),
+                source_kind: "magnet".to_string(),
+                info_hash: Some("rrm6-review".to_string()),
+                fingerprint: "rrm6-review".to_string(),
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::MovieRadarrStyle,
+                resolver_version: "test".to_string(),
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(100.0),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_provider_id: None,
+                download_id: Some("download-rrm6-review".to_string()),
+                remote_release_id: Some("remote-rrm6-review".to_string()),
+                state: AcquisitionReleaseState::ReviewRequired,
+                state_reason: Some("movie file list requires review".to_string()),
+                selected_candidate: Some(json!({
+                    "title": "Movie.2024.1080p.WEB-DL-GROUP",
+                    "movieCoveragePlan": source_plan,
+                })),
+                coverage_plan: Some(json!({
+                    "source": "debrid_provider_file_list",
+                    "movie": {
+                        "fileSelection": {
+                            "status": "review_required",
+                            "selectedFileId": null,
+                            "diagnostics": [{
+                                "fileId": "0",
+                                "path": "Movie.2024.1080p.mkv",
+                                "role": "main_candidate",
+                                "selected": false
+                            }]
+                        }
+                    },
+                    "selectionPolicy": {
+                        "status": "review_required",
+                        "reviewReasons": ["ambiguous_movie_main_file"]
+                    },
+                    "debridRuntime": {
+                        "status": "waiting_files"
+                    }
+                })),
+            },
+        )
+        .await?;
+        let file = upsert_release_file(
+            &database.pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id: release.release_id,
+                file_index: Some(0),
+                file_id: Some("0".to_string()),
+                provider_file_id: Some("0".to_string()),
+                path: "Movie.2024.1080p.mkv".to_string(),
+                basename: None,
+                size_bytes: Some(1_000_000_000),
+                selectable: true,
+                selected: None,
+                parsed_title: Some("Movie".to_string()),
+                parsed_season_number: None,
+                parsed_episode_number: None,
+                parsed_episode_end_number: None,
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: None,
+                parsed_quality: Some("1080p WEB-DL".to_string()),
+                parsed_language: Some("eng".to_string()),
+                parsed_release_group: Some("GROUP".to_string()),
+                parser_confidence: ReleaseConfidence::High,
+                parser_reason: None,
+                raw: Some(json!({
+                    "parsed": {
+                        "movieTitle": "Movie",
+                        "year": 2024
+                    }
+                })),
+                provider_metadata: None,
+            },
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: Some(file.release_file_id),
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::Movie,
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(80.0),
+                reason: Some("movie file list requires review".to_string()),
+                state: ReleaseCoverageState::ReviewRequired,
+                verified_by: Some("rrm5_debrid_movie_file_list".to_string()),
+            },
+        )
+        .await?;
+
+        let detail = load_release_detail(&database.pool, release.release_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].parsed.title.as_deref(), Some("Movie"));
+        assert!(detail.files[0].review_reasons.is_empty());
+        assert_eq!(
+            detail
+                .evidence
+                .movie_evidence
+                .as_ref()
+                .and_then(|value| value.pointer("/parsedRelease/movieTitle"))
+                .and_then(JsonValue::as_str),
+            Some("Movie")
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .movie_evidence
+                .as_ref()
+                .and_then(|value| value.pointer("/fileSelection/status"))
+                .and_then(JsonValue::as_str),
+            Some("review_required")
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .diagnostics
+                .as_ref()
+                .and_then(JsonValue::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
         Ok(())
     }
 

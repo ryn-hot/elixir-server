@@ -1891,6 +1891,19 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
     let release_file_id_raw: String = row.try_get("release_file_id")?;
     let release_id_raw: String = row.try_get("release_id")?;
     let parser_confidence_raw: String = row.try_get("parser_confidence")?;
+    let raw = parse_json_opt(
+        row_get_opt_string(row, "raw_json")?,
+        "acquisition_release_files.raw_json",
+    )?;
+    let provider_metadata = parse_json_opt(
+        row_get_opt_string(row, "provider_metadata_json")?,
+        "acquisition_release_files.provider_metadata_json",
+    )?;
+    let size_bytes = release_file_size_bytes_from_metadata(
+        row_get_i64_opt(row, "size_bytes")?,
+        raw.as_ref(),
+        provider_metadata.as_ref(),
+    );
     Ok(AcquisitionReleaseFile {
         release_file_id: parse_uuid(
             &release_file_id_raw,
@@ -1902,7 +1915,7 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
         provider_file_id: row_get_opt_string(row, "provider_file_id")?,
         path: row.try_get("path")?,
         basename: row.try_get("basename")?,
-        size_bytes: row_get_i64_opt(row, "size_bytes")?,
+        size_bytes,
         selectable: row_get_bool(row, "selectable")?,
         selected: row_get_bool_opt(row, "selected")?,
         parsed_title: row_get_opt_string(row, "parsed_title")?,
@@ -1925,14 +1938,8 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
         parsed_release_group: row_get_opt_string(row, "parsed_release_group")?,
         parser_confidence: ReleaseConfidence::from_str(&parser_confidence_raw)?,
         parser_reason: row_get_opt_string(row, "parser_reason")?,
-        raw: parse_json_opt(
-            row_get_opt_string(row, "raw_json")?,
-            "acquisition_release_files.raw_json",
-        )?,
-        provider_metadata: parse_json_opt(
-            row_get_opt_string(row, "provider_metadata_json")?,
-            "acquisition_release_files.provider_metadata_json",
-        )?,
+        raw,
+        provider_metadata,
         created_at: parse_datetime(
             &row.try_get::<String, _>("created_at")?,
             "acquisition_release_files.created_at",
@@ -1942,6 +1949,32 @@ fn map_release_file(row: &AnyRow) -> Result<AcquisitionReleaseFile> {
             "acquisition_release_files.updated_at",
         )?,
     })
+}
+
+fn release_file_size_bytes_from_metadata(
+    stored: Option<i64>,
+    raw: Option<&JsonValue>,
+    provider_metadata: Option<&JsonValue>,
+) -> Option<i64> {
+    stored.filter(|size| *size >= 0).or_else(|| {
+        provider_metadata
+            .and_then(|metadata| metadata.get("sizeBytes"))
+            .and_then(json_i64_or_u64)
+            .or_else(|| {
+                raw.and_then(|value| {
+                    ["size", "sizeBytes", "filesize", "bytes", "length"]
+                        .iter()
+                        .find_map(|key| value.get(*key).and_then(json_i64_or_u64))
+                })
+            })
+    })
+}
+
+fn json_i64_or_u64(value: &JsonValue) -> Option<i64> {
+    value
+        .as_i64()
+        .filter(|number| *number >= 0)
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
 }
 
 fn map_release_coverage(row: &AnyRow) -> Result<AcquisitionReleaseCoverage> {
@@ -2429,6 +2462,11 @@ fn row_get_i64_opt(row: &AnyRow, field: &str) -> Result<Option<i64>> {
     }
     if let Ok(value) = row.try_get::<i64, _>(field) {
         return Ok(Some(value));
+    }
+    if let Ok(value) = ValueRef::to_owned(&raw).try_decode::<String>()
+        && let Ok(parsed) = value.parse::<i64>()
+    {
+        return Ok(Some(parsed));
     }
     if let Ok(value) = row.try_get::<i32, _>(field) {
         return Ok(Some(value as i64));

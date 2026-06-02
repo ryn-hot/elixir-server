@@ -1,0 +1,107 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr3o-sonarr-anime-quality",
+  "resolver": "anime_shoko_style",
+  "classification": "rr3d_asserted",
+  "sourceFixtureSet": "rr2-sonarr-conventional-tv-exhaustive",
+  "cases": [
+    {
+      "id": "quality_sonarr_hdtv_1080i_avc",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_hdtv1080p_quality",
+      "sourceLine": 173,
+      "sourceClassification": "tv_rr2",
+      "input": "Series culpable 1x02 Culpabilidad [HDTV 1080i AVC MP2 2.0 Sub][GrupoHDS]",
+      "expected": {
+        "resolution": "1080p",
+        "source": "hdtv",
+        "videoCodec": "H264"
+      }
+    },
+    {
+      "id": "quality_sonarr_webdl_720p_h264",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_webdl720p_quality",
+      "sourceLine": 194,
+      "sourceClassification": "tv_rr2",
+      "input": "The.Series.S02E15.720p.WEB-DL.DD5.1.H.264-SURFER",
+      "expected": {
+        "resolution": "720p",
+        "source": "web_dl",
+        "videoCodec": "H264"
+      }
+    },
+    {
+      "id": "quality_sonarr_webdl_1440p_maps_1080p",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_webdl1080p_quality",
+      "sourceLine": 249,
+      "sourceClassification": "tv_rr2",
+      "input": "Series.S01E08.Pro.Gamer.1440p.BKPL.WEB-DL.H.264-LiGHT",
+      "expected": {
+        "resolution": "1080p",
+        "source": "web_dl",
+        "videoCodec": "H264"
+      }
+    },
+    {
+      "id": "quality_sonarr_webdl_4k_h265_dual_audio",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_webdl2160p_quality",
+      "sourceLine": 287,
+      "sourceClassification": "tv_rr2",
+      "input": "Series Title S02 2013 WEB-DL 4k H265 AAC 2Audio-HDSWEB",
+      "expected": {
+        "resolution": "2160p",
+        "source": "web_dl",
+        "videoCodec": "HEVC",
+        "audioCodec": "AAC",
+        "dualAudio": true
+      }
+    },
+    {
+      "id": "quality_sonarr_bluray_remux_avc_dts_hd",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_bluray1080p_remux_quality",
+      "sourceLine": 349,
+      "sourceClassification": "tv_rr2",
+      "input": "Series.Title.S01E08.The.Well.BluRay.1080p.AVC.DTS-HD.MA.5.1.REMUX-FraMeSToR",
+      "expected": {
+        "resolution": "1080p",
+        "source": "blu_ray",
+        "videoCodec": "H264",
+        "audioCodec": "DTS-HD"
+      }
+    },
+    {
+      "id": "quality_sonarr_raw_hd",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_raw_quality",
+      "sourceLine": 392,
+      "sourceClassification": "tv_rr2",
+      "input": "Show - S03E01 - Episode Title Raw-HD.ts",
+      "expected": {
+        "source": "raw_hd"
+      }
+    },
+    {
+      "id": "quality_sonarr_dvdrip_xvid",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "QualityParserFixture",
+      "sourceMethod": "should_parse_dvd_quality",
+      "sourceLine": 79,
+      "sourceClassification": "tv_rr2",
+      "input": "The.Series.S03E06.DVDRip.XviD-WiDE",
+      "expected": {
+        "source": "dvd",
+        "videoCodec": "XVID"
+      }
+    }
+  ]
+}

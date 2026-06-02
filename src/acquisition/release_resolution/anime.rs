@@ -18,6 +18,9 @@ use crate::{
             ReleaseConfidence, ReleaseCoverageKind, ReleaseCoverageState, ReleaseKind,
             ReleaseResolverKind,
         },
+        release_resolution::tv::{
+            TvParsedRelease, TvQuality, TvReleaseSource, TvResolution, TvSonarrStyleResolver,
+        },
         subscriptions::{AcquisitionTargetState, NewAcquisitionTarget},
     },
     db::models::MediaType,
@@ -29,6 +32,8 @@ pub const ANIME_SHOKO_STYLE_RESOLVER_VERSION: &str = "rr3-anime-shoko-style-v0";
 pub const SHOKO_REFERENCE_COMMIT: &str = "74a673ed57daef76ac6ac1c745728bebcfbd870b";
 pub const SHOKO_REFERENCE_REPOSITORY: &str = "https://github.com/ShokoAnime/ShokoServer";
 pub const ANIME_PRE_DOWNLOAD_PARSER_VERSION: &str = "rr3d-anime-pre-download-parser-v0";
+pub const ANIME_SONARR_ADAPTER_VERSION: &str = "rr3p-anime-sonarr-adapter-v0";
+pub const ANIME_PARSER_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 
 const RR3_METADATA_GRAPH_FINGERPRINT_PREFIX: &str = "rr3c-anime-graph";
 
@@ -96,17 +101,61 @@ static VERSION_RE: Lazy<Regex> = Lazy::new(|| {
 static CRC32_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:\[|\()(?P<crc>[a-f0-9]{8})(?:\]|\))").expect("valid CRC32 regex")
 });
+static FILE_SIZE_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?ix)(?:^|[^\p{L}\p{N}])0*(?P<size>\d{1,5})(?:\.\d+)?\s*(?:KB|MB|GB|TB|KiB|MiB|GiB|TiB)(?:$|[^\p{L}\p{N}])")
+        .expect("valid anime file size token regex")
+});
 static RESOLUTION_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?P<resolution>2160p|1080p10|1080p|720p|576p|540p|480p|360p|1920x1080|1280x720|4k|uhd)")
+    Regex::new(r"(?i)(?P<resolution>2160p|2160i|1440p|1080p10|1080p|1080i|720p|720i|576p|576i|540p|480p|480i|360p|4096x2160|3840x2160|1920x1080|1280x720|640x480|848x480|960p|4kto1080p|BluRay1080p|BD1080p|BluRay720p|BD720p|4k|uhd|fhd)")
         .expect("valid anime resolution regex")
 });
 static CODEC_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?P<codec>HEVC|H\.?265|x265|H\.?264|x264|AVC|AV1|VP9)\b")
-        .expect("valid anime codec regex")
+    Regex::new(
+        r"(?i)\b(?P<codec>HEVC|H\.?265|x265|H\.?264|x264|AVC|AV1|VP9|XviD|DivX|MPEG[-_. ]?2)\b",
+    )
+    .expect("valid anime codec regex")
 });
 static AUDIO_CODEC_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?P<audio>AAC|FLAC|OPUS|EAC3|AC3|DTS|TrueHD)\b")
+    Regex::new(r"(?i)\b(?P<audio>AAC|FLAC|OPUS|EAC3|AC3|DTS(?:[-_. ]?HD)?|TrueHD|DDP?|Dolby[-_. ]?Digital)\b")
         .expect("valid anime audio codec regex")
+});
+static WEB_DL_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bWEB[-_. ]?DL\b").expect("valid web-dl source regex"));
+static WEB_RIP_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bWEB[-_. ]?Rip\b").expect("valid web-rip source regex"));
+static BLURAY_SOURCE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:Blu[-_. ]?Ray|BDRip|BRRip|BD[-_. ]?Remux|BD[-_. ]?Box|Remux)\b")
+        .expect("valid bluray source regex")
+});
+static HDTV_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bHDTV\b").expect("valid hdtv source regex"));
+static DVD_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(?:DVD|DVDRip)\b").expect("valid dvd source regex"));
+static RAW_HD_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bRaw[-_. ]?HD\b").expect("valid raw-hd source regex"));
+static PDTV_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bPDTV\b").expect("valid pdtv source regex"));
+static DSR_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bDSR\b").expect("valid dsr source regex"));
+static SDTV_SOURCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(?:SDTV|TVRip)\b").expect("valid sdtv source regex"));
+static DUAL_AUDIO_SIGNAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:(?:dual|2)[-_. ]?audio|dual[-_. ]?dub|multi[-_. ]?audio|english[-_. ]?dub|eng[-_. ]?dub|dubbed)\b")
+        .expect("valid anime dual-audio signal regex")
+});
+static ENGLISH_DUB_SIGNAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:english[-_. ]?dub|eng[-_. ]?dub|dubbed)\b")
+        .expect("valid anime English dub signal regex")
+});
+static MULTI_SUB_SIGNAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?:multi[-_. ]?subs?|multisub|multiple[-_. ]?subtitles?)\b|简繁|簡繁|雙語|双语",
+    )
+    .expect("valid anime multi-sub signal regex")
+});
+static ANIME_LANGUAGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:TRUEFRENCH|SUBFRENCH|VOSTFR|VF2?|VFQ|VFF|VFI|ENGLISH|ENG|FRENCH|FRE|FRA|FR|GERMAN|SWISSGERMAN|GER|ITALIAN|ITALY|ITA|SPANISH|ESPA(?:Ñ|N)OL|CASTELLANO|SPA|ESP|CZECH|CZE|JAPANESE|JPN|JAP|JA|CHINESE|CANTONESE|MANDARIN|CHI|CHS|CHT|BIG5|GB|KOREAN|KOR|LATVIAN|LAT|LAV|LV|RUSSIAN|RUS|RU|POLISH|PL(?:LEK|DUB)?|DUBPL|LEKPL|DANISH|DAN|DUTCH|FLEMISH|PORTUGUESE|POR|MULTI[-_. ]?SUBS?|MULTISUB|MULTI|SUBS?|SUBBED|DUAL(?:[-_. ]AUDIO)?)\b")
+        .expect("valid anime language regex")
 });
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +187,81 @@ pub struct AnimeParsedQuality {
     pub multi_sub: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeSonarrParseFacts {
+    pub parser_version: String,
+    pub original_title: String,
+    pub series_title: Option<String>,
+    pub title_without_year: Option<String>,
+    pub title_year: Option<i32>,
+    pub all_titles: Vec<String>,
+    pub season_number: Option<i32>,
+    pub season_end_number: Option<i32>,
+    pub episode_numbers: Vec<i32>,
+    pub absolute_episode_numbers: Vec<i32>,
+    pub special_absolute_episode_numbers: Vec<String>,
+    pub episode_start_number: Option<i32>,
+    pub episode_end_number: Option<i32>,
+    pub release_kind: ReleaseKind,
+    pub batch_kind: AnimeBatchKind,
+    pub full_season: bool,
+    pub full_series: bool,
+    pub is_partial_season: bool,
+    pub is_multi_season: bool,
+    pub is_season_extra: bool,
+    pub season_part: Option<i32>,
+    pub daily_part: Option<i32>,
+    pub is_mini_series: bool,
+    pub special: bool,
+    pub is_split_episode: bool,
+    pub release_group: Option<String>,
+    pub release_hash: Option<String>,
+    pub release_tokens: Option<String>,
+    pub quality: AnimeParsedQuality,
+    pub audio_languages: Vec<String>,
+    pub raw: Option<TvParsedRelease>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeSignalFacts {
+    pub parser_version: String,
+    pub classifier_hints: Vec<AnimeClassifierSignal>,
+    pub title_candidates: Vec<String>,
+    pub normalized_title_candidates: Vec<String>,
+    pub title_season_alias_candidates: Vec<String>,
+    pub fallback_absolute_episode_hypotheses: Vec<i32>,
+    pub fallback_season_one_episode_hypotheses: Vec<i32>,
+    pub bounded_explicit_ranges: Vec<AnimeExplicitRange>,
+    pub dual_audio: bool,
+    pub english_dub: bool,
+    pub multi_sub: bool,
+    pub subtitle_languages: Vec<String>,
+    pub leading_bracket_release_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeClassifierSignal {
+    pub parser: String,
+    pub title: String,
+    pub alt_titles: Vec<String>,
+    pub year: Option<i32>,
+    pub season: Option<i32>,
+    pub episode: Option<i32>,
+    pub absolute_episode: Option<i32>,
+    pub parser_confidence_basis_points: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeExplicitRange {
+    pub start: i32,
+    pub end: i32,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeParsedRelease {
@@ -156,9 +280,15 @@ pub struct AnimeParsedRelease {
     pub batch_kind: AnimeBatchKind,
     pub version: Option<u8>,
     pub crc32: Option<String>,
+    #[serde(default)]
+    pub release_hash: Option<String>,
     pub quality: AnimeParsedQuality,
     pub audio_languages: Vec<String>,
     pub subtitle_languages: Vec<String>,
+    #[serde(default)]
+    pub sonarr_facts: AnimeSonarrParseFacts,
+    #[serde(default)]
+    pub anime_signal_facts: AnimeSignalFacts,
     pub confidence: ReleaseConfidence,
     pub review_reasons: Vec<String>,
 }
@@ -255,6 +385,11 @@ pub struct AnimeReleaseFileInput {
     pub selectable: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnimeCoverageOptions {
+    pub file_selection_supported: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeCandidateTargetMatch {
@@ -266,6 +401,41 @@ pub struct AnimeCandidateTargetMatch {
     pub absolute_episode_number: Option<i32>,
     pub match_reason: String,
     pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeReconciliationOutcome {
+    Agreement,
+    Translation,
+    Augmentation,
+    BenignMismatch,
+    TrueContradiction,
+    Unexplainable,
+}
+
+impl Default for AnimeReconciliationOutcome {
+    fn default() -> Self {
+        Self::Unexplainable
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeGraphReconciliation {
+    pub outcome: AnimeReconciliationOutcome,
+    pub graph_fingerprint: Option<String>,
+    pub identity_agreed: bool,
+    pub alias_best_score: Option<f64>,
+    pub alias_margin: Option<f64>,
+    pub target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub sonarr_target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub anime_signal_target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub agreed_target_keys: Vec<String>,
+    pub augmented_target_keys: Vec<String>,
+    pub contradiction_reasons: Vec<String>,
+    pub review_reasons: Vec<String>,
+    pub rejection_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -286,6 +456,7 @@ pub struct AnimeCandidateScore {
     pub parsed: AnimeParsedRelease,
     pub alias_matches: Vec<AnimeAliasMatch>,
     pub target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub reconciliation: AnimeGraphReconciliation,
     pub outcome: AnimeMatchOutcome,
     pub confidence: ReleaseConfidence,
     pub score: f64,
@@ -318,8 +489,145 @@ pub struct AnimeFileCoveragePlan {
     pub release_kind: ReleaseKind,
     pub confidence: ReleaseConfidence,
     pub requires_file_list: bool,
+    #[serde(default)]
+    pub requires_file_selection: bool,
     pub selected_file_keys: Vec<String>,
     pub entries: Vec<AnimeFileCoverageEntry>,
+    pub review_reasons: Vec<String>,
+    pub rejection_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeParserDiagnostics {
+    pub parser_provenance: AnimeParserProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeParserProvenance {
+    pub schema_version: u32,
+    pub resolver_kind: ReleaseResolverKind,
+    pub resolver_version: String,
+    pub parser_version: String,
+    pub sonarr_adapter_version: String,
+    pub parsed: AnimeParsedReleaseProvenance,
+    pub sonarr: AnimeSonarrParserProvenance,
+    pub anime_signals: AnimeSignalParserProvenance,
+    pub graph: AnimeGraphMappingProvenance,
+    pub reconciliation: AnimeReconciliationProvenance,
+    pub outcome: AnimeMatchOutcome,
+    pub confidence: ReleaseConfidence,
+    pub score: f64,
+    pub review_reasons: Vec<String>,
+    pub rejection_reasons: Vec<String>,
+    pub coverage: Option<AnimeCoverageProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeParsedReleaseProvenance {
+    pub original_title: String,
+    pub normalized_title: Option<String>,
+    pub series_title: Option<String>,
+    pub season_number: Option<i32>,
+    pub episode_numbers: Vec<i32>,
+    pub absolute_episode_numbers: Vec<i32>,
+    pub episode_type: AnimeEpisodeType,
+    pub batch_kind: AnimeBatchKind,
+    pub release_group: Option<String>,
+    pub release_hash: Option<String>,
+    pub quality: AnimeParsedQuality,
+    pub confidence: ReleaseConfidence,
+    pub review_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeSonarrParserProvenance {
+    pub parser_version: String,
+    pub matched_pattern_id: Option<String>,
+    pub matched_pattern_id_source: String,
+    pub original_title: String,
+    pub parsed_title: Option<String>,
+    pub title_without_year: Option<String>,
+    pub title_year: Option<i32>,
+    pub season_number: Option<i32>,
+    pub season_end_number: Option<i32>,
+    pub episode_numbers: Vec<i32>,
+    pub absolute_episode_numbers: Vec<i32>,
+    pub special_absolute_episode_numbers: Vec<String>,
+    pub release_kind: ReleaseKind,
+    pub batch_kind: AnimeBatchKind,
+    pub full_season: bool,
+    pub full_series: bool,
+    pub is_partial_season: bool,
+    pub is_multi_season: bool,
+    pub special: bool,
+    pub is_split_episode: bool,
+    pub release_group: Option<String>,
+    pub release_hash: Option<String>,
+    pub release_tokens: Option<String>,
+    pub quality: AnimeParsedQuality,
+    pub audio_languages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeSignalParserProvenance {
+    pub parser_version: String,
+    pub classifier_hints: Vec<AnimeClassifierSignal>,
+    pub title_candidates: Vec<String>,
+    pub normalized_title_candidates: Vec<String>,
+    pub title_season_alias_candidates: Vec<String>,
+    pub fallback_absolute_episode_hypotheses: Vec<i32>,
+    pub fallback_season_one_episode_hypotheses: Vec<i32>,
+    pub bounded_explicit_ranges: Vec<AnimeExplicitRange>,
+    pub dual_audio: bool,
+    pub english_dub: bool,
+    pub multi_sub: bool,
+    pub subtitle_languages: Vec<String>,
+    pub leading_bracket_release_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeGraphMappingProvenance {
+    pub graph_fingerprint: Option<String>,
+    pub alias_count: usize,
+    pub target_count: usize,
+    pub alias_matches: Vec<AnimeAliasMatch>,
+    pub target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub sonarr_target_matches: Vec<AnimeCandidateTargetMatch>,
+    pub anime_signal_target_matches: Vec<AnimeCandidateTargetMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeReconciliationProvenance {
+    pub outcome: AnimeReconciliationOutcome,
+    pub identity_agreed: bool,
+    pub alias_best_score: Option<f64>,
+    pub alias_margin: Option<f64>,
+    pub agreed_target_keys: Vec<String>,
+    pub augmented_target_keys: Vec<String>,
+    pub contradiction_reasons: Vec<String>,
+    pub review_reasons: Vec<String>,
+    pub rejection_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeCoverageProvenance {
+    pub resolver_kind: ReleaseResolverKind,
+    pub resolver_version: String,
+    pub release_kind: ReleaseKind,
+    pub confidence: ReleaseConfidence,
+    pub requires_file_list: bool,
+    pub requires_file_selection: bool,
+    pub selected_file_keys: Vec<String>,
+    pub entry_count: usize,
+    pub covered_target_keys: Vec<String>,
     pub review_reasons: Vec<String>,
     pub rejection_reasons: Vec<String>,
 }
@@ -353,57 +661,32 @@ impl AnimeCandidateScoringContext {
     }
 }
 
-pub fn parse_anime_release_title(input: &str) -> AnimeParsedRelease {
-    let original_title = input.trim().to_string();
-    let normalized_input = normalize_fullwidth_digits(&original_title);
-    let release_group = parse_anime_release_group(&normalized_input);
-    let bracket_segments = extract_bracket_segments(&normalized_input);
-    let classifier_hints = anime_classifier_hints(&original_title);
-    let classifier_hint = classifier_hints.iter().max_by(|left, right| {
-        left.parser_confidence
-            .partial_cmp(&right.parser_confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let extracted_title = extract_anime_series_title(&normalized_input, &bracket_segments);
-    let series_title = extracted_title
-        .or_else(|| classifier_hint.map(|hint| cleanup_anime_title(&hint.title)))
-        .filter(|title| !title.trim().is_empty());
-    let normalized_title = series_title.as_deref().map(normalize_anime_title);
-    let alt_titles = classifier_hint
-        .map(|hint| {
-            hint.alt_titles
-                .iter()
-                .map(|title| cleanup_anime_title(title))
-                .filter(|title| !title.is_empty())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+pub fn parse_anime_sonarr_adapter_facts(input: &str) -> AnimeSonarrParseFacts {
+    let resolver = TvSonarrStyleResolver;
+    sonarr_facts_from_tv_parse(resolver.parse_title(input))
+}
 
-    let sxxeyy = parse_sxxeyy_numbers(&normalized_input);
-    let season_number = sxxeyy
-        .as_ref()
-        .map(|parsed| parsed.0)
-        .or_else(|| parse_season_dash_episode(&normalized_input).map(|parsed| parsed.0))
-        .or_else(|| parse_season_number(&normalized_input))
-        .or_else(|| classifier_hint.and_then(|hint| hint.season));
-    let episode_numbers = sxxeyy
-        .as_ref()
-        .map(|parsed| expand_episode_numbers(parsed.1, parsed.2.unwrap_or(parsed.1), 200))
-        .unwrap_or_default();
-    let mut absolute_episode_numbers = if episode_numbers.is_empty() {
-        parse_absolute_episode_numbers(&normalized_input, &bracket_segments)
-    } else {
-        Vec::new()
-    };
-    if absolute_episode_numbers.is_empty()
-        && episode_numbers.is_empty()
-        && let Some(hint) = classifier_hint
-        && let Some(absolute) = hint.absolute_episode
-    {
-        absolute_episode_numbers.push(absolute);
+fn sonarr_facts_from_tv_parse(parsed: TvParsedRelease) -> AnimeSonarrParseFacts {
+    let mut all_titles = parsed.series_title_info.all_titles.clone();
+    if let Some(title) = parsed.normalized_series_title.as_deref() {
+        all_titles.push(title.to_string());
     }
+    if let Some(title) = parsed.series_title_info.title_without_year.as_deref() {
+        all_titles.push(title.to_string());
+    }
+    let all_titles = dedup_clean_strings(all_titles);
+
+    let mut episode_numbers = parsed.episode_numbers.clone();
+    episode_numbers.sort_unstable();
+    episode_numbers.dedup();
+
+    let mut absolute_episode_numbers = parsed
+        .anime_absolute_hints
+        .iter()
+        .copied()
+        .filter(|episode| !sonarr_absolute_hint_looks_like_year(&parsed.original_title, *episode))
+        .filter(|episode| !number_is_file_size_token(&parsed.original_title, *episode))
+        .collect::<Vec<_>>();
     absolute_episode_numbers.sort_unstable();
     absolute_episode_numbers.dedup();
 
@@ -415,17 +698,455 @@ pub fn parse_anime_release_title(input: &str) -> AnimeParsedRelease {
         .last()
         .copied()
         .or_else(|| absolute_episode_numbers.last().copied());
-    let episode_type = parse_anime_episode_type(&normalized_input);
-    let batch_kind = parse_anime_batch_kind(
+
+    let special_absolute_episode_numbers = if parsed.special && parsed.season_number == Some(0) {
+        episode_numbers
+            .iter()
+            .map(|episode| format!("S00E{episode:02}"))
+            .collect()
+    } else if parsed.special {
+        absolute_episode_numbers
+            .iter()
+            .map(|episode| format!("S{episode:04}"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let season_end_number = parsed.season_end_number;
+    let is_multi_season = season_end_number
+        .zip(parsed.season_number)
+        .is_some_and(|(end, start)| end > start)
+        || parsed.release_kind == ReleaseKind::MultiSeasonPack;
+
+    AnimeSonarrParseFacts {
+        parser_version: ANIME_SONARR_ADAPTER_VERSION.to_string(),
+        original_title: parsed.original_title.clone(),
+        series_title: parsed.normalized_series_title.clone(),
+        title_without_year: parsed.series_title_info.title_without_year.clone(),
+        title_year: parsed.series_title_info.year,
+        all_titles,
+        season_number: parsed.season_number,
+        season_end_number,
+        episode_numbers,
+        absolute_episode_numbers,
+        special_absolute_episode_numbers,
+        episode_start_number,
+        episode_end_number,
+        release_kind: parsed.release_kind,
+        batch_kind: anime_batch_kind_from_release_kind(parsed.release_kind),
+        full_season: parsed.full_season,
+        full_series: parsed.full_series,
+        is_partial_season: parsed.is_partial_season,
+        is_multi_season,
+        is_season_extra: parsed.is_season_extra,
+        season_part: parsed.season_part,
+        daily_part: parsed.daily_part,
+        is_mini_series: parsed.is_mini_series,
+        special: parsed.special,
+        is_split_episode: parsed.is_split_episode,
+        release_group: parsed.release_group.clone(),
+        release_hash: parsed.release_hash.clone(),
+        release_tokens: parsed.release_tokens.clone(),
+        quality: anime_quality_from_tv_quality(&parsed.quality, &parsed.original_title),
+        audio_languages: normalize_sonarr_languages(&parsed.modifiers.languages),
+        raw: Some(parsed),
+    }
+}
+
+fn anime_batch_kind_from_release_kind(release_kind: ReleaseKind) -> AnimeBatchKind {
+    match release_kind {
+        ReleaseKind::Single => AnimeBatchKind::Single,
+        ReleaseKind::MultiEpisode => AnimeBatchKind::Range,
+        ReleaseKind::SeasonPack => AnimeBatchKind::SeasonPack,
+        ReleaseKind::MultiSeasonPack => AnimeBatchKind::MultiSeasonPack,
+        ReleaseKind::SeriesPack => AnimeBatchKind::CompleteSeries,
+        ReleaseKind::Unknown => AnimeBatchKind::UnknownBatch,
+    }
+}
+
+fn sonarr_absolute_hint_looks_like_year(title: &str, episode: i32) -> bool {
+    if !(1950..=2100).contains(&episode) {
+        return false;
+    }
+    let token = episode.to_string();
+    extract_bracket_segments(title)
+        .iter()
+        .any(|segment| segment.trim() == token)
+}
+
+fn anime_quality_from_tv_quality(quality: &TvQuality, title: &str) -> AnimeParsedQuality {
+    let normalized = title.replace(['.', '_', '-'], " ");
+    AnimeParsedQuality {
+        resolution: quality.resolution.map(tv_resolution_label),
+        source: quality.source.map(tv_source_label),
+        video_codec: quality.codec.as_deref().map(normalize_codec),
+        audio_codec: None,
+        dual_audio: DUAL_AUDIO_SIGNAL_RE.is_match(&normalized),
+        multi_sub: MULTI_SUB_SIGNAL_RE.is_match(&normalized),
+    }
+}
+
+fn tv_resolution_label(resolution: TvResolution) -> String {
+    match resolution {
+        TvResolution::R360p => "360p",
+        TvResolution::R480p => "480p",
+        TvResolution::R540p => "540p",
+        TvResolution::R576p => "576p",
+        TvResolution::R720p => "720p",
+        TvResolution::R1080p => "1080p",
+        TvResolution::R2160p => "2160p",
+    }
+    .to_string()
+}
+
+fn tv_source_label(source: TvReleaseSource) -> String {
+    match source {
+        TvReleaseSource::BluRay | TvReleaseSource::BdRip | TvReleaseSource::BrRip => "blu_ray",
+        TvReleaseSource::WebDl => "web_dl",
+        TvReleaseSource::WebRip => "web_rip",
+        TvReleaseSource::Hdtv => "hdtv",
+        TvReleaseSource::Dvd => "dvd",
+        TvReleaseSource::Dsr => "dsr",
+        TvReleaseSource::Pdtv => "pdtv",
+        TvReleaseSource::Sdtv | TvReleaseSource::TvRip => "sdtv",
+        TvReleaseSource::RawHd => "raw_hd",
+    }
+    .to_string()
+}
+
+fn normalize_sonarr_languages(languages: &[String]) -> Vec<String> {
+    let mut normalized = BTreeSet::new();
+    for language in languages {
+        let token = language
+            .replace(['-', '_', '.', '/'], " ")
+            .replace(['ñ', 'Ñ'], "N")
+            .to_ascii_uppercase();
+        let token = token.trim();
+        if let Some(language) = normalize_anime_language_token(token) {
+            normalized.insert(language.to_string());
+        }
+    }
+    normalized.into_iter().collect()
+}
+
+fn build_anime_signal_facts(
+    input: &str,
+    classifier_hints: &[elixir_classifier::hint::ClassificationHint],
+    bracket_segments: &[String],
+    leading_bracket_release_group: Option<String>,
+    quality: &AnimeParsedQuality,
+    subtitle_languages: &[String],
+) -> AnimeSignalFacts {
+    let mut classifier_signals = Vec::new();
+    let mut title_candidates = BTreeSet::new();
+    let mut title_season_alias_candidates = BTreeSet::new();
+    let mut fallback_absolute_episode_hypotheses = BTreeSet::new();
+    let mut fallback_season_one_episode_hypotheses = BTreeSet::new();
+
+    for hint in classifier_hints {
+        let cleaned_title = cleanup_anime_title(&hint.title);
+        if !cleaned_title.is_empty() {
+            title_candidates.insert(cleaned_title.clone());
+            if let Some(season) = hint.season.filter(|season| *season > 0) {
+                title_season_alias_candidates.insert(format!("{cleaned_title} S{season:02}"));
+                title_season_alias_candidates.insert(format!("{cleaned_title} Season {season}"));
+            }
+        }
+
+        let alt_titles = hint
+            .alt_titles
+            .iter()
+            .map(|title| cleanup_anime_title(title))
+            .filter(|title| !title.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for title in &alt_titles {
+            title_candidates.insert(title.clone());
+            if let Some(season) = hint.season.filter(|season| *season > 0) {
+                title_season_alias_candidates.insert(format!("{title} S{season:02}"));
+                title_season_alias_candidates.insert(format!("{title} Season {season}"));
+            }
+        }
+
+        if let Some(absolute) = hint.absolute_episode.filter(|episode| *episode > 0) {
+            fallback_absolute_episode_hypotheses.insert(absolute);
+        }
+        if hint.season.unwrap_or(1) == 1
+            && let Some(episode) = hint.episode.filter(|episode| *episode > 0)
+        {
+            fallback_season_one_episode_hypotheses.insert(episode);
+        }
+
+        classifier_signals.push(AnimeClassifierSignal {
+            parser: hint.parser.to_string(),
+            title: cleaned_title,
+            alt_titles,
+            year: hint.year,
+            season: hint.season,
+            episode: hint.episode,
+            absolute_episode: hint.absolute_episode,
+            parser_confidence_basis_points: parser_confidence_basis_points(hint.parser_confidence),
+        });
+    }
+
+    for episode in parse_absolute_episode_numbers(input, bracket_segments) {
+        fallback_absolute_episode_hypotheses.insert(episode);
+    }
+
+    let normalized_title_candidates = title_candidates
+        .iter()
+        .map(|title| normalize_anime_title(title))
+        .filter(|title| !title.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let normalized = input.replace(['.', '_', '-'], " ");
+    AnimeSignalFacts {
+        parser_version: ANIME_PRE_DOWNLOAD_PARSER_VERSION.to_string(),
+        classifier_hints: classifier_signals,
+        title_candidates: title_candidates.into_iter().collect(),
+        normalized_title_candidates,
+        title_season_alias_candidates: title_season_alias_candidates.into_iter().collect(),
+        fallback_absolute_episode_hypotheses: fallback_absolute_episode_hypotheses
+            .into_iter()
+            .collect(),
+        fallback_season_one_episode_hypotheses: fallback_season_one_episode_hypotheses
+            .into_iter()
+            .collect(),
+        bounded_explicit_ranges: parse_bounded_explicit_ranges(input, bracket_segments),
+        dual_audio: quality.dual_audio,
+        english_dub: ENGLISH_DUB_SIGNAL_RE.is_match(&normalized),
+        multi_sub: quality.multi_sub,
+        subtitle_languages: subtitle_languages.to_vec(),
+        leading_bracket_release_group,
+    }
+}
+
+fn parser_confidence_basis_points(confidence: f32) -> u16 {
+    (confidence.clamp(0.0, 1.0) * 10_000.0).round() as u16
+}
+
+fn parse_bounded_explicit_ranges(
+    input: &str,
+    bracket_segments: &[String],
+) -> Vec<AnimeExplicitRange> {
+    let mut ranges = BTreeMap::<(i32, i32), String>::new();
+    if let Some((_, start, Some(end))) = parse_sxxeyy_numbers(input) {
+        push_explicit_range(&mut ranges, start, end, "sxxeyy");
+    }
+    for captures in BATCH_EPISODE_RANGE_RE.captures_iter(input) {
+        if let Some(start) = parse_capture_i32(&captures, "start") {
+            let end = parse_capture_i32(&captures, "end").unwrap_or(start);
+            push_explicit_range(&mut ranges, start, end, "batch");
+        }
+    }
+    for captures in DASH_EPISODE_RE.captures_iter(input) {
+        if let Some(start) = parse_capture_i32(&captures, "start") {
+            let end = parse_capture_i32(&captures, "end").unwrap_or(start);
+            push_explicit_range(&mut ranges, start, end, "dash");
+        }
+    }
+    for segment in bracket_segments.iter().skip(1) {
+        if let Some((start, end)) = parse_episode_segment_numbers(segment) {
+            push_explicit_range(&mut ranges, start, end, "bracket");
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|((start, end), source)| AnimeExplicitRange { start, end, source })
+        .collect()
+}
+
+fn push_explicit_range(
+    ranges: &mut BTreeMap<(i32, i32), String>,
+    start: i32,
+    end: i32,
+    source: &str,
+) {
+    if start <= 0 || end <= start || end - start > 200 {
+        return;
+    }
+    ranges
+        .entry((start, end))
+        .or_insert_with(|| source.to_string());
+}
+
+fn merge_anime_quality(
+    sonarr_quality: &AnimeParsedQuality,
+    anime_quality: AnimeParsedQuality,
+) -> AnimeParsedQuality {
+    AnimeParsedQuality {
+        resolution: anime_quality
+            .resolution
+            .or_else(|| sonarr_quality.resolution.clone()),
+        source: anime_quality
+            .source
+            .or_else(|| sonarr_quality.source.clone()),
+        video_codec: anime_quality
+            .video_codec
+            .or_else(|| sonarr_quality.video_codec.clone()),
+        audio_codec: anime_quality.audio_codec,
+        dual_audio: anime_quality.dual_audio || sonarr_quality.dual_audio,
+        multi_sub: anime_quality.multi_sub || sonarr_quality.multi_sub,
+    }
+}
+
+fn merge_i32_values(
+    left: impl IntoIterator<Item = i32>,
+    right: impl IntoIterator<Item = i32>,
+) -> Vec<i32> {
+    left.into_iter()
+        .chain(right)
+        .filter(|value| *value > 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn dedup_clean_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| cleanup_anime_title(&value))
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn sorted_unique_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn parse_anime_release_title(input: &str) -> AnimeParsedRelease {
+    let original_title = input.trim().to_string();
+    let normalized_input = normalize_fullwidth_digits(&original_title);
+    let leading_bracket_release_group = parse_anime_release_group(&normalized_input);
+    let sonarr_facts = parse_anime_sonarr_adapter_facts(&original_title);
+    let bracket_segments = extract_bracket_segments(&normalized_input);
+    let classifier_hints = anime_classifier_hints(&original_title);
+    let classifier_hint = classifier_hints.iter().max_by(|left, right| {
+        left.parser_confidence
+            .partial_cmp(&right.parser_confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let extracted_title = extract_anime_series_title(&normalized_input, &bracket_segments);
+    let series_title = extracted_title
+        .or_else(|| classifier_hint.map(|hint| cleanup_anime_title(&hint.title)))
+        .or_else(|| {
+            sonarr_facts
+                .series_title
+                .clone()
+                .map(|title| cleanup_anime_title(&title))
+        })
+        .filter(|title| !title.trim().is_empty());
+    let normalized_title = series_title.as_deref().map(normalize_anime_title);
+    let mut alt_title_candidates = classifier_hint
+        .map(|hint| hint.alt_titles.clone())
+        .unwrap_or_default();
+    alt_title_candidates.extend(sonarr_facts.all_titles.clone());
+    let alt_titles = dedup_clean_strings(alt_title_candidates);
+
+    let sxxeyy = parse_sxxeyy_numbers(&normalized_input);
+    let season_number = sxxeyy
+        .as_ref()
+        .map(|parsed| parsed.0)
+        .or_else(|| parse_season_dash_episode(&normalized_input).map(|parsed| parsed.0))
+        .or_else(|| parse_season_number(&normalized_input))
+        .or(sonarr_facts.season_number)
+        .or_else(|| classifier_hint.and_then(|hint| hint.season));
+    let mut episode_numbers = sxxeyy
+        .as_ref()
+        .map(|parsed| expand_episode_numbers(parsed.1, parsed.2.unwrap_or(parsed.1), 200))
+        .or_else(|| {
+            parse_season_dash_episode(&normalized_input)
+                .map(|parsed| expand_episode_numbers(parsed.1, parsed.1, 200))
+        })
+        .unwrap_or_default();
+    episode_numbers = merge_i32_values(episode_numbers, sonarr_facts.episode_numbers.clone());
+
+    let mut absolute_episode_numbers =
+        parse_absolute_episode_numbers(&normalized_input, &bracket_segments);
+    if absolute_episode_numbers.is_empty()
+        && episode_numbers.is_empty()
+        && let Some(hint) = classifier_hint
+        && let Some(absolute) = hint.absolute_episode
+    {
+        absolute_episode_numbers.push(absolute);
+    }
+    absolute_episode_numbers = merge_i32_values(
+        absolute_episode_numbers,
+        sonarr_facts.absolute_episode_numbers.clone(),
+    );
+
+    let episode_start_number = episode_numbers
+        .first()
+        .copied()
+        .or_else(|| absolute_episode_numbers.first().copied());
+    let episode_end_number = episode_numbers
+        .last()
+        .copied()
+        .or_else(|| absolute_episode_numbers.last().copied());
+    let mut episode_type = parse_anime_episode_type(&normalized_input);
+    if sonarr_facts.special && episode_type == AnimeEpisodeType::Normal {
+        episode_type = AnimeEpisodeType::Special;
+    }
+    let mut batch_kind = parse_anime_batch_kind(
         &normalized_input,
         episode_type,
         &episode_numbers,
         &absolute_episode_numbers,
     );
+    if matches!(
+        sonarr_facts.batch_kind,
+        AnimeBatchKind::CompleteSeries
+            | AnimeBatchKind::SeasonPack
+            | AnimeBatchKind::MultiSeasonPack
+    ) && !matches!(
+        batch_kind,
+        AnimeBatchKind::CompleteSeries
+            | AnimeBatchKind::SeasonPack
+            | AnimeBatchKind::MultiSeasonPack
+    ) && episode_numbers.is_empty()
+        && absolute_episode_numbers.is_empty()
+    {
+        batch_kind = sonarr_facts.batch_kind;
+    } else if sonarr_facts.batch_kind == AnimeBatchKind::Range
+        && batch_kind == AnimeBatchKind::Single
+    {
+        batch_kind = AnimeBatchKind::Range;
+    }
     let version = parse_anime_version(&normalized_input);
     let crc32 = parse_crc32(&normalized_input);
-    let quality = parse_anime_quality(&normalized_input);
+    let quality = merge_anime_quality(
+        &sonarr_facts.quality,
+        parse_anime_quality(&normalized_input),
+    );
     let (audio_languages, subtitle_languages) = parse_anime_languages(&normalized_input);
+    let audio_languages = dedup_clean_strings(
+        audio_languages
+            .into_iter()
+            .chain(sonarr_facts.audio_languages.clone()),
+    );
+    let release_group = leading_bracket_release_group
+        .clone()
+        .or_else(|| sonarr_facts.release_group.clone());
+    let release_hash = sonarr_facts.release_hash.clone().or_else(|| crc32.clone());
+    let anime_signal_facts = build_anime_signal_facts(
+        &normalized_input,
+        &classifier_hints,
+        &bracket_segments,
+        leading_bracket_release_group,
+        &quality,
+        &subtitle_languages,
+    );
 
     let mut review_reasons = Vec::new();
     if series_title.is_none() {
@@ -480,9 +1201,12 @@ pub fn parse_anime_release_title(input: &str) -> AnimeParsedRelease {
         batch_kind,
         version,
         crc32,
+        release_hash,
         quality,
         audio_languages,
         subtitle_languages,
+        sonarr_facts,
+        anime_signal_facts,
         confidence,
         review_reasons,
     }
@@ -851,6 +1575,178 @@ pub fn score_anime_candidate_for_graph(
     score_anime_candidate(&AnimeCandidateScoringContext::from_graph(graph), candidate)
 }
 
+pub fn reconcile_anime_graph(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    alias_matches: &[AnimeAliasMatch],
+) -> AnimeGraphReconciliation {
+    let sonarr_structured_matches = match_targets_by_season_episode(
+        context,
+        parsed.sonarr_facts.season_number,
+        &parsed.sonarr_facts.episode_numbers,
+        "sonarr_season_episode",
+        112.0,
+    );
+    let sonarr_absolute_matches = match_targets_by_absolute_episode(
+        context,
+        &parsed.sonarr_facts.absolute_episode_numbers,
+        "sonarr_absolute_episode",
+        108.0,
+    );
+    let sonarr_target_matches = dedup_target_matches(
+        sonarr_structured_matches
+            .iter()
+            .cloned()
+            .chain(sonarr_absolute_matches.iter().cloned()),
+    );
+    let anime_signal_target_matches = match_anime_signal_targets(context, parsed);
+    let direct_target_matches = match_candidate_targets(context, parsed);
+
+    let has_sonarr_structured_facts = parsed.sonarr_facts.season_number.is_some()
+        && !parsed.sonarr_facts.episode_numbers.is_empty();
+    let has_sonarr_absolute_facts = !parsed.sonarr_facts.absolute_episode_numbers.is_empty();
+    let sonarr_structured_keys = target_identity_keys(&sonarr_structured_matches);
+    let sonarr_absolute_keys = target_identity_keys(&sonarr_absolute_matches);
+    let sonarr_agreement_keys = sonarr_structured_keys
+        .intersection(&sonarr_absolute_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut contradiction_reasons = Vec::new();
+    let mut review_reasons = Vec::new();
+    let mut rejection_reasons = Vec::new();
+    let mut outcome = AnimeReconciliationOutcome::Unexplainable;
+    let mut target_matches = Vec::new();
+
+    if has_sonarr_structured_facts
+        && has_sonarr_absolute_facts
+        && !sonarr_structured_matches.is_empty()
+        && !sonarr_absolute_matches.is_empty()
+    {
+        if sonarr_agreement_keys.is_empty() {
+            outcome = AnimeReconciliationOutcome::TrueContradiction;
+            contradiction_reasons.push("sonarr_absolute_and_sxxeyy_disagree".to_string());
+            review_reasons.push("graph_reconciliation_true_contradiction".to_string());
+            target_matches = dedup_target_matches(
+                sonarr_structured_matches
+                    .iter()
+                    .cloned()
+                    .chain(sonarr_absolute_matches.iter().cloned()),
+            );
+        } else {
+            outcome = AnimeReconciliationOutcome::Translation;
+            target_matches = dedup_target_matches(
+                sonarr_structured_matches
+                    .iter()
+                    .cloned()
+                    .chain(sonarr_absolute_matches.iter().cloned())
+                    .filter(|item| {
+                        target_identity_key(item)
+                            .is_some_and(|key| sonarr_agreement_keys.contains(&key))
+                    }),
+            );
+        }
+    } else if has_sonarr_structured_facts
+        && has_sonarr_absolute_facts
+        && (!sonarr_structured_matches.is_empty() || !sonarr_absolute_matches.is_empty())
+    {
+        outcome = AnimeReconciliationOutcome::BenignMismatch;
+        review_reasons.push("sonarr_mixed_numbering_partially_unmapped".to_string());
+        target_matches = if !sonarr_target_matches.is_empty() {
+            sonarr_target_matches.clone()
+        } else {
+            direct_target_matches.clone()
+        };
+    } else if !sonarr_target_matches.is_empty() {
+        let sonarr_keys = target_identity_keys(&sonarr_target_matches);
+        let additive_matches = anime_signal_target_matches
+            .iter()
+            .filter(|item| match target_identity_key(item) {
+                Some(key) => !sonarr_keys.contains(&key),
+                None => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if additive_matches.is_empty() {
+            outcome = AnimeReconciliationOutcome::Agreement;
+            target_matches = sonarr_target_matches.clone();
+        } else {
+            outcome = AnimeReconciliationOutcome::Augmentation;
+            target_matches = dedup_target_matches(
+                sonarr_target_matches
+                    .iter()
+                    .cloned()
+                    .chain(additive_matches),
+            );
+        }
+    } else if !anime_signal_target_matches.is_empty() {
+        outcome = AnimeReconciliationOutcome::Augmentation;
+        target_matches = anime_signal_target_matches.clone();
+    } else if !direct_target_matches.is_empty() {
+        outcome = AnimeReconciliationOutcome::Augmentation;
+        target_matches = direct_target_matches.clone();
+    }
+
+    if target_matches.is_empty()
+        && (!parsed.episode_numbers.is_empty() || !parsed.absolute_episode_numbers.is_empty())
+    {
+        outcome = AnimeReconciliationOutcome::Unexplainable;
+        rejection_reasons.push("graph_reconciliation_unexplainable".to_string());
+    }
+    if sonarr_target_matches.is_empty()
+        && parsed.absolute_episode_numbers.is_empty()
+        && anime_signal_target_matches
+            .iter()
+            .any(|item| item.match_reason == "anime_signal_season_one_hypothesis")
+    {
+        review_reasons.push("season_one_inference_requires_review".to_string());
+    }
+
+    let alias_best_score = alias_matches.first().map(|item| item.score);
+    let alias_margin = alias_match_margin(alias_matches);
+    let identity_agreed = alias_matches.first().is_some_and(|best| {
+        best.kind == AnimeAliasMatchKind::Exact
+            || (best.score >= 86.0 && alias_margin.unwrap_or(100.0) > 8.0)
+    });
+    if !identity_agreed && !alias_matches.is_empty() {
+        review_reasons.push("weak_alias_margin".to_string());
+    }
+
+    let sonarr_keys = target_identity_keys(&sonarr_target_matches);
+    let target_keys = target_identity_keys(&target_matches);
+    let agreed_target_keys = sonarr_keys
+        .intersection(&target_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let augmented_target_keys = target_keys
+        .difference(&sonarr_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    review_reasons.sort();
+    review_reasons.dedup();
+    rejection_reasons.sort();
+    rejection_reasons.dedup();
+    contradiction_reasons.sort();
+    contradiction_reasons.dedup();
+
+    AnimeGraphReconciliation {
+        outcome,
+        graph_fingerprint: context.graph_fingerprint.clone(),
+        identity_agreed,
+        alias_best_score,
+        alias_margin,
+        target_matches,
+        sonarr_target_matches,
+        anime_signal_target_matches,
+        agreed_target_keys,
+        augmented_target_keys,
+        contradiction_reasons,
+        review_reasons,
+        rejection_reasons,
+    }
+}
+
 pub fn score_anime_candidate(
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
@@ -858,10 +1754,11 @@ pub fn score_anime_candidate(
     let parsed = parse_anime_release_title(&candidate.title);
     let alias_table = build_anime_alias_table(context);
     let alias_matches = match_anime_aliases(&alias_table, &parsed);
-    let target_matches = match_candidate_targets(context, &parsed);
+    let reconciliation = reconcile_anime_graph(context, &parsed, &alias_matches);
+    let target_matches = reconciliation.target_matches.clone();
 
     let mut review_reasons = parsed.review_reasons.clone();
-    let mut rejection_reasons = Vec::new();
+    let mut rejection_reasons = reconciliation.rejection_reasons.clone();
 
     if alias_matches.is_empty() {
         rejection_reasons.push("no_graph_alias_match".to_string());
@@ -878,6 +1775,8 @@ pub fn score_anime_candidate(
             review_reasons.push("missing_graph_target_coverage".to_string());
         }
     }
+
+    review_reasons.extend(reconciliation.review_reasons.iter().cloned());
 
     if parsed.confidence == ReleaseConfidence::ReviewRequired {
         review_reasons.extend(parsed.review_reasons.iter().cloned());
@@ -925,6 +1824,7 @@ pub fn score_anime_candidate(
         parsed,
         alias_matches,
         target_matches,
+        reconciliation,
         outcome,
         confidence,
         score: breakdown.total,
@@ -934,13 +1834,191 @@ pub fn score_anime_candidate(
     }
 }
 
+pub fn anime_parser_diagnostics(
+    context: &AnimeCandidateScoringContext,
+    score: &AnimeCandidateScore,
+    coverage_plan: Option<&AnimeFileCoveragePlan>,
+) -> JsonValue {
+    json!(AnimeParserDiagnostics {
+        parser_provenance: anime_parser_provenance(context, score, coverage_plan),
+    })
+}
+
+pub fn anime_parser_provenance(
+    context: &AnimeCandidateScoringContext,
+    score: &AnimeCandidateScore,
+    coverage_plan: Option<&AnimeFileCoveragePlan>,
+) -> AnimeParserProvenance {
+    let parsed = &score.parsed;
+    let sonarr = &parsed.sonarr_facts;
+    let signals = &parsed.anime_signal_facts;
+    let final_confidence = coverage_plan
+        .map(|plan| plan.confidence)
+        .unwrap_or(score.confidence);
+    let final_review_reasons = coverage_plan
+        .map(|plan| {
+            sorted_unique_strings(
+                plan.review_reasons
+                    .iter()
+                    .cloned()
+                    .chain(score.review_reasons.iter().cloned()),
+            )
+        })
+        .unwrap_or_else(|| score.review_reasons.clone());
+    let final_rejection_reasons = coverage_plan
+        .map(|plan| {
+            sorted_unique_strings(
+                plan.rejection_reasons
+                    .iter()
+                    .cloned()
+                    .chain(score.rejection_reasons.iter().cloned()),
+            )
+        })
+        .unwrap_or_else(|| score.rejection_reasons.clone());
+
+    AnimeParserProvenance {
+        schema_version: ANIME_PARSER_PROVENANCE_SCHEMA_VERSION,
+        resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+        resolver_version: score.resolver_version.clone(),
+        parser_version: parsed.parser_version.clone(),
+        sonarr_adapter_version: sonarr.parser_version.clone(),
+        parsed: AnimeParsedReleaseProvenance {
+            original_title: parsed.original_title.clone(),
+            normalized_title: parsed.normalized_title.clone(),
+            series_title: parsed.series_title.clone(),
+            season_number: parsed.season_number,
+            episode_numbers: parsed.episode_numbers.clone(),
+            absolute_episode_numbers: parsed.absolute_episode_numbers.clone(),
+            episode_type: parsed.episode_type,
+            batch_kind: parsed.batch_kind,
+            release_group: parsed.release_group.clone(),
+            release_hash: parsed.release_hash.clone(),
+            quality: parsed.quality.clone(),
+            confidence: parsed.confidence,
+            review_reasons: parsed.review_reasons.clone(),
+        },
+        sonarr: AnimeSonarrParserProvenance {
+            parser_version: sonarr.parser_version.clone(),
+            matched_pattern_id: None,
+            matched_pattern_id_source: "rr2_public_parser_does_not_expose_regex_id".to_string(),
+            original_title: sonarr.original_title.clone(),
+            parsed_title: sonarr
+                .series_title
+                .clone()
+                .or_else(|| sonarr.title_without_year.clone()),
+            title_without_year: sonarr.title_without_year.clone(),
+            title_year: sonarr.title_year,
+            season_number: sonarr.season_number,
+            season_end_number: sonarr.season_end_number,
+            episode_numbers: sonarr.episode_numbers.clone(),
+            absolute_episode_numbers: sonarr.absolute_episode_numbers.clone(),
+            special_absolute_episode_numbers: sonarr.special_absolute_episode_numbers.clone(),
+            release_kind: sonarr.release_kind,
+            batch_kind: sonarr.batch_kind,
+            full_season: sonarr.full_season,
+            full_series: sonarr.full_series,
+            is_partial_season: sonarr.is_partial_season,
+            is_multi_season: sonarr.is_multi_season,
+            special: sonarr.special,
+            is_split_episode: sonarr.is_split_episode,
+            release_group: sonarr.release_group.clone(),
+            release_hash: sonarr.release_hash.clone(),
+            release_tokens: sonarr.release_tokens.clone(),
+            quality: sonarr.quality.clone(),
+            audio_languages: sonarr.audio_languages.clone(),
+        },
+        anime_signals: AnimeSignalParserProvenance {
+            parser_version: signals.parser_version.clone(),
+            classifier_hints: signals.classifier_hints.clone(),
+            title_candidates: signals.title_candidates.clone(),
+            normalized_title_candidates: signals.normalized_title_candidates.clone(),
+            title_season_alias_candidates: signals.title_season_alias_candidates.clone(),
+            fallback_absolute_episode_hypotheses: signals
+                .fallback_absolute_episode_hypotheses
+                .clone(),
+            fallback_season_one_episode_hypotheses: signals
+                .fallback_season_one_episode_hypotheses
+                .clone(),
+            bounded_explicit_ranges: signals.bounded_explicit_ranges.clone(),
+            dual_audio: signals.dual_audio,
+            english_dub: signals.english_dub,
+            multi_sub: signals.multi_sub,
+            subtitle_languages: signals.subtitle_languages.clone(),
+            leading_bracket_release_group: signals.leading_bracket_release_group.clone(),
+        },
+        graph: AnimeGraphMappingProvenance {
+            graph_fingerprint: score.reconciliation.graph_fingerprint.clone(),
+            alias_count: context.aliases.len(),
+            target_count: context.targets.len(),
+            alias_matches: score.alias_matches.clone(),
+            target_matches: score.target_matches.clone(),
+            sonarr_target_matches: score.reconciliation.sonarr_target_matches.clone(),
+            anime_signal_target_matches: score.reconciliation.anime_signal_target_matches.clone(),
+        },
+        reconciliation: AnimeReconciliationProvenance {
+            outcome: score.reconciliation.outcome,
+            identity_agreed: score.reconciliation.identity_agreed,
+            alias_best_score: score.reconciliation.alias_best_score,
+            alias_margin: score.reconciliation.alias_margin,
+            agreed_target_keys: score.reconciliation.agreed_target_keys.clone(),
+            augmented_target_keys: score.reconciliation.augmented_target_keys.clone(),
+            contradiction_reasons: score.reconciliation.contradiction_reasons.clone(),
+            review_reasons: score.reconciliation.review_reasons.clone(),
+            rejection_reasons: score.reconciliation.rejection_reasons.clone(),
+        },
+        outcome: score.outcome,
+        confidence: final_confidence,
+        score: score.score,
+        review_reasons: final_review_reasons,
+        rejection_reasons: final_rejection_reasons,
+        coverage: coverage_plan.map(anime_coverage_provenance),
+    }
+}
+
+fn anime_coverage_provenance(plan: &AnimeFileCoveragePlan) -> AnimeCoverageProvenance {
+    let covered_target_keys = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    AnimeCoverageProvenance {
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        release_kind: plan.release_kind,
+        confidence: plan.confidence,
+        requires_file_list: plan.requires_file_list,
+        requires_file_selection: plan.requires_file_selection,
+        selected_file_keys: plan.selected_file_keys.clone(),
+        entry_count: plan.entries.len(),
+        covered_target_keys,
+        review_reasons: plan.review_reasons.clone(),
+        rejection_reasons: plan.rejection_reasons.clone(),
+    }
+}
+
 pub fn plan_anime_file_coverage(
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
     files: &[AnimeReleaseFileInput],
 ) -> AnimeFileCoveragePlan {
+    plan_anime_file_coverage_with_options(
+        context,
+        candidate,
+        files,
+        AnimeCoverageOptions::default(),
+    )
+}
+
+pub fn plan_anime_file_coverage_with_options(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    options: AnimeCoverageOptions,
+) -> AnimeFileCoveragePlan {
     let candidate_score = score_anime_candidate(context, candidate);
-    let release_kind = anime_release_kind(&candidate_score.parsed);
+    let release_kind = anime_release_kind_for_coverage(&candidate_score.parsed);
     let coverage_kind = anime_coverage_kind(release_kind);
     let mut review_reasons = candidate_score.review_reasons.clone();
     let mut rejection_reasons = candidate_score.rejection_reasons.clone();
@@ -960,11 +2038,22 @@ pub fn plan_anime_file_coverage(
     } else if !files.is_empty() {
         review_reasons.retain(|reason| reason != "file_list_required_for_pack");
     }
+    if !files.is_empty() && pack_requires_file_coverage {
+        rejection_reasons.retain(|reason| {
+            !matches!(
+                reason.as_str(),
+                "no_graph_alias_match"
+                    | "no_graph_target_coverage"
+                    | "graph_reconciliation_unexplainable"
+            )
+        });
+    }
 
     if !rejection_reasons.is_empty() {
         return anime_file_coverage_plan(
             release_kind,
             ReleaseConfidence::Low,
+            false,
             false,
             Vec::new(),
             review_reasons,
@@ -1005,6 +2094,7 @@ pub fn plan_anime_file_coverage(
             release_kind,
             confidence,
             false,
+            false,
             entries,
             review_reasons,
             rejection_reasons,
@@ -1023,6 +2113,10 @@ pub fn plan_anime_file_coverage(
             release_kind,
             ReleaseConfidence::ReviewRequired,
             true,
+            matches!(
+                release_kind,
+                ReleaseKind::MultiSeasonPack | ReleaseKind::SeriesPack
+            ),
             Vec::new(),
             review_reasons,
             rejection_reasons,
@@ -1036,6 +2130,8 @@ pub fn plan_anime_file_coverage(
     let mut covered_targets = BTreeSet::new();
     let mut duplicate_targets = BTreeSet::new();
     let mut unmapped_media_files = Vec::new();
+    let mut unsafe_overfetch_files = Vec::new();
+    let mut skipped_overfetch_file_keys = BTreeSet::new();
     let mut unselectable_wanted_files = Vec::new();
     let mut has_media_files = false;
 
@@ -1061,12 +2157,26 @@ pub fn plan_anime_file_coverage(
             || file_score.confidence == ReleaseConfidence::ReviewRequired
             || file_score.target_matches.is_empty()
         {
-            unmapped_media_files.push(file.path.clone());
+            if pack_requires_file_coverage
+                && anime_file_score_looks_like_scoped_overfetch(&file_score)
+            {
+                if anime_file_has_safe_selection_id(file, options) {
+                    skipped_overfetch_file_keys.insert(file.file_key.clone());
+                } else {
+                    unsafe_overfetch_files.push(file.path.clone());
+                }
+            } else {
+                unmapped_media_files.push(file.path.clone());
+            }
             continue;
         }
         for target in file_score.target_matches {
             if !expected_targets.is_empty() && !expected_targets.contains(&target.target_key) {
-                unmapped_media_files.push(file.path.clone());
+                if anime_file_has_safe_selection_id(file, options) {
+                    skipped_overfetch_file_keys.insert(file.file_key.clone());
+                } else {
+                    unsafe_overfetch_files.push(file.path.clone());
+                }
                 continue;
             }
             if !covered_targets.insert(target.target_key.clone()) {
@@ -1099,6 +2209,9 @@ pub fn plan_anime_file_coverage(
     }
     if !unmapped_media_files.is_empty() {
         review_reasons.push("unmapped_media_files".to_string());
+    }
+    if !unsafe_overfetch_files.is_empty() {
+        review_reasons.push("pack_overfetch_without_safe_file_selection".to_string());
     }
     if !duplicate_targets.is_empty() {
         review_reasons.push("duplicate_target_file_match".to_string());
@@ -1136,6 +2249,7 @@ pub fn plan_anime_file_coverage(
         release_kind,
         confidence,
         false,
+        !skipped_overfetch_file_keys.is_empty(),
         entries,
         review_reasons,
         rejection_reasons,
@@ -1560,6 +2674,176 @@ fn alias_match_is_ambiguous(matches: &[AnimeAliasMatch]) -> bool {
     })
 }
 
+fn alias_match_margin(matches: &[AnimeAliasMatch]) -> Option<f64> {
+    let best = matches.first()?;
+    matches
+        .iter()
+        .skip(1)
+        .find(|candidate| candidate.normalized != best.normalized)
+        .map(|candidate| best.score - candidate.score)
+}
+
+fn match_anime_signal_targets(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+) -> Vec<AnimeCandidateTargetMatch> {
+    let sonarr_episodes = parsed
+        .sonarr_facts
+        .episode_numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let signal_episodes = parsed
+        .episode_numbers
+        .iter()
+        .copied()
+        .filter(|episode| !sonarr_episodes.contains(episode))
+        .collect::<Vec<_>>();
+
+    let sonarr_absolute = parsed
+        .sonarr_facts
+        .absolute_episode_numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut signal_absolute = parsed
+        .absolute_episode_numbers
+        .iter()
+        .copied()
+        .filter(|episode| !sonarr_absolute.contains(episode))
+        .collect::<BTreeSet<_>>();
+    signal_absolute.extend(
+        parsed
+            .anime_signal_facts
+            .fallback_absolute_episode_hypotheses
+            .iter()
+            .copied()
+            .filter(|episode| !sonarr_absolute.contains(episode)),
+    );
+
+    let mut matches = Vec::new();
+    matches.extend(match_targets_by_season_episode(
+        context,
+        parsed.season_number,
+        &signal_episodes,
+        "anime_signal_season_episode",
+        88.0,
+    ));
+    matches.extend(match_targets_by_absolute_episode(
+        context,
+        &signal_absolute.into_iter().collect::<Vec<_>>(),
+        "anime_signal_absolute_episode",
+        86.0,
+    ));
+
+    let fallback_season_one = parsed
+        .anime_signal_facts
+        .fallback_season_one_episode_hypotheses
+        .iter()
+        .copied()
+        .filter(|episode| !sonarr_episodes.contains(episode))
+        .collect::<Vec<_>>();
+    matches.extend(match_targets_by_season_episode(
+        context,
+        Some(1),
+        &fallback_season_one,
+        "anime_signal_season_one_hypothesis",
+        72.0,
+    ));
+
+    dedup_target_matches(matches)
+}
+
+fn match_targets_by_season_episode(
+    context: &AnimeCandidateScoringContext,
+    season_number: Option<i32>,
+    episode_numbers: &[i32],
+    reason: &str,
+    base_score: f64,
+) -> Vec<AnimeCandidateTargetMatch> {
+    let Some(parsed_season) = season_number else {
+        return Vec::new();
+    };
+    let episode_numbers = episode_numbers.iter().copied().collect::<BTreeSet<_>>();
+    if episode_numbers.is_empty() {
+        return Vec::new();
+    }
+    context
+        .targets
+        .iter()
+        .filter(|target| {
+            target.season_number == Some(parsed_season)
+                && target
+                    .episode_number
+                    .is_some_and(|episode| episode_numbers.contains(&episode))
+        })
+        .map(|target| {
+            candidate_target_match(target, reason, base_score + target_identity_bonus(target))
+        })
+        .collect()
+}
+
+fn match_targets_by_absolute_episode(
+    context: &AnimeCandidateScoringContext,
+    absolute_episode_numbers: &[i32],
+    reason: &str,
+    base_score: f64,
+) -> Vec<AnimeCandidateTargetMatch> {
+    let absolute_episode_numbers = absolute_episode_numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if absolute_episode_numbers.is_empty() {
+        return Vec::new();
+    }
+    context
+        .targets
+        .iter()
+        .filter(|target| {
+            target
+                .absolute_episode_number
+                .is_some_and(|episode| absolute_episode_numbers.contains(&episode))
+        })
+        .map(|target| {
+            candidate_target_match(target, reason, base_score + target_identity_bonus(target))
+        })
+        .collect()
+}
+
+fn dedup_target_matches(
+    matches: impl IntoIterator<Item = AnimeCandidateTargetMatch>,
+) -> Vec<AnimeCandidateTargetMatch> {
+    let mut by_key = BTreeMap::<String, AnimeCandidateTargetMatch>::new();
+    for target_match in matches {
+        match by_key.get(&target_match.target_key) {
+            Some(existing) if existing.score >= target_match.score => {}
+            _ => {
+                by_key.insert(target_match.target_key.clone(), target_match);
+            }
+        }
+    }
+    let mut matches = by_key.into_values().collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.target_key.cmp(&right.target_key))
+    });
+    matches
+}
+
+fn target_identity_key(target_match: &AnimeCandidateTargetMatch) -> Option<String> {
+    target_match
+        .canonical_key
+        .clone()
+        .or_else(|| Some(target_match.target_key.clone()))
+}
+
+fn target_identity_keys(matches: &[AnimeCandidateTargetMatch]) -> BTreeSet<String> {
+    matches.iter().filter_map(target_identity_key).collect()
+}
+
 fn match_candidate_targets(
     context: &AnimeCandidateScoringContext,
     parsed: &AnimeParsedRelease,
@@ -1803,6 +3087,20 @@ fn anime_release_kind(parsed: &AnimeParsedRelease) -> ReleaseKind {
     }
 }
 
+fn anime_release_kind_for_coverage(parsed: &AnimeParsedRelease) -> ReleaseKind {
+    let parsed_kind = anime_release_kind(parsed);
+    let sonarr_kind = parsed.sonarr_facts.release_kind;
+    match (sonarr_kind, parsed_kind) {
+        (
+            ReleaseKind::SeasonPack | ReleaseKind::MultiSeasonPack | ReleaseKind::SeriesPack,
+            ReleaseKind::Single | ReleaseKind::MultiEpisode | ReleaseKind::Unknown,
+        ) => sonarr_kind,
+        (ReleaseKind::MultiEpisode, ReleaseKind::Single | ReleaseKind::Unknown) => sonarr_kind,
+        (kind, ReleaseKind::Unknown) if kind != ReleaseKind::Unknown => kind,
+        (_, kind) => kind,
+    }
+}
+
 fn anime_coverage_kind(release_kind: ReleaseKind) -> ReleaseCoverageKind {
     match release_kind {
         ReleaseKind::Single => ReleaseCoverageKind::SingleEpisode,
@@ -1818,6 +3116,7 @@ fn anime_file_coverage_plan(
     release_kind: ReleaseKind,
     confidence: ReleaseConfidence,
     requires_file_list: bool,
+    requires_file_selection: bool,
     entries: Vec<AnimeFileCoverageEntry>,
     mut review_reasons: Vec<String>,
     mut rejection_reasons: Vec<String>,
@@ -1838,6 +3137,7 @@ fn anime_file_coverage_plan(
         release_kind,
         confidence,
         requires_file_list,
+        requires_file_selection,
         selected_file_keys,
         entries,
         review_reasons,
@@ -1861,6 +3161,18 @@ fn expected_anime_pack_targets(
                         .filter(|target| target.season_number == Some(season))
                         .map(|target| target.target_key.clone()),
                 );
+                if expected.is_empty()
+                    && context.targets.iter().all(|target| {
+                        target.season_number.is_none() && target.absolute_episode_number.is_some()
+                    })
+                {
+                    expected.extend(
+                        context
+                            .targets
+                            .iter()
+                            .map(|target| target.target_key.clone()),
+                    );
+                }
             } else {
                 let seasons = context
                     .targets
@@ -1888,6 +3200,34 @@ fn expected_anime_pack_targets(
         _ => {}
     }
     expected
+}
+
+fn anime_file_has_safe_selection_id(
+    file: &AnimeReleaseFileInput,
+    options: AnimeCoverageOptions,
+) -> bool {
+    options.file_selection_supported
+        && file.selectable
+        && file
+            .file_id
+            .as_deref()
+            .is_some_and(|file_id| !file_id.trim().is_empty())
+}
+
+fn anime_file_score_looks_like_scoped_overfetch(score: &AnimeCandidateScore) -> bool {
+    !score.alias_matches.is_empty()
+        && !score
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason == "no_graph_alias_match")
+        && (!score.parsed.episode_numbers.is_empty()
+            || !score.parsed.absolute_episode_numbers.is_empty()
+            || !score.parsed.sonarr_facts.episode_numbers.is_empty()
+            || !score
+                .parsed
+                .sonarr_facts
+                .absolute_episode_numbers
+                .is_empty())
 }
 
 fn is_anime_media_file(path: &str) -> bool {
@@ -2412,12 +3752,18 @@ fn parse_absolute_episode_numbers(input: &str, bracket_segments: &[String]) -> V
     if let Some(captures) = BATCH_EPISODE_RANGE_RE.captures(input)
         && let Some(start) = parse_capture_i32(&captures, "start")
     {
+        if number_is_file_size_token(input, start) {
+            return Vec::new();
+        }
         let end = parse_capture_i32(&captures, "end").unwrap_or(start);
         return expand_episode_numbers(start, end, 200);
     }
     if let Some(captures) = DASH_EPISODE_RE.captures(input)
         && let Some(start) = parse_capture_i32(&captures, "start")
     {
+        if number_is_file_size_token(input, start) {
+            return Vec::new();
+        }
         let end = parse_capture_i32(&captures, "end").unwrap_or(start);
         return expand_episode_numbers(start, end, 200);
     }
@@ -2439,8 +3785,20 @@ fn parse_episode_segment_numbers(segment: &str) -> Option<(i32, i32)> {
     if looks_like_resolution_number(start, normalized.trim()) {
         return None;
     }
+    if number_is_file_size_token(&normalized, start) {
+        return None;
+    }
     let end = parse_capture_i32(&captures, "end").unwrap_or(start);
     Some((start, end))
+}
+
+fn number_is_file_size_token(input: &str, number: i32) -> bool {
+    FILE_SIZE_TOKEN_RE.captures_iter(input).any(|captures| {
+        captures
+            .name("size")
+            .and_then(|value| value.as_str().parse::<i32>().ok())
+            .is_some_and(|size| size == number)
+    })
 }
 
 fn expand_episode_numbers(start: i32, end: i32, max_span: i32) -> Vec<i32> {
@@ -2538,22 +3896,30 @@ fn parse_crc32(input: &str) -> Option<String> {
 }
 
 fn parse_anime_quality(input: &str) -> AnimeParsedQuality {
-    let lower = input.to_ascii_lowercase();
+    let normalized = input.replace('_', " ");
     let resolution = RESOLUTION_RE.captures(input).and_then(|captures| {
         captures
             .name("resolution")
             .map(|value| normalize_resolution(value.as_str()))
     });
-    let source = if lower.contains("web-dl") || lower.contains("webdl") {
+    let source = if RAW_HD_SOURCE_RE.is_match(&normalized) {
+        Some("raw_hd".to_string())
+    } else if WEB_DL_SOURCE_RE.is_match(&normalized) {
         Some("web_dl".to_string())
-    } else if lower.contains("webrip") || lower.contains("web-rip") {
+    } else if WEB_RIP_SOURCE_RE.is_match(&normalized) {
         Some("web_rip".to_string())
-    } else if lower.contains("bluray") || lower.contains("blu-ray") || lower.contains("bdrip") {
+    } else if BLURAY_SOURCE_RE.is_match(&normalized) {
         Some("blu_ray".to_string())
-    } else if lower.contains("hdtv") {
+    } else if HDTV_SOURCE_RE.is_match(&normalized) {
         Some("hdtv".to_string())
-    } else if lower.contains("dvd") {
+    } else if DVD_SOURCE_RE.is_match(&normalized) {
         Some("dvd".to_string())
+    } else if PDTV_SOURCE_RE.is_match(&normalized) {
+        Some("pdtv".to_string())
+    } else if DSR_SOURCE_RE.is_match(&normalized) {
+        Some("dsr".to_string())
+    } else if SDTV_SOURCE_RE.is_match(&normalized) {
+        Some("sdtv".to_string())
     } else {
         None
     };
@@ -2570,38 +3936,58 @@ fn parse_anime_quality(input: &str) -> AnimeParsedQuality {
                 .name("audio")
                 .map(|value| value.as_str().to_uppercase())
         }),
-        dual_audio: lower.contains("dual audio") || lower.contains("dual-audio"),
-        multi_sub: lower.contains("multisub")
-            || lower.contains("multi-sub")
-            || lower.contains("multi subs")
-            || lower.contains("multiple subtitle")
-            || lower.contains("简繁")
-            || lower.contains("雙語")
-            || lower.contains("双语"),
+        dual_audio: DUAL_AUDIO_SIGNAL_RE.is_match(&normalized),
+        multi_sub: MULTI_SUB_SIGNAL_RE.is_match(&normalized),
     }
 }
 
 fn parse_anime_languages(input: &str) -> (Vec<String>, Vec<String>) {
     let mut audio = BTreeSet::new();
     let mut subtitles = BTreeSet::new();
-    let upper = input.to_uppercase();
-    for (token, language) in [
-        ("JPN", "JPN"),
-        ("JAP", "JPN"),
-        ("ENG", "ENG"),
-        ("ENGLISH", "ENG"),
-        ("CHS", "CHS"),
-        ("GB", "CHS"),
-        ("CHT", "CHT"),
-        ("BIG5", "CHT"),
-    ] {
-        if upper.contains(token) {
-            if matches!(language, "JPN" | "ENG") {
-                audio.insert(language.to_string());
-            } else {
-                subtitles.insert(language.to_string());
-            }
+
+    let normalized = normalize_language_signal_input(input);
+    let normalized_lower = normalized.to_ascii_lowercase();
+    let subtitle_only_context = (normalized_lower.contains(" sub")
+        || normalized_lower.contains(" subtitle"))
+        && !normalized_lower.contains(" dub")
+        && !normalized_lower.contains(" audio");
+
+    for captures in ANIME_LANGUAGE_RE.captures_iter(&normalized) {
+        let Some(raw) = captures.get(0).map(|value| value.as_str()) else {
+            continue;
+        };
+        let token = raw
+            .replace(['-', '_', '.'], " ")
+            .replace(['ñ', 'Ñ'], "N")
+            .to_ascii_uppercase();
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
         }
+
+        if matches!(token, "DUAL" | "DUAL AUDIO" | "MULTI") {
+            continue;
+        }
+        if matches!(token, "MULTI SUB" | "MULTI SUBS" | "MULTISUB") {
+            subtitles.insert("MULTI".to_string());
+            continue;
+        }
+        if matches!(token, "SUB" | "SUBS" | "SUBBED") {
+            continue;
+        }
+
+        let Some(language) = normalize_anime_language_token(token) else {
+            continue;
+        };
+        if is_subtitle_language_token(token, language) || subtitle_only_context {
+            subtitles.insert(language.to_string());
+        } else {
+            audio.insert(language.to_string());
+        }
+    }
+
+    if ENGLISH_DUB_SIGNAL_RE.is_match(&normalized) {
+        audio.insert("ENG".to_string());
     }
     if input.contains("简体") || input.contains("簡體") || input.contains("繁中") {
         subtitles.insert("CHS".to_string());
@@ -2615,17 +4001,57 @@ fn parse_anime_languages(input: &str) -> (Vec<String>, Vec<String>) {
     }
     if input.to_ascii_lowercase().contains("multi-sub")
         || input.to_ascii_lowercase().contains("multisub")
+        || MULTI_SUB_SIGNAL_RE.is_match(&normalized)
     {
         subtitles.insert("MULTI".to_string());
     }
     (audio.into_iter().collect(), subtitles.into_iter().collect())
 }
 
+fn normalize_language_signal_input(input: &str) -> String {
+    input
+        .replace('\u{3000}', " ")
+        .replace(['.', '_', '-', '/', '[', ']', '(', ')'], " ")
+}
+
+fn normalize_anime_language_token(token: &str) -> Option<&'static str> {
+    match token {
+        "ENG" | "ENGLISH" => Some("ENG"),
+        "TRUEFRENCH" | "FRENCH" | "FRE" | "FRA" | "FR" | "SUBFRENCH" | "VOSTFR" | "VF" | "VF2"
+        | "VFQ" | "VFF" | "VFI" => Some("FRE"),
+        "GERMAN" | "SWISSGERMAN" | "GER" => Some("GER"),
+        "ITALIAN" | "ITALY" | "ITA" => Some("ITA"),
+        "SPANISH" | "ESPAÑOL" | "ESPANOL" | "CASTELLANO" | "SPA" | "ESP" => Some("SPA"),
+        "CZECH" | "CZE" => Some("CZE"),
+        "JAPANESE" | "JPN" | "JAP" | "JA" => Some("JPN"),
+        "CHINESE" | "CANTONESE" | "MANDARIN" | "CHI" => Some("CHI"),
+        "CHS" | "GB" => Some("CHS"),
+        "CHT" | "BIG5" => Some("CHT"),
+        "KOREAN" | "KOR" => Some("KOR"),
+        "LATVIAN" | "LAT" | "LAV" | "LV" => Some("LV"),
+        "RUSSIAN" | "RUS" | "RU" => Some("RUS"),
+        "POLISH" | "PL" | "PLDUB" | "DUBPL" | "PLLEK" | "LEKPL" => Some("POL"),
+        "DANISH" | "DAN" => Some("DAN"),
+        "DUTCH" | "FLEMISH" => Some("DUT"),
+        "PORTUGUESE" | "POR" => Some("POR"),
+        _ => None,
+    }
+}
+
+fn is_subtitle_language_token(token: &str, language: &str) -> bool {
+    matches!(token, "SUBFRENCH" | "VOSTFR")
+        || matches!(language, "CHS" | "CHT")
+        || token.contains("SUB")
+}
+
 fn normalize_resolution(value: &str) -> String {
     match value.to_ascii_lowercase().as_str() {
-        "1920x1080" | "1080p10" => "1080p".to_string(),
-        "1280x720" => "720p".to_string(),
-        "4k" | "uhd" => "2160p".to_string(),
+        "1920x1080" | "1080p10" | "1080i" | "1440p" | "fhd" | "4kto1080p" | "bluray1080p"
+        | "bd1080p" => "1080p".to_string(),
+        "1280x720" | "720i" | "960p" | "bluray720p" | "bd720p" => "720p".to_string(),
+        "576i" => "576p".to_string(),
+        "480i" | "640x480" | "848x480" => "480p".to_string(),
+        "4096x2160" | "3840x2160" | "4k" | "uhd" | "2160i" => "2160p".to_string(),
         other => other.to_string(),
     }
 }
@@ -2636,6 +4062,9 @@ fn normalize_codec(value: &str) -> String {
         "h264" | "x264" | "avc" => "H264".to_string(),
         "av1" => "AV1".to_string(),
         "vp9" => "VP9".to_string(),
+        "xvid" => "XVID".to_string(),
+        "divx" => "DIVX".to_string(),
+        "mpeg2" | "mpeg-2" => "MPEG2".to_string(),
         _ => value.to_uppercase(),
     }
 }
@@ -2666,6 +4095,15 @@ fn is_metadata_segment(segment: &str) -> bool {
     RESOLUTION_RE.is_match(&value)
         || CODEC_RE.is_match(&value)
         || AUDIO_CODEC_RE.is_match(&value)
+        || WEB_DL_SOURCE_RE.is_match(&value)
+        || WEB_RIP_SOURCE_RE.is_match(&value)
+        || BLURAY_SOURCE_RE.is_match(&value)
+        || HDTV_SOURCE_RE.is_match(&value)
+        || DVD_SOURCE_RE.is_match(&value)
+        || RAW_HD_SOURCE_RE.is_match(&value)
+        || DUAL_AUDIO_SIGNAL_RE.is_match(&value)
+        || MULTI_SUB_SIGNAL_RE.is_match(&value)
+        || ANIME_LANGUAGE_RE.is_match(&value)
         || CRC32_RE.is_match(&format!("[{value}]"))
         || lower.contains("web-dl")
         || lower.contains("webrip")
@@ -2963,10 +4401,56 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
+    struct AnimeReconciliationGoldenSet {
+        fixture_set: String,
+        resolver: String,
+        classification: String,
+        cases: Vec<AnimeReconciliationGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AnimeReconciliationGoldenCase {
+        id: String,
+        classification: String,
+        input: String,
+        aliases: Vec<String>,
+        targets: Vec<AnimeReconciliationTarget>,
+        expected: AnimeReconciliationExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AnimeReconciliationTarget {
+        target_key: String,
+        canonical_key: Option<String>,
+        title: String,
+        season_number: Option<i32>,
+        episode_number: Option<i32>,
+        absolute_episode_number: Option<i32>,
+        tvdb_episode_id: Option<String>,
+        anidb_episode_id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AnimeReconciliationExpected {
+        outcome: String,
+        target_keys: Vec<String>,
+        review_reasons: Vec<String>,
+        rejection_reasons: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct AnimeParserGoldenSet {
         fixture_set: String,
         resolver: String,
         classification: String,
+        #[serde(default)]
+        sonarr_commit: Option<String>,
+        #[serde(default)]
+        source_fixture_set: Option<String>,
         cases: Vec<AnimeParserGoldenCase>,
     }
 
@@ -2975,6 +4459,16 @@ mod tests {
     struct AnimeParserGoldenCase {
         id: String,
         classification: String,
+        #[serde(default)]
+        source_fixture: Option<String>,
+        #[serde(default)]
+        source_method: Option<String>,
+        #[serde(default)]
+        source_line: Option<u64>,
+        #[serde(default)]
+        source_classification: Option<String>,
+        #[serde(default)]
+        origin: Option<String>,
         input: String,
         expected: AnimeParserExpected,
     }
@@ -3019,9 +4513,37 @@ mod tests {
         .expect("valid RR-3 metadata graph golden fixture")
     }
 
+    fn load_anime_reconciliation_goldens() -> AnimeReconciliationGoldenSet {
+        serde_json::from_str(include_str!(
+            "fixtures/anime_rr3_reconciliation_goldens.json"
+        ))
+        .expect("valid RR-3Q reconciliation golden fixture")
+    }
+
     fn load_anime_parser_goldens() -> AnimeParserGoldenSet {
         serde_json::from_str(include_str!("fixtures/anime_rr3_parser_goldens.json"))
             .expect("valid RR-3 anime parser golden fixture")
+    }
+
+    fn load_anime_quality_goldens() -> AnimeParserGoldenSet {
+        serde_json::from_str(include_str!(
+            "fixtures/sonarr_rr3_anime_quality_goldens.json"
+        ))
+        .expect("valid RR-3O anime quality golden fixture")
+    }
+
+    fn load_anime_language_goldens() -> AnimeParserGoldenSet {
+        serde_json::from_str(include_str!(
+            "fixtures/sonarr_rr3_anime_language_goldens.json"
+        ))
+        .expect("valid RR-3O anime language golden fixture")
+    }
+
+    fn load_anime_release_group_goldens() -> AnimeParserGoldenSet {
+        serde_json::from_str(include_str!(
+            "fixtures/sonarr_rr3_anime_release_group_goldens.json"
+        ))
+        .expect("valid RR-3O anime release group golden fixture")
     }
 
     fn load_sonarr_generated_payload() -> Value {
@@ -3035,11 +4557,189 @@ mod tests {
         let allowed = [
             "rr3_asserted",
             "rr3d_asserted",
+            "rr3q_asserted",
             "unsupported_by_product_policy",
         ];
         assert!(
             allowed.contains(&classification),
             "{id} has non-production RR-3 classification {classification}"
+        );
+    }
+
+    fn rr3_fixture_payloads() -> Vec<(&'static str, JsonValue)> {
+        vec![
+            (
+                "anime_rr3_shoko_inventory.json",
+                serde_json::from_str(include_str!("fixtures/anime_rr3_shoko_inventory.json"))
+                    .expect("valid RR-3 Shoko inventory fixture"),
+            ),
+            (
+                "anime_rr3_sonarr_seed_fixtures.json",
+                serde_json::from_str(include_str!("fixtures/anime_rr3_sonarr_seed_fixtures.json"))
+                    .expect("valid RR-3 Sonarr anime seed fixture"),
+            ),
+            (
+                "anime_rr3_parser_goldens.json",
+                serde_json::from_str(include_str!("fixtures/anime_rr3_parser_goldens.json"))
+                    .expect("valid RR-3 anime parser golden fixture"),
+            ),
+            (
+                "sonarr_rr3_anime_quality_goldens.json",
+                serde_json::from_str(include_str!(
+                    "fixtures/sonarr_rr3_anime_quality_goldens.json"
+                ))
+                .expect("valid RR-3O anime quality golden fixture"),
+            ),
+            (
+                "sonarr_rr3_anime_language_goldens.json",
+                serde_json::from_str(include_str!(
+                    "fixtures/sonarr_rr3_anime_language_goldens.json"
+                ))
+                .expect("valid RR-3O anime language golden fixture"),
+            ),
+            (
+                "sonarr_rr3_anime_release_group_goldens.json",
+                serde_json::from_str(include_str!(
+                    "fixtures/sonarr_rr3_anime_release_group_goldens.json"
+                ))
+                .expect("valid RR-3O anime release group golden fixture"),
+            ),
+            (
+                "anime_rr3_metadata_graph_goldens.json",
+                serde_json::from_str(include_str!(
+                    "fixtures/anime_rr3_metadata_graph_goldens.json"
+                ))
+                .expect("valid RR-3 metadata graph golden fixture"),
+            ),
+            (
+                "anime_rr3_reconciliation_goldens.json",
+                serde_json::from_str(include_str!(
+                    "fixtures/anime_rr3_reconciliation_goldens.json"
+                ))
+                .expect("valid RR-3Q reconciliation golden fixture"),
+            ),
+        ]
+    }
+
+    fn collect_pending_rr3_fixture_values(
+        fixture: &str,
+        path: &str,
+        value: &JsonValue,
+        failures: &mut Vec<String>,
+    ) {
+        match value {
+            JsonValue::String(text) => {
+                let normalized = text.to_ascii_lowercase();
+                if normalized.contains("pending")
+                    || normalized == "known_parity_gap"
+                    || normalized == "parity_gap_pending"
+                    || normalized == "rr3_pending"
+                    || normalized == "anime_rr3_pending"
+                {
+                    failures.push(format!("{fixture}:{path} = {text:?}"));
+                }
+            }
+            JsonValue::Array(values) => {
+                for (index, item) in values.iter().enumerate() {
+                    collect_pending_rr3_fixture_values(
+                        fixture,
+                        &format!("{path}[{index}]"),
+                        item,
+                        failures,
+                    );
+                }
+            }
+            JsonValue::Object(values) => {
+                for (key, item) in values {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_pending_rr3_fixture_values(fixture, &child_path, item, failures);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_rr3_fixture_gate_counts_are_frozen() {
+        let inventory = load_shoko_inventory();
+        let seed = load_anime_seed_set();
+        let parser_goldens = load_anime_parser_goldens();
+        let quality_goldens = load_anime_quality_goldens();
+        let language_goldens = load_anime_language_goldens();
+        let release_group_goldens = load_anime_release_group_goldens();
+        let graph_goldens = load_anime_graph_goldens();
+        let reconciliation_goldens = load_anime_reconciliation_goldens();
+        let source = load_sonarr_generated_payload();
+
+        assert_eq!(inventory.fixture_set, "rr3-shoko-anime-resolver-inventory");
+        assert_eq!(inventory.inspected_source_files.len(), 18);
+        assert_eq!(inventory.fixture_schemas.len(), 5);
+
+        assert_eq!(seed.fixture_set, "rr3-sonarr-anime-seed-fixtures");
+        assert_eq!(seed.counts.total, 60);
+        assert_eq!(seed.counts.release_group, 6);
+        assert_eq!(seed.counts.unicode_title, 54);
+        assert_eq!(seed.cases.len(), 60);
+
+        assert_eq!(parser_goldens.fixture_set, "rr3-anime-parser-goldens");
+        assert_eq!(parser_goldens.cases.len(), 8);
+        assert_eq!(quality_goldens.fixture_set, "rr3o-sonarr-anime-quality");
+        assert_eq!(quality_goldens.cases.len(), 7);
+        assert_eq!(language_goldens.fixture_set, "rr3o-sonarr-anime-language");
+        assert_eq!(language_goldens.cases.len(), 8);
+        assert_eq!(
+            release_group_goldens.fixture_set,
+            "rr3o-sonarr-anime-release-group"
+        );
+        assert_eq!(release_group_goldens.cases.len(), 7);
+        assert_eq!(
+            graph_goldens.fixture_set,
+            "rr3-anime-metadata-graph-goldens"
+        );
+        assert_eq!(graph_goldens.cases.len(), 4);
+        assert_eq!(
+            reconciliation_goldens.fixture_set,
+            "rr3q-anime-reconciliation-goldens"
+        );
+        assert_eq!(reconciliation_goldens.cases.len(), 7);
+
+        let source_cases = source["cases"].as_array().expect("source cases array");
+        assert_eq!(source_cases.len(), 1192);
+        assert_eq!(
+            source_cases
+                .iter()
+                .filter(|case| case["classification"].as_str() == Some("anime_rr3"))
+                .count(),
+            60
+        );
+        assert_eq!(
+            source_cases
+                .iter()
+                .filter(|case| {
+                    case["classification"].as_str() == Some("unsupported_by_product_policy")
+                })
+                .count(),
+            13
+        );
+        assert_eq!(
+            source_cases
+                .iter()
+                .filter(|case| case["skipReason"].as_str() == Some("known_parity_gap"))
+                .count(),
+            0
+        );
+
+        let mut pending = Vec::new();
+        for (fixture, payload) in rr3_fixture_payloads() {
+            collect_pending_rr3_fixture_values(fixture, "", &payload, &mut pending);
+        }
+        assert!(
+            pending.is_empty(),
+            "RR-3 production fixtures still contain pending/parity-gap rows:\n{}",
+            pending.join("\n")
         );
     }
 
@@ -3138,6 +4838,21 @@ mod tests {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+            }
+        }
+    }
+
+    impl AnimeReconciliationTarget {
+        fn to_candidate_target(&self) -> AnimeCandidateTarget {
+            AnimeCandidateTarget {
+                target_key: self.target_key.clone(),
+                canonical_key: self.canonical_key.clone(),
+                title: self.title.clone(),
+                season_number: self.season_number,
+                episode_number: self.episode_number,
+                absolute_episode_number: self.absolute_episode_number,
+                tvdb_episode_id: self.tvdb_episode_id.clone(),
+                anidb_episode_id: self.anidb_episode_id.clone(),
             }
         }
     }
@@ -3278,6 +4993,75 @@ mod tests {
                 &parsed.review_reasons, review_reasons,
                 "{id} review reasons"
             );
+        }
+    }
+
+    fn assert_anime_parser_golden_set(
+        goldens: &AnimeParserGoldenSet,
+        expected_fixture_set: &str,
+        expected_case_count: usize,
+    ) {
+        assert_eq!(goldens.fixture_set, expected_fixture_set);
+        assert_eq!(goldens.resolver, "anime_shoko_style");
+        assert_eq!(goldens.classification, "rr3d_asserted");
+        if let Some(sonarr_commit) = goldens.sonarr_commit.as_deref() {
+            assert_eq!(sonarr_commit, "bf5d48c", "{expected_fixture_set} commit");
+        }
+        if let Some(source_fixture_set) = goldens.source_fixture_set.as_deref() {
+            assert_eq!(
+                source_fixture_set, "rr2-sonarr-conventional-tv-exhaustive",
+                "{expected_fixture_set} source fixture set"
+            );
+        }
+        assert_eq!(
+            goldens.cases.len(),
+            expected_case_count,
+            "{expected_fixture_set} case count"
+        );
+
+        let mut seen = BTreeSet::new();
+        for case in &goldens.cases {
+            assert!(
+                seen.insert(case.id.as_str()),
+                "duplicate golden id {}",
+                case.id
+            );
+            assert_eq!(case.classification, "rr3d_asserted", "{}", case.id);
+            if goldens.source_fixture_set.as_deref()
+                == Some("rr2-sonarr-conventional-tv-exhaustive")
+                && case.origin.as_deref() != Some("elixir_rr3o_enrichment")
+            {
+                assert!(
+                    case.source_fixture
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{} missing source fixture",
+                    case.id
+                );
+                assert!(
+                    case.source_method
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{} missing source method",
+                    case.id
+                );
+                assert!(
+                    case.source_line.is_some_and(|value| value > 0),
+                    "{} missing source line",
+                    case.id
+                );
+                assert!(
+                    matches!(
+                        case.source_classification.as_deref(),
+                        Some("tv_rr2" | "anime_rr3" | "unsupported_by_product_policy")
+                    ),
+                    "{} source classification missing",
+                    case.id
+                );
+            }
+            let parsed = parse_anime_release_title(&case.input);
+            assert_parser_expected(&case.id, &parsed, &case.expected);
+            assert_eq!(parsed.parser_version, ANIME_PRE_DOWNLOAD_PARSER_VERSION);
         }
     }
 
@@ -3526,16 +5310,167 @@ mod tests {
     #[test]
     fn rr3_anime_parser_goldens_pass() {
         let goldens = load_anime_parser_goldens();
-        assert_eq!(goldens.fixture_set, "rr3-anime-parser-goldens");
-        assert_eq!(goldens.resolver, "anime_shoko_style");
-        assert_eq!(goldens.classification, "rr3d_asserted");
+        assert_anime_parser_golden_set(&goldens, "rr3-anime-parser-goldens", 8);
+    }
 
-        for case in &goldens.cases {
-            assert_eq!(case.classification, "rr3d_asserted", "{}", case.id);
-            let parsed = parse_anime_release_title(&case.input);
-            assert_parser_expected(&case.id, &parsed, &case.expected);
-            assert_eq!(parsed.parser_version, ANIME_PRE_DOWNLOAD_PARSER_VERSION);
-        }
+    #[test]
+    fn rr3o_anime_quality_goldens_pass() {
+        let goldens = load_anime_quality_goldens();
+        assert_anime_parser_golden_set(&goldens, "rr3o-sonarr-anime-quality", 7);
+    }
+
+    #[test]
+    fn rr3o_anime_language_goldens_pass() {
+        let goldens = load_anime_language_goldens();
+        assert_anime_parser_golden_set(&goldens, "rr3o-sonarr-anime-language", 8);
+    }
+
+    #[test]
+    fn rr3o_anime_release_group_goldens_pass() {
+        let goldens = load_anime_release_group_goldens();
+        assert_anime_parser_golden_set(&goldens, "rr3o-sonarr-anime-release-group", 7);
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_absolute_only_title() {
+        let parsed = parse_anime_release_title("[SubsPlease] One Piece - 1149 (1080p) [ABCDEF12]");
+
+        assert_eq!(parsed.sonarr_facts.absolute_episode_numbers, vec![1149]);
+        assert_eq!(parsed.absolute_episode_numbers, vec![1149]);
+        assert_eq!(parsed.release_group.as_deref(), Some("SubsPlease"));
+        assert_eq!(parsed.release_hash.as_deref(), Some("ABCDEF12"));
+        assert_eq!(parsed.crc32.as_deref(), Some("ABCDEF12"));
+        assert_eq!(
+            parsed.sonarr_facts.quality.resolution.as_deref(),
+            Some("1080p")
+        );
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_sxxeyy_title() {
+        let parsed =
+            parse_anime_release_title("[EMBER] Solo Leveling S02E02 1080p WEB-DL AAC2.0 H.264");
+
+        assert_eq!(parsed.sonarr_facts.season_number, Some(2));
+        assert_eq!(parsed.sonarr_facts.episode_numbers, vec![2]);
+        assert_eq!(parsed.season_number, Some(2));
+        assert_eq!(parsed.episode_numbers, vec![2]);
+        assert_eq!(parsed.sonarr_facts.release_kind, ReleaseKind::Single);
+        assert_eq!(
+            parsed.sonarr_facts.quality.source.as_deref(),
+            Some("web_dl")
+        );
+        assert_eq!(
+            parsed.sonarr_facts.quality.video_codec.as_deref(),
+            Some("H264")
+        );
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_preserves_mixed_absolute_and_sxxeyy_evidence() {
+        let parsed =
+            parse_anime_release_title("[Group] Example Anime S02E03 [027] [1080p] [ABCDEF12]");
+
+        assert_eq!(parsed.sonarr_facts.season_number, Some(2));
+        assert_eq!(parsed.sonarr_facts.episode_numbers, vec![3]);
+        assert_eq!(parsed.episode_numbers, vec![3]);
+        assert_eq!(parsed.absolute_episode_numbers, vec![27]);
+        assert_eq!(
+            parsed
+                .anime_signal_facts
+                .fallback_absolute_episode_hypotheses,
+            vec![27]
+        );
+        assert!(
+            parsed
+                .anime_signal_facts
+                .normalized_title_candidates
+                .iter()
+                .any(|title| title == "exampleanime")
+        );
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_special_facts() {
+        let parsed = parse_anime_release_title("Example.Anime.S00E01.Special.1080p.WEB-DL-GRP");
+
+        assert_eq!(parsed.sonarr_facts.season_number, Some(0));
+        assert_eq!(parsed.sonarr_facts.episode_numbers, vec![1]);
+        assert!(parsed.sonarr_facts.special);
+        assert_eq!(
+            parsed.sonarr_facts.special_absolute_episode_numbers,
+            vec!["S00E01"]
+        );
+        assert_eq!(parsed.episode_type, AnimeEpisodeType::Special);
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_ranges() {
+        let parsed = parse_anime_release_title("Example.Anime.S01E01-E03.1080p.WEB-DL-GRP");
+
+        assert_eq!(parsed.sonarr_facts.release_kind, ReleaseKind::MultiEpisode);
+        assert_eq!(parsed.sonarr_facts.batch_kind, AnimeBatchKind::Range);
+        assert_eq!(parsed.sonarr_facts.episode_numbers, vec![1, 2, 3]);
+        assert_eq!(parsed.episode_numbers, vec![1, 2, 3]);
+        assert!(
+            parsed
+                .anime_signal_facts
+                .bounded_explicit_ranges
+                .iter()
+                .any(|range| range.start == 1 && range.end == 3)
+        );
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_season_pack() {
+        let parsed = parse_anime_release_title("Example.Anime.S01.1080p.WEB-DL.H264-GRP");
+
+        assert_eq!(parsed.sonarr_facts.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(parsed.sonarr_facts.batch_kind, AnimeBatchKind::SeasonPack);
+        assert_eq!(parsed.sonarr_facts.season_number, Some(1));
+        assert!(parsed.sonarr_facts.full_season);
+        assert_eq!(parsed.batch_kind, AnimeBatchKind::SeasonPack);
+        assert!(
+            parsed
+                .review_reasons
+                .iter()
+                .any(|reason| reason == "file_list_required_for_pack")
+        );
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_multi_season_pack() {
+        let parsed = parse_anime_release_title("Example.Anime.S01-S02.1080p.WEB-DL.H264-GRP");
+
+        assert_eq!(
+            parsed.sonarr_facts.release_kind,
+            ReleaseKind::MultiSeasonPack
+        );
+        assert_eq!(
+            parsed.sonarr_facts.batch_kind,
+            AnimeBatchKind::MultiSeasonPack
+        );
+        assert_eq!(parsed.sonarr_facts.season_number, Some(1));
+        assert_eq!(parsed.sonarr_facts.season_end_number, Some(2));
+        assert!(parsed.sonarr_facts.is_multi_season);
+        assert_eq!(parsed.batch_kind, AnimeBatchKind::MultiSeasonPack);
+    }
+
+    #[test]
+    fn rr3p_anime_adapter_maps_mini_series_flag_without_identity_decision() {
+        let parsed = parse_anime_release_title("Example Anime - E01-E03 1080p WEB-DL-GRP");
+
+        assert!(parsed.sonarr_facts.is_mini_series);
+        assert_eq!(parsed.sonarr_facts.season_number, Some(1));
+        assert_eq!(parsed.sonarr_facts.episode_numbers, vec![1, 2, 3]);
+        assert!(
+            !parsed
+                .sonarr_facts
+                .all_titles
+                .iter()
+                .any(|title| title.is_empty())
+        );
+        assert!(parsed.sonarr_facts.raw.is_some());
     }
 
     #[test]
@@ -3543,7 +5478,11 @@ mod tests {
         let inventory = load_shoko_inventory();
         let seed = load_anime_seed_set();
         let parser_goldens = load_anime_parser_goldens();
+        let quality_goldens = load_anime_quality_goldens();
+        let language_goldens = load_anime_language_goldens();
+        let release_group_goldens = load_anime_release_group_goldens();
         let graph_goldens = load_anime_graph_goldens();
+        let reconciliation_goldens = load_anime_reconciliation_goldens();
         let source = load_sonarr_generated_payload();
 
         for schema in &inventory.fixture_schemas {
@@ -3562,12 +5501,39 @@ mod tests {
         for case in &parser_goldens.cases {
             assert_rr3_production_classification(&case.id, &case.classification);
         }
+        assert_rr3_production_classification(
+            "quality fixture set",
+            &quality_goldens.classification,
+        );
+        assert_rr3_production_classification(
+            "language fixture set",
+            &language_goldens.classification,
+        );
+        assert_rr3_production_classification(
+            "release group fixture set",
+            &release_group_goldens.classification,
+        );
+        for case in quality_goldens
+            .cases
+            .iter()
+            .chain(language_goldens.cases.iter())
+            .chain(release_group_goldens.cases.iter())
+        {
+            assert_rr3_production_classification(&case.id, &case.classification);
+        }
 
         assert_rr3_production_classification(
             "metadata graph fixture set",
             &graph_goldens.classification,
         );
         for case in &graph_goldens.cases {
+            assert_rr3_production_classification(&case.id, &case.classification);
+        }
+        assert_rr3_production_classification(
+            "reconciliation fixture set",
+            &reconciliation_goldens.classification,
+        );
+        for case in &reconciliation_goldens.cases {
             assert_rr3_production_classification(&case.id, &case.classification);
         }
 
@@ -3607,6 +5573,26 @@ mod tests {
             seed_ids, source_anime_ids,
             "RR-3 seed fixtures must cover every Sonarr anime/absolute handoff row"
         );
+    }
+
+    #[test]
+    fn rr3t_production_gate_rejects_pending_anime_fixture_rows() {
+        let mut failures = Vec::new();
+
+        for (fixture, payload) in rr3_fixture_payloads() {
+            collect_pending_rr3_fixture_values(fixture, "", &payload, &mut failures);
+        }
+
+        assert!(
+            failures.is_empty(),
+            "RR-3 production fixtures still contain pending/parity-gap rows:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn rrmt_anime_fixture_gate_counts_are_frozen() {
+        assert_rr3_fixture_gate_counts_are_frozen();
     }
 
     #[test]
@@ -3957,6 +5943,96 @@ mod tests {
     }
 
     #[test]
+    fn rr3q_reconciliation_goldens_cover_expected_outcomes() {
+        let goldens = load_anime_reconciliation_goldens();
+        assert_eq!(goldens.fixture_set, "rr3q-anime-reconciliation-goldens");
+        assert_eq!(goldens.resolver, "anime_shoko_style");
+        assert_eq!(goldens.classification, "rr3q_asserted");
+        assert_eq!(goldens.cases.len(), 7);
+
+        let mut outcomes = BTreeSet::new();
+        for case in &goldens.cases {
+            assert_eq!(case.classification, "rr3q_asserted", "{}", case.id);
+            let context = AnimeCandidateScoringContext {
+                graph_fingerprint: Some(format!("rr3q:{}", case.id)),
+                aliases: case.aliases.clone(),
+                targets: case
+                    .targets
+                    .iter()
+                    .map(AnimeReconciliationTarget::to_candidate_target)
+                    .collect(),
+            };
+            let candidate = AnimeCandidateInput {
+                title: case.input.clone(),
+                source_kind: "golden".to_string(),
+                quality: None,
+                size_bytes: None,
+                seeders: None,
+                cached_debrid: Some(true),
+                rank: None,
+                source_score: None,
+                supported_routes: vec!["debrid".to_string()],
+                default_route: Some("debrid".to_string()),
+            };
+            let score = score_anime_candidate(&context, &candidate);
+            let reconciliation = &score.reconciliation;
+            let outcome = serde_json::to_value(reconciliation.outcome)
+                .expect("outcome serializes")
+                .as_str()
+                .expect("outcome string")
+                .to_string();
+            outcomes.insert(outcome.clone());
+            assert_eq!(outcome, case.expected.outcome, "{}", case.id);
+            assert_eq!(
+                reconciliation
+                    .target_matches
+                    .iter()
+                    .map(|target| target.target_key.clone())
+                    .collect::<Vec<_>>(),
+                case.expected.target_keys,
+                "{} target keys",
+                case.id
+            );
+            assert_eq!(
+                reconciliation.review_reasons, case.expected.review_reasons,
+                "{} review reasons",
+                case.id
+            );
+            assert_eq!(
+                reconciliation.rejection_reasons, case.expected.rejection_reasons,
+                "{} rejection reasons",
+                case.id
+            );
+
+            if case.id == "one_piece_absolute_only_graph_target_remains_mappable" {
+                assert_eq!(
+                    reconciliation
+                        .target_matches
+                        .first()
+                        .map(|target| target.target_key.as_str()),
+                    Some("A0009"),
+                    "mostly absolute-only ani.zip graph targets must stay selectable"
+                );
+            }
+        }
+
+        assert_eq!(
+            outcomes,
+            [
+                "agreement",
+                "translation",
+                "augmentation",
+                "benign_mismatch",
+                "true_contradiction",
+                "unexplainable",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
     fn rr3e_exact_alias_episode_match_is_high_confidence() {
         let score = score_anime_candidate(
             &rr3e_scoring_context(),
@@ -4114,6 +6190,267 @@ mod tests {
             plan.review_reasons
                 .iter()
                 .any(|reason| reason == "unmapped_media_files")
+        );
+    }
+
+    #[test]
+    fn rr3r_scoped_pack_overfetch_with_safe_file_selection_selects_only_wanted_targets() {
+        let mut context = rr3e_scoring_context();
+        context.targets.truncate(1);
+        let candidate = rr3e_candidate("[SubsPlease] Example Title S01 Batch [1080p]");
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "1".to_string(),
+                file_id: Some("1".to_string()),
+                file_index: Some(1),
+                path: "Example Title - 01 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "2".to_string(),
+                file_id: Some("2".to_string()),
+                file_index: Some(2),
+                path: "Example Title - 02 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_options(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+        );
+
+        assert_eq!(plan.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(plan.selected_file_keys, vec!["1"]);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S01E01"]
+        );
+        assert!(plan.requires_file_selection);
+        assert!(plan.review_reasons.is_empty());
+        assert!(plan.rejection_reasons.is_empty());
+    }
+
+    #[test]
+    fn rr3r_scoped_pack_overfetch_without_safe_file_selection_requires_review() {
+        let mut context = rr3e_scoring_context();
+        context.targets.truncate(1);
+        let candidate = rr3e_candidate("[SubsPlease] Example Title S01 Batch [1080p]");
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "1".to_string(),
+                file_id: Some("1".to_string()),
+                file_index: Some(1),
+                path: "Example Title - 01 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "2".to_string(),
+                file_id: None,
+                file_index: Some(2),
+                path: "Example Title - 02 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_options(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+        );
+
+        assert_eq!(plan.confidence, ReleaseConfidence::ReviewRequired);
+        assert_eq!(plan.selected_file_keys, vec!["1"]);
+        assert!(
+            plan.review_reasons
+                .iter()
+                .any(|reason| reason == "pack_overfetch_without_safe_file_selection")
+        );
+    }
+
+    #[test]
+    fn rr3r_pack_file_list_preserves_exact_file_episode_set() {
+        let context = rr3e_scoring_context();
+        let candidate = rr3e_candidate("[SubsPlease] Example Title S01 Batch [1080p]");
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "1".to_string(),
+                file_id: Some("1".to_string()),
+                file_index: Some(1),
+                path: "Example Title - 01 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "3".to_string(),
+                file_id: Some("3".to_string()),
+                file_index: Some(3),
+                path: "Example Title - 03 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_options(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+        );
+
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S01E01"]
+        );
+        assert!(
+            plan.review_reasons
+                .iter()
+                .any(|reason| reason == "file_list_does_not_cover_expected_targets")
+        );
+    }
+
+    #[test]
+    fn rr3r_absolute_only_arc_scope_uses_requested_graph_targets() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("rr3r-absolute-arc".to_string()),
+            aliases: vec!["Long Running Anime".to_string()],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "A0009".to_string(),
+                canonical_key: Some("anilist:21:A0009".to_string()),
+                title: "Long Running Anime A0009".to_string(),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: Some(9),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let candidate = rr3e_candidate("[SubsPlease] Long Running Anime S01 Batch [1080p]");
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "9".to_string(),
+                file_id: Some("9".to_string()),
+                file_index: Some(9),
+                path: "Long Running Anime - 0009 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "10".to_string(),
+                file_id: Some("10".to_string()),
+                file_index: Some(10),
+                path: "Long Running Anime - 0010 [1080p].mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_options(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+        );
+
+        assert_eq!(plan.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(plan.selected_file_keys, vec!["9"]);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A0009"]
+        );
+    }
+
+    #[test]
+    fn rr3s_parser_provenance_records_sonarr_graph_and_coverage() {
+        let context = rr3e_scoring_context();
+        let candidate = rr3e_candidate("[SubsPlease] Example Title S01E01 [1080p][ABCDEF12]");
+        let score = score_anime_candidate(&context, &candidate);
+        let plan = plan_anime_file_coverage(&context, &candidate, &[]);
+
+        let provenance = anime_parser_provenance(&context, &score, Some(&plan));
+
+        assert_eq!(
+            provenance.schema_version,
+            ANIME_PARSER_PROVENANCE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            provenance.sonarr.matched_pattern_id_source,
+            "rr2_public_parser_does_not_expose_regex_id"
+        );
+        assert_eq!(
+            provenance.sonarr.parsed_title.as_deref(),
+            Some("Example Title")
+        );
+        assert_eq!(provenance.sonarr.season_number, Some(1));
+        assert_eq!(provenance.sonarr.episode_numbers, vec![1]);
+        assert_eq!(provenance.sonarr.release_hash.as_deref(), Some("ABCDEF12"));
+        assert_eq!(
+            provenance.parsed.release_group.as_deref(),
+            Some("SubsPlease")
+        );
+        assert_eq!(provenance.parsed.release_hash.as_deref(), Some("ABCDEF12"));
+        assert_eq!(
+            provenance.graph.graph_fingerprint.as_deref(),
+            Some("rr3e-test-graph")
+        );
+        assert_eq!(provenance.graph.alias_count, 3);
+        assert_eq!(provenance.graph.target_count, 2);
+        assert_eq!(
+            provenance.reconciliation.outcome,
+            AnimeReconciliationOutcome::Agreement
+        );
+        assert_eq!(
+            provenance
+                .graph
+                .target_matches
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S01E01"]
+        );
+        let coverage = provenance.coverage.expect("coverage provenance");
+        assert_eq!(coverage.entry_count, 1);
+        assert_eq!(coverage.covered_target_keys, vec!["S01E01"]);
+        assert_eq!(coverage.confidence, ReleaseConfidence::High);
+
+        let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
+        assert_eq!(
+            diagnostics
+                .pointer("/parserProvenance/sonarr/episodeNumbers/0")
+                .and_then(JsonValue::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics
+                .pointer("/parserProvenance/graph/targetMatches/0/targetKey")
+                .and_then(JsonValue::as_str),
+            Some("S01E01")
         );
     }
 }

@@ -19,7 +19,9 @@ use crate::{
     acquisition::release_resolution::{
         anime::{
             AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
-            AnimeReleaseFileInput, parse_anime_release_title, plan_anime_file_coverage,
+            AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
+            parse_anime_release_title, plan_anime_file_coverage_with_options,
+            score_anime_candidate,
         },
         fingerprint::{
             ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
@@ -32,6 +34,11 @@ use crate::{
             ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
             ReleaseResolverKind,
         },
+        movie::{
+            MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput,
+            select_movie_main_file,
+        },
+        movie_radarr_parser::MovieRadarrStyleParser,
         store::{
             get_release_by_download_id, get_release_by_fingerprint, list_active_releases_by_route,
             list_release_coverage, list_release_files, list_release_jobs,
@@ -2001,6 +2008,7 @@ async fn persist_qbittorrent_release_file_rows(
                     "torrentHash": torrent_hash,
                     "providerFileId": provider_file_id,
                     "fileIndex": file_index,
+                    "sizeBytes": size_bytes,
                     "priority": priority,
                     "progress": row.get("progress").and_then(Value::as_f64),
                     "availability": row.get("availability").and_then(Value::as_f64),
@@ -2249,7 +2257,14 @@ async fn refine_anime_qbittorrent_coverage(
         .iter()
         .filter_map(qbittorrent_anime_release_file_input)
         .collect::<Vec<_>>();
-    let plan = plan_anime_file_coverage(&context, &candidate, &file_inputs);
+    let plan = plan_anime_file_coverage_with_options(
+        &context,
+        &candidate,
+        &file_inputs,
+        AnimeCoverageOptions {
+            file_selection_supported: false,
+        },
+    );
     let targets_by_key = targets
         .iter()
         .map(|target| (target.target_key.clone(), target.target_id))
@@ -2284,6 +2299,8 @@ async fn refine_anime_qbittorrent_coverage(
     review_reasons.extend(plan.rejection_reasons.clone());
     review_reasons.sort();
     review_reasons.dedup();
+    let score = score_anime_candidate(&context, &candidate);
+    let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
     Ok(QbittorrentCoverageRefinement {
         release_kind: plan.release_kind,
         resolver_kind: plan.resolver_kind,
@@ -2294,6 +2311,7 @@ async fn refine_anime_qbittorrent_coverage(
             "source": "qbittorrent_file_list",
             "torrentHash": torrent_hash,
             "anime": plan,
+            "diagnostics": diagnostics,
             "reviewReasons": review_reasons
         }),
     })
@@ -2306,38 +2324,51 @@ async fn refine_movie_qbittorrent_coverage(
     targets: &[AcquisitionTarget],
     files: &[AcquisitionReleaseFile],
 ) -> anyhow::Result<QbittorrentCoverageRefinement> {
-    let media_files = selectable_qbittorrent_media_files(files);
-    let mut review_reasons = Vec::new();
+    let file_inputs = files
+        .iter()
+        .filter_map(qbittorrent_movie_release_file_input)
+        .collect::<Vec<_>>();
+    let selection = select_movie_main_file(&file_inputs);
+    let mut review_reasons = selection.review_reasons.clone();
     if targets.is_empty() {
         review_reasons.push("missing_movie_target".to_string());
-    }
-    if media_files.is_empty() {
-        review_reasons.push("no_media_files".to_string());
-    }
-    if media_files.len() > 1 {
-        review_reasons.push("movie_multi_file_policy_pending".to_string());
     }
     let confidence = if review_reasons.is_empty() {
         ReleaseConfidence::High
     } else {
         ReleaseConfidence::ReviewRequired
     };
-    if let (Some(target), Some(file)) = (targets.first(), media_files.first())
-        && let Some(provider_file_id) = qbittorrent_file_key(file)
-    {
+    let selected_release_file = (confidence == ReleaseConfidence::High)
+        .then(|| {
+            selection.selected_file_id.as_ref().and_then(|selected_id| {
+                files
+                    .iter()
+                    .find(|file| qbittorrent_file_key(file).as_deref() == Some(selected_id))
+            })
+        })
+        .flatten();
+    if let Some(target) = targets.first() {
         upsert_release_coverage(
             pool,
             NewAcquisitionReleaseCoverage {
                 coverage_id: None,
                 release_id: release.release_id,
-                release_file_id: Some(file.release_file_id),
+                release_file_id: selected_release_file.map(|file| file.release_file_id),
                 target_id: target.target_id,
-                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                coverage_kind: ReleaseCoverageKind::Movie,
                 confidence,
                 score: Some(1.0),
-                reason: Some("rr5b_movie_single_file".to_string()),
-                state: ReleaseCoverageState::Planned,
-                verified_by: Some(format!("rr5b_qbittorrent_movie:{provider_file_id}")),
+                reason: Some(if confidence == ReleaseConfidence::High {
+                    "rrm5_qbittorrent_movie_main_file".to_string()
+                } else {
+                    "rrm5_qbittorrent_movie_file_list_review".to_string()
+                }),
+                state: if confidence == ReleaseConfidence::High {
+                    ReleaseCoverageState::Planned
+                } else {
+                    ReleaseCoverageState::ReviewRequired
+                },
+                verified_by: Some("rrm5_qbittorrent_movie_file_list".to_string()),
             },
         )
         .await?;
@@ -2350,8 +2381,8 @@ async fn refine_movie_qbittorrent_coverage(
         } else {
             ReleaseKind::Unknown
         },
-        resolver_kind: ReleaseResolverKind::MovieSingle,
-        resolver_version: QBITTORRENT_SELECTION_POLICY_VERSION.to_string(),
+        resolver_kind: ReleaseResolverKind::MovieRadarrStyle,
+        resolver_version: MOVIE_RADARR_STYLE_RESOLVER_VERSION.to_string(),
         confidence,
         review_reasons: review_reasons.clone(),
         coverage_plan: json!({
@@ -2359,7 +2390,10 @@ async fn refine_movie_qbittorrent_coverage(
             "torrentHash": torrent_hash,
             "movie": {
                 "confidence": confidence,
-                "mediaFileCount": media_files.len()
+                "coverageKind": ReleaseCoverageKind::Movie,
+                "fileSelection": selection,
+                "selectedFileId": selected_release_file.and_then(qbittorrent_file_key),
+                "mainCandidateCount": selection.main_candidate_count
             },
             "reviewReasons": review_reasons
         }),
@@ -3101,6 +3135,39 @@ fn qbittorrent_anime_release_file_input(
     })
 }
 
+fn qbittorrent_movie_release_file_input(
+    file: &AcquisitionReleaseFile,
+) -> Option<MovieReleaseFileSelectionInput> {
+    Some(MovieReleaseFileSelectionInput {
+        file_id: qbittorrent_file_key(file)?,
+        path: file.path.clone(),
+        size_bytes: qbittorrent_release_file_selection_size_bytes(file),
+        selectable: file.selectable,
+    })
+}
+
+fn qbittorrent_release_file_selection_size_bytes(file: &AcquisitionReleaseFile) -> Option<i64> {
+    file.size_bytes
+        .filter(|size| *size >= 0)
+        .or_else(|| {
+            file.provider_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("sizeBytes"))
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .filter(|size| *size >= 0)
+                        .or_else(|| value.as_u64().and_then(u64_to_i64))
+                })
+        })
+        .or_else(|| {
+            file.raw
+                .as_ref()
+                .and_then(|raw| number_field(raw, "size"))
+                .and_then(u64_to_i64)
+        })
+}
+
 fn release_file_ids_by_provider_file_id(files: &[AcquisitionReleaseFile]) -> HashMap<String, Uuid> {
     files
         .iter()
@@ -3594,20 +3661,36 @@ fn parsed_qbittorrent_file_metadata(
                     .then(|| parsed.review_reasons.join(",")),
             }
         }
-        MediaType::Movie => ParsedQbittorrentReleaseFileMetadata {
-            title: None,
-            season_number: None,
-            episode_number: None,
-            episode_end_number: None,
-            absolute_episode_number: None,
-            absolute_episode_end_number: None,
-            air_date: None,
-            quality: None,
-            language: None,
-            release_group: None,
-            confidence: ReleaseConfidence::Low,
-            reason: Some("movie_file_parser_pending".to_string()),
-        },
+        MediaType::Movie => {
+            let parsed = MovieRadarrStyleParser.parse_path(path);
+            ParsedQbittorrentReleaseFileMetadata {
+                title: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.primary_movie_title().map(ToString::to_string)),
+                season_number: None,
+                episode_number: None,
+                episode_end_number: None,
+                absolute_episode_number: None,
+                absolute_episode_end_number: None,
+                air_date: None,
+                quality: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.quality.quality.clone()),
+                language: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.languages.first().cloned()),
+                release_group: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.release_group.clone()),
+                confidence: parsed
+                    .as_ref()
+                    .map(|_| ReleaseConfidence::High)
+                    .unwrap_or(ReleaseConfidence::ReviewRequired),
+                reason: parsed
+                    .is_none()
+                    .then(|| "movie_file_path_unparseable".to_string()),
+            }
+        }
     }
 }
 
@@ -3908,6 +3991,24 @@ mod tests {
                     ..empty_target()
                 })
                 .collect(),
+        )
+        .await
+    }
+
+    async fn setup_movie_subscription(
+        database: &Database,
+        title: &str,
+    ) -> anyhow::Result<(AcquisitionSubscription, Vec<AcquisitionTarget>)> {
+        setup_subscription_with_targets(
+            database,
+            MediaType::Movie,
+            title,
+            vec![NewAcquisitionTarget {
+                target_key: Some("movie".to_string()),
+                media_type: Some(MediaType::Movie),
+                title: Some(title.to_string()),
+                ..empty_target()
+            }],
         )
         .await
     }
@@ -4900,6 +5001,169 @@ mod tests {
                 .find(|file| file.provider_file_id.as_deref() == Some("1"))
                 .and_then(|file| file.selected),
             Some(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm5_qbittorrent_movie_selects_dominant_main_file_and_skips_sidecars()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_movie_subscription(&database, "Movie").await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Movie,
+            "Movie",
+            "movies",
+            "Movie.2026.1080p.BluRay-GROUP",
+        )
+        .await?;
+        let rows = vec![
+            json!({ "index": 0, "name": "Movie.2026.1080p.BluRay/Movie.2026.1080p.BluRay-GROUP.mkv", "size": 8_000_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "Movie.2026.1080p.BluRay/Movie.2026.Commentary.Track.mkv", "size": 900_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 2, "name": "Movie.2026.1080p.BluRay/sample.mkv", "size": 50_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 3, "name": "Movie.2026.1080p.BluRay/Movie.2026.1080p.BluRay-GROUP.srt", "size": 100_000u64, "priority": 1, "progress": 0.0 }),
+        ];
+        persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
+
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.provider_file_id.as_deref() == Some("0"))
+                .and_then(|file| file.size_bytes),
+            Some(8_000_000_000)
+        );
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.provider_file_id.as_deref() == Some("0"))
+                .and_then(|file| file.parsed_title.as_deref()),
+            Some("Movie")
+        );
+        let refinement = refine_movie_qbittorrent_coverage(
+            &database.pool,
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        assert_eq!(refinement.release_kind, ReleaseKind::Single);
+        assert_eq!(
+            refinement.resolver_kind,
+            ReleaseResolverKind::MovieRadarrStyle
+        );
+        assert_eq!(refinement.confidence, ReleaseConfidence::High);
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .pointer("/movie/fileSelection/status")
+                .and_then(Value::as_str),
+            Some("approved")
+        );
+
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].coverage_kind, ReleaseCoverageKind::Movie);
+        let main_release_file_id = files
+            .iter()
+            .find(|file| file.provider_file_id.as_deref() == Some("0"))
+            .map(|file| file.release_file_id);
+        assert_eq!(coverage[0].release_file_id, main_release_file_id);
+        let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        assert!(decision.is_approved());
+        assert_eq!(decision.selected_file_ids, vec!["0"]);
+        assert_eq!(decision.skipped_file_ids, vec!["1", "2", "3"]);
+
+        persist_qbittorrent_priority_decision(
+            &database.pool,
+            &release,
+            &files,
+            &coverage,
+            &refinement,
+            &decision,
+            false,
+        )
+        .await?;
+        let updated_files = list_release_files(&database.pool, release.release_id).await?;
+        assert_eq!(
+            updated_files
+                .iter()
+                .find(|file| file.provider_file_id.as_deref() == Some("0"))
+                .and_then(|file| file.selected),
+            Some(true)
+        );
+        assert!(
+            updated_files
+                .iter()
+                .filter(|file| file.provider_file_id.as_deref() != Some("0"))
+                .all(|file| file.selected == Some(false))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm5_qbittorrent_movie_comparable_media_files_require_review() -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_movie_subscription(&database, "Movie").await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Movie,
+            "Movie",
+            "movies",
+            "Movie.2026.1080p.BluRay-GROUP",
+        )
+        .await?;
+        let rows = vec![
+            json!({ "index": 0, "name": "Movie.2026.1080p.BluRay/Movie.2026.Part1.mkv", "size": 4_000_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "Movie.2026.1080p.BluRay/Movie.2026.Part2.mkv", "size": 3_900_000_000u64, "priority": 1, "progress": 0.0 }),
+        ];
+        persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
+
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let refinement = refine_movie_qbittorrent_coverage(
+            &database.pool,
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        assert_eq!(refinement.release_kind, ReleaseKind::Unknown);
+        assert_eq!(
+            refinement.resolver_kind,
+            ReleaseResolverKind::MovieRadarrStyle
+        );
+        assert_eq!(refinement.confidence, ReleaseConfidence::ReviewRequired);
+        assert!(
+            refinement
+                .review_reasons
+                .iter()
+                .any(|reason| reason == "ambiguous_movie_main_file")
+        );
+
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].coverage_kind, ReleaseCoverageKind::Movie);
+        assert!(coverage[0].release_file_id.is_none());
+        let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        assert_eq!(
+            decision.status,
+            QbittorrentFilePriorityDecisionStatus::ReviewRequired
+        );
+        assert!(decision.selected_file_ids.is_empty());
+        assert!(
+            decision
+                .review_reasons
+                .iter()
+                .any(|reason| reason == "ambiguous_movie_main_file")
         );
         Ok(())
     }

@@ -1,0 +1,130 @@
+{
+  "sonarrCommit": "bf5d48c",
+  "fixtureSet": "rr3o-sonarr-anime-language",
+  "resolver": "anime_shoko_style",
+  "classification": "rr3d_asserted",
+  "sourceFixtureSet": "rr2-sonarr-conventional-tv-exhaustive",
+  "cases": [
+    {
+      "id": "language_sonarr_english_audio",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_english",
+      "sourceLine": 57,
+      "sourceClassification": "tv_rr2",
+      "input": "Title.the.Series.2009.S01E14.English.HDTV.XviD-LOL",
+      "expected": {
+        "audioLanguages": [
+          "ENG"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_truefrench_audio",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_french",
+      "sourceLine": 73,
+      "sourceClassification": "tv_rr2",
+      "input": "Title.S01.720p.TRUEFRENCH.WEB-DL.AAC2.0.H.264-BTN",
+      "expected": {
+        "audioLanguages": [
+          "FRE"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_multi_audio_tokens",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_german",
+      "sourceLine": 121,
+      "sourceClassification": "tv_rr2",
+      "input": "Series Title S01 KOREAN ENG FRA GER ITA SPA MULTI 2160p NF WEB DL DDP5 1 DV HDR x265 Atmos MassModz",
+      "expected": {
+        "audioLanguages": [
+          "ENG",
+          "FRE",
+          "GER",
+          "ITA",
+          "KOR",
+          "SPA"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_spanish_variants_dedupe",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_spanish",
+      "sourceLine": 106,
+      "sourceClassification": "tv_rr2",
+      "input": "Series Title - Temporada 2 [HDTV 720p][Cap.206][AC3 5.1 Español Castellano]",
+      "expected": {
+        "audioLanguages": [
+          "SPA"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_latvian_russian_suffixes",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_russian",
+      "sourceLine": 214,
+      "sourceClassification": "tv_rr2",
+      "input": "Title.the.Series.S01.COMPLETE.2009.1080p.WEB-DL.x264.AVC.AAC.LT.LV.RU",
+      "expected": {
+        "audioLanguages": [
+          "LV",
+          "RUS"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_anime_japanese_multisub",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_japanese",
+      "sourceLine": 155,
+      "sourceClassification": "tv_rr2",
+      "input": "[Erai-raws] To Be Series - 14 (JA) [1080p CR WEB-DL AVC AAC][MultiSub]",
+      "expected": {
+        "audioLanguages": [
+          "JPN"
+        ],
+        "subtitleLanguages": [
+          "MULTI"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_anime_eng_subs_are_subtitles",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_unknown",
+      "sourceLine": 45,
+      "sourceClassification": "tv_rr2",
+      "input": "[Judas] Series Japanese Name (Series English Name) - S02E10 [1080P][HEVC x256 10bit][Eng-Subs] (Weekly)",
+      "expected": {
+        "subtitleLanguages": [
+          "ENG"
+        ]
+      }
+    },
+    {
+      "id": "language_sonarr_anime_chs_bracket_is_subtitle",
+      "classification": "rr3d_asserted",
+      "sourceFixture": "LanguageParserFixture",
+      "sourceMethod": "should_parse_language_chinese",
+      "sourceLine": 178,
+      "sourceClassification": "tv_rr2",
+      "input": "[abc] My Series - 01 [CHS]",
+      "expected": {
+        "subtitleLanguages": [
+          "CHS"
+        ]
+      }
+    }
+  ]
+}

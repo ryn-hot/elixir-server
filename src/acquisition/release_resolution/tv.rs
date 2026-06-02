@@ -4577,6 +4577,7 @@ static SEPARATOR_RUN_RE: Lazy<Regex> =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -4973,6 +4974,120 @@ mod tests {
         errors
     }
 
+    fn generated_rr2_expected_output_digest<'a>(
+        cases: impl Iterator<Item = &'a GeneratedSonarrCase>,
+    ) -> String {
+        let mut payload = String::new();
+        for (index, case) in cases.enumerate() {
+            if index > 0 {
+                payload.push('\n');
+            }
+            payload.push_str(&case.id);
+            payload.push('\0');
+            payload.push_str(&case.input);
+            payload.push('\0');
+            payload.push_str(
+                &serde_json::to_string(&case.expected).expect("generated fixture expected json"),
+            );
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn generated_rr2_full_contract_digest(cases: &[GeneratedSonarrCase]) -> String {
+        let mut payload = String::new();
+        for (index, case) in cases.iter().enumerate() {
+            if index > 0 {
+                payload.push('\n');
+            }
+            payload.push_str(&case.id);
+            payload.push('\0');
+            payload.push_str(&case.input);
+            payload.push('\0');
+            payload.push_str(&case.classification);
+            payload.push('\0');
+            payload.push_str(case.skip_reason.as_deref().unwrap_or_default());
+            payload.push('\0');
+            payload.push_str(if case.current_gate_asserted == Some(true) {
+                "true"
+            } else {
+                "false"
+            });
+            payload.push('\0');
+            payload.push_str(
+                &serde_json::to_string(&case.expected).expect("generated fixture expected json"),
+            );
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn assert_rr2_generated_fixture_counts_and_outputs_are_frozen() {
+        let set = load_generated_sonarr_set();
+        let tv_cases = set
+            .cases
+            .iter()
+            .filter(|case| case.classification == "tv_rr2")
+            .collect::<Vec<_>>();
+        let asserted_cases = tv_cases
+            .iter()
+            .copied()
+            .filter(|case| case.skip_reason.is_none() && case.current_gate_asserted == Some(true))
+            .collect::<Vec<_>>();
+
+        assert_eq!(set.cases.len(), 1192);
+        assert_eq!(tv_cases.len(), 1119);
+        assert_eq!(asserted_cases.len(), 1119);
+        assert_eq!(
+            set.cases
+                .iter()
+                .filter(|case| case.classification == "anime_rr3")
+                .count(),
+            60
+        );
+        assert_eq!(
+            set.cases
+                .iter()
+                .filter(|case| case.classification == "unsupported_by_product_policy")
+                .count(),
+            13
+        );
+        assert_eq!(
+            set.cases
+                .iter()
+                .filter(|case| case.skip_reason.as_deref() == Some("known_parity_gap"))
+                .count(),
+            0
+        );
+
+        assert_eq!(
+            generated_rr2_full_contract_digest(&set.cases),
+            "2c989eab6c81af90a1e371103be62cec636d73078a763c8b9e1a052861a64f8b"
+        );
+        assert_eq!(
+            generated_rr2_expected_output_digest(asserted_cases.iter().copied()),
+            "73b70fa3d87978816ee2c210e30f0589a30433c4ad9aa1c5010b2f8bc4429ce3"
+        );
+
+        let failures = asserted_cases
+            .iter()
+            .flat_map(|case| {
+                generated_case_errors(case)
+                    .into_iter()
+                    .map(move |error| format!("{} {} => {}", case.id, case.input, error))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "RR-2 generated fixture outputs no longer match the parser:\n{}",
+            failures.join("\n")
+        );
+    }
+
     fn expected_i32_array(value: &serde_json::Value) -> Option<Vec<i32>> {
         value.as_array().map(|values| {
             values
@@ -5349,6 +5464,16 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn rr3t_rr2_generated_fixture_counts_and_outputs_are_frozen() {
+        assert_rr2_generated_fixture_counts_and_outputs_are_frozen();
+    }
+
+    #[test]
+    fn rrmt_tv_generated_fixture_counts_and_outputs_are_frozen() {
+        assert_rr2_generated_fixture_counts_and_outputs_are_frozen();
     }
 
     #[test]

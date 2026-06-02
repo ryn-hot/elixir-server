@@ -306,7 +306,7 @@ pub async fn upsert_manual_review_candidate_release(
                 release_id: release.release_id,
                 release_file_id: None,
                 target_id,
-                coverage_kind: coverage_kind_for_release_kind(input.release_kind),
+                coverage_kind: coverage_kind_for_review(input.media_type, input.release_kind),
                 confidence: ReleaseConfidence::ReviewRequired,
                 score: input.score.or(input.candidate.score),
                 reason: input
@@ -528,6 +528,16 @@ fn coverage_kind_for_release_kind(release_kind: ReleaseKind) -> ReleaseCoverageK
         ReleaseKind::SeriesPack => ReleaseCoverageKind::SeriesPack,
         ReleaseKind::Unknown => ReleaseCoverageKind::ManualOverride,
     }
+}
+
+fn coverage_kind_for_review(
+    media_type: MediaType,
+    release_kind: ReleaseKind,
+) -> ReleaseCoverageKind {
+    if media_type == MediaType::Movie {
+        return ReleaseCoverageKind::Movie;
+    }
+    coverage_kind_for_release_kind(release_kind)
 }
 
 pub fn sanitize_review_json(value: &JsonValue) -> JsonValue {

@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::acquisition::release_resolution::{
     anime::{
         AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
-        AnimeReleaseFileInput, parse_anime_release_title, plan_anime_file_coverage,
+        AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
+        parse_anime_release_title, plan_anime_file_coverage_with_options, score_anime_candidate,
     },
     fingerprint::{ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash},
     hashing::{HashFileJob, queue_anime_hash_file},
@@ -31,6 +32,10 @@ use crate::acquisition::release_resolution::{
         ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
         ReleaseResolverKind,
     },
+    movie::{
+        MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput, select_movie_main_file,
+    },
+    movie_radarr_parser::MovieRadarrStyleParser,
     review_candidates::SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
     store::{
         get_release, get_release_by_download_id, list_release_coverage, list_release_files,
@@ -5934,20 +5939,36 @@ fn parsed_file_metadata(media_type: MediaType, path: &str) -> ParsedReleaseFileM
                     .then(|| parsed.review_reasons.join(",")),
             }
         }
-        MediaType::Movie => ParsedReleaseFileMetadata {
-            title: None,
-            season_number: None,
-            episode_number: None,
-            episode_end_number: None,
-            absolute_episode_number: None,
-            absolute_episode_end_number: None,
-            air_date: None,
-            quality: None,
-            language: None,
-            release_group: None,
-            confidence: ReleaseConfidence::Low,
-            reason: Some("movie_file_parser_pending".to_string()),
-        },
+        MediaType::Movie => {
+            let parsed = MovieRadarrStyleParser.parse_path(path);
+            ParsedReleaseFileMetadata {
+                title: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.primary_movie_title().map(ToString::to_string)),
+                season_number: None,
+                episode_number: None,
+                episode_end_number: None,
+                absolute_episode_number: None,
+                absolute_episode_end_number: None,
+                air_date: None,
+                quality: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.quality.quality.clone()),
+                language: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.languages.first().cloned()),
+                release_group: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.release_group.clone()),
+                confidence: parsed
+                    .as_ref()
+                    .map(|_| ReleaseConfidence::High)
+                    .unwrap_or(ReleaseConfidence::ReviewRequired),
+                reason: parsed
+                    .is_none()
+                    .then(|| "movie_file_path_unparseable".to_string()),
+            }
+        }
     }
 }
 
@@ -5958,24 +5979,20 @@ async fn refine_movie_debrid_coverage(
     targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
     file_ids: &HashMap<String, Uuid>,
 ) -> Result<DebridCoverageRefinement> {
-    let media_files = inspection
+    let file_inputs = inspection
         .files
         .iter()
-        .filter(|file| {
-            file.selectable
-                && is_debrid_media_file(&file.path)
-                && !is_debrid_sample_or_extra_file(&file.path)
+        .map(|file| MovieReleaseFileSelectionInput {
+            file_id: file.provider_file_id.clone(),
+            path: file.path.clone(),
+            size_bytes: file.size_bytes.and_then(u64_to_i64),
+            selectable: file.selectable,
         })
         .collect::<Vec<_>>();
-    let mut review_reasons = Vec::new();
+    let selection = select_movie_main_file(&file_inputs);
+    let mut review_reasons = selection.review_reasons.clone();
     if targets.is_empty() {
         review_reasons.push("missing_movie_target".to_string());
-    }
-    if media_files.is_empty() {
-        review_reasons.push("no_media_files".to_string());
-    }
-    if media_files.len() > 1 {
-        review_reasons.push("movie_multi_file_policy_pending".to_string());
     }
     review_reasons.sort();
     review_reasons.dedup();
@@ -5986,20 +6003,34 @@ async fn refine_movie_debrid_coverage(
         ReleaseConfidence::ReviewRequired
     };
 
-    if let (Some(target), Some(file)) = (targets.first(), media_files.first()) {
+    let selected_file_id = (confidence == ReleaseConfidence::High)
+        .then(|| selection.selected_file_id.clone())
+        .flatten();
+
+    if let Some(target) = targets.first() {
         upsert_release_coverage(
             pool,
             NewAcquisitionReleaseCoverage {
                 coverage_id: None,
                 release_id: release.release_id,
-                release_file_id: file_ids.get(&file.provider_file_id).copied(),
+                release_file_id: selected_file_id
+                    .as_ref()
+                    .and_then(|file_id| file_ids.get(file_id).copied()),
                 target_id: target.target_id,
-                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                coverage_kind: ReleaseCoverageKind::Movie,
                 confidence,
                 score: Some(1.0),
-                reason: Some("rr10c_debrid_movie_single_file".to_string()),
-                state: ReleaseCoverageState::Planned,
-                verified_by: Some("rr10c_debrid_movie_file_list".to_string()),
+                reason: Some(if confidence == ReleaseConfidence::High {
+                    "rrm5_debrid_movie_main_file".to_string()
+                } else {
+                    "rrm5_debrid_movie_file_list_review".to_string()
+                }),
+                state: if confidence == ReleaseConfidence::High {
+                    ReleaseCoverageState::Planned
+                } else {
+                    ReleaseCoverageState::ReviewRequired
+                },
+                verified_by: Some("rrm5_debrid_movie_file_list".to_string()),
             },
         )
         .await?;
@@ -6012,8 +6043,8 @@ async fn refine_movie_debrid_coverage(
             } else {
                 ReleaseKind::Unknown
             },
-            resolver_kind: ReleaseResolverKind::MovieSingle,
-            resolver_version: DEBRID_SELECTION_POLICY_VERSION.to_string(),
+            resolver_kind: ReleaseResolverKind::MovieRadarrStyle,
+            resolver_version: MOVIE_RADARR_STYLE_RESOLVER_VERSION.to_string(),
             confidence,
         },
         json!({
@@ -6022,7 +6053,10 @@ async fn refine_movie_debrid_coverage(
             "remoteReleaseId": inspection.release.remote_release_id,
             "movie": {
                 "confidence": confidence,
-                "mediaFileCount": media_files.len()
+                "coverageKind": ReleaseCoverageKind::Movie,
+                "fileSelection": selection,
+                "selectedFileId": selected_file_id,
+                "mainCandidateCount": selection.main_candidate_count
             },
             "reviewReasons": review_reasons
         }),
@@ -6161,7 +6195,14 @@ async fn refine_anime_debrid_coverage(
             selectable: file.selectable,
         })
         .collect::<Vec<_>>();
-    let plan = plan_anime_file_coverage(&context, &candidate, &files);
+    let plan = plan_anime_file_coverage_with_options(
+        &context,
+        &candidate,
+        &files,
+        AnimeCoverageOptions {
+            file_selection_supported: inspection.capabilities.supports_file_selection,
+        },
+    );
     let targets_by_key = targets
         .iter()
         .map(|target| (target.target_key.clone(), target.target_id))
@@ -6195,6 +6236,8 @@ async fn refine_anime_debrid_coverage(
     review_reasons.extend(plan.rejection_reasons.clone());
     review_reasons.sort();
     review_reasons.dedup();
+    let score = score_anime_candidate(&context, &candidate);
+    let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
     Ok(refinement_from_plan(
         ReleaseShape {
             release_kind: plan.release_kind,
@@ -6207,6 +6250,7 @@ async fn refine_anime_debrid_coverage(
             "providerImplementation": inspection.release.provider_implementation,
             "remoteReleaseId": inspection.release.remote_release_id,
             "anime": plan,
+            "diagnostics": diagnostics,
             "reviewReasons": review_reasons
         }),
         review_reasons,
@@ -10681,7 +10725,7 @@ mod tests {
             .context("Premiumize pending transfer release should load")?;
         assert_eq!(release.state, AcquisitionReleaseState::Completed);
         assert_eq!(release.release_kind, ReleaseKind::Single);
-        assert_eq!(release.resolver_kind, ReleaseResolverKind::MovieSingle);
+        assert_eq!(release.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
         assert_eq!(release.confidence, ReleaseConfidence::High);
 
         let _ = shutdown.send(());
@@ -14619,6 +14663,39 @@ mod tests {
         assert!(decision.skipped_file_ids.is_empty());
         assert!(!decision.select_all);
         assert!(decision.select_all_approved);
+    }
+
+    #[test]
+    fn download_broker_debrid_movie_selection_uses_movie_coverage_main_file() {
+        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+        release.media_type = MediaType::Movie;
+        release.resolver_kind = ReleaseResolverKind::MovieRadarrStyle;
+        let main = test_release_file(
+            release.release_id,
+            "file-main",
+            "Movie.2026.1080p.BluRay/Movie.2026.1080p.BluRay-GROUP.mkv",
+            true,
+        );
+        let extra = test_release_file(
+            release.release_id,
+            "file-extra",
+            "Movie.2026.1080p.BluRay/Movie.2026.Commentary.Track.mkv",
+            true,
+        );
+        let files = vec![main.clone(), extra];
+        let mut coverage = test_coverage(release.release_id, main.release_file_id);
+        coverage.coverage_kind = ReleaseCoverageKind::Movie;
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &[coverage], &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(
+            decision.provider_selection_ids,
+            vec!["file-main".to_string()]
+        );
+        assert_eq!(decision.skipped_file_ids, vec!["file-extra".to_string()]);
+        assert!(decision.review_reasons.is_empty());
     }
 
     #[test]

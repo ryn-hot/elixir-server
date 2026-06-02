@@ -431,7 +431,13 @@ async fn prepare_import_run_for_completed_job(
     candidate: &CompletedReleaseJobForImport,
 ) -> Result<PreparedImportRun> {
     let coverage = list_release_coverage(pool, candidate.release.release_id).await?;
-    let provenance = import_run_provenance(&candidate.release, &candidate.job, &coverage);
+    let release_files = list_release_files(pool, candidate.release.release_id).await?;
+    let provenance = import_run_provenance(
+        &candidate.release,
+        &candidate.job,
+        &coverage,
+        &release_files,
+    );
     let (run, created) = create_or_get_import_run(
         pool,
         NewAcquisitionImportRun {
@@ -455,7 +461,6 @@ async fn prepare_import_run_for_completed_job(
     )
     .await?;
 
-    let release_files = list_release_files(pool, candidate.release.release_id).await?;
     let release_files_by_id = release_files
         .iter()
         .map(|file| (file.release_file_id, file))
@@ -772,6 +777,7 @@ async fn finalize_import_run_inner(
         .filter(|link| link.state == AcquisitionImportFileLinkState::Pending)
         .cloned()
         .collect();
+    let is_movie_import = subscription.media_type == MediaType::Movie;
     if importable_links.is_empty() {
         if !links.is_empty()
             && links
@@ -807,6 +813,15 @@ async fn finalize_import_run_inner(
             blocked: true,
             ..FinalizedImportRun::default()
         });
+    }
+    if is_movie_import && importable_links.len() != 1 {
+        return block_import_run_result(
+            pool,
+            run.import_run_id,
+            "movie import requires exactly one selected coverage file",
+            Some("movie_selected_file_count"),
+        )
+        .await;
     }
 
     let release_files = list_release_files(pool, candidate.release.release_id).await?;
@@ -878,6 +893,15 @@ async fn finalize_import_run_inner(
                 run.import_run_id,
                 "import file link coverage is no longer selected or submitted",
                 Some("coverage_not_importable"),
+            )
+            .await;
+        }
+        if is_movie_import && !movie_import_coverage_kind_allowed(coverage.coverage_kind) {
+            return block_import_run_result(
+                pool,
+                run.import_run_id,
+                "movie import coverage must use movie or manual override coverage",
+                Some("invalid_movie_coverage_kind"),
             )
             .await;
         }
@@ -2157,6 +2181,13 @@ fn importable_coverage_state(state: ReleaseCoverageState) -> bool {
     )
 }
 
+fn movie_import_coverage_kind_allowed(kind: ReleaseCoverageKind) -> bool {
+    matches!(
+        kind,
+        ReleaseCoverageKind::Movie | ReleaseCoverageKind::ManualOverride
+    )
+}
+
 async fn resolve_completed_file_local_path(
     pool: &AnyPool,
     job: &AcquisitionReleaseJob,
@@ -2660,6 +2691,7 @@ fn import_run_provenance(
     release: &AcquisitionRelease,
     job: &AcquisitionReleaseJob,
     coverage: &[AcquisitionReleaseCoverage],
+    release_files: &[AcquisitionReleaseFile],
 ) -> JsonValue {
     let coverage_rows = coverage
         .iter()
@@ -2675,6 +2707,11 @@ fn import_run_provenance(
                 "reason": row.reason,
             })
         })
+        .collect::<Vec<_>>();
+    let selected_release_files = release_files
+        .iter()
+        .filter(|file| file.selected == Some(true))
+        .map(import_release_file_evidence)
         .collect::<Vec<_>>();
     let manual_mappings = coverage
         .iter()
@@ -2697,6 +2734,7 @@ fn import_run_provenance(
             })
         })
         .collect::<Vec<_>>();
+    let movie_import_evidence = movie_import_evidence(release, job, coverage, release_files);
     json!({
         "phase": "rr8a",
         "releaseId": release.release_id,
@@ -2713,8 +2751,11 @@ fn import_run_provenance(
         "jobState": job.state.as_str(),
         "resolverKind": release.resolver_kind.as_str(),
         "resolverVersion": release.resolver_version,
+        "selectedCandidate": release.selected_candidate.clone(),
         "coveragePlan": release.coverage_plan,
         "coverage": coverage_rows,
+        "selectedReleaseFiles": selected_release_files,
+        "movieImportEvidence": movie_import_evidence,
         "manualCoverageMappings": manual_mappings,
         "manualReview": release.coverage_plan.as_ref().and_then(|plan| plan.get("manualReview")),
     })
@@ -2735,6 +2776,7 @@ fn import_link_evidence(
         "releaseJobId": job.release_job_id,
         "releaseFileId": file.map(|file| file.release_file_id),
         "providerFileId": file.and_then(|file| file.provider_file_id.clone()),
+        "file": file.map(import_release_file_evidence),
         "targetId": target_id,
         "localPath": local_path,
         "routeLogicalId": job.route_logical_id,
@@ -2748,8 +2790,215 @@ fn import_link_evidence(
             "verifiedBy": row.verified_by,
             "reason": row.reason,
         })),
+        "movieImportEvidence": movie_import_link_evidence(release, job, file, coverage),
         "reason": reason,
     })
+}
+
+fn import_release_file_evidence(file: &AcquisitionReleaseFile) -> JsonValue {
+    json!({
+        "releaseFileId": file.release_file_id,
+        "fileIndex": file.file_index,
+        "fileId": file.file_id,
+        "providerFileId": file.provider_file_id,
+        "path": file.path,
+        "basename": file.basename,
+        "sizeBytes": file.size_bytes,
+        "selectable": file.selectable,
+        "selected": file.selected,
+        "parsed": {
+            "title": file.parsed_title,
+            "seasonNumber": file.parsed_season_number,
+            "episodeNumber": file.parsed_episode_number,
+            "episodeEndNumber": file.parsed_episode_end_number,
+            "absoluteEpisodeNumber": file.parsed_absolute_episode_number,
+            "absoluteEpisodeEndNumber": file.parsed_absolute_episode_end_number,
+            "airDate": file.parsed_air_date,
+            "quality": file.parsed_quality,
+            "language": file.parsed_language,
+            "releaseGroup": file.parsed_release_group,
+            "confidence": file.parser_confidence.as_str(),
+            "reason": file.parser_reason,
+        },
+    })
+}
+
+fn movie_import_evidence(
+    release: &AcquisitionRelease,
+    job: &AcquisitionReleaseJob,
+    coverage: &[AcquisitionReleaseCoverage],
+    release_files: &[AcquisitionReleaseFile],
+) -> Option<JsonValue> {
+    if release.media_type != MediaType::Movie {
+        return None;
+    }
+    let source_plan = movie_source_coverage_plan(release);
+    let parsed_release = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("parsedRelease"))
+        .cloned();
+    let graph = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("graph"))
+        .cloned();
+    let reconciliation = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("reconciliation"))
+        .cloned();
+    let selected_coverage_files = coverage
+        .iter()
+        .filter(|row| row.release_file_id.is_some())
+        .filter(|row| movie_import_coverage_kind_allowed(row.coverage_kind))
+        .map(|row| {
+            let file = row.release_file_id.and_then(|release_file_id| {
+                release_files
+                    .iter()
+                    .find(|file| file.release_file_id == release_file_id)
+            });
+            json!({
+                "coverageId": row.coverage_id,
+                "releaseFileId": row.release_file_id,
+                "targetId": row.target_id,
+                "coverageKind": row.coverage_kind.as_str(),
+                "confidence": row.confidence.as_str(),
+                "state": row.state.as_str(),
+                "verifiedBy": row.verified_by,
+                "reason": row.reason,
+                "file": file.map(import_release_file_evidence),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "resolver": {
+            "kind": release.resolver_kind.as_str(),
+            "version": release.resolver_version,
+            "confidence": release.confidence.as_str(),
+        },
+        "route": {
+            "routeLogicalId": job.route_logical_id,
+            "providerId": job.provider_id,
+            "downloadId": job.download_id,
+            "remoteReleaseId": job.remote_release_id,
+            "releaseSelectedRouteLogicalId": release.selected_route_logical_id,
+            "releaseSelectedProviderId": release.selected_provider_id,
+            "sourceProviderId": release.source_provider_id,
+        },
+        "sourceMovieCoveragePlan": source_plan,
+        "parsedRelease": parsed_release,
+        "graph": graph,
+        "reconciliation": reconciliation,
+        "fileSelection": movie_file_selection_evidence(release.coverage_plan.as_ref()),
+        "selectionPolicy": movie_selection_policy_evidence(release.coverage_plan.as_ref()),
+        "runtime": movie_runtime_evidence(release.coverage_plan.as_ref()),
+        "selectedCoverageFiles": selected_coverage_files,
+    }))
+}
+
+fn movie_import_link_evidence(
+    release: &AcquisitionRelease,
+    job: &AcquisitionReleaseJob,
+    file: Option<&AcquisitionReleaseFile>,
+    coverage: Option<&AcquisitionReleaseCoverage>,
+) -> Option<JsonValue> {
+    if release.media_type != MediaType::Movie {
+        return None;
+    }
+    let source_plan = movie_source_coverage_plan(release);
+    let parsed_release = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("parsedRelease"))
+        .cloned();
+    let graph = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("graph"))
+        .cloned();
+    let reconciliation = source_plan
+        .as_ref()
+        .and_then(|plan| plan.get("reconciliation"))
+        .cloned();
+    Some(json!({
+        "resolver": {
+            "kind": release.resolver_kind.as_str(),
+            "version": release.resolver_version,
+        },
+        "route": {
+            "routeLogicalId": job.route_logical_id,
+            "providerId": job.provider_id,
+            "downloadId": job.download_id,
+            "remoteReleaseId": job.remote_release_id,
+        },
+        "releaseFileId": file.map(|file| file.release_file_id),
+        "targetId": coverage.map(|row| row.target_id),
+        "coverageKind": coverage.map(|row| row.coverage_kind.as_str()),
+        "sourceMovieCoveragePlan": source_plan,
+        "parsedRelease": parsed_release,
+        "graph": graph,
+        "reconciliation": reconciliation,
+        "fileSelection": movie_file_selection_evidence(release.coverage_plan.as_ref()),
+        "selectionPolicy": movie_selection_policy_evidence(release.coverage_plan.as_ref()),
+        "runtime": movie_runtime_evidence(release.coverage_plan.as_ref()),
+    }))
+}
+
+fn movie_source_coverage_plan(release: &AcquisitionRelease) -> Option<JsonValue> {
+    [
+        release
+            .selected_candidate
+            .as_ref()
+            .and_then(|value| value.get("movieCoveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.get("movieCoveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.get("coveragePlan")),
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|value| value.pointer("/resolverEvidence/parsedRelease/coveragePlan")),
+        release.coverage_plan.as_ref().filter(|value| {
+            value.get("parsedRelease").is_some()
+                || value.get("graph").is_some()
+                || value.get("reconciliation").is_some()
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .cloned()
+}
+
+fn movie_file_selection_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    plan.pointer("/movie/fileSelection")
+        .or_else(|| plan.get("fileSelection"))
+        .cloned()
+}
+
+fn movie_selection_policy_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    plan.get("selectionPolicy")
+        .or_else(|| plan.get("priorityPolicy"))
+        .or_else(|| plan.get("manualReview"))
+        .cloned()
+}
+
+fn movie_runtime_evidence(plan: Option<&JsonValue>) -> Option<JsonValue> {
+    let plan = plan?;
+    let debrid = plan.get("debridRuntime").cloned();
+    let torrent = plan
+        .get("torrentRuntime")
+        .or_else(|| plan.get("qbittorrentRuntime"))
+        .cloned();
+    if debrid.is_none() && torrent.is_none() {
+        return None;
+    }
+    Some(json!({
+        "debrid": debrid,
+        "torrent": torrent,
+    }))
 }
 
 fn map_release_job(row: &AnyRow) -> Result<AcquisitionReleaseJob> {
@@ -3476,6 +3725,58 @@ mod tests {
         Ok((subscription, targets))
     }
 
+    async fn create_movie_subscription_with_target(
+        database: &Database,
+        title: &str,
+        year: i32,
+    ) -> Result<(Uuid, Uuid)> {
+        let subscription = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: title.to_string(),
+                year: Some(year),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: AcquisitionMonitorPolicy::SelectedTargets,
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &database.pool,
+            subscription.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("movie".to_string()),
+                media_type: Some(MediaType::Movie),
+                title: Some(title.to_string()),
+                season_number: None,
+                episode_number: None,
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Submitted),
+                next_search_after: None,
+            }],
+        )
+        .await?;
+        let target = targets
+            .first()
+            .ok_or_else(|| anyhow!("missing movie test target"))?;
+        Ok((subscription.subscription_id, target.target_id))
+    }
+
     async fn seed_anidb_hit_for_file(
         database: &Database,
         path: &Path,
@@ -3887,7 +4188,7 @@ mod tests {
             MediaType::Movie,
             "Movie.2024.1080p.WEB-DL-GROUP",
             ReleaseKind::Single,
-            ReleaseResolverKind::MovieSingle,
+            ReleaseResolverKind::MovieRadarrStyle,
             DEBRID_DEFAULT_LOGICAL_ID,
             "movie-1",
             vec![TestReleaseFile {
@@ -3899,7 +4200,7 @@ mod tests {
                 parsed_episode: None,
                 coverage: vec![(
                     target.target_id,
-                    ReleaseCoverageKind::ManualOverride,
+                    ReleaseCoverageKind::Movie,
                     ReleaseCoverageState::Submitted,
                 )],
             }],
@@ -3933,6 +4234,279 @@ mod tests {
         .fetch_one(&database.pool)
         .await?;
         assert_eq!(subscription_status, "completed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm6_movie_import_uses_selected_movie_coverage_file_only() -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let main_path = dir.path().join("Movie.2024.1080p.mkv");
+        let extra_path = dir.path().join("Movie.2024.Extras.mkv");
+        tokio::fs::write(&main_path, b"movie main").await?;
+        tokio::fs::write(&extra_path, b"movie extra").await?;
+        let (subscription_id, target_id) =
+            create_movie_subscription_with_target(&database, "Movie", 2024).await?;
+
+        let (_release_id, job_id) = insert_completed_release_with_files(
+            &database,
+            subscription_id,
+            MediaType::Movie,
+            "Movie.2024.1080p.WEB-DL-GROUP",
+            ReleaseKind::Single,
+            ReleaseResolverKind::MovieRadarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "rrm6-movie-selected-coverage",
+            vec![
+                TestReleaseFile {
+                    local_path: main_path.to_string_lossy().to_string(),
+                    basename: "Movie.2024.1080p.mkv".to_string(),
+                    file_index: 0,
+                    selected: Some(true),
+                    parsed_season: None,
+                    parsed_episode: None,
+                    coverage: vec![(
+                        target_id,
+                        ReleaseCoverageKind::Movie,
+                        ReleaseCoverageState::Submitted,
+                    )],
+                },
+                TestReleaseFile {
+                    local_path: extra_path.to_string_lossy().to_string(),
+                    basename: "Movie.2024.Extras.mkv".to_string(),
+                    file_index: 1,
+                    selected: Some(true),
+                    parsed_season: None,
+                    parsed_episode: None,
+                    coverage: Vec::new(),
+                },
+            ],
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+        assert_eq!(stats.links_imported, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        let links = list_import_file_links(&database.pool, run.import_run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].local_path.as_deref(), main_path.to_str());
+        assert!(links[0].movie_id.is_some());
+        let media_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(media_files, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm6_movie_import_blocks_placeholder_only_coverage_before_linking() -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let path = dir.path().join("Movie.2024.1080p.mkv");
+        tokio::fs::write(&path, b"movie").await?;
+        let (subscription_id, target_id) =
+            create_movie_subscription_with_target(&database, "Movie", 2024).await?;
+
+        let (release_id, job_id) = insert_completed_release_with_files(
+            &database,
+            subscription_id,
+            MediaType::Movie,
+            "Movie.2024.1080p.WEB-DL-GROUP",
+            ReleaseKind::Single,
+            ReleaseResolverKind::MovieRadarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "rrm6-movie-placeholder-only",
+            vec![TestReleaseFile {
+                local_path: path.to_string_lossy().to_string(),
+                basename: "Movie.2024.1080p.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: None,
+                parsed_episode: None,
+                coverage: Vec::new(),
+            }],
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id,
+                release_file_id: None,
+                target_id,
+                coverage_kind: ReleaseCoverageKind::Movie,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("placeholder movie coverage".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("test".to_string()),
+            },
+        )
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 0);
+        assert_eq!(stats.blocked_runs, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        assert_eq!(run.state, AcquisitionImportRunState::Blocked);
+        let links = list_import_file_links(&database.pool, run.import_run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].mismatch_class.as_deref(),
+            Some("missing_release_file_mapping")
+        );
+        let media_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_files")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(media_files, 0);
+        let target = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Submitted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm6_movie_import_provenance_preserves_parser_file_selection_and_route_evidence()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let path = dir.path().join("Movie.2024.1080p.mkv");
+        tokio::fs::write(&path, b"movie").await?;
+        let (subscription_id, target_id) =
+            create_movie_subscription_with_target(&database, "Movie", 2024).await?;
+        let source_plan = json!({
+            "parsedRelease": {
+                "movieTitle": "Movie",
+                "year": 2024
+            },
+            "graph": {
+                "targetTitle": "Movie",
+                "targetYear": 2024
+            },
+            "reconciliation": {
+                "outcome": "planned",
+                "confidence": "high",
+                "reviewReasons": []
+            }
+        });
+        let active_plan = json!({
+            "source": "debrid_provider_file_list",
+            "movie": {
+                "coverageKind": "movie",
+                "fileSelection": {
+                    "policyVersion": "rrm5-movie-main-file-selection-v1",
+                    "status": "approved",
+                    "selectedFileId": "0",
+                    "skippedFileIds": ["1"],
+                    "diagnostics": [{
+                        "fileId": "0",
+                        "path": "Movie.2024.1080p.mkv",
+                        "role": "main_candidate",
+                        "selected": true
+                    }]
+                }
+            },
+            "selectionPolicy": {
+                "status": "approved",
+                "selectedFileIds": ["0"],
+                "skippedFileIds": ["1"]
+            },
+            "debridRuntime": {
+                "status": "completed",
+                "remoteReleaseId": "remote-movie-1"
+            }
+        });
+        let (release_id, job_id) = insert_completed_release_with_files_and_plan(
+            &database,
+            subscription_id,
+            MediaType::Movie,
+            "Movie.2024.1080p.WEB-DL-GROUP",
+            ReleaseKind::Single,
+            ReleaseResolverKind::MovieRadarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "rrm6-movie-provenance",
+            vec![TestReleaseFile {
+                local_path: path.to_string_lossy().to_string(),
+                basename: "Movie.2024.1080p.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: None,
+                parsed_episode: None,
+                coverage: vec![(
+                    target_id,
+                    ReleaseCoverageKind::Movie,
+                    ReleaseCoverageState::Submitted,
+                )],
+            }],
+            Some(active_plan),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE acquisition_releases SET selected_candidate_json = ? WHERE release_id = ?",
+        )
+        .bind(serde_json::to_string(&json!({
+            "title": "Movie.2024.1080p.WEB-DL-GROUP",
+            "movieCoveragePlan": source_plan,
+            "submissionResult": {
+                "routeLogicalId": DEBRID_DEFAULT_LOGICAL_ID,
+                "downloadId": "download-rrm6-movie-provenance"
+            }
+        }))?)
+        .bind(release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.pointer("/movieImportEvidence/parsedRelease/movieTitle"))
+                .and_then(JsonValue::as_str),
+            Some("Movie")
+        );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.pointer("/movieImportEvidence/fileSelection/status"))
+                .and_then(JsonValue::as_str),
+            Some("approved")
+        );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.pointer("/movieImportEvidence/route/routeLogicalId"))
+                .and_then(JsonValue::as_str),
+            Some(DEBRID_DEFAULT_LOGICAL_ID)
+        );
+        let links = list_import_file_links(&database.pool, run.import_run_id).await?;
+        assert_eq!(
+            links[0]
+                .evidence
+                .as_ref()
+                .and_then(|value| {
+                    value.pointer("/previousEvidence/movieImportEvidence/parsedRelease/year")
+                })
+                .and_then(JsonValue::as_i64),
+            Some(2024)
+        );
+        assert_eq!(
+            links[0]
+                .evidence
+                .as_ref()
+                .and_then(|value| value.pointer("/previousEvidence/file/parsed/title"))
+                .and_then(JsonValue::as_str),
+            Some("Movie.2024.1080p.WEB-DL-GROUP")
+        );
         Ok(())
     }
 

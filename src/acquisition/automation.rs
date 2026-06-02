@@ -20,9 +20,10 @@ use crate::{
     acquisition::release_resolution::{
         anime::{
             ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
-            AnimeCandidateScoringContext, AnimeCandidateTarget, AnimeFileCoveragePlan,
-            AnimeMetadataGraphInput, AnimeReleaseFileInput, AnimeSeasonMapping,
-            build_anime_metadata_graph, infer_anizip_season_number, plan_anime_file_coverage,
+            AnimeCandidateScoringContext, AnimeCandidateTarget, AnimeCoverageOptions,
+            AnimeFileCoveragePlan, AnimeMetadataGraphInput, AnimeReleaseFileInput,
+            AnimeSeasonMapping, anime_parser_diagnostics, build_anime_metadata_graph,
+            infer_anizip_season_number, plan_anime_file_coverage_with_options,
             score_anime_candidate,
         },
         fingerprint::candidate_release_fingerprint,
@@ -32,6 +33,13 @@ use crate::{
             NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
             ReleaseCoverageState, ReleaseJobState, ReleaseKind, ReleaseResolverKind,
         },
+        movie::{
+            MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieCandidateInput, MovieCoveragePlan,
+            MovieRadarrStyleResolver, MovieTarget,
+        },
+        movie_graph::{MovieSourceExternalIds, MovieTitleEvidenceKind},
+        movie_radarr_parser::MovieRadarrStyleParser,
+        movie_reconcile::{MovieReconciliationOutcome, MovieRejectionReason, MovieReviewReason},
         review_candidates::{
             ManualReviewResolverEvidence, ManualReviewRoutePolicyEvidence, ManualReviewTargetScope,
             NewManualReviewCandidateRelease, upsert_manual_review_candidate_release,
@@ -128,6 +136,7 @@ struct CandidateSubmission {
     provider_warnings: Vec<String>,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
     tv_coverage_plan: Option<TvCoveragePlan>,
+    movie_coverage_plan: Option<MovieCoveragePlan>,
     request_scope_evidence: Option<JsonValue>,
     dispatch: Option<SchedulerDispatchEvidence>,
 }
@@ -140,7 +149,9 @@ struct ExistingReleaseReuse {
 
 impl CandidateSubmission {
     fn has_release_coverage_plan(&self) -> bool {
-        self.anime_coverage_plan.is_some() || self.tv_coverage_plan.is_some()
+        self.anime_coverage_plan.is_some()
+            || self.tv_coverage_plan.is_some()
+            || self.movie_coverage_plan.is_some()
     }
 }
 
@@ -149,6 +160,7 @@ struct CandidateSelection {
     candidate: AcquisitionCandidate,
     anime_coverage_plan: Option<AnimeFileCoveragePlan>,
     tv_coverage_plan: Option<TvCoveragePlan>,
+    movie_coverage_plan: Option<MovieCoveragePlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +275,7 @@ impl CandidateReleasePlan {
             provider_warnings: self.provider_warnings,
             anime_coverage_plan: self.selection.anime_coverage_plan,
             tv_coverage_plan: self.selection.tv_coverage_plan,
+            movie_coverage_plan: self.selection.movie_coverage_plan,
             request_scope_evidence: self.request_scope_evidence,
             dispatch: Some(dispatch),
         }
@@ -1486,7 +1499,11 @@ fn build_manual_review_candidate_plan(
         grouped_targets.to_vec()
     };
     match subscription.media_type {
-        MediaType::Movie => Ok(None),
+        MediaType::Movie => Ok(build_movie_manual_review_candidate(
+            subscription,
+            representative,
+            candidate,
+        )),
         MediaType::Series => Ok(Some(build_tv_manual_review_candidate(candidate, &targets)?)),
         MediaType::Anime => Ok(Some(build_anime_manual_review_candidate(
             subscription,
@@ -1495,6 +1512,85 @@ fn build_manual_review_candidate_plan(
             candidate,
         )?)),
     }
+}
+
+fn build_movie_manual_review_candidate(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    candidate: &AcquisitionCandidate,
+) -> Option<CandidateReviewPlan> {
+    let resolver = MovieRadarrStyleResolver;
+    let plan = resolver.plan_candidate(
+        movie_target_for_acquisition(subscription, target),
+        movie_candidate_input(candidate),
+    );
+    if plan.reconciliation.outcome == MovieReconciliationOutcome::Rejected {
+        return None;
+    }
+    let mut rejection_codes = movie_review_codes(&plan);
+    if plan.confidence == ReleaseConfidence::ReviewRequired {
+        rejection_codes.push("review_required_confidence".to_string());
+    }
+    if plan.confidence == ReleaseConfidence::Low {
+        rejection_codes.push("low_confidence".to_string());
+    }
+    rejection_codes.sort();
+    rejection_codes.dedup();
+    let reason = manual_review_reason(&rejection_codes, "Movie");
+    Some(CandidateReviewPlan {
+        candidate: candidate.clone(),
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+        rejection_codes,
+        parsed_release: Some(json!({
+            "coveragePlan": plan,
+        })),
+        score: candidate.score,
+        reason,
+    })
+}
+
+fn movie_review_codes(plan: &MovieCoveragePlan) -> Vec<String> {
+    let mut codes = Vec::new();
+    codes.extend(
+        plan.reconciliation
+            .review_reasons
+            .iter()
+            .map(review_reason_code),
+    );
+    codes.extend(
+        plan.reconciliation
+            .rejection_reasons
+            .iter()
+            .map(rejection_reason_code),
+    );
+    if !plan.reconciliation.graph_id_conflicts.is_empty() {
+        codes.push("graph_identity_conflict".to_string());
+    }
+    if !plan.reconciliation.external_id_conflicts.is_empty() {
+        codes.push("external_id_conflict".to_string());
+    }
+    codes
+}
+
+fn review_reason_code(reason: &MovieReviewReason) -> String {
+    reason_code(reason)
+}
+
+fn rejection_reason_code(reason: &MovieRejectionReason) -> String {
+    reason_code(reason)
+}
+
+fn reason_code<T>(value: &T) -> String
+where
+    T: serde::Serialize + std::fmt::Debug,
+{
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| format!("{value:?}"))
 }
 
 fn build_tv_manual_review_candidate(
@@ -1581,7 +1677,12 @@ fn build_anime_manual_review_candidate(
     };
     let input = anime_candidate_input(candidate);
     let files = anime_release_file_inputs(candidate);
-    let plan = plan_anime_file_coverage(&context, &input, &files);
+    let plan = plan_anime_file_coverage_with_options(
+        &context,
+        &input,
+        &files,
+        anime_coverage_options_for_candidate(subscription.route_policy, candidate),
+    );
     let mut rejection_codes = plan.rejection_reasons.clone();
     rejection_codes.extend(plan.review_reasons.iter().cloned());
     if plan.confidence == ReleaseConfidence::ReviewRequired {
@@ -1596,6 +1697,7 @@ fn build_anime_manual_review_candidate(
     rejection_codes.sort();
     rejection_codes.dedup();
     let score = score_anime_candidate(&context, &input);
+    let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
     let reason = manual_review_reason(&rejection_codes, "Anime");
     Ok(CandidateReviewPlan {
         candidate: candidate.clone(),
@@ -1609,6 +1711,7 @@ fn build_anime_manual_review_candidate(
             "graphFingerprint": context.graph_fingerprint,
             "aliasCount": context.aliases.len(),
             "targetCount": context.targets.len(),
+            "diagnostics": diagnostics,
         })),
         score: Some(score.score),
         reason,
@@ -1707,6 +1810,19 @@ fn coverage_plan_with_request_scope(
         other => json!({
             "coveragePlan": other,
             "requestScopeEvidence": evidence,
+        }),
+    }
+}
+
+fn json_with_diagnostics(value: JsonValue, diagnostics: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(mut object) => {
+            object.insert("diagnostics".to_string(), diagnostics);
+            JsonValue::Object(object)
+        }
+        other => json!({
+            "value": other,
+            "diagnostics": diagnostics,
         }),
     }
 }
@@ -1918,7 +2034,9 @@ fn analyze_candidate_coverage(
             analyze_anime_candidate_coverage(subscription, representative, &targets, candidate)
         }
         MediaType::Series => analyze_tv_candidate_coverage(candidate, &targets),
-        MediaType::Movie => Some(analyze_movie_candidate_coverage(candidate, representative)),
+        MediaType::Movie => {
+            analyze_movie_candidate_coverage(subscription, candidate, representative)
+        }
     }
 }
 
@@ -1930,7 +2048,13 @@ fn analyze_anime_candidate_coverage(
 ) -> Option<CandidateCoverageAnalysis> {
     let context = anime_candidate_scoring_context(subscription, representative, targets)?;
     let input = anime_candidate_input(candidate);
-    let plan = plan_anime_file_coverage(&context, &input, &anime_release_file_inputs(candidate));
+    let files = anime_release_file_inputs(candidate);
+    let plan = plan_anime_file_coverage_with_options(
+        &context,
+        &input,
+        &files,
+        anime_coverage_options_for_candidate(subscription.route_policy, candidate),
+    );
     if !plan.rejection_reasons.is_empty()
         || plan.confidence == ReleaseConfidence::ReviewRequired
         || plan.entries.is_empty()
@@ -2018,6 +2142,7 @@ fn analyze_tv_candidate_coverage(
             candidate,
             anime_coverage_plan: None,
             tv_coverage_plan: Some(plan.clone()),
+            movie_coverage_plan: None,
         },
         release_kind: plan.release_kind,
         resolver_kind: plan.resolver_kind,
@@ -2030,23 +2155,218 @@ fn analyze_tv_candidate_coverage(
 }
 
 fn analyze_movie_candidate_coverage(
+    subscription: &AcquisitionSubscription,
     candidate: &AcquisitionCandidate,
     target: &AcquisitionTarget,
-) -> CandidateCoverageAnalysis {
-    CandidateCoverageAnalysis {
+) -> Option<CandidateCoverageAnalysis> {
+    let resolver = MovieRadarrStyleResolver;
+    let plan = resolver.plan_candidate(
+        movie_target_for_acquisition(subscription, target),
+        movie_candidate_input(candidate),
+    );
+    if !plan.is_planned() {
+        return None;
+    }
+    let mut candidate = candidate.clone();
+    candidate.score_badges.push(CandidateScoreBadge {
+        label: "Movie match".to_string(),
+        detail: Some(movie_match_detail(&plan)),
+        score: Some(match plan.confidence {
+            ReleaseConfidence::High => 1.0,
+            ReleaseConfidence::Medium => 0.5,
+            ReleaseConfidence::Low | ReleaseConfidence::ReviewRequired => 0.0,
+        }),
+    });
+    let overfetch_count = candidate_media_file_count(&candidate).saturating_sub(1);
+    Some(CandidateCoverageAnalysis {
         selection: CandidateSelection {
-            candidate: candidate.clone(),
+            candidate,
             anime_coverage_plan: None,
             tv_coverage_plan: None,
+            movie_coverage_plan: Some(plan.clone()),
         },
-        release_kind: ReleaseKind::Single,
-        resolver_kind: ReleaseResolverKind::MovieSingle,
-        resolver_version: "rr6-movie-single-v0".to_string(),
-        confidence: ReleaseConfidence::High,
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
         covered_target_ids: BTreeSet::from([target.target_id]),
         covered_target_keys: BTreeSet::from([target.target_key.clone()]),
-        overfetch_count: 0,
+        overfetch_count,
+    })
+}
+
+fn movie_target_for_acquisition(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+) -> MovieTarget {
+    MovieTarget {
+        target_id: target.target_id,
+        target_key: target.target_key.clone(),
+        title: if target.title.trim().is_empty() {
+            subscription.title.clone()
+        } else {
+            target.title.clone()
+        },
+        year: movie_target_year(subscription, target),
+        external_ids: merged_target_external_ids(subscription.external_ids.clone(), target),
+        tvdb_movie: movie_target_tvdb_metadata(target),
     }
+}
+
+fn movie_candidate_input(candidate: &AcquisitionCandidate) -> MovieCandidateInput {
+    let external_ids = candidate_external_ids(candidate);
+    MovieCandidateInput {
+        title: candidate.title.clone(),
+        source_external_ids: (!external_ids.is_default())
+            .then(|| MovieSourceExternalIds {
+                source: candidate
+                    .id
+                    .as_deref()
+                    .map(|id| format!("source_candidate:{id}"))
+                    .unwrap_or_else(|| "source_candidate".to_string()),
+                external_ids,
+            })
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn movie_match_detail(plan: &MovieCoveragePlan) -> String {
+    if !plan.reconciliation.external_id_matches.is_empty() {
+        return format!(
+            "External id match via {}.",
+            plan.reconciliation.external_id_matches[0].source
+        );
+    }
+    if let Some(title) = plan.reconciliation.title_match.as_ref()
+        && let Some(year) = plan.reconciliation.year_match.as_ref()
+    {
+        return format!(
+            "{} title/year match ({}, {}).",
+            movie_title_match_kind_label(title.graph_title_kind),
+            title.graph_title,
+            year.graph_year
+        );
+    }
+    "Movie candidate matched Radarr-style resolver policy.".to_string()
+}
+
+fn movie_title_match_kind_label(kind: MovieTitleEvidenceKind) -> &'static str {
+    match kind {
+        MovieTitleEvidenceKind::Target => "target",
+        MovieTitleEvidenceKind::TvdbCanonical => "TVDB canonical",
+        MovieTitleEvidenceKind::TvdbAlias => "TVDB alias",
+        MovieTitleEvidenceKind::TvdbTranslation => "TVDB translation",
+    }
+}
+
+fn movie_target_year(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+) -> Option<i32> {
+    subscription.year.or_else(|| {
+        target
+            .metadata
+            .as_ref()
+            .and_then(|metadata| json_i32_field(metadata, &["year", "releaseYear", "release_year"]))
+    })
+}
+
+fn movie_target_tvdb_metadata(target: &AcquisitionTarget) -> Option<JsonValue> {
+    let metadata = target.metadata.as_ref()?;
+    for key in [
+        "tvdbMovie",
+        "tvdb_movie",
+        "tvdbMovieMetadata",
+        "tvdb_movie_metadata",
+        "tvdbMetadata",
+        "tvdb_metadata",
+        "movieMetadata",
+        "movie_metadata",
+    ] {
+        if let Some(value) = metadata.get(key) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn candidate_external_ids(candidate: &AcquisitionCandidate) -> ExternalIds {
+    let mut ids = ExternalIds::default();
+    let Some(raw) = candidate.raw.as_ref() else {
+        return ids;
+    };
+    for path in [
+        "/externalIds",
+        "/external_ids",
+        "/ids",
+        "/metadata/externalIds",
+        "/metadata/external_ids",
+        "/sourceRaw/externalIds",
+        "/sourceRaw/external_ids",
+    ] {
+        if let Some(value) = raw.pointer(path)
+            && let Ok(extracted) = serde_json::from_value::<ExternalIds>(value.clone())
+        {
+            merge_external_ids(&mut ids, &extracted);
+        }
+    }
+    merge_candidate_external_id_fields(&mut ids, raw);
+    if let Some(source_raw) = raw.get("sourceRaw") {
+        merge_candidate_external_id_fields(&mut ids, source_raw);
+    }
+    ids
+}
+
+fn merge_candidate_external_id_fields(ids: &mut ExternalIds, value: &JsonValue) {
+    if ids.imdb.is_none() {
+        ids.imdb = json_string_field(value, &["imdb", "imdbId", "imdb_id"]);
+    }
+    if ids.tmdb.is_none() {
+        ids.tmdb = json_string_field(value, &["tmdb", "tmdbId", "tmdb_id"]);
+    }
+    if ids.tvdb.is_none() {
+        ids.tvdb = json_string_field(value, &["tvdb", "tvdbId", "tvdb_id"]);
+    }
+    if ids.tvdb_movie.is_none() {
+        ids.tvdb_movie = json_string_field(
+            value,
+            &["tvdbMovie", "tvdbMovieId", "tvdb_movie", "tvdb_movie_id"],
+        );
+    }
+}
+
+fn json_string_field(value: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(json_string_value)
+}
+
+fn json_string_value(value: &JsonValue) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    value
+        .as_i64()
+        .map(|number| number.to_string())
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
+fn json_i32_field(value: &JsonValue, keys: &[&str]) -> Option<i32> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|value| {
+            value
+                .as_i64()
+                .and_then(|number| i32::try_from(number).ok())
+                .or_else(|| {
+                    value.as_str().and_then(|text| {
+                        let prefix = text.trim().get(0..4)?;
+                        prefix.parse::<i32>().ok()
+                    })
+                })
+        })
 }
 
 async fn release_fingerprint_already_claimed(
@@ -2778,6 +3098,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                     provider_warnings: Vec::new(),
                     anime_coverage_plan: None,
                     tv_coverage_plan: None,
+                    movie_coverage_plan: None,
                     request_scope_evidence: Some(request_scope_resolution_evidence(
                         subscription,
                         &[target.clone()],
@@ -3375,6 +3696,18 @@ async fn persist_release_submission(
             reason,
         )
         .await
+    } else if submission.movie_coverage_plan.is_some() {
+        persist_movie_release_submission(
+            state,
+            subscription,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            route_provider_id,
+            reason,
+        )
+        .await
     } else {
         mark_target_submitted(
             state,
@@ -3413,6 +3746,13 @@ async fn persist_anime_release_submission(
     };
     let fingerprint =
         candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+    let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+    let anime_scoring =
+        anime_candidate_scoring_context(subscription, target, &targets).map(|context| {
+            let input = anime_candidate_input(&submission.candidate);
+            let score = score_anime_candidate(&context, &input);
+            (context, score)
+        });
     let selected_candidate = selected_candidate_provenance_with_submission(
         submission,
         route_logical_id,
@@ -3420,6 +3760,13 @@ async fn persist_anime_release_submission(
         route_provider_id,
         reason,
     )?;
+    let coverage_plan = match anime_scoring.as_ref() {
+        Some((context, score)) => json_with_diagnostics(
+            serde_json::to_value(plan)?,
+            anime_parser_diagnostics(context, score, Some(plan)),
+        ),
+        None => serde_json::to_value(plan)?,
+    };
     let release = upsert_release(
         &state.db_pool,
         NewAcquisitionRelease {
@@ -3451,16 +3798,28 @@ async fn persist_anime_release_submission(
             )),
             selected_candidate: Some(selected_candidate.clone()),
             coverage_plan: Some(coverage_plan_with_request_scope(
-                serde_json::to_value(plan)?,
+                coverage_plan,
                 submission.request_scope_evidence.as_ref(),
             )),
         },
     )
     .await?;
 
-    let parsed = crate::acquisition::release_resolution::anime::parse_anime_release_title(
-        &submission.candidate.title,
-    );
+    let parsed = anime_scoring
+        .as_ref()
+        .map(|(_, score)| score.parsed.clone())
+        .unwrap_or_else(|| {
+            crate::acquisition::release_resolution::anime::parse_anime_release_title(
+                &submission.candidate.title,
+            )
+        });
+    let parsed_json = match anime_scoring.as_ref() {
+        Some((context, score)) => json_with_diagnostics(
+            serde_json::to_value(&parsed)?,
+            anime_parser_diagnostics(context, score, Some(plan)),
+        ),
+        None => serde_json::to_value(&parsed)?,
+    };
     upsert_anime_candidate_parse(
         &state.db_pool,
         NewAcquisitionAnimeCandidateParse {
@@ -3470,7 +3829,7 @@ async fn persist_anime_release_submission(
             source_candidate_id: submission.candidate.id.clone(),
             release_title: submission.candidate.title.clone(),
             normalized_title: parsed.normalized_title.clone(),
-            parsed: serde_json::to_value(&parsed)?,
+            parsed: parsed_json,
             confidence: plan.confidence,
             review_reasons: json!(plan.review_reasons),
         },
@@ -3526,7 +3885,6 @@ async fn persist_anime_release_submission(
         file_ids_by_key.insert(file.file_key, release_file.release_file_id);
     }
 
-    let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
     let targets_by_key = targets
         .into_iter()
         .map(|target| (target.target_key.clone(), target))
@@ -3811,6 +4169,183 @@ async fn persist_tv_release_submission(
         release_id = %release.release_id,
         coverage = plan.entries.len(),
         "persisted RR-6B TV release coverage"
+    );
+    Ok(())
+}
+
+async fn persist_movie_release_submission(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    download_id: Option<String>,
+    route_provider_id: Uuid,
+    reason: &str,
+) -> Result<()> {
+    let Some(plan) = submission.movie_coverage_plan.as_ref() else {
+        return mark_target_submitted(
+            state,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            route_provider_id,
+            reason,
+        )
+        .await;
+    };
+    let fingerprint =
+        candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+    let selected_candidate = selected_candidate_provenance_with_submission(
+        submission,
+        route_logical_id,
+        &download_id,
+        route_provider_id,
+        reason,
+    )?;
+    let release = upsert_release(
+        &state.db_pool,
+        NewAcquisitionRelease {
+            release_id: None,
+            subscription_id: Some(subscription.subscription_id),
+            source_provider_id: Some(submission.provider_id),
+            source_extension_id: submission.source_extension_id.clone(),
+            owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+            media_type: target.media_type,
+            title: subscription.title.clone(),
+            release_title: submission.candidate.title.clone(),
+            source: submission.candidate.source.clone(),
+            source_kind: submission.candidate.source_kind.clone(),
+            info_hash: submission.candidate.info_hash.clone(),
+            fingerprint,
+            release_kind: plan.release_kind,
+            resolver_kind: plan.resolver_kind,
+            resolver_version: plan.resolver_version.clone(),
+            confidence: plan.confidence,
+            score: submission.candidate.score,
+            selected_route_logical_id: Some(route_logical_id.to_string()),
+            selected_provider_id: Some(route_provider_id),
+            download_id: download_id.clone(),
+            remote_release_id: None,
+            state: AcquisitionReleaseState::Submitted,
+            state_reason: Some(format!("{reason} Movie Radarr-style match.")),
+            selected_candidate: Some(selected_candidate.clone()),
+            coverage_plan: Some(coverage_plan_with_request_scope(
+                serde_json::to_value(plan)?,
+                submission.request_scope_evidence.as_ref(),
+            )),
+        },
+    )
+    .await?;
+
+    for file in movie_release_file_inputs(&submission.candidate) {
+        let parsed = MovieRadarrStyleParser.parse_path(&file.path);
+        upsert_release_file(
+            &state.db_pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: None,
+                release_id: release.release_id,
+                file_index: file.file_index,
+                file_id: file.file_id.clone(),
+                provider_file_id: file.file_id.clone(),
+                path: file.path.clone(),
+                basename: None,
+                size_bytes: file.size_bytes,
+                selectable: file.selectable,
+                selected: None,
+                parsed_title: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.primary_movie_title().map(ToString::to_string)),
+                parsed_season_number: None,
+                parsed_episode_number: None,
+                parsed_episode_end_number: None,
+                parsed_absolute_episode_number: None,
+                parsed_absolute_episode_end_number: None,
+                parsed_air_date: None,
+                parsed_quality: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.quality.quality.clone()),
+                parsed_language: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.languages.first().cloned()),
+                parsed_release_group: parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.release_group.clone()),
+                parser_confidence: parsed
+                    .as_ref()
+                    .map(|_| ReleaseConfidence::High)
+                    .unwrap_or(ReleaseConfidence::ReviewRequired),
+                parser_reason: parsed
+                    .is_none()
+                    .then(|| "movie_file_path_unparseable".to_string()),
+                raw: Some(json!({
+                    "parsed": parsed,
+                    "resolverVersion": MOVIE_RADARR_STYLE_RESOLVER_VERSION,
+                })),
+                provider_metadata: Some(json!({
+                    "fileId": file.file_id,
+                    "selectable": file.selectable,
+                })),
+            },
+        )
+        .await?;
+    }
+
+    upsert_release_coverage(
+        &state.db_pool,
+        NewAcquisitionReleaseCoverage {
+            coverage_id: None,
+            release_id: release.release_id,
+            release_file_id: None,
+            target_id: target.target_id,
+            coverage_kind: plan.coverage_kind,
+            confidence: plan.confidence,
+            score: submission.candidate.score,
+            reason: Some("Movie Radarr-style reconciliation covered target.".to_string()),
+            state: ReleaseCoverageState::Submitted,
+            verified_by: Some("rrm_movie_radarr_style".to_string()),
+        },
+    )
+    .await?;
+
+    update_target_state(
+        &state.db_pool,
+        target.target_id,
+        AcquisitionTargetStateUpdate {
+            state: AcquisitionTargetState::Submitted,
+            state_reason: Some(format!("{reason} {route_logical_id}")),
+            selected_provider_id: Some(submission.provider_id),
+            selected_route_logical_id: Some(route_logical_id.to_string()),
+            selected_candidate: Some(selected_candidate),
+            download_id: download_id.clone(),
+            next_search_after: None,
+            increment_search_attempts: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    upsert_release_job(
+        &state.db_pool,
+        NewAcquisitionReleaseJob {
+            release_job_id: None,
+            release_id: release.release_id,
+            route_logical_id: route_logical_id.to_string(),
+            provider_id: Some(route_provider_id),
+            download_id,
+            remote_release_id: None,
+            state: ReleaseJobState::Submitted,
+            state_reason: Some(reason.to_string()),
+            active: true,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+        },
+    )
+    .await?;
+    debug!(
+        release_id = %release.release_id,
+        "persisted RR-M4 movie release coverage"
     );
     Ok(())
 }
@@ -4712,10 +5247,12 @@ fn select_best_candidate_with_preference(
         let selection = match anime_context {
             Some(context) => {
                 let input = anime_candidate_input(candidate);
-                let plan = plan_anime_file_coverage(
+                let files = anime_release_file_inputs(candidate);
+                let plan = plan_anime_file_coverage_with_options(
                     context,
                     &input,
-                    &anime_release_file_inputs(candidate),
+                    &files,
+                    anime_coverage_options_for_candidate(route_policy, candidate),
                 );
                 if !plan.rejection_reasons.is_empty()
                     || plan.confidence == ReleaseConfidence::ReviewRequired
@@ -4729,6 +5266,7 @@ fn select_best_candidate_with_preference(
                 candidate: candidate.clone(),
                 anime_coverage_plan: None,
                 tv_coverage_plan: None,
+                movie_coverage_plan: None,
             },
         };
         let replace = best
@@ -4842,6 +5380,7 @@ fn anime_scored_candidate(
         candidate,
         anime_coverage_plan,
         tv_coverage_plan: None,
+        movie_coverage_plan: None,
     }
 }
 
@@ -5090,12 +5629,78 @@ fn tv_release_file_inputs(candidate: &AcquisitionCandidate) -> Vec<TvReleaseFile
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct MovieReleaseFileInput {
+    file_id: Option<String>,
+    file_index: Option<i64>,
+    path: String,
+    size_bytes: Option<i64>,
+    selectable: bool,
+}
+
+fn movie_release_file_inputs(candidate: &AcquisitionCandidate) -> Vec<MovieReleaseFileInput> {
+    if candidate.files.is_empty() {
+        return vec![MovieReleaseFileInput {
+            file_id: candidate
+                .file_index
+                .map(|index| index.to_string())
+                .or_else(|| candidate.id.clone()),
+            file_index: candidate.file_index,
+            path: candidate.title.clone(),
+            size_bytes: candidate
+                .size_bytes
+                .and_then(|value| i64::try_from(value).ok()),
+            selectable: true,
+        }];
+    }
+    candidate
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| MovieReleaseFileInput {
+            file_id: file.file_id.clone(),
+            file_index: file
+                .file_index
+                .or_else(|| i64::try_from(index).ok().map(|value| value + 1)),
+            path: file.path.clone(),
+            size_bytes: file.size_bytes.and_then(|value| i64::try_from(value).ok()),
+            selectable: file.selectable.unwrap_or(true),
+        })
+        .collect()
+}
+
 fn candidate_file_selection_supported(candidate: &AcquisitionCandidate) -> bool {
     !candidate.files.is_empty()
         && candidate
             .files
             .iter()
             .any(|file| file.selectable.unwrap_or(true))
+}
+
+fn anime_coverage_options_for_candidate(
+    route_policy: AcquisitionRoutePolicy,
+    candidate: &AcquisitionCandidate,
+) -> AnimeCoverageOptions {
+    let debrid_file_selection_route =
+        matches!(
+            route_policy,
+            AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::DebridOnly
+        ) && candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID);
+    AnimeCoverageOptions {
+        file_selection_supported: debrid_file_selection_route
+            && anime_candidate_file_selection_supported(candidate),
+    }
+}
+
+fn anime_candidate_file_selection_supported(candidate: &AcquisitionCandidate) -> bool {
+    !candidate.files.is_empty()
+        && candidate.files.iter().any(|file| {
+            file.selectable.unwrap_or(true)
+                && file
+                    .file_id
+                    .as_deref()
+                    .is_some_and(|file_id| !file_id.trim().is_empty())
+        })
 }
 
 fn candidate_media_file_count(candidate: &AcquisitionCandidate) -> usize {
@@ -5192,6 +5797,9 @@ fn selected_candidate_provenance_inner(
         }
         if let Some(plan) = submission.tv_coverage_plan.as_ref() {
             object.insert("tvCoveragePlan".to_string(), serde_json::to_value(plan)?);
+        }
+        if let Some(plan) = submission.movie_coverage_plan.as_ref() {
+            object.insert("movieCoveragePlan".to_string(), serde_json::to_value(plan)?);
         }
         if let Some(evidence) = submission.request_scope_evidence.as_ref() {
             object.insert("requestScopeEvidence".to_string(), evidence.clone());
@@ -6374,6 +6982,7 @@ mod tests {
             provider_warnings: Vec::new(),
             anime_coverage_plan: None,
             tv_coverage_plan: None,
+            movie_coverage_plan: None,
             request_scope_evidence: None,
             dispatch: None,
         };
@@ -6572,6 +7181,22 @@ mod tests {
         }
     }
 
+    fn new_movie_target(title: &str, metadata: Option<JsonValue>) -> NewAcquisitionTarget {
+        NewAcquisitionTarget {
+            target_key: Some("MOVIE".to_string()),
+            media_type: Some(MediaType::Movie),
+            title: Some(title.to_string()),
+            season_number: None,
+            episode_number: None,
+            absolute_episode_number: None,
+            air_date: None,
+            air_time: None,
+            metadata,
+            state: Some(AcquisitionTargetState::Pending),
+            next_search_after: Some(Utc::now()),
+        }
+    }
+
     fn new_anime_episode_target(
         title: &str,
         season_number: i32,
@@ -6657,6 +7282,7 @@ mod tests {
                 candidate,
                 anime_coverage_plan: None,
                 tv_coverage_plan: None,
+                movie_coverage_plan: None,
             },
             release_kind,
             resolver_kind: ReleaseResolverKind::TvSonarrStyle,
@@ -6745,6 +7371,7 @@ mod tests {
             media_type: MediaType::Movie,
             title: "Movie".to_string(),
             normalized_title: "movie".to_string(),
+            year: Some(2026),
             external_ids: Some(ExternalIds {
                 imdb: Some("tt1000001".to_string()),
                 ..Default::default()
@@ -6837,7 +7464,7 @@ mod tests {
                 targets: movie_targets,
                 search_intent: None,
                 release_kind: ReleaseKind::Single,
-                resolver_kind: ReleaseResolverKind::MovieSingle,
+                resolver_kind: ReleaseResolverKind::MovieRadarrStyle,
                 confidence: ReleaseConfidence::High,
                 covered: 1,
             },
@@ -6894,7 +7521,7 @@ mod tests {
                 search_intent: None,
                 release_kind: ReleaseKind::Single,
                 resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
-                confidence: ReleaseConfidence::Medium,
+                confidence: ReleaseConfidence::High,
                 covered: 1,
             },
         ];
@@ -7862,6 +8489,344 @@ mod tests {
         assert!(groups.iter().all(|group| group.search_intent.is_none()));
     }
 
+    #[tokio::test]
+    async fn rrm4_movie_source_id_match_plans_high_even_with_wrong_title() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "The Matrix".to_string(),
+            normalized_title: "the matrix".to_string(),
+            year: Some(1999),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt0133093".to_string()),
+                ..Default::default()
+            }),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let mut release = candidate(
+            "Completely.Wrong.Movie.2020.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        release.raw = Some(json!({
+            "externalIds": {
+                "imdb": "tt0133093"
+            }
+        }));
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "test.movie.source",
+            vec!["movie"],
+            vec![release],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        let plan = &batch.plans[0];
+        assert_eq!(plan.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        let coverage = plan
+            .selection
+            .movie_coverage_plan
+            .as_ref()
+            .expect("movie coverage plan");
+        assert_eq!(
+            coverage.reconciliation.outcome,
+            MovieReconciliationOutcome::Planned
+        );
+        assert_eq!(coverage.reconciliation.external_id_matches.len(), 1);
+        assert!(coverage.reconciliation.title_match.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm4_movie_title_year_match_plans_high() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: Some(2004),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "test.movie.source",
+            vec!["movie"],
+            vec![candidate(
+                "Primer.2004.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        let plan = &batch.plans[0];
+        assert_eq!(plan.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        let coverage = plan
+            .selection
+            .movie_coverage_plan
+            .as_ref()
+            .expect("movie coverage plan");
+        assert!(coverage.reconciliation.external_id_matches.is_empty());
+        assert!(
+            coverage
+                .reconciliation
+                .year_match
+                .as_ref()
+                .is_some_and(|year| year.exact)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm4_movie_wrong_year_is_rejected_without_manual_review() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: Some(2004),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "test.movie.source",
+            vec!["movie"],
+            vec![candidate(
+                "Primer.2010.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert!(batch.plans.is_empty());
+        assert!(batch.review_candidates.is_empty());
+        assert_eq!(batch.resolver_rejected_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm4_movie_weak_year_evidence_goes_to_manual_review() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: None,
+            external_ids: None,
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "test.movie.source",
+            vec!["movie"],
+            vec![candidate(
+                "Primer.2004.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert!(batch.plans.is_empty());
+        assert_eq!(batch.review_candidates.len(), 1);
+        let review = &batch.review_candidates[0];
+        assert_eq!(review.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
+        assert_eq!(review.confidence, ReleaseConfidence::ReviewRequired);
+        assert!(
+            review
+                .rejection_codes
+                .iter()
+                .any(|code| code == "missing_graph_year")
+        );
+        assert_eq!(
+            review
+                .parsed_release
+                .as_ref()
+                .and_then(|value| value.pointer("/coveragePlan/reconciliation/outcome"))
+                .and_then(Value::as_str),
+            Some("review_required")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rrm4_movie_persistence_records_movie_coverage_plan() -> Result<()> {
+        let state = setup_test_state().await?;
+        let provider_id = seed_te10b_candidate_provider(&state, 49156).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: "Primer".to_string(),
+                year: Some(2004),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_movie_target("Primer", None)],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let response = candidate_search_response_for_test(
+            provider_id,
+            "test.movie.source",
+            vec!["movie"],
+            vec![candidate(
+                "Primer.2004.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+        let release_plan = batch.plans[0].clone();
+        let submission = CandidateSubmission {
+            provider_id: release_plan.provider_id,
+            source_extension_id: release_plan.source_extension_id.clone(),
+            candidate: release_plan.selection.candidate.clone(),
+            provider_warnings: release_plan.provider_warnings.clone(),
+            anime_coverage_plan: release_plan.selection.anime_coverage_plan.clone(),
+            tv_coverage_plan: release_plan.selection.tv_coverage_plan.clone(),
+            movie_coverage_plan: release_plan.selection.movie_coverage_plan.clone(),
+            request_scope_evidence: release_plan.request_scope_evidence.clone(),
+            dispatch: None,
+        };
+
+        persist_release_submission(
+            &state,
+            &subscription,
+            &target,
+            &submission,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            Some("rrm4-movie-download".to_string()),
+            provider_id,
+            "Submitted through RR-M4 test.",
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::Submitted),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/resolverKind"))
+                .and_then(Value::as_str),
+            Some("movie_radarr_style")
+        );
+        assert!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/movieCoveragePlan"))
+                .is_some()
+        );
+        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(
+            coverage[0].coverage_kind,
+            crate::acquisition::release_resolution::models::ReleaseCoverageKind::Movie
+        );
+        Ok(())
+    }
+
     #[test]
     fn large_backfill_selection_prefers_high_coverage_pack_over_single() {
         let context = anime_scoring_context(3);
@@ -8290,6 +9255,7 @@ mod tests {
             provider_warnings: Vec::new(),
             anime_coverage_plan: None,
             tv_coverage_plan: None,
+            movie_coverage_plan: None,
             request_scope_evidence: None,
             dispatch: None,
         };
@@ -8975,6 +9941,211 @@ mod tests {
                 .and_then(|value| value.get("requestScope"))
                 .and_then(JsonValue::as_str),
             Some("season")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rr3r_anime_one_shot_episode_accepts_pack_with_safe_file_selection() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Episode,
+            scope: Some(json!({
+                "kind": "episode",
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "targetKey": "S01E01"
+            })),
+            source_provider_id: Some(Uuid::new_v4()),
+            ..anime_subscription()
+        };
+        let target = anime_episode_target(&subscription, 1, 1);
+        let candidate: AcquisitionCandidate = serde_json::from_value(candidate_json(
+            "[SubsPlease] Example Title S01 Batch [1080p]",
+            "rr3ranimepack",
+            &[
+                ("1", "Example Title - 01 [1080p].mkv"),
+                ("2", "Example Title - 02 [1080p].mkv"),
+            ],
+        ))?;
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.anime.source",
+            vec!["anime"],
+            vec![candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        let plan = &batch.plans[0];
+        assert_eq!(plan.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(
+            plan.covered_target_keys,
+            BTreeSet::from(["S01E01".to_string()])
+        );
+        assert_eq!(plan.overfetch_count, 1);
+        let coverage = plan
+            .selection
+            .anime_coverage_plan
+            .as_ref()
+            .expect("anime coverage plan");
+        assert_eq!(coverage.selected_file_keys, vec!["1"]);
+        assert!(coverage.requires_file_selection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rr3r_anime_pack_overfetch_without_safe_file_selection_goes_to_review() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Episode,
+            source_provider_id: Some(Uuid::new_v4()),
+            ..anime_subscription()
+        };
+        let target = anime_episode_target(&subscription, 1, 1);
+        let candidate: AcquisitionCandidate = serde_json::from_value(json!({
+            "title": "[SubsPlease] Example Title S01 Batch [1080p]",
+            "source": "magnet:?xt=urn:btih:rr3runsafeanimepack",
+            "sourceKind": "magnet",
+            "infoHash": "rr3runsafeanimepack",
+            "quality": "1080p",
+            "seeders": 100,
+            "cachedDebrid": true,
+            "supportedRoutes": [
+                DEBRID_DEFAULT_LOGICAL_ID,
+                TORRENT_DEFAULT_LOGICAL_ID
+            ],
+            "defaultRoute": DEBRID_DEFAULT_LOGICAL_ID,
+            "files": [
+                {
+                    "fileIndex": 1,
+                    "path": "Example Title - 01 [1080p].mkv",
+                    "sizeBytes": 1_000_000u64,
+                    "selectable": true
+                },
+                {
+                    "fileIndex": 2,
+                    "path": "Example Title - 02 [1080p].mkv",
+                    "sizeBytes": 1_000_000u64,
+                    "selectable": true
+                }
+            ]
+        }))?;
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.anime.source",
+            vec!["anime"],
+            vec![candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert!(batch.plans.is_empty());
+        assert_eq!(batch.review_candidates.len(), 1);
+        assert!(
+            batch.review_candidates[0]
+                .rejection_codes
+                .iter()
+                .any(|reason| reason == "pack_overfetch_without_safe_file_selection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rr3s_anime_manual_review_keeps_summary_clean_and_stores_diagnostics() -> Result<()> {
+        let subscription = AcquisitionSubscription {
+            request_mode: AcquisitionRequestMode::OneShot,
+            request_scope: AcquisitionRequestScope::Episode,
+            ..anime_subscription()
+        };
+        let target = anime_episode_target(&subscription, 1, 1);
+        let candidate: AcquisitionCandidate = serde_json::from_value(json!({
+            "title": "[SubsPlease] Example Title S01 Batch [1080p]",
+            "source": "magnet:?xt=urn:btih:rr3smanualreview",
+            "sourceKind": "magnet",
+            "infoHash": "rr3smanualreview",
+            "quality": "1080p",
+            "seeders": 100,
+            "cachedDebrid": true,
+            "supportedRoutes": [
+                DEBRID_DEFAULT_LOGICAL_ID,
+                TORRENT_DEFAULT_LOGICAL_ID
+            ],
+            "defaultRoute": DEBRID_DEFAULT_LOGICAL_ID,
+            "files": [
+                {
+                    "fileIndex": 1,
+                    "path": "Example Title - 01 [1080p].mkv",
+                    "sizeBytes": 1_000_000u64,
+                    "selectable": true
+                },
+                {
+                    "fileIndex": 2,
+                    "path": "Example Title - 02 [1080p].mkv",
+                    "sizeBytes": 1_000_000u64,
+                    "selectable": true
+                }
+            ]
+        }))?;
+
+        let plan = build_anime_manual_review_candidate(
+            &subscription,
+            &target,
+            &[target.clone()],
+            &candidate,
+        )?;
+
+        assert!(
+            plan.reason
+                .starts_with("Anime candidate needs manual review")
+        );
+        assert!(!plan.reason.contains("sonarrFacts"));
+        assert!(!plan.reason.contains("parserProvenance"));
+        assert!(
+            plan.rejection_codes
+                .iter()
+                .any(|reason| reason == "pack_overfetch_without_safe_file_selection")
+        );
+        let parsed_release = plan.parsed_release.expect("review parsed release evidence");
+        assert_eq!(
+            parsed_release
+                .pointer("/diagnostics/parserProvenance/sonarr/releaseKind")
+                .and_then(JsonValue::as_str),
+            Some("season_pack")
+        );
+        assert_eq!(
+            parsed_release
+                .pointer("/diagnostics/parserProvenance/coverage/requiresFileSelection")
+                .and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            parsed_release.pointer("/parsed/sonarrFacts"),
+            None,
+            "manual review rows should not expose raw parser dumps at the top level"
         );
         Ok(())
     }

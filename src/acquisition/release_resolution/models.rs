@@ -64,6 +64,7 @@ string_enum! {
     pub enum ReleaseResolverKind {
         Unresolved => "unresolved",
         MovieSingle => "movie_single",
+        MovieRadarrStyle => "movie_radarr_style",
         TvSonarrStyle => "tv_sonarr_style",
         AnimeShokoStyle => "anime_shoko_style",
     }
@@ -114,6 +115,7 @@ impl Default for AcquisitionReleaseState {
 
 string_enum! {
     pub enum ReleaseCoverageKind {
+        Movie => "movie",
         SingleEpisode => "single_episode",
         MultiEpisodeRange => "multi_episode_range",
         SeasonPack => "season_pack",

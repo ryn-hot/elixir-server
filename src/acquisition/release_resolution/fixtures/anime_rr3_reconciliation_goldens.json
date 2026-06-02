@@ -1,0 +1,174 @@
+{
+  "fixtureSet": "rr3q-anime-reconciliation-goldens",
+  "resolver": "anime_shoko_style",
+  "classification": "rr3q_asserted",
+  "cases": [
+    {
+      "id": "agreement_sxxeyy",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title S01E01 [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E01",
+          "canonicalKey": "tvdb:100:S01E01",
+          "title": "Example Title Episode 1",
+          "seasonNumber": 1,
+          "episodeNumber": 1,
+          "absoluteEpisodeNumber": 1,
+          "tvdbEpisodeId": "1001"
+        }
+      ],
+      "expected": {
+        "outcome": "agreement",
+        "targetKeys": ["S01E01"],
+        "reviewReasons": [],
+        "rejectionReasons": []
+      }
+    },
+    {
+      "id": "translation_sxxeyy_absolute_same_graph_target",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title S01E02 [014] [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E02",
+          "canonicalKey": "tvdb:100:S01E02",
+          "title": "Example Title Episode 2",
+          "seasonNumber": 1,
+          "episodeNumber": 2,
+          "absoluteEpisodeNumber": 14,
+          "tvdbEpisodeId": "1002"
+        }
+      ],
+      "expected": {
+        "outcome": "translation",
+        "targetKeys": ["S01E02"],
+        "reviewReasons": [],
+        "rejectionReasons": []
+      }
+    },
+    {
+      "id": "augmentation_anime_absolute_signal_maps_without_sonarr_episode",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title - 03 [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E03",
+          "canonicalKey": "tvdb:100:S01E03",
+          "title": "Example Title Episode 3",
+          "seasonNumber": 1,
+          "episodeNumber": 3,
+          "absoluteEpisodeNumber": 3,
+          "tvdbEpisodeId": "1003"
+        }
+      ],
+      "expected": {
+        "outcome": "augmentation",
+        "targetKeys": ["S01E03"],
+        "reviewReasons": [],
+        "rejectionReasons": []
+      }
+    },
+    {
+      "id": "benign_mismatch_partial_mixed_numbering",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title S01E04 [014] [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E04",
+          "canonicalKey": "tvdb:100:S01E04",
+          "title": "Example Title Episode 4",
+          "seasonNumber": 1,
+          "episodeNumber": 4,
+          "absoluteEpisodeNumber": 4,
+          "tvdbEpisodeId": "1004"
+        }
+      ],
+      "expected": {
+        "outcome": "benign_mismatch",
+        "targetKeys": ["S01E04"],
+        "reviewReasons": ["sonarr_mixed_numbering_partially_unmapped"],
+        "rejectionReasons": []
+      }
+    },
+    {
+      "id": "true_contradiction_mixed_numbering_maps_different_targets",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title S01E05 [014] [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E05",
+          "canonicalKey": "tvdb:100:S01E05",
+          "title": "Example Title Episode 5",
+          "seasonNumber": 1,
+          "episodeNumber": 5,
+          "absoluteEpisodeNumber": 5,
+          "tvdbEpisodeId": "1005"
+        },
+        {
+          "targetKey": "S01E14",
+          "canonicalKey": "tvdb:100:S01E14",
+          "title": "Example Title Episode 14",
+          "seasonNumber": 1,
+          "episodeNumber": 14,
+          "absoluteEpisodeNumber": 14,
+          "tvdbEpisodeId": "1014"
+        }
+      ],
+      "expected": {
+        "outcome": "true_contradiction",
+        "targetKeys": ["S01E05", "S01E14"],
+        "reviewReasons": ["graph_reconciliation_true_contradiction"],
+        "rejectionReasons": []
+      }
+    },
+    {
+      "id": "unexplainable_episode_not_in_graph",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Example Title S01E99 [1080p]",
+      "aliases": ["Example Title"],
+      "targets": [
+        {
+          "targetKey": "S01E01",
+          "canonicalKey": "tvdb:100:S01E01",
+          "title": "Example Title Episode 1",
+          "seasonNumber": 1,
+          "episodeNumber": 1,
+          "absoluteEpisodeNumber": 1,
+          "tvdbEpisodeId": "1001"
+        }
+      ],
+      "expected": {
+        "outcome": "unexplainable",
+        "targetKeys": [],
+        "reviewReasons": [],
+        "rejectionReasons": ["graph_reconciliation_unexplainable"]
+      }
+    },
+    {
+      "id": "one_piece_absolute_only_graph_target_remains_mappable",
+      "classification": "rr3q_asserted",
+      "input": "[SubsPlease] Long Running Anime - 0009 [1080p]",
+      "aliases": ["Long Running Anime"],
+      "targets": [
+        {
+          "targetKey": "A0009",
+          "canonicalKey": "anilist:21:A0009",
+          "title": "Long Running Anime A0009",
+          "absoluteEpisodeNumber": 9
+        }
+      ],
+      "expected": {
+        "outcome": "agreement",
+        "targetKeys": ["A0009"],
+        "reviewReasons": [],
+        "rejectionReasons": []
+      }
+    }
+  ]
+}
