@@ -9,21 +9,28 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{
-    acquisition::subscriptions::{
-        AcquisitionRequestBlocker, AcquisitionRequestRetryResult, AcquisitionRequestTargetCounts,
-        AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionDetail,
-        AcquisitionSubscriptionFilter, AcquisitionSubscriptionStopTrackingResult,
-        AcquisitionSubscriptionUpdate, AcquisitionTarget, AcquisitionTargetState,
-        AcquisitionTargetStateUpdate, CreateAcquisitionIntent, NewAcquisitionSubscription,
-        NewAcquisitionTarget, acquisition_request_blockers, acquisition_request_target_counts,
-        create_or_update_acquisition_intent, create_subscription, get_subscription,
-        get_subscription_detail, get_target, list_subscriptions,
-        retry_acquisition_request as retry_acquisition_request_store, stop_subscription_tracking,
-        update_subscription, update_target_state, upsert_subscription_targets,
-        validate_new_targets,
+    acquisition::{
+        release_resolution::fingerprint::candidate_release_fingerprint,
+        route_attempts::{RouteAttemptRecord, RouteAttemptStatus, attach_route_attempt_ledger},
+        subscriptions::{
+            AcquisitionRequestBlocker, AcquisitionRequestRetryResult,
+            AcquisitionRequestTargetCounts, AcquisitionRoutePolicy, AcquisitionSubscription,
+            AcquisitionSubscriptionDetail, AcquisitionSubscriptionFilter,
+            AcquisitionSubscriptionStopTrackingResult, AcquisitionSubscriptionUpdate,
+            AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
+            CreateAcquisitionIntent, NewAcquisitionSubscription, NewAcquisitionTarget,
+            acquisition_request_blockers, acquisition_request_target_counts,
+            create_or_update_acquisition_intent, create_subscription, get_subscription,
+            get_subscription_detail, get_target, list_subscriptions,
+            retry_acquisition_request as retry_acquisition_request_store,
+            stop_subscription_tracking, update_subscription, update_target_state,
+            upsert_subscription_targets, validate_new_targets,
+        },
     },
     db::models::ProviderHealthState,
-    download_broker::{DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID},
+    download_broker::{
+        DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID,
+    },
     extensions::store::ExtensionStore,
     http::{
         auth::CurrentUser,
@@ -572,8 +579,10 @@ pub async fn submit_acquisition_target_candidate(
         subscription.route_policy,
         &candidate,
     )?;
-    let selected_candidate =
+    let mut selected_candidate =
         selected_candidate_provenance(&candidate, source_provider_id, &source_extension_id)?;
+    let candidate_fingerprint = candidate_release_fingerprint(&candidate, Some(source_provider_id));
+    let mut route_attempts = Vec::new();
     let broker_request = DownloadBrokerSubmitRequest {
         source: candidate.source.clone(),
         category: request.category,
@@ -587,7 +596,7 @@ pub async fn submit_acquisition_target_candidate(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(candidate.clone()),
-        release_fingerprint: None,
+        release_fingerprint: Some(candidate_fingerprint.clone()),
     };
 
     let mut state_reason = format!("Submitted through '{}'.", route_logical_id);
@@ -604,29 +613,64 @@ pub async fn submit_acquisition_target_candidate(
         Err(err)
             if route_logical_id == DEBRID_DEFAULT_LOGICAL_ID
                 && subscription.route_policy == AcquisitionRoutePolicy::DebridFirst
-                && candidate_supports_route(&candidate, TORRENT_DEFAULT_LOGICAL_ID) =>
+                && candidate_local_fallback_route(&candidate).is_some() =>
         {
+            let local_route = candidate_local_fallback_route(&candidate)
+                .expect("checked candidate has local fallback route");
+            route_attempts.push(RouteAttemptRecord::new(
+                &route_logical_id,
+                None,
+                None,
+                None,
+                RouteAttemptStatus::Failed,
+                None,
+                Some(format!(
+                    "Debrid route failed before direct target fallback: {}",
+                    acquisition_state_error_message(&err)
+                )),
+            ));
             match submit_to_broker(
                 &state,
                 &store,
-                TORRENT_DEFAULT_LOGICAL_ID,
+                local_route,
                 Some(&source_extension_id),
                 broker_request,
             )
             .await
             {
                 Ok(response) => {
-                    route_logical_id = TORRENT_DEFAULT_LOGICAL_ID.to_string();
-                    state_reason =
-                        "Debrid rejected the candidate; submitted torrent fallback.".to_string();
+                    route_logical_id = local_route.to_string();
+                    state_reason = format!(
+                        "Debrid rejected the candidate; submitted {} fallback.",
+                        local_route_label(local_route)
+                    );
                     response
                 }
                 Err(fallback_err) => {
                     if should_record_target_blocker(&fallback_err) {
                         let message = format!(
-                            "Debrid route failed: {}; torrent fallback failed: {}",
+                            "Debrid route failed: {}; {} fallback failed: {}",
                             acquisition_state_error_message(&err),
+                            local_route_label(local_route),
                             acquisition_state_error_message(&fallback_err)
+                        );
+                        route_attempts.push(RouteAttemptRecord::new(
+                            local_route,
+                            None,
+                            None,
+                            None,
+                            RouteAttemptStatus::Failed,
+                            None,
+                            Some(format!(
+                                "{} fallback failed: {}",
+                                local_route_label_title_case(local_route),
+                                acquisition_state_error_message(&fallback_err)
+                            )),
+                        ));
+                        attach_route_attempt_ledger(
+                            &mut selected_candidate,
+                            &candidate_fingerprint,
+                            &route_attempts,
                         );
                         set_target_state_after_submission(
                             &state.db_pool,
@@ -640,13 +684,27 @@ pub async fn submit_acquisition_target_candidate(
                         )
                         .await?;
                     }
-                    return Err(err);
+                    return Err(fallback_err);
                 }
             }
         }
         Err(err) => {
             if should_record_target_blocker(&err) {
                 let message = acquisition_state_error_message(&err);
+                route_attempts.push(RouteAttemptRecord::new(
+                    &route_logical_id,
+                    None,
+                    None,
+                    None,
+                    RouteAttemptStatus::Blocked,
+                    None,
+                    Some(message.clone()),
+                ));
+                attach_route_attempt_ledger(
+                    &mut selected_candidate,
+                    &candidate_fingerprint,
+                    &route_attempts,
+                );
                 set_target_state_after_submission(
                     &state.db_pool,
                     target_id,
@@ -667,6 +725,20 @@ pub async fn submit_acquisition_target_candidate(
         .download_id
         .clone()
         .or_else(|| candidate.info_hash.clone());
+    route_attempts.push(RouteAttemptRecord::new(
+        &broker_response.logical_id,
+        Some(broker_response.provider_id),
+        broker_response.provider_implementation.as_deref(),
+        broker_response.download_id.clone(),
+        RouteAttemptStatus::Submitted,
+        None,
+        Some(state_reason.clone()),
+    ));
+    attach_route_attempt_ledger(
+        &mut selected_candidate,
+        &candidate_fingerprint,
+        &route_attempts,
+    );
     let target = set_target_state_after_submission(
         &state.db_pool,
         target_id,
@@ -771,8 +843,8 @@ fn select_candidate_route(
         AcquisitionRoutePolicy::DebridFirst => {
             if candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID) {
                 Some(DEBRID_DEFAULT_LOGICAL_ID)
-            } else if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
-                Some(TORRENT_DEFAULT_LOGICAL_ID)
+            } else if let Some(route) = candidate_local_fallback_route(candidate) {
+                Some(route)
             } else {
                 candidate.default_route.as_deref()
             }
@@ -800,7 +872,10 @@ fn validate_selected_candidate_route<'a>(
     candidate: &AcquisitionCandidate,
 ) -> ApiResult<&'a str> {
     let route = route.trim();
-    if route != DEBRID_DEFAULT_LOGICAL_ID && route != TORRENT_DEFAULT_LOGICAL_ID {
+    if route != DEBRID_DEFAULT_LOGICAL_ID
+        && route != TORRENT_DEFAULT_LOGICAL_ID
+        && route != USENET_DEFAULT_LOGICAL_ID
+    {
         return Err(ApiError::bad_request(format!(
             "unsupported selected route '{}'",
             route
@@ -815,6 +890,32 @@ fn validate_selected_candidate_route<'a>(
     Ok(route)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateRouteFamily {
+    Debrid,
+    Torrent,
+    Usenet,
+}
+
+fn candidate_route_family(route: &str) -> Option<CandidateRouteFamily> {
+    match route {
+        DEBRID_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Debrid),
+        TORRENT_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Torrent),
+        USENET_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Usenet),
+        _ => None,
+    }
+}
+
+fn candidate_local_fallback_route(candidate: &AcquisitionCandidate) -> Option<&'static str> {
+    if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
+        Some(TORRENT_DEFAULT_LOGICAL_ID)
+    } else if candidate_supports_route(candidate, USENET_DEFAULT_LOGICAL_ID) {
+        Some(USENET_DEFAULT_LOGICAL_ID)
+    } else {
+        None
+    }
+}
+
 fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bool {
     if !candidate.supported_routes.is_empty() {
         return candidate
@@ -822,11 +923,48 @@ fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bo
             .iter()
             .any(|item| item.eq_ignore_ascii_case(route));
     }
-    match (candidate.source_kind.as_str(), route) {
-        ("magnet", DEBRID_DEFAULT_LOGICAL_ID | TORRENT_DEFAULT_LOGICAL_ID) => true,
-        ("http" | "hoster", DEBRID_DEFAULT_LOGICAL_ID) => true,
-        ("torrent", TORRENT_DEFAULT_LOGICAL_ID) => true,
-        _ => false,
+    let source_kind = candidate.source_kind.trim().to_ascii_lowercase();
+    match candidate_route_family(route) {
+        Some(CandidateRouteFamily::Debrid) => matches!(
+            source_kind.as_str(),
+            "magnet" | "http" | "hoster" | "url" | "nzb" | "usenet"
+        ),
+        Some(CandidateRouteFamily::Torrent) => matches!(source_kind.as_str(), "magnet" | "torrent"),
+        Some(CandidateRouteFamily::Usenet) => {
+            matches!(source_kind.as_str(), "nzb" | "usenet")
+                || (matches!(source_kind.as_str(), "http" | "url")
+                    && candidate_source_looks_like_nzb(&candidate.source))
+        }
+        None => false,
+    }
+}
+
+fn candidate_source_looks_like_nzb(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.to_ascii_lowercase().ends_with(".nzb")
+}
+
+fn local_route_label(route: &str) -> &'static str {
+    match route {
+        TORRENT_DEFAULT_LOGICAL_ID => "torrent",
+        USENET_DEFAULT_LOGICAL_ID => "usenet",
+        _ => "local",
+    }
+}
+
+fn local_route_label_title_case(route: &str) -> &'static str {
+    match route {
+        TORRENT_DEFAULT_LOGICAL_ID => "Torrent",
+        USENET_DEFAULT_LOGICAL_ID => "Usenet",
+        _ => "Local",
     }
 }
 
@@ -932,5 +1070,89 @@ fn map_acquisition_input_error(err: anyhow::Error) -> ApiError {
         ApiError::bad_request(message)
     } else {
         ApiError::internal(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(source: &str, source_kind: &str, routes: Vec<&str>) -> AcquisitionCandidate {
+        AcquisitionCandidate {
+            id: Some("candidate-1".to_string()),
+            title: "Example.Release.1080p-GROUP".to_string(),
+            source: source.to_string(),
+            source_kind: source_kind.to_string(),
+            info_hash: None,
+            file_index: None,
+            quality: Some("1080p".to_string()),
+            size_bytes: Some(1024),
+            seeders: None,
+            language: None,
+            cached_debrid: None,
+            rank: None,
+            score: None,
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: routes.into_iter().map(ToString::to_string).collect(),
+            default_route: None,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn dfu6_direct_submit_route_support_accepts_usenet_nzb() {
+        let nzb = candidate(
+            "https://indexer.example/releases/example.nzb",
+            "nzb",
+            Vec::new(),
+        );
+
+        assert!(candidate_supports_route(&nzb, DEBRID_DEFAULT_LOGICAL_ID));
+        assert!(candidate_supports_route(&nzb, USENET_DEFAULT_LOGICAL_ID));
+        assert!(!candidate_supports_route(&nzb, TORRENT_DEFAULT_LOGICAL_ID));
+        assert_eq!(
+            candidate_local_fallback_route(&nzb),
+            Some(USENET_DEFAULT_LOGICAL_ID)
+        );
+    }
+
+    #[test]
+    fn dfu6_direct_submit_route_support_keeps_hoster_debrid_only() {
+        let hoster = candidate("https://hoster.example/video.mkv", "http", Vec::new());
+
+        assert!(candidate_supports_route(&hoster, DEBRID_DEFAULT_LOGICAL_ID));
+        assert!(!candidate_supports_route(
+            &hoster,
+            TORRENT_DEFAULT_LOGICAL_ID
+        ));
+        assert!(!candidate_supports_route(
+            &hoster,
+            USENET_DEFAULT_LOGICAL_ID
+        ));
+        assert_eq!(candidate_local_fallback_route(&hoster), None);
+    }
+
+    #[test]
+    fn dfu6_direct_submit_selects_usenet_for_nzb_when_debrid_not_supported() {
+        let nzb = candidate(
+            "https://indexer.example/download?id=123",
+            "nzb",
+            vec![USENET_DEFAULT_LOGICAL_ID],
+        );
+
+        assert_eq!(
+            select_candidate_route(None, AcquisitionRoutePolicy::DebridFirst, &nzb).expect("route"),
+            USENET_DEFAULT_LOGICAL_ID
+        );
+    }
+
+    #[test]
+    fn dfu6_direct_submit_rejects_magnet_to_usenet() {
+        let magnet = candidate("magnet:?xt=urn:btih:abc", "magnet", Vec::new());
+
+        let err = validate_selected_candidate_route(USENET_DEFAULT_LOGICAL_ID, &magnet)
+            .expect_err("magnet should not support usenet");
+        assert!(api_error_message(&err).contains("does not support route"));
     }
 }

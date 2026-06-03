@@ -46,6 +46,7 @@ use crate::{
                 update_release_job_state, update_release_review_state, upsert_release_coverage,
             },
         },
+        route_attempts::{RouteAttemptRecord, RouteAttemptStatus, route_attempt_ledger},
         subscriptions::{
             AcquisitionSubscription, AcquisitionTarget, AcquisitionTargetState,
             AcquisitionTargetStateUpdate, clear_target_next_search_after, get_subscription,
@@ -675,6 +676,15 @@ async fn approve_release_for_review(
         .await
         .map_err(ApiError::from)?;
     let file_selection = resolve_manual_file_selection(&files, &coverage, &request)?;
+    validate_manual_review_target_mappings(
+        pool,
+        &release,
+        &files,
+        &coverage,
+        &file_selection,
+        &request.mappings,
+    )
+    .await?;
     let active_release = if let Some(state) = broker_state
         && release.download_id.is_none()
         && !matches!(
@@ -1153,6 +1163,15 @@ fn review_submission_policy_json(
     } else {
         "inspection_requested"
     };
+    let route_attempt = RouteAttemptRecord::new(
+        &broker_response.logical_id,
+        Some(broker_response.provider_id),
+        broker_response.provider_implementation.as_deref(),
+        broker_response.download_id.clone(),
+        RouteAttemptStatus::Submitted,
+        None,
+        Some(reason.to_string()),
+    );
     let mut manual_review = release
         .coverage_plan
         .as_ref()
@@ -1177,8 +1196,10 @@ fn review_submission_policy_json(
             "accepted": broker_response.accepted,
             "routeLogicalId": broker_response.logical_id,
             "routeProviderId": broker_response.provider_id,
-            "downloadId": broker_response.download_id
-        }
+            "routeProviderImplementation": broker_response.provider_implementation.clone(),
+            "downloadId": broker_response.download_id.clone()
+        },
+        "routeAttemptLedger": route_attempt_ledger(&release.fingerprint, &[route_attempt])
     });
     if let JsonValue::Object(map) = &mut patch {
         map.insert("manualReview".to_string(), manual_review);
@@ -2170,6 +2191,302 @@ fn apply_release_file_aliases(
     }
 }
 
+async fn validate_manual_review_target_mappings(
+    pool: &AnyPool,
+    release: &AcquisitionRelease,
+    files: &[AcquisitionReleaseFile],
+    coverage: &[AcquisitionReleaseCoverage],
+    selection: &ResolvedManualFileSelection,
+    mappings: &[ManualCoverageMappingRequest],
+) -> ApiResult<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let files_by_id = files
+        .iter()
+        .map(|file| (file.release_file_id, file))
+        .collect::<BTreeMap<_, _>>();
+    let mut targets_by_id = BTreeMap::new();
+    let mut targets_by_file = BTreeMap::<Uuid, BTreeMap<Uuid, AcquisitionTarget>>::new();
+
+    for row in coverage {
+        let Some(release_file_id) = row.release_file_id else {
+            continue;
+        };
+        if row.state == ReleaseCoverageState::Rejected
+            || selection
+                .skipped_release_file_ids
+                .contains(&release_file_id)
+            || !selection
+                .selected_release_file_ids
+                .contains(&release_file_id)
+        {
+            continue;
+        }
+        let Some(file) = files_by_id.get(&release_file_id).copied() else {
+            return Err(ApiError::bad_request(format!(
+                "coverage references unknown release file {release_file_id}"
+            )));
+        };
+        let target = load_review_mapping_target(pool, &mut targets_by_id, row.target_id).await?;
+        validate_review_file_matches_target(release, file, &target)?;
+        targets_by_file
+            .entry(release_file_id)
+            .or_default()
+            .insert(target.target_id, target);
+    }
+
+    let mut mapped_targets = BTreeSet::new();
+    for mapping in mappings {
+        if !mapped_targets.insert(mapping.target_id) {
+            return Err(ApiError::bad_request(format!(
+                "manual review includes multiple file mappings for target {}",
+                mapping.target_id
+            )));
+        }
+        let Some(requested_release_file_id) = mapping.release_file_id else {
+            continue;
+        };
+        let release_file_id = selection
+            .release_file_aliases
+            .get(&requested_release_file_id)
+            .copied()
+            .unwrap_or(requested_release_file_id);
+        let Some(file) = files_by_id.get(&release_file_id).copied() else {
+            return Err(ApiError::bad_request(format!(
+                "manual mapping references unknown release file {requested_release_file_id}"
+            )));
+        };
+        if !selection
+            .selected_release_file_ids
+            .contains(&release_file_id)
+        {
+            return Err(ApiError::bad_request(format!(
+                "manual mapping for target {} points to an unselected release file",
+                mapping.target_id
+            )));
+        }
+        let target =
+            load_review_mapping_target(pool, &mut targets_by_id, mapping.target_id).await?;
+        validate_review_file_matches_target(release, file, &target)?;
+        targets_by_file
+            .entry(release_file_id)
+            .or_default()
+            .insert(target.target_id, target);
+    }
+
+    for (release_file_id, targets) in targets_by_file {
+        if targets.len() <= 1 {
+            continue;
+        }
+        let Some(file) = files_by_id.get(&release_file_id).copied() else {
+            continue;
+        };
+        if !review_file_can_cover_multiple_targets(file, targets.values()) {
+            return Err(ApiError::bad_request(format!(
+                "release file {} cannot be mapped to {} targets without parsed range evidence",
+                review_file_label(file),
+                targets.len()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_review_mapping_target(
+    pool: &AnyPool,
+    cache: &mut BTreeMap<Uuid, AcquisitionTarget>,
+    target_id: Uuid,
+) -> ApiResult<AcquisitionTarget> {
+    if let Some(target) = cache.get(&target_id) {
+        return Ok(target.clone());
+    }
+    let target = get_target(pool, target_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::bad_request(format!("unknown acquisition target {target_id}")))?;
+    cache.insert(target_id, target.clone());
+    Ok(target)
+}
+
+fn validate_review_file_matches_target(
+    release: &AcquisitionRelease,
+    file: &AcquisitionReleaseFile,
+    target: &AcquisitionTarget,
+) -> ApiResult<()> {
+    if !matches!(target.media_type, MediaType::Anime | MediaType::Series)
+        && !matches!(release.media_type, MediaType::Anime | MediaType::Series)
+    {
+        return Ok(());
+    }
+
+    if let (Some(file_season), Some(target_season)) =
+        (file.parsed_season_number, target.season_number)
+        && file_season != target_season
+        && file.parsed_absolute_episode_number.is_none()
+    {
+        return Err(review_mapping_mismatch(
+            file,
+            target,
+            format!("parsed as season {file_season}"),
+        ));
+    }
+
+    if let Some(start) = file.parsed_episode_number {
+        let end = file.parsed_episode_end_number.unwrap_or(start);
+        if let Some(target_episode) = target.episode_number
+            && !number_in_range(target_episode, start, end)
+        {
+            return Err(review_mapping_mismatch(
+                file,
+                target,
+                format!("parsed as episode {}", format_number_range(start, end)),
+            ));
+        }
+    }
+
+    if let Some(start) = file.parsed_absolute_episode_number {
+        let end = file.parsed_absolute_episode_end_number.unwrap_or(start);
+        let comparable_target_episode = target.absolute_episode_number.or_else(|| {
+            target
+                .episode_number
+                .filter(|_| target.season_number.unwrap_or(1) == 1)
+        });
+        if let Some(target_episode) = comparable_target_episode
+            && !number_in_range(target_episode, start, end)
+        {
+            return Err(review_mapping_mismatch(
+                file,
+                target,
+                format!(
+                    "parsed as absolute episode {}",
+                    format_number_range(start, end)
+                ),
+            ));
+        }
+    }
+
+    if let (Some(file_air_date), Some(target_air_date)) =
+        (file.parsed_air_date.as_deref(), target.air_date.as_deref())
+        && !file_air_date.trim().is_empty()
+        && !target_air_date.trim().is_empty()
+        && file_air_date.trim() != target_air_date.trim()
+    {
+        return Err(review_mapping_mismatch(
+            file,
+            target,
+            format!("parsed as air date {}", file_air_date.trim()),
+        ));
+    }
+
+    Ok(())
+}
+
+fn review_file_can_cover_multiple_targets<'a>(
+    file: &AcquisitionReleaseFile,
+    targets: impl Iterator<Item = &'a AcquisitionTarget>,
+) -> bool {
+    let targets = targets.collect::<Vec<_>>();
+    if targets.len() <= 1 {
+        return true;
+    }
+    let has_episode_range = file
+        .parsed_episode_number
+        .zip(file.parsed_episode_end_number)
+        .is_some_and(|(start, end)| end > start);
+    let has_absolute_range = file
+        .parsed_absolute_episode_number
+        .zip(file.parsed_absolute_episode_end_number)
+        .is_some_and(|(start, end)| end > start);
+    if !has_episode_range && !has_absolute_range {
+        return false;
+    }
+    targets
+        .into_iter()
+        .all(|target| validate_review_file_matches_target_for_range(file, target))
+}
+
+fn validate_review_file_matches_target_for_range(
+    file: &AcquisitionReleaseFile,
+    target: &AcquisitionTarget,
+) -> bool {
+    if let Some(start) = file.parsed_episode_number {
+        let end = file.parsed_episode_end_number.unwrap_or(start);
+        if let Some(target_episode) = target.episode_number
+            && !number_in_range(target_episode, start, end)
+        {
+            return false;
+        }
+    }
+    if let Some(start) = file.parsed_absolute_episode_number {
+        let end = file.parsed_absolute_episode_end_number.unwrap_or(start);
+        let comparable_target_episode = target.absolute_episode_number.or_else(|| {
+            target
+                .episode_number
+                .filter(|_| target.season_number.unwrap_or(1) == 1)
+        });
+        if let Some(target_episode) = comparable_target_episode
+            && !number_in_range(target_episode, start, end)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn review_mapping_mismatch(
+    file: &AcquisitionReleaseFile,
+    target: &AcquisitionTarget,
+    parsed_detail: String,
+) -> ApiError {
+    ApiError::bad_request(format!(
+        "manual mapping mismatch: release file {} {parsed_detail}, but target is {}",
+        review_file_label(file),
+        review_target_label(target)
+    ))
+}
+
+fn review_file_label(file: &AcquisitionReleaseFile) -> String {
+    let label = file.basename.trim();
+    if !label.is_empty() {
+        return label.to_string();
+    }
+    file.path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(file.path.as_str())
+        .to_string()
+}
+
+fn review_target_label(target: &AcquisitionTarget) -> String {
+    if let (Some(season), Some(episode)) = (target.season_number, target.episode_number) {
+        return format!("S{season:02}E{episode:02}");
+    }
+    if let Some(absolute) = target.absolute_episode_number {
+        return format!("A{absolute:04}");
+    }
+    target.target_key.clone()
+}
+
+fn number_in_range(value: i32, start: i32, end: i32) -> bool {
+    if start <= end {
+        value >= start && value <= end
+    } else {
+        value >= end && value <= start
+    }
+}
+
+fn format_number_range(start: i32, end: i32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
 fn synthetic_source_candidate_aliases(files: &[AcquisitionReleaseFile]) -> BTreeMap<Uuid, Uuid> {
     let mut aliases = BTreeMap::new();
     for file in files
@@ -2289,6 +2606,9 @@ fn file_identity_keys(file: &AcquisitionReleaseFile) -> BTreeSet<String> {
 }
 
 fn file_policy_key(file: &AcquisitionReleaseFile) -> Option<String> {
+    if is_synthetic_source_candidate_file(file) {
+        return Some(file.release_file_id.to_string());
+    }
     file.file_id
         .clone()
         .or_else(|| file.provider_file_id.clone())
@@ -4747,12 +5067,13 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some("6")
         );
+        let synthetic_release_file_id = synthetic.release_file_id.to_string();
         assert!(
             plan.pointer("/manualReview/skippedFileIds")
                 .and_then(JsonValue::as_array)
                 .expect("skipped ids")
                 .iter()
-                .any(|value| value.as_str() == Some(SYNTHETIC_SOURCE_CANDIDATE_FILE_ID))
+                .any(|value| value.as_str() == Some(synthetic_release_file_id.as_str()))
         );
 
         let files = list_release_files(&database.pool, release_id).await?;
@@ -5405,6 +5726,112 @@ mod tests {
         let jobs = list_release_jobs(&database.pool, fixture.release_id).await?;
         assert_eq!(jobs[0].state, ReleaseJobState::Ready);
         assert!(jobs[0].active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_approval_rejects_single_anime_episode_file_mapped_to_multiple_targets()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let fixture = setup_anime_review_pack(&database).await?;
+        let release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("release");
+        upsert_subscription_targets(
+            &database.pool,
+            release.subscription_id.expect("subscription"),
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E02".to_string()),
+                media_type: Some(MediaType::Anime),
+                title: Some("Episode 2".to_string()),
+                season_number: Some(1),
+                episode_number: Some(2),
+                absolute_episode_number: Some(2),
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Searching),
+                next_search_after: Some(Utc::now()),
+            }],
+        )
+        .await?;
+        let extra_target =
+            list_subscription_targets(&database.pool, release.subscription_id.unwrap())
+                .await?
+                .into_iter()
+                .find(|target| target.target_key == "S01E02")
+                .expect("extra target");
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: fixture.release_id,
+                release_file_id: None,
+                target_id: extra_target.target_id,
+                coverage_kind: ReleaseCoverageKind::SeasonPack,
+                confidence: ReleaseConfidence::ReviewRequired,
+                score: Some(60.0),
+                reason: Some("needs manual file mapping".to_string()),
+                state: ReleaseCoverageState::ReviewRequired,
+                verified_by: None,
+            },
+        )
+        .await?;
+
+        let err = approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            fixture.release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: vec![fixture.file_ids[0]],
+                skipped_release_file_ids: vec![fixture.file_ids[1]],
+                mappings: vec![
+                    ManualCoverageMappingRequest {
+                        target_id: fixture.target_ids[0],
+                        release_file_id: Some(fixture.file_ids[0]),
+                        coverage_kind: Some(ReleaseCoverageKind::ManualOverride),
+                        confidence: Some(ReleaseConfidence::High),
+                        score: Some(100.0),
+                        reason: Some("manual anime episode mapping".to_string()),
+                    },
+                    ManualCoverageMappingRequest {
+                        target_id: extra_target.target_id,
+                        release_file_id: Some(fixture.file_ids[0]),
+                        coverage_kind: Some(ReleaseCoverageKind::ManualOverride),
+                        confidence: Some(ReleaseConfidence::High),
+                        score: Some(100.0),
+                        reason: Some("manual anime episode mapping".to_string()),
+                    },
+                ],
+                reason: Some("verified anime file mapping".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("single episode file must not cover multiple anime targets");
+
+        match err {
+            ApiError::BadRequest(message) => {
+                assert!(message.contains("manual mapping mismatch"), "{message}");
+                assert!(message.contains("S01E02"), "{message}");
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
+
+        let release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, AcquisitionReleaseState::ReviewRequired);
+        let files = list_release_files(&database.pool, fixture.release_id).await?;
+        assert!(files.iter().all(|file| file.selected.is_none()));
+        let selected_rows = list_release_coverage(&database.pool, fixture.release_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.state == ReleaseCoverageState::Selected)
+            .count();
+        assert_eq!(selected_rows, 0);
         Ok(())
     }
 

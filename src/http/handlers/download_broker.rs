@@ -62,8 +62,8 @@ use crate::{
         DownloadBrokerBindingKind, DownloadBrokerInventory, DownloadBrokerProviderRecord,
         DownloadBrokerRole, DownloadBrokerRouteInventory, DownloadBrokerRouteRecord,
         DownloadBrokerRouteUpdate, ResolvedDownloadBrokerProvider, TORRENT_DEFAULT_LOGICAL_ID,
-        list_acquisition_routes, list_logical_downloaders, resolve_logical_downloader_for_owner,
-        upsert_acquisition_route,
+        USENET_DEFAULT_LOGICAL_ID, list_acquisition_routes, list_logical_downloaders,
+        resolve_logical_downloader_for_owner, upsert_acquisition_route,
     },
     extensions::store::ExtensionStore,
     http::{
@@ -175,6 +175,7 @@ pub struct DownloadBrokerRouteQuery {
 pub struct DownloadBrokerSubmitResponse {
     pub logical_id: String,
     pub provider_id: Uuid,
+    pub provider_implementation: Option<String>,
     pub accepted: bool,
     pub download_id: Option<String>,
 }
@@ -357,6 +358,7 @@ pub(crate) async fn submit_to_broker(
     Ok(DownloadBrokerSubmitResponse {
         logical_id: logical_id.to_string(),
         provider_id: resolved.record.provider_id,
+        provider_implementation: resolved.record.implementation.clone(),
         accepted: true,
         download_id,
     })
@@ -593,7 +595,7 @@ async fn submit_nzbget(
     source: &str,
     request: &DownloadBrokerSubmitRequest,
 ) -> ApiResult<String> {
-    validate_nzb_source(source)?;
+    validate_nzb_submit_source(source, request)?;
     let payload = request_instance_service_json(
         state,
         store,
@@ -1172,10 +1174,43 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
             now,
         )
         .await?;
+        if let Err(err) =
+            remove_stale_qbittorrent_runtime_torrent(state, &store, &release, &torrent_hash).await
+        {
+            tracing::warn!(
+                release_id = %release.release_id,
+                torrent_hash = torrent_hash,
+                "failed to remove stale qBittorrent runtime torrent after release retry: {err}"
+            );
+        }
         failed += 1;
     }
 
     Ok(failed)
+}
+
+async fn remove_stale_qbittorrent_runtime_torrent(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+) -> anyhow::Result<()> {
+    let provider_id = release
+        .selected_provider_id
+        .context("stale qBittorrent release is missing selected provider")?;
+    let provider = store
+        .get_provider(provider_id)
+        .await?
+        .context("stale qBittorrent provider is missing")?;
+    let fields = qbittorrent_delete_fields(torrent_hash, false);
+    request_instance_service_form(
+        state,
+        store,
+        provider.instance_id,
+        "api/v2/torrents/delete",
+        &fields,
+    )
+    .await
 }
 
 async fn load_qbittorrent_torrent_info_for_release(
@@ -3794,6 +3829,49 @@ fn validate_nzb_source(source: &str) -> ApiResult<()> {
     ))
 }
 
+fn validate_nzb_submit_source(
+    source: &str,
+    request: &DownloadBrokerSubmitRequest,
+) -> ApiResult<()> {
+    validate_nzb_source(source)?;
+    let Some(candidate) = request.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    if candidate_declares_usenet_route(candidate) {
+        return Ok(());
+    }
+    let source_kind = candidate.source_kind.trim().to_ascii_lowercase();
+    if matches!(source_kind.as_str(), "nzb" | "usenet") {
+        return Ok(());
+    }
+    if matches!(source_kind.as_str(), "http" | "url") && source_looks_like_nzb(source) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "selected candidate is not an NZB/usenet source",
+    ))
+}
+
+fn candidate_declares_usenet_route(candidate: &AcquisitionCandidate) -> bool {
+    candidate
+        .supported_routes
+        .iter()
+        .any(|route| route.eq_ignore_ascii_case(USENET_DEFAULT_LOGICAL_ID))
+}
+
+fn source_looks_like_nzb(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.to_ascii_lowercase().ends_with(".nzb")
+}
+
 fn validate_debrid_source(source: &str) -> ApiResult<()> {
     debrid_source_kind(source)
         .map(|_| ())
@@ -4165,6 +4243,24 @@ mod tests {
 
         assert!(validate_nzb_source("https://example.test/file.nzb").is_ok());
         assert!(validate_nzb_source("magnet:?xt=urn:btih:abc").is_err());
+
+        let mut nzb_request = sample_request(true);
+        let mut nzb_candidate = sample_candidate();
+        nzb_candidate.source = "https://indexer.example/api?t=get&id=123".to_string();
+        nzb_candidate.source_kind = "nzb".to_string();
+        nzb_candidate.supported_routes = vec![USENET_DEFAULT_LOGICAL_ID.to_string()];
+        nzb_request.source = nzb_candidate.source.clone();
+        nzb_request.selected_candidate = Some(nzb_candidate);
+        assert!(validate_nzb_submit_source(&nzb_request.source, &nzb_request).is_ok());
+
+        let mut hoster_request = sample_request(true);
+        let mut hoster_candidate = sample_candidate();
+        hoster_candidate.source = "https://hoster.example/video.mkv".to_string();
+        hoster_candidate.source_kind = "http".to_string();
+        hoster_candidate.supported_routes = Vec::new();
+        hoster_request.source = hoster_candidate.source.clone();
+        hoster_request.selected_candidate = Some(hoster_candidate);
+        assert!(validate_nzb_submit_source(&hoster_request.source, &hoster_request).is_err());
     }
 
     #[test]

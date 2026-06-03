@@ -52,7 +52,10 @@ use crate::db::models::{
     ExtensionKind, ExtensionTrustLevel, MediaType, ProviderHealthState, ProviderReadinessPhase,
     SecretScope, SlotCardinality,
 };
-use crate::download_broker::{DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID};
+use crate::download_broker::{
+    DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, DownloadBrokerProviderKind,
+    DownloadBrokerRole, list_acquisition_routes, list_logical_downloaders,
+};
 use crate::extensions::store::{
     ExtensionStore, NewExtension, NewExtensionInstance, NewProvider, NewSecret,
 };
@@ -110,6 +113,17 @@ pub enum DebridServiceKind {
     TorBox,
     AllDebrid,
     Premiumize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DebridRouteAttempt {
+    pub provider_id: Uuid,
+    pub instance_id: Uuid,
+    pub implementation: String,
+    pub display_name: String,
+    pub health_state: ProviderHealthState,
+    pub attempt_key: String,
 }
 
 #[allow(dead_code)]
@@ -5250,6 +5264,145 @@ pub async fn real_debrid_token_for_instance(
     debrid_token_for_instance(state, store, instance_id, DebridServiceKind::RealDebrid).await
 }
 
+pub async fn list_eligible_debrid_route_attempts(
+    pool: &sqlx::AnyPool,
+    store: &ExtensionStore<'_>,
+    owner_id: Option<&str>,
+) -> Result<Vec<DebridRouteAttempt>> {
+    let owner_id = normalize_debrid_route_owner_id(owner_id);
+    let routes = list_acquisition_routes(pool, store).await?;
+    let Some(route) = routes
+        .routes
+        .into_iter()
+        .find(|route| route.logical_id == DEBRID_DEFAULT_LOGICAL_ID && route.owner_id == owner_id)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let inventory = list_logical_downloaders(store).await?;
+    let records_by_id = inventory
+        .downloaders
+        .into_iter()
+        .filter(|record| {
+            record.role == DownloadBrokerRole::DebridResolver
+                && record.logical_id == DEBRID_DEFAULT_LOGICAL_ID
+                && record.provider_kind == DownloadBrokerProviderKind::Debrid
+        })
+        .map(|record| (record.provider_id, record))
+        .collect::<HashMap<_, _>>();
+
+    let mut provider_ids = Vec::new();
+    if let Some(provider_id) = route.selected_provider_id {
+        provider_ids.push(provider_id);
+    }
+    let mut fallback_provider_ids = route
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.provider_kind == DownloadBrokerProviderKind::Debrid)
+        .filter_map(|candidate| {
+            (Some(candidate.provider_id) != route.selected_provider_id)
+                .then_some(candidate.provider_id)
+        })
+        .collect::<Vec<_>>();
+    fallback_provider_ids.sort();
+    fallback_provider_ids.dedup();
+    provider_ids.extend(fallback_provider_ids);
+
+    let mut attempts = Vec::new();
+    let mut seen_attempts = HashSet::new();
+    for provider_id in provider_ids {
+        let Some(record) = records_by_id.get(&provider_id) else {
+            continue;
+        };
+        if record.health_state == ProviderHealthState::Unhealthy {
+            continue;
+        }
+        if !is_builtin_debrid_extension_id(&record.extension_id) {
+            continue;
+        }
+        let Some(instance) = store.get_instance(record.instance_id).await? else {
+            continue;
+        };
+        if !instance.enabled
+            || instance.extension_id != record.extension_id
+            || !is_builtin_debrid_extension_id(&instance.extension_id)
+        {
+            continue;
+        }
+        let active_service = active_debrid_service_from_config(instance.config_json.as_ref())?;
+        for service in
+            debrid_route_attempt_service_order(instance.config_json.as_ref(), active_service)
+        {
+            if !debrid_secret_exists_for_instance(store, record.instance_id, service).await? {
+                continue;
+            }
+            let attempt_key = debrid_route_attempt_key(provider_id, service);
+            if !seen_attempts.insert(attempt_key.clone()) {
+                continue;
+            }
+            attempts.push(DebridRouteAttempt {
+                provider_id,
+                instance_id: record.instance_id,
+                implementation: service.implementation_id().to_string(),
+                display_name: service.display_name().to_string(),
+                health_state: record.health_state,
+                attempt_key,
+            });
+        }
+    }
+
+    Ok(attempts)
+}
+
+pub fn debrid_route_attempt_key(provider_id: Uuid, service: DebridServiceKind) -> String {
+    format!("debrid:{provider_id}:{}", service.implementation_id())
+}
+
+fn normalize_debrid_route_owner_id(owner_id: Option<&str>) -> String {
+    owner_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ROUTE_OWNER_ID)
+        .to_string()
+}
+
+fn is_builtin_debrid_extension_id(extension_id: &str) -> bool {
+    extension_id == DEBRID_EXTENSION_ID || extension_id == LEGACY_REAL_DEBRID_EXTENSION_ID
+}
+
+fn debrid_route_attempt_service_order(
+    config_json: Option<&Value>,
+    active_service: DebridServiceKind,
+) -> Vec<DebridServiceKind> {
+    let mut ordered = Vec::new();
+    push_unique_debrid_service(&mut ordered, active_service);
+    if let Some(values) = config_json
+        .and_then(|config| config.get("serviceOrder"))
+        .or_else(|| config_json.and_then(|config| config.get("service_order")))
+        .and_then(Value::as_array)
+    {
+        for value in values {
+            if let Some(service) = value
+                .as_str()
+                .and_then(|raw| DebridServiceKind::from_implementation_id(raw).ok())
+            {
+                push_unique_debrid_service(&mut ordered, service);
+            }
+        }
+    } else {
+        for service in DebridServiceKind::ALL {
+            push_unique_debrid_service(&mut ordered, service);
+        }
+    }
+    ordered
+}
+
+fn push_unique_debrid_service(ordered: &mut Vec<DebridServiceKind>, service: DebridServiceKind) {
+    if !ordered.contains(&service) {
+        ordered.push(service);
+    }
+}
+
 pub async fn test_debrid_service_account(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -5574,6 +5727,7 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
         let staged_result = async {
             let inspection = adapter.inspect_release(remote_release_id).await?;
             update_debrid_job_from_inspection(pool, job_id, &inspection).await?;
+            cleanup_torbox_uncached_no_seed_release(pool, adapter, job_id, &inspection).await?;
             if matches!(
                 inspection.release.status,
                 DebridReleaseStatus::WaitingFiles | DebridReleaseStatus::Downloaded
@@ -6892,14 +7046,28 @@ fn approved_debrid_user_override(
         return None;
     }
 
-    let selected_file_ids =
-        resolve_approved_debrid_file_ids(json_string_array(policy.get("selectedFileIds")), files);
+    let selected_release_file_ids = resolve_approved_debrid_file_ids(
+        json_string_array(policy.get("selectedReleaseFileIds")),
+        files,
+    );
+    let selected_file_ids = if selected_release_file_ids.is_empty() {
+        resolve_approved_debrid_file_ids(json_string_array(policy.get("selectedFileIds")), files)
+    } else {
+        selected_release_file_ids
+    };
     if selected_file_ids.is_empty() {
         return None;
     }
     let selected_set = selected_file_ids.iter().cloned().collect::<BTreeSet<_>>();
-    let mut skipped_file_ids =
-        resolve_approved_debrid_file_ids(json_string_array(policy.get("skippedFileIds")), files);
+    let skipped_release_file_ids = resolve_approved_debrid_file_ids(
+        json_string_array(policy.get("skippedReleaseFileIds")),
+        files,
+    );
+    let mut skipped_file_ids = if skipped_release_file_ids.is_empty() {
+        resolve_approved_debrid_file_ids(json_string_array(policy.get("skippedFileIds")), files)
+    } else {
+        skipped_release_file_ids
+    };
     skipped_file_ids.retain(|file_id| !selected_set.contains(file_id));
     let known_provider_ids = files
         .iter()
@@ -6953,6 +7121,7 @@ fn resolve_approved_debrid_file_ids(
     file_ids: Vec<String>,
     files: &[AcquisitionReleaseFile],
 ) -> Vec<String> {
+    let release_file_aliases = synthetic_source_candidate_release_file_aliases(files);
     file_ids
         .into_iter()
         .flat_map(|file_id| {
@@ -6961,6 +7130,24 @@ fn resolve_approved_debrid_file_ids(
                     matching_provider_file_id_for_synthetic_source_candidate(files)
             {
                 return vec![provider_file_id];
+            }
+            if let Ok(release_file_id) = Uuid::parse_str(file_id.trim()) {
+                let effective_release_file_id = release_file_aliases
+                    .get(&release_file_id)
+                    .copied()
+                    .unwrap_or(release_file_id);
+                if let Some(provider_file_id) = files
+                    .iter()
+                    .find(|file| file.release_file_id == effective_release_file_id)
+                    .and_then(|file| {
+                        file.provider_file_id
+                            .clone()
+                            .or_else(|| file.file_id.clone())
+                    })
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    return vec![provider_file_id];
+                }
             }
             vec![file_id]
         })
@@ -8104,6 +8291,8 @@ async fn process_debrid_job(
     {
         let inspection = adapter.inspect_release(&remote_release_id).await?;
         update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection).await?;
+        cleanup_torbox_uncached_no_seed_release(&state.db_pool, &*adapter, job.job_id, &inspection)
+            .await?;
         job = load_debrid_job(&state.db_pool, job.job_id)
             .await?
             .ok_or_else(|| anyhow!("Debrid job disappeared during refresh"))?;
@@ -8497,6 +8686,13 @@ async fn refresh_debrid_remote_state(
                 Ok(inspection) => {
                     update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection)
                         .await?;
+                    cleanup_torbox_uncached_no_seed_release(
+                        &state.db_pool,
+                        &*adapter,
+                        job.job_id,
+                        &inspection,
+                    )
+                    .await?;
                 }
                 Err(err) => {
                     handle_debrid_refresh_error(&state.db_pool, &job, &err).await?;
@@ -8773,6 +8969,132 @@ fn debrid_failure_message_from_inspection(inspection: &DebridReleaseInspection) 
         }
         None => format!("{provider_name} reported a failed release."),
     })
+}
+
+async fn cleanup_torbox_uncached_no_seed_release(
+    pool: &sqlx::AnyPool,
+    adapter: &(impl DebridProviderAdapter + ?Sized),
+    job_id: Uuid,
+    inspection: &DebridReleaseInspection,
+) -> Result<()> {
+    if !should_cleanup_torbox_uncached_no_seed_release(inspection) {
+        return Ok(());
+    }
+    let remote_release_id = inspection.release.remote_release_id.trim();
+    if remote_release_id.is_empty() {
+        return Ok(());
+    }
+    let provider_status = debrid_provider_status_from_inspection(inspection);
+    let mut evidence = json!({
+        "providerImplementation": inspection.release.provider_implementation,
+        "providerName": debrid_provider_display_name(&inspection.release.provider_implementation),
+        "remoteReleaseId": remote_release_id,
+        "reason": "torbox_uncached_no_seeds",
+        "providerFailureClass": provider_status.get("providerFailureClass").cloned(),
+        "notCached": provider_status.get("notCached").and_then(Value::as_bool).unwrap_or(false),
+        "noSeeds": provider_status.get("noSeeds").and_then(Value::as_bool).unwrap_or(false),
+        "attemptedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    match adapter.delete_release(remote_release_id).await {
+        Ok(true) => {
+            evidence["status"] = json!("deleted");
+            evidence["deleted"] = json!(true);
+        }
+        Ok(false) => {
+            evidence["status"] = json!("already_absent");
+            evidence["deleted"] = json!(false);
+        }
+        Err(err) => {
+            evidence["status"] = json!("delete_failed");
+            evidence["deleted"] = json!(false);
+            evidence["error"] = json!(err.to_string());
+            tracing::warn!(
+                debrid_job_id = %job_id,
+                remote_release_id,
+                "TorBox uncached no-seeds cleanup failed: {err}"
+            );
+        }
+    }
+    persist_debrid_provider_cleanup_evidence(pool, job_id, evidence).await
+}
+
+fn should_cleanup_torbox_uncached_no_seed_release(inspection: &DebridReleaseInspection) -> bool {
+    if inspection.release.status != DebridReleaseStatus::Failed
+        || !inspection
+            .release
+            .provider_implementation
+            .eq_ignore_ascii_case(DebridServiceKind::TorBox.implementation_id())
+    {
+        return false;
+    }
+    let provider_status = debrid_provider_status_from_inspection(inspection);
+    let no_seeds = provider_status
+        .get("noSeeds")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && provider_status
+            .get("providerFailureClass")
+            .and_then(Value::as_str)
+            .map(|value| value.eq_ignore_ascii_case(DebridFailureClass::NoSeeds.as_str()))
+            .unwrap_or(false);
+    let not_cached = provider_status
+        .get("notCached")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || provider_status
+            .get("cached")
+            .and_then(Value::as_bool)
+            .is_some_and(|cached| !cached);
+    no_seeds && not_cached
+}
+
+async fn persist_debrid_provider_cleanup_evidence(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    evidence: Value,
+) -> Result<()> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(());
+    };
+    let provider_status = merge_debrid_evidence_object(
+        job.provider_status.clone(),
+        "providerCleanup",
+        evidence.clone(),
+    );
+    let provider_status_json = serde_json::to_string(&provider_status)
+        .context("serializing debrid provider cleanup evidence")?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET provider_status_json = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = ?",
+    )
+    .bind(provider_status_json)
+    .bind(job_id.to_string())
+    .execute(pool)
+    .await?;
+
+    let Some(release_id) = job.release_id else {
+        return Ok(());
+    };
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(());
+    };
+    let coverage_plan = merge_debrid_evidence_object(
+        release.coverage_plan.clone(),
+        "debridProviderCleanup",
+        evidence,
+    );
+    update_release_state(
+        pool,
+        release.release_id,
+        release.state,
+        release
+            .state_reason
+            .as_deref()
+            .unwrap_or("Debrid provider cleanup evidence updated."),
+        Some(coverage_plan),
+    )
+    .await
 }
 
 async fn update_debrid_job_from_inspection(
@@ -12577,6 +12899,136 @@ mod tests {
             .context("default debrid provider should exist")
     }
 
+    #[tokio::test]
+    async fn dfu2_debrid_route_attempts_start_with_active_service_then_service_order() -> Result<()>
+    {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let instance_id = setup_debrid_factory_instance(
+            &state.db_pool,
+            &store,
+            json!({
+                "activeService": "torbox",
+                "serviceOrder": ["premiumize", "real_debrid", "torbox", "all_debrid"]
+            }),
+        )
+        .await?;
+        for (service, token) in [
+            (DebridServiceKind::TorBox, "tb-token"),
+            (DebridServiceKind::Premiumize, "pm-token"),
+            (DebridServiceKind::RealDebrid, "rd-token"),
+        ] {
+            save_debrid_token(state.secrets.as_ref(), &store, instance_id, service, token).await?;
+        }
+        let provider_id =
+            reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id).await?;
+        let route_before = crate::download_broker::list_acquisition_routes(&state.db_pool, &store)
+            .await?
+            .routes
+            .into_iter()
+            .find(|route| {
+                route.logical_id == DEBRID_DEFAULT_LOGICAL_ID
+                    && route.owner_id == DEFAULT_ROUTE_OWNER_ID
+            })
+            .context("default debrid route should exist")?;
+
+        let attempts = list_eligible_debrid_route_attempts(&state.db_pool, &store, None).await?;
+
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.implementation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["torbox", "premiumize", "real_debrid"]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["TorBox", "Premiumize", "Real-Debrid"]
+        );
+        assert!(attempts.iter().all(|attempt| {
+            attempt.provider_id == provider_id
+                && attempt.instance_id == instance_id
+                && attempt.health_state == ProviderHealthState::Healthy
+        }));
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("debrid:{provider_id}:torbox"),
+                format!("debrid:{provider_id}:premiumize"),
+                format!("debrid:{provider_id}:real_debrid")
+            ]
+        );
+
+        let instance_after = store
+            .get_instance(instance_id)
+            .await?
+            .context("debrid instance should still exist")?;
+        assert_eq!(
+            instance_after
+                .config_json
+                .as_ref()
+                .and_then(|config| config.get("activeService"))
+                .and_then(Value::as_str),
+            Some("torbox")
+        );
+        let route_after = crate::download_broker::list_acquisition_routes(&state.db_pool, &store)
+            .await?
+            .routes
+            .into_iter()
+            .find(|route| {
+                route.logical_id == DEBRID_DEFAULT_LOGICAL_ID
+                    && route.owner_id == DEFAULT_ROUTE_OWNER_ID
+            })
+            .context("default debrid route should still exist")?;
+        assert_eq!(
+            route_after.selected_provider_id,
+            route_before.selected_provider_id
+        );
+        assert_eq!(route_after.selected_provider_id, Some(provider_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dfu2_debrid_route_attempts_skip_unhealthy_provider() -> Result<()> {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let instance_id = setup_debrid_factory_instance(
+            &state.db_pool,
+            &store,
+            json!({
+                "activeService": "torbox",
+                "serviceOrder": ["torbox", "real_debrid"]
+            }),
+        )
+        .await?;
+        for service in [DebridServiceKind::TorBox, DebridServiceKind::RealDebrid] {
+            save_debrid_token(
+                state.secrets.as_ref(),
+                &store,
+                instance_id,
+                service,
+                "token",
+            )
+            .await?;
+        }
+        let provider_id =
+            reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id).await?;
+        store
+            .update_provider_health(provider_id, ProviderHealthState::Unhealthy)
+            .await?;
+
+        let attempts = list_eligible_debrid_route_attempts(&state.db_pool, &store, None).await?;
+
+        assert!(attempts.is_empty());
+        Ok(())
+    }
+
     async fn insert_lifecycle_debrid_job(
         pool: &sqlx::AnyPool,
         provider_id: Uuid,
@@ -12783,6 +13235,7 @@ mod tests {
         requested_downloads: Arc<Mutex<Vec<String>>>,
         deleted_releases: Arc<Mutex<Vec<String>>>,
         ready: Arc<Mutex<bool>>,
+        failed_no_seeds: Arc<Mutex<bool>>,
     }
 
     #[derive(Clone, Default)]
@@ -13923,6 +14376,29 @@ mod tests {
                 .into_response();
         }
         let ready = *state.ready.lock().unwrap();
+        let failed_no_seeds = *state.failed_no_seeds.lock().unwrap();
+        if failed_no_seeds {
+            return Json(json!({
+                "success": true,
+                "detail": "Torrent list retrieved successfully.",
+                "data": {
+                    "id": 77,
+                    "auth_id": "auth-77",
+                    "hash": "0123456789abcdef0123456789abcdef01234567",
+                    "name": "Show.S01.PACK",
+                    "size": 4096,
+                    "download_state": "stalled (no seeds)",
+                    "progress": 0,
+                    "download_speed": 0,
+                    "total_downloaded": 0,
+                    "download_finished": false,
+                    "download_present": false,
+                    "cached": false,
+                    "files": null
+                }
+            }))
+            .into_response();
+        }
         Json(json!({
             "success": true,
             "detail": "Torrent list retrieved successfully.",
@@ -14983,6 +15459,62 @@ mod tests {
             decision.coverage_fingerprint,
             "sha256:user-approved-synthetic"
         );
+        assert!(decision.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn debrid_selection_policy_prefers_reviewed_release_file_alias_over_numeric_provider_collision()
+    {
+        let mut release =
+            test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::ReviewRequired);
+        let mut synthetic = test_release_file(
+            release.release_id,
+            "source-preview",
+            "[Erai-raws] Fullmetal Alchemist - Brotherhood - 01 [1080p NF WEB-DL AVC AAC][MultiSub][C99DA55C].mkv",
+            true,
+        );
+        synthetic.file_index = Some(0);
+        synthetic.file_id = None;
+        synthetic.provider_file_id = None;
+        synthetic.raw = Some(json!({
+            "source": "manual_review_source_candidate",
+            "synthetic": true
+        }));
+        let provider_episode_one = test_release_file(
+            release.release_id,
+            "62",
+            "/completed/hash/[Erai-raws] Fullmetal Alchemist - Brotherhood - 01 [1080p NF WEB-DL AVC AAC][MultiSub][C99DA55C].mkv",
+            true,
+        );
+        let provider_id_zero_is_episode_thirty_six = test_release_file(
+            release.release_id,
+            "0",
+            "/completed/hash/[Erai-raws] Fullmetal Alchemist - Brotherhood - 36 [1080p NF WEB-DL AVC AAC][MultiSub][37B0B992].mkv",
+            true,
+        );
+        release.coverage_plan = Some(json!({
+            "manualReview": {
+                "status": "approved",
+                "userApproved": true,
+                "selectedReleaseFileIds": [synthetic.release_file_id.to_string()],
+                "selectedFileIds": ["0"],
+                "skippedFileIds": [],
+                "coverageFingerprint": "sha256:user-approved-fma"
+            }
+        }));
+        let files = vec![
+            synthetic,
+            provider_episode_one,
+            provider_id_zero_is_episode_thirty_six,
+        ];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &[], &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.selected_file_ids, vec!["62".to_string()]);
+        assert_eq!(decision.provider_selection_ids, vec!["62".to_string()]);
+        assert!(!decision.selected_file_ids.iter().any(|id| id == "0"));
         assert!(decision.review_reasons.is_empty());
     }
 
@@ -16133,6 +16665,126 @@ mod tests {
         assert_eq!(job.status, "cancelled");
         assert_eq!(job.provider_implementation.as_deref(), Some("torbox"));
         assert!(job.last_error.is_none());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn torbox_uncached_no_seed_failure_deletes_remote_release() -> Result<()> {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let (base_url, mock_state, shutdown) = start_mock_torbox_lifecycle_server().await?;
+        *mock_state.failed_no_seeds.lock().unwrap() = true;
+        let instance_id = setup_debrid_factory_instance(
+            &state.db_pool,
+            &store,
+            json!({
+                "activeService": "torbox",
+                "materialize": true,
+                "testTorBoxApiBaseUrl": base_url.clone()
+            }),
+        )
+        .await?;
+        save_debrid_token(
+            state.secrets.as_ref(),
+            &store,
+            instance_id,
+            DebridServiceKind::TorBox,
+            "good-token",
+        )
+        .await?;
+        let provider_id =
+            reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id).await?;
+        let subscription_id = create_series_subscription_with_targets(&state.db_pool).await?;
+        let source = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+
+        let job_id = submit_debrid(
+            &state,
+            &store,
+            provider_id,
+            instance_id,
+            None,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01.PACK"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Series,
+                    title: "Show".to_string(),
+                    release_title: "Show.S01.PACK".to_string(),
+                    info_hash: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                    fingerprint: Some("torbox-uncached-no-seed-cleanup".to_string()),
+                    score: Some(99.0),
+                    selected_candidate: Some(json!({
+                        "title": "Show.S01.PACK",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "cachedDebrid": false
+                    })),
+                }),
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            mock_state.deleted_releases.lock().unwrap().as_slice(),
+            ["77"]
+        );
+        let job = load_debrid_job(&state.db_pool, job_id)
+            .await?
+            .context("failed TorBox job should load")?;
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.provider_implementation.as_deref(), Some("torbox"));
+        assert_eq!(job.remote_release_id.as_deref(), Some("77"));
+        assert_eq!(
+            classify_debrid_job_failure(&job),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        let provider_cleanup = job
+            .provider_status
+            .as_ref()
+            .and_then(|status| status.get("providerCleanup"))
+            .context("job provider cleanup evidence should persist")?;
+        assert_eq!(
+            provider_cleanup.get("status").and_then(Value::as_str),
+            Some("deleted")
+        );
+        assert_eq!(
+            provider_cleanup.get("notCached").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_cleanup.get("noSeeds").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let release = get_release_by_download_id(&state.db_pool, &job_id.to_string())
+            .await?
+            .context("failed TorBox acquisition release should load")?;
+        let release_cleanup = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("debridProviderCleanup"))
+            .context("release cleanup evidence should persist")?;
+        assert_eq!(
+            release_cleanup.get("status").and_then(Value::as_str),
+            Some("deleted")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("debridFailure"))
+                .and_then(|failure| failure.get("failureClass"))
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
 
         let _ = shutdown.send(());
         Ok(())

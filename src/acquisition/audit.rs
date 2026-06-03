@@ -11,6 +11,7 @@ pub const EVENT_MANUAL_IMPORT_QUARANTINED: &str = "manual_import_quarantined";
 pub const EVENT_MANUAL_IMPORT_COMPLETED: &str = "manual_import_completed";
 pub const EVENT_ACQUISITION_SEARCH_SCHEDULED: &str = "acquisition_search_scheduled";
 pub const EVENT_ACQUISITION_REQUEST_COMPLETED: &str = "acquisition_request_completed";
+pub const EVENT_ROUTE_FALLBACK: &str = "route_fallback";
 
 #[derive(Debug, Clone, Default)]
 pub struct NewAcquisitionAuditEvent {

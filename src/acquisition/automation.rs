@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::audit::{
-        EVENT_ACQUISITION_SEARCH_SCHEDULED, NewAcquisitionAuditEvent,
+        EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_ROUTE_FALLBACK, NewAcquisitionAuditEvent,
         record_acquisition_audit_event,
     },
     acquisition::release_resolution::{
@@ -57,6 +57,12 @@ use crate::{
             TvReleaseFileInput, TvSonarrStyleResolver, TvTarget,
         },
     },
+    acquisition::route_attempts::{
+        RouteAttemptRecord, RouteAttemptStatus, attach_route_attempt_ledger,
+        coverage_plan_with_route_attempt_ledger, route_attempt_ledger,
+        route_attempt_ledger_for_candidate, route_attempt_record_from_evidence,
+        route_attempt_spent_keys, seed_route_attempt_ledger,
+    },
     acquisition::subscriptions::{
         AcquisitionCompletionPolicy, AcquisitionRequestMode, AcquisitionRequestScope,
         AcquisitionRoutePolicy, AcquisitionSubscription, AcquisitionSubscriptionFilter,
@@ -69,11 +75,13 @@ use crate::{
     },
     db::models::{MediaType, ProviderHealthState},
     debrid::{
-        DebridFailureClass, DebridFailureResponsePolicy, active_debrid_concurrent_downloads,
-        get_debrid_job_status,
+        DebridFailureClass, DebridFailureResponsePolicy, DebridReleaseSubmitContext,
+        DebridRouteAttempt, DebridSubmitOptions, active_debrid_concurrent_downloads,
+        get_debrid_job_status, list_eligible_debrid_route_attempts, submit_debrid,
     },
     download_broker::{
         DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
+        USENET_DEFAULT_LOGICAL_ID, resolve_logical_downloader_for_owner,
     },
     extensions::{ExternalIds, store::ExtensionStore},
     http::{
@@ -115,6 +123,8 @@ const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP: i64 = 2;
+const DEFAULT_GLOBAL_USENET_RELEASE_JOB_CAP: i64 = 5;
+const DEFAULT_SUBSCRIPTION_USENET_RELEASE_JOB_CAP: i64 = 2;
 const DEFAULT_GLOBAL_RELEASE_JOB_CAP: i64 = 12;
 const DEFAULT_SUBSCRIPTION_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK: usize = SEARCH_BATCH_LIMIT as usize;
@@ -139,12 +149,21 @@ struct CandidateSubmission {
     movie_coverage_plan: Option<MovieCoveragePlan>,
     request_scope_evidence: Option<JsonValue>,
     dispatch: Option<SchedulerDispatchEvidence>,
+    route_attempt_ledger: Option<JsonValue>,
+    route_attempts: Vec<RouteAttemptRecord>,
 }
 
 #[derive(Debug, Clone)]
 struct ExistingReleaseReuse {
     download_id: String,
     selected_provider_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct RouteAttemptDescriptor {
+    route_logical_id: String,
+    provider_id: Option<Uuid>,
+    provider_implementation: Option<String>,
 }
 
 impl CandidateSubmission {
@@ -278,6 +297,8 @@ impl CandidateReleasePlan {
             movie_coverage_plan: self.selection.movie_coverage_plan,
             request_scope_evidence: self.request_scope_evidence,
             dispatch: Some(dispatch),
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
         }
     }
 }
@@ -335,6 +356,8 @@ struct QueueGovernorCaps {
     subscription_debrid: i64,
     global_torrent: i64,
     subscription_torrent: i64,
+    global_usenet: i64,
+    subscription_usenet: i64,
     max_candidate_searches_per_tick: usize,
     max_submissions_per_tick: usize,
     stale_active_job_seconds: i64,
@@ -351,6 +374,8 @@ impl Default for QueueGovernorCaps {
             subscription_debrid: DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP,
             global_torrent: DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP,
             subscription_torrent: DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP,
+            global_usenet: DEFAULT_GLOBAL_USENET_RELEASE_JOB_CAP,
+            subscription_usenet: DEFAULT_SUBSCRIPTION_USENET_RELEASE_JOB_CAP,
             max_candidate_searches_per_tick: DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK,
             max_submissions_per_tick: DEFAULT_MAX_SUBMISSIONS_PER_TICK,
             stale_active_job_seconds: DEFAULT_STALE_ACTIVE_JOB_SECONDS,
@@ -407,7 +432,11 @@ impl QueueGovernor {
         caps.subscription_debrid = debrid_cap;
         let stale_before = Utc::now() - ChronoDuration::seconds(caps.stale_active_job_seconds);
         let mut active_by_route = HashMap::new();
-        for route in [DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID] {
+        for route in [
+            DEBRID_DEFAULT_LOGICAL_ID,
+            TORRENT_DEFAULT_LOGICAL_ID,
+            USENET_DEFAULT_LOGICAL_ID,
+        ] {
             active_by_route.insert(
                 route.to_string(),
                 count_active_release_jobs_by_route(pool, route).await?,
@@ -800,6 +829,9 @@ impl QueueGovernor {
             TORRENT_DEFAULT_LOGICAL_ID => {
                 Some((self.caps.global_torrent, self.caps.subscription_torrent))
             }
+            USENET_DEFAULT_LOGICAL_ID => {
+                Some((self.caps.global_usenet, self.caps.subscription_usenet))
+            }
             _ => None,
         }
     }
@@ -821,7 +853,7 @@ pub(crate) async fn run_acquisition_automation_iteration(state: &AppState) -> Re
     refresh_due_metadata(state).await?;
     process_stale_qbittorrent_acquisition_releases(state, FALLBACK_BATCH_LIMIT).await?;
     search_due_targets(state).await?;
-    retry_failed_debrid_targets_with_torrent(state).await?;
+    retry_failed_debrid_targets_with_next_route(state).await?;
     reconcile_terminal_acquisition_requests(state).await?;
     Ok(())
 }
@@ -2553,7 +2585,7 @@ fn route_preference_score(route: &str, route_policy: AcquisitionRoutePolicy) -> 
         AcquisitionRoutePolicy::DebridFirst => {
             if route == DEBRID_DEFAULT_LOGICAL_ID {
                 2
-            } else if route == TORRENT_DEFAULT_LOGICAL_ID {
+            } else if route == TORRENT_DEFAULT_LOGICAL_ID || route == USENET_DEFAULT_LOGICAL_ID {
                 1
             } else {
                 0
@@ -2679,7 +2711,11 @@ fn route_preference_order(
 ) -> Vec<&'static str> {
     match route_policy {
         AcquisitionRoutePolicy::DebridFirst => {
-            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID]
+            vec![
+                DEBRID_DEFAULT_LOGICAL_ID,
+                TORRENT_DEFAULT_LOGICAL_ID,
+                USENET_DEFAULT_LOGICAL_ID,
+            ]
         }
         AcquisitionRoutePolicy::DebridOnly => vec![DEBRID_DEFAULT_LOGICAL_ID],
         AcquisitionRoutePolicy::TorrentOnly => vec![TORRENT_DEFAULT_LOGICAL_ID],
@@ -2687,10 +2723,15 @@ fn route_preference_order(
             match default_route.and_then(|route| match route {
                 DEBRID_DEFAULT_LOGICAL_ID => Some(DEBRID_DEFAULT_LOGICAL_ID),
                 TORRENT_DEFAULT_LOGICAL_ID => Some(TORRENT_DEFAULT_LOGICAL_ID),
+                USENET_DEFAULT_LOGICAL_ID => Some(USENET_DEFAULT_LOGICAL_ID),
                 _ => None,
             }) {
                 Some(route) => vec![route],
-                None => vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                None => vec![
+                    DEBRID_DEFAULT_LOGICAL_ID,
+                    TORRENT_DEFAULT_LOGICAL_ID,
+                    USENET_DEFAULT_LOGICAL_ID,
+                ],
             }
         }
     }
@@ -3041,7 +3082,7 @@ fn queue_capacity_reason(block: &QueueCapacityBlock) -> String {
     }
 }
 
-async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()> {
+async fn retry_failed_debrid_targets_with_next_route(state: &AppState) -> Result<()> {
     let targets = list_submitted_debrid_targets(&state.db_pool, FALLBACK_BATCH_LIMIT).await?;
     if targets.is_empty() {
         return Ok(());
@@ -3069,41 +3110,172 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
         if !status.is_failed() {
             continue;
         }
-        if status.source_kind != "magnet" {
-            continue;
-        }
         let Some(subscription) = subscriptions.get(&target.subscription_id) else {
             continue;
         };
         let Some(candidate_value) = target.selected_candidate.clone() else {
             continue;
         };
-        let candidate: AcquisitionCandidate = serde_json::from_value(candidate_value)
+        let candidate: AcquisitionCandidate = serde_json::from_value(candidate_value.clone())
             .context("parsing selected acquisition candidate for debrid fallback")?;
-        match debrid_failure_fallback_action(subscription, &candidate, &status) {
-            DebridFailureFallbackAction::SubmitTorrent { route_logical_id } => {
-                let provider_id = target
-                    .selected_provider_id
-                    .or(subscription.source_provider_id)
-                    .ok_or_else(|| anyhow!("source provider is missing for torrent fallback"))?;
-                let source_extension_id = source_extension_id_for_candidate_provider(
-                    &ExtensionStore::new(&state.db_pool),
-                    provider_id,
-                )
+        let provider_id = target
+            .selected_provider_id
+            .or(subscription.source_provider_id)
+            .ok_or_else(|| anyhow!("source provider is missing for debrid fallback"))?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let source_extension_id =
+            source_extension_id_for_candidate_provider(&store, provider_id).await?;
+        let candidate_fingerprint = candidate_release_fingerprint(&candidate, Some(provider_id));
+        let route_attempt_ledger =
+            route_attempt_ledger_for_candidate(&candidate_value, &candidate_fingerprint);
+        let route_attempts = route_attempt_record_from_evidence(
+            &candidate_value,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            RouteAttemptStatus::Failed,
+            Some(status.job_id.to_string()),
+            status.failure_class.as_deref(),
+            Some(debrid_failure_user_summary(&status)),
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        let mut spent_attempt_keys =
+            route_attempt_spent_keys(&candidate_value, &candidate_fingerprint);
+        spent_attempt_keys.extend(
+            route_attempts
+                .iter()
+                .map(|attempt| attempt.attempt_key.clone()),
+        );
+        let eligible_debrid_attempts =
+            list_eligible_debrid_route_attempts(&state.db_pool, &store, Some(&source_extension_id))
                 .await?;
-                let submission = CandidateSubmission {
+
+        match debrid_failure_fallback_action(
+            subscription,
+            &candidate,
+            &status,
+            &eligible_debrid_attempts,
+            &spent_attempt_keys,
+        ) {
+            DebridFailureFallbackAction::SubmitDebrid { attempt } => {
+                let Some(submission) = build_debrid_failure_fallback_submission(
+                    subscription,
+                    &target,
                     provider_id,
                     source_extension_id,
                     candidate,
-                    provider_warnings: Vec::new(),
-                    anime_coverage_plan: None,
-                    tv_coverage_plan: None,
-                    movie_coverage_plan: None,
-                    request_scope_evidence: Some(request_scope_resolution_evidence(
-                        subscription,
-                        &[target.clone()],
-                    )),
-                    dispatch: None,
+                    route_attempt_ledger,
+                    route_attempts,
+                ) else {
+                    reset_target_for_candidate_retry(
+                        &state.db_pool,
+                        target.target_id,
+                        format!(
+                            "Debrid could not complete this release. {} Elixir will try the next ranked release because the fallback candidate no longer resolves safely for this target.",
+                            debrid_failure_user_summary(&status)
+                        ),
+                        Utc::now()
+                            + jittered_seconds(
+                                &target.target_id,
+                                FALLBACK_NEXT_CANDIDATE_RETRY_SECONDS,
+                                15,
+                            ),
+                    )
+                    .await?;
+                    continue;
+                };
+                match submit_debrid_fallback_attempt(
+                    state,
+                    subscription,
+                    &target,
+                    submission,
+                    &attempt,
+                    Some(&mut governor),
+                )
+                .await
+                {
+                    Ok(CandidateSubmitOutcome::Submitted) => info!(
+                        target_id = %target.target_id,
+                        debrid_job_id = %status.job_id,
+                        debrid_release_id = ?status.release_id,
+                        remote_status = status.remote_status.as_deref().unwrap_or("unknown"),
+                        failure_class = status.failure_class.as_deref().unwrap_or("unknown"),
+                        fallback_provider_id = %attempt.provider_id,
+                        fallback_implementation = attempt.implementation.as_str(),
+                        "submitted alternate debrid fallback after debrid failure"
+                    ),
+                    Ok(CandidateSubmitOutcome::CapacityBlocked(block)) => {
+                        let next_after = Utc::now()
+                            + jittered_seconds(
+                                &target.target_id,
+                                QUEUE_CAPACITY_RETRY_SECONDS,
+                                120,
+                            );
+                        update_target_state(
+                            &state.db_pool,
+                            target.target_id,
+                            AcquisitionTargetStateUpdate {
+                                state: AcquisitionTargetState::Blocked,
+                                state_reason: Some(queue_capacity_reason(&block)),
+                                next_search_after: Some(next_after),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(err) => {
+                        warn!(
+                            target_id = %target.target_id,
+                            debrid_job_id = %status.job_id,
+                            fallback_provider_id = %attempt.provider_id,
+                            fallback_implementation = attempt.implementation.as_str(),
+                            error = %err,
+                            "alternate debrid fallback after debrid failure could not be submitted"
+                        );
+                        let next_after = Utc::now()
+                            + jittered_seconds(&target.target_id, WARM_RETRY_INTERVAL_SECONDS, 300);
+                        update_target_state(
+                            &state.db_pool,
+                            target.target_id,
+                            AcquisitionTargetStateUpdate {
+                                state: AcquisitionTargetState::Blocked,
+                                state_reason: Some(
+                                    "Debrid could not complete this release, and the alternate debrid fallback could not be started. Check route/provider status or try another release."
+                                        .to_string(),
+                                ),
+                                next_search_after: Some(next_after),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            DebridFailureFallbackAction::SubmitLocal { route_logical_id } => {
+                let Some(submission) = build_debrid_failure_fallback_submission(
+                    subscription,
+                    &target,
+                    provider_id,
+                    source_extension_id,
+                    candidate,
+                    route_attempt_ledger,
+                    route_attempts,
+                ) else {
+                    reset_target_for_candidate_retry(
+                        &state.db_pool,
+                        target.target_id,
+                        format!(
+                            "Debrid could not complete this release. {} Elixir will try the next ranked release because the fallback candidate no longer resolves safely for this target.",
+                            debrid_failure_user_summary(&status)
+                        ),
+                        Utc::now()
+                            + jittered_seconds(
+                                &target.target_id,
+                                FALLBACK_NEXT_CANDIDATE_RETRY_SECONDS,
+                                15,
+                            ),
+                    )
+                    .await?;
+                    continue;
                 };
                 match submit_selected_candidate(
                     state,
@@ -3122,7 +3294,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                         remote_status = status.remote_status.as_deref().unwrap_or("unknown"),
                         failure_class = status.failure_class.as_deref().unwrap_or("unknown"),
                         fallback_route = route_logical_id,
-                        "submitted torrent fallback after debrid failure"
+                        "submitted local fallback after debrid failure"
                     ),
                     Ok(CandidateSubmitOutcome::CapacityBlocked(block)) => {
                         let next_after = Utc::now()
@@ -3149,7 +3321,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                             debrid_job_id = %status.job_id,
                             fallback_route = route_logical_id,
                             error = %err,
-                            "torrent fallback after debrid failure could not be submitted"
+                            "local fallback after debrid failure could not be submitted"
                         );
                         let next_after = Utc::now()
                             + jittered_seconds(&target.target_id, WARM_RETRY_INTERVAL_SECONDS, 300);
@@ -3159,7 +3331,7 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
                             AcquisitionTargetStateUpdate {
                                 state: AcquisitionTargetState::Blocked,
                                 state_reason: Some(
-                                    "Debrid could not complete this release, and qBittorrent fallback could not be started. Check route/provider status or try another release."
+                                    "Debrid could not complete this release, and local downloader fallback could not be started. Check route/provider status or try another release."
                                         .to_string(),
                                 ),
                                 next_search_after: Some(next_after),
@@ -3209,9 +3381,42 @@ async fn retry_failed_debrid_targets_with_torrent(state: &AppState) -> Result<()
     Ok(())
 }
 
+fn build_debrid_failure_fallback_submission(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    provider_id: Uuid,
+    source_extension_id: String,
+    candidate: AcquisitionCandidate,
+    route_attempt_ledger: Option<JsonValue>,
+    route_attempts: Vec<RouteAttemptRecord>,
+) -> Option<CandidateSubmission> {
+    let targets = [target.clone()];
+    let coverage = analyze_candidate_coverage(subscription, target, &targets, &candidate)?;
+    if coverage.confidence == ReleaseConfidence::ReviewRequired
+        || coverage.confidence == ReleaseConfidence::Low
+        || coverage.covered_target_ids.is_empty()
+    {
+        return None;
+    }
+    Some(CandidateSubmission {
+        provider_id,
+        source_extension_id,
+        candidate: coverage.selection.candidate,
+        provider_warnings: Vec::new(),
+        anime_coverage_plan: coverage.selection.anime_coverage_plan,
+        tv_coverage_plan: coverage.selection.tv_coverage_plan,
+        movie_coverage_plan: coverage.selection.movie_coverage_plan,
+        request_scope_evidence: Some(request_scope_resolution_evidence(subscription, &targets)),
+        dispatch: None,
+        route_attempt_ledger,
+        route_attempts,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DebridFailureFallbackAction {
-    SubmitTorrent { route_logical_id: &'static str },
+    SubmitDebrid { attempt: DebridRouteAttempt },
+    SubmitLocal { route_logical_id: &'static str },
     RetryNextCandidate { reason: String },
     NoAutomaticFallback { reason: String },
 }
@@ -3220,6 +3425,8 @@ fn debrid_failure_fallback_action(
     subscription: &AcquisitionSubscription,
     candidate: &AcquisitionCandidate,
     status: &crate::debrid::DebridJobStatus,
+    eligible_debrid_attempts: &[DebridRouteAttempt],
+    spent_attempt_keys: &BTreeSet<String>,
 ) -> DebridFailureFallbackAction {
     let summary = debrid_failure_user_summary(status);
     let failure_class = status
@@ -3247,22 +3454,33 @@ fn debrid_failure_fallback_action(
             ),
         };
     }
-    if subscription.route_policy != AcquisitionRoutePolicy::DebridFirst {
+    if !matches!(
+        subscription.route_policy,
+        AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::DebridOnly
+    ) {
         return DebridFailureFallbackAction::NoAutomaticFallback {
             reason: format!(
-                "Debrid could not complete this release. Route policy '{}' does not allow automatic qBittorrent fallback. {summary}",
+                "Debrid could not complete this release. Route policy '{}' does not allow automatic debrid fallback. {summary}",
                 subscription.route_policy.as_str()
             ),
         };
     }
-    if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
-        return DebridFailureFallbackAction::SubmitTorrent {
-            route_logical_id: TORRENT_DEFAULT_LOGICAL_ID,
-        };
+    if candidate_supports_debrid(candidate)
+        && let Some(attempt) = eligible_debrid_attempts
+            .iter()
+            .find(|attempt| !spent_attempt_keys.contains(&attempt.attempt_key))
+            .cloned()
+    {
+        return DebridFailureFallbackAction::SubmitDebrid { attempt };
+    }
+    if subscription.route_policy == AcquisitionRoutePolicy::DebridFirst
+        && let Some(route_logical_id) = candidate_local_fallback_route(candidate)
+    {
+        return DebridFailureFallbackAction::SubmitLocal { route_logical_id };
     }
     DebridFailureFallbackAction::RetryNextCandidate {
         reason: format!(
-            "Debrid could not complete this release and the selected candidate has no qBittorrent fallback. {summary} Trying the next ranked release."
+            "Debrid could not complete this release and no untried fallback route remains for the selected candidate. {summary} Trying the next ranked release."
         ),
     }
 }
@@ -3388,178 +3606,873 @@ async fn submit_selected_candidate(
             &route_logical_id,
             Some(reuse.download_id),
             reuse.selected_provider_id.unwrap_or(submission.provider_id),
+            None,
             "Reused existing pack-aware acquisition release.",
+            &[],
         )
         .await?;
         return Ok(CandidateSubmitOutcome::Submitted);
     }
-    let governed_submission = governor.is_some();
+    submit_candidate_with_route_fallback_sequence(
+        state,
+        subscription,
+        target,
+        &submission,
+        route_logical_id,
+        route_override,
+        governor.as_deref_mut(),
+    )
+    .await
+}
+
+#[derive(Debug)]
+enum SubmissionRouteAttemptOutcome {
+    Submitted,
+    CapacityBlocked(QueueCapacityBlock),
+    Failed {
+        route_attempt: RouteAttemptRecord,
+        error_message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubmissionFallbackRoute {
+    Debrid { attempt: DebridRouteAttempt },
+    Local { route_logical_id: &'static str },
+}
+
+async fn submit_candidate_with_route_fallback_sequence(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: String,
+    route_override: Option<&str>,
+    mut governor: Option<&mut QueueGovernor>,
+) -> Result<CandidateSubmitOutcome> {
+    let primary_reason = broker_route_success_reason(route_override, &route_logical_id);
+    let primary_failure_status = if route_logical_id == DEBRID_DEFAULT_LOGICAL_ID {
+        RouteAttemptStatus::Failed
+    } else {
+        RouteAttemptStatus::Blocked
+    };
+    let primary_failure_prefix = if route_logical_id == DEBRID_DEFAULT_LOGICAL_ID {
+        "Debrid route failed before fallback"
+    } else {
+        "Acquisition route blocked"
+    };
+    let primary_outcome = submit_broker_route_attempt(
+        state,
+        subscription,
+        target,
+        submission,
+        &route_logical_id,
+        primary_reason,
+        &[],
+        primary_failure_status,
+        primary_failure_prefix,
+        governor.as_deref_mut(),
+    )
+    .await?;
+    let mut route_attempts = match primary_outcome {
+        SubmissionRouteAttemptOutcome::Submitted => return Ok(CandidateSubmitOutcome::Submitted),
+        SubmissionRouteAttemptOutcome::CapacityBlocked(block) => {
+            return Ok(CandidateSubmitOutcome::CapacityBlocked(block));
+        }
+        SubmissionRouteAttemptOutcome::Failed {
+            route_attempt,
+            error_message,
+        } => {
+            if route_logical_id != DEBRID_DEFAULT_LOGICAL_ID
+                || !matches!(
+                    subscription.route_policy,
+                    AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::DebridOnly
+                )
+            {
+                return block_submission_after_route_failures(
+                    state,
+                    subscription,
+                    target,
+                    submission,
+                    &route_logical_id,
+                    format!("Acquisition route blocked: {error_message}"),
+                    vec![route_attempt],
+                )
+                .await;
+            }
+            warn!(
+                target_id = %target.target_id,
+                error = %error_message,
+                "debrid submission failed, evaluating alternate debrid/local fallback routes"
+            );
+            vec![route_attempt]
+        }
+    };
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let eligible_debrid_attempts = list_eligible_debrid_route_attempts(
+        &state.db_pool,
+        &store,
+        Some(&submission.source_extension_id),
+    )
+    .await?;
+    let spent_attempt_keys = spent_route_attempt_keys_for_submission(submission, &route_attempts);
+    let fallback_routes = submission_time_fallback_route_plan(
+        subscription,
+        &submission.candidate,
+        &eligible_debrid_attempts,
+        &spent_attempt_keys,
+    );
+
+    for fallback_route in fallback_routes {
+        match fallback_route {
+            SubmissionFallbackRoute::Debrid { attempt } => {
+                let outcome = submit_direct_debrid_route_attempt(
+                    state,
+                    subscription,
+                    target,
+                    submission,
+                    &attempt,
+                    &route_attempts,
+                    governor.as_deref_mut(),
+                )
+                .await?;
+                match outcome {
+                    SubmissionRouteAttemptOutcome::Submitted => {
+                        return Ok(CandidateSubmitOutcome::Submitted);
+                    }
+                    SubmissionRouteAttemptOutcome::CapacityBlocked(block) => {
+                        route_attempts.push(RouteAttemptRecord::new(
+                            DEBRID_DEFAULT_LOGICAL_ID,
+                            Some(attempt.provider_id),
+                            Some(attempt.implementation.as_str()),
+                            None,
+                            RouteAttemptStatus::Blocked,
+                            None,
+                            Some(queue_capacity_reason(&block)),
+                        ));
+                        return block_submission_after_route_failures(
+                            state,
+                            subscription,
+                            target,
+                            submission,
+                            DEBRID_DEFAULT_LOGICAL_ID,
+                            queue_capacity_reason(&block),
+                            route_attempts,
+                        )
+                        .await;
+                    }
+                    SubmissionRouteAttemptOutcome::Failed {
+                        route_attempt,
+                        error_message,
+                    } => {
+                        warn!(
+                            target_id = %target.target_id,
+                            fallback_provider_id = %attempt.provider_id,
+                            fallback_implementation = attempt.implementation.as_str(),
+                            error = %error_message,
+                            "alternate debrid submission failed before creating a job"
+                        );
+                        route_attempts.push(route_attempt);
+                    }
+                }
+            }
+            SubmissionFallbackRoute::Local { route_logical_id } => {
+                let reason = local_fallback_success_reason(route_logical_id);
+                let outcome = submit_broker_route_attempt(
+                    state,
+                    subscription,
+                    target,
+                    submission,
+                    route_logical_id,
+                    reason,
+                    &route_attempts,
+                    RouteAttemptStatus::Failed,
+                    local_fallback_failure_prefix(route_logical_id),
+                    governor.as_deref_mut(),
+                )
+                .await?;
+                match outcome {
+                    SubmissionRouteAttemptOutcome::Submitted => {
+                        return Ok(CandidateSubmitOutcome::Submitted);
+                    }
+                    SubmissionRouteAttemptOutcome::CapacityBlocked(block) => {
+                        route_attempts.push(RouteAttemptRecord::new(
+                            route_logical_id,
+                            None,
+                            None,
+                            None,
+                            RouteAttemptStatus::Blocked,
+                            None,
+                            Some(queue_capacity_reason(&block)),
+                        ));
+                        return block_submission_after_route_failures(
+                            state,
+                            subscription,
+                            target,
+                            submission,
+                            route_logical_id,
+                            queue_capacity_reason(&block),
+                            route_attempts,
+                        )
+                        .await;
+                    }
+                    SubmissionRouteAttemptOutcome::Failed {
+                        route_attempt,
+                        error_message,
+                    } => {
+                        warn!(
+                            target_id = %target.target_id,
+                            fallback_route = route_logical_id,
+                            error = %error_message,
+                            "local fallback submission failed before creating a job"
+                        );
+                        route_attempts.push(route_attempt);
+                    }
+                }
+            }
+        }
+    }
+
+    let selected_route = route_attempts
+        .last()
+        .map(|attempt| attempt.route_logical_id.clone())
+        .unwrap_or_else(|| route_logical_id.clone());
+    let last_error = route_attempts
+        .last()
+        .and_then(|attempt| attempt.reason.as_deref())
+        .unwrap_or("No compatible fallback route remains.");
+    block_submission_after_route_failures(
+        state,
+        subscription,
+        target,
+        submission,
+        &selected_route,
+        format!("Acquisition route fallback exhausted: {last_error}"),
+        route_attempts,
+    )
+    .await
+}
+
+async fn submit_broker_route_attempt(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    reason: &str,
+    prior_route_attempts: &[RouteAttemptRecord],
+    failure_status: RouteAttemptStatus,
+    failure_prefix: &str,
+    mut governor: Option<&mut QueueGovernor>,
+) -> Result<SubmissionRouteAttemptOutcome> {
+    let reserved_route = match reserve_submission_route(
+        state,
+        subscription.subscription_id,
+        route_logical_id,
+        governor.as_deref_mut(),
+    )
+    .await?
+    {
+        Ok(route) => route,
+        Err(block) => return Ok(SubmissionRouteAttemptOutcome::CapacityBlocked(block)),
+    };
+    let route_descriptor =
+        route_attempt_descriptor(state, route_logical_id, &submission.source_extension_id).await;
+    match submit_candidate_to_route(state, subscription, target, submission, route_logical_id).await
+    {
+        Ok(response) => {
+            let submitted_attempt = submitted_route_attempt(&response, reason);
+            let mut route_attempts = prior_route_attempts.to_vec();
+            route_attempts.push(submitted_attempt);
+            persist_successful_submission_route(
+                state,
+                subscription,
+                target,
+                submission,
+                route_logical_id,
+                response.download_id.clone(),
+                response.provider_id,
+                response.provider_implementation.as_deref(),
+                reason,
+                &route_attempts,
+            )
+            .await?;
+            Ok(SubmissionRouteAttemptOutcome::Submitted)
+        }
+        Err(err) => {
+            release_submission_route(
+                subscription.subscription_id,
+                reserved_route,
+                governor.as_deref_mut(),
+            );
+            let error_message = err.to_string();
+            let route_attempt = route_attempt_from_descriptor(
+                &route_descriptor,
+                failure_status,
+                None,
+                None,
+                Some(format!("{failure_prefix}: {error_message}")),
+            );
+            Ok(SubmissionRouteAttemptOutcome::Failed {
+                route_attempt,
+                error_message,
+            })
+        }
+    }
+}
+
+async fn submit_direct_debrid_route_attempt(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    attempt: &DebridRouteAttempt,
+    prior_route_attempts: &[RouteAttemptRecord],
+    mut governor: Option<&mut QueueGovernor>,
+) -> Result<SubmissionRouteAttemptOutcome> {
+    let reserved_route = match reserve_submission_route(
+        state,
+        subscription.subscription_id,
+        DEBRID_DEFAULT_LOGICAL_ID,
+        governor.as_deref_mut(),
+    )
+    .await?
+    {
+        Ok(route) => route,
+        Err(block) => return Ok(SubmissionRouteAttemptOutcome::CapacityBlocked(block)),
+    };
+    let store = ExtensionStore::new(&state.db_pool);
+    let release_context = debrid_release_context_for_submission(
+        subscription,
+        target,
+        submission,
+        prior_route_attempts,
+    )?;
+    let display_name = download_display_name(target, &submission.candidate);
+    let reason = "Submitted through Debrid fallback provider.";
+    match submit_debrid(
+        state,
+        &store,
+        attempt.provider_id,
+        attempt.instance_id,
+        Some(attempt.implementation.as_str()),
+        &submission.candidate.source,
+        DebridSubmitOptions {
+            owner_id: submission.source_extension_id.as_str(),
+            category: None,
+            name: Some(display_name.as_str()),
+            paused: false,
+            release_context: Some(release_context),
+        },
+    )
+    .await
+    {
+        Ok(job_id) => {
+            let download_id = Some(job_id.to_string());
+            let submitted_attempt = RouteAttemptRecord::new(
+                DEBRID_DEFAULT_LOGICAL_ID,
+                Some(attempt.provider_id),
+                Some(attempt.implementation.as_str()),
+                download_id.clone(),
+                RouteAttemptStatus::Submitted,
+                None,
+                Some(reason.to_string()),
+            );
+            let mut route_attempts = prior_route_attempts.to_vec();
+            route_attempts.push(submitted_attempt);
+            persist_successful_submission_route(
+                state,
+                subscription,
+                target,
+                submission,
+                DEBRID_DEFAULT_LOGICAL_ID,
+                download_id,
+                attempt.provider_id,
+                Some(attempt.implementation.as_str()),
+                reason,
+                &route_attempts,
+            )
+            .await?;
+            Ok(SubmissionRouteAttemptOutcome::Submitted)
+        }
+        Err(err) => {
+            release_submission_route(
+                subscription.subscription_id,
+                reserved_route,
+                governor.as_deref_mut(),
+            );
+            let error_message = err.to_string();
+            let route_attempt = RouteAttemptRecord::new(
+                DEBRID_DEFAULT_LOGICAL_ID,
+                Some(attempt.provider_id),
+                Some(attempt.implementation.as_str()),
+                None,
+                RouteAttemptStatus::Failed,
+                None,
+                Some(format!(
+                    "Debrid fallback provider '{}' failed before creating a job: {error_message}",
+                    attempt.display_name
+                )),
+            );
+            Ok(SubmissionRouteAttemptOutcome::Failed {
+                route_attempt,
+                error_message,
+            })
+        }
+    }
+}
+
+async fn persist_successful_submission_route(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_logical_id: &str,
+    download_id: Option<String>,
+    route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
+    reason: &str,
+    route_attempts: &[RouteAttemptRecord],
+) -> Result<()> {
+    if submission.has_release_coverage_plan() {
+        persist_release_submission(
+            state,
+            subscription,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            route_provider_id,
+            route_provider_implementation,
+            reason,
+            route_attempts,
+        )
+        .await?;
+    } else {
+        mark_target_submitted(
+            state,
+            target,
+            submission,
+            route_logical_id,
+            download_id,
+            route_provider_id,
+            route_provider_implementation,
+            reason,
+            route_attempts,
+        )
+        .await?;
+    }
+    if submission_attempts_include_fallback(submission, route_attempts) {
+        let mut audit_attempts = submission.route_attempts.clone();
+        audit_attempts.extend(route_attempts.iter().cloned());
+        record_route_fallback_audit_event(
+            state,
+            subscription,
+            target,
+            submission,
+            &audit_attempts,
+            reason,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn block_submission_after_route_failures(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    selected_route_logical_id: &str,
+    state_reason: String,
+    route_attempts: Vec<RouteAttemptRecord>,
+) -> Result<CandidateSubmitOutcome> {
+    update_target_state(
+        &state.db_pool,
+        target.target_id,
+        AcquisitionTargetStateUpdate {
+            state: AcquisitionTargetState::Blocked,
+            state_reason: Some(state_reason),
+            selected_provider_id: Some(submission.provider_id),
+            selected_route_logical_id: Some(selected_route_logical_id.to_string()),
+            selected_candidate: Some(selected_candidate_provenance_with_route_attempts(
+                submission,
+                &route_attempts,
+            )?),
+            next_search_after: Some(next_candidate_retry_after(subscription, target, Utc::now())),
+            increment_search_attempts: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(CandidateSubmitOutcome::Submitted)
+}
+
+async fn reserve_submission_route(
+    state: &AppState,
+    subscription_id: Uuid,
+    route_logical_id: &str,
+    governor: Option<&mut QueueGovernor>,
+) -> Result<std::result::Result<Option<String>, QueueCapacityBlock>> {
+    let Some(governor) = governor else {
+        return Ok(Ok(None));
+    };
+    match governor
+        .try_reserve(&state.db_pool, subscription_id, route_logical_id)
+        .await?
+    {
+        Ok(()) => Ok(Ok(Some(route_logical_id.to_string()))),
+        Err(block) => Ok(Err(block)),
+    }
+}
+
+fn release_submission_route(
+    subscription_id: Uuid,
+    reserved_route: Option<String>,
+    governor: Option<&mut QueueGovernor>,
+) {
+    if let (Some(route), Some(governor)) = (reserved_route, governor) {
+        governor.release_reservation(subscription_id, &route);
+    }
+}
+
+fn submission_time_fallback_route_plan(
+    subscription: &AcquisitionSubscription,
+    candidate: &AcquisitionCandidate,
+    eligible_debrid_attempts: &[DebridRouteAttempt],
+    spent_attempt_keys: &BTreeSet<String>,
+) -> Vec<SubmissionFallbackRoute> {
+    let mut routes = Vec::new();
+    if matches!(
+        subscription.route_policy,
+        AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::DebridOnly
+    ) && candidate_supports_debrid(candidate)
+    {
+        routes.extend(
+            eligible_debrid_attempts
+                .iter()
+                .filter(|attempt| !spent_attempt_keys.contains(&attempt.attempt_key))
+                .cloned()
+                .map(|attempt| SubmissionFallbackRoute::Debrid { attempt }),
+        );
+    }
+    if subscription.route_policy == AcquisitionRoutePolicy::DebridFirst
+        && let Some(route_logical_id) = candidate_local_fallback_route(candidate)
+    {
+        routes.push(SubmissionFallbackRoute::Local { route_logical_id });
+    }
+    routes
+}
+
+fn spent_route_attempt_keys_for_submission(
+    submission: &CandidateSubmission,
+    route_attempts: &[RouteAttemptRecord],
+) -> BTreeSet<String> {
+    let fingerprint =
+        candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+    let mut evidence = json!({});
+    seed_route_attempt_ledger(
+        &mut evidence,
+        &fingerprint,
+        submission.route_attempt_ledger.as_ref(),
+    );
+    attach_route_attempt_ledger(&mut evidence, &fingerprint, &submission.route_attempts);
+    attach_route_attempt_ledger(&mut evidence, &fingerprint, route_attempts);
+    route_attempt_spent_keys(&evidence, &fingerprint)
+}
+
+fn submission_attempts_include_fallback(
+    submission: &CandidateSubmission,
+    route_attempts: &[RouteAttemptRecord],
+) -> bool {
+    !submission.route_attempts.is_empty()
+        || route_attempts
+            .iter()
+            .any(|attempt| attempt.status != RouteAttemptStatus::Submitted)
+}
+
+fn broker_route_success_reason(
+    route_override: Option<&str>,
+    route_logical_id: &str,
+) -> &'static str {
+    match route_override {
+        Some(TORRENT_DEFAULT_LOGICAL_ID) => "Submitted through torrent fallback.",
+        Some(USENET_DEFAULT_LOGICAL_ID) => "Submitted through usenet fallback.",
+        _ if route_logical_id == TORRENT_DEFAULT_LOGICAL_ID => {
+            "Submitted through torrent fallback."
+        }
+        _ if route_logical_id == USENET_DEFAULT_LOGICAL_ID => "Submitted through usenet fallback.",
+        _ => "Submitted through acquisition route.",
+    }
+}
+
+fn local_fallback_success_reason(route_logical_id: &str) -> &'static str {
+    match route_logical_id {
+        TORRENT_DEFAULT_LOGICAL_ID => "Submitted through torrent fallback.",
+        USENET_DEFAULT_LOGICAL_ID => "Submitted through usenet fallback.",
+        _ => "Submitted through acquisition route.",
+    }
+}
+
+fn local_fallback_failure_prefix(route_logical_id: &str) -> &'static str {
+    match route_logical_id {
+        TORRENT_DEFAULT_LOGICAL_ID => "Torrent fallback failed",
+        USENET_DEFAULT_LOGICAL_ID => "Usenet fallback failed",
+        _ => "Local fallback failed",
+    }
+}
+
+async fn route_attempt_descriptor(
+    state: &AppState,
+    route_logical_id: &str,
+    owner_id: &str,
+) -> RouteAttemptDescriptor {
+    let store = ExtensionStore::new(&state.db_pool);
+    match resolve_logical_downloader_for_owner(&state.db_pool, &store, route_logical_id, owner_id)
+        .await
+    {
+        Ok(resolved) => RouteAttemptDescriptor {
+            route_logical_id: route_logical_id.to_string(),
+            provider_id: Some(resolved.record.provider_id),
+            provider_implementation: resolved.record.implementation.clone(),
+        },
+        Err(err) => {
+            debug!(
+                route_logical_id,
+                owner_id,
+                error = %err,
+                "could not resolve acquisition route attempt descriptor"
+            );
+            RouteAttemptDescriptor {
+                route_logical_id: route_logical_id.to_string(),
+                provider_id: None,
+                provider_implementation: None,
+            }
+        }
+    }
+}
+
+fn route_attempt_from_descriptor(
+    descriptor: &RouteAttemptDescriptor,
+    status: RouteAttemptStatus,
+    download_id: Option<String>,
+    failure_class: Option<&str>,
+    reason: Option<String>,
+) -> RouteAttemptRecord {
+    RouteAttemptRecord::new(
+        &descriptor.route_logical_id,
+        descriptor.provider_id,
+        descriptor.provider_implementation.as_deref(),
+        download_id,
+        status,
+        failure_class,
+        reason,
+    )
+}
+
+fn submitted_route_attempt(
+    response: &DownloadBrokerSubmitResponse,
+    reason: &str,
+) -> RouteAttemptRecord {
+    RouteAttemptRecord::new(
+        &response.logical_id,
+        Some(response.provider_id),
+        response.provider_implementation.as_deref(),
+        response.download_id.clone(),
+        RouteAttemptStatus::Submitted,
+        None,
+        Some(reason.to_string()),
+    )
+}
+
+async fn record_route_fallback_audit_event(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_attempts: &[RouteAttemptRecord],
+    reason: &str,
+) -> Result<()> {
+    let candidate_fingerprint =
+        candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+    record_acquisition_audit_event(
+        &state.db_pool,
+        NewAcquisitionAuditEvent {
+            event_type: EVENT_ROUTE_FALLBACK.to_string(),
+            subscription_id: Some(subscription.subscription_id),
+            target_id: Some(target.target_id),
+            state: Some(target.state.as_str().to_string()),
+            reason: Some(reason.to_string()),
+            evidence: Some(json!({
+                "candidateFingerprint": candidate_fingerprint,
+                "sourceProviderId": submission.provider_id,
+                "sourceExtensionId": submission.source_extension_id,
+                "routeAttemptLedger": route_attempt_ledger(
+                    &candidate_release_fingerprint(
+                        &submission.candidate,
+                        Some(submission.provider_id),
+                    ),
+                    route_attempts,
+                ),
+            })),
+            ..NewAcquisitionAuditEvent::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn submit_debrid_fallback_attempt(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    submission: CandidateSubmission,
+    attempt: &DebridRouteAttempt,
+    mut governor: Option<&mut QueueGovernor>,
+) -> Result<CandidateSubmitOutcome> {
     let mut reserved_route = None::<String>;
-    if governed_submission && let Some(governor) = governor.as_deref_mut() {
+    if let Some(governor) = governor.as_deref_mut() {
         match governor
             .try_reserve(
                 &state.db_pool,
                 subscription.subscription_id,
-                &route_logical_id,
+                DEBRID_DEFAULT_LOGICAL_ID,
             )
             .await?
         {
-            Ok(()) => reserved_route = Some(route_logical_id.clone()),
+            Ok(()) => reserved_route = Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
             Err(block) => return Ok(CandidateSubmitOutcome::CapacityBlocked(block)),
         }
     }
-    match submit_candidate_to_route(state, subscription, target, &submission, &route_logical_id)
-        .await
+
+    let store = ExtensionStore::new(&state.db_pool);
+    let release_context =
+        debrid_release_context_for_submission(subscription, target, &submission, &[])?;
+    let reason = "Submitted through Debrid fallback provider.";
+    let display_name = download_display_name(target, &submission.candidate);
+    let job_id = match submit_debrid(
+        state,
+        &store,
+        attempt.provider_id,
+        attempt.instance_id,
+        Some(attempt.implementation.as_str()),
+        &submission.candidate.source,
+        DebridSubmitOptions {
+            owner_id: submission.source_extension_id.as_str(),
+            category: None,
+            name: Some(display_name.as_str()),
+            paused: false,
+            release_context: Some(release_context),
+        },
+    )
+    .await
     {
-        Ok(response) => {
-            let reason = if route_override == Some(TORRENT_DEFAULT_LOGICAL_ID) {
-                "Submitted through torrent fallback."
-            } else {
-                "Submitted through acquisition route."
-            };
-            if submission.has_release_coverage_plan() {
-                persist_release_submission(
-                    state,
-                    subscription,
-                    target,
-                    &submission,
-                    &route_logical_id,
-                    response.download_id,
-                    response.provider_id,
-                    reason,
-                )
-                .await?;
-            } else {
-                mark_target_submitted(
-                    state,
-                    target,
-                    &submission,
-                    &route_logical_id,
-                    response.download_id,
-                    response.provider_id,
-                    reason,
-                )
-                .await?;
-            }
-            Ok(CandidateSubmitOutcome::Submitted)
-        }
-        Err(err)
-            if route_logical_id == DEBRID_DEFAULT_LOGICAL_ID
-                && subscription.route_policy == AcquisitionRoutePolicy::DebridFirst
-                && candidate_supports_route(&submission.candidate, TORRENT_DEFAULT_LOGICAL_ID) =>
-        {
-            if let Some(route) = reserved_route.take() {
-                if let Some(governor) = governor.as_deref_mut() {
-                    governor.release_reservation(subscription.subscription_id, &route);
-                }
-            }
-            if governed_submission && let Some(governor) = governor.as_deref_mut() {
-                match governor
-                    .try_reserve(
-                        &state.db_pool,
-                        subscription.subscription_id,
-                        TORRENT_DEFAULT_LOGICAL_ID,
-                    )
-                    .await?
-                {
-                    Ok(()) => reserved_route = Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
-                    Err(block) => return Ok(CandidateSubmitOutcome::CapacityBlocked(block)),
-                }
-            }
-            warn!(
-                target_id = %target.target_id,
-                "debrid submission failed, trying torrent fallback: {err}"
-            );
-            let torrent_response = match submit_candidate_to_route(
-                state,
-                subscription,
-                target,
-                &submission,
-                TORRENT_DEFAULT_LOGICAL_ID,
-            )
-            .await
-            {
-                Ok(download_id) => download_id,
-                Err(fallback_err) => {
-                    if let Some(route) = reserved_route.take() {
-                        if let Some(governor) = governor.as_deref_mut() {
-                            governor.release_reservation(subscription.subscription_id, &route);
-                        }
-                    }
-                    let next_after = next_candidate_retry_after(subscription, target, Utc::now());
-                    update_target_state(
-                        &state.db_pool,
-                        target.target_id,
-                        AcquisitionTargetStateUpdate {
-                            state: AcquisitionTargetState::Blocked,
-                            state_reason: Some(format!(
-                                "Debrid route failed: {err}; torrent fallback failed: {fallback_err}"
-                            )),
-                            selected_provider_id: Some(submission.provider_id),
-                            selected_route_logical_id: Some(
-                                TORRENT_DEFAULT_LOGICAL_ID.to_string(),
-                            ),
-                            selected_candidate: Some(selected_candidate_provenance(&submission)?),
-                            next_search_after: Some(next_after),
-                            increment_search_attempts: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    return Ok(CandidateSubmitOutcome::Submitted);
-                }
-            };
-            if submission.has_release_coverage_plan() {
-                persist_release_submission(
-                    state,
-                    subscription,
-                    target,
-                    &submission,
-                    TORRENT_DEFAULT_LOGICAL_ID,
-                    torrent_response.download_id,
-                    torrent_response.provider_id,
-                    "Debrid rejected the candidate; submitted torrent fallback.",
-                )
-                .await?;
-            } else {
-                mark_target_submitted(
-                    state,
-                    target,
-                    &submission,
-                    TORRENT_DEFAULT_LOGICAL_ID,
-                    torrent_response.download_id,
-                    torrent_response.provider_id,
-                    "Debrid rejected the candidate; submitted torrent fallback.",
-                )
-                .await?;
-            }
-            Ok(CandidateSubmitOutcome::Submitted)
-        }
+        Ok(job_id) => job_id,
         Err(err) => {
-            if let Some(route) = reserved_route.take() {
-                if let Some(governor) = governor.as_deref_mut() {
-                    governor.release_reservation(subscription.subscription_id, &route);
-                }
+            if let Some(route) = reserved_route.take()
+                && let Some(governor) = governor.as_deref_mut()
+            {
+                governor.release_reservation(subscription.subscription_id, &route);
             }
-            let next_after = next_candidate_retry_after(subscription, target, Utc::now());
+            let failed_attempt = RouteAttemptRecord::new(
+                DEBRID_DEFAULT_LOGICAL_ID,
+                Some(attempt.provider_id),
+                Some(attempt.implementation.as_str()),
+                None,
+                RouteAttemptStatus::Failed,
+                None,
+                Some(format!(
+                    "Debrid fallback provider '{}' failed before creating a job: {err}",
+                    attempt.display_name
+                )),
+            );
+            let selected_candidate =
+                selected_candidate_provenance_with_route_attempts(&submission, &[failed_attempt])?;
             update_target_state(
                 &state.db_pool,
                 target.target_id,
                 AcquisitionTargetStateUpdate {
-                    state: AcquisitionTargetState::Blocked,
-                    state_reason: Some(format!("Acquisition route blocked: {err}")),
+                    state: AcquisitionTargetState::Submitted,
+                    state_reason: Some(
+                        "Debrid fallback provider failed before creating a job; Elixir will try the next eligible route."
+                            .to_string(),
+                    ),
                     selected_provider_id: Some(submission.provider_id),
-                    selected_route_logical_id: Some(route_logical_id),
-                    selected_candidate: Some(selected_candidate_provenance(&submission)?),
-                    next_search_after: Some(next_after),
-                    increment_search_attempts: true,
+                    selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                    selected_candidate: Some(selected_candidate),
+                    next_search_after: None,
+                    increment_search_attempts: false,
                     ..Default::default()
                 },
             )
             .await?;
-            Ok(CandidateSubmitOutcome::Submitted)
+            return Ok(CandidateSubmitOutcome::Submitted);
         }
-    }
+    };
+
+    let download_id = Some(job_id.to_string());
+    let route_attempt = RouteAttemptRecord::new(
+        DEBRID_DEFAULT_LOGICAL_ID,
+        Some(attempt.provider_id),
+        Some(attempt.implementation.as_str()),
+        download_id.clone(),
+        RouteAttemptStatus::Submitted,
+        None,
+        Some(reason.to_string()),
+    );
+    let route_attempts = vec![route_attempt];
+    persist_release_submission(
+        state,
+        subscription,
+        target,
+        &submission,
+        DEBRID_DEFAULT_LOGICAL_ID,
+        download_id,
+        attempt.provider_id,
+        Some(attempt.implementation.as_str()),
+        reason,
+        &route_attempts,
+    )
+    .await?;
+    let mut audit_attempts = submission.route_attempts.clone();
+    audit_attempts.extend(route_attempts);
+    record_route_fallback_audit_event(
+        state,
+        subscription,
+        target,
+        &submission,
+        &audit_attempts,
+        reason,
+    )
+    .await?;
+    Ok(CandidateSubmitOutcome::Submitted)
+}
+
+fn debrid_release_context_for_submission(
+    subscription: &AcquisitionSubscription,
+    _target: &AcquisitionTarget,
+    submission: &CandidateSubmission,
+    route_attempts: &[RouteAttemptRecord],
+) -> Result<DebridReleaseSubmitContext> {
+    Ok(DebridReleaseSubmitContext {
+        subscription_id: Some(subscription.subscription_id),
+        source_provider_id: Some(submission.provider_id),
+        source_extension_id: submission.source_extension_id.clone(),
+        media_type: subscription.media_type,
+        title: subscription.title.clone(),
+        release_title: submission.candidate.title.clone(),
+        info_hash: submission.candidate.info_hash.clone(),
+        fingerprint: Some(candidate_release_fingerprint(
+            &submission.candidate,
+            Some(submission.provider_id),
+        )),
+        score: submission.candidate.score,
+        selected_candidate: Some(selected_candidate_provenance_with_route_attempts(
+            submission,
+            route_attempts,
+        )?),
+    })
 }
 
 async fn submit_candidate_to_route(
@@ -3583,7 +4496,10 @@ async fn submit_candidate_to_route(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(submission.candidate.clone()),
-        release_fingerprint: None,
+        release_fingerprint: Some(candidate_release_fingerprint(
+            &submission.candidate,
+            Some(submission.provider_id),
+        )),
     };
     submit_to_broker(
         state,
@@ -3603,14 +4519,18 @@ async fn mark_target_submitted(
     route_logical_id: &str,
     download_id: Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<()> {
     let selected_candidate = selected_candidate_provenance_with_submission(
         submission,
         route_logical_id,
         &download_id,
         route_provider_id,
+        route_provider_implementation,
         reason,
+        route_attempts,
     )?;
     update_target_state(
         &state.db_pool,
@@ -3670,7 +4590,9 @@ async fn persist_release_submission(
     route_logical_id: &str,
     download_id: Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<()> {
     if submission.anime_coverage_plan.is_some() {
         persist_anime_release_submission(
@@ -3681,7 +4603,9 @@ async fn persist_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await
     } else if submission.tv_coverage_plan.is_some() {
@@ -3693,7 +4617,9 @@ async fn persist_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await
     } else if submission.movie_coverage_plan.is_some() {
@@ -3705,7 +4631,9 @@ async fn persist_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await
     } else {
@@ -3716,7 +4644,9 @@ async fn persist_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await
     }
@@ -3730,7 +4660,9 @@ async fn persist_anime_release_submission(
     route_logical_id: &str,
     download_id: Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<()> {
     let Some(plan) = submission.anime_coverage_plan.as_ref() else {
         return mark_target_submitted(
@@ -3740,7 +4672,9 @@ async fn persist_anime_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await;
     };
@@ -3758,7 +4692,9 @@ async fn persist_anime_release_submission(
         route_logical_id,
         &download_id,
         route_provider_id,
+        route_provider_implementation,
         reason,
+        route_attempts,
     )?;
     let coverage_plan = match anime_scoring.as_ref() {
         Some((context, score)) => json_with_diagnostics(
@@ -3798,7 +4734,7 @@ async fn persist_anime_release_submission(
             )),
             selected_candidate: Some(selected_candidate.clone()),
             coverage_plan: Some(coverage_plan_with_request_scope(
-                coverage_plan,
+                coverage_plan_with_route_attempt_ledger(coverage_plan, &selected_candidate),
                 submission.request_scope_evidence.as_ref(),
             )),
         },
@@ -3942,7 +4878,9 @@ async fn persist_anime_release_submission(
             route_logical_id,
             download_id.clone(),
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await?;
     }
@@ -3981,7 +4919,9 @@ async fn persist_tv_release_submission(
     route_logical_id: &str,
     download_id: Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<()> {
     let Some(plan) = submission.tv_coverage_plan.as_ref() else {
         return mark_target_submitted(
@@ -3991,7 +4931,9 @@ async fn persist_tv_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await;
     };
@@ -4002,7 +4944,9 @@ async fn persist_tv_release_submission(
         route_logical_id,
         &download_id,
         route_provider_id,
+        route_provider_implementation,
         reason,
+        route_attempts,
     )?;
     let release = upsert_release(
         &state.db_pool,
@@ -4035,7 +4979,10 @@ async fn persist_tv_release_submission(
             )),
             selected_candidate: Some(selected_candidate.clone()),
             coverage_plan: Some(coverage_plan_with_request_scope(
-                serde_json::to_value(plan)?,
+                coverage_plan_with_route_attempt_ledger(
+                    serde_json::to_value(plan)?,
+                    &selected_candidate,
+                ),
                 submission.request_scope_evidence.as_ref(),
             )),
         },
@@ -4143,7 +5090,9 @@ async fn persist_tv_release_submission(
             route_logical_id,
             download_id.clone(),
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await?;
     }
@@ -4181,7 +5130,9 @@ async fn persist_movie_release_submission(
     route_logical_id: &str,
     download_id: Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<()> {
     let Some(plan) = submission.movie_coverage_plan.as_ref() else {
         return mark_target_submitted(
@@ -4191,7 +5142,9 @@ async fn persist_movie_release_submission(
             route_logical_id,
             download_id,
             route_provider_id,
+            route_provider_implementation,
             reason,
+            route_attempts,
         )
         .await;
     };
@@ -4202,7 +5155,9 @@ async fn persist_movie_release_submission(
         route_logical_id,
         &download_id,
         route_provider_id,
+        route_provider_implementation,
         reason,
+        route_attempts,
     )?;
     let release = upsert_release(
         &state.db_pool,
@@ -4232,7 +5187,10 @@ async fn persist_movie_release_submission(
             state_reason: Some(format!("{reason} Movie Radarr-style match.")),
             selected_candidate: Some(selected_candidate.clone()),
             coverage_plan: Some(coverage_plan_with_request_scope(
-                serde_json::to_value(plan)?,
+                coverage_plan_with_route_attempt_ledger(
+                    serde_json::to_value(plan)?,
+                    &selected_candidate,
+                ),
                 submission.request_scope_evidence.as_ref(),
             )),
         },
@@ -5155,6 +6113,19 @@ fn anime_candidate_scoring_context(
     let metadata = target.metadata.as_ref();
     let mut aliases = BTreeSet::new();
     insert_candidate_alias(&mut aliases, &subscription.title);
+    if let Some(scope) = subscription.scope.as_ref() {
+        if let Some(title) = scope
+            .get("media")
+            .and_then(|value| value.get("title"))
+            .and_then(JsonValue::as_str)
+        {
+            insert_candidate_alias(&mut aliases, title);
+        }
+        insert_candidate_aliases_from_json_array(
+            &mut aliases,
+            scope.get("media").and_then(|value| value.get("aliases")),
+        );
+    }
     let targets = if subscription_targets.is_empty() {
         vec![target.clone()]
     } else {
@@ -5162,18 +6133,12 @@ fn anime_candidate_scoring_context(
     };
     for item in &targets {
         insert_candidate_alias(&mut aliases, &item.title);
-        if let Some(values) = item
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("aliases"))
-            .and_then(JsonValue::as_array)
-        {
-            for value in values {
-                if let Some(alias) = value.as_str() {
-                    insert_candidate_alias(&mut aliases, alias);
-                }
-            }
-        }
+        insert_candidate_aliases_from_json_array(
+            &mut aliases,
+            item.metadata
+                .as_ref()
+                .and_then(|value| value.get("aliases")),
+        );
     }
 
     Some(AnimeCandidateScoringContext {
@@ -5202,6 +6167,20 @@ fn insert_candidate_alias(aliases: &mut BTreeSet<String>, value: &str) {
     let trimmed = value.trim();
     if !trimmed.is_empty() {
         aliases.insert(trimmed.to_string());
+    }
+}
+
+fn insert_candidate_aliases_from_json_array(
+    aliases: &mut BTreeSet<String>,
+    value: Option<&JsonValue>,
+) {
+    let Some(values) = value.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for value in values {
+        if let Some(alias) = value.as_str() {
+            insert_candidate_alias(aliases, alias);
+        }
     }
 }
 
@@ -5466,15 +6445,12 @@ fn candidate_allowed_by_policy(
     route_policy: AcquisitionRoutePolicy,
 ) -> bool {
     match route_policy {
-        AcquisitionRoutePolicy::DebridOnly => {
-            candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID)
-        }
-        AcquisitionRoutePolicy::TorrentOnly => {
-            candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID)
-        }
+        AcquisitionRoutePolicy::DebridOnly => candidate_supports_debrid(candidate),
+        AcquisitionRoutePolicy::TorrentOnly => candidate_supports_torrent(candidate),
         AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::Manual => {
-            candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID)
-                || candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID)
+            candidate_supports_debrid(candidate)
+                || candidate_supports_torrent(candidate)
+                || candidate_supports_usenet(candidate)
         }
     }
 }
@@ -5490,10 +6466,10 @@ fn select_candidate_route(
     }
     let selected = match route_policy {
         AcquisitionRoutePolicy::DebridFirst => {
-            if candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID) {
+            if candidate_supports_debrid(candidate) {
                 Some(DEBRID_DEFAULT_LOGICAL_ID)
-            } else if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
-                Some(TORRENT_DEFAULT_LOGICAL_ID)
+            } else if let Some(route) = candidate_local_fallback_route(candidate) {
+                Some(route)
             } else {
                 candidate.default_route.as_deref()
             }
@@ -5508,13 +6484,54 @@ fn select_candidate_route(
 }
 
 fn validate_selected_candidate_route(route: &str, candidate: &AcquisitionCandidate) -> Result<()> {
-    if route != DEBRID_DEFAULT_LOGICAL_ID && route != TORRENT_DEFAULT_LOGICAL_ID {
+    if route != DEBRID_DEFAULT_LOGICAL_ID
+        && route != TORRENT_DEFAULT_LOGICAL_ID
+        && route != USENET_DEFAULT_LOGICAL_ID
+    {
         bail!("unsupported selected route '{route}'");
     }
     if !candidate_supports_route(candidate, route) {
         bail!("candidate does not support route '{route}'");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateRouteFamily {
+    Debrid,
+    Torrent,
+    Usenet,
+}
+
+fn candidate_route_family(route: &str) -> Option<CandidateRouteFamily> {
+    match route {
+        DEBRID_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Debrid),
+        TORRENT_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Torrent),
+        USENET_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Usenet),
+        _ => None,
+    }
+}
+
+fn candidate_local_fallback_route(candidate: &AcquisitionCandidate) -> Option<&'static str> {
+    if candidate_supports_torrent(candidate) {
+        Some(TORRENT_DEFAULT_LOGICAL_ID)
+    } else if candidate_supports_usenet(candidate) {
+        Some(USENET_DEFAULT_LOGICAL_ID)
+    } else {
+        None
+    }
+}
+
+fn candidate_supports_debrid(candidate: &AcquisitionCandidate) -> bool {
+    candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID)
+}
+
+fn candidate_supports_torrent(candidate: &AcquisitionCandidate) -> bool {
+    candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID)
+}
+
+fn candidate_supports_usenet(candidate: &AcquisitionCandidate) -> bool {
+    candidate_supports_route(candidate, USENET_DEFAULT_LOGICAL_ID)
 }
 
 fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bool {
@@ -5524,12 +6541,33 @@ fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bo
             .iter()
             .any(|item| item.eq_ignore_ascii_case(route));
     }
-    match (candidate.source_kind.as_str(), route) {
-        ("magnet", DEBRID_DEFAULT_LOGICAL_ID | TORRENT_DEFAULT_LOGICAL_ID) => true,
-        ("http" | "hoster", DEBRID_DEFAULT_LOGICAL_ID) => true,
-        ("torrent", TORRENT_DEFAULT_LOGICAL_ID) => true,
-        _ => false,
+    let source_kind = candidate.source_kind.trim().to_ascii_lowercase();
+    match candidate_route_family(route) {
+        Some(CandidateRouteFamily::Debrid) => matches!(
+            source_kind.as_str(),
+            "magnet" | "http" | "hoster" | "url" | "nzb" | "usenet"
+        ),
+        Some(CandidateRouteFamily::Torrent) => matches!(source_kind.as_str(), "magnet" | "torrent"),
+        Some(CandidateRouteFamily::Usenet) => {
+            matches!(source_kind.as_str(), "nzb" | "usenet")
+                || (matches!(source_kind.as_str(), "http" | "url")
+                    && candidate_source_looks_like_nzb(&candidate.source))
+        }
+        None => false,
     }
+}
+
+fn candidate_source_looks_like_nzb(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.to_ascii_lowercase().ends_with(".nzb")
 }
 
 fn route_option_available(route_options: &[CandidateRouteOption], route: &str) -> bool {
@@ -5640,12 +6678,13 @@ struct MovieReleaseFileInput {
 
 fn movie_release_file_inputs(candidate: &AcquisitionCandidate) -> Vec<MovieReleaseFileInput> {
     if candidate.files.is_empty() {
+        let file_index = candidate.file_index.or(Some(0));
         return vec![MovieReleaseFileInput {
             file_id: candidate
-                .file_index
-                .map(|index| index.to_string())
-                .or_else(|| candidate.id.clone()),
-            file_index: candidate.file_index,
+                .id
+                .clone()
+                .or_else(|| file_index.map(|index| index.to_string())),
+            file_index,
             path: candidate.title.clone(),
             size_bytes: candidate
                 .size_bytes
@@ -5657,14 +6696,18 @@ fn movie_release_file_inputs(candidate: &AcquisitionCandidate) -> Vec<MovieRelea
         .files
         .iter()
         .enumerate()
-        .map(|(index, file)| MovieReleaseFileInput {
-            file_id: file.file_id.clone(),
-            file_index: file
-                .file_index
-                .or_else(|| i64::try_from(index).ok().map(|value| value + 1)),
-            path: file.path.clone(),
-            size_bytes: file.size_bytes.and_then(|value| i64::try_from(value).ok()),
-            selectable: file.selectable.unwrap_or(true),
+        .map(|(index, file)| {
+            let file_index = file.file_index.or_else(|| i64::try_from(index).ok());
+            MovieReleaseFileInput {
+                file_id: file
+                    .file_id
+                    .clone()
+                    .or_else(|| file_index.map(|value| value.to_string())),
+                file_index,
+                path: file.path.clone(),
+                size_bytes: file.size_bytes.and_then(|value| i64::try_from(value).ok()),
+                selectable: file.selectable.unwrap_or(true),
+            }
         })
         .collect()
 }
@@ -5755,8 +6798,9 @@ async fn source_extension_id_for_candidate_provider(
     Ok(instance.extension_id)
 }
 
+#[cfg(test)]
 fn selected_candidate_provenance(submission: &CandidateSubmission) -> Result<JsonValue> {
-    selected_candidate_provenance_inner(submission, None)
+    selected_candidate_provenance_inner(submission, None, &[])
 }
 
 fn selected_candidate_provenance_with_submission(
@@ -5764,25 +6808,39 @@ fn selected_candidate_provenance_with_submission(
     route_logical_id: &str,
     download_id: &Option<String>,
     route_provider_id: Uuid,
+    route_provider_implementation: Option<&str>,
     reason: &str,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<JsonValue> {
     selected_candidate_provenance_inner(
         submission,
         Some(json!({
             "routeLogicalId": route_logical_id,
             "routeProviderId": route_provider_id,
+            "routeProviderImplementation": route_provider_implementation,
             "downloadId": download_id,
             "reason": reason,
             "recordedAt": Utc::now().to_rfc3339(),
         })),
+        route_attempts,
     )
+}
+
+fn selected_candidate_provenance_with_route_attempts(
+    submission: &CandidateSubmission,
+    route_attempts: &[RouteAttemptRecord],
+) -> Result<JsonValue> {
+    selected_candidate_provenance_inner(submission, None, route_attempts)
 }
 
 fn selected_candidate_provenance_inner(
     submission: &CandidateSubmission,
     submission_result: Option<JsonValue>,
+    route_attempts: &[RouteAttemptRecord],
 ) -> Result<JsonValue> {
     let mut value = serde_json::to_value(&submission.candidate)?;
+    let fingerprint =
+        candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "sourceProviderId".to_string(),
@@ -5820,6 +6878,13 @@ fn selected_candidate_provenance_inner(
             object.insert("submissionResult".to_string(), submission_result);
         }
     }
+    seed_route_attempt_ledger(
+        &mut value,
+        &fingerprint,
+        submission.route_attempt_ledger.as_ref(),
+    );
+    attach_route_attempt_ledger(&mut value, &fingerprint, &submission.route_attempts);
+    attach_route_attempt_ledger(&mut value, &fingerprint, route_attempts);
     Ok(value)
 }
 
@@ -6967,6 +8032,132 @@ mod tests {
     }
 
     #[test]
+    fn candidate_supports_route_accepts_usenet_nzb() {
+        let mut nzb = candidate("Example.Release.1080p-GROUP", Vec::new(), None, None);
+        nzb.source = "https://indexer.example/releases/example.nzb".to_string();
+        nzb.source_kind = "nzb".to_string();
+
+        assert!(candidate_supports_debrid(&nzb));
+        assert!(candidate_supports_usenet(&nzb));
+        assert!(!candidate_supports_torrent(&nzb));
+
+        let mut generic_url = nzb.clone();
+        generic_url.source =
+            "https://indexer.example/download/example.nzb?apikey=redacted".to_string();
+        generic_url.source_kind = "url".to_string();
+        assert!(candidate_supports_usenet(&generic_url));
+
+        let mut hoster_url = generic_url.clone();
+        hoster_url.source = "https://hoster.example/video.mkv".to_string();
+        hoster_url.source_kind = "http".to_string();
+        assert!(candidate_supports_debrid(&hoster_url));
+        assert!(!candidate_supports_usenet(&hoster_url));
+    }
+
+    #[test]
+    fn candidate_supported_routes_override_usenet_source_inference() {
+        let mut nzb = candidate(
+            "Example.Release.1080p-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            None,
+            None,
+        );
+        nzb.source = "https://indexer.example/releases/example.nzb".to_string();
+        nzb.source_kind = "nzb".to_string();
+
+        assert!(candidate_supports_debrid(&nzb));
+        assert!(!candidate_supports_usenet(&nzb));
+        assert_eq!(candidate_local_fallback_route(&nzb), None);
+    }
+
+    #[test]
+    fn candidate_local_fallback_route_uses_qb_for_magnet_and_nzbget_for_nzb() {
+        let magnet = candidate("Example.Show.S01E01", Vec::new(), None, Some(10));
+        assert_eq!(
+            candidate_local_fallback_route(&magnet),
+            Some(TORRENT_DEFAULT_LOGICAL_ID)
+        );
+
+        let mut nzb = candidate("Example.Show.S01E01", Vec::new(), None, None);
+        nzb.source = "https://indexer.example/releases/example-show-s01e01.nzb".to_string();
+        nzb.source_kind = "nzb".to_string();
+        assert_eq!(
+            candidate_local_fallback_route(&nzb),
+            Some(USENET_DEFAULT_LOGICAL_ID)
+        );
+    }
+
+    #[test]
+    fn select_candidate_route_allows_usenet_default_and_manual_selection() -> Result<()> {
+        let mut nzb = candidate(
+            "Example.Show.S01E01",
+            vec![USENET_DEFAULT_LOGICAL_ID],
+            None,
+            None,
+        );
+        nzb.source = "https://indexer.example/releases/example-show-s01e01.nzb".to_string();
+        nzb.source_kind = "nzb".to_string();
+
+        assert_eq!(
+            select_candidate_route(None, AcquisitionRoutePolicy::DebridFirst, &nzb)?,
+            USENET_DEFAULT_LOGICAL_ID
+        );
+
+        nzb.default_route = Some(USENET_DEFAULT_LOGICAL_ID.to_string());
+        assert_eq!(
+            select_candidate_route(None, AcquisitionRoutePolicy::Manual, &nzb)?,
+            USENET_DEFAULT_LOGICAL_ID
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rrm_movie_release_file_inputs_assign_fallback_file_ids() {
+        let single = candidate(
+            "The.Northman.2022.1080p.WEB-DL-GROUP.mkv",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(12),
+        );
+
+        let single_files = movie_release_file_inputs(&single);
+        assert_eq!(single_files.len(), 1);
+        assert_eq!(single_files[0].file_id.as_deref(), Some("0"));
+        assert_eq!(single_files[0].file_index, Some(0));
+
+        let mut pack = candidate(
+            "Movie.Pack.2024.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(12),
+        );
+        pack.files = vec![
+            AcquisitionCandidateFile {
+                file_id: None,
+                file_index: Some(0),
+                path: "Movie.Pack.2024/Movie.Pack.2024.mkv".to_string(),
+                size_bytes: Some(2_000_000_000),
+                selectable: Some(true),
+            },
+            AcquisitionCandidateFile {
+                file_id: None,
+                file_index: None,
+                path: "Movie.Pack.2024/sample.mkv".to_string(),
+                size_bytes: Some(10_000_000),
+                selectable: Some(true),
+            },
+        ];
+
+        let pack_files = movie_release_file_inputs(&pack);
+        assert_eq!(pack_files.len(), 2);
+        assert_eq!(pack_files[0].file_id.as_deref(), Some("0"));
+        assert_eq!(pack_files[0].file_index, Some(0));
+        assert_eq!(pack_files[1].file_id.as_deref(), Some("1"));
+        assert_eq!(pack_files[1].file_index, Some(1));
+    }
+
+    #[test]
     fn asr6_selected_candidate_provenance_records_route_provider_id() -> Result<()> {
         let source_provider_id = Uuid::new_v4();
         let route_provider_id = Uuid::new_v4();
@@ -6985,14 +8176,27 @@ mod tests {
             movie_coverage_plan: None,
             request_scope_evidence: None,
             dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
         };
+        let route_attempts = vec![RouteAttemptRecord::new(
+            TORRENT_DEFAULT_LOGICAL_ID,
+            Some(route_provider_id),
+            Some("qbittorrent"),
+            Some("qb-fallback".to_string()),
+            RouteAttemptStatus::Submitted,
+            None,
+            Some("Submitted through torrent fallback.".to_string()),
+        )];
 
         let provenance = selected_candidate_provenance_with_submission(
             &submission,
             TORRENT_DEFAULT_LOGICAL_ID,
             &Some("qb-fallback".to_string()),
             route_provider_id,
+            Some("qbittorrent"),
             "Submitted through torrent fallback.",
+            &route_attempts,
         )?;
 
         assert_eq!(
@@ -7015,6 +8219,13 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some(TORRENT_DEFAULT_LOGICAL_ID)
         );
+        let expected_attempt_key = format!("torrent:{route_provider_id}");
+        assert_eq!(
+            provenance
+                .pointer("/routeAttemptLedger/attempts/0/attemptKey")
+                .and_then(JsonValue::as_str),
+            Some(expected_attempt_key.as_str())
+        );
         Ok(())
     }
 
@@ -7028,6 +8239,17 @@ mod tests {
             failure_class: Some(failure_class.to_string()),
             last_error: None,
             selection_error: None,
+        }
+    }
+
+    fn debrid_attempt(provider_id: Uuid, implementation: &str) -> DebridRouteAttempt {
+        DebridRouteAttempt {
+            provider_id,
+            instance_id: Uuid::new_v4(),
+            implementation: implementation.to_string(),
+            display_name: implementation.to_string(),
+            health_state: ProviderHealthState::Healthy,
+            attempt_key: format!("debrid:{provider_id}:{implementation}"),
         }
     }
 
@@ -7260,6 +8482,14 @@ mod tests {
                 available: true,
                 selected_provider_id: Some(Uuid::new_v4()),
                 selected_extension_id: Some("test.torrent".to_string()),
+                blocker: None,
+            },
+            CandidateRouteOption {
+                logical_id: USENET_DEFAULT_LOGICAL_ID.to_string(),
+                label: "Usenet".to_string(),
+                available: true,
+                selected_provider_id: Some(Uuid::new_v4()),
+                selected_extension_id: Some("test.usenet".to_string()),
                 blocker: None,
             },
         ]
@@ -8232,6 +9462,66 @@ mod tests {
     }
 
     #[test]
+    fn anime_scoring_context_reads_find_media_scoped_aliases() {
+        let mut subscription = anime_subscription();
+        subscription.title = "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST".to_string();
+        subscription.normalized_title = "hagane no renkinjutsushi fullmetal alchemist".to_string();
+        subscription.request_mode = AcquisitionRequestMode::OneShot;
+        subscription.request_scope = AcquisitionRequestScope::Range;
+        subscription.scope = Some(json!({
+            "media": {
+                "kind": "anime",
+                "title": subscription.title.clone(),
+                "aliases": ["Fullmetal Alchemist Brotherhood"]
+            },
+            "selection": {
+                "type": "range",
+                "seasonNumber": 1,
+                "episodeStart": 1,
+                "episodeEnd": 10
+            }
+        }));
+        let mut target = anime_episode_target(&subscription, 1, 1);
+        target.title = "Fullmetal Alchemist".to_string();
+        target.metadata = Some(json!({
+            "source": "find_media_scoped_add",
+            "targetKey": "S01E01"
+        }));
+
+        let context = anime_candidate_scoring_context(&subscription, &target, &[target.clone()])
+            .expect("anime scoring context");
+        assert!(
+            context
+                .aliases
+                .iter()
+                .any(|alias| alias == "Fullmetal Alchemist Brotherhood")
+        );
+
+        let candidate = candidate(
+            "[Dubtitles] Fullmetal Alchemist Brotherhood - 01 (BD 1080p)",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        let best = select_best_candidate(
+            &[candidate],
+            AcquisitionRoutePolicy::DebridFirst,
+            Some(&context),
+        )
+        .expect("scoped anime alias should allow release match");
+        assert_eq!(
+            best.candidate.title,
+            "[Dubtitles] Fullmetal Alchemist Brotherhood - 01 (BD 1080p)"
+        );
+        assert!(
+            best.candidate
+                .score_badges
+                .iter()
+                .any(|badge| badge.label == "Anime match")
+        );
+    }
+
+    #[test]
     fn anime_pack_candidate_with_file_list_covers_many_targets_once() {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("automation-rr3f".to_string()),
@@ -8610,6 +9900,82 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn debrid_failure_torrent_fallback_recomputes_movie_coverage() -> Result<()> {
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: Some(2004),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let candidate = candidate(
+            "Primer.2004.1080p.WEB-DL-GROUP",
+            vec![TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(25),
+        );
+
+        let submission = build_debrid_failure_fallback_submission(
+            &subscription,
+            &target,
+            provider_id,
+            "test.movie.source".to_string(),
+            candidate,
+            None,
+            Vec::new(),
+        )
+        .expect("safe movie fallback submission");
+
+        assert!(submission.movie_coverage_plan.is_some());
+        assert!(submission.tv_coverage_plan.is_none());
+        assert!(submission.anime_coverage_plan.is_none());
+        assert!(
+            submission
+                .candidate
+                .score_badges
+                .iter()
+                .any(|badge| badge.label == "Movie match")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn debrid_failure_torrent_fallback_rejects_unresolved_movie_candidate() -> Result<()> {
+        let provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: Some(2004),
+            source_provider_id: Some(provider_id),
+            ..test_subscription()
+        };
+        let target = movie_target(&subscription);
+        let candidate = candidate(
+            "Completely.Different.2020.1080p.WEB-DL-GROUP",
+            vec![TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(25),
+        );
+
+        let submission = build_debrid_failure_fallback_submission(
+            &subscription,
+            &target,
+            provider_id,
+            "test.movie.source".to_string(),
+            candidate,
+            None,
+            Vec::new(),
+        );
+
+        assert!(submission.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rrm4_movie_wrong_year_is_rejected_without_manual_review() -> Result<()> {
         let state = setup_test_state().await?;
@@ -8777,6 +10143,8 @@ mod tests {
             movie_coverage_plan: release_plan.selection.movie_coverage_plan.clone(),
             request_scope_evidence: release_plan.request_scope_evidence.clone(),
             dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
         };
 
         persist_release_submission(
@@ -8787,7 +10155,9 @@ mod tests {
             DEBRID_DEFAULT_LOGICAL_ID,
             Some("rrm4-movie-download".to_string()),
             provider_id,
+            None,
             "Submitted through RR-M4 test.",
+            &[],
         )
         .await?;
 
@@ -9258,6 +10628,8 @@ mod tests {
             movie_coverage_plan: None,
             request_scope_evidence: None,
             dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
         };
 
         let provenance = selected_candidate_provenance(&submission)?;
@@ -9405,6 +10777,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dfu1_debrid_first_uses_usenet_when_debrid_capacity_is_full_for_nzb() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = test_subscription();
+        let mut candidate = candidate("Show.S01E01.1080p.WEB-DL-GROUP", Vec::new(), None, None);
+        candidate.source = "https://indexer.example/releases/show-s01e01.nzb".to_string();
+        candidate.source_kind = "nzb".to_string();
+        let mut governor = empty_queue_governor();
+        governor.caps.global_debrid = 0;
+
+        let route = select_candidate_route_for_plan(
+            &database.pool,
+            &subscription,
+            &candidate,
+            &available_route_options(),
+            &mut governor,
+        )
+        .await?
+        .expect("usenet route should be selected");
+
+        assert_eq!(route, USENET_DEFAULT_LOGICAL_ID);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rr6b_torrent_only_rejects_blocked_torrent_route() -> Result<()> {
         let database = setup_test_db().await?;
         let subscription = AcquisitionSubscription {
@@ -9441,7 +10837,7 @@ mod tests {
     }
 
     #[test]
-    fn asr3_debrid_failure_fallback_uses_only_qbittorrent_route() {
+    fn asr3_debrid_failure_fallback_uses_local_route_after_debrid_exhaustion() {
         let subscription = test_subscription();
         let candidate = candidate(
             "Show.S01E01.1080p.WEB-DL-GROUP",
@@ -9454,12 +10850,19 @@ mod tests {
             Some(0),
         );
         let status = failed_debrid_status("no_seeds");
+        let spent_attempt_keys = BTreeSet::new();
 
-        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[],
+            &spent_attempt_keys,
+        );
 
         assert_eq!(
             action,
-            DebridFailureFallbackAction::SubmitTorrent {
+            DebridFailureFallbackAction::SubmitLocal {
                 route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
             }
         );
@@ -9475,8 +10878,15 @@ mod tests {
             Some(0),
         );
         let status = failed_debrid_status("rate_limited");
+        let spent_attempt_keys = BTreeSet::new();
 
-        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[],
+            &spent_attempt_keys,
+        );
 
         match action {
             DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
@@ -9499,7 +10909,14 @@ mod tests {
 
         for failure_class in ["provider_auth_missing", "quota_exhausted"] {
             let status = failed_debrid_status(failure_class);
-            let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+            let spent_attempt_keys = BTreeSet::new();
+            let action = debrid_failure_fallback_action(
+                &subscription,
+                &candidate,
+                &status,
+                &[],
+                &spent_attempt_keys,
+            );
             match action {
                 DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
                     assert!(reason.contains("Check the active debrid account"));
@@ -9510,7 +10927,7 @@ mod tests {
     }
 
     #[test]
-    fn debrid_source_rejections_still_use_allowed_torrent_fallback() {
+    fn dfu4_debrid_source_rejection_uses_next_untried_debrid_before_local_fallback() {
         let subscription = test_subscription();
         let candidate = candidate(
             "Show.S01E01.1080p.WEB-DL-GROUP",
@@ -9519,15 +10936,198 @@ mod tests {
             Some(0),
         );
         let status = failed_debrid_status("content_blocked");
+        let torbox = debrid_attempt(Uuid::new_v4(), "torbox");
+        let real_debrid = debrid_attempt(Uuid::new_v4(), "real_debrid");
+        let spent_attempt_keys = BTreeSet::from([torbox.attempt_key.clone()]);
 
-        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[torbox, real_debrid.clone()],
+            &spent_attempt_keys,
+        );
 
         assert_eq!(
             action,
-            DebridFailureFallbackAction::SubmitTorrent {
-                route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
+            DebridFailureFallbackAction::SubmitDebrid {
+                attempt: real_debrid
             }
         );
+    }
+
+    #[test]
+    fn dfu4_real_debrid_rejection_can_fall_through_to_premiumize() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(0),
+        );
+        let status = failed_debrid_status("magnet_rejected");
+        let real_debrid = debrid_attempt(Uuid::new_v4(), "real_debrid");
+        let premiumize = debrid_attempt(Uuid::new_v4(), "premiumize");
+        let spent_attempt_keys = BTreeSet::from([real_debrid.attempt_key.clone()]);
+
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[real_debrid, premiumize.clone()],
+            &spent_attempt_keys,
+        );
+
+        assert_eq!(
+            action,
+            DebridFailureFallbackAction::SubmitDebrid {
+                attempt: premiumize
+            }
+        );
+    }
+
+    #[test]
+    fn dfu4_debrid_exhaustion_uses_usenet_local_fallback_for_nzb() {
+        let subscription = test_subscription();
+        let mut candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID],
+            Some(false),
+            None,
+        );
+        candidate.source = "https://indexer.example/releases/show-s01e01.nzb".to_string();
+        candidate.source_kind = "nzb".to_string();
+        let status = failed_debrid_status("provider_stalled");
+        let spent_attempt_keys = BTreeSet::new();
+
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[],
+            &spent_attempt_keys,
+        );
+
+        assert_eq!(
+            action,
+            DebridFailureFallbackAction::SubmitLocal {
+                route_logical_id: USENET_DEFAULT_LOGICAL_ID
+            }
+        );
+    }
+
+    #[test]
+    fn dfu5_submission_fallback_plan_uses_next_debrid_before_local() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(10),
+        );
+        let torbox = debrid_attempt(Uuid::new_v4(), "torbox");
+        let real_debrid = debrid_attempt(Uuid::new_v4(), "real_debrid");
+        let spent_attempt_keys = BTreeSet::from([torbox.attempt_key.clone()]);
+
+        let routes = submission_time_fallback_route_plan(
+            &subscription,
+            &candidate,
+            &[torbox, real_debrid.clone()],
+            &spent_attempt_keys,
+        );
+
+        assert_eq!(
+            routes,
+            vec![
+                SubmissionFallbackRoute::Debrid {
+                    attempt: real_debrid
+                },
+                SubmissionFallbackRoute::Local {
+                    route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn dfu5_submission_fallback_plan_uses_qb_after_debrid_exhaustion_for_magnet() {
+        let subscription = test_subscription();
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(10),
+        );
+        let torbox = debrid_attempt(Uuid::new_v4(), "torbox");
+        let spent_attempt_keys = BTreeSet::from([torbox.attempt_key.clone()]);
+
+        let routes = submission_time_fallback_route_plan(
+            &subscription,
+            &candidate,
+            &[torbox],
+            &spent_attempt_keys,
+        );
+
+        assert_eq!(
+            routes,
+            vec![SubmissionFallbackRoute::Local {
+                route_logical_id: TORRENT_DEFAULT_LOGICAL_ID
+            }]
+        );
+    }
+
+    #[test]
+    fn dfu5_submission_fallback_plan_uses_nzbget_after_debrid_exhaustion_for_nzb() {
+        let subscription = test_subscription();
+        let mut candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID],
+            Some(false),
+            None,
+        );
+        candidate.source = "https://indexer.example/releases/show-s01e01.nzb".to_string();
+        candidate.source_kind = "nzb".to_string();
+        let torbox = debrid_attempt(Uuid::new_v4(), "torbox");
+        let spent_attempt_keys = BTreeSet::from([torbox.attempt_key.clone()]);
+
+        let routes = submission_time_fallback_route_plan(
+            &subscription,
+            &candidate,
+            &[torbox],
+            &spent_attempt_keys,
+        );
+
+        assert_eq!(
+            routes,
+            vec![SubmissionFallbackRoute::Local {
+                route_logical_id: USENET_DEFAULT_LOGICAL_ID
+            }]
+        );
+    }
+
+    #[test]
+    fn dfu5_submission_fallback_plan_does_not_use_local_for_debrid_only() {
+        let subscription = AcquisitionSubscription {
+            route_policy: AcquisitionRoutePolicy::DebridOnly,
+            ..test_subscription()
+        };
+        let candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(10),
+        );
+        let torbox = debrid_attempt(Uuid::new_v4(), "torbox");
+        let spent_attempt_keys = BTreeSet::from([torbox.attempt_key.clone()]);
+
+        let routes = submission_time_fallback_route_plan(
+            &subscription,
+            &candidate,
+            &[torbox],
+            &spent_attempt_keys,
+        );
+
+        assert!(routes.is_empty());
     }
 
     #[test]
@@ -9545,12 +11145,19 @@ mod tests {
             )
         };
         let status = failed_debrid_status("provider_stalled");
+        let spent_attempt_keys = BTreeSet::new();
 
-        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[],
+            &spent_attempt_keys,
+        );
 
         match action {
             DebridFailureFallbackAction::RetryNextCandidate { reason } => {
-                assert!(reason.contains("no qBittorrent fallback"));
+                assert!(reason.contains("no untried fallback route remains"));
                 assert!(reason.contains("provider transfer is stalled"));
             }
             other => panic!("expected source retry, got {other:?}"),
@@ -9570,15 +11177,22 @@ mod tests {
             Some(0),
         );
         let status = failed_debrid_status("no_seeds");
+        let spent_attempt_keys = BTreeSet::new();
 
-        let action = debrid_failure_fallback_action(&subscription, &candidate, &status);
+        let action = debrid_failure_fallback_action(
+            &subscription,
+            &candidate,
+            &status,
+            &[],
+            &spent_attempt_keys,
+        );
 
         match action {
-            DebridFailureFallbackAction::NoAutomaticFallback { reason } => {
-                assert!(reason.contains("debrid_only"));
+            DebridFailureFallbackAction::RetryNextCandidate { reason } => {
+                assert!(reason.contains("no untried fallback route remains"));
                 assert!(reason.contains("has no seeds"));
             }
-            other => panic!("expected blocked fallback, got {other:?}"),
+            other => panic!("expected next-candidate fallback, got {other:?}"),
         }
     }
 

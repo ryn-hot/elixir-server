@@ -1265,6 +1265,7 @@ pub async fn find_media_scoped_add(
                 scoped_add_new_acquisition_target(
                     payload.media_type,
                     &preview.media.title,
+                    &preview.media.aliases,
                     target,
                     catalog
                         .episode_ids_by_target_key
@@ -2099,6 +2100,7 @@ fn scoped_add_media_metadata(media: &ScopedAddMediaIdentity) -> Value {
         "title": media.title,
         "year": media.year,
         "externalIds": media.external_ids,
+        "aliases": media.aliases,
     }))
 }
 
@@ -2201,6 +2203,7 @@ fn scoped_add_intent_target(
 fn scoped_add_new_acquisition_target(
     media_type: MediaType,
     media_title: &str,
+    media_aliases: &[String],
     target: &FindMediaScopedPreviewTarget,
     library_episode_id: Option<Uuid>,
     media_item_id: Uuid,
@@ -2230,6 +2233,7 @@ fn scoped_add_new_acquisition_target(
             "mediaItemId": media_item_id.to_string(),
             "libraryEpisodeId": library_episode_id.map(|id| id.to_string()),
             "targetKey": target.target_key,
+            "aliases": media_aliases,
             "title": target.title,
             "seasonNumber": target.season_number,
             "episodeNumber": target.episode_number,
@@ -2703,6 +2707,7 @@ async fn build_find_media_anime_scope_preview(
     });
 
     media.external_ids = Some(graph.external_ids.clone());
+    media.aliases = graph.aliases.clone();
     let seasons = anime_scope_preview_seasons_from_graph(&graph);
 
     if seasons.is_empty() {
@@ -3167,6 +3172,7 @@ async fn sync_source_acquisition_imports(
     provider_map: &HashMap<Uuid, ProviderContext>,
     downloader_progress: &AcquisitionDownloaderProgressIndex,
 ) -> AnyResult<()> {
+    let release_job_download_ids = acquisition_release_job_download_ids(&state.db_pool).await?;
     let subscriptions = list_subscriptions(
         &state.db_pool,
         AcquisitionSubscriptionFilter { active: Some(true) },
@@ -3200,6 +3206,9 @@ async fn sync_source_acquisition_imports(
             let Some(download_id) = target.download_id.as_deref() else {
                 continue;
             };
+            if release_job_download_ids.contains(download_id) {
+                continue;
+            }
             let Some(progress) = downloader_progress.get(download_id) else {
                 continue;
             };
@@ -3311,6 +3320,19 @@ async fn sync_source_acquisition_imports(
     }
 
     Ok(())
+}
+
+async fn acquisition_release_job_download_ids(pool: &sqlx::AnyPool) -> AnyResult<HashSet<String>> {
+    let rows = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT DISTINCT download_id
+         FROM acquisition_release_jobs
+         WHERE download_id IS NOT NULL
+           AND TRIM(download_id) <> ''",
+    )
+    .fetch_all(pool)
+    .await
+    .context("loading acquisition release job download ids")?;
+    Ok(rows.into_iter().collect())
 }
 
 async fn upsert_source_managed_ingest_intent(
@@ -4088,6 +4110,8 @@ fn build_source_acquisition_child(
     let no_results = source_target_is_no_results(target);
     let status = if no_results {
         Some("no_results".to_string())
+    } else if target.state == AcquisitionTargetState::Imported {
+        Some(target.state.as_str().to_string())
     } else {
         progress
             .and_then(|item| item.status.clone())
@@ -4967,6 +4991,33 @@ fn source_target_detail(
             .clone()
             .or_else(|| release_runtime.and_then(SourceTargetReleaseRuntime::state_reason));
         return Some(source_finding_another_release_detail(raw_detail.as_deref()));
+    }
+    if target.state == AcquisitionTargetState::Imported {
+        return Some(
+            target
+                .state_reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "Imported into the Elixir library.".to_string()),
+        );
+    }
+    if matches!(
+        phase,
+        AcquisitionPhase::Staged
+            | AcquisitionPhase::Submitted
+            | AcquisitionPhase::QueuedInDownloader
+            | AcquisitionPhase::Downloading
+            | AcquisitionPhase::Materializing
+            | AcquisitionPhase::PostProcessing
+            | AcquisitionPhase::Importing
+    ) {
+        if let Some(reason) = release_runtime
+            .and_then(SourceTargetReleaseRuntime::state_reason)
+            .or_else(|| target.state_reason.clone())
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            return Some(reason);
+        }
     }
     if let Some(title) = selected_title.filter(|value| !value.trim().is_empty()) {
         return Some(format!("Selected release: {}.", title.trim()));
@@ -10530,6 +10581,7 @@ fn value_as_f64(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::DatabaseConfig, db::Database};
     use std::fs;
 
     #[test]
@@ -10642,6 +10694,7 @@ mod tests {
                 title: "Long Running Anime".to_string(),
                 year: Some(1999),
                 external_ids: None,
+                aliases: Vec::new(),
             },
             anime_scope_preview_seasons_from_graph_at(
                 &graph,
@@ -10667,6 +10720,48 @@ mod tests {
         assert_eq!(
             response.seasons[0].episodes[1].absolute_episode_number,
             Some(23)
+        );
+    }
+
+    #[test]
+    fn scoped_add_target_metadata_carries_media_aliases() {
+        let target = FindMediaScopedPreviewTarget {
+            target_key: "S01E01".to_string(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            absolute_episode_number: Some(1),
+            title: Some("Fullmetal Alchemist".to_string()),
+            air_date: Some("2009-04-05".to_string()),
+            thumbnail_url: None,
+        };
+        let aliases = vec![
+            "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST".to_string(),
+            "Fullmetal Alchemist Brotherhood".to_string(),
+        ];
+
+        let acquisition_target = scoped_add_new_acquisition_target(
+            MediaType::Anime,
+            "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST",
+            &aliases,
+            &target,
+            Some(Uuid::new_v4()),
+            Uuid::new_v4(),
+            Utc::now(),
+        );
+
+        let metadata = acquisition_target.metadata.expect("metadata");
+        assert_eq!(
+            metadata
+                .get("aliases")
+                .and_then(Value::as_array)
+                .expect("aliases")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST",
+                "Fullmetal Alchemist Brotherhood"
+            ]
         );
     }
 
@@ -10730,6 +10825,70 @@ mod tests {
             panic!("expected pack file to be selected");
         };
         assert_eq!(file.path, expected_path.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn release_job_download_id_guard_collects_rr_managed_downloads() -> AnyResult<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+
+        let release_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_releases (
+                release_id,
+                source_extension_id,
+                media_type,
+                title,
+                release_title,
+                source,
+                source_kind,
+                fingerprint,
+                release_kind,
+                resolver_kind,
+                resolver_version,
+                confidence,
+                state
+            ) VALUES (?, 'torrentio', 'anime', 'Fullmetal Alchemist Brotherhood',
+                '[Erai-raws] Fullmetal Alchemist Brotherhood Batch', 'torrentio',
+                'magnet', 'release-fingerprint', 'season_pack', 'anime_shoko_style',
+                'test', 'medium', 'submitted')",
+        )
+        .bind(release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        for (download_id, job_suffix) in [
+            (Some("rr-managed-download"), "managed"),
+            (Some("   "), "blank"),
+            (None, "missing"),
+        ] {
+            sqlx::query::<sqlx::Any>(
+                "INSERT INTO acquisition_release_jobs (
+                    release_job_id,
+                    release_id,
+                    route_logical_id,
+                    download_id,
+                    state,
+                    active
+                ) VALUES (?, ?, 'acquisition.debrid.default', ?, 'submitted', 1)",
+            )
+            .bind(format!("job-{job_suffix}"))
+            .bind(release_id.to_string())
+            .bind(download_id)
+            .execute(&database.pool)
+            .await?;
+        }
+
+        let guarded = acquisition_release_job_download_ids(&database.pool).await?;
+
+        assert!(guarded.contains("rr-managed-download"));
+        assert_eq!(guarded.len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -11097,6 +11256,170 @@ mod tests {
         assert_eq!(item.progress_percent, Some(0.0));
         assert_eq!(item.children[0].phase, "materializing");
         assert_eq!(item.children[0].progress_percent, Some(0.0));
+    }
+
+    #[test]
+    fn staged_source_acquisition_child_surfaces_route_state_reason() {
+        let source_provider_id = Uuid::new_v4();
+        let route_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Movie)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "The.Northman.2022.1080p.WEBRip.x265-RARBG.mp4",
+                "submissionResult": {
+                    "routeLogicalId": TORRENT_DEFAULT_LOGICAL_ID,
+                    "routeProviderId": route_provider_id.to_string(),
+                    "downloadId": "northman-qb"
+                }
+            })),
+            download_id: Some("northman-qb".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                None,
+            )
+        };
+        let runtime = SourceTargetReleaseRuntime {
+            release_id: Uuid::new_v4(),
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: Some(route_provider_id),
+            release_title: "The.Northman.2022.1080p.WEBRip.x265-RARBG.mp4".to_string(),
+            release_state: AcquisitionReleaseState::Staging,
+            release_state_reason: Some(
+                "qBittorrent torrent staged for deterministic file selection.".to_string(),
+            ),
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("northman-qb".to_string()),
+            job_state: Some(ReleaseJobState::Staging),
+            job_state_reason: Some(
+                "qBittorrent metadata pending for staged file selection.".to_string(),
+            ),
+            import_state: None,
+            import_state_reason: None,
+            import_mismatch_class: None,
+            updated_at: Utc::now(),
+        };
+        let provider_map = HashMap::from([
+            (
+                source_provider_id,
+                test_provider_context(source_provider_id, "Torrentio", "torrentio"),
+            ),
+            (
+                route_provider_id,
+                test_provider_context(route_provider_id, "qBittorrent", "qbittorrent"),
+            ),
+        ]);
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        let child = item.children.first().expect("child");
+        assert_eq!(child.phase, "staged");
+        assert_eq!(
+            child.detail.as_deref(),
+            Some("qBittorrent metadata pending for staged file selection.")
+        );
+    }
+
+    #[test]
+    fn imported_source_acquisition_child_ignores_duplicate_blocked_import_run() {
+        let source_provider_id = Uuid::new_v4();
+        let route_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            ..test_source_subscription(MediaType::Movie)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "The.Northman.2022.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4",
+                "submissionResult": {
+                    "routeLogicalId": DEBRID_DEFAULT_LOGICAL_ID,
+                    "routeProviderId": route_provider_id.to_string(),
+                    "downloadId": "northman-debrid"
+                }
+            })),
+            download_id: Some("northman-debrid".to_string()),
+            import_event_id: Some(Uuid::new_v4()),
+            state: AcquisitionTargetState::Imported,
+            state_reason: Some("Imported into the Elixir library.".to_string()),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                None,
+            )
+        };
+        let runtime = SourceTargetReleaseRuntime {
+            release_id: Uuid::new_v4(),
+            source_provider_id: Some(source_provider_id),
+            route_provider_id: Some(route_provider_id),
+            release_title: "The.Northman.2022.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4".to_string(),
+            release_state: AcquisitionReleaseState::Completed,
+            release_state_reason: Some("Debrid materializer completed selected files.".to_string()),
+            coverage_state: Some(ReleaseCoverageState::Submitted),
+            coverage_reason: None,
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            download_id: Some("northman-debrid".to_string()),
+            job_state: Some(ReleaseJobState::Completed),
+            job_state_reason: Some("Debrid materializer completed selected files.".to_string()),
+            import_state: Some(AcquisitionImportRunState::Blocked),
+            import_state_reason: Some("target is already imported by another release".to_string()),
+            import_mismatch_class: Some("target_already_imported".to_string()),
+            updated_at: Utc::now(),
+        };
+        let provider_map = HashMap::from([
+            (
+                source_provider_id,
+                test_provider_context(source_provider_id, "Torrentio", "torrentio"),
+            ),
+            (
+                route_provider_id,
+                test_provider_context(route_provider_id, "TorBox", "torbox"),
+            ),
+        ]);
+        let release_runtime = HashMap::from([(target.target_id, runtime)]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &release_runtime,
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        let child = item.children.first().expect("child");
+        assert_eq!(item.phase, "completed");
+        assert_eq!(child.phase, "completed");
+        assert_eq!(child.status.as_deref(), Some("imported"));
+        assert_eq!(child.headline, "Imported.");
+        assert_eq!(
+            child.detail.as_deref(),
+            Some("Imported into the Elixir library.")
+        );
+        assert!(child.blocker.is_none());
     }
 
     #[test]
@@ -11799,6 +12122,7 @@ mod tests {
                 title: "Example Series".to_string(),
                 year: Some(2026),
                 external_ids: None,
+                aliases: Vec::new(),
             },
             selection,
         )

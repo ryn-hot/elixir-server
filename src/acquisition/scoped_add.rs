@@ -106,6 +106,8 @@ pub struct ScopedAddMediaIdentity {
     pub year: Option<i32>,
     #[serde(default)]
     pub external_ids: Option<ExternalIds>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 impl ScopedAddMediaIdentity {
@@ -119,8 +121,22 @@ impl ScopedAddMediaIdentity {
             title: title.to_string(),
             year: self.year,
             external_ids: self.external_ids.clone(),
+            aliases: normalized_scoped_aliases(&self.aliases),
         })
     }
+}
+
+fn normalized_scoped_aliases(values: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut aliases = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_ascii_lowercase()) {
+            continue;
+        }
+        aliases.push(trimmed.to_string());
+    }
+    aliases
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -505,6 +521,7 @@ mod tests {
                 tvdb_series: Some("456".to_string()),
                 ..ExternalIds::default()
             }),
+            aliases: Vec::new(),
         }
     }
 
@@ -629,6 +646,7 @@ mod tests {
                 title: " Scoped TV ".to_string(),
                 year: None,
                 external_ids: None,
+                aliases: Vec::new(),
             },
             scope: ScopedAddSelection {
                 selection_type: ScopedAddSelectionType::Episode,
