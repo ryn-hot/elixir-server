@@ -4,6 +4,11 @@ use std::{
     hash::{Hash, Hasher},
     time::Duration,
 };
+#[cfg(test)]
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, OnceLock},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
@@ -166,12 +171,157 @@ struct RouteAttemptDescriptor {
     provider_implementation: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestSubmissionHooks {
+    broker_outcomes: VecDeque<TestBrokerSubmitOutcome>,
+    debrid_outcomes: VecDeque<TestDebridSubmitOutcome>,
+}
+
+#[cfg(test)]
+enum TestBrokerSubmitOutcome {
+    Failure {
+        route_logical_id: &'static str,
+        message: &'static str,
+    },
+    Success {
+        route_logical_id: &'static str,
+        provider_id: Uuid,
+        provider_implementation: Option<&'static str>,
+        download_id: Option<&'static str>,
+    },
+}
+
+#[cfg(test)]
+enum TestDebridSubmitOutcome {
+    Failure {
+        implementation: &'static str,
+        message: &'static str,
+    },
+}
+
+#[cfg(test)]
+static TEST_SUBMISSION_HOOKS: OnceLock<Mutex<HashMap<Uuid, TestSubmissionHooks>>> = OnceLock::new();
+
 impl CandidateSubmission {
     fn has_release_coverage_plan(&self) -> bool {
         self.anime_coverage_plan.is_some()
             || self.tv_coverage_plan.is_some()
             || self.movie_coverage_plan.is_some()
     }
+}
+
+#[cfg(test)]
+fn install_test_submission_hooks(
+    subscription_id: Uuid,
+    broker_outcomes: Vec<TestBrokerSubmitOutcome>,
+    debrid_outcomes: Vec<TestDebridSubmitOutcome>,
+) {
+    let hooks = TEST_SUBMISSION_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+    hooks
+        .lock()
+        .expect("test submission hooks poisoned")
+        .insert(
+            subscription_id,
+            TestSubmissionHooks {
+                broker_outcomes: broker_outcomes.into(),
+                debrid_outcomes: debrid_outcomes.into(),
+            },
+        );
+}
+
+#[cfg(test)]
+fn clear_test_submission_hooks(subscription_id: Uuid) {
+    if let Some(hooks) = TEST_SUBMISSION_HOOKS.get() {
+        hooks
+            .lock()
+            .expect("test submission hooks poisoned")
+            .remove(&subscription_id);
+    }
+}
+
+#[cfg(test)]
+fn take_test_broker_submit_outcome(
+    subscription_id: Uuid,
+    route_logical_id: &str,
+) -> Option<Result<DownloadBrokerSubmitResponse>> {
+    let hooks = TEST_SUBMISSION_HOOKS.get()?;
+    let mut hooks = hooks.lock().expect("test submission hooks poisoned");
+    let state = hooks.get_mut(&subscription_id)?;
+    let outcome = state.broker_outcomes.pop_front();
+    Some(match outcome {
+        Some(TestBrokerSubmitOutcome::Failure {
+            route_logical_id: expected_route,
+            message,
+        }) => {
+            if route_logical_id != expected_route {
+                Err(anyhow!(
+                    "test broker submit expected route '{}' but got '{}'",
+                    expected_route,
+                    route_logical_id
+                ))
+            } else {
+                Err(anyhow!(message))
+            }
+        }
+        Some(TestBrokerSubmitOutcome::Success {
+            route_logical_id: expected_route,
+            provider_id,
+            provider_implementation,
+            download_id,
+        }) => {
+            if route_logical_id != expected_route {
+                Err(anyhow!(
+                    "test broker submit expected route '{}' but got '{}'",
+                    expected_route,
+                    route_logical_id
+                ))
+            } else {
+                Ok(DownloadBrokerSubmitResponse {
+                    logical_id: route_logical_id.to_string(),
+                    provider_id,
+                    provider_implementation: provider_implementation.map(ToString::to_string),
+                    accepted: true,
+                    download_id: download_id.map(ToString::to_string),
+                })
+            }
+        }
+        None => Err(anyhow!(
+            "test broker submit had no scripted outcome for route '{}'",
+            route_logical_id
+        )),
+    })
+}
+
+#[cfg(test)]
+fn take_test_debrid_submit_outcome(
+    subscription_id: Uuid,
+    attempt: &DebridRouteAttempt,
+) -> Option<Result<Uuid>> {
+    let hooks = TEST_SUBMISSION_HOOKS.get()?;
+    let mut hooks = hooks.lock().expect("test submission hooks poisoned");
+    let state = hooks.get_mut(&subscription_id)?;
+    let outcome = state.debrid_outcomes.pop_front();
+    Some(match outcome {
+        Some(TestDebridSubmitOutcome::Failure {
+            implementation: expected_implementation,
+            message,
+        }) => {
+            if attempt.implementation != expected_implementation {
+                Err(anyhow!(
+                    "test debrid submit expected implementation '{}' but got '{}'",
+                    expected_implementation,
+                    attempt.implementation
+                ))
+            } else {
+                Err(anyhow!(message))
+            }
+        }
+        None => Err(anyhow!(
+            "test debrid submit had no scripted outcome for implementation '{}'",
+            attempt.implementation
+        )),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -3951,12 +4101,11 @@ async fn submit_direct_debrid_route_attempt(
     )?;
     let display_name = download_display_name(target, &submission.candidate);
     let reason = "Submitted through Debrid fallback provider.";
-    match submit_debrid(
+    match submit_debrid_for_route_fallback(
         state,
         &store,
-        attempt.provider_id,
-        attempt.instance_id,
-        Some(attempt.implementation.as_str()),
+        subscription.subscription_id,
+        attempt,
         &submission.candidate.source,
         DebridSubmitOptions {
             owner_id: submission.source_extension_id.as_str(),
@@ -4021,6 +4170,34 @@ async fn submit_direct_debrid_route_attempt(
             })
         }
     }
+}
+
+async fn submit_debrid_for_route_fallback(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    subscription_id: Uuid,
+    attempt: &DebridRouteAttempt,
+    source: &str,
+    options: DebridSubmitOptions<'_>,
+) -> Result<Uuid> {
+    #[cfg(not(test))]
+    let _ = subscription_id;
+
+    #[cfg(test)]
+    if let Some(outcome) = take_test_debrid_submit_outcome(subscription_id, attempt) {
+        return outcome;
+    }
+
+    submit_debrid(
+        state,
+        store,
+        attempt.provider_id,
+        attempt.instance_id,
+        Some(attempt.implementation.as_str()),
+        source,
+        options,
+    )
+    .await
 }
 
 async fn persist_successful_submission_route(
@@ -4482,6 +4659,13 @@ async fn submit_candidate_to_route(
     submission: &CandidateSubmission,
     route_logical_id: &str,
 ) -> Result<DownloadBrokerSubmitResponse> {
+    #[cfg(test)]
+    if let Some(outcome) =
+        take_test_broker_submit_outcome(subscription.subscription_id, route_logical_id)
+    {
+        return outcome;
+    }
+
     let store = ExtensionStore::new(&state.db_pool);
     let request = DownloadBrokerSubmitRequest {
         source: submission.candidate.source.clone(),
@@ -7200,6 +7384,7 @@ mod tests {
         audit::{
             EVENT_ACQUISITION_SEARCH_SCHEDULED, count_acquisition_audit_events_for_subscription,
         },
+        release_resolution::store::list_release_jobs,
         release_resolution::store::{ReleaseListFilter, list_releases},
         subscriptions::{
             AcquisitionCompletionPolicy, AcquisitionMetadataPolicy, AcquisitionRequestMode,
@@ -7216,7 +7401,7 @@ mod tests {
         config::Settings,
         extensions::{
             ExtensionManager,
-            store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider},
+            store::{ExtensionStore, NewExtension, NewExtensionInstance, NewProvider, NewSecret},
         },
         metadata::MetadataService,
         orchestrator::planner::stable_provider_id,
@@ -7226,7 +7411,7 @@ mod tests {
         config::DatabaseConfig,
         db::{
             Database,
-            models::{ExtensionKind, ExtensionTrustLevel, SlotCardinality},
+            models::{ExtensionKind, ExtensionTrustLevel, SecretScope, SlotCardinality},
         },
         library::LinkerService,
     };
@@ -7647,7 +7832,7 @@ mod tests {
         capability: &str,
         implementation: &str,
         provider_kind: &str,
-    ) -> Result<()> {
+    ) -> Result<Uuid> {
         let instance_id = Uuid::new_v4();
         store
             .upsert_extension(&NewExtension {
@@ -7677,9 +7862,10 @@ mod tests {
                 enabled: true,
             })
             .await?;
+        let provider_id = Uuid::new_v4();
         store
             .upsert_provider(&NewProvider {
-                provider_id: Uuid::new_v4(),
+                provider_id,
                 instance_id,
                 capability: capability.to_string(),
                 slot_id: "default".to_string(),
@@ -7700,7 +7886,151 @@ mod tests {
                 health_state: ProviderHealthState::Healthy,
             })
             .await?;
-        Ok(())
+        Ok(provider_id)
+    }
+
+    async fn seed_dfu_smoke_candidate_provider(state: &AppState) -> Result<(Uuid, String)> {
+        let store = ExtensionStore::new(&state.db_pool);
+        let extension_id = "elixir.sources.dfu-smoke.fixture";
+        let instance_id = Uuid::new_v4();
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "DFU Smoke Fixture Source".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": "DFU Smoke Fixture Source",
+                    "provides": [{
+                        "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+                        "slot": "default",
+                        "cardinality": "one",
+                        "implementation": "dfu_smoke_fixture",
+                        "scope": {
+                            "media_types": ["series", "tv"],
+                            "actions": ["search"]
+                        }
+                    }],
+                    "requires": {
+                        "downloads": [
+                            { "kind": "debrid", "mode": "broker" },
+                            { "kind": "torrent", "mode": "broker" },
+                            { "kind": "usenet", "mode": "broker" }
+                        ]
+                    },
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/dfu-smoke-fixture:1"
+                    }
+                }),
+                package_hash: Some("dfu-smoke".to_string()),
+                enabled: true,
+            })
+            .await?;
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({ "resultLimit": 25 })),
+                enabled: true,
+            })
+            .await?;
+        let provider_id = stable_provider_id(
+            instance_id,
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "default",
+        );
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("dfu_smoke_fixture".to_string()),
+                scope_json: Some(json!({
+                    "media_types": ["series", "tv"],
+                    "actions": ["search"]
+                })),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "dfu-smoke-provider.internal",
+                    "port": 49157,
+                    "base_path": "/candidate-provider",
+                    "network": null
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok((provider_id, extension_id.to_string()))
+    }
+
+    async fn seed_dfu_smoke_download_routes(state: &AppState) -> Result<(Uuid, Uuid)> {
+        let store = ExtensionStore::new(&state.db_pool);
+        let torrent_provider_id = seed_te10b_broker_provider(
+            &store,
+            "elixir.modules.qbittorrent.dfu-smoke",
+            "downloader.torrent",
+            "qbittorrent",
+            "managed",
+        )
+        .await?;
+        let usenet_provider_id = seed_te10b_broker_provider(
+            &store,
+            "elixir.modules.nzbget.dfu-smoke",
+            "downloader.usenet",
+            "nzbget",
+            "managed",
+        )
+        .await?;
+        seed_dfu_smoke_debrid_route(state).await?;
+        Ok((torrent_provider_id, usenet_provider_id))
+    }
+
+    async fn seed_dfu_smoke_debrid_route(state: &AppState) -> Result<Uuid> {
+        crate::debrid::ensure_debrid_builtin(state).await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let instance = store
+            .list_instances(Some(crate::debrid::DEBRID_EXTENSION_ID))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("debrid test instance was not created"))?;
+        store
+            .update_instance_config(
+                instance.instance_id,
+                Some(&json!({
+                    "activeService": "real_debrid",
+                    "serviceOrder": ["real_debrid", "torbox", "all_debrid", "premiumize"],
+                    "maxConcurrentDownloads": 1
+                })),
+            )
+            .await?;
+        for service in crate::debrid::DebridServiceKind::ALL {
+            store
+                .upsert_secret(&NewSecret {
+                    secret_id: Uuid::new_v4(),
+                    scope: SecretScope::Instance,
+                    scope_id: Some(instance.instance_id),
+                    key: service.secret_key().to_string(),
+                    value_encrypted: format!("dfu-smoke-token-{}", service.implementation_id()),
+                    rotatable: true,
+                })
+                .await?;
+        }
+        crate::debrid::reconcile_debrid_provider_for_instance(
+            &state.db_pool,
+            &store,
+            instance.instance_id,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -11128,6 +11458,264 @@ mod tests {
         );
 
         assert!(routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dfu6_smoke_debrid_chain_falls_back_to_qbittorrent_for_magnet() -> Result<()> {
+        let mut candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(false),
+            Some(50),
+        );
+        candidate.info_hash = Some("dfu6smokemagnet".to_string());
+
+        run_dfu6_submission_fallback_smoke(
+            candidate,
+            TORRENT_DEFAULT_LOGICAL_ID,
+            Some("qbittorrent"),
+            "dfu6-qb-download",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn dfu6_smoke_debrid_chain_falls_back_to_nzbget_for_nzb() -> Result<()> {
+        let mut candidate = candidate(
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID],
+            Some(false),
+            None,
+        );
+        candidate.source = "https://indexer.example/releases/show-s01e01.nzb".to_string();
+        candidate.source_kind = "nzb".to_string();
+
+        run_dfu6_submission_fallback_smoke(
+            candidate,
+            USENET_DEFAULT_LOGICAL_ID,
+            Some("nzbget"),
+            "dfu6-nzbget-download",
+        )
+        .await
+    }
+
+    async fn run_dfu6_submission_fallback_smoke(
+        candidate: AcquisitionCandidate,
+        expected_local_route: &'static str,
+        expected_local_implementation: Option<&'static str>,
+        expected_download_id: &'static str,
+    ) -> Result<()> {
+        let state = setup_test_state().await?;
+        let (torrent_provider_id, usenet_provider_id) =
+            seed_dfu_smoke_download_routes(&state).await?;
+        let (source_provider_id, source_extension_id) =
+            seed_dfu_smoke_candidate_provider(&state).await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Show".to_string(),
+                year: Some(2026),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(source_provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_series_episode_target("Show", 1, 1)],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let response = candidate_search_response_for_test(
+            source_provider_id,
+            &source_extension_id,
+            vec!["series"],
+            vec![candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+        assert_eq!(batch.plans.len(), 1);
+        let release_plan = batch.plans[0].clone();
+        let submission = CandidateSubmission {
+            provider_id: release_plan.provider_id,
+            source_extension_id: release_plan.source_extension_id.clone(),
+            candidate: release_plan.selection.candidate.clone(),
+            provider_warnings: release_plan.provider_warnings.clone(),
+            anime_coverage_plan: release_plan.selection.anime_coverage_plan.clone(),
+            tv_coverage_plan: release_plan.selection.tv_coverage_plan.clone(),
+            movie_coverage_plan: release_plan.selection.movie_coverage_plan.clone(),
+            request_scope_evidence: release_plan.request_scope_evidence.clone(),
+            dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
+        };
+        let local_provider_id = match expected_local_route {
+            TORRENT_DEFAULT_LOGICAL_ID => torrent_provider_id,
+            USENET_DEFAULT_LOGICAL_ID => usenet_provider_id,
+            other => bail!("unexpected local route '{other}'"),
+        };
+        install_test_submission_hooks(
+            subscription.subscription_id,
+            vec![
+                TestBrokerSubmitOutcome::Failure {
+                    route_logical_id: DEBRID_DEFAULT_LOGICAL_ID,
+                    message: "primary Real-Debrid submit failed",
+                },
+                TestBrokerSubmitOutcome::Success {
+                    route_logical_id: expected_local_route,
+                    provider_id: local_provider_id,
+                    provider_implementation: expected_local_implementation,
+                    download_id: Some(expected_download_id),
+                },
+            ],
+            vec![
+                TestDebridSubmitOutcome::Failure {
+                    implementation: "torbox",
+                    message: "TorBox fallback submit failed",
+                },
+                TestDebridSubmitOutcome::Failure {
+                    implementation: "all_debrid",
+                    message: "AllDebrid fallback submit failed",
+                },
+                TestDebridSubmitOutcome::Failure {
+                    implementation: "premiumize",
+                    message: "Premiumize fallback submit failed",
+                },
+            ],
+        );
+
+        let outcome = submit_selected_candidate(
+            &state,
+            &subscription,
+            &target,
+            submission,
+            None,
+            Some(&mut governor),
+        )
+        .await;
+        clear_test_submission_hooks(subscription.subscription_id);
+        assert!(matches!(outcome?, CandidateSubmitOutcome::Submitted));
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::Submitted),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(
+            release.selected_route_logical_id.as_deref(),
+            Some(expected_local_route)
+        );
+        assert_eq!(release.download_id.as_deref(), Some(expected_download_id));
+
+        let jobs = list_release_jobs(&state.db_pool, release.release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].route_logical_id, expected_local_route);
+        assert_eq!(jobs[0].download_id.as_deref(), Some(expected_download_id));
+        assert_eq!(jobs[0].provider_id, Some(local_provider_id));
+
+        let refreshed_target = get_target(&state.db_pool, target.target_id)
+            .await?
+            .expect("target");
+        assert_eq!(refreshed_target.state, AcquisitionTargetState::Submitted);
+        assert_eq!(
+            refreshed_target.selected_route_logical_id.as_deref(),
+            Some(expected_local_route)
+        );
+        assert_eq!(
+            refreshed_target.download_id.as_deref(),
+            Some(expected_download_id)
+        );
+
+        assert_dfu6_submission_attempt_ledger(
+            release
+                .selected_candidate
+                .as_ref()
+                .expect("selected candidate"),
+            expected_local_route,
+            expected_local_implementation,
+            expected_download_id,
+        );
+        Ok(())
+    }
+
+    fn assert_dfu6_submission_attempt_ledger(
+        selected_candidate: &JsonValue,
+        expected_local_route: &str,
+        expected_local_implementation: Option<&str>,
+        expected_download_id: &str,
+    ) {
+        let attempts = selected_candidate
+            .pointer("/routeAttemptLedger/attempts")
+            .and_then(JsonValue::as_array)
+            .expect("route attempt ledger attempts");
+        assert_eq!(attempts.len(), 5, "unexpected attempts: {attempts:?}");
+        for (attempt, implementation) in
+            attempts[..4]
+                .iter()
+                .zip(["real_debrid", "torbox", "all_debrid", "premiumize"])
+        {
+            assert_eq!(
+                attempt.get("routeLogicalId").and_then(JsonValue::as_str),
+                Some(DEBRID_DEFAULT_LOGICAL_ID)
+            );
+            assert_eq!(
+                attempt.get("status").and_then(JsonValue::as_str),
+                Some("failed")
+            );
+            assert_eq!(
+                attempt.get("implementation").and_then(JsonValue::as_str),
+                Some(implementation)
+            );
+        }
+        let local_attempt = &attempts[4];
+        assert_eq!(
+            local_attempt
+                .get("routeLogicalId")
+                .and_then(JsonValue::as_str),
+            Some(expected_local_route)
+        );
+        assert_eq!(
+            local_attempt.get("status").and_then(JsonValue::as_str),
+            Some("submitted")
+        );
+        assert_eq!(
+            local_attempt
+                .get("implementation")
+                .and_then(JsonValue::as_str),
+            expected_local_implementation
+        );
+        assert_eq!(
+            local_attempt.get("downloadId").and_then(JsonValue::as_str),
+            Some(expected_download_id)
+        );
     }
 
     #[test]
