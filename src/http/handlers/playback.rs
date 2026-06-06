@@ -47,6 +47,7 @@ use tracing::info;
 pub struct PlayRequest {
     pub media_item_id: String,
     pub preferred_file_id: Option<String>,
+    pub preferred_episode_id: Option<String>,
     pub network_type: Option<String>,
     pub client_capabilities: Option<Value>,
 }
@@ -75,6 +76,8 @@ pub struct EffectiveProfile {
 }
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientCapabilities {
+    pub client_kind: Option<String>,
+    pub direct_play_preferred: Option<bool>,
     pub max_resolution: Option<String>,
     pub supported_containers: Option<Vec<String>>,
     pub supported_video_codecs: Option<Vec<String>>,
@@ -135,12 +138,72 @@ pub async fn play(
         }
     };
 
+    let requested_file_id = body
+        .preferred_file_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let requested_episode_id = body
+        .preferred_episode_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if requested_file_id.is_some() && requested_episode_id.is_some() {
+        return Err(ApiError::bad_request(
+            "provide either preferred_file_id or preferred_episode_id, not both",
+        ));
+    }
+    if matches!(item.r#type, MediaType::Movie) && requested_episode_id.is_some() {
+        return Err(ApiError::bad_request(
+            "preferred_episode_id is only valid for series items",
+        ));
+    }
+
+    let scoped_episode_id = if matches!(item.r#type, MediaType::Movie) {
+        None
+    } else if let Some(episode_id) = requested_episode_id {
+        let episode = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM episodes WHERE id = ? AND series_id = ? LIMIT 1",
+        )
+        .bind(episode_id)
+        .bind(&body.media_item_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        Some(episode.ok_or_else(|| ApiError::not_found("episode not found for item"))?)
+    } else if let Some(file_or_legacy_episode_id) = requested_file_id {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM episodes WHERE id = ? AND series_id = ? LIMIT 1",
+        )
+        .bind(file_or_legacy_episode_id)
+        .bind(&body.media_item_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        None
+    };
+    let preferred_file_id = if scoped_episode_id.is_some() {
+        None
+    } else {
+        requested_file_id
+    };
+
     let rows = match item.r#type {
         MediaType::Movie => {
             sqlx::query(
                 "SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = ? AND mf.scan_state = 'ok'",
             )
             .bind(&body.media_item_id)
+            .fetch_all(&state.db_pool)
+            .await
+        }
+        _ if scoped_episode_id.is_some() => {
+            sqlx::query(
+                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = ? AND e.id = ? AND mf.scan_state = 'ok'",
+            )
+            .bind(&body.media_item_id)
+            .bind(scoped_episode_id.as_deref().unwrap_or_default())
             .fetch_all(&state.db_pool)
             .await
         }
@@ -171,7 +234,12 @@ pub async fn play(
     }
 
     if files.is_empty() {
-        return Err(ApiError::not_found("no playable files for item"));
+        let message = if scoped_episode_id.is_some() {
+            "no playable files for episode"
+        } else {
+            "no playable files for item"
+        };
+        return Err(ApiError::not_found(message));
     }
 
     let profile = profile_for_network(&state.settings.playback, body.network_type.as_deref());
@@ -191,7 +259,7 @@ pub async fn play(
 
     let selected = select_file(
         &files,
-        body.preferred_file_id.as_deref(),
+        preferred_file_id,
         &caps,
         &profile,
         body.network_type.as_deref(),
@@ -219,6 +287,9 @@ pub async fn play(
     info!(
         user = %user.user_id,
         item = %body.media_item_id,
+        requested_file = ?requested_file_id,
+        requested_episode = ?requested_episode_id,
+        episode = ?scoped_episode_id,
         file = %selected.id,
         mode = %decision.mode_as_str(),
         network = ?body.network_type,
@@ -370,9 +441,7 @@ fn select_file<'a>(
     item_duration: Option<i32>,
 ) -> Option<&'a FileRow> {
     if let Some(pref) = preferred {
-        if let Some(f) = files.iter().find(|f| f.id == pref) {
-            return Some(f);
-        }
+        return files.iter().find(|f| f.id == pref);
     }
 
     files
@@ -389,6 +458,7 @@ fn compare_files(
     item_duration: Option<i32>,
 ) -> Ordering {
     let cmp_tuple = |f: &FileRow| -> (bool, i32, i64, i64, i32) {
+        let native_direct = native_direct_play_client(caps);
         let container_match = caps
             .supported_containers
             .as_ref()
@@ -405,19 +475,17 @@ fn compare_files(
             .map(|c| matches_or_unknown(f.audio_codec.as_deref(), c))
             .unwrap_or(true);
 
-        let res_ok = match caps.max_resolution.as_deref() {
-            Some("720p") => f.height <= 720,
-            Some("1080p") => f.height <= 1080,
-            Some("1440p") => f.height <= 1440,
-            Some("4k") | Some("2160p") => f.height <= 2160,
-            _ => true,
-        };
+        let res_ok = resolution_within_cap(f.height, caps.max_resolution.as_deref());
 
-        let bitrate_cap = match (network, caps.max_bitrate_bps) {
+        let profile_bitrate_cap = (!native_direct)
+            .then_some(profile.max_bitrate_bps)
+            .flatten();
+        let client_bitrate_cap = positive_bitrate_cap(caps.max_bitrate_bps);
+        let bitrate_cap = match (network, client_bitrate_cap) {
             (Some("wan"), Some(max)) => Some(max.min(8_000_000)),
             (Some("wan"), None) => Some(8_000_000),
             (Some("lan"), _) => None,
-            (_, max) => max.or(profile.max_bitrate_bps),
+            (_, max) => max.or(profile_bitrate_cap),
         };
         let bitrate_val = effective_bitrate(f, item_duration);
         let bitrate_ok = bitrate_cap.map(|max| bitrate_val <= max).unwrap_or(true);
@@ -501,6 +569,8 @@ fn default_capabilities(
     };
 
     ClientCapabilities {
+        client_kind: None,
+        direct_play_preferred: None,
         max_resolution: Some(profile.max_resolution.clone()),
         supported_containers: Some(profile.supported_containers.clone()),
         supported_video_codecs: Some(profile.supported_video_codecs.clone()),
@@ -513,6 +583,20 @@ fn merge_caps_with_profile(
     mut caps: ClientCapabilities,
     profile: &EffectiveProfile,
 ) -> ClientCapabilities {
+    if native_direct_play_client(&caps) {
+        if caps
+            .max_resolution
+            .as_deref()
+            .is_some_and(is_unlimited_resolution)
+        {
+            caps.max_resolution = None;
+        }
+        if caps.max_bitrate_bps.is_some_and(|value| value <= 0) {
+            caps.max_bitrate_bps = None;
+        }
+        return caps;
+    }
+
     // Merge supported containers/codecs by intersection when both present.
     if let Some(client) = caps.supported_containers.as_ref() {
         let merged: Vec<String> = client
@@ -570,10 +654,15 @@ fn merge_caps_with_profile(
     };
 
     // Min bitrate cap if both present
-    if let (Some(client), Some(profile_bps)) = (caps.max_bitrate_bps, profile.max_bitrate_bps) {
+    if let (Some(client), Some(profile_bps)) = (
+        positive_bitrate_cap(caps.max_bitrate_bps),
+        profile.max_bitrate_bps,
+    ) {
         caps.max_bitrate_bps = Some(client.min(profile_bps));
     } else if caps.max_bitrate_bps.is_none() {
         caps.max_bitrate_bps = profile.max_bitrate_bps;
+    } else {
+        caps.max_bitrate_bps = positive_bitrate_cap(caps.max_bitrate_bps);
     }
 
     caps
@@ -582,10 +671,13 @@ fn merge_caps_with_profile(
 fn min_resolution(a: &str, b: &str) -> String {
     let rank = |r: &str| -> i32 {
         match r.to_ascii_lowercase().as_str() {
+            "480p" => 0,
             "720p" => 1,
             "1080p" => 2,
             "1440p" => 3,
             "4k" | "2160p" => 4,
+            "8k" | "4320p" => 5,
+            _ if is_unlimited_resolution(r) => i32::MAX,
             _ => 0,
         }
     };
@@ -593,6 +685,43 @@ fn min_resolution(a: &str, b: &str) -> String {
         a.to_string()
     } else {
         b.to_string()
+    }
+}
+
+fn native_direct_play_client(caps: &ClientCapabilities) -> bool {
+    if caps.direct_play_preferred == Some(true) {
+        return true;
+    }
+    caps.client_kind
+        .as_deref()
+        .map(|kind| {
+            let normalized = kind.to_ascii_lowercase();
+            normalized.contains("mpv") || normalized.contains("native")
+        })
+        .unwrap_or(false)
+}
+
+fn positive_bitrate_cap(value: Option<i64>) -> Option<i64> {
+    value.filter(|cap| *cap > 0)
+}
+
+fn is_unlimited_resolution(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "any" | "none" | "unlimited" | "original" | "source" | "direct" | "native"
+    )
+}
+
+fn resolution_within_cap(height: i32, max_resolution: Option<&str>) -> bool {
+    match max_resolution.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if is_unlimited_resolution(&value) => true,
+        Some(value) if value == "480p" => height <= 480,
+        Some(value) if value == "720p" => height <= 720,
+        Some(value) if value == "1080p" => height <= 1080,
+        Some(value) if value == "1440p" => height <= 1440,
+        Some(value) if value == "4k" || value == "2160p" => height <= 2160,
+        Some(value) if value == "8k" || value == "4320p" => height <= 4320,
+        _ => true,
     }
 }
 
@@ -619,19 +748,18 @@ fn decide_playback(
         .map(|c| matches_or_unknown(file.audio_codec.as_deref(), c))
         .unwrap_or(true);
 
-    let res_ok = match caps.max_resolution.as_deref() {
-        Some("720p") => file.height <= 720,
-        Some("1080p") => file.height <= 1080,
-        Some("1440p") => file.height <= 1440,
-        Some("4k") | Some("2160p") => file.height <= 2160,
-        _ => true,
-    };
+    let res_ok = resolution_within_cap(file.height, caps.max_resolution.as_deref());
 
-    let bitrate_cap = match (network_type, caps.max_bitrate_bps) {
+    let native_direct = native_direct_play_client(caps);
+    let profile_bitrate_cap = (!native_direct)
+        .then_some(profile.max_bitrate_bps)
+        .flatten();
+    let client_bitrate_cap = positive_bitrate_cap(caps.max_bitrate_bps);
+    let bitrate_cap = match (network_type, client_bitrate_cap) {
         (Some("wan"), Some(max)) => Some(max.min(8_000_000)), // cap WAN more tightly
         (Some("wan"), None) => Some(8_000_000),
         (Some("lan"), _) => None, // relax bitrate enforcement on LAN
-        (_, max) => max.or(profile.max_bitrate_bps),
+        (_, max) => max.or(profile_bitrate_cap),
     };
 
     let bitrate_val = effective_bitrate(file, item_duration);
@@ -1888,4 +2016,87 @@ pub async fn seek_transcode(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn constrained_profile() -> EffectiveProfile {
+        EffectiveProfile {
+            max_resolution: "1080p".to_string(),
+            supported_containers: vec!["mp4".to_string(), "mkv".to_string()],
+            supported_video_codecs: vec!["h264".to_string()],
+            supported_audio_codecs: vec!["aac".to_string(), "ac3".to_string()],
+            max_bitrate_bps: Some(6_000_000),
+        }
+    }
+
+    fn succession_4k_file() -> FileRow {
+        FileRow {
+            id: "file-1".to_string(),
+            path: "Succession.S01E01.2160p.HEVC.EAC3.mkv".to_string(),
+            container: Some("matroska,webm".to_string()),
+            video_codec: Some("hevc".to_string()),
+            audio_codec: Some("eac3".to_string()),
+            width: 3840,
+            height: 2160,
+            bitrate_bps: 22_000_000,
+            size_bytes: Some(10_000_000_000),
+        }
+    }
+
+    #[test]
+    fn native_mpv_caps_direct_play_4k_hevc_without_profile_cap() {
+        let profile = constrained_profile();
+        let caps = ClientCapabilities {
+            client_kind: Some("native_mpv".to_string()),
+            direct_play_preferred: Some(true),
+            max_resolution: Some("unlimited".to_string()),
+            supported_containers: Some(vec!["mkv".to_string(), "mp4".to_string()]),
+            supported_video_codecs: Some(vec!["h264".to_string(), "hevc".to_string()]),
+            supported_audio_codecs: Some(vec![
+                "aac".to_string(),
+                "ac3".to_string(),
+                "eac3".to_string(),
+            ]),
+            max_bitrate_bps: Some(0),
+        };
+
+        let merged = merge_caps_with_profile(caps, &profile);
+        let decision = decide_playback(&succession_4k_file(), &merged, &profile, None, Some(3600));
+
+        assert_eq!(decision.mode, PlaybackMode::DirectPlay);
+        assert_eq!(decision.reason, "direct play: all capabilities satisfied");
+    }
+
+    #[test]
+    fn generic_browser_caps_still_transcode_4k_hevc_against_profile() {
+        let profile = constrained_profile();
+        let caps = ClientCapabilities {
+            client_kind: None,
+            direct_play_preferred: None,
+            max_resolution: Some("2160p".to_string()),
+            supported_containers: Some(vec!["mkv".to_string(), "mp4".to_string()]),
+            supported_video_codecs: Some(vec!["h264".to_string(), "hevc".to_string()]),
+            supported_audio_codecs: Some(vec![
+                "aac".to_string(),
+                "ac3".to_string(),
+                "eac3".to_string(),
+            ]),
+            max_bitrate_bps: Some(50_000_000),
+        };
+
+        let merged = merge_caps_with_profile(caps, &profile);
+        let decision = decide_playback(&succession_4k_file(), &merged, &profile, None, Some(3600));
+
+        assert_eq!(decision.mode, PlaybackMode::Transcode);
+        assert!(
+            decision.reason.contains("resolution too high")
+                || decision.reason.contains("video codec unsupported")
+                || decision.reason.contains("bitrate exceeds cap"),
+            "{}",
+            decision.reason
+        );
+    }
 }

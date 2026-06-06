@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -53,6 +53,7 @@ use crate::{
         AcquisitionLibraryTargetScaffold, LinkerService,
         ingest_acquisition_library_import_with_metadata, scaffold_acquisition_library_targets,
     },
+    media::ffprobe,
     metadata::MetadataService,
     runtime::RuntimePaths,
     state::AppState,
@@ -690,10 +691,38 @@ struct AnimeImportVerificationPass {
     finalized: Option<FinalizedImportRun>,
 }
 
+#[derive(Debug, Clone)]
+struct MediaSafetyVerificationPass {
+    links: Vec<AcquisitionImportFileLink>,
+    finalized: Option<FinalizedImportRun>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AnimeImportFileGroupKey {
     release_file_id: Uuid,
     local_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportFileGroupKey {
+    release_file_id: Uuid,
+    local_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportAudioPolicy {
+    required_languages: Vec<String>,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImportAudioDecision {
+    Pass,
+    Block {
+        verification_state: &'static str,
+        mismatch_class: &'static str,
+        reason: String,
+    },
 }
 
 async fn finalize_import_run(
@@ -964,6 +993,20 @@ async fn finalize_import_run_inner(
         return Ok(finalized);
     }
     importable_links = verification.links;
+
+    let media_safety = verify_import_media_safety(
+        pool,
+        &subscription,
+        &candidate.release,
+        run,
+        importable_links,
+        &release_files_by_id,
+    )
+    .await?;
+    if let Some(finalized) = media_safety.finalized {
+        return Ok(finalized);
+    }
+    importable_links = media_safety.links;
 
     let mut library_files = Vec::new();
     for link in &importable_links {
@@ -1498,6 +1541,616 @@ async fn verify_anime_import_links(
         links,
         finalized: None,
     })
+}
+
+async fn verify_import_media_safety(
+    pool: &AnyPool,
+    subscription: &AcquisitionSubscription,
+    release: &AcquisitionRelease,
+    run: &AcquisitionImportRun,
+    importable_links: Vec<AcquisitionImportFileLink>,
+    release_files_by_id: &HashMap<Uuid, &AcquisitionReleaseFile>,
+) -> Result<MediaSafetyVerificationPass> {
+    if subscription.media_type == MediaType::Anime {
+        return Ok(MediaSafetyVerificationPass {
+            links: importable_links,
+            finalized: None,
+        });
+    }
+
+    let mut links_by_id = importable_links
+        .iter()
+        .cloned()
+        .map(|link| (link.import_link_id, link))
+        .collect::<HashMap<_, _>>();
+    let mut groups: HashMap<ImportFileGroupKey, Vec<AcquisitionImportFileLink>> = HashMap::new();
+    for link in &importable_links {
+        let Some(release_file_id) = link.release_file_id else {
+            continue;
+        };
+        let Some(local_path) = link.local_path.as_deref() else {
+            continue;
+        };
+        groups
+            .entry(ImportFileGroupKey {
+                release_file_id,
+                local_path: local_path.to_string(),
+            })
+            .or_default()
+            .push(link.clone());
+    }
+
+    for (group_key, group_links) in groups {
+        let Some(release_file) = release_files_by_id.get(&group_key.release_file_id).copied()
+        else {
+            continue;
+        };
+        let policy = import_audio_policy(subscription, release, release_file);
+        if policy.required_languages.is_empty() {
+            continue;
+        }
+
+        let metadata = match ffprobe::probe(&group_key.local_path).await {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                tracing::warn!(
+                    "audio language verification skipped for import run {} release file {}: {err}",
+                    run.import_run_id,
+                    group_key.release_file_id
+                );
+                continue;
+            }
+        };
+        let evidence = import_audio_safety_evidence(
+            "checked",
+            &policy,
+            &metadata,
+            release_file,
+            &group_key.local_path,
+        );
+        let decision = evaluate_import_audio_policy(&metadata, &policy);
+        if let ImportAudioDecision::Block {
+            verification_state,
+            mismatch_class,
+            reason,
+        } = decision
+        {
+            let updated_links = mark_import_media_safety_group(
+                pool,
+                run,
+                &group_links,
+                verification_state,
+                &reason,
+                Some(mismatch_class),
+                import_audio_safety_evidence(
+                    verification_state,
+                    &policy,
+                    &metadata,
+                    release_file,
+                    &group_key.local_path,
+                ),
+                AcquisitionImportFileLinkState::Blocked,
+            )
+            .await?;
+            for link in updated_links {
+                links_by_id.insert(link.import_link_id, link);
+            }
+            block_import_run(pool, run.import_run_id, &reason, Some(mismatch_class)).await?;
+            return Ok(MediaSafetyVerificationPass {
+                links: links_by_id.into_values().collect(),
+                finalized: Some(FinalizedImportRun {
+                    blocked: true,
+                    ..FinalizedImportRun::default()
+                }),
+            });
+        }
+
+        for link in mark_import_media_safety_group(
+            pool,
+            run,
+            &group_links,
+            "verified",
+            "Import audio language evidence satisfied the selected release policy.",
+            None,
+            evidence,
+            AcquisitionImportFileLinkState::Pending,
+        )
+        .await?
+        {
+            links_by_id.insert(link.import_link_id, link);
+        }
+    }
+
+    let links = importable_links
+        .into_iter()
+        .filter_map(|link| links_by_id.remove(&link.import_link_id))
+        .collect();
+    Ok(MediaSafetyVerificationPass {
+        links,
+        finalized: None,
+    })
+}
+
+async fn mark_import_media_safety_group(
+    pool: &AnyPool,
+    run: &AcquisitionImportRun,
+    links: &[AcquisitionImportFileLink],
+    verification_state: &str,
+    reason: &str,
+    mismatch_class: Option<&str>,
+    evidence: JsonValue,
+    state: AcquisitionImportFileLinkState,
+) -> Result<Vec<AcquisitionImportFileLink>> {
+    let mut updated = Vec::with_capacity(links.len());
+    for link in links {
+        updated.push(
+            upsert_import_file_link(
+                pool,
+                NewAcquisitionImportFileLink {
+                    import_link_id: Some(link.import_link_id),
+                    import_run_id: link.import_run_id,
+                    release_id: link.release_id,
+                    release_file_id: link.release_file_id,
+                    target_id: link.target_id,
+                    local_path: link.local_path.clone(),
+                    media_file_id: link.media_file_id,
+                    movie_id: link.movie_id,
+                    episode_id: link.episode_id,
+                    state,
+                    state_reason: Some(reason.to_string()),
+                    verification_state: Some(verification_state.to_string()),
+                    mismatch_class: mismatch_class.map(ToString::to_string),
+                    evidence: Some(json!({
+                        "phase": "rr8d",
+                        "importRunId": run.import_run_id,
+                        "releaseId": link.release_id,
+                        "releaseFileId": link.release_file_id,
+                        "targetId": link.target_id,
+                        "localPath": link.local_path,
+                        "verification": evidence.clone(),
+                        "previousEvidence": link.evidence,
+                    })),
+                },
+            )
+            .await?,
+        );
+    }
+    Ok(updated)
+}
+
+fn import_audio_policy(
+    subscription: &AcquisitionSubscription,
+    release: &AcquisitionRelease,
+    release_file: &AcquisitionReleaseFile,
+) -> ImportAudioPolicy {
+    let mut required = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+
+    for key in [
+        "requiredAudioLanguages",
+        "required_audio_languages",
+        "audioLanguages",
+        "audio_languages",
+        "requiredLanguages",
+        "required_languages",
+        "languages",
+        "language",
+    ] {
+        add_policy_languages_from_json_path(
+            subscription.quality_profile.as_ref(),
+            &[key],
+            &format!("qualityProfile.{key}"),
+            &mut required,
+            &mut sources,
+        );
+    }
+    for path in [
+        &["audio", "requiredLanguages"][..],
+        &["audio", "required_languages"][..],
+        &["languageProfile", "languages"][..],
+    ] {
+        add_policy_languages_from_json_path(
+            subscription.quality_profile.as_ref(),
+            path,
+            &format!("qualityProfile.{}", path.join(".")),
+            &mut required,
+            &mut sources,
+        );
+    }
+
+    for path in [
+        &["language"][..],
+        &["languages"][..],
+        &["audioLanguage"][..],
+        &["audioLanguages"][..],
+        &["parsedLanguage"][..],
+        &["raw", "language"][..],
+        &["raw", "languages"][..],
+        &["raw", "audioLanguage"][..],
+        &["raw", "audioLanguages"][..],
+    ] {
+        add_policy_languages_from_json_path(
+            release.selected_candidate.as_ref(),
+            path,
+            &format!("selectedCandidate.{}", path.join(".")),
+            &mut required,
+            &mut sources,
+        );
+    }
+
+    if let Some(language) = release_file.parsed_language.as_deref() {
+        add_normalized_import_language(
+            language,
+            "releaseFile.parsedLanguage",
+            &mut required,
+            &mut sources,
+        );
+    }
+
+    ImportAudioPolicy {
+        required_languages: required.into_iter().collect(),
+        sources: sources.into_iter().collect(),
+    }
+}
+
+fn add_policy_languages_from_json_path(
+    root: Option<&JsonValue>,
+    path: &[&str],
+    source: &str,
+    required: &mut BTreeSet<String>,
+    sources: &mut BTreeSet<String>,
+) {
+    let Some(value) = json_value_path(root, path) else {
+        return;
+    };
+    for raw in json_language_values(value) {
+        add_normalized_import_language(&raw, source, required, sources);
+    }
+}
+
+fn json_value_path<'a>(root: Option<&'a JsonValue>, path: &[&str]) -> Option<&'a JsonValue> {
+    let mut cursor = root?;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    Some(cursor)
+}
+
+fn json_language_values(value: &JsonValue) -> Vec<String> {
+    if let Some(raw) = value.as_str() {
+        return split_language_list(raw);
+    }
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .flat_map(json_language_values)
+            .collect::<Vec<_>>();
+    }
+    if let Some(object) = value.as_object() {
+        return ["language", "name", "value", "code", "id"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .flat_map(json_language_values)
+            .collect();
+    }
+    Vec::new()
+}
+
+fn split_language_list(raw: &str) -> Vec<String> {
+    raw.split(|ch: char| matches!(ch, ',' | ';' | '/' | '|'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn add_normalized_import_language(
+    raw: &str,
+    source: &str,
+    required: &mut BTreeSet<String>,
+    sources: &mut BTreeSet<String>,
+) {
+    let Some(language) = normalize_import_language_value(raw) else {
+        return;
+    };
+    required.insert(language);
+    sources.insert(source.to_string());
+}
+
+fn evaluate_import_audio_policy(
+    metadata: &ffprobe::MediaMetadata,
+    policy: &ImportAudioPolicy,
+) -> ImportAudioDecision {
+    if policy.required_languages.is_empty() {
+        return ImportAudioDecision::Pass;
+    }
+    let audio_stream_count = import_audio_streams(metadata).count();
+    if audio_stream_count == 0 {
+        return ImportAudioDecision::Block {
+            verification_state: "audio_missing",
+            mismatch_class: "media_audio_missing",
+            reason: "Downloaded file has no audio streams to satisfy the selected release policy."
+                .to_string(),
+        };
+    }
+    let detected = detected_audio_languages(metadata);
+    if detected.is_empty() {
+        return ImportAudioDecision::Pass;
+    }
+    if policy
+        .required_languages
+        .iter()
+        .any(|required| detected.contains(required))
+    {
+        return ImportAudioDecision::Pass;
+    }
+    ImportAudioDecision::Block {
+        verification_state: "audio_language_mismatch",
+        mismatch_class: "audio_language_mismatch",
+        reason: format!(
+            "Downloaded file audio languages {} do not include required or claimed language {}.",
+            format_language_list(detected.iter()),
+            format_language_list(policy.required_languages.iter())
+        ),
+    }
+}
+
+fn import_audio_safety_evidence(
+    verification_state: &str,
+    policy: &ImportAudioPolicy,
+    metadata: &ffprobe::MediaMetadata,
+    release_file: &AcquisitionReleaseFile,
+    local_path: &str,
+) -> JsonValue {
+    json!({
+        "phase": "rr8d",
+        "verificationState": verification_state,
+        "localPath": local_path,
+        "releaseFileId": release_file.release_file_id,
+        "releaseFilePath": release_file.path.as_str(),
+        "parsedLanguage": release_file.parsed_language.as_deref(),
+        "requiredAudioLanguages": &policy.required_languages,
+        "policySources": &policy.sources,
+        "detectedAudioLanguages": detected_audio_languages(metadata),
+        "container": metadata.container.as_deref(),
+        "videoCodec": metadata.video_codec.as_deref(),
+        "audioCodec": metadata.audio_codec.as_deref(),
+        "durationSeconds": metadata.duration_seconds,
+        "audioStreams": import_audio_streams(metadata)
+            .map(import_audio_stream_evidence)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn import_audio_streams(
+    metadata: &ffprobe::MediaMetadata,
+) -> impl Iterator<Item = &ffprobe::Stream> {
+    metadata
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+}
+
+fn import_audio_stream_evidence(stream: &ffprobe::Stream) -> JsonValue {
+    json!({
+        "index": stream.index,
+        "codec": stream.codec_name.as_deref(),
+        "channels": stream.channels,
+        "language": stream_language_tag(stream),
+        "normalizedLanguage": stream_normalized_audio_language(stream),
+        "title": stream_text_tag(stream, "title"),
+        "handlerName": stream_text_tag(stream, "handler_name"),
+        "default": stream
+            .disposition
+            .as_ref()
+            .and_then(|disposition| disposition.default_flag)
+            .unwrap_or_default()
+            == 1,
+        "forced": stream
+            .disposition
+            .as_ref()
+            .and_then(|disposition| disposition.forced)
+            .unwrap_or_default()
+            == 1,
+    })
+}
+
+fn detected_audio_languages(metadata: &ffprobe::MediaMetadata) -> Vec<String> {
+    import_audio_streams(metadata)
+        .filter_map(stream_normalized_audio_language)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn stream_normalized_audio_language(stream: &ffprobe::Stream) -> Option<String> {
+    stream_language_tag(stream)
+        .as_deref()
+        .and_then(normalize_import_language_value)
+        .or_else(|| {
+            stream_text_tag(stream, "title")
+                .as_deref()
+                .and_then(normalize_import_language_freeform)
+        })
+        .or_else(|| {
+            stream_text_tag(stream, "handler_name")
+                .as_deref()
+                .and_then(normalize_import_language_freeform)
+        })
+}
+
+fn stream_language_tag(stream: &ffprobe::Stream) -> Option<String> {
+    stream_text_tag(stream, "language")
+        .or_else(|| stream_text_tag(stream, "LANGUAGE"))
+        .or_else(|| stream_text_tag(stream, "lang"))
+}
+
+fn stream_text_tag(stream: &ffprobe::Stream, key: &str) -> Option<String> {
+    stream
+        .tags
+        .as_ref()
+        .and_then(|tags| {
+            tags.iter()
+                .find(|(tag_key, _)| tag_key.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.clone())
+        })
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+}
+
+fn normalize_import_language_freeform(raw: &str) -> Option<String> {
+    normalize_import_language_value(raw).or_else(|| {
+        raw.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter_map(normalize_import_language_name_or_three_letter)
+            .next()
+    })
+}
+
+fn normalize_import_language_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('_', "-");
+    let first = normalized
+        .split('-')
+        .find(|part| !part.trim().is_empty())?
+        .trim()
+        .to_ascii_lowercase();
+    normalize_import_language_token(&first)
+}
+
+fn normalize_import_language_name_or_three_letter(token: &str) -> Option<String> {
+    let token = token.trim().to_ascii_lowercase();
+    if token.len() == 3 && token.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return map_import_three_letter_language(&token).map(ToString::to_string);
+    }
+    map_import_language_name(&token).map(ToString::to_string)
+}
+
+fn normalize_import_language_token(token: &str) -> Option<String> {
+    let token = token.trim().to_ascii_lowercase();
+    if matches!(
+        token.as_str(),
+        "" | "und" | "undefined" | "unknown" | "unk" | "mul" | "multi" | "dual" | "original"
+    ) {
+        return None;
+    }
+    if token.len() == 2 && token.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return Some(token);
+    }
+    if token.len() == 3 && token.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return map_import_three_letter_language(&token)
+            .map(ToString::to_string)
+            .or(Some(token));
+    }
+    map_import_language_name(&token).map(ToString::to_string)
+}
+
+fn map_import_three_letter_language(token: &str) -> Option<&'static str> {
+    match token {
+        "eng" => Some("en"),
+        "spa" => Some("es"),
+        "fra" | "fre" => Some("fr"),
+        "deu" | "ger" => Some("de"),
+        "ita" => Some("it"),
+        "por" => Some("pt"),
+        "nld" | "dut" => Some("nl"),
+        "rus" => Some("ru"),
+        "jpn" => Some("ja"),
+        "kor" => Some("ko"),
+        "zho" | "chi" => Some("zh"),
+        "ara" => Some("ar"),
+        "heb" => Some("he"),
+        "hin" => Some("hi"),
+        "tur" => Some("tr"),
+        "pol" => Some("pl"),
+        "ukr" => Some("uk"),
+        "swe" => Some("sv"),
+        "fin" => Some("fi"),
+        "dan" => Some("da"),
+        "nor" => Some("no"),
+        "ron" | "rum" => Some("ro"),
+        "ell" | "gre" => Some("el"),
+        "ces" | "cze" => Some("cs"),
+        "hun" => Some("hu"),
+        "tha" => Some("th"),
+        "vie" => Some("vi"),
+        "ind" => Some("id"),
+        "msa" | "may" => Some("ms"),
+        "fas" | "per" => Some("fa"),
+        "urd" => Some("ur"),
+        "tam" => Some("ta"),
+        "tel" => Some("te"),
+        "ben" => Some("bn"),
+        "mar" => Some("mr"),
+        "lit" => Some("lt"),
+        "lav" => Some("lv"),
+        "est" => Some("et"),
+        "slv" => Some("sl"),
+        "slk" | "slo" => Some("sk"),
+        "hrv" => Some("hr"),
+        "srp" => Some("sr"),
+        "bul" => Some("bg"),
+        "isl" | "ice" => Some("is"),
+        "gle" => Some("ga"),
+        "kat" | "geo" => Some("ka"),
+        "kaz" => Some("kk"),
+        "tgl" => Some("tl"),
+        _ => None,
+    }
+}
+
+fn map_import_language_name(token: &str) -> Option<&'static str> {
+    match token {
+        "english" => Some("en"),
+        "spanish" | "espanol" | "castellano" => Some("es"),
+        "french" => Some("fr"),
+        "german" => Some("de"),
+        "italian" => Some("it"),
+        "portuguese" => Some("pt"),
+        "russian" => Some("ru"),
+        "japanese" => Some("ja"),
+        "korean" => Some("ko"),
+        "chinese" | "mandarin" | "cantonese" => Some("zh"),
+        "dutch" => Some("nl"),
+        "swedish" => Some("sv"),
+        "norwegian" => Some("no"),
+        "danish" => Some("da"),
+        "finnish" => Some("fi"),
+        "polish" => Some("pl"),
+        "turkish" => Some("tr"),
+        "arabic" => Some("ar"),
+        "hebrew" => Some("he"),
+        "greek" => Some("el"),
+        "czech" => Some("cs"),
+        "hungarian" => Some("hu"),
+        "thai" => Some("th"),
+        "vietnamese" => Some("vi"),
+        "indonesian" => Some("id"),
+        "malay" => Some("ms"),
+        "persian" => Some("fa"),
+        "hindi" => Some("hi"),
+        "ukrainian" => Some("uk"),
+        "romanian" => Some("ro"),
+        "latino" => Some("es"),
+        _ => None,
+    }
+}
+
+fn format_language_list<'a>(languages: impl Iterator<Item = &'a String>) -> String {
+    let values = languages.cloned().collect::<Vec<_>>();
+    if values.is_empty() {
+        "[]".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 async fn ensure_anime_import_file_hash(
@@ -4511,6 +5164,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn es6_import_provenance_preserves_extension_suite_source_evidence() -> Result<()> {
+        let database = setup_db().await?;
+        let dir = tempdir()?;
+        let path = dir.path().join("Primer.2004.1080p.mkv");
+        tokio::fs::write(&path, b"movie").await?;
+        let (subscription_id, target_id) =
+            create_movie_subscription_with_target(&database, "Primer", 2004).await?;
+        let source_provider_id = Uuid::new_v4();
+        let secondary_provider_id = Uuid::new_v4();
+        let coverage_plan = json!({
+            "resolverKind": "movie_radarr_style",
+            "requestScopeEvidence": {
+                "sourceSelection": {
+                    "mode": "suite",
+                    "route": "suite:default",
+                    "suiteId": "default"
+                }
+            }
+        });
+        let (release_id, job_id) = insert_completed_release_with_files_and_plan(
+            &database,
+            subscription_id,
+            MediaType::Movie,
+            "Primer.2004.1080p.WEB-DL-GROUP",
+            ReleaseKind::Single,
+            ReleaseResolverKind::MovieRadarrStyle,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            "es6-suite-import-provenance",
+            vec![TestReleaseFile {
+                local_path: path.to_string_lossy().to_string(),
+                basename: "Primer.2004.1080p.mkv".to_string(),
+                file_index: 0,
+                selected: Some(true),
+                parsed_season: None,
+                parsed_episode: None,
+                coverage: vec![(
+                    target_id,
+                    ReleaseCoverageKind::Movie,
+                    ReleaseCoverageState::Submitted,
+                )],
+            }],
+            Some(coverage_plan),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE acquisition_releases SET selected_candidate_json = ? WHERE release_id = ?",
+        )
+        .bind(serde_json::to_string(&json!({
+            "title": "Primer.2004.1080p.WEB-DL-GROUP",
+            "sourceProviderId": source_provider_id.to_string(),
+            "sourceExtensionId": "elixir.sources.torrentio",
+            "sourceSuite": {
+                "label": "Elixir Extension Suite",
+                "mode": "suite",
+                "sourceSelection": {
+                    "mode": "suite",
+                    "route": "suite:default",
+                    "suiteId": "default"
+                },
+                "primaryProviderId": source_provider_id.to_string(),
+                "primaryExtensionId": "elixir.sources.torrentio",
+                "contributorCount": 2,
+                "contributors": [
+                    {
+                        "primary": true,
+                        "providerId": source_provider_id.to_string(),
+                        "extensionId": "elixir.sources.torrentio",
+                        "extensionName": "Torrentio",
+                        "implementation": "torrentio"
+                    },
+                    {
+                        "primary": false,
+                        "providerId": secondary_provider_id.to_string(),
+                        "extensionId": "elixir.sources.comet",
+                        "extensionName": "Comet",
+                        "implementation": "comet"
+                    }
+                ]
+            }
+        }))?)
+        .bind(release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let stats = run_acquisition_import_iteration(&database.pool, 10).await?;
+        assert_eq!(stats.runs_imported, 1);
+        let run = get_import_run_by_release_job(&database.pool, job_id)
+            .await?
+            .expect("import run");
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| value.pointer("/selectedCandidate/sourceSuite/label"))
+                .and_then(JsonValue::as_str),
+            Some("Elixir Extension Suite")
+        );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| {
+                    value.pointer("/selectedCandidate/sourceSuite/contributors/1/providerId")
+                })
+                .and_then(JsonValue::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            Some(secondary_provider_id)
+        );
+        assert_eq!(
+            run.provenance
+                .as_ref()
+                .and_then(|value| {
+                    value.pointer("/coveragePlan/requestScopeEvidence/sourceSelection/mode")
+                })
+                .and_then(JsonValue::as_str),
+            Some("suite")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rr8b_tv_season_pack_imports_many_episode_targets() -> Result<()> {
         let database = setup_db().await?;
         let dir = tempdir()?;
@@ -5521,5 +6293,190 @@ mod tests {
             .await?;
         assert_eq!(count, 0);
         Ok(())
+    }
+
+    #[test]
+    fn rr8d_audio_policy_blocks_known_wrong_language() {
+        let metadata = media_metadata_with_audio_language(Some("rus"), None);
+        let policy = ImportAudioPolicy {
+            required_languages: vec!["en".to_string()],
+            sources: vec!["qualityProfile.requiredLanguages".to_string()],
+        };
+
+        let decision = evaluate_import_audio_policy(&metadata, &policy);
+
+        assert_eq!(
+            decision,
+            ImportAudioDecision::Block {
+                verification_state: "audio_language_mismatch",
+                mismatch_class: "audio_language_mismatch",
+                reason: "Downloaded file audio languages ru do not include required or claimed language en."
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rr8d_audio_policy_allows_unknown_tags_without_false_block() {
+        let metadata = media_metadata_with_audio_language(Some("und"), None);
+        let policy = ImportAudioPolicy {
+            required_languages: vec!["en".to_string()],
+            sources: vec!["qualityProfile.requiredLanguages".to_string()],
+        };
+
+        assert_eq!(
+            evaluate_import_audio_policy(&metadata, &policy),
+            ImportAudioDecision::Pass
+        );
+    }
+
+    #[test]
+    fn rr8d_audio_policy_does_not_default_to_english() {
+        let metadata = media_metadata_with_audio_language(Some("rus"), None);
+        let policy = ImportAudioPolicy {
+            required_languages: Vec::new(),
+            sources: Vec::new(),
+        };
+
+        assert_eq!(
+            evaluate_import_audio_policy(&metadata, &policy),
+            ImportAudioDecision::Pass
+        );
+    }
+
+    #[test]
+    fn rr8d_import_audio_policy_collects_candidate_and_parsed_language_hints() {
+        let subscription = AcquisitionSubscription {
+            quality_profile: None,
+            ..test_subscription_for_import_policy(MediaType::Series)
+        };
+        let release = AcquisitionRelease {
+            release_id: Uuid::new_v4(),
+            subscription_id: Some(subscription.subscription_id),
+            source_provider_id: None,
+            source_extension_id: "test.source".to_string(),
+            owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+            media_type: MediaType::Series,
+            title: "Show".to_string(),
+            release_title: "Show.S01E01.English.1080p-WEB".to_string(),
+            source: "magnet:?xt=urn:btih:test".to_string(),
+            source_kind: "magnet".to_string(),
+            info_hash: Some("test".to_string()),
+            fingerprint: "test".to_string(),
+            release_kind: ReleaseKind::Single,
+            resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+            resolver_version: "test".to_string(),
+            confidence: ReleaseConfidence::High,
+            score: None,
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            selected_provider_id: None,
+            download_id: Some("download".to_string()),
+            remote_release_id: None,
+            state: AcquisitionReleaseState::Completed,
+            state_reason: Some("completed".to_string()),
+            selected_candidate: Some(json!({ "language": "eng" })),
+            coverage_plan: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let release_file = AcquisitionReleaseFile {
+            release_file_id: Uuid::new_v4(),
+            release_id: release.release_id,
+            file_index: Some(0),
+            file_id: Some("1".to_string()),
+            provider_file_id: Some("1".to_string()),
+            path: "Show.S01E01.English.1080p.mkv".to_string(),
+            basename: "Show.S01E01.English.1080p.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+            selected: Some(true),
+            parsed_title: Some("Show".to_string()),
+            parsed_season_number: Some(1),
+            parsed_episode_number: Some(1),
+            parsed_episode_end_number: None,
+            parsed_absolute_episode_number: None,
+            parsed_absolute_episode_end_number: None,
+            parsed_air_date: None,
+            parsed_quality: Some("1080p".to_string()),
+            parsed_language: Some("English".to_string()),
+            parsed_release_group: Some("GROUP".to_string()),
+            parser_confidence: ReleaseConfidence::High,
+            parser_reason: None,
+            raw: None,
+            provider_metadata: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let policy = import_audio_policy(&subscription, &release, &release_file);
+
+        assert_eq!(policy.required_languages, vec!["en".to_string()]);
+        assert!(
+            policy
+                .sources
+                .iter()
+                .any(|source| source == "selectedCandidate.language")
+        );
+        assert!(
+            policy
+                .sources
+                .iter()
+                .any(|source| source == "releaseFile.parsedLanguage")
+        );
+    }
+
+    fn media_metadata_with_audio_language(
+        language: Option<&str>,
+        title: Option<&str>,
+    ) -> ffprobe::MediaMetadata {
+        let mut tags = HashMap::new();
+        if let Some(language) = language {
+            tags.insert("language".to_string(), language.to_string());
+        }
+        if let Some(title) = title {
+            tags.insert("title".to_string(), title.to_string());
+        }
+        ffprobe::MediaMetadata {
+            streams: vec![ffprobe::Stream {
+                index: Some(1),
+                codec_type: Some("audio".to_string()),
+                codec_name: Some("aac".to_string()),
+                channels: Some(2),
+                tags: Some(tags),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn test_subscription_for_import_policy(media_type: MediaType) -> AcquisitionSubscription {
+        AcquisitionSubscription {
+            subscription_id: Uuid::new_v4(),
+            media_type,
+            title: "Show".to_string(),
+            normalized_title: "show".to_string(),
+            year: Some(2024),
+            external_ids: None,
+            idempotency_key: None,
+            request_mode: AcquisitionRequestMode::Monitored,
+            request_scope: AcquisitionRequestScope::Subscription,
+            scope: None,
+            metadata_policy: AcquisitionMetadataPolicy::Recurring,
+            completion_policy: AcquisitionCompletionPolicy::Manual,
+            monitor_policy: AcquisitionMonitorPolicy::AllMissing,
+            route_policy: AcquisitionRoutePolicy::DebridFirst,
+            source_provider_id: None,
+            release_delay_seconds: 0,
+            quality_profile: None,
+            metadata_refresh_after: Utc::now(),
+            candidate_search_after: Utc::now(),
+            last_metadata_refresh_at: None,
+            last_candidate_search_at: None,
+            tracking_started_at: None,
+            status: Default::default(),
+            active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 }

@@ -344,6 +344,8 @@ pub struct FindMediaScopePreviewEpisode {
     pub title: Option<String>,
     pub air_date: Option<String>,
     pub thumbnail_url: Option<String>,
+    pub overview: Option<String>,
+    pub runtime_minutes: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

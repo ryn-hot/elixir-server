@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -8,6 +12,7 @@ use axum::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::{
@@ -45,7 +50,7 @@ pub struct CandidateProvidersResponse {
     pub providers: Vec<CandidateProviderSummary>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateProviderSummary {
     pub provider_id: Uuid,
@@ -145,7 +150,7 @@ pub struct CandidateSearchResponse {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateRouteOption {
     pub logical_id: String,
@@ -285,6 +290,7 @@ pub(crate) async fn search_candidates_with_store(
     pool: &sqlx::AnyPool,
     request: CandidateSearchRequest,
 ) -> Result<CandidateSearchResponse> {
+    validate_candidate_search_request(&request)?;
     let store = ExtensionStore::new(pool);
     let provider =
         select_candidate_provider(&store, request.provider_id, Some(&request.media_type)).await?;
@@ -294,12 +300,23 @@ pub(crate) async fn search_candidates_with_store(
     candidate_search_response_from_upstream(provider.summary, route_options, upstream)
 }
 
+pub(crate) async fn search_candidate_suite_with_store(
+    pool: &sqlx::AnyPool,
+    request: CandidateSearchRequest,
+) -> Result<CandidateSearchResponse> {
+    validate_candidate_search_request(&request)?;
+    let store = ExtensionStore::new(pool);
+    let providers = available_candidate_providers(&store, Some(&request.media_type)).await?;
+    search_candidate_suite_with_providers(pool, request, providers, None).await
+}
+
 #[cfg(test)]
 pub(crate) async fn search_candidates_with_store_at_base_url(
     pool: &sqlx::AnyPool,
     request: CandidateSearchRequest,
     base_url: &str,
 ) -> Result<CandidateSearchResponse> {
+    validate_candidate_search_request(&request)?;
     let store = ExtensionStore::new(pool);
     let provider =
         select_candidate_provider(&store, request.provider_id, Some(&request.media_type)).await?;
@@ -307,6 +324,702 @@ pub(crate) async fn search_candidates_with_store_at_base_url(
         candidate_route_options(pool, &store, &provider.extension.extension_id).await?;
     let upstream = invoke_candidate_provider_at_base_url(base_url, &provider, &request).await?;
     candidate_search_response_from_upstream(provider.summary, route_options, upstream)
+}
+
+#[cfg(test)]
+pub(crate) async fn search_candidate_suite_with_store_at_base_urls(
+    pool: &sqlx::AnyPool,
+    request: CandidateSearchRequest,
+    base_urls: std::collections::HashMap<Uuid, String>,
+) -> Result<CandidateSearchResponse> {
+    validate_candidate_search_request(&request)?;
+    let store = ExtensionStore::new(pool);
+    let providers = available_candidate_providers(&store, Some(&request.media_type)).await?;
+    search_candidate_suite_with_providers(pool, request, providers, Some(base_urls)).await
+}
+
+async fn search_candidate_suite_with_providers(
+    pool: &sqlx::AnyPool,
+    request: CandidateSearchRequest,
+    providers: Vec<CandidateProviderSelection>,
+    #[cfg_attr(not(test), allow(unused_variables))] test_base_urls: Option<
+        std::collections::HashMap<Uuid, String>,
+    >,
+) -> Result<CandidateSearchResponse> {
+    if providers.is_empty() {
+        return Ok(extension_suite_response(
+            &request.media_type,
+            Vec::new(),
+            Vec::new(),
+            vec![format!(
+                "extension_suite:no_provider: no eligible acquisition candidate providers are available for {}",
+                request.media_type
+            )],
+        ));
+    }
+
+    let mut tasks = JoinSet::new();
+    for (index, selected) in providers.into_iter().enumerate() {
+        let pool = pool.clone();
+        let mut provider_request = request.clone();
+        provider_request.provider_id = Some(selected.summary.provider_id);
+        #[cfg(test)]
+        let base_url = test_base_urls
+            .as_ref()
+            .and_then(|urls| urls.get(&selected.summary.provider_id).cloned());
+
+        tasks.spawn(async move {
+            let store = ExtensionStore::new(&pool);
+            let route_options =
+                candidate_route_options(&pool, &store, &selected.extension.extension_id).await?;
+            let upstream = {
+                #[cfg(test)]
+                {
+                    if let Some(base_url) = base_url {
+                        invoke_candidate_provider_at_base_url(
+                            &base_url,
+                            &selected,
+                            &provider_request,
+                        )
+                        .await?
+                    } else {
+                        invoke_candidate_provider(&selected, &provider_request).await?
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    invoke_candidate_provider(&selected, &provider_request).await?
+                }
+            };
+            let mut response = candidate_search_response_from_upstream(
+                selected.summary.clone(),
+                route_options,
+                upstream,
+            )?;
+            apply_candidate_result_cap(&mut response, provider_request.limit);
+            let provider = response.provider.clone();
+            let route_options = response.route_options.clone();
+            let warnings = response.warnings.clone();
+            for candidate in &mut response.candidates {
+                attach_extension_suite_provider_evidence(
+                    candidate,
+                    &provider,
+                    &route_options,
+                    &warnings,
+                );
+            }
+            Ok::<_, anyhow::Error>((index, response))
+        });
+    }
+
+    let mut successes = Vec::new();
+    let mut warnings = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(success)) => successes.push(success),
+            Ok(Err(err)) => warnings.push(format!("extension_suite:provider_failed: {err}")),
+            Err(err) => warnings.push(format!(
+                "extension_suite:provider_failed: task failed: {err}"
+            )),
+        }
+    }
+    successes.sort_by_key(|(index, _)| *index);
+
+    let mut candidates = Vec::new();
+    let mut route_options_by_key = BTreeMap::new();
+    for (_, response) in successes {
+        for warning in response.warnings {
+            warnings.push(format!(
+                "extension_suite:{}:{warning}",
+                response.provider.extension_id
+            ));
+        }
+        for option in response.route_options {
+            route_options_by_key
+                .entry((option.logical_id.clone(), option.selected_provider_id))
+                .or_insert(option);
+        }
+        candidates.extend(response.candidates);
+    }
+
+    let candidates = dedupe_extension_suite_candidates(candidates);
+
+    if candidates.is_empty() {
+        if warnings.is_empty() {
+            warnings.push(
+                "extension_suite:no_results: no suite provider returned acquisition candidates"
+                    .to_string(),
+            );
+        } else {
+            warnings.push("extension_suite:all_failed_or_no_results: no suite provider returned usable acquisition candidates".to_string());
+        }
+    }
+
+    Ok(extension_suite_response(
+        &request.media_type,
+        route_options_by_key.into_values().collect(),
+        candidates,
+        warnings,
+    ))
+}
+
+fn apply_candidate_result_cap(response: &mut CandidateSearchResponse, limit: Option<u32>) {
+    let Some(limit) = limit.and_then(|limit| usize::try_from(limit).ok()) else {
+        return;
+    };
+    if response.candidates.len() > limit {
+        response.candidates.truncate(limit);
+    }
+}
+
+#[derive(Debug)]
+struct SuiteCandidateDedupeGroup {
+    key: String,
+    items: Vec<SuiteCandidateDedupeItem>,
+}
+
+#[derive(Debug)]
+struct SuiteCandidateDedupeItem {
+    index: usize,
+    candidate: AcquisitionCandidate,
+}
+
+fn dedupe_extension_suite_candidates(
+    candidates: Vec<AcquisitionCandidate>,
+) -> Vec<AcquisitionCandidate> {
+    let mut groups = Vec::<SuiteCandidateDedupeGroup>::new();
+    let mut group_index_by_key = BTreeMap::<String, usize>::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let key = suite_candidate_dedupe_key(&candidate);
+        let group_index = if let Some(group_index) = group_index_by_key.get(&key).copied() {
+            group_index
+        } else {
+            let group_index = groups.len();
+            group_index_by_key.insert(key.clone(), group_index);
+            groups.push(SuiteCandidateDedupeGroup {
+                key,
+                items: Vec::new(),
+            });
+            group_index
+        };
+        groups[group_index]
+            .items
+            .push(SuiteCandidateDedupeItem { index, candidate });
+    }
+
+    groups
+        .into_iter()
+        .map(merge_extension_suite_candidate_group)
+        .collect()
+}
+
+fn merge_extension_suite_candidate_group(group: SuiteCandidateDedupeGroup) -> AcquisitionCandidate {
+    let primary_index = group
+        .items
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| compare_suite_primary_candidates(left, right))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let primary_item = &group.items[primary_index];
+    let mut merged = primary_item.candidate.clone();
+    let mut badges = merged.score_badges.clone();
+    for item in &group.items {
+        if item.index == primary_item.index {
+            continue;
+        }
+        merge_candidate_hints(&mut merged, &item.candidate, &mut badges);
+    }
+    merged.score_badges = badges;
+    let evidence = merged_extension_suite_evidence(&group, primary_item.index);
+    upsert_candidate_server_evidence(&mut merged, "extensionSuite", evidence);
+    merged
+}
+
+fn compare_suite_primary_candidates(
+    left: &SuiteCandidateDedupeItem,
+    right: &SuiteCandidateDedupeItem,
+) -> Ordering {
+    suite_primary_score(&left.candidate)
+        .cmp(&suite_primary_score(&right.candidate))
+        .then_with(|| right.index.cmp(&left.index))
+}
+
+fn suite_primary_score(candidate: &AcquisitionCandidate) -> (i32, i32, i64, i64, i64, i64) {
+    (
+        suite_route_availability_score(candidate),
+        cached_debrid_score(candidate.cached_debrid),
+        finite_score(candidate.score),
+        source_rank_score(candidate.rank),
+        i64::from(candidate.seeders.unwrap_or_default()),
+        i64::try_from(candidate.files.len()).unwrap_or(i64::MAX),
+    )
+}
+
+fn suite_route_availability_score(candidate: &AcquisitionCandidate) -> i32 {
+    let Some(route_options) = candidate_extension_suite_route_options(candidate) else {
+        return 1;
+    };
+    if route_options
+        .iter()
+        .any(|option| option.available && option.blocker.is_none())
+    {
+        2
+    } else {
+        0
+    }
+}
+
+fn cached_debrid_score(value: Option<bool>) -> i32 {
+    match value {
+        Some(true) => 2,
+        None => 1,
+        Some(false) => 0,
+    }
+}
+
+fn finite_score(value: Option<f64>) -> i64 {
+    value
+        .filter(|score| score.is_finite())
+        .map(|score| (score * 1_000.0).round() as i64)
+        .unwrap_or_default()
+}
+
+fn source_rank_score(rank: Option<u32>) -> i64 {
+    rank.map(|rank| i64::from(u32::MAX - rank))
+        .unwrap_or_default()
+}
+
+fn merge_candidate_hints(
+    primary: &mut AcquisitionCandidate,
+    other: &AcquisitionCandidate,
+    badges: &mut Vec<CandidateScoreBadge>,
+) {
+    primary.cached_debrid = match (primary.cached_debrid, other.cached_debrid) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    primary.seeders = max_option(primary.seeders, other.seeders);
+    primary.rank = min_option(primary.rank, other.rank);
+    primary.score = max_finite_option(primary.score, other.score);
+    if primary.quality.is_none() {
+        primary.quality.clone_from(&other.quality);
+    }
+    if primary.size_bytes.is_none() {
+        primary.size_bytes = other.size_bytes;
+    }
+    if primary.language.is_none() {
+        primary.language.clone_from(&other.language);
+    }
+    if primary.file_index.is_none() {
+        primary.file_index = other.file_index;
+    }
+    if primary.files.is_empty() && !other.files.is_empty() {
+        primary.files.clone_from(&other.files);
+    }
+    merge_supported_routes(&mut primary.supported_routes, &other.supported_routes);
+    if primary.default_route.is_none() {
+        primary.default_route.clone_from(&other.default_route);
+    }
+    merge_score_badges(badges, &other.score_badges);
+}
+
+fn max_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn min_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn max_finite_option(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (
+        left.filter(|value| value.is_finite()),
+        right.filter(|value| value.is_finite()),
+    ) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_supported_routes(primary: &mut Vec<String>, other: &[String]) {
+    let mut seen = primary
+        .iter()
+        .map(|route| route.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for route in other {
+        let key = route.to_ascii_lowercase();
+        if seen.insert(key) {
+            primary.push(route.clone());
+        }
+    }
+}
+
+fn merge_score_badges(primary: &mut Vec<CandidateScoreBadge>, other: &[CandidateScoreBadge]) {
+    let mut seen = primary.iter().map(score_badge_key).collect::<BTreeSet<_>>();
+    for badge in other {
+        let key = score_badge_key(badge);
+        if seen.insert(key) {
+            primary.push(badge.clone());
+        }
+    }
+}
+
+fn score_badge_key(badge: &CandidateScoreBadge) -> String {
+    format!(
+        "{}\u{1f}{}",
+        badge.label.trim().to_ascii_lowercase(),
+        badge
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    )
+}
+
+fn merged_extension_suite_evidence(
+    group: &SuiteCandidateDedupeGroup,
+    primary_item_index: usize,
+) -> Value {
+    let primary_item = group
+        .items
+        .iter()
+        .find(|item| item.index == primary_item_index)
+        .or_else(|| group.items.first())
+        .expect("suite dedupe groups are non-empty");
+    let mut evidence = suite_provider_evidence_object(&primary_item.candidate);
+    let contributors = group
+        .items
+        .iter()
+        .map(|item| suite_candidate_contributor_evidence(item, item.index == primary_item_index))
+        .collect::<Vec<_>>();
+    let warnings = group
+        .items
+        .iter()
+        .flat_map(|item| suite_candidate_provider_warnings(&item.candidate))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    evidence.insert("dedupeKey".to_string(), Value::String(group.key.clone()));
+    evidence.insert(
+        "dedupeFingerprintVersion".to_string(),
+        Value::String("es4-suite-v1".to_string()),
+    );
+    evidence.insert("contributorCount".to_string(), json!(contributors.len()));
+    evidence.insert("contributors".to_string(), Value::Array(contributors));
+    evidence.insert("warnings".to_string(), Value::Array(warnings));
+    Value::Object(evidence)
+}
+
+fn suite_candidate_contributor_evidence(item: &SuiteCandidateDedupeItem, primary: bool) -> Value {
+    let provider = suite_provider_evidence_object(&item.candidate);
+    json!({
+        "primary": primary,
+        "providerId": provider.get("providerId").cloned().unwrap_or(Value::Null),
+        "extensionId": provider.get("extensionId").cloned().unwrap_or(Value::Null),
+        "extensionName": provider.get("extensionName").cloned().unwrap_or(Value::Null),
+        "instanceId": provider.get("instanceId").cloned().unwrap_or(Value::Null),
+        "instanceName": provider.get("instanceName").cloned().unwrap_or(Value::Null),
+        "capability": provider.get("capability").cloned().unwrap_or(Value::Null),
+        "implementation": provider.get("implementation").cloned().unwrap_or(Value::Null),
+        "mediaTypes": provider.get("mediaTypes").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "actions": provider.get("actions").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "warnings": provider.get("warnings").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "routeOptions": provider.get("routeOptions").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "candidate": suite_candidate_snapshot(&item.candidate),
+    })
+}
+
+fn suite_candidate_snapshot(candidate: &AcquisitionCandidate) -> Value {
+    let mut object = JsonMap::new();
+    insert_optional_json(&mut object, "id", candidate.id.clone());
+    object.insert("title".to_string(), json!(candidate.title));
+    object.insert("sourceKind".to_string(), json!(candidate.source_kind));
+    insert_optional_json(&mut object, "infoHash", candidate.info_hash.clone());
+    insert_optional_json(&mut object, "fileIndex", candidate.file_index);
+    insert_optional_json(&mut object, "quality", candidate.quality.clone());
+    insert_optional_json(&mut object, "sizeBytes", candidate.size_bytes);
+    insert_optional_json(&mut object, "seeders", candidate.seeders);
+    insert_optional_json(&mut object, "language", candidate.language.clone());
+    insert_optional_json(&mut object, "cachedDebrid", candidate.cached_debrid);
+    insert_optional_json(&mut object, "rank", candidate.rank);
+    insert_optional_json(&mut object, "score", candidate.score);
+    object.insert("fileCount".to_string(), json!(candidate.files.len()));
+    if !candidate.score_badges.is_empty() {
+        object.insert("scoreBadges".to_string(), json!(candidate.score_badges));
+    }
+    if let Some(raw) = contributor_raw_evidence(candidate) {
+        object.insert("raw".to_string(), raw);
+    }
+    Value::Object(object)
+}
+
+fn insert_optional_json<T: Serialize>(
+    object: &mut JsonMap<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn contributor_raw_evidence(candidate: &AcquisitionCandidate) -> Option<Value> {
+    let mut raw = candidate.raw.clone()?;
+    if let Value::Object(root) = &mut raw {
+        let remove_server_evidence = if let Some(server_evidence) = root
+            .get_mut("serverEvidence")
+            .and_then(Value::as_object_mut)
+        {
+            server_evidence.remove("extensionSuite");
+            server_evidence.is_empty()
+        } else {
+            false
+        };
+        if remove_server_evidence {
+            root.remove("serverEvidence");
+        }
+        if root.is_empty() {
+            return None;
+        }
+    }
+    Some(raw)
+}
+
+fn suite_provider_evidence_object(candidate: &AcquisitionCandidate) -> JsonMap<String, Value> {
+    candidate
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.pointer("/serverEvidence/extensionSuite"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn suite_candidate_provider_warnings(candidate: &AcquisitionCandidate) -> Vec<String> {
+    suite_provider_evidence_object(candidate)
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn candidate_extension_suite_route_options(
+    candidate: &AcquisitionCandidate,
+) -> Option<Vec<CandidateRouteOption>> {
+    candidate
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.pointer("/serverEvidence/extensionSuite/routeOptions"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<CandidateRouteOption>>(value).ok())
+}
+
+fn suite_candidate_dedupe_key(candidate: &AcquisitionCandidate) -> String {
+    let source_kind = candidate.source_kind.trim().to_ascii_lowercase();
+    match source_kind.as_str() {
+        "magnet" | "torrent" => normalized_info_hash(candidate.info_hash.as_deref())
+            .or_else(|| magnet_source_info_hash(&candidate.source))
+            .map(|hash| format!("torrent:infohash:{hash}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:source:{}",
+                    source_kind,
+                    source_fingerprint(&candidate.source)
+                )
+            }),
+        "nzb" | "usenet" => candidate
+            .id
+            .as_deref()
+            .map(stable_value_fingerprint)
+            .map(|id| format!("usenet:id:{id}"))
+            .unwrap_or_else(|| format!("usenet:source:{}", source_fingerprint(&candidate.source))),
+        "url" if source_looks_like_nzb(&candidate.source) => {
+            format!("usenet:source:{}", source_fingerprint(&candidate.source))
+        }
+        "http" | "hoster" | "url" => candidate
+            .id
+            .as_deref()
+            .map(stable_value_fingerprint)
+            .map(|id| format!("{source_kind}:id:{id}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:source:{}",
+                    source_kind,
+                    source_fingerprint(&candidate.source)
+                )
+            }),
+        _ => format!(
+            "{}:source:{}",
+            source_kind,
+            source_fingerprint(&candidate.source)
+        ),
+    }
+}
+
+fn normalized_info_hash(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    let hash = trimmed
+        .strip_prefix("urn:btih:")
+        .or_else(|| trimmed.strip_prefix("URN:BTIH:"))
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_lowercase();
+    (!hash.is_empty()
+        && hash
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch.is_ascii_alphanumeric()))
+    .then_some(hash)
+}
+
+fn magnet_source_info_hash(source: &str) -> Option<String> {
+    let (scheme, query) = source.split_once('?')?;
+    if !scheme.eq_ignore_ascii_case("magnet:") {
+        return None;
+    }
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Ok(key) = urlencoding::decode(key) else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("xt") {
+            continue;
+        }
+        let Ok(value) = urlencoding::decode(value) else {
+            continue;
+        };
+        if let Some(hash) = normalized_info_hash(Some(
+            value
+                .strip_prefix("urn:btih:")
+                .or_else(|| value.strip_prefix("URN:BTIH:"))
+                .unwrap_or(value.as_ref()),
+        )) {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+fn source_fingerprint(source: &str) -> String {
+    stable_value_fingerprint(&canonical_source_for_fingerprint(source))
+}
+
+fn stable_value_fingerprint(value: &str) -> String {
+    blake3::hash(value.trim().as_bytes()).to_hex().to_string()
+}
+
+fn canonical_source_for_fingerprint(source: &str) -> String {
+    let trimmed = source.trim();
+    let Ok(mut url) = Url::parse(trimmed) else {
+        return trimmed.to_ascii_lowercase();
+    };
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url.host_str().map(str::to_ascii_lowercase);
+    let mut query_pairs = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if !query_pairs.is_empty() {
+        query_pairs.sort();
+        url.set_query(None);
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in query_pairs {
+                query.append_pair(&key, &value);
+            }
+        }
+    }
+    url.set_fragment(None);
+    if let Some(host) = host.as_deref() {
+        let _ = url.set_host(Some(host));
+    }
+    let _ = url.set_scheme(&scheme);
+    url.to_string()
+}
+
+fn source_looks_like_nzb(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.to_ascii_lowercase().ends_with(".nzb")
+}
+
+fn extension_suite_response(
+    media_type: &str,
+    route_options: Vec<CandidateRouteOption>,
+    candidates: Vec<AcquisitionCandidate>,
+    warnings: Vec<String>,
+) -> CandidateSearchResponse {
+    CandidateSearchResponse {
+        schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
+        provider: CandidateProviderSummary {
+            provider_id: Uuid::nil(),
+            extension_id: "elixir.extension_suite".to_string(),
+            extension_name: "Elixir Extension Suite".to_string(),
+            instance_id: Uuid::nil(),
+            instance_name: "default".to_string(),
+            capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+            implementation: Some("extension_suite".to_string()),
+            health_state: ProviderHealthState::Healthy,
+            media_types: vec![media_type.to_string()],
+            actions: vec!["search".to_string()],
+        },
+        route_options,
+        candidates,
+        warnings,
+    }
+}
+
+fn attach_extension_suite_provider_evidence(
+    candidate: &mut AcquisitionCandidate,
+    provider: &CandidateProviderSummary,
+    route_options: &[CandidateRouteOption],
+    warnings: &[String],
+) {
+    upsert_candidate_server_evidence(
+        candidate,
+        "extensionSuite",
+        json!({
+            "providerId": provider.provider_id.to_string(),
+            "extensionId": provider.extension_id,
+            "extensionName": provider.extension_name,
+            "instanceId": provider.instance_id.to_string(),
+            "instanceName": provider.instance_name,
+            "capability": provider.capability,
+            "implementation": provider.implementation,
+            "mediaTypes": provider.media_types,
+            "actions": provider.actions,
+            "warnings": warnings,
+            "routeOptions": route_options,
+        }),
+    );
 }
 
 fn candidate_search_response_from_upstream(
@@ -961,9 +1674,12 @@ mod tests {
         extensions::store::{NewExtension, NewExtensionInstance, NewProvider},
         orchestrator::planner::stable_provider_id,
     };
-    use axum::{Router, routing::post};
+    use axum::{Router, http::StatusCode, routing::post};
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
     use tokio::net::TcpListener;
 
     async fn setup_db() -> Result<Database> {
@@ -1046,6 +1762,653 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].contains("candidate[1] rejected"));
         assert!(warnings[1].contains("candidate[2] rejected"));
+    }
+
+    #[derive(Clone)]
+    struct SuiteProviderFixtureState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        response: Value,
+        status: StatusCode,
+        delay_ms: u64,
+    }
+
+    async fn start_suite_provider_fixture(
+        response: Value,
+        status: StatusCode,
+        delay_ms: u64,
+    ) -> Result<(String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SuiteProviderFixtureState {
+            requests: Arc::clone(&requests),
+            response,
+            status,
+            delay_ms,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let app = Router::new()
+            .route("/candidate-provider/search", post(suite_provider_fixture))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        Ok((
+            format!("http://127.0.0.1:{port}/candidate-provider"),
+            requests,
+            handle,
+        ))
+    }
+
+    async fn suite_provider_fixture(
+        State(state): State<SuiteProviderFixtureState>,
+        Json(payload): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        state.requests.lock().expect("requests lock").push(payload);
+        if state.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(state.delay_ms)).await;
+        }
+        (state.status, Json(state.response.clone()))
+    }
+
+    fn suite_candidate(title: &str, hash: &str) -> Value {
+        json!({
+            "title": title,
+            "source": format!("magnet:?xt=urn:btih:{hash}"),
+            "sourceKind": "magnet",
+            "infoHash": hash,
+            "quality": "1080p",
+            "seeders": 42,
+            "cachedDebrid": true,
+            "supportedRoutes": [
+                DEBRID_DEFAULT_LOGICAL_ID,
+                TORRENT_DEFAULT_LOGICAL_ID
+            ],
+            "defaultRoute": DEBRID_DEFAULT_LOGICAL_ID
+        })
+    }
+
+    fn suite_candidate_with_evidence(
+        title: &str,
+        hash: &str,
+        score: f64,
+        seeders: u32,
+        label: &str,
+    ) -> Value {
+        let mut candidate = suite_candidate(title, hash);
+        let object = candidate.as_object_mut().expect("candidate object");
+        object.insert("score".to_string(), json!(score));
+        object.insert("seeders".to_string(), json!(seeders));
+        object.insert(
+            "scoreBadges".to_string(),
+            json!([{
+                "label": label,
+                "detail": format!("{label} scoring evidence"),
+                "score": score
+            }]),
+        );
+        object.insert(
+            "raw".to_string(),
+            json!({
+                "fixture": label,
+                "sourceUrl": format!("https://source.example/{label}?token=secret-token")
+            }),
+        );
+        candidate
+    }
+
+    async fn seed_suite_provider(
+        store: &ExtensionStore<'_>,
+        extension_id: &str,
+        extension_name: &str,
+        port: u16,
+    ) -> Result<Uuid> {
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: extension_name.to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": extension_name,
+                    "provides": [{
+                        "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+                        "slot": "default",
+                        "cardinality": "one",
+                        "implementation": "suite_fixture",
+                        "scope": {
+                            "media_types": ["movie", "series", "anime"],
+                            "actions": ["search"]
+                        }
+                    }],
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/suite-fixture:1"
+                    }
+                }),
+                package_hash: Some(extension_id.to_string()),
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let provider_id = stable_provider_id(
+            instance_id,
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "default",
+        );
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("suite_fixture".to_string()),
+                scope_json: Some(json!({
+                    "media_types": ["movie", "series", "anime"],
+                    "actions": ["search"]
+                })),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "base_path": "/candidate-provider",
+                    "network": null
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok(provider_id)
+    }
+
+    fn suite_search_request(limit: Option<u32>) -> CandidateSearchRequest {
+        CandidateSearchRequest {
+            provider_id: None,
+            media_type: "movie".to_string(),
+            title: "Shared Request".to_string(),
+            year: Some(2026),
+            external_ids: Some(ExternalIds {
+                imdb: Some("tt1234567".to_string()),
+                ..Default::default()
+            }),
+            target: None,
+            search_intent: None,
+            preferences: CandidateSearchPreferences::default(),
+            limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_returns_partial_results_when_one_provider_fails() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (success_base_url, success_requests, success_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("A Release", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+                "warnings": ["fixture warning"]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let success_port = Url::parse(&success_base_url)?.port().unwrap();
+        let (failure_base_url, failure_requests, failure_server) = start_suite_provider_fixture(
+            json!({ "error": "upstream failed" }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            0,
+        )
+        .await?;
+        let failure_port = Url::parse(&failure_base_url)?.port().unwrap();
+        let success_provider =
+            seed_suite_provider(&store, "elixir.sources.suite.a", "A Source", success_port).await?;
+        let failure_provider =
+            seed_suite_provider(&store, "elixir.sources.suite.b", "B Source", failure_port).await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(success_provider, success_base_url);
+        base_urls.insert(failure_provider, failure_base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.provider.provider_id, Uuid::nil());
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        assert_eq!(response.candidates[0].title, "A Release");
+        let success_provider_text = success_provider.to_string();
+        let failure_provider_text = failure_provider.to_string();
+        assert_eq!(
+            response.candidates[0]
+                .raw
+                .as_ref()
+                .and_then(|value| value.pointer("/serverEvidence/extensionSuite/providerId"))
+                .and_then(Value::as_str),
+            Some(success_provider_text.as_str())
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fixture warning"))
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("provider_failed"))
+        );
+        let success_payload = success_requests.lock().expect("success requests")[0].clone();
+        let failure_payload = failure_requests.lock().expect("failure requests")[0].clone();
+        assert_eq!(
+            success_payload.pointer("/request/title"),
+            failure_payload.pointer("/request/title")
+        );
+        assert_eq!(
+            success_payload.pointer("/request/mediaType"),
+            failure_payload.pointer("/request/mediaType")
+        );
+        assert_eq!(
+            success_payload.pointer("/request/year"),
+            failure_payload.pointer("/request/year")
+        );
+        assert_eq!(
+            success_payload
+                .pointer("/request/providerId")
+                .and_then(Value::as_str),
+            Some(success_provider_text.as_str())
+        );
+        assert_eq!(
+            failure_payload
+                .pointer("/request/providerId")
+                .and_then(Value::as_str),
+            Some(failure_provider_text.as_str())
+        );
+        success_server.abort();
+        failure_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_keeps_deterministic_provider_order() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (slow_base_url, _slow_requests, slow_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("A Sorted Release", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]
+            }),
+            StatusCode::OK,
+            100,
+        )
+        .await?;
+        let (fast_base_url, _fast_requests, fast_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("B Sorted Release", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let slow_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.sorted_a",
+            "A Source",
+            Url::parse(&slow_base_url)?.port().unwrap(),
+        )
+        .await?;
+        let fast_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.sorted_b",
+            "B Source",
+            Url::parse(&fast_base_url)?.port().unwrap(),
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(slow_provider, slow_base_url);
+        base_urls.insert(fast_provider, fast_base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(
+            response
+                .candidates
+                .iter()
+                .map(|candidate| candidate.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A Sorted Release", "B Sorted Release"],
+            "{:?}",
+            response.warnings
+        );
+        slow_server.abort();
+        fast_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_all_failures_returns_explainable_empty_response() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (first_base_url, _first_requests, first_server) = start_suite_provider_fixture(
+            json!({ "error": "first failed" }),
+            StatusCode::BAD_GATEWAY,
+            0,
+        )
+        .await?;
+        let (second_base_url, _second_requests, second_server) = start_suite_provider_fixture(
+            json!({ "error": "second failed" }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            0,
+        )
+        .await?;
+        let first_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.fail_a",
+            "A Source",
+            Url::parse(&first_base_url)?.port().unwrap(),
+        )
+        .await?;
+        let second_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.fail_b",
+            "B Source",
+            Url::parse(&second_base_url)?.port().unwrap(),
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(first_provider, first_base_url);
+        base_urls.insert(second_provider, second_base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.provider.provider_id, Uuid::nil());
+        assert!(response.candidates.is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("provider_failed"))
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("all_failed_or_no_results"))
+        );
+        first_server.abort();
+        second_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_no_results_returns_explainable_empty_response() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (base_url, _requests, server) = start_suite_provider_fixture(
+            json!({
+                "candidates": []
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.empty",
+            "Empty Source",
+            Url::parse(&base_url)?.port().unwrap(),
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(provider, base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.provider.provider_id, Uuid::nil());
+        assert!(response.candidates.is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no_results"))
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_dedupes_same_info_hash_and_merges_contributors() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let hash = "cccccccccccccccccccccccccccccccccccccccc";
+        let (first_base_url, _first_requests, first_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate_with_evidence("Same Release A", hash, 10.0, 10, "first")],
+                "warnings": ["first provider warning"]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (second_base_url, _second_requests, second_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate_with_evidence("Same Release B", hash, 99.0, 90, "second")],
+                "warnings": ["second provider warning"]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let first_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.dedupe_a",
+            "A Source",
+            Url::parse(&first_base_url)?.port().unwrap(),
+        )
+        .await?;
+        let second_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.dedupe_b",
+            "B Source",
+            Url::parse(&second_base_url)?.port().unwrap(),
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(first_provider, first_base_url);
+        base_urls.insert(second_provider, second_base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        let candidate = &response.candidates[0];
+        assert_eq!(candidate.title, "Same Release B");
+        assert_eq!(candidate.seeders, Some(90));
+        assert_eq!(candidate.score, Some(99.0));
+        assert_eq!(candidate.cached_debrid, Some(true));
+        assert!(
+            candidate
+                .score_badges
+                .iter()
+                .any(|badge| badge.label == "first")
+        );
+        assert!(
+            candidate
+                .score_badges
+                .iter()
+                .any(|badge| badge.label == "second")
+        );
+        let evidence = candidate
+            .raw
+            .as_ref()
+            .and_then(|value| value.pointer("/serverEvidence/extensionSuite"))
+            .expect("extension suite evidence");
+        assert_eq!(
+            evidence.pointer("/providerId").and_then(Value::as_str),
+            Some(second_provider.to_string().as_str())
+        );
+        assert_eq!(
+            evidence
+                .pointer("/contributorCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            evidence.pointer("/dedupeKey").and_then(Value::as_str),
+            Some(format!("torrent:infohash:{hash}").as_str())
+        );
+        let contributor_provider_ids = evidence
+            .pointer("/contributors")
+            .and_then(Value::as_array)
+            .expect("contributors")
+            .iter()
+            .filter_map(|value| value.get("providerId").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert!(contributor_provider_ids.contains(first_provider.to_string().as_str()));
+        assert!(contributor_provider_ids.contains(second_provider.to_string().as_str()));
+        let warnings = evidence
+            .get("warnings")
+            .and_then(Value::as_array)
+            .expect("merged warnings")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(warnings.contains("first provider warning"));
+        assert!(warnings.contains("second provider warning"));
+        let raw_text = serde_json::to_string(evidence)?;
+        assert!(!raw_text.contains("secret-token"));
+        assert!(raw_text.contains("%5BREDACTED%5D"));
+        first_server.abort();
+        second_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_fanout_keeps_same_title_different_info_hashes_separate() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (first_base_url, _first_requests, first_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("Shared Title", "dddddddddddddddddddddddddddddddddddddddd")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (second_base_url, _second_requests, second_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("Shared Title", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let first_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.distinct_a",
+            "A Source",
+            Url::parse(&first_base_url)?.port().unwrap(),
+        )
+        .await?;
+        let second_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.suite.distinct_b",
+            "B Source",
+            Url::parse(&second_base_url)?.port().unwrap(),
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(first_provider, first_base_url.clone());
+        base_urls.insert(second_provider, second_base_url.clone());
+        let first_response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls.clone(),
+        )
+        .await?;
+        let second_response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(5)),
+            base_urls,
+        )
+        .await?;
+
+        let first_keys = first_response
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .raw
+                    .as_ref()
+                    .and_then(|value| value.pointer("/serverEvidence/extensionSuite/dedupeKey"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        let second_keys = second_response
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .raw
+                    .as_ref()
+                    .and_then(|value| value.pointer("/serverEvidence/extensionSuite/dedupeKey"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_response.candidates.len(), 2);
+        assert_eq!(first_keys, second_keys);
+        assert!(
+            first_keys
+                .iter()
+                .any(|key| key.ends_with("dddddddddddddddddddddddddddddddddddddddd"))
+        );
+        assert!(
+            first_keys
+                .iter()
+                .any(|key| key.ends_with("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
+        );
+        first_server.abort();
+        second_server.abort();
+        Ok(())
     }
 
     #[test]

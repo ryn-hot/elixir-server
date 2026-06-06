@@ -685,6 +685,8 @@ async fn approve_release_for_review(
         &request.mappings,
     )
     .await?;
+    let approved_target_mappings =
+        approved_manual_target_mappings(&file_selection, &request.mappings);
     let active_release = if let Some(state) = broker_state
         && release.download_id.is_none()
         && !matches!(
@@ -736,31 +738,21 @@ async fn approve_release_for_review(
     let reviewer = reviewer_id(user_id);
     let selected_coverage_state = selected_coverage_state(&active_release);
     for row in &coverage {
-        let state = match row.release_file_id {
-            Some(release_file_id)
-                if file_selection
-                    .skipped_release_file_ids
-                    .contains(&release_file_id) =>
-            {
-                ReleaseCoverageState::Rejected
-            }
-            Some(release_file_id)
-                if file_selection.explicit
-                    && !file_selection
-                        .selected_release_file_ids
-                        .contains(&release_file_id) =>
-            {
-                ReleaseCoverageState::Rejected
-            }
-            None if file_selection.explicit
-                && !file_selection.selected_release_file_ids.is_empty() =>
-            {
-                ReleaseCoverageState::Rejected
-            }
-            _ => selected_coverage_state,
-        };
+        let state = manual_approval_coverage_state(
+            row,
+            &file_selection,
+            &approved_target_mappings,
+            selected_coverage_state,
+        );
         let reason = if state == ReleaseCoverageState::Rejected {
-            Some("Skipped by manual acquisition review.".to_string())
+            Some(
+                if approved_target_mappings.is_empty() {
+                    "Skipped by manual acquisition review."
+                } else {
+                    "Not selected by manual acquisition review mapping."
+                }
+                .to_string(),
+            )
         } else {
             request
                 .reason
@@ -778,19 +770,21 @@ async fn approve_release_for_review(
         .map_err(ApiError::from)?;
     }
     for mapping in &request.mappings {
-        let release_file_id = mapping.release_file_id.map(|release_file_id| {
+        let Some(release_file_id) = mapping.release_file_id.map(|release_file_id| {
             file_selection
                 .release_file_aliases
                 .get(&release_file_id)
                 .copied()
                 .unwrap_or(release_file_id)
-        });
+        }) else {
+            continue;
+        };
         upsert_release_coverage(
             pool,
             NewAcquisitionReleaseCoverage {
                 coverage_id: None,
                 release_id,
-                release_file_id,
+                release_file_id: Some(release_file_id),
                 target_id: mapping.target_id,
                 coverage_kind: mapping
                     .coverage_kind
@@ -2172,6 +2166,73 @@ fn resolve_manual_file_selection(
         skipped_file_ids,
         release_file_aliases,
     })
+}
+
+fn approved_manual_target_mappings(
+    selection: &ResolvedManualFileSelection,
+    mappings: &[ManualCoverageMappingRequest],
+) -> BTreeMap<Uuid, Uuid> {
+    mappings
+        .iter()
+        .filter_map(|mapping| {
+            let release_file_id = mapping.release_file_id?;
+            let release_file_id = selection
+                .release_file_aliases
+                .get(&release_file_id)
+                .copied()
+                .unwrap_or(release_file_id);
+            Some((mapping.target_id, release_file_id))
+        })
+        .collect()
+}
+
+fn manual_approval_coverage_state(
+    row: &AcquisitionReleaseCoverage,
+    selection: &ResolvedManualFileSelection,
+    approved_target_mappings: &BTreeMap<Uuid, Uuid>,
+    selected_state: ReleaseCoverageState,
+) -> ReleaseCoverageState {
+    if row.state == ReleaseCoverageState::Rejected {
+        return ReleaseCoverageState::Rejected;
+    }
+
+    if !approved_target_mappings.is_empty() {
+        let Some(release_file_id) = row.release_file_id else {
+            return ReleaseCoverageState::Rejected;
+        };
+        let release_file_id = selection
+            .release_file_aliases
+            .get(&release_file_id)
+            .copied()
+            .unwrap_or(release_file_id);
+        return if approved_target_mappings.get(&row.target_id) == Some(&release_file_id) {
+            selected_state
+        } else {
+            ReleaseCoverageState::Rejected
+        };
+    }
+
+    match row.release_file_id {
+        Some(release_file_id)
+            if selection
+                .skipped_release_file_ids
+                .contains(&release_file_id) =>
+        {
+            ReleaseCoverageState::Rejected
+        }
+        Some(release_file_id)
+            if selection.explicit
+                && !selection
+                    .selected_release_file_ids
+                    .contains(&release_file_id) =>
+        {
+            ReleaseCoverageState::Rejected
+        }
+        None if selection.explicit && !selection.selected_release_file_ids.is_empty() => {
+            ReleaseCoverageState::Rejected
+        }
+        _ => selected_state,
+    }
 }
 
 fn apply_release_file_aliases(
@@ -5726,6 +5787,153 @@ mod tests {
         let jobs = list_release_jobs(&database.pool, fixture.release_id).await?;
         assert_eq!(jobs[0].state, ReleaseJobState::Ready);
         assert!(jobs[0].active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_approval_can_map_subset_of_placeholder_review_targets() -> Result<()> {
+        let database = setup_db().await?;
+        let user_id = Uuid::new_v4();
+        let fixture = setup_anime_review_pack(&database).await?;
+        let release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .expect("release");
+        let subscription_id = release.subscription_id.expect("subscription");
+        let placeholder_targets = upsert_subscription_targets(
+            &database.pool,
+            subscription_id,
+            vec![
+                NewAcquisitionTarget {
+                    target_key: Some("S01E02".to_string()),
+                    media_type: Some(MediaType::Anime),
+                    title: Some("Episode 2".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(2),
+                    absolute_episode_number: Some(2),
+                    air_date: None,
+                    air_time: None,
+                    metadata: None,
+                    state: Some(AcquisitionTargetState::Searching),
+                    next_search_after: Some(Utc::now()),
+                },
+                NewAcquisitionTarget {
+                    target_key: Some("S01E03".to_string()),
+                    media_type: Some(MediaType::Anime),
+                    title: Some("Episode 3".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(3),
+                    absolute_episode_number: Some(3),
+                    air_date: None,
+                    air_time: None,
+                    metadata: None,
+                    state: Some(AcquisitionTargetState::Searching),
+                    next_search_after: Some(Utc::now()),
+                },
+            ],
+        )
+        .await?
+        .into_iter()
+        .filter(|target| !fixture.target_ids.contains(&target.target_id))
+        .collect::<Vec<_>>();
+        for target in &placeholder_targets {
+            upsert_release_coverage(
+                &database.pool,
+                NewAcquisitionReleaseCoverage {
+                    coverage_id: None,
+                    release_id: fixture.release_id,
+                    release_file_id: None,
+                    target_id: target.target_id,
+                    coverage_kind: ReleaseCoverageKind::SeasonPack,
+                    confidence: ReleaseConfidence::ReviewRequired,
+                    score: Some(60.0),
+                    reason: Some("needs manual file mapping".to_string()),
+                    state: ReleaseCoverageState::ReviewRequired,
+                    verified_by: None,
+                },
+            )
+            .await?;
+        }
+        let all_target_ids = fixture
+            .target_ids
+            .iter()
+            .copied()
+            .chain(placeholder_targets.iter().map(|target| target.target_id))
+            .collect::<Vec<_>>();
+        let competing =
+            setup_competing_review_pack(&database, subscription_id, &all_target_ids, "cccccccc")
+                .await?;
+
+        approve_release_for_review(
+            None,
+            &database.pool,
+            user_id,
+            fixture.release_id,
+            ApproveAcquisitionReleaseRequest {
+                selected_release_file_ids: vec![fixture.file_ids[0]],
+                skipped_release_file_ids: vec![fixture.file_ids[1]],
+                mappings: vec![ManualCoverageMappingRequest {
+                    target_id: fixture.target_ids[0],
+                    release_file_id: Some(fixture.file_ids[0]),
+                    coverage_kind: Some(ReleaseCoverageKind::ManualOverride),
+                    confidence: Some(ReleaseConfidence::High),
+                    score: Some(100.0),
+                    reason: Some("manual anime episode mapping".to_string()),
+                }],
+                reason: Some("verified one anime episode file".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let approved_coverage = list_release_coverage(&database.pool, fixture.release_id).await?;
+        let selected_targets = approved_coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::Selected)
+            .map(|row| row.target_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected_targets, BTreeSet::from([fixture.target_ids[0]]));
+        for target in &placeholder_targets {
+            assert!(
+                approved_coverage.iter().any(|row| {
+                    row.target_id == target.target_id && row.state == ReleaseCoverageState::Rejected
+                }),
+                "unmapped target {} should stay unapproved on approved release",
+                target.target_key
+            );
+        }
+        let submitted_target = get_target(&database.pool, fixture.target_ids[0])
+            .await?
+            .expect("submitted target");
+        assert_eq!(submitted_target.state, AcquisitionTargetState::Submitted);
+
+        let competing_release = get_release(&database.pool, competing.release_id)
+            .await?
+            .expect("competing release");
+        assert_eq!(
+            competing_release.state,
+            AcquisitionReleaseState::ReviewRequired
+        );
+        let competing_coverage =
+            list_release_coverage(&database.pool, competing.release_id).await?;
+        let competing_rejected = competing_coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::Rejected)
+            .map(|row| row.target_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(competing_rejected, BTreeSet::from([fixture.target_ids[0]]));
+        let competing_remaining = competing_coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::ReviewRequired)
+            .map(|row| row.target_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            competing_remaining,
+            placeholder_targets
+                .iter()
+                .map(|target| target.target_id)
+                .collect::<BTreeSet<_>>()
+        );
         Ok(())
     }
 

@@ -3253,6 +3253,7 @@ fn anime_scoring_context_from_qbittorrent_release(
             .and_then(Value::as_str)
             .map(str::to_string),
         aliases,
+        scoped_aliases: vec![],
         targets: targets
             .iter()
             .map(|target| {
@@ -3262,6 +3263,7 @@ fn anime_scoring_context_from_qbittorrent_release(
                     canonical_key: metadata_json_string(metadata, "targetCanonicalKey"),
                     title: target.title.clone(),
                     season_number: target.season_number,
+                    anilist_season_id: metadata_json_string(metadata, "anilistSeasonId"),
                     episode_number: target.episode_number,
                     absolute_episode_number: target.absolute_episode_number,
                     tvdb_episode_id: metadata_json_string(metadata, "tvdbEpisodeId"),

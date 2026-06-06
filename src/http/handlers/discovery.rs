@@ -55,7 +55,10 @@ use crate::{
             list_subscription_targets, list_subscriptions, update_target_state,
         },
     },
-    db::models::{ExtensionTrustLevel, MediaType, ProviderHealthState, SecretScope},
+    db::models::{
+        Extension, ExtensionInstance, ExtensionTrustLevel, MediaType, ProviderHealthState,
+        ProviderReadiness, ProviderReadinessPhase, SecretScope,
+    },
     debrid::{
         DEBRID_EXTENSION_ID, LEGACY_REAL_DEBRID_EXTENSION_ID, active_debrid_service_from_config,
         debrid_secret_exists_for_instance, is_debrid_service_implementation, load_debrid_progress,
@@ -262,6 +265,30 @@ pub struct ProviderSummary {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSuiteProviderSummary {
+    pub provider_id: Uuid,
+    pub extension_id: String,
+    pub extension_name: String,
+    pub instance_id: Uuid,
+    pub instance_name: String,
+    pub capability: String,
+    pub implementation: Option<String>,
+    pub health_state: ProviderHealthState,
+    pub enabled: bool,
+    pub extension_enabled: bool,
+    pub instance_enabled: bool,
+    pub media_types: Vec<String>,
+    pub actions: Vec<String>,
+    pub label: String,
+    pub last_healthcheck_at: Option<DateTime<Utc>>,
+    pub readiness_phase: Option<ProviderReadinessPhase>,
+    pub readiness_detail: Option<String>,
+    pub last_readiness_checked_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerPreferencesResponse {
@@ -413,6 +440,8 @@ pub struct FindMediaAcquisitionChildItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_suite: Option<FindMediaAcquisitionSourceSuite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub route_provider_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_provider_label: Option<String>,
@@ -461,6 +490,52 @@ pub struct FindMediaAcquisitionChildItem {
     pub availability: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seen_complete_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindMediaAcquisitionSourceSuite {
+    pub label: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suite_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_provider_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_provider_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_extension_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_extension_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_implementation: Option<String>,
+    pub contributor_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<FindMediaAcquisitionSourceContributor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindMediaAcquisitionSourceContributor {
+    pub primary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,6 +844,7 @@ struct AcquisitionUxContext {
 struct SourceTargetReleaseRuntime {
     release_id: Uuid,
     source_provider_id: Option<Uuid>,
+    source_suite: Option<FindMediaAcquisitionSourceSuite>,
     route_provider_id: Option<Uuid>,
     release_title: String,
     release_state: AcquisitionReleaseState,
@@ -904,6 +980,7 @@ pub struct FindMediaPreferencesResponse {
     pub tv_source_candidates: Vec<ProviderSummary>,
     pub movies_source_candidates: Vec<ProviderSummary>,
     pub anime_source_candidates: Vec<ProviderSummary>,
+    pub source_suite_providers: Vec<SourceSuiteProviderSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1087,13 +1164,10 @@ pub async fn find_media_targets(
     )
     .await
     .map_err(ApiError::from)?;
-    let (source_contexts, _source_errors) = filter_search_providers(
-        &state,
-        &store,
-        collect_source_providers(&providers, media_type),
-    )
-    .await
-    .map_err(ApiError::from)?;
+    let source_contexts = resolve_extension_suite_providers(&state, &store, &providers, media_type)
+        .await
+        .map_err(ApiError::from)?
+        .providers;
 
     let preferred = preferred_manager_for_type(&preferences, media_type);
     let blueprint_preferred =
@@ -1254,6 +1328,9 @@ pub async fn find_media_scoped_add(
         ),
         route_policy: payload.route_policy.or(scope_document.route_policy),
         source_provider_id: Some(payload.provider_id),
+        source_selection_route: Some("suite:default".to_string()),
+        source_selection_mode: Some("suite".to_string()),
+        source_suite_id: Some("default".to_string()),
         release_delay_seconds: None,
         quality_profile: None,
         metadata_refresh_after: Some(now),
@@ -1472,6 +1549,8 @@ struct FindMediaScopedPreviewTarget {
     title: Option<String>,
     air_date: Option<String>,
     thumbnail_url: Option<String>,
+    overview: Option<String>,
+    runtime_minutes: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1498,6 +1577,8 @@ fn select_scoped_add_targets_from_preview(
                 title: Some(preview.media.title.clone()),
                 air_date: None,
                 thumbnail_url: None,
+                overview: None,
+                runtime_minutes: None,
             }]);
         }
         bail!("movie scoped add only supports movie or entire-title selection");
@@ -1607,6 +1688,8 @@ fn flattened_scope_preview_targets(
                 title: episode.title.clone(),
                 air_date: episode.air_date.clone(),
                 thumbnail_url: episode.thumbnail_url.clone(),
+                overview: episode.overview.clone(),
+                runtime_minutes: episode.runtime_minutes,
             });
         }
     }
@@ -1646,24 +1729,8 @@ async fn ensure_find_media_scoped_catalog(
         MediaType::Series | MediaType::Anime => {
             let media_item_id =
                 ensure_find_media_scoped_series(&state.db_pool, &preview.media).await?;
-            let scaffolds = targets
-                .iter()
-                .filter_map(|target| {
-                    let season = target.season_number?;
-                    let episode = target.episode_number?;
-                    Some(AcquisitionLibraryTargetScaffold {
-                        media_type: preview.media.kind,
-                        title: target
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| format!("Episode {episode}")),
-                        season_number: Some(season),
-                        episode_number: Some(episode),
-                        absolute_episode_number: target.absolute_episode_number,
-                        metadata: Some(scoped_add_episode_metadata(target)),
-                    })
-                })
-                .collect::<Vec<_>>();
+            let catalog_targets = scoped_add_catalog_targets_from_preview(preview, targets)?;
+            let scaffolds = scoped_add_catalog_scaffolds(preview.media.kind, &catalog_targets);
             scaffold_acquisition_library_targets(
                 &state.db_pool,
                 Some(state.artwork.as_ref()),
@@ -1680,6 +1747,47 @@ async fn ensure_find_media_scoped_catalog(
         media_item_id,
         episode_ids_by_target_key,
     })
+}
+
+fn scoped_add_catalog_targets_from_preview(
+    preview: &FindMediaScopePreviewResponse,
+    selected_targets: &[FindMediaScopedPreviewTarget],
+) -> AnyResult<Vec<FindMediaScopedPreviewTarget>> {
+    match preview.media.kind {
+        MediaType::Movie => Ok(selected_targets.to_vec()),
+        MediaType::Series | MediaType::Anime => {
+            let preview_targets = flattened_scope_preview_targets(preview)?;
+            if preview_targets.is_empty() {
+                Ok(selected_targets.to_vec())
+            } else {
+                Ok(preview_targets)
+            }
+        }
+    }
+}
+
+fn scoped_add_catalog_scaffolds(
+    media_type: MediaType,
+    targets: &[FindMediaScopedPreviewTarget],
+) -> Vec<AcquisitionLibraryTargetScaffold> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            let season = target.season_number?;
+            let episode = target.episode_number?;
+            Some(AcquisitionLibraryTargetScaffold {
+                media_type,
+                title: target
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("Episode {episode}")),
+                season_number: Some(season),
+                episode_number: Some(episode),
+                absolute_episode_number: target.absolute_episode_number,
+                metadata: Some(scoped_add_episode_metadata(target)),
+            })
+        })
+        .collect()
 }
 
 async fn ensure_find_media_scoped_movie(
@@ -2116,6 +2224,10 @@ fn scoped_add_episode_metadata(target: &FindMediaScopedPreviewTarget) -> Value {
         "airDate": target.air_date,
         "image": target.thumbnail_url,
         "thumbnail": target.thumbnail_url,
+        "overview": target.overview,
+        "description": target.overview,
+        "runtime": target.runtime_minutes,
+        "runtimeMinutes": target.runtime_minutes,
     }))
 }
 
@@ -2151,6 +2263,8 @@ fn scoped_add_scope_json(
                 "title": target.title,
                 "airDate": target.air_date,
                 "thumbnailUrl": target.thumbnail_url,
+                "overview": target.overview,
+                "runtimeMinutes": target.runtime_minutes,
                 "libraryEpisodeId": episode_ids_by_target_key
                     .get(&target.target_key)
                     .map(|id| id.to_string()),
@@ -2240,6 +2354,8 @@ fn scoped_add_new_acquisition_target(
             "absoluteEpisodeNumber": target.absolute_episode_number,
             "airDate": target.air_date,
             "thumbnailUrl": target.thumbnail_url,
+            "overview": target.overview,
+            "runtimeMinutes": target.runtime_minutes,
             "scopeMetadata": {
                 "mediaItemId": media_item_id.to_string(),
                 "libraryEpisodeId": library_episode_id.map(|id| id.to_string()),
@@ -2465,8 +2581,10 @@ async fn find_media_scope_provider_blockers(
     provider_id: Option<Uuid>,
 ) -> AnyResult<Vec<FindMediaScopePreviewBlocker>> {
     let providers = load_provider_contexts(store).await?;
-    let source_contexts = collect_source_providers(&providers, media_type);
-    let (available, unavailable) = filter_search_providers(state, store, source_contexts).await?;
+    let suite_resolution =
+        resolve_extension_suite_providers(state, store, &providers, media_type).await?;
+    let available = suite_resolution.providers;
+    let unavailable = suite_resolution.unavailable;
     let mut blockers = Vec::new();
 
     if let Some(provider_id) = provider_id {
@@ -2585,6 +2703,8 @@ async fn build_find_media_tv_scope_preview(
                     title: episode.title,
                     air_date: extract_preview_air_date(&episode.raw),
                     thumbnail_url: episode.image,
+                    overview: preview_overview_from_raw(&episode.raw),
+                    runtime_minutes: preview_runtime_minutes_from_raw(&episode.raw),
                 })
             })
             .collect::<Vec<_>>();
@@ -2753,6 +2873,8 @@ fn anime_scope_preview_seasons_from_graph_at(
                     title: Some(target.title.clone()),
                     air_date: target.air_date.clone(),
                     thumbnail_url: preview_thumbnail_from_raw(&target.raw),
+                    overview: preview_overview_from_raw(&target.raw),
+                    runtime_minutes: preview_runtime_minutes_from_raw(&target.raw),
                 })
                 .collect::<Vec<_>>();
             (!episodes.is_empty()).then_some(FindMediaScopePreviewSeason {
@@ -2900,6 +3022,45 @@ fn preview_thumbnail_from_raw(value: &Value) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn preview_overview_from_raw(value: &Value) -> Option<String> {
+    for key in ["overview", "description", "summary", "synopsis", "plot"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str).map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn preview_runtime_minutes_from_raw(value: &Value) -> Option<i32> {
+    for key in [
+        "runtimeMinutes",
+        "runtime_minutes",
+        "durationMinutes",
+        "duration_minutes",
+        "runtime",
+        "length",
+    ] {
+        if let Some(minutes) = json_i32(value.get(key)).filter(|value| *value > 0) {
+            return Some(minutes);
+        }
+    }
+
+    for key in [
+        "runtimeSeconds",
+        "runtime_seconds",
+        "durationSeconds",
+        "duration_seconds",
+    ] {
+        if let Some(seconds) = json_i32(value.get(key)).filter(|value| *value > 0) {
+            return Some((seconds + 59) / 60);
+        }
+    }
+
     None
 }
 
@@ -3554,6 +3715,10 @@ async fn load_source_release_runtime_by_target(
             let runtime = SourceTargetReleaseRuntime {
                 release_id: release.release_id,
                 source_provider_id: release.source_provider_id,
+                source_suite: source_suite_summary_from_selected_candidate(
+                    release.selected_candidate.as_ref(),
+                    &HashMap::new(),
+                ),
                 route_provider_id: latest_job
                     .as_ref()
                     .and_then(|job| job.provider_id)
@@ -3614,7 +3779,7 @@ fn build_source_acquisition_item(
     let source_provider_id = source_provider_id_for_subscription(subscription, targets);
     let source_provider = source_provider_id.and_then(|id| provider_map.get(&id));
     let manager_provider_id = source_provider_id.unwrap_or_else(Uuid::nil);
-    let source_label = source_provider
+    let source_provider_label = source_provider
         .map(provider_label)
         .unwrap_or_else(|| "Acquisition source".to_string());
 
@@ -3622,7 +3787,7 @@ fn build_source_acquisition_item(
         return Some(build_empty_source_acquisition_item(
             subscription,
             manager_provider_id,
-            source_label,
+            source_acquisition_source_label(subscription, &[], source_provider_label),
             ux_context,
         ));
     }
@@ -3658,6 +3823,8 @@ fn build_source_acquisition_item(
                 source_target_sort_key(&left.title).cmp(&source_target_sort_key(&right.title))
             })
     });
+    let source_label =
+        source_acquisition_source_label(subscription, &children, source_provider_label);
     let target_count = children.len();
     let counts = source_acquisition_counts(&children);
     let phase = summarize_source_acquisition_phase(counts);
@@ -3777,6 +3944,53 @@ fn source_acquisition_request_label(subscription: &AcquisitionSubscription) -> S
         AcquisitionRequestScope::Subscription => "One-time request",
     }
     .to_string()
+}
+
+fn source_acquisition_source_label(
+    subscription: &AcquisitionSubscription,
+    children: &[FindMediaAcquisitionChildItem],
+    fallback: String,
+) -> String {
+    if subscription_scope_uses_extension_suite(subscription.scope.as_ref())
+        || children.iter().any(|child| child.source_suite.is_some())
+    {
+        "Elixir Extension Suite".to_string()
+    } else {
+        fallback
+    }
+}
+
+fn subscription_scope_uses_extension_suite(scope: Option<&Value>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let source_selection = scope
+        .get("sourceSelection")
+        .or_else(|| scope.get("source_selection"));
+    let mode = source_selection
+        .and_then(|value| {
+            value
+                .get("mode")
+                .or_else(|| value.get("sourceSelectionMode"))
+                .or_else(|| value.get("source_selection_mode"))
+        })
+        .or_else(|| scope.get("sourceSelectionMode"))
+        .or_else(|| scope.get("source_selection_mode"))
+        .and_then(json_string_value);
+    if mode.is_some_and(|value| value.eq_ignore_ascii_case("suite")) {
+        return true;
+    }
+    let route = source_selection
+        .and_then(|value| {
+            value
+                .get("route")
+                .or_else(|| value.get("sourceSelectionRoute"))
+                .or_else(|| value.get("source_selection_route"))
+        })
+        .or_else(|| scope.get("sourceSelectionRoute"))
+        .or_else(|| scope.get("source_selection_route"))
+        .and_then(json_string_value);
+    route.is_some_and(|value| value.eq_ignore_ascii_case("suite:default"))
 }
 
 fn find_media_scoped_request_label(subscription: &AcquisitionSubscription) -> Option<String> {
@@ -3941,7 +4155,11 @@ fn json_string_at(value: Option<&Value>, path: &[&str]) -> Option<String> {
     for key in path {
         current = current.get(*key)?;
     }
-    current
+    json_string_value(current)
+}
+
+fn json_string_value(value: &Value) -> Option<String> {
+    value
         .as_str()
         .map(str::trim)
         .filter(|value: &&str| !value.is_empty())
@@ -4105,6 +4323,7 @@ fn build_source_acquisition_child(
     let route_provider_id = route_provider_id_for_target(target, release_runtime);
     let source_provider_label = source_provider_id
         .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+    let source_suite = source_suite_summary_for_target(target, release_runtime, provider_map);
     let route_provider_label = route_provider_id
         .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
     let no_results = source_target_is_no_results(target);
@@ -4125,6 +4344,7 @@ fn build_source_acquisition_child(
         release_id: release_runtime.map(|runtime| runtime.release_id),
         source_provider_id,
         source_provider_label,
+        source_suite,
         route_provider_id,
         route_provider_label,
         route_logical_id,
@@ -4220,8 +4440,155 @@ fn route_provider_id_for_target(
         .or_else(|| selected_candidate_route_provider_id(target))
 }
 
+fn source_suite_summary_for_target(
+    target: &AcquisitionTarget,
+    release_runtime: Option<&SourceTargetReleaseRuntime>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+) -> Option<FindMediaAcquisitionSourceSuite> {
+    source_suite_summary_from_selected_candidate(target.selected_candidate.as_ref(), provider_map)
+        .or_else(|| {
+            release_runtime
+                .and_then(|runtime| runtime.source_suite.clone())
+                .map(|suite| enrich_source_suite_labels(suite, provider_map))
+        })
+}
+
+fn source_suite_summary_from_selected_candidate(
+    candidate: Option<&Value>,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+) -> Option<FindMediaAcquisitionSourceSuite> {
+    let candidate = candidate?;
+    let source_suite = candidate
+        .get("sourceSuite")
+        .or_else(|| candidate.pointer("/raw/serverEvidence/extensionSuite"))?;
+    parse_source_suite_summary(source_suite, provider_map)
+}
+
+fn parse_source_suite_summary(
+    source_suite: &Value,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+) -> Option<FindMediaAcquisitionSourceSuite> {
+    let primary_provider_id = json_uuid_field(
+        source_suite,
+        &["primaryProviderId", "providerId", "sourceProviderId"],
+    );
+    let primary_extension_id = json_string_field(
+        source_suite,
+        &["primaryExtensionId", "extensionId", "sourceExtensionId"],
+    );
+    let contributors = source_suite
+        .get("contributors")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| source_suite_contributor_summary(value, provider_map))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let contributors = if contributors.is_empty() {
+        source_suite_contributor_summary(source_suite, provider_map)
+            .into_iter()
+            .collect()
+    } else {
+        contributors
+    };
+    if primary_provider_id.is_none() && primary_extension_id.is_none() && contributors.is_empty() {
+        return None;
+    }
+    let source_selection = source_suite.get("sourceSelection");
+    let route = json_string_at(source_selection, &["route"])
+        .or_else(|| json_string_field(source_suite, &["route"]));
+    let suite_id = json_string_at(source_selection, &["suiteId"])
+        .or_else(|| json_string_at(source_selection, &["suite_id"]))
+        .or_else(|| json_string_field(source_suite, &["suiteId", "suite_id"]));
+    let contributor_count = source_suite
+        .get("contributorCount")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(contributors.len());
+    let primary_provider_label = primary_provider_id
+        .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+    Some(FindMediaAcquisitionSourceSuite {
+        label: json_string_field(source_suite, &["label"])
+            .unwrap_or_else(|| "Elixir Extension Suite".to_string()),
+        mode: json_string_field(source_suite, &["mode"]).unwrap_or_else(|| "suite".to_string()),
+        route,
+        suite_id,
+        primary_provider_id,
+        primary_provider_label,
+        primary_extension_id,
+        primary_extension_name: json_string_field(
+            source_suite,
+            &["primaryExtensionName", "extensionName"],
+        ),
+        primary_implementation: json_string_field(
+            source_suite,
+            &["primaryImplementation", "implementation"],
+        ),
+        contributor_count,
+        contributors,
+    })
+}
+
+fn source_suite_contributor_summary(
+    value: &Value,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+) -> Option<FindMediaAcquisitionSourceContributor> {
+    let provider_id = json_uuid_field(value, &["providerId", "sourceProviderId"]);
+    let extension_id = json_string_field(value, &["extensionId", "sourceExtensionId"]);
+    if provider_id.is_none() && extension_id.is_none() {
+        return None;
+    }
+    let provider_label = provider_id.and_then(|id| provider_map.get(&id).map(provider_label));
+    Some(FindMediaAcquisitionSourceContributor {
+        primary: value
+            .get("primary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        provider_id,
+        provider_label,
+        extension_id,
+        extension_name: json_string_field(value, &["extensionName"]),
+        instance_id: json_uuid_field(value, &["instanceId"]),
+        instance_name: json_string_field(value, &["instanceName"]),
+        implementation: json_string_field(value, &["implementation"]),
+        warnings: value
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(|values| json_string_array(values))
+            .unwrap_or_default(),
+    })
+}
+
+fn enrich_source_suite_labels(
+    mut suite: FindMediaAcquisitionSourceSuite,
+    provider_map: &HashMap<Uuid, ProviderContext>,
+) -> FindMediaAcquisitionSourceSuite {
+    if suite.primary_provider_label.is_none() {
+        suite.primary_provider_label = suite
+            .primary_provider_id
+            .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+    }
+    for contributor in &mut suite.contributors {
+        if contributor.provider_label.is_none() {
+            contributor.provider_label = contributor
+                .provider_id
+                .and_then(|provider_id| provider_map.get(&provider_id).map(provider_label));
+        }
+    }
+    suite
+}
+
 fn selected_candidate_source_provider_id(target: &AcquisitionTarget) -> Option<Uuid> {
-    selected_candidate_uuid_at(target.selected_candidate.as_ref(), &["sourceProviderId"])
+    selected_candidate_uuid_at(target.selected_candidate.as_ref(), &["sourceProviderId"]).or_else(
+        || {
+            selected_candidate_uuid_at(
+                target.selected_candidate.as_ref(),
+                &["sourceSuite", "primaryProviderId"],
+            )
+        },
+    )
 }
 
 fn selected_candidate_route_provider_id(target: &AcquisitionTarget) -> Option<Uuid> {
@@ -4244,6 +4611,23 @@ fn selected_candidate_uuid_at(candidate: Option<&Value>, path: &[&str]) -> Optio
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .and_then(|text| Uuid::parse_str(text).ok())
+}
+
+fn json_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(json_string_value)
+}
+
+fn json_uuid_field(value: &Value, keys: &[&str]) -> Option<Uuid> {
+    json_string_field(value, keys).and_then(|text| Uuid::parse_str(&text).ok())
+}
+
+fn json_string_array(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(json_string_value)
+        .collect::<Vec<_>>()
 }
 
 fn select_source_import_file(
@@ -7428,6 +7812,7 @@ fn build_download_attempt_child(
         release_id: None,
         source_provider_id: None,
         source_provider_label: None,
+        source_suite: None,
         route_provider_id: None,
         route_provider_label: None,
         route_logical_id: None,
@@ -8374,6 +8759,9 @@ pub async fn find_media_preferences(
     let source_preferences = load_source_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let source_suite_providers = source_suite_provider_statuses(&state, &store)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(FindMediaPreferencesResponse {
         preferences: FindMediaPreferencesState {
@@ -8396,18 +8784,43 @@ pub async fn find_media_preferences(
             .iter()
             .map(provider_summary)
             .collect(),
-        tv_source_candidates: collect_source_providers(&providers, MediaType::Series)
-            .iter()
-            .map(provider_summary)
-            .collect(),
-        movies_source_candidates: collect_source_providers(&providers, MediaType::Movie)
-            .iter()
-            .map(provider_summary)
-            .collect(),
-        anime_source_candidates: collect_source_providers(&providers, MediaType::Anime)
-            .iter()
-            .map(provider_summary)
-            .collect(),
+        tv_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Series,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        movies_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Movie,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        anime_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Anime,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        source_suite_providers,
     }))
 }
 
@@ -8464,6 +8877,9 @@ pub async fn patch_find_media_preferences(
     let source_preferences = load_source_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let source_suite_providers = source_suite_provider_statuses(&state, &store)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(FindMediaPreferencesResponse {
         preferences: FindMediaPreferencesState {
@@ -8486,18 +8902,43 @@ pub async fn patch_find_media_preferences(
             .iter()
             .map(provider_summary)
             .collect(),
-        tv_source_candidates: collect_source_providers(&providers, MediaType::Series)
-            .iter()
-            .map(provider_summary)
-            .collect(),
-        movies_source_candidates: collect_source_providers(&providers, MediaType::Movie)
-            .iter()
-            .map(provider_summary)
-            .collect(),
-        anime_source_candidates: collect_source_providers(&providers, MediaType::Anime)
-            .iter()
-            .map(provider_summary)
-            .collect(),
+        tv_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Series,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        movies_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Movie,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        anime_source_candidates: resolve_extension_suite_providers(
+            &state,
+            &store,
+            &providers,
+            MediaType::Anime,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .providers
+        .iter()
+        .map(provider_summary)
+        .collect(),
+        source_suite_providers,
     }))
 }
 
@@ -8638,10 +9079,193 @@ fn provider_summary(provider: &ProviderContext) -> ProviderSummary {
     }
 }
 
+async fn source_suite_provider_statuses(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+) -> AnyResult<Vec<SourceSuiteProviderSummary>> {
+    let details = store.list_provider_details().await?;
+    let instances: HashMap<Uuid, ExtensionInstance> = store
+        .list_instances(None)
+        .await?
+        .into_iter()
+        .map(|instance| (instance.instance_id, instance))
+        .collect();
+    let extensions: HashMap<String, Extension> = store
+        .list_extensions()
+        .await?
+        .into_iter()
+        .map(|extension| (extension.extension_id.clone(), extension))
+        .collect();
+    let readiness_by_provider: HashMap<Uuid, ProviderReadiness> = store
+        .list_provider_readiness()
+        .await?
+        .into_iter()
+        .map(|readiness| (readiness.provider_id, readiness))
+        .collect();
+
+    let mut out = Vec::new();
+    for detail in details {
+        if !detail
+            .provider
+            .capability
+            .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+        {
+            continue;
+        }
+        let Some(instance) = instances.get(&detail.provider.instance_id) else {
+            continue;
+        };
+        let Some(extension) = extensions.get(&detail.extension_id) else {
+            continue;
+        };
+
+        let scope = parse_provider_scope(
+            &detail.provider.capability,
+            detail.provider.scope_json.as_ref(),
+        );
+        let media_types = parse_scope_media_types(&scope);
+        let context = ProviderContext {
+            detail,
+            instance_name: instance.instance_name.clone(),
+            instance_config: instance.config_json.clone(),
+            scope,
+            media_types,
+        };
+        let missing_required_fields = if extension.enabled && instance.enabled {
+            missing_required_fields_for_provider(state, store, &context).await?
+        } else {
+            Vec::new()
+        };
+
+        out.push(source_suite_provider_summary(
+            &context,
+            extension,
+            instance,
+            readiness_by_provider.get(&context.detail.provider.provider_id),
+            &missing_required_fields,
+        ));
+    }
+
+    out.sort_by(compare_source_suite_provider_summaries);
+    Ok(out)
+}
+
+fn source_suite_provider_summary(
+    provider: &ProviderContext,
+    extension: &Extension,
+    instance: &ExtensionInstance,
+    readiness: Option<&ProviderReadiness>,
+    missing_required_fields: &[String],
+) -> SourceSuiteProviderSummary {
+    SourceSuiteProviderSummary {
+        provider_id: provider.detail.provider.provider_id,
+        extension_id: provider.detail.extension_id.clone(),
+        extension_name: extension.name.clone(),
+        instance_id: provider.detail.provider.instance_id,
+        instance_name: provider.instance_name.clone(),
+        capability: provider.detail.provider.capability.clone(),
+        implementation: provider.detail.provider.implementation.clone(),
+        health_state: provider.detail.provider.health_state,
+        enabled: extension.enabled && instance.enabled,
+        extension_enabled: extension.enabled,
+        instance_enabled: instance.enabled,
+        media_types: provider
+            .media_types
+            .iter()
+            .map(|media_type| media_type_name(*media_type).to_string())
+            .collect(),
+        actions: provider.scope.actions.clone(),
+        label: provider_label(provider),
+        last_healthcheck_at: provider.detail.provider.last_healthcheck_at,
+        readiness_phase: readiness.map(|value| value.readiness_phase),
+        readiness_detail: readiness
+            .and_then(|value| non_empty_string(value.readiness_detail.clone())),
+        last_readiness_checked_at: readiness.and_then(|value| value.last_checked_at),
+        last_error: source_suite_provider_last_error(
+            provider,
+            extension.enabled,
+            instance.enabled,
+            readiness,
+            missing_required_fields,
+        ),
+    }
+}
+
+fn source_suite_provider_last_error(
+    provider: &ProviderContext,
+    extension_enabled: bool,
+    instance_enabled: bool,
+    readiness: Option<&ProviderReadiness>,
+    missing_required_fields: &[String],
+) -> Option<String> {
+    if !extension_enabled {
+        return Some("Extension disabled.".to_string());
+    }
+    if !instance_enabled {
+        return Some("Instance disabled.".to_string());
+    }
+    if !provider_supports_action(provider, "search") {
+        return Some("Provider does not expose the search action.".to_string());
+    }
+    if provider.detail.provider.endpoint_json.is_none() {
+        return Some("Provider endpoint is not configured.".to_string());
+    }
+    if !missing_required_fields.is_empty() {
+        return Some(format!(
+            "Missing required secrets: {}.",
+            missing_required_fields.join(", ")
+        ));
+    }
+
+    match provider.detail.provider.health_state {
+        ProviderHealthState::Unhealthy => readiness
+            .and_then(|value| non_empty_string(value.readiness_detail.clone()))
+            .or_else(|| Some("Provider health is unhealthy.".to_string())),
+        ProviderHealthState::Degraded => readiness
+            .and_then(|value| non_empty_string(value.readiness_detail.clone()))
+            .or_else(|| Some("Provider health is degraded.".to_string())),
+        ProviderHealthState::Unknown => {
+            readiness.and_then(|value| non_empty_string(value.readiness_detail.clone()))
+        }
+        ProviderHealthState::Healthy => None,
+    }
+}
+
+fn compare_source_suite_provider_summaries(
+    left: &SourceSuiteProviderSummary,
+    right: &SourceSuiteProviderSummary,
+) -> std::cmp::Ordering {
+    let by_enabled = right.enabled.cmp(&left.enabled);
+    if by_enabled != std::cmp::Ordering::Equal {
+        return by_enabled;
+    }
+    let by_extension = left.extension_id.cmp(&right.extension_id);
+    if by_extension != std::cmp::Ordering::Equal {
+        return by_extension;
+    }
+    let by_instance = left.instance_name.cmp(&right.instance_name);
+    if by_instance != std::cmp::Ordering::Equal {
+        return by_instance;
+    }
+    left.provider_id.cmp(&right.provider_id)
+}
+
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone)]
 struct ProviderFilterError {
     provider: ProviderContext,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionSuiteProviderResolution {
+    providers: Vec<ProviderContext>,
+    unavailable: Vec<ProviderFilterError>,
 }
 
 fn provider_label(provider: &ProviderContext) -> String {
@@ -8760,7 +9384,21 @@ fn collect_manager_providers(
     out
 }
 
-fn collect_source_providers(
+async fn resolve_extension_suite_providers(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    providers: &[ProviderContext],
+    media_type: MediaType,
+) -> AnyResult<ExtensionSuiteProviderResolution> {
+    let candidates = collect_extension_suite_provider_candidates(providers, media_type);
+    let (providers, unavailable) = filter_search_providers(state, store, candidates).await?;
+    Ok(ExtensionSuiteProviderResolution {
+        providers,
+        unavailable,
+    })
+}
+
+fn collect_extension_suite_provider_candidates(
     providers: &[ProviderContext],
     media_type: MediaType,
 ) -> Vec<ProviderContext> {
@@ -9047,13 +9685,10 @@ async fn execute_find_media_search(
     )
     .await
     .map_err(ApiError::from)?;
-    let (source_contexts, _source_errors) = filter_search_providers(
-        state,
-        &store,
-        collect_source_providers(&providers, media_type),
-    )
-    .await
-    .map_err(ApiError::from)?;
+    let source_contexts = resolve_extension_suite_providers(state, &store, &providers, media_type)
+        .await
+        .map_err(ApiError::from)?
+        .providers;
 
     let mut provider_errors: Vec<ProviderSearchError> = search_errors
         .into_iter()
@@ -9507,7 +10142,7 @@ async fn sanitize_source_preference(
         return Ok(None);
     };
 
-    let is_valid = collect_source_providers(providers, media_type)
+    let is_valid = collect_extension_suite_provider_candidates(providers, media_type)
         .iter()
         .any(|provider| provider.detail.provider.provider_id == provider_id);
     if is_valid {
@@ -9583,7 +10218,7 @@ fn validate_source_preference_provider(
     let Some(provider_id) = provider_id else {
         return Ok(());
     };
-    let valid = collect_source_providers(providers, media_type)
+    let valid = collect_extension_suite_provider_candidates(providers, media_type)
         .iter()
         .any(|provider| provider.detail.provider.provider_id == provider_id);
     if !valid {
@@ -10643,7 +11278,11 @@ mod tests {
                     anidb_anime_id: None,
                     anidb_episode_id: None,
                     season: season_ref.clone(),
-                    raw: json!({ "episode": "1" }),
+                    raw: json!({
+                        "episode": "1",
+                        "overview": "Ani.zip episode description.",
+                        "runtime": 24
+                    }),
                 },
                 crate::acquisition::release_resolution::anime::AnimeGraphTarget {
                     source: crate::acquisition::release_resolution::anime::AnimeGraphTargetSource::AniZip,
@@ -10685,6 +11324,7 @@ mod tests {
                 },
             ],
             aliases: vec![],
+            scoped_aliases: vec![],
             fingerprint: "test".to_string(),
         };
 
@@ -10721,6 +11361,11 @@ mod tests {
             response.seasons[0].episodes[1].absolute_episode_number,
             Some(23)
         );
+        assert_eq!(
+            response.seasons[0].episodes[0].overview.as_deref(),
+            Some("Ani.zip episode description.")
+        );
+        assert_eq!(response.seasons[0].episodes[0].runtime_minutes, Some(24));
     }
 
     #[test]
@@ -10733,6 +11378,8 @@ mod tests {
             title: Some("Fullmetal Alchemist".to_string()),
             air_date: Some("2009-04-05".to_string()),
             thumbnail_url: None,
+            overview: Some("Episode description from ani.zip.".to_string()),
+            runtime_minutes: Some(24),
         };
         let aliases = vec![
             "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST".to_string(),
@@ -10763,6 +11410,110 @@ mod tests {
                 "Fullmetal Alchemist Brotherhood"
             ]
         );
+        assert_eq!(
+            metadata.get("overview").and_then(Value::as_str),
+            Some("Episode description from ani.zip.")
+        );
+        assert_eq!(
+            metadata.get("runtimeMinutes").and_then(Value::as_i64),
+            Some(24)
+        );
+    }
+
+    #[tokio::test]
+    async fn fmsa_catalog_hydrates_full_anime_preview_for_partial_slice() -> AnyResult<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+
+        let preview = scope_preview_response(
+            ScopedAddMediaIdentity {
+                kind: MediaType::Anime,
+                title: "Fullmetal Alchemist: Brotherhood".to_string(),
+                year: Some(2009),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("5114".to_string()),
+                    ..ExternalIds::default()
+                }),
+                aliases: vec!["Hagane no Renkinjutsushi: Fullmetal Alchemist".to_string()],
+            },
+            vec![FindMediaScopePreviewSeason {
+                season_number: 1,
+                episode_count: 10,
+                episodes: (1..=10)
+                    .map(|episode| FindMediaScopePreviewEpisode {
+                        target_key: format!("S01E{episode:02}"),
+                        season_number: Some(1),
+                        episode_number: Some(episode),
+                        absolute_episode_number: Some(episode),
+                        title: Some(format!("FMAB Episode {episode}")),
+                        air_date: Some(format!("2009-04-{episode:02}")),
+                        thumbnail_url: None,
+                        overview: Some(format!("ani.zip overview {episode}")),
+                        runtime_minutes: Some(24),
+                    })
+                    .collect(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let selected = select_scoped_add_targets_from_preview(
+            &preview,
+            &ScopedAddSelection {
+                selection_type: ScopedAddSelectionType::Range,
+                season_number: Some(1),
+                episode_start: Some(1),
+                episode_end: Some(2),
+                ..empty_scoped_selection(ScopedAddSelectionType::Range)
+            },
+        )?;
+        assert_eq!(selected.len(), 2);
+
+        let media_item_id = ensure_find_media_scoped_series(&database.pool, &preview.media).await?;
+        let catalog_targets = scoped_add_catalog_targets_from_preview(&preview, &selected)?;
+        let scaffolds = scoped_add_catalog_scaffolds(preview.media.kind, &catalog_targets);
+        scaffold_acquisition_library_targets(&database.pool, None, media_item_id, &scaffolds)
+            .await?;
+        let selected_episode_ids =
+            load_scoped_catalog_episode_ids(&database.pool, media_item_id, &selected).await?;
+
+        let episode_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+                .bind(media_item_id.to_string())
+                .fetch_one(&database.pool)
+                .await?;
+        assert_eq!(episode_count, 10);
+        assert_eq!(selected_episode_ids.len(), 2);
+        assert!(selected_episode_ids.contains_key("S01E01"));
+        assert!(selected_episode_ids.contains_key("S01E02"));
+        assert!(!selected_episode_ids.contains_key("S01E03"));
+
+        let row = sqlx::query(
+            "SELECT title, runtime_seconds, CAST(has_file AS INTEGER) AS has_file, CAST(metadata_json AS TEXT) AS metadata_json
+             FROM episodes
+             WHERE series_id = ? AND season_number = 1 AND episode_number = 10
+             LIMIT 1",
+        )
+        .bind(media_item_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            row.try_get::<String, _>("title").ok().as_deref(),
+            Some("FMAB Episode 10")
+        );
+        assert_eq!(row.get::<i32, _>("runtime_seconds"), 24 * 60);
+        assert_eq!(row.get::<i64, _>("has_file"), 0);
+        let metadata_json: String = row.get("metadata_json");
+        let metadata: Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(
+            metadata.get("overview").and_then(Value::as_str),
+            Some("ani.zip overview 10")
+        );
+        Ok(())
     }
 
     #[test]
@@ -10997,6 +11748,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id: Uuid::new_v4(),
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: Some(route_provider_id),
             release_title: "Example Series S01E01 1080p".to_string(),
             release_state: AcquisitionReleaseState::Submitted,
@@ -11056,6 +11808,115 @@ mod tests {
             child.route_logical_id.as_deref(),
             Some(TORRENT_DEFAULT_LOGICAL_ID)
         );
+    }
+
+    #[test]
+    fn es6_source_acquisition_history_explains_extension_suite_provenance() {
+        let primary_provider_id = Uuid::new_v4();
+        let secondary_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: None,
+            scope: Some(json!({
+                "sourceSelection": {
+                    "mode": "suite",
+                    "route": "suite:default",
+                    "suiteId": "default"
+                }
+            })),
+            ..test_source_subscription(MediaType::Movie)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(primary_provider_id),
+            selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "Primer.2004.1080p.WEB-DL-GROUP",
+                "sourceProviderId": primary_provider_id.to_string(),
+                "sourceSuite": {
+                    "label": "Elixir Extension Suite",
+                    "mode": "suite",
+                    "sourceSelection": {
+                        "mode": "suite",
+                        "route": "suite:default",
+                        "suiteId": "default"
+                    },
+                    "primaryProviderId": primary_provider_id.to_string(),
+                    "primaryExtensionId": "elixir.sources.torrentio",
+                    "primaryExtensionName": "Torrentio",
+                    "primaryImplementation": "torrentio",
+                    "contributorCount": 2,
+                    "contributors": [
+                        {
+                            "primary": true,
+                            "providerId": primary_provider_id.to_string(),
+                            "extensionId": "elixir.sources.torrentio",
+                            "extensionName": "Torrentio",
+                            "implementation": "torrentio"
+                        },
+                        {
+                            "primary": false,
+                            "providerId": secondary_provider_id.to_string(),
+                            "extensionId": "elixir.sources.comet",
+                            "extensionName": "Comet",
+                            "implementation": "comet"
+                        }
+                    ]
+                }
+            })),
+            download_id: Some("suite-download".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                None,
+            )
+        };
+        let provider_map = HashMap::from([
+            (
+                primary_provider_id,
+                test_provider_context(primary_provider_id, "Torrentio", "torrentio"),
+            ),
+            (
+                secondary_provider_id,
+                test_provider_context(secondary_provider_id, "Comet", "comet"),
+            ),
+        ]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.manager_label, "Elixir Extension Suite");
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Source" && evidence.value == "Elixir Extension Suite"
+        }));
+        let child = item.children.first().expect("child");
+        assert_eq!(child.source_provider_id, Some(primary_provider_id));
+        assert_eq!(
+            child.source_provider_label.as_deref(),
+            Some("Torrentio (torrentio)")
+        );
+        let suite = child.source_suite.as_ref().expect("source suite summary");
+        assert_eq!(suite.label, "Elixir Extension Suite");
+        assert_eq!(suite.mode, "suite");
+        assert_eq!(suite.route.as_deref(), Some("suite:default"));
+        assert_eq!(suite.primary_provider_id, Some(primary_provider_id));
+        assert_eq!(
+            suite.primary_provider_label.as_deref(),
+            Some("Torrentio (torrentio)")
+        );
+        assert_eq!(suite.contributor_count, 2);
+        assert!(suite.contributors.iter().any(|contributor| {
+            contributor.provider_id == Some(secondary_provider_id)
+                && contributor.provider_label.as_deref() == Some("Comet (comet)")
+        }));
     }
 
     #[test]
@@ -11221,6 +12082,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id: Uuid::new_v4(),
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: None,
             release_title: "Example Series S01E01 1080p".to_string(),
             release_state: AcquisitionReleaseState::Materializing,
@@ -11290,6 +12152,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id: Uuid::new_v4(),
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: Some(route_provider_id),
             release_title: "The.Northman.2022.1080p.WEBRip.x265-RARBG.mp4".to_string(),
             release_state: AcquisitionReleaseState::Staging,
@@ -11373,6 +12236,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id: Uuid::new_v4(),
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: Some(route_provider_id),
             release_title: "The.Northman.2022.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4".to_string(),
             release_state: AcquisitionReleaseState::Completed,
@@ -11461,6 +12325,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id: Uuid::new_v4(),
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: None,
             release_title: "Example Series S01E01 1080p".to_string(),
             release_state: AcquisitionReleaseState::Completed,
@@ -11558,6 +12423,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id,
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: Some(source_provider_id),
             release_title: "Example Series S01E01 1080p".to_string(),
             release_state: AcquisitionReleaseState::ReviewRequired,
@@ -11650,6 +12516,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id,
             source_provider_id: Some(source_provider_id),
+            source_suite: None,
             route_provider_id: Some(route_provider_id),
             release_title: "Example Series Pack 1080p".to_string(),
             release_state: AcquisitionReleaseState::ReviewRequired,
@@ -11854,6 +12721,7 @@ mod tests {
         let runtime = SourceTargetReleaseRuntime {
             release_id,
             source_provider_id: None,
+            source_suite: None,
             route_provider_id: None,
             release_title: "Example Anime 007 1080p".to_string(),
             release_state: AcquisitionReleaseState::Completed,
@@ -12259,6 +13127,251 @@ mod tests {
             scope: ProviderScopeDocument::default(),
             media_types: vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
         }
+    }
+
+    fn test_suite_candidate_provider_context(
+        extension_id: &str,
+        instance_name: &str,
+        implementation: &str,
+        media_types: Vec<MediaType>,
+        health_state: ProviderHealthState,
+        has_endpoint: bool,
+    ) -> ProviderContext {
+        let now = Utc::now();
+        let instance_id = Uuid::new_v4();
+        let scope_media_types = media_types
+            .iter()
+            .map(|media_type| media_type_name(*media_type).to_string())
+            .collect::<Vec<_>>();
+        ProviderContext {
+            detail: crate::extensions::store::ProviderDetails {
+                provider: crate::db::models::Provider {
+                    provider_id: Uuid::new_v4(),
+                    instance_id,
+                    capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: crate::db::models::SlotCardinality::Many,
+                    implementation: Some(implementation.to_string()),
+                    scope_json: Some(json!({
+                        "media_types": scope_media_types.clone(),
+                        "actions": ["search"]
+                    })),
+                    endpoint_json: has_endpoint.then(|| {
+                        json!({
+                            "scheme": "http",
+                            "host": "candidate-provider",
+                            "port": 8097,
+                            "base_path": "/",
+                            "network": "elixir_net"
+                        })
+                    }),
+                    health_state,
+                    last_healthcheck_at: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                extension_id: extension_id.to_string(),
+                trust_level: ExtensionTrustLevel::Community,
+            },
+            instance_name: instance_name.to_string(),
+            instance_config: None,
+            scope: ProviderScopeDocument {
+                media_types: scope_media_types,
+                actions: vec!["search".to_string()],
+                requires_account: false,
+                required_fields: Vec::new(),
+            },
+            media_types,
+        }
+    }
+
+    #[test]
+    fn extension_suite_provider_candidates_filter_static_eligibility() {
+        let torrentio = test_suite_candidate_provider_context(
+            "elixir.sources.torrentio",
+            "default",
+            "torrentio_stremio",
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let unhealthy = test_suite_candidate_provider_context(
+            "elixir.sources.unhealthy",
+            "default",
+            "unhealthy_source",
+            vec![MediaType::Movie],
+            ProviderHealthState::Unhealthy,
+            true,
+        );
+        let missing_endpoint = test_suite_candidate_provider_context(
+            "elixir.sources.no_endpoint",
+            "default",
+            "no_endpoint_source",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            false,
+        );
+        let series_only = test_suite_candidate_provider_context(
+            "elixir.sources.series_only",
+            "default",
+            "series_only_source",
+            vec![MediaType::Series],
+            ProviderHealthState::Healthy,
+            true,
+        );
+
+        let providers = vec![unhealthy, missing_endpoint, series_only, torrentio.clone()];
+        let eligible = collect_extension_suite_provider_candidates(&providers, MediaType::Movie);
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(
+            eligible[0].detail.provider.provider_id,
+            torrentio.detail.provider.provider_id
+        );
+        assert_eq!(
+            eligible[0].detail.provider.implementation.as_deref(),
+            Some("torrentio_stremio")
+        );
+    }
+
+    #[test]
+    fn extension_suite_provider_candidates_are_deterministically_ordered() {
+        let later = test_suite_candidate_provider_context(
+            "elixir.sources.zeta",
+            "zeta",
+            "zeta_source",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let earlier = test_suite_candidate_provider_context(
+            "elixir.sources.alpha",
+            "alpha",
+            "alpha_source",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+
+        let providers = vec![later, earlier];
+        let eligible = collect_extension_suite_provider_candidates(&providers, MediaType::Movie);
+        let extension_ids = eligible
+            .iter()
+            .map(|provider| provider.detail.extension_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            extension_ids,
+            vec!["elixir.sources.alpha", "elixir.sources.zeta"]
+        );
+    }
+
+    #[test]
+    fn es7_source_suite_provider_summary_reports_settings_status() {
+        let now = Utc::now();
+        let healthy = test_suite_candidate_provider_context(
+            "elixir.sources.torrentio",
+            "default",
+            "torrentio_stremio",
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let extension = Extension {
+            extension_id: healthy.detail.extension_id.clone(),
+            name: "Torrentio".to_string(),
+            version: "1.0.0".to_string(),
+            kind: crate::db::models::ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            installed_at: now,
+            enabled: true,
+        };
+        let instance = ExtensionInstance {
+            instance_id: healthy.detail.provider.instance_id,
+            extension_id: extension.extension_id.clone(),
+            instance_name: healthy.instance_name.clone(),
+            config_json: None,
+            runtime_version: None,
+            rollback_version: None,
+            created_at: now,
+            updated_at: now,
+            enabled: true,
+        };
+
+        let clean = source_suite_provider_summary(&healthy, &extension, &instance, None, &[]);
+        assert!(clean.enabled);
+        assert_eq!(clean.extension_name, "Torrentio");
+        assert_eq!(clean.health_state, ProviderHealthState::Healthy);
+        assert_eq!(clean.last_error, None);
+        assert_eq!(
+            clean.media_types,
+            vec![
+                "movie".to_string(),
+                "series".to_string(),
+                "anime".to_string()
+            ]
+        );
+
+        let missing_secret = source_suite_provider_summary(
+            &healthy,
+            &extension,
+            &instance,
+            None,
+            &["api_key".to_string()],
+        );
+        assert_eq!(
+            missing_secret.last_error.as_deref(),
+            Some("Missing required secrets: api_key.")
+        );
+
+        let mut disabled_instance = instance.clone();
+        disabled_instance.enabled = false;
+        let disabled =
+            source_suite_provider_summary(&healthy, &extension, &disabled_instance, None, &[]);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.last_error.as_deref(), Some("Instance disabled."));
+
+        let unhealthy = test_suite_candidate_provider_context(
+            "elixir.sources.comet",
+            "default",
+            "comet_stremio",
+            vec![MediaType::Movie],
+            ProviderHealthState::Unhealthy,
+            true,
+        );
+        let mut unhealthy_extension = extension.clone();
+        unhealthy_extension.extension_id = unhealthy.detail.extension_id.clone();
+        unhealthy_extension.name = "Comet".to_string();
+        let mut unhealthy_instance = instance.clone();
+        unhealthy_instance.instance_id = unhealthy.detail.provider.instance_id;
+        unhealthy_instance.extension_id = unhealthy_extension.extension_id.clone();
+        let readiness = ProviderReadiness {
+            provider_id: unhealthy.detail.provider.provider_id,
+            readiness_phase: ProviderReadinessPhase::Unknown,
+            readiness_detail: Some("HTTP 500 from provider healthcheck.".to_string()),
+            last_checked_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let unhealthy_status = source_suite_provider_summary(
+            &unhealthy,
+            &unhealthy_extension,
+            &unhealthy_instance,
+            Some(&readiness),
+            &[],
+        );
+        assert_eq!(
+            unhealthy_status.health_state,
+            ProviderHealthState::Unhealthy
+        );
+        assert_eq!(
+            unhealthy_status.last_error.as_deref(),
+            Some("HTTP 500 from provider healthcheck.")
+        );
     }
 
     #[test]

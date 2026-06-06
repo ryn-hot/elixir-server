@@ -3265,6 +3265,11 @@ fn premiumize_transfer_to_inspection(
     };
     skipped_file_ids.sort();
     let progress = premiumize_transfer_progress(transfer);
+    let provider_status = premiumize_transfer_provider_status(transfer, progress.status);
+    let raw = json!({
+        "transfer": transfer,
+        "providerStatus": provider_status,
+    });
     let remote_release_id = transfer
         .id
         .clone()
@@ -3279,7 +3284,7 @@ fn premiumize_transfer_to_inspection(
             display_name: transfer.name.clone(),
             status: progress.status,
             raw_status: Some(premiumize_transfer_raw_status(transfer)),
-            raw: Some(serde_json::to_value(transfer)?),
+            raw: Some(raw.clone()),
         },
         capabilities: premiumize_lifecycle_capabilities(),
         files,
@@ -3290,8 +3295,80 @@ fn premiumize_transfer_to_inspection(
             selected_file_ids,
             skipped_file_ids,
         }),
-        raw: Some(serde_json::to_value(transfer)?),
+        raw: Some(raw),
     })
+}
+
+fn premiumize_transfer_provider_status(
+    transfer: &PremiumizeTransfer,
+    release_status: DebridReleaseStatus,
+) -> Value {
+    let raw_status = transfer
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let message = transfer
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let raw_status_string = premiumize_transfer_raw_status(transfer);
+    let provider_failure_class = if release_status == DebridReleaseStatus::Failed {
+        classify_debrid_failure("failed", raw_status, message, None)
+            .filter(|failure_class| *failure_class != DebridFailureClass::Unknown)
+    } else {
+        None
+    };
+    let message_lower = message.unwrap_or_default().to_ascii_lowercase();
+    let no_seeds = provider_failure_class == Some(DebridFailureClass::NoSeeds)
+        || message_lower.contains("no seed")
+        || message_lower.contains("no peer");
+    let not_cached = release_status == DebridReleaseStatus::Failed
+        && no_seeds
+        && (message_lower.contains("not cached")
+            || message_lower.contains("uncached")
+            || message_lower.contains("cache miss"));
+    json!({
+        "providerImplementation": DebridServiceKind::Premiumize.implementation_id(),
+        "providerName": DebridServiceKind::Premiumize.display_name(),
+        "status": release_status.as_str(),
+        "providerState": raw_status,
+        "rawStatus": raw_status_string,
+        "providerFailureClass": provider_failure_class.map(DebridFailureClass::as_str),
+        "retryable": provider_failure_class
+            .map(|failure_class| failure_class.response_policy() == DebridFailureResponsePolicy::TryAlternateRouteOrCandidate)
+            .unwrap_or(false),
+        "cached": if not_cached { Some(false) } else { None },
+        "notCached": not_cached,
+        "noSeeds": no_seeds,
+        "progress": transfer.progress,
+        "message": premiumize_transfer_user_message(
+            message,
+            provider_failure_class,
+            not_cached,
+        ),
+    })
+}
+
+fn premiumize_transfer_user_message(
+    message: Option<&str>,
+    failure_class: Option<DebridFailureClass>,
+    not_cached: bool,
+) -> Option<String> {
+    match failure_class {
+        Some(DebridFailureClass::NoSeeds) if not_cached => Some(
+            "Premiumize accepted this transfer, but it is not cached and has no peers.".to_string(),
+        ),
+        Some(failure_class) => Some(format!(
+            "Premiumize reported {}{}.",
+            failure_class.as_str(),
+            message
+                .map(|message| format!(" ({message})"))
+                .unwrap_or_default()
+        )),
+        None => message.map(str::to_string),
+    }
 }
 
 fn premiumize_transfer_progress(transfer: &PremiumizeTransfer) -> DebridReleaseProgress {
@@ -4082,6 +4159,11 @@ fn all_debrid_status_to_inspection(
     let mut selected_file_ids = selected_file_ids.into_iter().collect::<Vec<_>>();
     selected_file_ids.sort();
     let progress = all_debrid_status_to_progress(&status);
+    let provider_status = all_debrid_magnet_provider_status(&status, progress.status);
+    let raw = json!({
+        "magnet": status,
+        "providerStatus": provider_status,
+    });
     Ok(DebridReleaseInspection {
         release: DebridRemoteRelease {
             provider_implementation: DebridServiceKind::AllDebrid.implementation_id().to_string(),
@@ -4090,7 +4172,7 @@ fn all_debrid_status_to_inspection(
             display_name: status.filename.clone(),
             status: progress.status,
             raw_status: status.status.clone(),
-            raw: Some(serde_json::to_value(&status)?),
+            raw: Some(raw.clone()),
         },
         capabilities: all_debrid_lifecycle_capabilities(),
         files,
@@ -4101,7 +4183,7 @@ fn all_debrid_status_to_inspection(
             selected_file_ids,
             skipped_file_ids,
         }),
-        raw: Some(serde_json::to_value(status)?),
+        raw: Some(raw),
     })
 }
 
@@ -4145,6 +4227,113 @@ fn all_debrid_status_to_release_status(status: &AllDebridMagnetStatus) -> Debrid
             }
             _ => DebridReleaseStatus::Staging,
         },
+    }
+}
+
+fn all_debrid_magnet_provider_status(
+    status: &AllDebridMagnetStatus,
+    release_status: DebridReleaseStatus,
+) -> Value {
+    let status_code = status.status_code;
+    let raw_status = status
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_failure_class = all_debrid_status_failure_class(status_code, raw_status);
+    let no_seeds = provider_failure_class == Some(DebridFailureClass::NoSeeds);
+    let file_list_unavailable =
+        status.files.is_empty() && release_status != DebridReleaseStatus::Downloaded;
+    let not_cached = matches!(release_status, DebridReleaseStatus::Failed)
+        && (no_seeds || file_list_unavailable || matches!(status_code, Some(7 | 10 | 15)));
+    let message =
+        all_debrid_magnet_user_message(status_code, raw_status, provider_failure_class, not_cached);
+    json!({
+        "providerImplementation": DebridServiceKind::AllDebrid.implementation_id(),
+        "providerName": DebridServiceKind::AllDebrid.display_name(),
+        "status": release_status.as_str(),
+        "providerState": raw_status,
+        "rawStatus": raw_status,
+        "providerStatusCode": status_code,
+        "providerFailureClass": provider_failure_class.map(DebridFailureClass::as_str),
+        "retryable": provider_failure_class
+            .map(|failure_class| failure_class.response_policy() == DebridFailureResponsePolicy::TryAlternateRouteOrCandidate)
+            .unwrap_or(false),
+        "cached": if not_cached { Some(false) } else { None },
+        "notCached": not_cached,
+        "fileCount": status.files.len(),
+        "fileListUnavailable": file_list_unavailable,
+        "providerStalled": provider_failure_class == Some(DebridFailureClass::ProviderStalled),
+        "noSeeds": no_seeds,
+        "progress": all_debrid_status_to_progress(status).progress,
+        "downloadedBytes": status.downloaded,
+        "totalBytes": status.size,
+        "downloadRateBps": status.download_speed,
+        "seeders": status.seeders,
+        "message": message,
+    })
+}
+
+fn all_debrid_status_failure_class(
+    status_code: Option<i64>,
+    raw_status: Option<&str>,
+) -> Option<DebridFailureClass> {
+    match status_code {
+        Some(5 | 12 | 13) => Some(DebridFailureClass::TransferFailed),
+        Some(6 | 9) => Some(DebridFailureClass::ProviderUnavailable),
+        Some(7 | 10) => Some(DebridFailureClass::StagingTimeout),
+        Some(8) => Some(DebridFailureClass::InvalidSource),
+        Some(11) => Some(DebridFailureClass::NotFoundExpired),
+        Some(14) => Some(DebridFailureClass::ProviderStalled),
+        Some(15) => Some(DebridFailureClass::NoSeeds),
+        _ => {
+            let raw_status = raw_status.unwrap_or_default().to_ascii_lowercase();
+            if raw_status.contains("no peer") || raw_status.contains("no seed") {
+                Some(DebridFailureClass::NoSeeds)
+            } else if raw_status.contains("not downloaded") || raw_status.contains("took more") {
+                Some(DebridFailureClass::StagingTimeout)
+            } else if raw_status.contains("tracker") {
+                Some(DebridFailureClass::ProviderStalled)
+            } else if raw_status.contains("deleted") || raw_status.contains("removed") {
+                Some(DebridFailureClass::NotFoundExpired)
+            } else if raw_status.contains("too big") {
+                Some(DebridFailureClass::InvalidSource)
+            } else if raw_status.contains("fail") || raw_status.contains("error") {
+                Some(DebridFailureClass::TransferFailed)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn all_debrid_magnet_user_message(
+    status_code: Option<i64>,
+    raw_status: Option<&str>,
+    failure_class: Option<DebridFailureClass>,
+    not_cached: bool,
+) -> Option<String> {
+    match failure_class {
+        Some(DebridFailureClass::NoSeeds) if not_cached => {
+            Some("AllDebrid accepted this magnet, but it is not cached and has no peers.".to_string())
+        }
+        Some(DebridFailureClass::StagingTimeout) if not_cached => {
+            Some("AllDebrid accepted this magnet, but provider staging timed out before it became cached.".to_string())
+        }
+        Some(DebridFailureClass::ProviderStalled) if not_cached => {
+            Some("AllDebrid accepted this magnet, but the provider transfer is stalled.".to_string())
+        }
+        Some(failure_class) => Some(format!(
+            "AllDebrid reported {}{}{}.",
+            failure_class.as_str(),
+            status_code
+                .map(|code| format!(" for statusCode {code}"))
+                .unwrap_or_default(),
+            raw_status
+                .map(|status| format!(" ({status})"))
+                .unwrap_or_default()
+        )),
+        None => None,
     }
 }
 
@@ -5389,10 +5578,9 @@ fn debrid_route_attempt_service_order(
                 push_unique_debrid_service(&mut ordered, service);
             }
         }
-    } else {
-        for service in DebridServiceKind::ALL {
-            push_unique_debrid_service(&mut ordered, service);
-        }
+    }
+    for service in DebridServiceKind::ALL {
+        push_unique_debrid_service(&mut ordered, service);
     }
     ordered
 }
@@ -5727,7 +5915,7 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
         let staged_result = async {
             let inspection = adapter.inspect_release(remote_release_id).await?;
             update_debrid_job_from_inspection(pool, job_id, &inspection).await?;
-            cleanup_torbox_uncached_no_seed_release(pool, adapter, job_id, &inspection).await?;
+            cleanup_uncached_no_seed_release(pool, adapter, job_id, &inspection).await?;
             if matches!(
                 inspection.release.status,
                 DebridReleaseStatus::WaitingFiles | DebridReleaseStatus::Downloaded
@@ -6438,6 +6626,7 @@ fn anime_scoring_context_from_release(
             .and_then(Value::as_str)
             .map(str::to_string),
         aliases,
+        scoped_aliases: vec![],
         targets: targets
             .iter()
             .map(|target| {
@@ -6447,6 +6636,7 @@ fn anime_scoring_context_from_release(
                     canonical_key: metadata_json_string(metadata, "targetCanonicalKey"),
                     title: target.title.clone(),
                     season_number: target.season_number,
+                    anilist_season_id: metadata_json_string(metadata, "anilistSeasonId"),
                     episode_number: target.episode_number,
                     absolute_episode_number: target.absolute_episode_number,
                     tvdb_episode_id: metadata_json_string(metadata, "tvdbEpisodeId"),
@@ -6634,11 +6824,18 @@ struct DebridFileSelectionDecision {
     selected_file_ids: Vec<String>,
     skipped_file_ids: Vec<String>,
     provider_selection_ids: Vec<String>,
+    target_file_selections: Vec<DebridTargetFileSelection>,
     review_reasons: Vec<String>,
     policy_version: String,
     coverage_fingerprint: String,
     select_all: bool,
     select_all_approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DebridTargetFileSelection {
+    target_id: Uuid,
+    provider_file_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6654,6 +6851,20 @@ struct DebridCoverageTarget {
 impl DebridFileSelectionDecision {
     fn is_approved(&self) -> bool {
         self.status == DebridSelectionDecisionStatus::Approved
+    }
+
+    fn with_inferred_target_file_selections(
+        mut self,
+        release: &AcquisitionRelease,
+        files: &[AcquisitionReleaseFile],
+        coverage: &[AcquisitionReleaseCoverage],
+    ) -> Self {
+        if !self.is_approved() || !self.target_file_selections.is_empty() {
+            return self;
+        }
+        self.target_file_selections =
+            infer_debrid_target_file_selections(release, files, coverage, &self.selected_file_ids);
+        self
     }
 }
 
@@ -6698,7 +6909,7 @@ fn decide_debrid_file_selection(
 ) -> DebridFileSelectionDecision {
     if let Some(decision) = approved_debrid_user_override(release, files, &inspection.capabilities)
     {
-        return decision;
+        return decision.with_inferred_target_file_selections(release, files, coverage);
     }
 
     let mut review_reasons = BTreeSet::new();
@@ -6749,20 +6960,13 @@ fn decide_debrid_file_selection(
         })
         .collect::<BTreeSet<_>>();
 
+    let mut target_file_selections = Vec::new();
     if selected_file_ids.is_empty() && release.confidence == ReleaseConfidence::High {
         let targets = debrid_targets_from_coverage_plan(release, coverage);
-        for file in &selectable_media_files {
-            if targets
-                .iter()
-                .any(|target| debrid_file_matches_target(file, target))
-                && let Some(file_id) = file
-                    .provider_file_id
-                    .clone()
-                    .or_else(|| file.file_id.clone())
-            {
-                selected_file_ids.insert(file_id);
-            }
-        }
+        let fallback = select_debrid_files_for_targets(release, &selectable_media_files, &targets);
+        selected_file_ids.extend(fallback.selected_file_ids);
+        target_file_selections.extend(fallback.target_file_selections);
+        review_reasons.extend(fallback.review_reasons);
     }
 
     if selected_file_ids.is_empty()
@@ -6844,6 +7048,7 @@ fn decide_debrid_file_selection(
         selected_file_ids,
         skipped_file_ids,
         provider_selection_ids,
+        target_file_selections,
         policy_version: DEBRID_SELECTION_POLICY_VERSION.to_string(),
         coverage_fingerprint: debrid_coverage_fingerprint(release, files, coverage),
         review_reasons,
@@ -6918,11 +7123,62 @@ fn debrid_targets_from_coverage_plan(
         return Vec::new();
     }
 
-    debrid_coverage_plan_entries(release.coverage_plan.as_ref())
-        .into_iter()
-        .filter_map(debrid_target_from_coverage_plan_entry)
-        .filter(|target| covered_target_ids.contains(&target.target_id))
-        .collect::<Vec<_>>()
+    let scoped_targets = debrid_scope_targets(release.coverage_plan.as_ref());
+    let scoped_by_id = scoped_targets
+        .iter()
+        .map(|(_, target)| (target.target_id, *target))
+        .collect::<HashMap<_, _>>();
+    let scoped_by_key = scoped_targets
+        .iter()
+        .filter_map(|(target_key, target)| {
+            target_key
+                .as_ref()
+                .map(|target_key| (target_key.clone(), *target))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in debrid_coverage_plan_entries(release.coverage_plan.as_ref()) {
+        let target_key = coverage_plan_string(entry, &["targetKey", "target_key"]);
+        let target = debrid_target_from_coverage_plan_entry(entry)
+            .or_else(|| {
+                target_key
+                    .as_ref()
+                    .and_then(|target_key| scoped_by_key.get(target_key).copied())
+            })
+            .or_else(|| {
+                let target_id = single_covered_target_id(&covered_target_ids)?;
+                let mut target = debrid_target_from_coverage_entry_values(target_id, entry);
+                if let Some(target_key) = target_key.as_deref()
+                    && let Some(from_key) = debrid_target_from_key(target_id, target_key)
+                {
+                    target = merge_debrid_coverage_target(target, from_key);
+                }
+                Some(target)
+            })
+            .map(|target| {
+                scoped_by_id
+                    .get(&target.target_id)
+                    .copied()
+                    .map(|fallback| merge_debrid_coverage_target(target, fallback))
+                    .unwrap_or(target)
+            });
+        let Some(target) = target else {
+            continue;
+        };
+        if covered_target_ids.contains(&target.target_id) && seen.insert(target.target_id) {
+            targets.push(target);
+        }
+    }
+
+    for (_, target) in scoped_targets {
+        if covered_target_ids.contains(&target.target_id) && seen.insert(target.target_id) {
+            targets.push(target);
+        }
+    }
+
+    targets
 }
 
 fn debrid_coverage_plan_entries(coverage_plan: Option<&Value>) -> Vec<&Value> {
@@ -6966,7 +7222,14 @@ fn debrid_target_from_coverage_plan_entry(entry: &Value) -> Option<DebridCoverag
         .or_else(|| entry.get("target_id"))
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())?;
-    Some(DebridCoverageTarget {
+    Some(debrid_target_from_coverage_entry_values(target_id, entry))
+}
+
+fn debrid_target_from_coverage_entry_values(
+    target_id: Uuid,
+    entry: &Value,
+) -> DebridCoverageTarget {
+    let mut target = DebridCoverageTarget {
         target_id,
         season_number: coverage_plan_i32(entry, &["seasonNumber", "season_number"]),
         episode_number: coverage_plan_i32(entry, &["episodeNumber", "episode_number"]),
@@ -6979,7 +7242,164 @@ fn debrid_target_from_coverage_plan_entry(entry: &Value) -> Option<DebridCoverag
             entry,
             &["absoluteEpisodeEndNumber", "absolute_episode_end_number"],
         ),
-    })
+    };
+    if let Some(target_key) = coverage_plan_string(entry, &["targetKey", "target_key"])
+        && let Some(from_key) = debrid_target_from_key(target_id, &target_key)
+    {
+        target = merge_debrid_coverage_target(target, from_key);
+    }
+    target
+}
+
+fn debrid_scope_targets(
+    coverage_plan: Option<&Value>,
+) -> Vec<(Option<String>, DebridCoverageTarget)> {
+    let Some(evidence) = coverage_plan.and_then(|plan| find_request_scope_evidence(plan, 0)) else {
+        return Vec::new();
+    };
+
+    let target_ids = json_string_array(
+        evidence
+            .get("targetIds")
+            .or_else(|| evidence.get("target_ids")),
+    );
+    let target_keys = json_string_array(
+        evidence
+            .get("targetKeys")
+            .or_else(|| evidence.get("target_keys")),
+    );
+    let season_numbers = json_i32_array(
+        evidence
+            .get("seasonNumbers")
+            .or_else(|| evidence.get("season_numbers")),
+    );
+    let episode_numbers = json_i32_array(
+        evidence
+            .get("episodeNumbers")
+            .or_else(|| evidence.get("episode_numbers")),
+    );
+    let episode_end_numbers = json_i32_array(
+        evidence
+            .get("episodeEndNumbers")
+            .or_else(|| evidence.get("episode_end_numbers")),
+    );
+    let absolute_episode_numbers = json_i32_array(
+        evidence
+            .get("absoluteEpisodeNumbers")
+            .or_else(|| evidence.get("absolute_episode_numbers")),
+    );
+    let absolute_episode_end_numbers = json_i32_array(
+        evidence
+            .get("absoluteEpisodeEndNumbers")
+            .or_else(|| evidence.get("absolute_episode_end_numbers")),
+    );
+
+    target_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target_id)| {
+            let target_id = Uuid::parse_str(target_id).ok()?;
+            let target_key = target_keys.get(index).cloned();
+            let target_metadata = target_key.as_ref().and_then(|target_key| {
+                evidence
+                    .get("targets")
+                    .and_then(|targets| targets.get(target_key))
+            });
+            let mut target = DebridCoverageTarget {
+                target_id,
+                season_number: target_metadata
+                    .and_then(|value| coverage_plan_i32(value, &["seasonNumber", "season_number"]))
+                    .or_else(|| indexed_or_single_i32(&season_numbers, index)),
+                episode_number: target_metadata
+                    .and_then(|value| {
+                        coverage_plan_i32(value, &["episodeNumber", "episode_number"])
+                    })
+                    .or_else(|| indexed_or_single_i32(&episode_numbers, index)),
+                episode_end_number: target_metadata
+                    .and_then(|value| {
+                        coverage_plan_i32(value, &["episodeEndNumber", "episode_end_number"])
+                    })
+                    .or_else(|| indexed_or_single_i32(&episode_end_numbers, index)),
+                absolute_episode_number: target_metadata
+                    .and_then(|value| {
+                        coverage_plan_i32(
+                            value,
+                            &["absoluteEpisodeNumber", "absolute_episode_number"],
+                        )
+                    })
+                    .or_else(|| indexed_or_single_i32(&absolute_episode_numbers, index)),
+                absolute_episode_end_number: target_metadata
+                    .and_then(|value| {
+                        coverage_plan_i32(
+                            value,
+                            &["absoluteEpisodeEndNumber", "absolute_episode_end_number"],
+                        )
+                    })
+                    .or_else(|| indexed_or_single_i32(&absolute_episode_end_numbers, index)),
+            };
+            if let Some(target_key) = target_key.as_deref()
+                && let Some(from_key) = debrid_target_from_key(target_id, target_key)
+            {
+                target = merge_debrid_coverage_target(target, from_key);
+            }
+            Some((target_key, target))
+        })
+        .collect()
+}
+
+fn single_covered_target_id(target_ids: &BTreeSet<Uuid>) -> Option<Uuid> {
+    (target_ids.len() == 1)
+        .then(|| target_ids.iter().next().copied())
+        .flatten()
+}
+
+fn debrid_target_from_key(target_id: Uuid, target_key: &str) -> Option<DebridCoverageTarget> {
+    let trimmed = target_key.trim();
+    if trimmed.len() == 6
+        && trimmed.as_bytes()[0].eq_ignore_ascii_case(&b'S')
+        && trimmed.as_bytes()[3].eq_ignore_ascii_case(&b'E')
+    {
+        let season = trimmed.get(1..3)?.parse::<i32>().ok()?;
+        let episode = trimmed.get(4..6)?.parse::<i32>().ok()?;
+        return Some(DebridCoverageTarget {
+            target_id,
+            season_number: Some(season),
+            episode_number: Some(episode),
+            episode_end_number: Some(episode),
+            absolute_episode_number: None,
+            absolute_episode_end_number: None,
+        });
+    }
+    if trimmed.len() == 5 && trimmed.as_bytes()[0].eq_ignore_ascii_case(&b'A') {
+        let absolute = trimmed.get(1..5)?.parse::<i32>().ok()?;
+        return Some(DebridCoverageTarget {
+            target_id,
+            season_number: None,
+            episode_number: None,
+            episode_end_number: None,
+            absolute_episode_number: Some(absolute),
+            absolute_episode_end_number: Some(absolute),
+        });
+    }
+    None
+}
+
+fn merge_debrid_coverage_target(
+    target: DebridCoverageTarget,
+    fallback: DebridCoverageTarget,
+) -> DebridCoverageTarget {
+    DebridCoverageTarget {
+        target_id: target.target_id,
+        season_number: target.season_number.or(fallback.season_number),
+        episode_number: target.episode_number.or(fallback.episode_number),
+        episode_end_number: target.episode_end_number.or(fallback.episode_end_number),
+        absolute_episode_number: target
+            .absolute_episode_number
+            .or(fallback.absolute_episode_number),
+        absolute_episode_end_number: target
+            .absolute_episode_end_number
+            .or(fallback.absolute_episode_end_number),
+    }
 }
 
 fn coverage_plan_i32(entry: &Value, keys: &[&str]) -> Option<i32> {
@@ -6987,6 +7407,181 @@ fn coverage_plan_i32(entry: &Value, keys: &[&str]) -> Option<i32> {
         .find_map(|key| entry.get(*key))
         .and_then(Value::as_i64)
         .and_then(|value| i32::try_from(value).ok())
+}
+
+fn coverage_plan_string(entry: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| entry.get(*key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_i32_array(value: Option<&Value>) -> Vec<i32> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_i64)
+                .filter_map(|value| i32::try_from(value).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn indexed_or_single_i32(values: &[i32], index: usize) -> Option<i32> {
+    if values.len() == 1 {
+        values.first().copied()
+    } else {
+        values.get(index).copied()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DebridTargetSelectionFallback {
+    selected_file_ids: BTreeSet<String>,
+    target_file_selections: Vec<DebridTargetFileSelection>,
+    review_reasons: Vec<String>,
+}
+
+fn select_debrid_files_for_targets(
+    release: &AcquisitionRelease,
+    files: &[&AcquisitionReleaseFile],
+    targets: &[DebridCoverageTarget],
+) -> DebridTargetSelectionFallback {
+    let mut selection = DebridTargetSelectionFallback::default();
+    let mut review_reasons = BTreeSet::new();
+    for target in targets {
+        let episode_matches = files
+            .iter()
+            .copied()
+            .filter(|file| debrid_file_matches_target(file, target))
+            .collect::<Vec<_>>();
+        if episode_matches.is_empty() {
+            continue;
+        }
+        let title_matches = episode_matches
+            .iter()
+            .copied()
+            .filter(|file| debrid_file_title_compatible(release, file))
+            .collect::<Vec<_>>();
+        let selected = if title_matches.len() == 1 {
+            title_matches[0]
+        } else if title_matches.is_empty() && episode_matches.len() == 1 {
+            episode_matches[0]
+        } else {
+            review_reasons.insert("ambiguous_target_file_match".to_string());
+            continue;
+        };
+        let Some(provider_file_id) = selected
+            .provider_file_id
+            .clone()
+            .or_else(|| selected.file_id.clone())
+        else {
+            review_reasons.insert("matched_file_missing_provider_file_id".to_string());
+            continue;
+        };
+        selection.selected_file_ids.insert(provider_file_id.clone());
+        selection
+            .target_file_selections
+            .push(DebridTargetFileSelection {
+                target_id: target.target_id,
+                provider_file_id,
+            });
+    }
+    selection.review_reasons = review_reasons.into_iter().collect();
+    selection
+        .target_file_selections
+        .sort_by(|left, right| left.target_id.cmp(&right.target_id));
+    selection
+}
+
+fn infer_debrid_target_file_selections(
+    release: &AcquisitionRelease,
+    files: &[AcquisitionReleaseFile],
+    coverage: &[AcquisitionReleaseCoverage],
+    selected_file_ids: &[String],
+) -> Vec<DebridTargetFileSelection> {
+    let selected_ids = selected_file_ids.iter().cloned().collect::<HashSet<_>>();
+    if selected_ids.is_empty() || selected_ids.contains("all") {
+        return Vec::new();
+    }
+
+    let selected_media_files = files
+        .iter()
+        .filter(|file| file.selectable)
+        .filter(|file| {
+            is_debrid_media_file(&file.path) && !is_debrid_sample_or_extra_file(&file.path)
+        })
+        .filter(|file| {
+            file.provider_file_id
+                .as_ref()
+                .or(file.file_id.as_ref())
+                .is_some_and(|file_id| selected_ids.contains(file_id))
+        })
+        .collect::<Vec<_>>();
+    if selected_media_files.is_empty() {
+        return Vec::new();
+    }
+
+    let targets = debrid_targets_from_coverage_plan(release, coverage);
+    let inferred = select_debrid_files_for_targets(release, &selected_media_files, &targets)
+        .target_file_selections;
+    if !inferred.is_empty() {
+        return inferred;
+    }
+
+    let unresolved_coverage = coverage
+        .iter()
+        .filter(|entry| entry.confidence == ReleaseConfidence::High)
+        .filter(|entry| entry.state != ReleaseCoverageState::Rejected)
+        .filter(|entry| entry.release_file_id.is_none())
+        .collect::<Vec<_>>();
+    if unresolved_coverage.len() == 1 && selected_media_files.len() == 1 {
+        let Some(provider_file_id) = selected_media_files[0]
+            .provider_file_id
+            .clone()
+            .or_else(|| selected_media_files[0].file_id.clone())
+        else {
+            return Vec::new();
+        };
+        return vec![DebridTargetFileSelection {
+            target_id: unresolved_coverage[0].target_id,
+            provider_file_id,
+        }];
+    }
+
+    Vec::new()
+}
+
+fn debrid_file_title_compatible(
+    release: &AcquisitionRelease,
+    file: &AcquisitionReleaseFile,
+) -> bool {
+    if release.media_type != MediaType::Anime {
+        return true;
+    }
+    let expected = parse_anime_release_title(&release.release_title)
+        .series_title
+        .or_else(|| Some(release.title.clone()))
+        .map(|title| normalized_debrid_title(&title))
+        .unwrap_or_default();
+    let actual = file
+        .parsed_title
+        .as_ref()
+        .map(|title| normalized_debrid_title(title))
+        .unwrap_or_default();
+    expected.is_empty() || actual.is_empty() || expected == actual
+}
+
+fn normalized_debrid_title(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn debrid_file_matches_target(
@@ -7101,6 +7696,7 @@ fn approved_debrid_user_override(
         selected_file_ids,
         skipped_file_ids,
         provider_selection_ids,
+        target_file_selections: Vec::new(),
         review_reasons: review_reasons.into_iter().collect(),
         policy_version: policy
             .get("policyVersion")
@@ -7283,6 +7879,25 @@ async fn persist_debrid_selection_decision(
         .await?;
     }
     let file_aliases = synthetic_source_candidate_release_file_aliases(files);
+    let selected_provider_file_to_release_file = files
+        .iter()
+        .filter_map(|file| {
+            let provider_id = file.provider_file_id.as_ref().or(file.file_id.as_ref())?;
+            selected_ids
+                .contains(provider_id)
+                .then_some((provider_id.clone(), file.release_file_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let target_selection_by_target_id = decision
+        .target_file_selections
+        .iter()
+        .filter_map(|selection| {
+            selected_provider_file_to_release_file
+                .get(&selection.provider_file_id)
+                .copied()
+                .map(|release_file_id| (selection.target_id, release_file_id))
+        })
+        .collect::<HashMap<_, _>>();
     let selected_target_ids = coverage
         .iter()
         .filter_map(|entry| {
@@ -7299,14 +7914,18 @@ async fn persist_debrid_selection_decision(
             (decision.is_approved() && selected_ids.contains(provider_id))
                 .then_some(entry.target_id)
         })
+        .chain(target_selection_by_target_id.keys().copied())
         .collect::<HashSet<_>>();
     for entry in coverage {
-        let release_file_id = entry.release_file_id.and_then(|release_file_id| {
-            file_aliases
-                .get(&release_file_id)
-                .copied()
-                .or(Some(release_file_id))
-        });
+        let release_file_id = entry
+            .release_file_id
+            .and_then(|release_file_id| {
+                file_aliases
+                    .get(&release_file_id)
+                    .copied()
+                    .or(Some(release_file_id))
+            })
+            .or_else(|| target_selection_by_target_id.get(&entry.target_id).copied());
         let selected = release_file_id
             .and_then(|release_file_id| {
                 files
@@ -7523,6 +8142,14 @@ fn merge_selection_policy_evidence(
         "selectedFileIds": decision.selected_file_ids,
         "skippedFileIds": decision.skipped_file_ids,
         "providerSelectionIds": decision.provider_selection_ids,
+        "targetFileSelections": decision
+            .target_file_selections
+            .iter()
+            .map(|selection| json!({
+                "targetId": selection.target_id,
+                "providerFileId": selection.provider_file_id,
+            }))
+            .collect::<Vec<_>>(),
         "selectAll": decision.select_all,
         "selectAllApproved": decision.select_all_approved,
         "coverageFingerprint": decision.coverage_fingerprint,
@@ -7919,8 +8546,7 @@ fn classify_debrid_failure(
         return None;
     }
 
-    if message.contains("error_code\":35")
-        || message.contains("error_code:35")
+    if real_debrid_error_code_in(&message, &[28, 35])
         || message.contains("infringing file")
         || message.contains("infringing_file")
         || message.contains("file not allowed")
@@ -7930,42 +8556,54 @@ fn classify_debrid_failure(
         || message.contains("copyright")
     {
         Some(DebridFailureClass::ContentBlocked)
-    } else if message.contains("error_code\":21")
-        || message.contains("error_code:21")
+    } else if real_debrid_error_code_in(&message, &[21])
         || message.contains("too many active downloads")
         || message.contains("too many active")
         || message.contains("maximum allowed active")
+        || message.contains("link_too_many_downloads")
         || message.contains("magnet_too_many_active")
+        || message.contains("magnet_too_many")
     {
         Some(DebridFailureClass::TooManyActiveDownloads)
     } else if message.contains("account_limit_reached")
         || message.contains("service_limit_reached")
         || message.contains("account limit")
         || message.contains("service limit")
+        || message.contains("link_host_limit_reached")
     {
         Some(DebridFailureClass::ProviderAccountLimitReached)
-    } else if message.contains("error_code\":23")
-        || message.contains("error_code:23")
-        || message.contains("error_code\":36")
-        || message.contains("error_code:36")
+    } else if real_debrid_error_code_in(&message, &[18, 23, 36])
         || message.contains("traffic exhausted")
         || message.contains("fair usage limit")
         || message.contains("fair-use")
         || message.contains("fairuse")
         || message.contains("quota")
+        || message.contains("free_trial_limit_reached")
+        || message.contains("insufficient_balance")
     {
         Some(DebridFailureClass::QuotaExhausted)
-    } else if message.contains("not premium")
+    } else if real_debrid_error_code_in(&message, &[9, 10, 11, 12, 13, 14, 15, 20, 22])
+        || message.contains("not premium")
         || message.contains("must be premium")
         || message.contains("free users")
         || message.contains("magnet_must_be_premium")
         || message.contains("magnet_no_server")
+        || message.contains("must_be_premium")
+        || message.contains("no_server")
+        || message.contains("auth_blocked")
+        || message.contains("auth_user_banned")
+        || message.contains("account_invalid")
         || message.contains("permission_denied")
         || message.contains("account locked")
         || message.contains("account restricted")
+        || message.contains("ip address not allowed")
     {
         Some(DebridFailureClass::ProviderAccountRestricted)
-    } else if message.contains("api token")
+    } else if real_debrid_error_code_in(&message, &[8])
+        || message.contains("auth_missing_apikey")
+        || message.contains("auth_bad_apikey")
+        || message.contains("authentication_failed")
+        || message.contains("api token")
         || message.contains("apikey")
         || message.contains("api key")
         || message.contains("unauthorized")
@@ -7976,13 +8614,15 @@ fn classify_debrid_failure(
         || message.contains("403")
     {
         Some(DebridFailureClass::ProviderAuthMissing)
-    } else if message.contains("native adapter")
+    } else if real_debrid_error_code_in(&message, &[37])
+        || message.contains("native adapter")
         || message.contains("provider unsupported")
         || message.contains("unsupported provider")
         || message.contains("unsupported_container")
     {
         Some(DebridFailureClass::ProviderUnsupported)
-    } else if message.contains("rate limit")
+    } else if real_debrid_error_code_in(&message, &[5, 34])
+        || message.contains("rate limit")
         || message.contains("ratelimit")
         || message.contains("too many requests")
         || message.contains("slow down")
@@ -7990,26 +8630,54 @@ fn classify_debrid_failure(
         || message.contains("rate_limit_reached")
     {
         Some(DebridFailureClass::RateLimited)
-    } else if message.contains("provider unavailable")
+    } else if real_debrid_error_code_in(&message, &[7, 24])
+        || all_debrid_status_code_in(&message, &[11])
+        || message.contains("file unavailable")
+        || message.contains("magnet_invalid_id")
+        || message.contains("magnet_links_removed")
+        || message.contains("link_down")
+        || message.contains("delayed_invalid_id")
+        || message.contains("not_found")
+        || message.contains("not found")
+        || message.contains("expired")
+        || message.contains("not_found_or_expired")
+    {
+        Some(DebridFailureClass::NotFoundExpired)
+    } else if real_debrid_error_code_in(&message, &[-1, 6, 17, 19, 25])
+        || message.contains("provider unavailable")
+        || message.contains("maintenance")
         || message.contains("service_down")
         || message.contains("semi_permanent_error")
         || message.contains("link_generation_failed")
         || message.contains("transient_error")
+        || message.contains("link_host_unavailable")
+        || message.contains("link_host_full")
+        || message.contains("link_temporary_unavailable")
+        || message.contains("magnet_internal_error")
+        || message.contains("unknown_error")
         || message.contains("service unavailable")
         || message.contains("temporar")
-        || message.contains("unknown_error")
         || message.contains("503")
         || message.contains("502")
         || message.contains("504")
         || message.contains("500")
     {
         Some(DebridFailureClass::ProviderUnavailable)
-    } else if message.contains("timed out") || message.contains("timeout") {
+    } else if all_debrid_status_code_in(&message, &[7, 10])
+        || message.contains("magnet_cant_bootstrap")
+        || message.contains("magnet_took_too_long")
+        || message.contains("not downloaded in 20 min")
+        || message.contains("download took more than 72h")
+        || message.contains("timed out")
+        || message.contains("timeout")
+    {
         Some(DebridFailureClass::StagingTimeout)
     } else if message.contains("selecting debrid files")
         || message.contains("selectfiles")
         || message.contains("file selection")
         || message.contains("selection failed")
+        || message.contains("action already done")
+        || real_debrid_error_code_in(&message, &[31])
     {
         Some(DebridFailureClass::SelectionFailed)
     } else if message.contains("unrestrict") {
@@ -8030,52 +8698,61 @@ fn classify_debrid_failure(
         || message.contains("no peer")
         || message.contains("no peers")
         || message.contains("file not available - no peer")
+        || message.contains("torrent as dead")
+        || all_debrid_status_code_in(&message, &[15])
     {
         Some(DebridFailureClass::NoSeeds)
     } else if message.contains("provider_stalled")
         || message.contains("stalled")
         || message.contains("no progress")
+        || message.contains("error while contacting tracker")
+        || all_debrid_status_code_in(&message, &[14])
     {
         Some(DebridFailureClass::ProviderStalled)
     } else if message.contains("file list")
         || message.contains("no files")
         || message.contains("torrent info")
-        || message.contains("magnet_invalid_id")
-        || message.contains("not_found")
-        || message.contains("not found")
         || message.contains("not cached")
-        || message.contains("expired")
-        || message.contains("not_found_or_expired")
     {
-        if message.contains("not found")
-            || message.contains("not_found")
-            || message.contains("expired")
-        {
-            Some(DebridFailureClass::NotFoundExpired)
-        } else {
-            Some(DebridFailureClass::FileListUnavailable)
-        }
-    } else if message.contains("magnet_error")
+        Some(DebridFailureClass::FileListUnavailable)
+    } else if real_debrid_error_code_in(&message, &[1, 2, 16, 26, 29, 30, 32])
+        || all_debrid_status_code_in(&message, &[8])
+        || message.contains("magnet_error")
         || message.contains("magnet_invalid")
         || message.contains("magnet_invalid_file")
         || message.contains("magnet rejected")
         || message.contains("invalid magnet")
         || message.contains("bad magnet")
+        || message.contains("bad_link")
+        || message.contains("link_is_missing")
+        || message.contains("link_pass_protected")
+        || message.contains("magnet_no_uri")
+        || message.contains("magnet_too_large")
+        || message.contains("magnet_magnet_too_big")
+        || message.contains("magnet_too_big")
+        || message.contains("service_unsupported")
+        || message.contains("service unsupported")
+        || message.contains("link_host_not_supported")
+        || message.contains("link_not_supported")
+        || message.contains("redirector_not_supported")
+        || message.contains("unsupported hoster")
+        || message.contains("unsupported_hoster")
         || message.contains("torrent file invalid")
         || message.contains("torrent invalid")
         || message.contains("invalid torrent")
-        || message.contains("error_code\":30")
-        || message.contains("error_code:30")
-        || message.contains("error_code\":29")
-        || message.contains("error_code:29")
-        || message.contains("service_unsupported")
-        || message.contains("service unsupported")
-        || message.contains("unsupported hoster")
-        || message.contains("unsupported_hoster")
         || message.contains("invalid_request")
         || message.contains("permanent_error")
     {
-        if message.contains("magnet")
+        if real_debrid_error_code_in(&message, &[1, 2, 16, 26, 29, 30, 32])
+            || all_debrid_status_code_in(&message, &[8])
+            || message.contains("service_unsupported")
+            || message.contains("service unsupported")
+            || message.contains("link_host_not_supported")
+            || message.contains("link_not_supported")
+            || message.contains("redirector_not_supported")
+            || message.contains("unsupported hoster")
+            || message.contains("unsupported_hoster")
+            || message.contains("magnet")
             || message.contains("torrent")
             || message.contains("invalid_request")
         {
@@ -8083,11 +8760,25 @@ fn classify_debrid_failure(
         } else {
             Some(DebridFailureClass::MagnetRejected)
         }
-    } else if message.contains("connection")
+    } else if real_debrid_error_code_in(&message, &[27])
+        || all_debrid_status_code_in(&message, &[5, 12, 13])
+        || message.contains("magnet_file_upload_failed")
+        || message.contains("magnet_upload_failed")
+        || message.contains("link_error")
+        || message.contains("redirector_error")
+        || message.contains("download_failed")
+        || message.contains("connection")
         || message.contains("connect")
         || message.contains("network")
     {
-        Some(DebridFailureClass::ProviderUnavailable)
+        if message.contains("connection")
+            || message.contains("connect")
+            || message.contains("network")
+        {
+            Some(DebridFailureClass::ProviderUnavailable)
+        } else {
+            Some(DebridFailureClass::TransferFailed)
+        }
     } else if message.contains("transfer")
         || message.contains("downloading")
         || message.contains("download failed")
@@ -8096,6 +8787,66 @@ fn classify_debrid_failure(
     } else {
         Some(DebridFailureClass::Unknown)
     }
+}
+
+fn real_debrid_error_code_in(message: &str, codes: &[i32]) -> bool {
+    numeric_code_after_keys(message, &["error_code"], codes)
+}
+
+fn all_debrid_status_code_in(message: &str, codes: &[i32]) -> bool {
+    numeric_code_after_keys(
+        message,
+        &["statuscode", "status_code", "providerstatuscode"],
+        codes,
+    )
+}
+
+fn numeric_code_after_keys(message: &str, keys: &[&str], codes: &[i32]) -> bool {
+    keys.iter()
+        .any(|key| numeric_codes_after_key(message, key).any(|code| codes.contains(&code)))
+}
+
+fn numeric_codes_after_key<'a>(message: &'a str, key: &'a str) -> impl Iterator<Item = i32> + 'a {
+    let mut search_from = 0usize;
+    std::iter::from_fn(move || {
+        while search_from < message.len() {
+            let relative = message[search_from..].find(key)?;
+            let start = search_from + relative + key.len();
+            search_from = start;
+            let tail = &message[start..];
+            let mut number = String::new();
+            let mut seen_separator = false;
+            for character in tail.chars().take(32) {
+                if character == '-' && number.is_empty() {
+                    number.push(character);
+                    seen_separator = true;
+                    continue;
+                }
+                if character.is_ascii_digit() {
+                    number.push(character);
+                    seen_separator = true;
+                    continue;
+                }
+                if number.chars().any(|value| value.is_ascii_digit()) {
+                    break;
+                }
+                if matches!(
+                    character,
+                    ':' | '=' | '"' | '\'' | ' ' | '\t' | '\n' | '\r' | '{' | '['
+                ) {
+                    seen_separator = true;
+                    continue;
+                }
+                if seen_separator {
+                    break;
+                }
+            }
+            if let Ok(value) = number.parse::<i32>() {
+                return Some(value);
+            }
+        }
+        None
+    })
 }
 
 pub async fn load_debrid_progress(
@@ -8291,7 +9042,7 @@ async fn process_debrid_job(
     {
         let inspection = adapter.inspect_release(&remote_release_id).await?;
         update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection).await?;
-        cleanup_torbox_uncached_no_seed_release(&state.db_pool, &*adapter, job.job_id, &inspection)
+        cleanup_uncached_no_seed_release(&state.db_pool, &*adapter, job.job_id, &inspection)
             .await?;
         job = load_debrid_job(&state.db_pool, job.job_id)
             .await?
@@ -8686,7 +9437,7 @@ async fn refresh_debrid_remote_state(
                 Ok(inspection) => {
                     update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection)
                         .await?;
-                    cleanup_torbox_uncached_no_seed_release(
+                    cleanup_uncached_no_seed_release(
                         &state.db_pool,
                         &*adapter,
                         job.job_id,
@@ -8828,7 +9579,13 @@ async fn list_active_debrid_jobs(
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
+         WHERE (
+               status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
+               OR (
+                   status = 'review_required'
+                   AND COALESCE(selection_error, '') LIKE '%no_selected_files%'
+               )
+         )
          ORDER BY updated_at ASC
          LIMIT ?"
     ))
@@ -8971,13 +9728,13 @@ fn debrid_failure_message_from_inspection(inspection: &DebridReleaseInspection) 
     })
 }
 
-async fn cleanup_torbox_uncached_no_seed_release(
+async fn cleanup_uncached_no_seed_release(
     pool: &sqlx::AnyPool,
     adapter: &(impl DebridProviderAdapter + ?Sized),
     job_id: Uuid,
     inspection: &DebridReleaseInspection,
 ) -> Result<()> {
-    if !should_cleanup_torbox_uncached_no_seed_release(inspection) {
+    if !should_cleanup_uncached_no_seed_release(inspection) {
         return Ok(());
     }
     let remote_release_id = inspection.release.remote_release_id.trim();
@@ -8989,7 +9746,7 @@ async fn cleanup_torbox_uncached_no_seed_release(
         "providerImplementation": inspection.release.provider_implementation,
         "providerName": debrid_provider_display_name(&inspection.release.provider_implementation),
         "remoteReleaseId": remote_release_id,
-        "reason": "torbox_uncached_no_seeds",
+        "reason": "uncached_no_seeds",
         "providerFailureClass": provider_status.get("providerFailureClass").cloned(),
         "notCached": provider_status.get("notCached").and_then(Value::as_bool).unwrap_or(false),
         "noSeeds": provider_status.get("noSeeds").and_then(Value::as_bool).unwrap_or(false),
@@ -9011,20 +9768,16 @@ async fn cleanup_torbox_uncached_no_seed_release(
             tracing::warn!(
                 debrid_job_id = %job_id,
                 remote_release_id,
-                "TorBox uncached no-seeds cleanup failed: {err}"
+                provider_implementation = %inspection.release.provider_implementation,
+                "debrid uncached no-seeds cleanup failed: {err}"
             );
         }
     }
     persist_debrid_provider_cleanup_evidence(pool, job_id, evidence).await
 }
 
-fn should_cleanup_torbox_uncached_no_seed_release(inspection: &DebridReleaseInspection) -> bool {
-    if inspection.release.status != DebridReleaseStatus::Failed
-        || !inspection
-            .release
-            .provider_implementation
-            .eq_ignore_ascii_case(DebridServiceKind::TorBox.implementation_id())
-    {
+fn should_cleanup_uncached_no_seed_release(inspection: &DebridReleaseInspection) -> bool {
+    if inspection.release.status != DebridReleaseStatus::Failed {
         return false;
     }
     let provider_status = debrid_provider_status_from_inspection(inspection);
@@ -9743,6 +10496,11 @@ fn real_debrid_torrent_to_inspection(
         })
         .collect::<Vec<_>>();
     let status = real_debrid_status_to_debrid_status(torrent.status.as_deref());
+    let provider_status = real_debrid_torrent_provider_status(&torrent, status);
+    let raw = json!({
+        "torrent": torrent,
+        "providerStatus": provider_status,
+    });
     Ok(DebridReleaseInspection {
         release: DebridRemoteRelease {
             provider_implementation: REAL_DEBRID_IMPLEMENTATION.to_string(),
@@ -9754,7 +10512,7 @@ fn real_debrid_torrent_to_inspection(
             display_name: torrent.filename.clone(),
             status,
             raw_status: torrent.status.clone(),
-            raw: Some(serde_json::to_value(&torrent)?),
+            raw: Some(raw.clone()),
         },
         capabilities: real_debrid_capabilities(),
         files,
@@ -9765,8 +10523,84 @@ fn real_debrid_torrent_to_inspection(
             selected_file_ids,
             skipped_file_ids,
         }),
-        raw: Some(serde_json::to_value(torrent)?),
+        raw: Some(raw),
     })
+}
+
+fn real_debrid_torrent_provider_status(
+    torrent: &RealDebridTorrent,
+    release_status: DebridReleaseStatus,
+) -> Value {
+    let raw_status = torrent
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let raw_status_lower = raw_status.unwrap_or_default().to_ascii_lowercase();
+    let provider_failure_class = if release_status == DebridReleaseStatus::Failed {
+        real_debrid_torrent_status_failure_class(raw_status_lower.as_str()).or_else(|| {
+            classify_debrid_failure("failed", raw_status, None, None)
+                .filter(|failure_class| *failure_class != DebridFailureClass::Unknown)
+        })
+    } else {
+        None
+    };
+    let no_seeds = provider_failure_class == Some(DebridFailureClass::NoSeeds);
+    let file_list_unavailable =
+        torrent.files.is_empty() && release_status != DebridReleaseStatus::Downloaded;
+    json!({
+        "providerImplementation": DebridServiceKind::RealDebrid.implementation_id(),
+        "providerName": DebridServiceKind::RealDebrid.display_name(),
+        "status": release_status.as_str(),
+        "providerState": raw_status,
+        "rawStatus": raw_status,
+        "providerFailureClass": provider_failure_class.map(DebridFailureClass::as_str),
+        "retryable": provider_failure_class
+            .map(|failure_class| failure_class.response_policy() == DebridFailureResponsePolicy::TryAlternateRouteOrCandidate)
+            .unwrap_or(false),
+        "cached": Option::<bool>::None,
+        "notCached": false,
+        "fileCount": torrent.files.len(),
+        "fileListUnavailable": file_list_unavailable,
+        "providerStalled": false,
+        "noSeeds": no_seeds,
+        "progress": torrent.progress.map(|value| (value / 100.0).clamp(0.0, 1.0)),
+        "downloadedBytes": progress_downloaded_bytes(torrent.progress, torrent.bytes.or(torrent.original_bytes)),
+        "totalBytes": torrent.bytes.or(torrent.original_bytes),
+        "downloadRateBps": torrent.speed,
+        "message": real_debrid_torrent_status_user_message(
+            raw_status,
+            provider_failure_class,
+        ),
+    })
+}
+
+fn real_debrid_torrent_status_failure_class(raw_status: &str) -> Option<DebridFailureClass> {
+    match raw_status {
+        "dead" => Some(DebridFailureClass::NoSeeds),
+        "virus" => Some(DebridFailureClass::ContentBlocked),
+        "magnet_error" | "error" => Some(DebridFailureClass::InvalidSource),
+        _ => None,
+    }
+}
+
+fn real_debrid_torrent_status_user_message(
+    raw_status: Option<&str>,
+    failure_class: Option<DebridFailureClass>,
+) -> Option<String> {
+    match failure_class {
+        Some(DebridFailureClass::NoSeeds) => {
+            Some("Real-Debrid reported this torrent as dead.".to_string())
+        }
+        Some(failure_class) => Some(format!(
+            "Real-Debrid reported {}{}.",
+            failure_class.as_str(),
+            raw_status
+                .map(|status| format!(" ({status})"))
+                .unwrap_or_default()
+        )),
+        None => None,
+    }
 }
 
 fn real_debrid_torrent_files(torrent: &RealDebridTorrent) -> Result<Vec<DebridRemoteFile>> {
@@ -12995,6 +13829,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dfu2_debrid_route_attempts_append_tokened_services_missing_from_service_order()
+    -> Result<()> {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let instance_id = setup_debrid_factory_instance(
+            &state.db_pool,
+            &store,
+            json!({
+                "activeService": "torbox",
+                "serviceOrder": ["torbox", "real_debrid"]
+            }),
+        )
+        .await?;
+        for service in DebridServiceKind::ALL {
+            save_debrid_token(
+                state.secrets.as_ref(),
+                &store,
+                instance_id,
+                service,
+                "token",
+            )
+            .await?;
+        }
+        let provider_id =
+            reconcile_debrid_provider_for_instance(&state.db_pool, &store, instance_id).await?;
+
+        let attempts = list_eligible_debrid_route_attempts(&state.db_pool, &store, None).await?;
+
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.implementation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["torbox", "real_debrid", "all_debrid", "premiumize"]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("debrid:{provider_id}:torbox"),
+                format!("debrid:{provider_id}:real_debrid"),
+                format!("debrid:{provider_id}:all_debrid"),
+                format!("debrid:{provider_id}:premiumize")
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dfu2_debrid_route_attempts_skip_unhealthy_provider() -> Result<()> {
         let state = setup_debrid_test_state().await?;
         let store = ExtensionStore::new(&state.db_pool);
@@ -14984,6 +15869,43 @@ mod tests {
         }
     }
 
+    async fn insert_test_release(
+        pool: &sqlx::AnyPool,
+        release: &AcquisitionRelease,
+    ) -> Result<AcquisitionRelease> {
+        upsert_release(
+            pool,
+            NewAcquisitionRelease {
+                release_id: Some(release.release_id),
+                subscription_id: release.subscription_id,
+                source_provider_id: release.source_provider_id,
+                source_extension_id: release.source_extension_id.clone(),
+                owner_id: release.owner_id.clone(),
+                media_type: release.media_type,
+                title: release.title.clone(),
+                release_title: release.release_title.clone(),
+                source: release.source.clone(),
+                source_kind: release.source_kind.clone(),
+                info_hash: release.info_hash.clone(),
+                fingerprint: release.fingerprint.clone(),
+                release_kind: release.release_kind,
+                resolver_kind: release.resolver_kind,
+                resolver_version: release.resolver_version.clone(),
+                confidence: release.confidence,
+                score: release.score,
+                selected_route_logical_id: release.selected_route_logical_id.clone(),
+                selected_provider_id: release.selected_provider_id,
+                download_id: release.download_id.clone(),
+                remote_release_id: release.remote_release_id.clone(),
+                state: release.state,
+                state_reason: release.state_reason.clone(),
+                selected_candidate: release.selected_candidate.clone(),
+                coverage_plan: release.coverage_plan.clone(),
+            },
+        )
+        .await
+    }
+
     fn test_release_file(
         release_id: Uuid,
         provider_file_id: &str,
@@ -15019,6 +15941,42 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    async fn insert_test_release_file(
+        pool: &sqlx::AnyPool,
+        file: &AcquisitionReleaseFile,
+    ) -> Result<AcquisitionReleaseFile> {
+        upsert_release_file(
+            pool,
+            NewAcquisitionReleaseFile {
+                release_file_id: Some(file.release_file_id),
+                release_id: file.release_id,
+                file_index: file.file_index,
+                file_id: file.file_id.clone(),
+                provider_file_id: file.provider_file_id.clone(),
+                path: file.path.clone(),
+                basename: Some(file.basename.clone()),
+                size_bytes: file.size_bytes,
+                selectable: file.selectable,
+                selected: file.selected,
+                parsed_title: file.parsed_title.clone(),
+                parsed_season_number: file.parsed_season_number,
+                parsed_episode_number: file.parsed_episode_number,
+                parsed_episode_end_number: file.parsed_episode_end_number,
+                parsed_absolute_episode_number: file.parsed_absolute_episode_number,
+                parsed_absolute_episode_end_number: file.parsed_absolute_episode_end_number,
+                parsed_air_date: file.parsed_air_date.clone(),
+                parsed_quality: file.parsed_quality.clone(),
+                parsed_language: file.parsed_language.clone(),
+                parsed_release_group: file.parsed_release_group.clone(),
+                parser_confidence: file.parser_confidence,
+                parser_reason: file.parser_reason.clone(),
+                raw: file.raw.clone(),
+                provider_metadata: file.provider_metadata.clone(),
+            },
+        )
+        .await
     }
 
     fn test_coverage(release_id: Uuid, release_file_id: Uuid) -> AcquisitionReleaseCoverage {
@@ -15253,6 +16211,213 @@ mod tests {
     }
 
     #[test]
+    fn debrid_selection_policy_maps_anime_target_key_scope_to_single_pack_file() {
+        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+        release.media_type = MediaType::Anime;
+        release.resolver_kind = ReleaseResolverKind::AnimeShokoStyle;
+        release.release_title =
+            "Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist Bluray-1080p Remux.mkv"
+                .to_string();
+        let target_id = Uuid::new_v4();
+        release.coverage_plan = Some(json!({
+            "resolverKind": "anime_shoko_style",
+            "releaseKind": "single",
+            "confidence": "high",
+            "requiresFileList": false,
+            "requiresFileSelection": false,
+            "entries": [{
+                "targetKey": "S01E01",
+                "canonicalKey": null,
+                "releaseFileKey": null,
+                "fileId": null,
+                "fileIndex": null,
+                "path": null,
+                "coverageKind": "single_episode",
+                "confidence": "high",
+                "reason": "sonarr_season_episode",
+                "state": "planned"
+            }],
+            "requestScopeEvidence": {
+                "requestMode": "one_shot",
+                "requestScope": "range",
+                "targetCount": 1,
+                "targetIds": [target_id.to_string()],
+                "targetKeys": ["S01E01"],
+                "targets": {
+                    "S01E01": {
+                        "seasonNumber": 1,
+                        "episodeNumber": 1,
+                        "absoluteEpisodeNumber": 1,
+                        "title": "Fullmetal Alchemist"
+                    }
+                }
+            }
+        }));
+
+        let mut brotherhood = test_release_file(
+            release.release_id,
+            "42",
+            "/completed/hash/Full Metal Alchemist Brotherhood (1-64)/Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist.mkv",
+            true,
+        );
+        brotherhood.parsed_title = Some("Fullmetal Alchemist - Brotherhood".to_string());
+        brotherhood.parsed_episode_number = Some(1);
+        brotherhood.parsed_episode_end_number = Some(1);
+        brotherhood.parsed_absolute_episode_number = None;
+        brotherhood.parsed_absolute_episode_end_number = None;
+
+        let mut original_series_same_episode = test_release_file(
+            release.release_id,
+            "99",
+            "/completed/hash/Full Metal Alchemist (2003)/Fullmetal Alchemist - S01E01.mkv",
+            true,
+        );
+        original_series_same_episode.parsed_title = Some("Fullmetal Alchemist".to_string());
+        original_series_same_episode.parsed_episode_number = Some(1);
+        original_series_same_episode.parsed_episode_end_number = Some(1);
+        original_series_same_episode.parsed_absolute_episode_number = None;
+        original_series_same_episode.parsed_absolute_episode_end_number = None;
+
+        let mut next_episode = test_release_file(
+            release.release_id,
+            "31",
+            "/completed/hash/Full Metal Alchemist Brotherhood (1-64)/Fullmetal Alchemist - Brotherhood - S01E02 - The First Day.mkv",
+            true,
+        );
+        next_episode.parsed_title = Some("Fullmetal Alchemist - Brotherhood".to_string());
+        next_episode.parsed_episode_number = Some(2);
+        next_episode.parsed_episode_end_number = Some(2);
+        next_episode.parsed_absolute_episode_number = None;
+        next_episode.parsed_absolute_episode_end_number = None;
+
+        let now = Utc::now();
+        let coverage = vec![AcquisitionReleaseCoverage {
+            coverage_id: Uuid::new_v4(),
+            release_id: release.release_id,
+            release_file_id: None,
+            target_id,
+            coverage_kind: ReleaseCoverageKind::SingleEpisode,
+            confidence: ReleaseConfidence::High,
+            score: Some(112.0),
+            reason: Some("sonarr_season_episode".to_string()),
+            state: ReleaseCoverageState::Submitted,
+            verified_by: Some("rr3f_file_list".to_string()),
+            created_at: now,
+            updated_at: now,
+        }];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(
+            &release,
+            &[brotherhood, original_series_same_episode, next_episode],
+            &coverage,
+            &inspection,
+        );
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.provider_selection_ids, vec!["42".to_string()]);
+        assert_eq!(
+            decision.skipped_file_ids,
+            vec!["31".to_string(), "99".to_string()]
+        );
+        assert_eq!(
+            decision.target_file_selections,
+            vec![DebridTargetFileSelection {
+                target_id,
+                provider_file_id: "42".to_string(),
+            }]
+        );
+        assert!(decision.review_reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn debrid_selection_persistence_attaches_fallback_file_to_coverage() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
+        let target_id = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT target_id FROM acquisition_targets
+             WHERE subscription_id = ? AND target_key = 'S01E01'
+             LIMIT 1",
+        )
+        .bind(subscription_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .context("loading test S01E01 target")?;
+        let target_id = Uuid::parse_str(&target_id).context("parsing test S01E01 target id")?;
+        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+        release.subscription_id = Some(subscription_id);
+        release.source_provider_id = None;
+        release.selected_provider_id = None;
+        release.media_type = MediaType::Anime;
+        release.resolver_kind = ReleaseResolverKind::AnimeShokoStyle;
+        release.release_title =
+            "Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist Bluray-1080p Remux.mkv"
+                .to_string();
+        let release = insert_test_release(&database.pool, &release).await?;
+        let mut file = test_release_file(
+            release.release_id,
+            "42",
+            "/completed/hash/Full Metal Alchemist Brotherhood (1-64)/Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist.mkv",
+            true,
+        );
+        file.parsed_title = Some("Fullmetal Alchemist - Brotherhood".to_string());
+        file.parsed_episode_number = Some(1);
+        file.parsed_episode_end_number = Some(1);
+        let file = insert_test_release_file(&database.pool, &file).await?;
+        let coverage = upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(112.0),
+                reason: Some("sonarr_season_episode".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("rr3f_file_list".to_string()),
+            },
+        )
+        .await?;
+        let decision = DebridFileSelectionDecision {
+            status: DebridSelectionDecisionStatus::Approved,
+            selected_file_ids: vec!["42".to_string()],
+            skipped_file_ids: Vec::new(),
+            provider_selection_ids: vec!["42".to_string()],
+            target_file_selections: vec![DebridTargetFileSelection {
+                target_id,
+                provider_file_id: "42".to_string(),
+            }],
+            review_reasons: Vec::new(),
+            policy_version: DEBRID_SELECTION_POLICY_VERSION.to_string(),
+            coverage_fingerprint: "sha256:test".to_string(),
+            select_all: false,
+            select_all_approved: true,
+        };
+
+        persist_debrid_selection_decision(
+            &database.pool,
+            Uuid::new_v4(),
+            &release,
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&coverage),
+            &decision,
+        )
+        .await?;
+
+        let updated = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].target_id, target_id);
+        assert_eq!(updated[0].release_file_id, Some(file.release_file_id));
+        assert_eq!(updated[0].state, ReleaseCoverageState::Selected);
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].selected, Some(true));
+        Ok(())
+    }
+
+    #[test]
     fn debrid_selection_policy_reviews_unsupported_file_selection() {
         let release = test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::High);
         let file = test_release_file(
@@ -15414,6 +16579,111 @@ mod tests {
         assert_eq!(decision.provider_selection_ids, vec!["file-1".to_string()]);
         assert_eq!(decision.skipped_file_ids, vec!["file-2".to_string()]);
         assert_eq!(decision.coverage_fingerprint, "sha256:user-approved-debrid");
+        assert!(decision.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn debrid_selection_policy_user_override_infers_anime_target_file_mapping() {
+        let mut release =
+            test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::ReviewRequired);
+        release.media_type = MediaType::Anime;
+        release.resolver_kind = ReleaseResolverKind::AnimeShokoStyle;
+        release.release_title =
+            "Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist Bluray-1080p Remux.mkv"
+                .to_string();
+        let target_id = Uuid::new_v4();
+        release.coverage_plan = Some(json!({
+            "manualReview": {
+                "status": "approved",
+                "userApproved": true,
+                "selectedFileIds": ["42"],
+                "skippedFileIds": ["31", "99"],
+                "coverageFingerprint": "sha256:user-approved-fmab"
+            },
+            "animeCoveragePlan": {
+                "resolverKind": "anime_shoko_style",
+                "releaseKind": "single",
+                "confidence": "high",
+                "entries": [{
+                    "targetKey": "S01E01",
+                    "coverageKind": "single_episode",
+                    "confidence": "high",
+                    "reason": "sonarr_season_episode",
+                    "state": "planned"
+                }],
+                "requestScopeEvidence": {
+                    "requestMode": "one_shot",
+                    "requestScope": "range",
+                    "targetCount": 1,
+                    "targetIds": [target_id.to_string()],
+                    "targetKeys": ["S01E01"],
+                    "targets": {
+                        "S01E01": {
+                            "seasonNumber": 1,
+                            "episodeNumber": 1,
+                            "absoluteEpisodeNumber": 1,
+                            "title": "Fullmetal Alchemist"
+                        }
+                    }
+                }
+            }
+        }));
+
+        let mut brotherhood = test_release_file(
+            release.release_id,
+            "42",
+            "/completed/hash/Full Metal Alchemist Brotherhood (1-64)/Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist.mkv",
+            true,
+        );
+        brotherhood.parsed_title = Some("Fullmetal Alchemist - Brotherhood".to_string());
+        brotherhood.parsed_episode_number = Some(1);
+        brotherhood.parsed_episode_end_number = Some(1);
+        let mut original_series_same_episode = test_release_file(
+            release.release_id,
+            "99",
+            "/completed/hash/Full Metal Alchemist (2003)/Fullmetal Alchemist - S01E01.mkv",
+            true,
+        );
+        original_series_same_episode.parsed_title = Some("Fullmetal Alchemist".to_string());
+        original_series_same_episode.parsed_episode_number = Some(1);
+        original_series_same_episode.parsed_episode_end_number = Some(1);
+        let mut next_episode = test_release_file(
+            release.release_id,
+            "31",
+            "/completed/hash/Full Metal Alchemist Brotherhood (1-64)/Fullmetal Alchemist - Brotherhood - S01E02 - The First Day.mkv",
+            true,
+        );
+        next_episode.parsed_title = Some("Fullmetal Alchemist - Brotherhood".to_string());
+        next_episode.parsed_episode_number = Some(2);
+        next_episode.parsed_episode_end_number = Some(2);
+        let coverage = vec![AcquisitionReleaseCoverage {
+            coverage_id: Uuid::new_v4(),
+            release_id: release.release_id,
+            release_file_id: None,
+            target_id,
+            coverage_kind: ReleaseCoverageKind::SingleEpisode,
+            confidence: ReleaseConfidence::High,
+            score: Some(112.0),
+            reason: Some("sonarr_season_episode".to_string()),
+            state: ReleaseCoverageState::Submitted,
+            verified_by: Some("rr3f_file_list".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let files = vec![brotherhood, original_series_same_episode, next_episode];
+        let inspection = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+
+        let decision = decide_debrid_file_selection(&release, &files, &coverage, &inspection);
+
+        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
+        assert_eq!(decision.provider_selection_ids, vec!["42".to_string()]);
+        assert_eq!(
+            decision.target_file_selections,
+            vec![DebridTargetFileSelection {
+                target_id,
+                provider_file_id: "42".to_string(),
+            }]
+        );
         assert!(decision.review_reasons.is_empty());
     }
 
@@ -15743,6 +17013,31 @@ mod tests {
                 DebridFailureResponsePolicy::AccountActionRequired,
             ),
             (
+                r#"Real-Debrid API returned 429: {"error":"Slow down","error_code":5}"#,
+                DebridFailureClass::RateLimited,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+            (
+                r#"Real-Debrid API returned 503: {"error":"Service unavailable","error_code":25}"#,
+                DebridFailureClass::ProviderUnavailable,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+            (
+                r#"Real-Debrid API returned 503: {"error":"File unavailable","error_code":24}"#,
+                DebridFailureClass::NotFoundExpired,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                r#"Real-Debrid API returned 400: {"error":"Torrent file invalid","error_code":30}"#,
+                DebridFailureClass::InvalidSource,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                r#"Real-Debrid API returned 400: {"error":"Unsupported hoster","error_code":16}"#,
+                DebridFailureClass::InvalidSource,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
                 "AllDebrid API request rejected (MAGNET_INVALID_URI): Magnet is not valid",
                 DebridFailureClass::InvalidSource,
                 DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
@@ -15763,6 +17058,26 @@ mod tests {
                 DebridFailureResponsePolicy::AccountActionRequired,
             ),
             (
+                "AllDebrid API request rejected (LINK_HOST_FULL): All servers are full for this host, please retry later",
+                DebridFailureClass::ProviderUnavailable,
+                DebridFailureResponsePolicy::RetryProviderLater,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_CANT_BOOTSTRAP): Not downloaded in 20 min",
+                DebridFailureClass::StagingTimeout,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "AllDebrid status providerStatusCode: 15 File not available - no peer",
+                DebridFailureClass::NoSeeds,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "AllDebrid API request rejected (MAGNET_LINKS_REMOVED): Removed from hoster website",
+                DebridFailureClass::NotFoundExpired,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
                 "Premiumize API provider unavailable (rate_limit_reached): too many API requests",
                 DebridFailureClass::RateLimited,
                 DebridFailureResponsePolicy::RetryProviderLater,
@@ -15776,6 +17091,16 @@ mod tests {
                 "Premiumize API rejected request (invalid_request): missing malformed parameter",
                 DebridFailureClass::InvalidSource,
                 DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "Premiumize API rejected request (service_unsupported): link points to a service we cannot process",
+                DebridFailureClass::InvalidSource,
+                DebridFailureResponsePolicy::TryAlternateRouteOrCandidate,
+            ),
+            (
+                "Premiumize API temporary error (transient_error): try again",
+                DebridFailureClass::ProviderUnavailable,
+                DebridFailureResponsePolicy::RetryProviderLater,
             ),
             (
                 "TorBox status: Stalled (No seeds)",
@@ -15799,6 +17124,159 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn all_debrid_no_peer_status_uses_torbox_strength_cleanup_evidence() -> Result<()> {
+        let status = AllDebridMagnetStatus {
+            id: json!(77),
+            filename: Some("Show.S01E01.1080p.WEB-DL".to_string()),
+            size: Some(1024),
+            status: Some("File not available - no peer".to_string()),
+            status_code: Some(15),
+            downloaded: Some(0),
+            download_speed: Some(0),
+            seeders: Some(0),
+            files: Vec::new(),
+        };
+        let inspection = all_debrid_status_to_inspection(status, Vec::new(), Vec::new(), None)?;
+        assert_eq!(inspection.release.status, DebridReleaseStatus::Failed);
+
+        let provider_status = debrid_provider_status_from_inspection(&inspection);
+        assert_eq!(
+            provider_status
+                .get("providerImplementation")
+                .and_then(Value::as_str),
+            Some("all_debrid")
+        );
+        assert_eq!(
+            provider_status
+                .get("providerFailureClass")
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            provider_status.get("notCached").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status.get("noSeeds").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status.get("message").and_then(Value::as_str),
+            Some("AllDebrid accepted this magnet, but it is not cached and has no peers.")
+        );
+        assert!(should_cleanup_uncached_no_seed_release(&inspection));
+        assert_eq!(
+            classify_debrid_failure(
+                "failed",
+                Some("failed"),
+                debrid_failure_message_from_inspection(&inspection).as_deref(),
+                None,
+            ),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_debrid_dead_torrent_routes_without_uncached_cleanup() -> Result<()> {
+        let torrent = RealDebridTorrent {
+            id: Some("rd-dead-1".to_string()),
+            filename: Some("Show.S01E01.1080p.WEB-DL".to_string()),
+            bytes: Some(1024),
+            original_bytes: Some(1024),
+            progress: Some(0.0),
+            status: Some("dead".to_string()),
+            links: Vec::new(),
+            files: Vec::new(),
+            speed: Some(0),
+        };
+        let inspection = real_debrid_torrent_to_inspection("rd-dead-1", torrent)?;
+        assert_eq!(inspection.release.status, DebridReleaseStatus::Failed);
+
+        let provider_status = debrid_provider_status_from_inspection(&inspection);
+        assert_eq!(
+            provider_status
+                .get("providerImplementation")
+                .and_then(Value::as_str),
+            Some(REAL_DEBRID_IMPLEMENTATION)
+        );
+        assert_eq!(
+            provider_status
+                .get("providerFailureClass")
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            provider_status.get("noSeeds").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status.get("notCached").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(!should_cleanup_uncached_no_seed_release(&inspection));
+        assert_eq!(
+            classify_debrid_failure(
+                "failed",
+                Some("failed"),
+                debrid_failure_message_from_inspection(&inspection).as_deref(),
+                None,
+            ),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn premiumize_uncached_no_peer_transfer_uses_cleanup_evidence() -> Result<()> {
+        let transfer = PremiumizeTransfer {
+            id: Some("pm-transfer-1".to_string()),
+            name: Some("Show.S01E01.1080p.WEB-DL".to_string()),
+            status: Some("error".to_string()),
+            progress: Some(0.0),
+            message: Some("Torrent is not cached and has no peers".to_string()),
+            folder_id: None,
+            file_id: None,
+        };
+        let inspection =
+            premiumize_transfer_to_inspection(&transfer, Vec::new(), Vec::new(), None)?;
+        assert_eq!(inspection.release.status, DebridReleaseStatus::Failed);
+
+        let provider_status = debrid_provider_status_from_inspection(&inspection);
+        assert_eq!(
+            provider_status
+                .get("providerImplementation")
+                .and_then(Value::as_str),
+            Some("premiumize")
+        );
+        assert_eq!(
+            provider_status
+                .get("providerFailureClass")
+                .and_then(Value::as_str),
+            Some("no_seeds")
+        );
+        assert_eq!(
+            provider_status.get("notCached").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_status.get("noSeeds").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(should_cleanup_uncached_no_seed_release(&inspection));
+        assert_eq!(
+            classify_debrid_failure(
+                "failed",
+                Some("failed"),
+                debrid_failure_message_from_inspection(&inspection).as_deref(),
+                None,
+            ),
+            Some(DebridFailureClass::NoSeeds)
+        );
+        Ok(())
     }
 
     #[test]
@@ -18115,6 +19593,58 @@ mod tests {
         assert!(
             active.iter().any(|job| job.job_id == job_id),
             "downloaded debrid jobs should still be materialized"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debrid_materializer_requeues_no_selected_files_review_jobs() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let adapter = FakeDebridAdapter::new();
+        let job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("series"),
+                name: Some("Show.S01E01.1080p.WEB-DL"),
+                paused: false,
+                release_context: None,
+            },
+            &adapter,
+        )
+        .await?;
+
+        mark_debrid_job_status(&database.pool, job_id, "review_required", None).await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs
+             SET selection_error = 'no_selected_files'
+             WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let active = list_active_debrid_jobs(&database.pool, 10).await?;
+        assert!(
+            active.iter().any(|job| job.job_id == job_id),
+            "no_selected_files review jobs should be retried after selector fixes"
+        );
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs
+             SET selection_error = 'ambiguous_target_file_match'
+             WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let active = list_active_debrid_jobs(&database.pool, 10).await?;
+        assert!(
+            active.iter().all(|job| job.job_id != job_id),
+            "ambiguous review jobs must remain parked for manual review"
         );
         Ok(())
     }

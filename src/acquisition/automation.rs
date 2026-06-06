@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::Duration,
 };
@@ -27,9 +27,9 @@ use crate::{
             ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
             AnimeCandidateScoringContext, AnimeCandidateTarget, AnimeCoverageOptions,
             AnimeFileCoveragePlan, AnimeMetadataGraphInput, AnimeReleaseFileInput,
-            AnimeSeasonMapping, anime_parser_diagnostics, build_anime_metadata_graph,
-            infer_anizip_season_number, plan_anime_file_coverage_with_options,
-            score_anime_candidate,
+            AnimeScopedAlias, AnimeSeasonMapping, anime_parser_diagnostics,
+            build_anime_metadata_graph, infer_anizip_season_number,
+            plan_anime_file_coverage_with_options, score_anime_candidate,
         },
         fingerprint::candidate_release_fingerprint,
         models::{
@@ -94,9 +94,10 @@ use crate::{
         handlers::{
             acquisition_sources::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
-                CandidateRouteOption, CandidateScoreBadge, CandidateSearchIntent,
-                CandidateSearchPreferences, CandidateSearchRequest, CandidateSearchResponse,
-                CandidateSearchTarget, acquisition_candidate_tracker_count,
+                CandidateProviderSummary, CandidateRouteOption, CandidateScoreBadge,
+                CandidateSearchIntent, CandidateSearchPreferences, CandidateSearchRequest,
+                CandidateSearchResponse, CandidateSearchTarget,
+                acquisition_candidate_tracker_count, search_candidate_suite_with_store,
                 search_candidates_with_store,
             },
             download_broker::{
@@ -387,11 +388,12 @@ struct SchedulerPlanScoreEvidence {
     freshness_score: i32,
     tracker_count: usize,
     quality_score: i32,
+    safety_score: i32,
     seeders: Option<u32>,
     overfetch_count: usize,
     source_rank: Option<u32>,
     source_score: Option<f64>,
-    score_tuple: (i32, usize, i32, i32, i32, i32, i32, i64, i32, i32, i32),
+    score_tuple: (i32, usize, i32, i32, i32, i32, i32, i32, i64, i32, i32, i32),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1292,9 +1294,14 @@ async fn search_and_submit_group(
     }
     record_scheduler_search_audit_event(state, subscription, group, &target).await?;
 
-    let request =
+    let mut request =
         candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
-    let response = search_candidates_with_store(&state.db_pool, request).await?;
+    let response = if subscription_uses_extension_suite(subscription) {
+        request.provider_id = None;
+        search_candidate_suite_with_store(&state.db_pool, request).await?
+    } else {
+        search_candidates_with_store(&state.db_pool, request).await?
+    };
     process_candidate_search_response_for_group(
         state,
         subscription,
@@ -1355,7 +1362,7 @@ async fn process_candidate_search_response_for_group(
             .await?;
             return Ok(());
         }
-        let state_reason = no_matching_candidates_reason(&batch, group);
+        let state_reason = no_matching_candidates_reason(&batch, group, response);
         if should_mark_no_candidate_group_terminal(subscription, target) {
             update_group_targets_terminal_no_results(
                 state,
@@ -1438,6 +1445,7 @@ async fn build_candidate_release_plans(
 ) -> Result<CandidateReleasePlanBatch> {
     let mut batch = CandidateReleasePlanBatch::default();
     for candidate in &response.candidates {
+        let source_context = candidate_source_context(candidate, response);
         batch.candidate_count += 1;
         if !candidate_allowed_by_policy(candidate, subscription.route_policy) {
             batch.policy_rejected_count += 1;
@@ -1449,17 +1457,17 @@ async fn build_candidate_release_plans(
         }
         if !candidate_has_available_route_for_policy(
             candidate,
-            &response.route_options,
+            &source_context.route_options,
             subscription.route_policy,
         ) {
             batch.route_unavailable_count += 1;
             continue;
         }
         let fingerprint =
-            candidate_release_fingerprint(candidate, Some(response.provider.provider_id));
+            candidate_release_fingerprint(candidate, Some(source_context.provider.provider_id));
         if release_fingerprint_already_claimed(
             &state.db_pool,
-            &response.provider.extension_id,
+            &source_context.provider.extension_id,
             &fingerprint,
         )
         .await?
@@ -1500,7 +1508,7 @@ async fn build_candidate_release_plans(
             &state.db_pool,
             subscription,
             candidate,
-            &response.route_options,
+            &source_context.route_options,
             governor,
         )
         .await
@@ -1518,9 +1526,9 @@ async fn build_candidate_release_plans(
         };
         match route_selection {
             Ok(route_logical_id) => batch.plans.push(CandidateReleasePlan {
-                provider_id: response.provider.provider_id,
-                source_extension_id: response.provider.extension_id.clone(),
-                provider_warnings: response.warnings.clone(),
+                provider_id: source_context.provider.provider_id,
+                source_extension_id: source_context.provider.extension_id.clone(),
+                provider_warnings: source_context.warnings.clone(),
                 route_logical_id,
                 fingerprint,
                 selection: coverage.selection,
@@ -1553,6 +1561,7 @@ async fn build_candidate_release_plans(
 fn no_matching_candidates_reason(
     batch: &CandidateReleasePlanBatch,
     group: &TargetSearchGroup,
+    response: &CandidateSearchResponse,
 ) -> String {
     let intent = group
         .search_intent
@@ -1560,6 +1569,11 @@ fn no_matching_candidates_reason(
         .map(|intent| intent.kind.as_str())
         .unwrap_or("target");
     if batch.candidate_count == 0 {
+        if response.provider.provider_id == Uuid::nil()
+            && let Some(reason) = extension_suite_empty_result_reason(response)
+        {
+            return reason;
+        }
         return format!("No acquisition candidates were returned for {intent}.");
     }
     if batch.policy_rejected_count == batch.candidate_count {
@@ -1590,6 +1604,50 @@ fn no_matching_candidates_reason(
     format!("No matching acquisition candidates were found for {intent}.")
 }
 
+fn extension_suite_empty_result_reason(response: &CandidateSearchResponse) -> Option<String> {
+    let warnings = response
+        .warnings
+        .iter()
+        .filter(|warning| warning.starts_with("extension_suite:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if warnings.is_empty() {
+        return None;
+    }
+    if warnings
+        .iter()
+        .any(|warning| warning.starts_with("extension_suite:no_provider:"))
+    {
+        return Some(
+            "No eligible Extension Suite source providers are available for this media type."
+                .to_string(),
+        );
+    }
+    if warnings
+        .iter()
+        .any(|warning| warning.starts_with("extension_suite:provider_failed:"))
+    {
+        return Some(format!(
+            "Extension Suite source providers failed before returning usable candidates. {}",
+            compact_suite_warning_summary(&warnings)
+        ));
+    }
+    Some(format!(
+        "Extension Suite source providers returned no usable candidates. {}",
+        compact_suite_warning_summary(&warnings)
+    ))
+}
+
+fn compact_suite_warning_summary(warnings: &[String]) -> String {
+    warnings
+        .iter()
+        .take(3)
+        .map(|warning| warning.trim())
+        .filter(|warning| !warning.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 async fn persist_group_manual_review_candidates(
     state: &AppState,
     subscription: &AcquisitionSubscription,
@@ -1602,15 +1660,21 @@ async fn persist_group_manual_review_candidates(
     let target_scope = manual_review_target_scope(subscription, grouped_targets);
     let selected = select_bounded_review_candidates(review_candidates);
     let mut release_count = 0usize;
+    let mut first_provider_id = None;
     for plan in selected {
-        let route_policy =
-            manual_review_route_policy_evidence(subscription, response, &plan.candidate);
+        let source_context = candidate_source_context(&plan.candidate, response);
+        first_provider_id.get_or_insert(source_context.provider.provider_id);
+        let route_policy = manual_review_route_policy_evidence(
+            subscription,
+            &source_context.route_options,
+            &plan.candidate,
+        );
         upsert_manual_review_candidate_release(
             &state.db_pool,
             NewManualReviewCandidateRelease {
                 subscription_id: Some(subscription.subscription_id),
-                source_provider_id: Some(response.provider.provider_id),
-                source_extension_id: response.provider.extension_id.clone(),
+                source_provider_id: Some(source_context.provider.provider_id),
+                source_extension_id: source_context.provider.extension_id.clone(),
                 owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
                 media_type: subscription.media_type,
                 title: subscription.title.clone(),
@@ -1645,7 +1709,7 @@ async fn persist_group_manual_review_candidates(
                 "Candidates found; awaiting manual release selection ({release_count} review item{}).",
                 if release_count == 1 { "" } else { "s" }
             )),
-            selected_provider_id: Some(response.provider.provider_id),
+            selected_provider_id: Some(first_provider_id.unwrap_or(response.provider.provider_id)),
             next_search_after: Some(next_after),
             increment_search_attempts: true,
             ..Default::default()
@@ -1940,7 +2004,7 @@ fn request_scope_resolution_evidence(
     subscription: &AcquisitionSubscription,
     targets: &[AcquisitionTarget],
 ) -> JsonValue {
-    json!({
+    let mut evidence = json!({
         "requestMode": subscription.request_mode.as_str(),
         "requestScope": subscription.request_scope.as_str(),
         "metadataPolicy": subscription.metadata_policy.as_str(),
@@ -1974,7 +2038,66 @@ fn request_scope_resolution_evidence(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(source_selection) =
+        source_selection_evidence_from_scope(subscription.scope.as_ref())
+        && let Some(object) = evidence.as_object_mut()
+    {
+        object.insert("sourceSelection".to_string(), source_selection);
+    }
+    evidence
+}
+
+fn source_selection_evidence_from_scope(scope: Option<&JsonValue>) -> Option<JsonValue> {
+    let scope = scope?;
+    let source_selection = scope
+        .get("sourceSelection")
+        .or_else(|| scope.get("source_selection"));
+    let mode = source_selection
+        .and_then(|value| {
+            value
+                .get("mode")
+                .or_else(|| value.get("sourceSelectionMode"))
+                .or_else(|| value.get("source_selection_mode"))
+        })
+        .or_else(|| scope.get("sourceSelectionMode"))
+        .or_else(|| scope.get("source_selection_mode"))
+        .and_then(json_string_value);
+    let route = source_selection
+        .and_then(|value| {
+            value
+                .get("route")
+                .or_else(|| value.get("sourceSelectionRoute"))
+                .or_else(|| value.get("source_selection_route"))
+        })
+        .or_else(|| scope.get("sourceSelectionRoute"))
+        .or_else(|| scope.get("source_selection_route"))
+        .and_then(json_string_value);
+    let suite_id = source_selection
+        .and_then(|value| {
+            value
+                .get("suiteId")
+                .or_else(|| value.get("suite_id"))
+                .or_else(|| value.get("sourceSuiteId"))
+                .or_else(|| value.get("source_suite_id"))
+        })
+        .or_else(|| scope.get("sourceSuiteId"))
+        .or_else(|| scope.get("source_suite_id"))
+        .and_then(json_string_value);
+    if mode.is_none() && route.is_none() && suite_id.is_none() {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    if let Some(mode) = mode {
+        object.insert("mode".to_string(), json!(mode));
+    }
+    if let Some(route) = route {
+        object.insert("route".to_string(), json!(route));
+    }
+    if let Some(suite_id) = suite_id {
+        object.insert("suiteId".to_string(), json!(suite_id));
+    }
+    Some(JsonValue::Object(object))
 }
 
 fn coverage_plan_with_request_scope(
@@ -2011,7 +2134,7 @@ fn json_with_diagnostics(value: JsonValue, diagnostics: JsonValue) -> JsonValue 
 
 fn manual_review_route_policy_evidence(
     subscription: &AcquisitionSubscription,
-    response: &CandidateSearchResponse,
+    route_options: &[CandidateRouteOption],
     candidate: &AcquisitionCandidate,
 ) -> ManualReviewRoutePolicyEvidence {
     let mut allowed_routes = route_preference_order(
@@ -2021,8 +2144,7 @@ fn manual_review_route_policy_evidence(
     .into_iter()
     .filter(|route| candidate_supports_route(candidate, route))
     .filter(|route| {
-        response
-            .route_options
+        route_options
             .iter()
             .any(|option| option.logical_id == *route)
     })
@@ -2050,6 +2172,93 @@ fn candidate_has_available_route_for_policy(
         })
 }
 
+#[derive(Debug, Clone)]
+struct CandidateSourceContext {
+    provider: CandidateProviderSummary,
+    route_options: Vec<CandidateRouteOption>,
+    warnings: Vec<String>,
+}
+
+fn candidate_source_context(
+    candidate: &AcquisitionCandidate,
+    response: &CandidateSearchResponse,
+) -> CandidateSourceContext {
+    if response.provider.provider_id != Uuid::nil() {
+        return CandidateSourceContext {
+            provider: response.provider.clone(),
+            route_options: response.route_options.clone(),
+            warnings: response.warnings.clone(),
+        };
+    }
+    candidate_extension_suite_context(candidate).unwrap_or_else(|| CandidateSourceContext {
+        provider: response.provider.clone(),
+        route_options: response.route_options.clone(),
+        warnings: response.warnings.clone(),
+    })
+}
+
+fn candidate_extension_suite_context(
+    candidate: &AcquisitionCandidate,
+) -> Option<CandidateSourceContext> {
+    let evidence = candidate
+        .raw
+        .as_ref()?
+        .pointer("/serverEvidence/extensionSuite")?;
+    let provider_id = json_string_field(evidence, &["providerId", "sourceProviderId"])
+        .and_then(|value| Uuid::parse_str(&value).ok())?;
+    let extension_id = json_string_field(evidence, &["extensionId", "sourceExtensionId"])?;
+    let instance_id = json_string_field(evidence, &["instanceId"])
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .unwrap_or_else(Uuid::nil);
+    let route_options = evidence
+        .get("routeOptions")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<CandidateRouteOption>>(value).ok())
+        .unwrap_or_default();
+    let warnings = evidence
+        .get("warnings")
+        .and_then(JsonValue::as_array)
+        .map(|values| json_value_string_array(values))
+        .unwrap_or_default();
+    Some(CandidateSourceContext {
+        provider: CandidateProviderSummary {
+            provider_id,
+            extension_id,
+            extension_name: json_string_field(evidence, &["extensionName"])
+                .unwrap_or_else(|| "Extension Suite Provider".to_string()),
+            instance_id,
+            instance_name: json_string_field(evidence, &["instanceName"])
+                .unwrap_or_else(|| "default".to_string()),
+            capability: json_string_field(evidence, &["capability"])
+                .unwrap_or_else(|| ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string()),
+            implementation: json_string_field(evidence, &["implementation"]),
+            health_state: ProviderHealthState::Healthy,
+            media_types: evidence
+                .get("mediaTypes")
+                .and_then(JsonValue::as_array)
+                .map(|values| json_value_string_array(values))
+                .unwrap_or_default(),
+            actions: evidence
+                .get("actions")
+                .and_then(JsonValue::as_array)
+                .map(|values| json_value_string_array(values))
+                .unwrap_or_else(|| vec!["search".to_string()]),
+        },
+        route_options,
+        warnings,
+    })
+}
+
+fn json_value_string_array(values: &[JsonValue]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn scheduler_dispatch_evidence(
     subscription: &AcquisitionSubscription,
     group: &TargetSearchGroup,
@@ -2075,6 +2284,7 @@ fn scheduler_dispatch_evidence(
             freshness_score: candidate_freshness_score(candidate),
             tracker_count: candidate_tracker_count(candidate),
             quality_score: quality_score(candidate.quality.as_deref()),
+            safety_score: candidate_safety_score(candidate),
             seeders: candidate.seeders,
             overfetch_count: plan.overfetch_count,
             source_rank: candidate.rank,
@@ -2693,7 +2903,7 @@ fn compare_release_plans(
 fn release_plan_score_tuple(
     plan: &CandidateReleasePlan,
     route_policy: AcquisitionRoutePolicy,
-) -> (i32, usize, i32, i32, i32, i32, i32, i64, i32, i32, i32) {
+) -> (i32, usize, i32, i32, i32, i32, i32, i32, i64, i32, i32, i32) {
     let candidate = &plan.selection.candidate;
     (
         confidence_rank(plan.confidence),
@@ -2701,6 +2911,7 @@ fn release_plan_score_tuple(
         route_preference_score(&plan.route_logical_id, route_policy),
         cached_debrid_score(candidate.cached_debrid),
         candidate_freshness_score(candidate),
+        candidate_safety_score(candidate),
         quality_score(candidate.quality.as_deref()),
         release_kind_rank(plan.release_kind),
         candidate.seeders.unwrap_or_default() as i64,
@@ -2788,6 +2999,100 @@ fn candidate_freshness_score(candidate: &AcquisitionCandidate) -> i32 {
         _ => -5,
     };
     score
+}
+
+fn candidate_safety_score(candidate: &AcquisitionCandidate) -> i32 {
+    let text = candidate_safety_text(candidate);
+    let tokens = release_safety_tokens(&text);
+    let mut score = 0;
+
+    if candidate_has_media_extension(candidate, "avi") {
+        score -= 10;
+    }
+    if candidate_has_any_token(&tokens, &["xvid", "divx", "wmv", "vc1", "mp4v"]) {
+        score -= 8;
+    }
+    if candidate_has_any_token(
+        &tokens,
+        &[
+            "cam", "camrip", "hdcam", "telesync", "telecine", "dvdscr", "screener", "line", "mic",
+        ],
+    ) {
+        score -= 12;
+    }
+    if candidate_has_any_token(
+        &tokens,
+        &[
+            "rus",
+            "russian",
+            "dublado",
+            "latino",
+            "castellano",
+            "dubbed",
+        ],
+    ) {
+        score -= 4;
+    }
+    score
+}
+
+fn candidate_safety_text(candidate: &AcquisitionCandidate) -> String {
+    let mut parts = vec![
+        candidate.title.as_str(),
+        candidate.source.as_str(),
+        candidate.source_kind.as_str(),
+    ];
+    if let Some(value) = candidate.quality.as_deref() {
+        parts.push(value);
+    }
+    if let Some(value) = candidate.language.as_deref() {
+        parts.push(value);
+    }
+    for file in &candidate.files {
+        parts.push(file.path.as_str());
+        if let Some(value) = file.file_id.as_deref() {
+            parts.push(value);
+        }
+    }
+    parts.join(" ").to_ascii_lowercase()
+}
+
+fn candidate_has_media_extension(candidate: &AcquisitionCandidate, extension: &str) -> bool {
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    if candidate_title_has_extension(&candidate.title, &extension)
+        || candidate_title_has_extension(&candidate.source, &extension)
+    {
+        return true;
+    }
+    candidate
+        .files
+        .iter()
+        .any(|file| candidate_title_has_extension(&file.path, &extension))
+}
+
+fn candidate_title_has_extension(value: &str, extension: &str) -> bool {
+    value
+        .rsplit_once('.')
+        .map(|(_, suffix)| {
+            suffix
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric())
+                .collect::<String>()
+                .eq_ignore_ascii_case(extension)
+        })
+        .unwrap_or(false)
+}
+
+fn release_safety_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn candidate_has_any_token(tokens: &BTreeSet<String>, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| tokens.contains(*needle))
 }
 
 fn candidate_tracker_count(candidate: &AcquisitionCandidate) -> usize {
@@ -6273,6 +6578,39 @@ fn candidate_search_request_for_group(
     }
 }
 
+fn subscription_uses_extension_suite(subscription: &AcquisitionSubscription) -> bool {
+    let Some(scope) = subscription.scope.as_ref() else {
+        return false;
+    };
+    let source_selection = scope
+        .get("sourceSelection")
+        .or_else(|| scope.get("source_selection"));
+    let mode = source_selection
+        .and_then(|value| {
+            value
+                .get("mode")
+                .or_else(|| value.get("sourceSelectionMode"))
+                .or_else(|| value.get("source_selection_mode"))
+        })
+        .and_then(JsonValue::as_str)
+        .map(str::trim);
+    if mode.is_some_and(|value| value.eq_ignore_ascii_case("suite")) {
+        return true;
+    }
+    let route = source_selection
+        .and_then(|value| {
+            value
+                .get("route")
+                .or_else(|| value.get("sourceSelectionRoute"))
+                .or_else(|| value.get("source_selection_route"))
+        })
+        .or_else(|| scope.get("sourceSelectionRoute"))
+        .or_else(|| scope.get("source_selection_route"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim);
+    route.is_some_and(|value| value.eq_ignore_ascii_case("suite:default"))
+}
+
 fn preferences_from_subscription(
     subscription: &AcquisitionSubscription,
 ) -> CandidateSearchPreferences {
@@ -6296,6 +6634,7 @@ fn anime_candidate_scoring_context(
 
     let metadata = target.metadata.as_ref();
     let mut aliases = BTreeSet::new();
+    let mut scoped_aliases = BTreeMap::<String, AnimeScopedAlias>::new();
     insert_candidate_alias(&mut aliases, &subscription.title);
     if let Some(scope) = subscription.scope.as_ref() {
         if let Some(title) = scope
@@ -6323,11 +6662,18 @@ fn anime_candidate_scoring_context(
                 .as_ref()
                 .and_then(|value| value.get("aliases")),
         );
+        insert_candidate_scoped_aliases_from_json_array(
+            &mut scoped_aliases,
+            item.metadata
+                .as_ref()
+                .and_then(|value| value.get("scopedAliases")),
+        );
     }
 
     Some(AnimeCandidateScoringContext {
         graph_fingerprint: metadata_string(metadata, &["graphFingerprint"]),
         aliases: aliases.into_iter().collect(),
+        scoped_aliases: scoped_aliases.into_values().collect(),
         targets: targets
             .iter()
             .map(|target| {
@@ -6337,6 +6683,7 @@ fn anime_candidate_scoring_context(
                     canonical_key: metadata_string(metadata, &["targetCanonicalKey"]),
                     title: target.title.clone(),
                     season_number: target.season_number,
+                    anilist_season_id: metadata_string(metadata, &["anilistSeasonId"]),
                     episode_number: target.episode_number,
                     absolute_episode_number: target.absolute_episode_number,
                     tvdb_episode_id: metadata_string(metadata, &["tvdbEpisodeId"]),
@@ -6365,6 +6712,37 @@ fn insert_candidate_aliases_from_json_array(
         if let Some(alias) = value.as_str() {
             insert_candidate_alias(aliases, alias);
         }
+    }
+}
+
+fn insert_candidate_scoped_aliases_from_json_array(
+    aliases: &mut BTreeMap<String, AnimeScopedAlias>,
+    value: Option<&JsonValue>,
+) {
+    let Some(values) = value.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for value in values {
+        let Ok(alias) = serde_json::from_value::<AnimeScopedAlias>(value.clone()) else {
+            continue;
+        };
+        let display = alias.display.trim();
+        if display.is_empty()
+            || (alias.season_number.is_none() && alias.anilist_season_id.is_none())
+        {
+            continue;
+        }
+        let key = format!(
+            "{}:{}:{}:{}",
+            display.to_ascii_lowercase(),
+            alias.source,
+            alias
+                .season_number
+                .map(|season| season.to_string())
+                .unwrap_or_default(),
+            alias.anilist_season_id.clone().unwrap_or_default()
+        );
+        aliases.entry(key).or_insert(alias);
     }
 }
 
@@ -6574,7 +6952,7 @@ fn compare_candidates(
 fn candidate_score_tuple(
     candidate: &AcquisitionCandidate,
     route_policy: AcquisitionRoutePolicy,
-) -> (i32, i32, i32, i32, i32, i64, i32, i32) {
+) -> (i32, i32, i32, i32, i32, i32, i64, i32, i32) {
     let route_score = match route_policy {
         AcquisitionRoutePolicy::TorrentOnly => {
             if candidate_supports_route(candidate, TORRENT_DEFAULT_LOGICAL_ID) {
@@ -6604,6 +6982,7 @@ fn candidate_score_tuple(
         None => 1,
     };
     let freshness = candidate_freshness_score(candidate);
+    let safety = candidate_safety_score(candidate);
     let score = (candidate.score.unwrap_or(0.0) * 1000.0).round() as i32;
     let quality = quality_score(candidate.quality.as_deref());
     let seeders = candidate.seeders.unwrap_or_default() as i64;
@@ -6616,6 +6995,7 @@ fn candidate_score_tuple(
         route_score,
         cached_score,
         freshness,
+        safety,
         score,
         quality,
         seeders,
@@ -7046,6 +7426,12 @@ fn selected_candidate_provenance_inner(
         if let Some(evidence) = submission.request_scope_evidence.as_ref() {
             object.insert("requestScopeEvidence".to_string(), evidence.clone());
         }
+        if let Some(source_suite) = source_suite_provenance(
+            &submission.candidate,
+            submission.request_scope_evidence.as_ref(),
+        ) {
+            object.insert("sourceSuite".to_string(), source_suite);
+        }
         if let Some(dispatch) = submission.dispatch.as_ref() {
             object.insert(
                 "schedulerDispatch".to_string(),
@@ -7070,6 +7456,94 @@ fn selected_candidate_provenance_inner(
     attach_route_attempt_ledger(&mut value, &fingerprint, &submission.route_attempts);
     attach_route_attempt_ledger(&mut value, &fingerprint, route_attempts);
     Ok(value)
+}
+
+fn source_suite_provenance(
+    candidate: &AcquisitionCandidate,
+    request_scope_evidence: Option<&JsonValue>,
+) -> Option<JsonValue> {
+    let suite = candidate
+        .raw
+        .as_ref()?
+        .pointer("/serverEvidence/extensionSuite")?;
+    let mut contributors = suite
+        .get("contributors")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(source_suite_contributor_provenance)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if contributors.is_empty()
+        && let Some(contributor) = source_suite_contributor_provenance(suite)
+    {
+        contributors.push(contributor);
+    }
+    let source_selection = request_scope_evidence
+        .and_then(|evidence| evidence.get("sourceSelection"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "mode": "suite",
+                "route": "suite:default",
+                "suiteId": "default",
+            })
+        });
+    let contributor_count = suite
+        .get("contributorCount")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(contributors.len() as u64);
+    Some(json!({
+        "schemaVersion": 1,
+        "mode": "suite",
+        "label": "Elixir Extension Suite",
+        "sourceSelection": source_selection,
+        "primaryProviderId": json_string_field(suite, &["primaryProviderId", "providerId"]),
+        "primaryExtensionId": json_string_field(suite, &["primaryExtensionId", "extensionId"]),
+        "primaryExtensionName": json_string_field(suite, &["primaryExtensionName", "extensionName"]),
+        "primaryInstanceId": json_string_field(suite, &["primaryInstanceId", "instanceId"]),
+        "primaryInstanceName": json_string_field(suite, &["primaryInstanceName", "instanceName"]),
+        "primaryImplementation": json_string_field(suite, &["primaryImplementation", "implementation"]),
+        "contributorCount": contributor_count,
+        "contributors": contributors,
+    }))
+}
+
+fn source_suite_contributor_provenance(value: &JsonValue) -> Option<JsonValue> {
+    let provider_id = json_string_field(value, &["providerId", "sourceProviderId"]);
+    let extension_id = json_string_field(value, &["extensionId", "sourceExtensionId"]);
+    if provider_id.is_none() && extension_id.is_none() {
+        return None;
+    }
+    Some(json!({
+        "primary": value
+            .get("primary")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false),
+        "providerId": provider_id,
+        "extensionId": extension_id,
+        "extensionName": json_string_field(value, &["extensionName"]),
+        "instanceId": json_string_field(value, &["instanceId"]),
+        "instanceName": json_string_field(value, &["instanceName"]),
+        "implementation": json_string_field(value, &["implementation"]),
+        "mediaTypes": value
+            .get("mediaTypes")
+            .and_then(JsonValue::as_array)
+            .map(|values| json_value_string_array(values))
+            .unwrap_or_default(),
+        "actions": value
+            .get("actions")
+            .and_then(JsonValue::as_array)
+            .map(|values| json_value_string_array(values))
+            .unwrap_or_default(),
+        "warnings": value
+            .get("warnings")
+            .and_then(JsonValue::as_array)
+            .map(|values| json_value_string_array(values))
+            .unwrap_or_default(),
+    }))
 }
 
 fn merged_target_external_ids(
@@ -7725,6 +8199,174 @@ mod tests {
             candidates,
             warnings: Vec::new(),
         }
+    }
+
+    async fn insert_test_provider_ref(
+        pool: &sqlx::AnyPool,
+        provider_id: Uuid,
+        extension_id: &str,
+        extension_name: &str,
+        capability: &str,
+        cardinality: &str,
+        implementation: &str,
+    ) -> Result<()> {
+        let instance_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extensions (
+                extension_id, name, version, kind, trust_level, manifest_json, enabled
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(extension_id)
+        .bind(extension_name)
+        .bind("0.1.0")
+        .bind("module")
+        .bind("community")
+        .bind("{}")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_instances (
+                instance_id, extension_id, instance_name, config_json, enabled
+             ) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(instance_id.to_string())
+        .bind(extension_id)
+        .bind("default")
+        .bind("{}")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO providers (
+                provider_id, instance_id, capability, slot_id, cardinality, implementation, health_state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(provider_id.to_string())
+        .bind(instance_id.to_string())
+        .bind(capability)
+        .bind("default")
+        .bind(cardinality)
+        .bind(implementation)
+        .bind("healthy")
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn test_provider_ref_exists(pool: &sqlx::AnyPool, provider_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT CAST(provider_id AS TEXT) FROM providers WHERE CAST(provider_id AS TEXT) = ?",
+        )
+        .bind(provider_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .is_some())
+    }
+
+    fn suite_response_from_direct_response_for_test(
+        response: &CandidateSearchResponse,
+    ) -> CandidateSearchResponse {
+        let mut candidates = response.candidates.clone();
+        for candidate in &mut candidates {
+            attach_suite_provider_evidence_for_test(
+                candidate,
+                &response.provider,
+                &response.route_options,
+                &response.warnings,
+            );
+        }
+        CandidateSearchResponse {
+            schema_version: response.schema_version,
+            provider: CandidateProviderSummary {
+                provider_id: Uuid::nil(),
+                extension_id: "elixir.extension_suite".to_string(),
+                extension_name: "Elixir Extension Suite".to_string(),
+                instance_id: Uuid::nil(),
+                instance_name: "default".to_string(),
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                implementation: Some("extension_suite".to_string()),
+                health_state: ProviderHealthState::Healthy,
+                media_types: response.provider.media_types.clone(),
+                actions: vec!["search".to_string()],
+            },
+            route_options: Vec::new(),
+            candidates,
+            warnings: response.warnings.clone(),
+        }
+    }
+
+    fn attach_suite_provider_evidence_for_test(
+        candidate: &mut AcquisitionCandidate,
+        provider: &CandidateProviderSummary,
+        route_options: &[CandidateRouteOption],
+        warnings: &[String],
+    ) {
+        let mut root = match candidate.raw.take() {
+            Some(Value::Object(object)) => object,
+            Some(raw) => {
+                let mut object = serde_json::Map::new();
+                object.insert("sourceRaw".to_string(), raw);
+                object
+            }
+            None => serde_json::Map::new(),
+        };
+        let route_options = serde_json::to_value(route_options).expect("serialize route options");
+        let provider_warnings = warnings
+            .iter()
+            .map(|warning| json!(warning))
+            .collect::<Vec<_>>();
+        let evidence = json!({
+            "providerId": provider.provider_id,
+            "extensionId": provider.extension_id,
+            "extensionName": provider.extension_name,
+            "instanceId": provider.instance_id,
+            "instanceName": provider.instance_name,
+            "capability": provider.capability,
+            "implementation": provider.implementation,
+            "mediaTypes": provider.media_types,
+            "actions": provider.actions,
+            "warnings": provider_warnings,
+            "routeOptions": route_options,
+            "dedupeKey": format!("es5-test:{}", candidate.title),
+            "dedupeFingerprintVersion": "es5-test-v1",
+            "contributorCount": 1,
+            "contributors": [{
+                "primary": true,
+                "providerId": provider.provider_id,
+                "extensionId": provider.extension_id,
+                "extensionName": provider.extension_name,
+                "instanceId": provider.instance_id,
+                "instanceName": provider.instance_name,
+                "capability": provider.capability,
+                "implementation": provider.implementation,
+                "mediaTypes": provider.media_types,
+                "actions": provider.actions,
+                "warnings": provider_warnings,
+                "routeOptions": route_options,
+                "candidate": {
+                    "title": candidate.title,
+                    "sourceKind": candidate.source_kind,
+                    "infoHash": candidate.info_hash,
+                    "quality": candidate.quality,
+                    "sizeBytes": candidate.size_bytes,
+                    "seeders": candidate.seeders,
+                    "cachedDebrid": candidate.cached_debrid,
+                    "fileCount": candidate.files.len()
+                }
+            }]
+        });
+        let server_evidence = root
+            .entry("serverEvidence".to_string())
+            .or_insert_with(|| json!({}));
+        if !server_evidence.is_object() {
+            *server_evidence = json!({});
+        }
+        server_evidence
+            .as_object_mut()
+            .expect("server evidence object")
+            .insert("extensionSuite".to_string(), evidence);
+        candidate.raw = Some(Value::Object(root));
     }
 
     async fn seed_te10b_candidate_provider(state: &AppState, port: u16) -> Result<Uuid> {
@@ -8781,12 +9423,14 @@ mod tests {
         AnimeCandidateScoringContext {
             graph_fingerprint: Some("automation-rr3k".to_string()),
             aliases: vec!["Example Title".to_string()],
+            scoped_aliases: vec![],
             targets: (1..=target_count)
                 .map(|episode| AnimeCandidateTarget {
                     target_key: format!("S01E{episode:02}"),
                     canonical_key: Some(format!("tvdb:100:S01E{episode:02}")),
                     title: format!("Episode {episode}"),
                     season_number: Some(1),
+                    anilist_season_id: Some("100".to_string()),
                     episode_number: Some(episode),
                     absolute_episode_number: Some(episode),
                     tvdb_episode_id: Some(format!("10{episode:02}")),
@@ -9747,11 +10391,13 @@ mod tests {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("automation-rr3e".to_string()),
             aliases: vec!["Example Title".to_string()],
+            scoped_aliases: vec![],
             targets: vec![AnimeCandidateTarget {
                 target_key: "S01E01".to_string(),
                 canonical_key: Some("tvdb:100:S01E01".to_string()),
                 title: "Episode One".to_string(),
                 season_number: Some(1),
+                anilist_season_id: Some("100".to_string()),
                 episode_number: Some(1),
                 absolute_episode_number: Some(1),
                 tvdb_episode_id: Some("1001".to_string()),
@@ -9815,7 +10461,16 @@ mod tests {
         target.title = "Fullmetal Alchemist".to_string();
         target.metadata = Some(json!({
             "source": "find_media_scoped_add",
-            "targetKey": "S01E01"
+            "targetKey": "S01E01",
+            "anilistSeasonId": "21",
+            "scopedAliases": [
+                {
+                    "display": "Fullmetal Alchemist Brotherhood",
+                    "source": "anilist_season_title",
+                    "seasonNumber": 1,
+                    "anilistSeasonId": "21"
+                }
+            ]
         }));
 
         let context = anime_candidate_scoring_context(&subscription, &target, &[target.clone()])
@@ -9826,6 +10481,11 @@ mod tests {
                 .iter()
                 .any(|alias| alias == "Fullmetal Alchemist Brotherhood")
         );
+        assert!(context.scoped_aliases.iter().any(|alias| {
+            alias.display == "Fullmetal Alchemist Brotherhood"
+                && alias.season_number == Some(1)
+                && alias.anilist_season_id.as_deref() == Some("21")
+        }));
 
         let candidate = candidate(
             "[Dubtitles] Fullmetal Alchemist Brotherhood - 01 (BD 1080p)",
@@ -9856,12 +10516,14 @@ mod tests {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("automation-rr3f".to_string()),
             aliases: vec!["Example Title".to_string()],
+            scoped_aliases: vec![],
             targets: vec![
                 AnimeCandidateTarget {
                     target_key: "S01E01".to_string(),
                     canonical_key: Some("tvdb:100:S01E01".to_string()),
                     title: "Episode One".to_string(),
                     season_number: Some(1),
+                    anilist_season_id: Some("100".to_string()),
                     episode_number: Some(1),
                     absolute_episode_number: Some(1),
                     tvdb_episode_id: Some("1001".to_string()),
@@ -9872,6 +10534,7 @@ mod tests {
                     canonical_key: Some("tvdb:100:S01E02".to_string()),
                     title: "Episode Two".to_string(),
                     season_number: Some(1),
+                    anilist_season_id: Some("100".to_string()),
                     episode_number: Some(2),
                     absolute_episode_number: Some(2),
                     tvdb_episode_id: Some("1002".to_string()),
@@ -10226,6 +10889,609 @@ mod tests {
                 .year_match
                 .as_ref()
                 .is_some_and(|year| year.exact)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_planning_uses_candidate_source_provider_evidence() -> Result<()> {
+        let state = setup_test_state().await?;
+        let suite_provider_id = Uuid::nil();
+        let actual_provider_id = Uuid::new_v4();
+        let actual_instance_id = Uuid::new_v4();
+        let actual_extension_id = "elixir.sources.suite.actual";
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: "Primer".to_string(),
+                year: Some(2004),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: Some(json!({
+                    "sourceSelection": {
+                        "mode": "suite",
+                        "route": "suite:default",
+                        "suiteId": "default"
+                    }
+                })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_movie_target("Primer", None)],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let route_options = available_route_options();
+        let mut release = candidate(
+            "Primer.2004.1080p.WEB-DL-GROUP",
+            vec![DEBRID_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        release.raw = Some(json!({
+            "serverEvidence": {
+                "extensionSuite": {
+                    "providerId": actual_provider_id,
+                    "extensionId": actual_extension_id,
+                    "extensionName": "Actual Suite Source",
+                    "instanceId": actual_instance_id,
+                    "instanceName": "Default",
+                    "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+                    "implementation": "suite_actual_fixture",
+                    "mediaTypes": ["movie"],
+                    "actions": ["search"],
+                    "warnings": ["actual suite provider warning"],
+                    "routeOptions": route_options
+                }
+            }
+        }));
+        let response = CandidateSearchResponse {
+            schema_version: 1,
+            provider: CandidateProviderSummary {
+                provider_id: suite_provider_id,
+                extension_id: "elixir.extension_suite".to_string(),
+                extension_name: "Elixir Extension Suite".to_string(),
+                instance_id: Uuid::nil(),
+                instance_name: "default".to_string(),
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                implementation: Some("extension_suite".to_string()),
+                health_state: ProviderHealthState::Healthy,
+                media_types: vec!["movie".to_string()],
+                actions: vec!["search".to_string()],
+            },
+            route_options: Vec::new(),
+            candidates: vec![release],
+            warnings: vec!["suite wrapper warning".to_string()],
+        };
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        let plan = &batch.plans[0];
+        assert_eq!(plan.provider_id, actual_provider_id);
+        assert_eq!(plan.source_extension_id, actual_extension_id);
+        assert_eq!(
+            plan.provider_warnings,
+            vec!["actual suite provider warning".to_string()]
+        );
+        assert_ne!(plan.provider_id, suite_provider_id);
+        assert_eq!(plan.route_logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(plan.resolver_kind, ReleaseResolverKind::MovieRadarrStyle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn es5_extension_suite_single_provider_matches_direct_resolver_plans() -> Result<()> {
+        let state = setup_test_state().await?;
+
+        #[derive(Clone)]
+        struct Fixture {
+            name: &'static str,
+            subscription: AcquisitionSubscription,
+            targets: Vec<AcquisitionTarget>,
+            candidate: AcquisitionCandidate,
+            extension_id: &'static str,
+            media_types: Vec<&'static str>,
+            release_kind: ReleaseKind,
+            resolver_kind: ReleaseResolverKind,
+            confidence: ReleaseConfidence,
+        }
+
+        let movie_subscription = AcquisitionSubscription {
+            media_type: MediaType::Movie,
+            title: "Primer".to_string(),
+            normalized_title: "primer".to_string(),
+            year: Some(2004),
+            ..test_subscription()
+        };
+        let movie_targets = vec![movie_target(&movie_subscription)];
+
+        let series_subscription = AcquisitionSubscription {
+            external_ids: Some(ExternalIds {
+                tvdb_series: Some("100".to_string()),
+                ..Default::default()
+            }),
+            ..test_subscription()
+        };
+        let series_targets = vec![episode_target(&series_subscription, 2, 1)];
+
+        let anime_subscription = AcquisitionSubscription {
+            external_ids: Some(ExternalIds {
+                anilist: Some("200".to_string()),
+                ..Default::default()
+            }),
+            ..anime_subscription()
+        };
+        let anime_targets = vec![anime_absolute_target(&anime_subscription, 1000)];
+
+        let fixtures = vec![
+            Fixture {
+                name: "movie",
+                subscription: movie_subscription,
+                targets: movie_targets,
+                candidate: candidate(
+                    "Primer.2004.1080p.WEB-DL-GROUP",
+                    vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                    Some(true),
+                    Some(100),
+                ),
+                extension_id: "elixir.sources.torrentio.movie",
+                media_types: vec!["movie"],
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::MovieRadarrStyle,
+                confidence: ReleaseConfidence::High,
+            },
+            Fixture {
+                name: "tv",
+                subscription: series_subscription,
+                targets: series_targets,
+                candidate: candidate(
+                    "Show.S02E01.1080p.WEB-DL-GROUP",
+                    vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                    Some(true),
+                    Some(100),
+                ),
+                extension_id: "elixir.sources.torrentio.tv",
+                media_types: vec!["series"],
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::TvSonarrStyle,
+                confidence: ReleaseConfidence::High,
+            },
+            Fixture {
+                name: "anime",
+                subscription: anime_subscription,
+                targets: anime_targets,
+                candidate: candidate(
+                    "[SubsPlease] Example Title - 1000 [1080p]",
+                    vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                    Some(true),
+                    Some(100),
+                ),
+                extension_id: "elixir.sources.torrentio.anime",
+                media_types: vec!["anime"],
+                release_kind: ReleaseKind::Single,
+                resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+                confidence: ReleaseConfidence::High,
+            },
+        ];
+
+        for mut fixture in fixtures {
+            let provider_id = Uuid::new_v4();
+            fixture.subscription.source_provider_id = Some(provider_id);
+            let representative = fixture
+                .targets
+                .first()
+                .cloned()
+                .expect("fixture has representative target");
+            let mut direct_response = candidate_search_response_for_test(
+                provider_id,
+                fixture.extension_id,
+                fixture.media_types.clone(),
+                vec![fixture.candidate.clone()],
+            );
+            direct_response.warnings = vec![format!("{} provider warning", fixture.name)];
+            let suite_response = suite_response_from_direct_response_for_test(&direct_response);
+
+            let mut direct_governor = QueueGovernor::load(&state.db_pool).await?;
+            let direct_batch = build_candidate_release_plans(
+                &state,
+                &fixture.subscription,
+                &direct_response,
+                &representative,
+                &fixture.targets,
+                &mut direct_governor,
+            )
+            .await?;
+
+            let mut suite_governor = QueueGovernor::load(&state.db_pool).await?;
+            let suite_batch = build_candidate_release_plans(
+                &state,
+                &fixture.subscription,
+                &suite_response,
+                &representative,
+                &fixture.targets,
+                &mut suite_governor,
+            )
+            .await?;
+
+            assert_eq!(
+                direct_batch.plans.len(),
+                1,
+                "{} direct provider should produce one selected plan",
+                fixture.name
+            );
+            assert_eq!(
+                suite_batch.plans.len(),
+                1,
+                "{} suite provider should produce one selected plan",
+                fixture.name
+            );
+            let direct_plan = &direct_batch.plans[0];
+            let suite_plan = &suite_batch.plans[0];
+
+            assert_eq!(suite_plan.provider_id, provider_id, "{}", fixture.name);
+            assert_eq!(
+                suite_plan.source_extension_id, fixture.extension_id,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.provider_warnings, direct_plan.provider_warnings,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.route_logical_id, direct_plan.route_logical_id,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.fingerprint, direct_plan.fingerprint,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.release_kind, fixture.release_kind,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.release_kind, direct_plan.release_kind,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.resolver_kind, fixture.resolver_kind,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.resolver_kind, direct_plan.resolver_kind,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.resolver_version, direct_plan.resolver_version,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.confidence, fixture.confidence,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.confidence, direct_plan.confidence,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.covered_target_keys, direct_plan.covered_target_keys,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.covered_target_ids, direct_plan.covered_target_ids,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.selection.movie_coverage_plan.is_some(),
+                direct_plan.selection.movie_coverage_plan.is_some(),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.selection.tv_coverage_plan.is_some(),
+                direct_plan.selection.tv_coverage_plan.is_some(),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                suite_plan.selection.anime_coverage_plan.is_some(),
+                direct_plan.selection.anime_coverage_plan.is_some(),
+                "{}",
+                fixture.name
+            );
+
+            let group = TargetSearchGroup {
+                group_key: format!("es5-{}", fixture.name),
+                representative,
+                targets: fixture.targets.clone(),
+                search_intent: None,
+            };
+            let dispatch = scheduler_dispatch_evidence(
+                &fixture.subscription,
+                &group,
+                suite_plan,
+                suite_governor.capacity_snapshot(
+                    fixture.subscription.subscription_id,
+                    &suite_plan.route_logical_id,
+                ),
+            );
+            let provenance =
+                selected_candidate_provenance(&suite_plan.clone().into_submission(dispatch))?;
+            let provider_id = provider_id.to_string();
+            assert_eq!(
+                provenance
+                    .pointer("/sourceProviderId")
+                    .and_then(Value::as_str),
+                Some(provider_id.as_str()),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/sourceExtensionId")
+                    .and_then(Value::as_str),
+                Some(fixture.extension_id),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/raw/serverEvidence/extensionSuite/providerId")
+                    .and_then(Value::as_str),
+                Some(provider_id.as_str()),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/raw/serverEvidence/extensionSuite/contributorCount")
+                    .and_then(Value::as_u64),
+                Some(1),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/raw/serverEvidence/extensionSuite/contributors/0/providerId")
+                    .and_then(Value::as_str),
+                Some(provider_id.as_str()),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                provenance
+                    .pointer("/raw/serverEvidence/extensionSuite/contributors/0/extensionId")
+                    .and_then(Value::as_str),
+                Some(fixture.extension_id),
+                "{}",
+                fixture.name
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn es6_extension_suite_release_persistence_records_request_and_contributors() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let mut settings = Settings::default();
+        settings.database = DatabaseConfig {
+            url: format!(
+                "sqlite://{}",
+                temp_dir.path().join("es6-persistence.sqlite").display()
+            ),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        };
+        let state = setup_test_state_with_settings(settings).await?;
+        let source_provider_id = Uuid::new_v4();
+        let source_extension_id = "elixir.sources.torrentio.es6";
+        let route_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            source_provider_id,
+            source_extension_id,
+            "Torrentio ES-6",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "many",
+            "torrentio_stremio",
+        )
+        .await?;
+        insert_test_provider_ref(
+            &state.db_pool,
+            route_provider_id,
+            "elixir.routes.torbox.es6",
+            "TorBox ES-6",
+            "debrid.resolver",
+            "one",
+            "torbox",
+        )
+        .await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: "Primer".to_string(),
+                year: Some(2004),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: Some(json!({
+                    "sourceSelection": {
+                        "mode": "suite",
+                        "route": "suite:default",
+                        "suiteId": "default"
+                    }
+                })),
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_movie_target("Primer", None)],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let mut direct_response = candidate_search_response_for_test(
+            source_provider_id,
+            source_extension_id,
+            vec!["movie"],
+            vec![candidate(
+                "Primer.2004.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        direct_response.warnings = vec!["torrentio warning".to_string()];
+        let suite_response = suite_response_from_direct_response_for_test(&direct_response);
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_candidate_release_plans(
+            &state,
+            &subscription,
+            &suite_response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+        assert_eq!(batch.plans.len(), 1);
+        let plan = batch.plans[0].clone();
+        let submission = CandidateSubmission {
+            provider_id: plan.provider_id,
+            source_extension_id: plan.source_extension_id.clone(),
+            candidate: plan.selection.candidate.clone(),
+            provider_warnings: plan.provider_warnings.clone(),
+            anime_coverage_plan: plan.selection.anime_coverage_plan.clone(),
+            tv_coverage_plan: plan.selection.tv_coverage_plan.clone(),
+            movie_coverage_plan: plan.selection.movie_coverage_plan.clone(),
+            request_scope_evidence: plan.request_scope_evidence.clone(),
+            dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
+        };
+
+        assert_eq!(submission.provider_id, source_provider_id);
+        assert!(test_provider_ref_exists(&state.db_pool, source_provider_id).await?);
+        assert!(test_provider_ref_exists(&state.db_pool, route_provider_id).await?);
+
+        persist_release_submission(
+            &state,
+            &subscription,
+            &target,
+            &submission,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            Some("es6-suite-download".to_string()),
+            route_provider_id,
+            Some("torbox"),
+            "Submitted through ES-6 test.",
+            &[],
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::Submitted),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.source_provider_id, Some(source_provider_id));
+        assert_eq!(release.source_extension_id, source_extension_id);
+        assert_eq!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/sourceSuite/label"))
+                .and_then(Value::as_str),
+            Some("Elixir Extension Suite")
+        );
+        assert_eq!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/sourceSuite/sourceSelection/mode"))
+                .and_then(Value::as_str),
+            Some("suite")
+        );
+        assert_eq!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/sourceSuite/contributors/0/providerId"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            Some(source_provider_id)
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/requestScopeEvidence/sourceSelection/mode"))
+                .and_then(Value::as_str),
+            Some("suite")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.pointer("/requestScopeEvidence/sourceSelection/route"))
+                .and_then(Value::as_str),
+            Some("suite:default")
         );
         Ok(())
     }
@@ -10922,6 +12188,66 @@ mod tests {
                 AcquisitionRoutePolicy::DebridFirst,
             ) == Ordering::Greater,
             "server freshness scoring should prefer healthier tracker evidence over stale source seeder hints"
+        );
+    }
+
+    #[test]
+    fn asr8_risky_avi_candidate_ranks_below_clean_release() {
+        let target = episode_target(&test_subscription(), 1, 1);
+        let mut risky = candidate(
+            "Show.S01E01.1080p.HDTV.XviD-GROUP.avi",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(500),
+        );
+        risky.score = Some(1.0);
+        risky.files = vec![AcquisitionCandidateFile {
+            file_id: Some("1".to_string()),
+            file_index: Some(0),
+            path: "Show.S01E01.1080p.HDTV.XviD-GROUP.avi".to_string(),
+            size_bytes: Some(700_000_000),
+            selectable: Some(true),
+        }];
+        let mut clean = candidate(
+            "Show.S01E01.720p.WEB-DL-GROUP.mkv",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(25),
+        );
+        clean.quality = Some("720p".to_string());
+        clean.score = Some(0.1);
+        clean.files = vec![AcquisitionCandidateFile {
+            file_id: Some("1".to_string()),
+            file_index: Some(0),
+            path: "Show.S01E01.720p.WEB-DL-GROUP.mkv".to_string(),
+            size_bytes: Some(1_500_000_000),
+            selectable: Some(true),
+        }];
+
+        let risky_plan = release_plan_for_test(
+            risky,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let clean_plan = release_plan_for_test(
+            clean,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            &[target],
+        );
+
+        assert!(candidate_safety_score(&risky_plan.selection.candidate) < 0);
+        assert_eq!(candidate_safety_score(&clean_plan.selection.candidate), 0);
+        assert_eq!(
+            compare_release_plans(
+                &clean_plan,
+                &risky_plan,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
         );
     }
 

@@ -320,6 +320,10 @@ pub struct AnimeAliasEntry {
     pub normalized: String,
     pub tokens: Vec<String>,
     pub source: String,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub anilist_season_id: Option<String>,
     pub priority: i32,
 }
 
@@ -335,8 +339,23 @@ pub struct AnimeAliasMatch {
     pub display: String,
     pub normalized: String,
     pub source: String,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub anilist_season_id: Option<String>,
     pub kind: AnimeAliasMatchKind,
     pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeScopedAlias {
+    pub display: String,
+    pub source: String,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub anilist_season_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,6 +365,8 @@ pub struct AnimeCandidateTarget {
     pub canonical_key: Option<String>,
     pub title: String,
     pub season_number: Option<i32>,
+    #[serde(default)]
+    pub anilist_season_id: Option<String>,
     pub episode_number: Option<i32>,
     pub absolute_episode_number: Option<i32>,
     pub tvdb_episode_id: Option<String>,
@@ -357,6 +378,8 @@ pub struct AnimeCandidateTarget {
 pub struct AnimeCandidateScoringContext {
     pub graph_fingerprint: Option<String>,
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub scoped_aliases: Vec<AnimeScopedAlias>,
     pub targets: Vec<AnimeCandidateTarget>,
 }
 
@@ -639,6 +662,7 @@ impl AnimeCandidateTarget {
             canonical_key: Some(target.canonical_key.clone()),
             title: target.title.clone(),
             season_number: target.season_number,
+            anilist_season_id: Some(target.anilist_season_id.clone()),
             episode_number: target.episode_number,
             absolute_episode_number: target.absolute_episode_number,
             tvdb_episode_id: target.tvdb_episode_id.clone(),
@@ -652,6 +676,7 @@ impl AnimeCandidateScoringContext {
         Self {
             graph_fingerprint: Some(graph.fingerprint.clone()),
             aliases: graph.aliases.clone(),
+            scoped_aliases: graph.scoped_aliases.clone(),
             targets: graph
                 .targets
                 .iter()
@@ -1240,6 +1265,8 @@ pub struct AnimeMetadataGraph {
     pub seasons: Vec<AnimeGraphSeason>,
     pub targets: Vec<AnimeGraphTarget>,
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub scoped_aliases: Vec<AnimeScopedAlias>,
     pub fingerprint: String,
 }
 
@@ -1383,6 +1410,7 @@ impl AnimeMetadataGraph {
                     "targetCanonicalKey": target.canonical_key,
                     "externalIds": self.external_ids,
                     "aliases": self.aliases,
+                    "scopedAliases": self.scoped_aliases,
                     "anilistRootId": self.root_anilist_id,
                     "anilistSeasonId": target.anilist_season_id,
                     "anilistSeason": target.season,
@@ -1449,15 +1477,29 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
         .unwrap_or_else(|| input.seed_anilist_id.clone());
 
     let mut aliases = BTreeSet::new();
+    let mut scoped_aliases = BTreeMap::<String, AnimeScopedAlias>::new();
     insert_alias(&mut aliases, &input.title);
     let mut targets_by_key: BTreeMap<String, AnimeGraphTarget> = BTreeMap::new();
     let mut mapped_counts_by_season = HashMap::<String, usize>::new();
 
     for season_input in &season_inputs {
         insert_alias(&mut aliases, &season_input.season.title);
+        insert_scoped_alias(
+            &mut scoped_aliases,
+            &season_input.season.title,
+            "anilist_season_title",
+            &season_input.season,
+        );
+        insert_generated_season_aliases(&mut scoped_aliases, &input.title, &season_input.season);
         if let Some(mapping) = season_input.mapping.as_ref() {
             for title in mapping.titles.values() {
                 insert_alias(&mut aliases, title);
+                insert_scoped_alias(
+                    &mut scoped_aliases,
+                    title,
+                    "anizip_title",
+                    &season_input.season,
+                );
             }
             let prefer_mainline_numbering = anizip_prefers_mainline_numbering(mapping);
             for episode in &mapping.episodes {
@@ -1534,11 +1576,13 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
 
     let targets = targets_by_key.into_values().collect::<Vec<_>>();
     let aliases = aliases.into_iter().collect::<Vec<_>>();
+    let scoped_aliases = scoped_aliases.into_values().collect::<Vec<_>>();
     let fingerprint = graph_fingerprint(
         &input.seed_anilist_id,
         &root_anilist_id,
         &external_ids,
         &targets,
+        &scoped_aliases,
     );
 
     AnimeMetadataGraph {
@@ -1551,17 +1595,44 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
         seasons,
         targets,
         aliases,
+        scoped_aliases,
         fingerprint,
     }
 }
 
 pub fn build_anime_alias_table(context: &AnimeCandidateScoringContext) -> AnimeAliasTable {
     let mut entries_by_key = BTreeMap::<String, AnimeAliasEntry>::new();
+    let scoped_normalized = context
+        .scoped_aliases
+        .iter()
+        .map(|alias| normalize_anime_alias(&alias.display))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
     for alias in &context.aliases {
-        insert_alias_entry(&mut entries_by_key, alias, "graph_alias", 50);
+        let normalized = normalize_anime_alias(alias);
+        if !scoped_normalized.contains(&normalized) {
+            insert_alias_entry(&mut entries_by_key, alias, "graph_alias", 50, None, None);
+        }
+    }
+    for alias in &context.scoped_aliases {
+        insert_alias_entry(
+            &mut entries_by_key,
+            &alias.display,
+            &alias.source,
+            60,
+            alias.season_number,
+            alias.anilist_season_id.clone(),
+        );
     }
     for target in &context.targets {
-        insert_alias_entry(&mut entries_by_key, &target.title, "target_title", 10);
+        insert_alias_entry(
+            &mut entries_by_key,
+            &target.title,
+            "target_title",
+            10,
+            target.season_number,
+            target.anilist_season_id.clone(),
+        );
     }
     AnimeAliasTable {
         entries: entries_by_key.into_values().collect(),
@@ -1599,6 +1670,7 @@ pub fn reconcile_anime_graph(
             .cloned()
             .chain(sonarr_absolute_matches.iter().cloned()),
     );
+    let alias_scoped_target_matches = match_targets_by_alias_scope(context, parsed, alias_matches);
     let anime_signal_target_matches = match_anime_signal_targets(context, parsed);
     let direct_target_matches = match_candidate_targets(context, parsed);
 
@@ -1611,6 +1683,10 @@ pub fn reconcile_anime_graph(
         .intersection(&sonarr_absolute_keys)
         .cloned()
         .collect::<BTreeSet<_>>();
+    let exact_scoped_alias_match = alias_matches.first().is_some_and(|alias| {
+        alias.kind == AnimeAliasMatchKind::Exact
+            && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
+    });
 
     let mut contradiction_reasons = Vec::new();
     let mut review_reasons = Vec::new();
@@ -1618,7 +1694,10 @@ pub fn reconcile_anime_graph(
     let mut outcome = AnimeReconciliationOutcome::Unexplainable;
     let mut target_matches = Vec::new();
 
-    if has_sonarr_structured_facts
+    if exact_scoped_alias_match && !alias_scoped_target_matches.is_empty() {
+        outcome = AnimeReconciliationOutcome::Translation;
+        target_matches = alias_scoped_target_matches.clone();
+    } else if has_sonarr_structured_facts
         && has_sonarr_absolute_facts
         && !sonarr_structured_matches.is_empty()
         && !sonarr_absolute_matches.is_empty()
@@ -1679,6 +1758,9 @@ pub fn reconcile_anime_graph(
                     .chain(additive_matches),
             );
         }
+    } else if !alias_scoped_target_matches.is_empty() {
+        outcome = AnimeReconciliationOutcome::Augmentation;
+        target_matches = alias_scoped_target_matches.clone();
     } else if !anime_signal_target_matches.is_empty() {
         outcome = AnimeReconciliationOutcome::Augmentation;
         target_matches = anime_signal_target_matches.clone();
@@ -2563,6 +2645,8 @@ fn insert_alias_entry(
     display: &str,
     source: &str,
     priority: i32,
+    season_number: Option<i32>,
+    anilist_season_id: Option<String>,
 ) {
     let cleaned = cleanup_anime_title(display);
     let normalized = normalize_anime_alias(&cleaned);
@@ -2570,12 +2654,22 @@ fn insert_alias_entry(
     if normalized.is_empty() || tokens.is_empty() || is_metadata_segment(&cleaned) {
         return;
     }
-    let key = format!("{normalized}:{source}");
+    let key = format!(
+        "{}:{}:{}:{}",
+        normalized,
+        source,
+        season_number
+            .map(|season| season.to_string())
+            .unwrap_or_default(),
+        anilist_season_id.clone().unwrap_or_default()
+    );
     let entry = AnimeAliasEntry {
         display: cleaned,
         normalized,
         tokens,
         source: source.to_string(),
+        season_number,
+        anilist_season_id,
         priority,
     };
     match entries_by_key.get(&key) {
@@ -2597,6 +2691,9 @@ fn match_anime_aliases(
     for title in &parsed.alt_titles {
         titles.insert(cleanup_anime_title(title));
     }
+    for title in &parsed.anime_signal_facts.title_season_alias_candidates {
+        titles.insert(cleanup_anime_title(title));
+    }
     let mut matches = Vec::new();
     for title in titles {
         let title_normalized = normalize_anime_alias(&title);
@@ -2611,10 +2708,37 @@ fn match_anime_aliases(
                     display: alias.display.clone(),
                     normalized: alias.normalized.clone(),
                     source: alias.source.clone(),
+                    season_number: alias.season_number,
+                    anilist_season_id: alias.anilist_season_id.clone(),
                     kind,
                     score: score + f64::from(alias.priority) / 1000.0,
                 });
             }
+        }
+    }
+    let original_tokens = anime_alias_tokens(&parsed.original_title);
+    if !original_tokens.is_empty() {
+        for alias in &alias_table.entries {
+            if alias.season_number.is_none() && alias.anilist_season_id.is_none() {
+                continue;
+            }
+            if alias.tokens.is_empty() || alias.tokens.len() > original_tokens.len() {
+                continue;
+            }
+            if !token_sequence_contains(&original_tokens, &alias.tokens) {
+                continue;
+            }
+            matches.push(AnimeAliasMatch {
+                display: alias.display.clone(),
+                normalized: alias.normalized.clone(),
+                source: alias.source.clone(),
+                season_number: alias.season_number,
+                anilist_season_id: alias.anilist_season_id.clone(),
+                kind: AnimeAliasMatchKind::Exact,
+                score: 101.0
+                    + (alias.tokens.len() as f64 / 100.0)
+                    + f64::from(alias.priority) / 1000.0,
+            });
         }
     }
     matches.sort_by(|left, right| {
@@ -2628,9 +2752,25 @@ fn match_anime_aliases(
     let mut seen = BTreeSet::new();
     matches
         .into_iter()
-        .filter(|item| seen.insert((item.normalized.clone(), item.kind)))
+        .filter(|item| {
+            seen.insert((
+                item.normalized.clone(),
+                item.kind,
+                item.season_number,
+                item.anilist_season_id.clone(),
+            ))
+        })
         .take(5)
         .collect()
+}
+
+fn token_sequence_contains(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn score_alias_match(
@@ -2681,6 +2821,109 @@ fn alias_match_margin(matches: &[AnimeAliasMatch]) -> Option<f64> {
         .skip(1)
         .find(|candidate| candidate.normalized != best.normalized)
         .map(|candidate| best.score - candidate.score)
+}
+
+fn match_targets_by_alias_scope(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    alias_matches: &[AnimeAliasMatch],
+) -> Vec<AnimeCandidateTargetMatch> {
+    let scoped_matches = alias_matches
+        .iter()
+        .filter(|item| item.season_number.is_some() || item.anilist_season_id.is_some())
+        .filter(|item| item.kind >= AnimeAliasMatchKind::Suffix)
+        .collect::<Vec<_>>();
+    if scoped_matches.is_empty() {
+        return Vec::new();
+    }
+    let selected_scope = scoped_matches
+        .iter()
+        .find(|item| item.kind == AnimeAliasMatchKind::Exact)
+        .copied()
+        .or_else(|| scoped_matches.first().copied());
+    let scoped_matches = selected_scope
+        .map(|best| {
+            scoped_matches
+                .into_iter()
+                .filter(|item| anime_alias_scopes_agree(best, item))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if scoped_matches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut episode_numbers = parsed
+        .sonarr_facts
+        .episode_numbers
+        .iter()
+        .copied()
+        .chain(parsed.sonarr_facts.absolute_episode_numbers.iter().copied())
+        .chain(parsed.episode_numbers.iter().copied())
+        .chain(parsed.absolute_episode_numbers.iter().copied())
+        .filter(|episode| *episode > 0)
+        .collect::<BTreeSet<_>>();
+    episode_numbers.extend(
+        parsed
+            .anime_signal_facts
+            .fallback_season_one_episode_hypotheses
+            .iter()
+            .copied()
+            .filter(|episode| *episode > 0),
+    );
+    if episode_numbers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for alias in scoped_matches {
+        for target in &context.targets {
+            let season_matches = alias
+                .anilist_season_id
+                .as_ref()
+                .zip(target.anilist_season_id.as_ref())
+                .is_some_and(|(alias_id, target_id)| alias_id == target_id)
+                || alias
+                    .season_number
+                    .zip(target.season_number)
+                    .is_some_and(|(alias_season, target_season)| alias_season == target_season);
+            if !season_matches {
+                continue;
+            }
+            if !target
+                .episode_number
+                .is_some_and(|episode| episode_numbers.contains(&episode))
+            {
+                continue;
+            }
+            let mut matched = candidate_target_match(
+                target,
+                "scoped_alias_season_episode",
+                104.0 + alias.score / 100.0 + target_identity_bonus(target),
+            );
+            matched.match_reason = format!("scoped_alias_season_episode:{}", alias.source);
+            matches.push(matched);
+        }
+    }
+
+    dedup_target_matches(matches)
+}
+
+fn anime_alias_scopes_agree(left: &AnimeAliasMatch, right: &AnimeAliasMatch) -> bool {
+    if let (Some(left_id), Some(right_id)) = (
+        left.anilist_season_id.as_deref(),
+        right.anilist_season_id.as_deref(),
+    ) && left_id != right_id
+    {
+        return false;
+    }
+    if let (Some(left_season), Some(right_season)) = (left.season_number, right.season_number)
+        && left_season != right_season
+    {
+        return false;
+    }
+    (left.anilist_season_id.is_some() || left.season_number.is_some())
+        && (right.anilist_season_id.is_some() || right.season_number.is_some())
 }
 
 fn match_anime_signal_targets(
@@ -3310,6 +3553,7 @@ fn graph_fingerprint(
     root_anilist_id: &str,
     external_ids: &ExternalIds,
     targets: &[AnimeGraphTarget],
+    scoped_aliases: &[AnimeScopedAlias],
 ) -> String {
     let mut material = vec![
         ANIME_SHOKO_STYLE_RESOLVER_VERSION.to_string(),
@@ -3332,6 +3576,18 @@ fn graph_fingerprint(
             target.anilist_season_id,
             target.tvdb_episode_id.clone().unwrap_or_default(),
             target.anidb_episode_id.clone().unwrap_or_default()
+        )
+    }));
+    material.extend(scoped_aliases.iter().map(|alias| {
+        format!(
+            "alias:{}:{}:{}:{}",
+            alias.display,
+            alias.source,
+            alias
+                .season_number
+                .map(|season| season.to_string())
+                .unwrap_or_default(),
+            alias.anilist_season_id.clone().unwrap_or_default()
         )
     }));
     format!(
@@ -3368,6 +3624,62 @@ fn insert_alias(aliases: &mut BTreeSet<String>, value: &str) {
     if !trimmed.is_empty() {
         aliases.insert(trimmed.to_string());
     }
+}
+
+fn insert_generated_season_aliases(
+    scoped_aliases: &mut BTreeMap<String, AnimeScopedAlias>,
+    base_title: &str,
+    season: &AniListSeasonChainEntry,
+) {
+    if season.season_number <= 1 {
+        return;
+    }
+    insert_scoped_alias(
+        scoped_aliases,
+        &format!("{} Season {}", base_title.trim(), season.season_number),
+        "generated_season_ordinal",
+        season,
+    );
+    insert_scoped_alias(
+        scoped_aliases,
+        &format!("{} S{}", base_title.trim(), season.season_number),
+        "generated_season_short",
+        season,
+    );
+    insert_scoped_alias(
+        scoped_aliases,
+        &format!("{} S{:02}", base_title.trim(), season.season_number),
+        "generated_season_short",
+        season,
+    );
+}
+
+fn insert_scoped_alias(
+    scoped_aliases: &mut BTreeMap<String, AnimeScopedAlias>,
+    value: &str,
+    source: &str,
+    season: &AniListSeasonChainEntry,
+) {
+    let display = cleanup_anime_title(value);
+    if display.is_empty() || is_metadata_segment(&display) {
+        return;
+    }
+    let normalized = normalize_anime_alias(&display);
+    if normalized.is_empty() {
+        return;
+    }
+    let key = format!(
+        "{}:{}:{}:{}",
+        normalized, source, season.season_number, season.anilist_id
+    );
+    scoped_aliases
+        .entry(key)
+        .or_insert_with(|| AnimeScopedAlias {
+            display,
+            source: source.to_string(),
+            season_number: Some(season.season_number),
+            anilist_season_id: Some(season.anilist_id.clone()),
+        });
 }
 
 fn next_search_after_for_air_time(
@@ -4751,12 +5063,14 @@ mod tests {
                 "Example Title Alternative".to_string(),
                 "例題".to_string(),
             ],
+            scoped_aliases: vec![],
             targets: vec![
                 AnimeCandidateTarget {
                     target_key: "S01E01".to_string(),
                     canonical_key: Some("tvdb:100:S01E01".to_string()),
                     title: "Episode One".to_string(),
                     season_number: Some(1),
+                    anilist_season_id: Some("100".to_string()),
                     episode_number: Some(1),
                     absolute_episode_number: Some(1),
                     tvdb_episode_id: Some("1001".to_string()),
@@ -4767,6 +5081,7 @@ mod tests {
                     canonical_key: Some("tvdb:100:S01E02".to_string()),
                     title: "Episode Two".to_string(),
                     season_number: Some(1),
+                    anilist_season_id: Some("100".to_string()),
                     episode_number: Some(2),
                     absolute_episode_number: Some(2),
                     tvdb_episode_id: Some("1002".to_string()),
@@ -4849,6 +5164,7 @@ mod tests {
                 canonical_key: self.canonical_key.clone(),
                 title: self.title.clone(),
                 season_number: self.season_number,
+                anilist_season_id: None,
                 episode_number: self.episode_number,
                 absolute_episode_number: self.absolute_episode_number,
                 tvdb_episode_id: self.tvdb_episode_id.clone(),
@@ -5956,6 +6272,7 @@ mod tests {
             let context = AnimeCandidateScoringContext {
                 graph_fingerprint: Some(format!("rr3q:{}", case.id)),
                 aliases: case.aliases.clone(),
+                scoped_aliases: vec![],
                 targets: case
                     .targets
                     .iter()
@@ -6086,6 +6403,7 @@ mod tests {
                 "Example Title Final".to_string(),
                 "Example Title Special".to_string(),
             ],
+            scoped_aliases: vec![],
             targets: rr3e_scoring_context().targets,
         };
         let score = score_anime_candidate(
@@ -6118,6 +6436,115 @@ mod tests {
                 .rejection_reasons
                 .iter()
                 .any(|reason| reason == "no_graph_alias_match")
+        );
+    }
+
+    fn tokyo_ghoul_scoped_context() -> AnimeCandidateScoringContext {
+        AnimeCandidateScoringContext {
+            graph_fingerprint: Some("rr3-scoped-tokyo-ghoul".to_string()),
+            aliases: vec![
+                "Tokyo Ghoul".to_string(),
+                "Tokyo Ghoul Root A".to_string(),
+                "Tokyo Ghoul:re".to_string(),
+            ],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul".to_string(),
+                    source: "anilist_season_title".to_string(),
+                    season_number: Some(1),
+                    anilist_season_id: Some("1001".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul Root A".to_string(),
+                    source: "anilist_season_title".to_string(),
+                    season_number: Some(2),
+                    anilist_season_id: Some("1002".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul Season 2".to_string(),
+                    source: "generated_season_ordinal".to_string(),
+                    season_number: Some(2),
+                    anilist_season_id: Some("1002".to_string()),
+                },
+            ],
+            targets: vec![
+                AnimeCandidateTarget {
+                    target_key: "S01E01".to_string(),
+                    canonical_key: Some("anilist:1001:S01E01".to_string()),
+                    title: "Tragedy".to_string(),
+                    season_number: Some(1),
+                    anilist_season_id: Some("1001".to_string()),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    tvdb_episode_id: Some("2001".to_string()),
+                    anidb_episode_id: None,
+                },
+                AnimeCandidateTarget {
+                    target_key: "S02E01".to_string(),
+                    canonical_key: Some("anilist:1002:S02E01".to_string()),
+                    title: "New Surge".to_string(),
+                    season_number: Some(2),
+                    anilist_season_id: Some("1002".to_string()),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(13),
+                    tvdb_episode_id: Some("2013".to_string()),
+                    anidb_episode_id: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn rr3_scoped_anilist_season_alias_maps_to_matching_season() {
+        let score = score_anime_candidate(
+            &tokyo_ghoul_scoped_context(),
+            &rr3e_candidate("[SubsPlease] Tokyo Ghoul Root A - 01 [1080p]"),
+        );
+
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(
+            score
+                .target_matches
+                .first()
+                .map(|target| target.target_key.as_str()),
+            Some("S02E01")
+        );
+        assert!(
+            score
+                .target_matches
+                .iter()
+                .all(|target| target.target_key != "S01E01")
+        );
+        assert_eq!(
+            score
+                .alias_matches
+                .first()
+                .and_then(|alias| alias.season_number),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rr3_generated_season_alias_maps_to_matching_season() {
+        let score = score_anime_candidate(
+            &tokyo_ghoul_scoped_context(),
+            &rr3e_candidate("[SubsPlease] Tokyo Ghoul Season 2 - 01 [1080p]"),
+        );
+
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(
+            score
+                .target_matches
+                .first()
+                .map(|target| target.target_key.as_str()),
+            Some("S02E01")
+        );
+        assert_eq!(
+            score
+                .alias_matches
+                .first()
+                .map(|alias| alias.source.as_str()),
+            Some("generated_season_ordinal")
         );
     }
 
@@ -6334,11 +6761,13 @@ mod tests {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("rr3r-absolute-arc".to_string()),
             aliases: vec!["Long Running Anime".to_string()],
+            scoped_aliases: vec![],
             targets: vec![AnimeCandidateTarget {
                 target_key: "A0009".to_string(),
                 canonical_key: Some("anilist:21:A0009".to_string()),
                 title: "Long Running Anime A0009".to_string(),
                 season_number: None,
+                anilist_season_id: None,
                 episode_number: None,
                 absolute_episode_number: Some(9),
                 tvdb_episode_id: None,

@@ -4769,6 +4769,60 @@ async fn mmr4_selected_episode_retry_uses_explicit_targets_and_idempotency() -> 
 }
 
 #[tokio::test]
+async fn acquisition_intent_accepts_extension_suite_source_selection_route() -> Result<()> {
+    let (app, db_pool, token) = setup_download_broker_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let source_provider_id =
+        seed_acquisition_candidate_provider(&store, "elixir.sources.suite_route").await?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/find/acquisition")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "mediaType": "movie",
+                    "title": "Suite Route Movie",
+                    "year": 2026,
+                    "sourceProviderId": source_provider_id,
+                    "sourceSelectionRoute": "suite:default",
+                    "sourceSelectionMode": "suite",
+                    "sourceSuiteId": "default"
+                }))?))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(status, StatusCode::OK, "create response: {payload}");
+    assert_eq!(
+        payload.pointer("/detail/subscription/sourceProviderId"),
+        Some(&json!(source_provider_id.to_string()))
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/routePolicy")
+            .and_then(Value::as_str),
+        Some("debrid_first")
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/scope/sourceSelection/mode")
+            .and_then(Value::as_str),
+        Some("suite")
+    );
+    assert_eq!(
+        payload
+            .pointer("/detail/subscription/scope/sourceSelection/route")
+            .and_then(Value::as_str),
+        Some("suite:default")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_counts() -> Result<()>
 {
     let (app, db_pool, token) = setup_download_broker_test_app().await?;
@@ -10210,6 +10264,250 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
             .and_then(Value::as_f64)
             .unwrap_or(-1.0) as i32,
         0
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "play-series-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let extensions = ExtensionManager::new();
+    let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let dir = tempdir()?;
+    let s1e1_path = dir.path().join("Playback.Scope.S01E01.mkv");
+    let s2e10_path = dir.path().join("Playback.Scope.S02E10.mkv");
+    tokio::fs::write(&s1e1_path, b"s01e01").await?;
+    tokio::fs::write(&s2e10_path, b"s02e10").await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("play-series-user@example.com")
+        .bind("hashed")
+        .execute(&state.db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let series_id = Uuid::new_v4();
+    let season_one_id = Uuid::new_v4();
+    let season_two_id = Uuid::new_v4();
+    let episode_one_id = Uuid::new_v4();
+    let episode_later_id = Uuid::new_v4();
+    let file_one_id = Uuid::new_v4();
+    let file_later_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, 'series', '{}', 'Playback Scope', 2024)",
+    )
+    .bind(series_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO series (id, title, year, library_type, metadata_json)
+         VALUES (?, 'Playback Scope', 2024, 'series', NULL)",
+    )
+    .bind(series_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+        .bind(season_one_id.to_string())
+        .bind(series_id.to_string())
+        .bind("Season 1")
+        .execute(&state.db_pool)
+        .await?;
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 2, ?)")
+        .bind(season_two_id.to_string())
+        .bind(series_id.to_string())
+        .bind("Season 2")
+        .execute(&state.db_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO episodes
+            (id, series_id, season_id, season_number, episode_number, title, has_file)
+         VALUES (?, ?, ?, 1, 1, 'Episode One', 1)",
+    )
+    .bind(episode_one_id.to_string())
+    .bind(series_id.to_string())
+    .bind(season_one_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO episodes
+            (id, series_id, season_id, season_number, episode_number, title, has_file)
+         VALUES (?, ?, ?, 2, 10, 'Later Episode', 1)",
+    )
+    .bind(episode_later_id.to_string())
+    .bind(series_id.to_string())
+    .bind(season_two_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files
+            (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
+         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+    )
+    .bind(file_one_id.to_string())
+    .bind(series_id.to_string())
+    .bind(s1e1_path.to_string_lossy().to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files
+            (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
+         VALUES (?, ?, ?, 6, 'mkv', 'h265', 'aac', 3840, 2160, 18000000, 'ok')",
+    )
+    .bind(file_later_id.to_string())
+    .bind(series_id.to_string())
+    .bind(s2e10_path.to_string_lossy().to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+        .bind(episode_one_id.to_string())
+        .bind(file_one_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+        .bind(episode_later_id.to_string())
+        .bind(file_later_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+
+    let play_body = serde_json::json!({
+        "media_item_id": series_id,
+        "preferred_episode_id": episode_one_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv"],
+            "supported_video_codecs": ["h264", "h265"],
+            "supported_audio_codecs": ["aac"]
+        }
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::OK, "body: {}", json);
+    let selected_file_id = json
+        .get("mediaFileId")
+        .or_else(|| json.get("media_file_id"))
+        .and_then(Value::as_str)
+        .context("media file id in play response")?;
+    assert_eq!(selected_file_id, file_one_id.to_string());
+
+    let legacy_play_body = serde_json::json!({
+        "media_item_id": series_id,
+        "preferred_file_id": episode_one_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true
+        }
+    });
+    let legacy_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(legacy_play_body.to_string()))?,
+        )
+        .await?;
+    let legacy_status = legacy_resp.status();
+    let legacy_bytes = body::to_bytes(legacy_resp.into_body(), 1_048_576).await?;
+    let legacy_json: Value = serde_json::from_slice(&legacy_bytes)?;
+    assert_eq!(legacy_status, StatusCode::OK, "body: {}", legacy_json);
+    let legacy_selected_file_id = legacy_json
+        .get("mediaFileId")
+        .or_else(|| legacy_json.get("media_file_id"))
+        .and_then(Value::as_str)
+        .context("media file id in legacy play response")?;
+    assert_eq!(legacy_selected_file_id, file_one_id.to_string());
+
+    let invalid_preferred_body = serde_json::json!({
+        "media_item_id": series_id,
+        "preferred_file_id": Uuid::new_v4(),
+        "network_type": "lan",
+        "client_capabilities": {
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true
+        }
+    });
+    let invalid_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(invalid_preferred_body.to_string()))?,
+        )
+        .await?;
+    let invalid_status = invalid_resp.status();
+    let invalid_body = body::to_bytes(invalid_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        invalid_status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        String::from_utf8_lossy(&invalid_body)
+    );
+
+    let invalid_episode_body = serde_json::json!({
+        "media_item_id": series_id,
+        "preferred_episode_id": Uuid::new_v4(),
+        "network_type": "lan",
+        "client_capabilities": {
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true
+        }
+    });
+    let invalid_episode_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(invalid_episode_body.to_string()))?,
+        )
+        .await?;
+    let invalid_episode_status = invalid_episode_resp.status();
+    let invalid_episode_body = body::to_bytes(invalid_episode_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        invalid_episode_status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        String::from_utf8_lossy(&invalid_episode_body)
     );
 
     Ok(())

@@ -596,6 +596,12 @@ pub struct CreateAcquisitionIntent {
     pub route_policy: Option<AcquisitionRoutePolicy>,
     #[serde(default)]
     pub source_provider_id: Option<Uuid>,
+    #[serde(default, alias = "source_selection_route")]
+    pub source_selection_route: Option<String>,
+    #[serde(default, alias = "source_selection_mode")]
+    pub source_selection_mode: Option<String>,
+    #[serde(default, alias = "source_suite_id")]
+    pub source_suite_id: Option<String>,
     #[serde(default)]
     pub release_delay_seconds: Option<i64>,
     #[serde(default)]
@@ -2467,7 +2473,71 @@ fn validate_intent_input(intent: &CreateAcquisitionIntent) -> Result<()> {
     if intent.release_delay_seconds.unwrap_or_default() < 0 {
         bail!("releaseDelaySeconds cannot be negative");
     }
+    validate_source_selection_input(intent)?;
     normalize_idempotency_key(intent.idempotency_key.as_deref())?;
+    Ok(())
+}
+
+fn validate_source_selection_input(intent: &CreateAcquisitionIntent) -> Result<()> {
+    let route = intent
+        .source_selection_route
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mode = intent
+        .source_selection_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let suite_id = intent
+        .source_suite_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(suite_id) = suite_id
+        && suite_id != "default"
+    {
+        bail!("sourceSuiteId must be 'default'");
+    }
+
+    if let Some(mode) = mode {
+        match mode {
+            "suite" => {
+                if let Some(route) = route
+                    && route != "suite:default"
+                {
+                    bail!("sourceSelectionRoute must be 'suite:default' for suite mode");
+                }
+            }
+            "source" => {
+                if let Some(route) = route
+                    && !route.starts_with("source:")
+                {
+                    bail!("sourceSelectionRoute must be a source route for source mode");
+                }
+            }
+            _ => bail!("sourceSelectionMode must be 'suite' or 'source'"),
+        }
+    }
+
+    let Some(route) = route else {
+        return Ok(());
+    };
+    if route == "suite:default" {
+        return Ok(());
+    }
+    let Some(provider_id_text) = route.strip_prefix("source:") else {
+        bail!("sourceSelectionRoute must be 'suite:default' or 'source:<provider_id>'");
+    };
+    let route_provider_id = Uuid::parse_str(provider_id_text).with_context(|| {
+        format!("invalid sourceSelectionRoute provider id '{provider_id_text}'")
+    })?;
+    if let Some(source_provider_id) = intent.source_provider_id
+        && source_provider_id != route_provider_id
+    {
+        bail!("sourceSelectionRoute provider does not match sourceProviderId");
+    }
     Ok(())
 }
 
@@ -2489,11 +2559,14 @@ fn intent_subscription_data(
                 .is_some_and(AcquisitionRequestMode::is_one_shot)
                 .then(|| intent_request_scope(intent, has_explicit_targets))
         }),
-        scope: intent.scope.clone().or_else(|| {
-            request_mode
-                .is_some_and(AcquisitionRequestMode::is_one_shot)
-                .then(|| intent_scope_evidence(intent))
-        }),
+        scope: intent_source_selection_scope(
+            intent,
+            intent.scope.clone().or_else(|| {
+                request_mode
+                    .is_some_and(AcquisitionRequestMode::is_one_shot)
+                    .then(|| intent_scope_evidence(intent))
+            }),
+        ),
         metadata_policy: intent.metadata_policy.or_else(|| {
             request_mode
                 .is_some_and(AcquisitionRequestMode::is_one_shot)
@@ -2587,6 +2660,53 @@ fn intent_scope_evidence(intent: &CreateAcquisitionIntent) -> JsonValue {
         "absoluteEpisodeEnd": target.absolute_episode_end,
         "explicitTargetCount": intent.targets.len() + target.targets.len()
     })
+}
+
+fn intent_source_selection_scope(
+    intent: &CreateAcquisitionIntent,
+    scope: Option<JsonValue>,
+) -> Option<JsonValue> {
+    let has_source_selection = intent
+        .source_selection_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || intent
+            .source_selection_route
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        || intent
+            .source_suite_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+    if !has_source_selection {
+        return scope;
+    }
+
+    let mut root = match scope {
+        Some(JsonValue::Object(object)) => object,
+        Some(value) => {
+            let mut object = serde_json::Map::new();
+            object.insert("scope".to_string(), value);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    root.insert(
+        "sourceSelection".to_string(),
+        json!({
+            "mode": intent.source_selection_mode.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            "route": intent.source_selection_route.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            "suiteId": intent.source_suite_id.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            "providerId": intent.source_provider_id.map(|value| value.to_string()),
+        }),
+    );
+    Some(JsonValue::Object(root))
 }
 
 fn intent_explicit_targets(
@@ -3722,6 +3842,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
@@ -3873,6 +3996,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -3930,6 +4056,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: Some(AcquisitionRoutePolicy::DebridOnly),
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: Some(900),
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -3972,6 +4101,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -4017,6 +4149,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -4050,6 +4185,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -4098,6 +4236,9 @@ mod tests {
             monitor_policy: None,
             route_policy: None,
             source_provider_id: None,
+            source_selection_route: None,
+            source_selection_mode: None,
+            source_suite_id: None,
             release_delay_seconds: None,
             quality_profile: None,
             metadata_refresh_after: None,
@@ -4175,6 +4316,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
@@ -4207,6 +4351,9 @@ mod tests {
             monitor_policy: None,
             route_policy: None,
             source_provider_id: None,
+            source_selection_route: None,
+            source_selection_mode: None,
+            source_suite_id: None,
             release_delay_seconds: None,
             quality_profile: None,
             metadata_refresh_after: None,
@@ -4286,6 +4433,9 @@ mod tests {
                 monitor_policy: None,
                 route_policy: None,
                 source_provider_id: None,
+                source_selection_route: None,
+                source_selection_mode: None,
+                source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
                 metadata_refresh_after: None,
