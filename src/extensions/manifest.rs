@@ -553,10 +553,10 @@ impl ManifestProviderScope {
             ensure_non_empty(action, "provides.scope.actions")?;
             if !matches!(
                 action.trim().to_ascii_lowercase().as_str(),
-                "search" | "add" | "monitor"
+                "search" | "add" | "monitor" | "resolve"
             ) {
                 bail!(
-                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor",
+                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor|resolve",
                     action
                 );
             }
@@ -614,6 +614,7 @@ impl ManifestDownloadBrokerProviderScope {
                 "downloaders.torrent.default"
                     | "downloaders.usenet.default"
                     | "acquisition.debrid.default"
+                    | "acquisition.http_stream.default"
             ) {
                 bail!(
                     "unsupported {prefix}.logical_id '{}'; expected a known logical downloader id",
@@ -2110,6 +2111,7 @@ fn infer_scope_actions_for_capability(capability: &str) -> Vec<&'static str> {
             vec!["add", "monitor"]
         }
         value if value.starts_with("media.search.") => vec!["search"],
+        "acquisition.stream_candidate_provider" => vec!["search"],
         _ => Vec::new(),
     }
 }
@@ -2122,6 +2124,9 @@ fn infer_scope_media_for_capability(capability: &str) -> Option<Vec<&'static str
         "media.manager.tv" => Some(vec!["tv", "anime"]),
         "media.manager.anime" | "media.search.anime" => Some(vec!["anime"]),
         "media.search.series" | "media.search.tv" => Some(vec!["tv"]),
+        "acquisition.candidate_provider" | "acquisition.stream_candidate_provider" => {
+            Some(vec!["movies", "tv", "anime"])
+        }
         _ => None,
     }
 }
@@ -2153,6 +2158,16 @@ fn validate_scope_actions_for_capability(
     if capability.starts_with("media.search.") && !actions.iter().any(|value| value == "search") {
         bail!(
             "search capability '{}' requires provides.scope.actions to include 'search'",
+            capability
+        );
+    }
+    if matches!(
+        capability.as_str(),
+        "acquisition.candidate_provider" | "acquisition.stream_candidate_provider"
+    ) && !actions.iter().any(|value| value == "search")
+    {
+        bail!(
+            "source capability '{}' requires provides.scope.actions to include 'search'",
             capability
         );
     }
@@ -2510,6 +2525,70 @@ runtime:
             Some("acquisition.debrid.default")
         );
         assert!(broker.capabilities.as_ref().is_some_and(Value::is_object));
+    }
+
+    #[test]
+    fn ess1_manifest_accepts_stream_candidate_provider_scope() {
+        let yaml = r#"
+id: elixir.sources.cloudstream_compat
+version: 1.0.0
+kind: module
+name: CloudStream Compat
+provides:
+  - capability: acquisition.stream_candidate_provider
+    slot: default
+    cardinality: many
+    implementation: cloudstream_compat
+    scope:
+      media_types: ["movie", "tv", "anime"]
+      actions: ["search", "resolve"]
+      download_broker:
+        enabled: true
+        provider_kind: managed
+        logical_id: acquisition.http_stream.default
+        capabilities: {}
+runtime:
+  type: container
+  image: example/cloudstream-compat:1
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("stream provider manifest should parse");
+        let provide = &parsed.manifest.provides[0];
+        assert_eq!(provide.capability, "acquisition.stream_candidate_provider");
+        let scope = provide.scope.as_ref().expect("scope");
+        assert_eq!(scope.actions, vec!["search", "resolve"]);
+        assert_eq!(
+            scope
+                .download_broker
+                .as_ref()
+                .and_then(|broker| broker.logical_id.as_deref()),
+            Some("acquisition.http_stream.default")
+        );
+    }
+
+    #[test]
+    fn ess1_manifest_rejects_stream_candidate_provider_without_search() {
+        let yaml = r#"
+id: elixir.sources.bad_stream
+version: 1.0.0
+kind: module
+name: Bad Stream
+provides:
+  - capability: acquisition.stream_candidate_provider
+    slot: default
+    cardinality: many
+    implementation: bad_stream
+    scope:
+      media_types: ["movie"]
+      actions: ["resolve"]
+runtime:
+  type: container
+  image: example/bad-stream:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires provides.scope.actions to include 'search'")
+        );
     }
 
     #[test]

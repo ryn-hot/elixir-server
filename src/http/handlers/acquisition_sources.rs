@@ -32,10 +32,17 @@ use crate::{
 };
 
 pub const ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY: &str = "acquisition.candidate_provider";
+pub const ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY: &str =
+    "acquisition.stream_candidate_provider";
 
 const CANDIDATE_PROVIDER_SCHEMA_VERSION: u32 = 1;
 const CANDIDATE_PROVIDER_SEARCH_PATH: &str = "search";
 const CANDIDATE_PROVIDER_TIMEOUT_SECONDS: u64 = 30;
+const STREAM_CANDIDATE_DEFAULT_LIMIT: u32 = 25;
+const STREAM_CANDIDATE_MAX_LIMIT: u32 = 100;
+const STREAM_CANDIDATE_MAX_TARGETS: usize = 100;
+const STREAM_CANDIDATE_MAX_TITLE_VARIANTS: usize = 32;
+const STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +147,68 @@ pub struct CandidateSearchIntent {
     pub retry_bucket: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCandidateSearchRequest {
+    #[serde(default)]
+    pub provider_id: Option<Uuid>,
+    pub media_type: String,
+    pub title: String,
+    #[serde(default)]
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub external_ids: Option<ExternalIds>,
+    #[serde(default)]
+    pub titles: Vec<StreamTitleVariant>,
+    #[serde(default)]
+    pub targets: Vec<StreamSearchTarget>,
+    #[serde(default)]
+    pub preferences: StreamSearchPreferences,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamTitleVariant {
+    pub value: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSearchTarget {
+    #[serde(default)]
+    pub target_key: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub season_number: Option<i32>,
+    #[serde(default)]
+    pub episode_number: Option<i32>,
+    #[serde(default)]
+    pub absolute_episode_number: Option<i32>,
+    #[serde(default)]
+    pub air_date: Option<String>,
+    #[serde(default)]
+    pub runtime_seconds: Option<u32>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSearchPreferences {
+    #[serde(default)]
+    pub allowed_qualities: Vec<String>,
+    #[serde(default)]
+    pub required_languages: Vec<String>,
+    #[serde(default)]
+    pub subtitle_mode: Option<String>,
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateSearchResponse {
@@ -147,6 +216,15 @@ pub struct CandidateSearchResponse {
     pub provider: CandidateProviderSummary,
     pub route_options: Vec<CandidateRouteOption>,
     pub candidates: Vec<AcquisitionCandidate>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCandidateSearchResponse {
+    pub schema_version: u32,
+    pub provider: CandidateProviderSummary,
+    pub candidates: Vec<Value>,
     pub warnings: Vec<String>,
 }
 
@@ -233,6 +311,14 @@ struct CandidateProviderInvocation<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct StreamCandidateProviderInvocation<'a> {
+    schema_version: u32,
+    request: &'a StreamCandidateSearchRequest,
+    provider: CandidateProviderInvocationContext<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CandidateProviderInvocationContext<'a> {
     provider_id: Uuid,
     extension_id: &'a str,
@@ -251,12 +337,26 @@ struct CandidateProviderUpstreamResponse {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamCandidateProviderUpstreamResponse {
+    #[serde(default)]
+    candidates: Vec<Value>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateProviderSelection {
     summary: CandidateProviderSummary,
     provider: Provider,
     extension: Extension,
     instance: ExtensionInstance,
+}
+
+pub(crate) fn is_extension_suite_source_provider_capability(capability: &str) -> bool {
+    capability.eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+        || capability.eq_ignore_ascii_case(ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY)
 }
 
 pub async fn list_candidate_providers(
@@ -310,6 +410,17 @@ pub(crate) async fn search_candidate_suite_with_store(
     search_candidate_suite_with_providers(pool, request, providers, None).await
 }
 
+#[allow(dead_code)]
+pub(crate) async fn search_stream_candidate_suite_with_store(
+    pool: &sqlx::AnyPool,
+    request: StreamCandidateSearchRequest,
+) -> Result<StreamCandidateSearchResponse> {
+    let request = normalize_stream_candidate_search_request(request)?;
+    let store = ExtensionStore::new(pool);
+    let providers = available_stream_candidate_providers(&store, Some(&request.media_type)).await?;
+    search_stream_candidate_suite_with_providers(request, providers, None).await
+}
+
 #[cfg(test)]
 pub(crate) async fn search_candidates_with_store_at_base_url(
     pool: &sqlx::AnyPool,
@@ -336,6 +447,18 @@ pub(crate) async fn search_candidate_suite_with_store_at_base_urls(
     let store = ExtensionStore::new(pool);
     let providers = available_candidate_providers(&store, Some(&request.media_type)).await?;
     search_candidate_suite_with_providers(pool, request, providers, Some(base_urls)).await
+}
+
+#[cfg(test)]
+pub(crate) async fn search_stream_candidate_suite_with_store_at_base_urls(
+    pool: &sqlx::AnyPool,
+    request: StreamCandidateSearchRequest,
+    base_urls: std::collections::HashMap<Uuid, String>,
+) -> Result<StreamCandidateSearchResponse> {
+    let request = normalize_stream_candidate_search_request(request)?;
+    let store = ExtensionStore::new(pool);
+    let providers = available_stream_candidate_providers(&store, Some(&request.media_type)).await?;
+    search_stream_candidate_suite_with_providers(request, providers, Some(base_urls)).await
 }
 
 async fn search_candidate_suite_with_providers(
@@ -463,6 +586,108 @@ async fn search_candidate_suite_with_providers(
     ))
 }
 
+async fn search_stream_candidate_suite_with_providers(
+    request: StreamCandidateSearchRequest,
+    providers: Vec<CandidateProviderSelection>,
+    #[cfg_attr(not(test), allow(unused_variables))] test_base_urls: Option<
+        std::collections::HashMap<Uuid, String>,
+    >,
+) -> Result<StreamCandidateSearchResponse> {
+    let limit = stream_candidate_effective_limit(request.limit) as usize;
+    if providers.is_empty() {
+        return Ok(extension_suite_stream_response(
+            &request.media_type,
+            Vec::new(),
+            vec![format!(
+                "extension_suite:stream:no_provider: no eligible acquisition stream candidate providers are available for {}",
+                request.media_type
+            )],
+        ));
+    }
+
+    let mut tasks = JoinSet::new();
+    for (index, selected) in providers.into_iter().enumerate() {
+        let mut provider_request = request.clone();
+        provider_request.provider_id = Some(selected.summary.provider_id);
+        provider_request.limit = Some(stream_candidate_effective_limit(provider_request.limit));
+        #[cfg(test)]
+        let base_url = test_base_urls
+            .as_ref()
+            .and_then(|urls| urls.get(&selected.summary.provider_id).cloned());
+
+        tasks.spawn(async move {
+            let upstream = {
+                #[cfg(test)]
+                {
+                    if let Some(base_url) = base_url {
+                        invoke_stream_candidate_provider_at_base_url(
+                            &base_url,
+                            &selected,
+                            &provider_request,
+                        )
+                        .await?
+                    } else {
+                        invoke_stream_candidate_provider(&selected, &provider_request).await?
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    invoke_stream_candidate_provider(&selected, &provider_request).await?
+                }
+            };
+            let mut response =
+                stream_candidate_search_response_from_upstream(selected.summary.clone(), upstream);
+            apply_stream_candidate_result_cap(&mut response, Some(limit as u32));
+            Ok::<_, anyhow::Error>((index, response))
+        });
+    }
+
+    let mut successes = Vec::new();
+    let mut warnings = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(success)) => successes.push(success),
+            Ok(Err(err)) => warnings.push(format!("extension_suite:stream_provider_failed: {err}")),
+            Err(err) => warnings.push(format!(
+                "extension_suite:stream_provider_failed: task failed: {err}"
+            )),
+        }
+    }
+    successes.sort_by_key(|(index, _)| *index);
+
+    let mut candidates = Vec::new();
+    for (_, response) in successes {
+        for warning in response.warnings {
+            warnings.push(format!(
+                "extension_suite:{}:{warning}",
+                response.provider.extension_id
+            ));
+        }
+        candidates.extend(response.candidates);
+        if candidates.len() >= limit {
+            candidates.truncate(limit);
+            break;
+        }
+    }
+
+    if candidates.is_empty() {
+        if warnings.is_empty() {
+            warnings.push(
+                "extension_suite:stream:no_results: no stream provider returned candidates"
+                    .to_string(),
+            );
+        } else {
+            warnings.push("extension_suite:stream:all_failed_or_no_results: no stream provider returned usable candidates".to_string());
+        }
+    }
+
+    Ok(extension_suite_stream_response(
+        &request.media_type,
+        candidates,
+        warnings,
+    ))
+}
+
 fn apply_candidate_result_cap(response: &mut CandidateSearchResponse, limit: Option<u32>) {
     let Some(limit) = limit.and_then(|limit| usize::try_from(limit).ok()) else {
         return;
@@ -470,6 +695,147 @@ fn apply_candidate_result_cap(response: &mut CandidateSearchResponse, limit: Opt
     if response.candidates.len() > limit {
         response.candidates.truncate(limit);
     }
+}
+
+fn apply_stream_candidate_result_cap(
+    response: &mut StreamCandidateSearchResponse,
+    limit: Option<u32>,
+) {
+    let limit = stream_candidate_effective_limit(limit) as usize;
+    if response.candidates.len() > limit {
+        response.candidates.truncate(limit);
+    }
+}
+
+fn stream_candidate_effective_limit(limit: Option<u32>) -> u32 {
+    limit
+        .unwrap_or(STREAM_CANDIDATE_DEFAULT_LIMIT)
+        .clamp(1, STREAM_CANDIDATE_MAX_LIMIT)
+}
+
+fn normalize_stream_candidate_search_request(
+    mut request: StreamCandidateSearchRequest,
+) -> Result<StreamCandidateSearchRequest> {
+    request.media_type = request.media_type.trim().to_string();
+    request.title = request.title.trim().to_string();
+    if request.media_type.is_empty() {
+        bail!("mediaType is required");
+    }
+    if request.title.is_empty() {
+        bail!("title is required");
+    }
+    if request.limit == Some(0) {
+        bail!("limit must be greater than zero");
+    }
+    if request.targets.is_empty() {
+        bail!("targets must include at least one canonical target");
+    }
+    if request.targets.len() > STREAM_CANDIDATE_MAX_TARGETS {
+        bail!(
+            "targets must include no more than {} items",
+            STREAM_CANDIDATE_MAX_TARGETS
+        );
+    }
+    request.limit = Some(stream_candidate_effective_limit(request.limit));
+    request.titles = normalize_stream_title_variants(&request.title, request.titles);
+    request.targets = request
+        .targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| normalize_stream_search_target(index, target))
+        .collect::<Result<Vec<_>>>()?;
+    request.preferences.allowed_qualities =
+        normalize_string_list(request.preferences.allowed_qualities);
+    request.preferences.required_languages =
+        normalize_string_list(request.preferences.required_languages);
+    request.preferences.subtitle_mode = request
+        .preferences
+        .subtitle_mode
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    Ok(request)
+}
+
+fn normalize_stream_title_variants(
+    canonical_title: &str,
+    titles: Vec<StreamTitleVariant>,
+) -> Vec<StreamTitleVariant> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_stream_title_variant(&mut out, &mut seen, canonical_title, "canonical");
+    for title in titles {
+        if out.len() >= STREAM_CANDIDATE_MAX_TITLE_VARIANTS {
+            break;
+        }
+        push_stream_title_variant(&mut out, &mut seen, &title.value, &title.kind);
+    }
+    out
+}
+
+fn push_stream_title_variant(
+    out: &mut Vec<StreamTitleVariant>,
+    seen: &mut BTreeSet<String>,
+    value: &str,
+    kind: &str,
+) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    let kind = {
+        let trimmed = kind.trim();
+        if trimmed.is_empty() { "alias" } else { trimmed }
+    };
+    let key = format!(
+        "{}\u{1f}{}",
+        value.to_ascii_lowercase(),
+        kind.to_ascii_lowercase()
+    );
+    if seen.insert(key) {
+        out.push(StreamTitleVariant {
+            value: value.to_string(),
+            kind: kind.to_string(),
+        });
+    }
+}
+
+fn normalize_stream_search_target(
+    index: usize,
+    mut target: StreamSearchTarget,
+) -> Result<StreamSearchTarget> {
+    target.target_key = target
+        .target_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if target.target_key.is_none() {
+        bail!("targets[{index}].targetKey is required");
+    }
+    target.title = target
+        .title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    target.air_date = target
+        .air_date
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    target.metadata = target.metadata.map(redact_sensitive_value);
+    Ok(target)
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let key = value.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(value.to_string());
+        }
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -997,6 +1363,30 @@ fn extension_suite_response(
     }
 }
 
+fn extension_suite_stream_response(
+    media_type: &str,
+    candidates: Vec<Value>,
+    warnings: Vec<String>,
+) -> StreamCandidateSearchResponse {
+    StreamCandidateSearchResponse {
+        schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
+        provider: CandidateProviderSummary {
+            provider_id: Uuid::nil(),
+            extension_id: "elixir.extension_suite".to_string(),
+            extension_name: "Elixir Extension Suite".to_string(),
+            instance_id: Uuid::nil(),
+            instance_name: "default".to_string(),
+            capability: ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+            implementation: Some("extension_suite_stream".to_string()),
+            health_state: ProviderHealthState::Healthy,
+            media_types: vec![media_type.to_string()],
+            actions: vec!["search".to_string()],
+        },
+        candidates,
+        warnings,
+    }
+}
+
 fn attach_extension_suite_provider_evidence(
     candidate: &mut AcquisitionCandidate,
     provider: &CandidateProviderSummary,
@@ -1040,13 +1430,59 @@ fn candidate_search_response_from_upstream(
     })
 }
 
+fn stream_candidate_search_response_from_upstream(
+    provider: CandidateProviderSummary,
+    upstream: StreamCandidateProviderUpstreamResponse,
+) -> StreamCandidateSearchResponse {
+    StreamCandidateSearchResponse {
+        schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
+        provider,
+        candidates: upstream
+            .candidates
+            .into_iter()
+            .map(redact_sensitive_value)
+            .collect(),
+        warnings: upstream
+            .warnings
+            .into_iter()
+            .map(|warning| warning.trim().to_string())
+            .filter(|warning| !warning.is_empty())
+            .collect(),
+    }
+}
+
 async fn available_candidate_providers(
     store: &ExtensionStore<'_>,
     media_type: Option<&str>,
 ) -> Result<Vec<CandidateProviderSelection>> {
+    available_source_providers_for_capability(
+        store,
+        media_type,
+        ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+    )
+    .await
+}
+
+async fn available_stream_candidate_providers(
+    store: &ExtensionStore<'_>,
+    media_type: Option<&str>,
+) -> Result<Vec<CandidateProviderSelection>> {
+    available_source_providers_for_capability(
+        store,
+        media_type,
+        ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+    )
+    .await
+}
+
+async fn available_source_providers_for_capability(
+    store: &ExtensionStore<'_>,
+    media_type: Option<&str>,
+    capability: &str,
+) -> Result<Vec<CandidateProviderSelection>> {
     let mut providers = Vec::new();
     for detail in store.list_provider_details().await? {
-        if detail.provider.capability != ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY {
+        if detail.provider.capability != capability {
             continue;
         }
         if detail.provider.health_state != ProviderHealthState::Healthy {
@@ -1178,6 +1614,100 @@ async fn invoke_candidate_provider_at_base_url(
         .json::<CandidateProviderUpstreamResponse>()
         .await
         .context("parsing candidate provider response")
+}
+
+async fn invoke_stream_candidate_provider(
+    selected: &CandidateProviderSelection,
+    request: &StreamCandidateSearchRequest,
+) -> Result<StreamCandidateProviderUpstreamResponse> {
+    let endpoint_json = selected
+        .provider
+        .endpoint_json
+        .clone()
+        .ok_or_else(|| anyhow!("stream candidate provider endpoint is missing"))?;
+    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)
+        .context("parsing stream candidate provider endpoint")?;
+    let base_url =
+        resolve_control_provider_transport_base_url(selected.instance.instance_id, &endpoint)
+            .await?;
+    invoke_stream_candidate_provider_at_base_url(&base_url, selected, request).await
+}
+
+async fn invoke_stream_candidate_provider_at_base_url(
+    base_url: &str,
+    selected: &CandidateProviderSelection,
+    request: &StreamCandidateSearchRequest,
+) -> Result<StreamCandidateProviderUpstreamResponse> {
+    let search_url = candidate_provider_search_url(&base_url)?;
+    let provider_config =
+        candidate_provider_invocation_config(&selected.extension, &selected.instance)?;
+    let invocation = StreamCandidateProviderInvocation {
+        schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
+        request,
+        provider: CandidateProviderInvocationContext {
+            provider_id: selected.provider.provider_id,
+            extension_id: &selected.extension.extension_id,
+            instance_id: selected.instance.instance_id,
+            implementation: selected.provider.implementation.as_deref(),
+            config: provider_config,
+        },
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CANDIDATE_PROVIDER_TIMEOUT_SECONDS))
+        .build()
+        .context("building stream candidate provider HTTP client")?;
+    let response = client
+        .post(search_url.clone())
+        .json(&invocation)
+        .send()
+        .await
+        .with_context(|| format!("calling stream candidate provider at {search_url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "stream candidate provider returned {status}: {}",
+            truncate_diagnostic(&body, 1024)
+        );
+    }
+    parse_bounded_stream_candidate_provider_response(response).await
+}
+
+async fn parse_bounded_stream_candidate_provider_response(
+    response: reqwest::Response,
+) -> Result<StreamCandidateProviderUpstreamResponse> {
+    if let Some(length) = response.content_length() {
+        if length > STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES {
+            bail!(
+                "stream candidate provider response exceeds {} bytes",
+                STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES
+            );
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .context("reading stream candidate provider response")?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES
+    {
+        bail!(
+            "stream candidate provider response exceeds {} bytes",
+            STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES
+        );
+    }
+    serde_json::from_slice::<StreamCandidateProviderUpstreamResponse>(&bytes)
+        .context("parsing stream candidate provider response")
+}
+
+fn truncate_diagnostic(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 async fn candidate_route_options(
@@ -1935,6 +2465,235 @@ mod tests {
         Ok(provider_id)
     }
 
+    async fn seed_stream_suite_provider(
+        store: &ExtensionStore<'_>,
+        extension_id: &str,
+        extension_name: &str,
+        port: u16,
+        media_types: Vec<&str>,
+        health_state: ProviderHealthState,
+    ) -> Result<Uuid> {
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: extension_name.to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir Test".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.0.0",
+                    "kind": "module",
+                    "name": extension_name,
+                    "provides": [{
+                        "capability": ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+                        "slot": "default",
+                        "cardinality": "many",
+                        "implementation": "stream_fixture",
+                        "scope": {
+                            "media_types": media_types,
+                            "actions": ["search", "resolve"]
+                        }
+                    }],
+                    "runtime": {
+                        "type": "container",
+                        "image": "example/stream-fixture:1"
+                    },
+                    "control_surface": {
+                        "adapter": "generic_v1",
+                        "owned_settings": [
+                            {
+                                "id": "sourcePack",
+                                "label": "Source pack",
+                                "type": "text",
+                                "storage": {
+                                    "type": "instance_setting",
+                                    "key": "sourcePack"
+                                }
+                            }
+                        ]
+                    }
+                }),
+                package_hash: Some(extension_id.to_string()),
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({
+                    "sourcePack": "fixture-pack",
+                    "apiToken": "must-not-cross-boundary"
+                })),
+                enabled: true,
+            })
+            .await?;
+        let provider_id = stable_provider_id(
+            instance_id,
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "default",
+        );
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::Many,
+                implementation: Some("stream_fixture".to_string()),
+                scope_json: Some(json!({
+                    "media_types": media_types,
+                    "actions": ["search", "resolve"]
+                })),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "base_path": "/stream-provider",
+                    "network": null
+                })),
+                health_state,
+            })
+            .await?;
+        Ok(provider_id)
+    }
+
+    async fn start_stream_provider_fixture(
+        response: Value,
+        status: StatusCode,
+        delay_ms: u64,
+    ) -> Result<(String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SuiteProviderFixtureState {
+            requests: Arc::clone(&requests),
+            response,
+            status,
+            delay_ms,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let app = Router::new()
+            .route("/stream-provider/search", post(suite_provider_fixture))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        Ok((
+            format!("http://127.0.0.1:{port}/stream-provider"),
+            requests,
+            handle,
+        ))
+    }
+
+    fn stream_search_request(limit: Option<u32>) -> StreamCandidateSearchRequest {
+        StreamCandidateSearchRequest {
+            provider_id: None,
+            media_type: "anime".to_string(),
+            title: "Fullmetal Alchemist: Brotherhood".to_string(),
+            year: Some(2009),
+            external_ids: Some(ExternalIds {
+                anilist: Some("5114".to_string()),
+                tvdb: Some("85249".to_string()),
+                ..Default::default()
+            }),
+            titles: vec![
+                StreamTitleVariant {
+                    value: "Hagane no Renkinjutsushi: Fullmetal Alchemist".to_string(),
+                    kind: "romaji".to_string(),
+                },
+                StreamTitleVariant {
+                    value: "Fullmetal Alchemist: Brotherhood".to_string(),
+                    kind: "canonical".to_string(),
+                },
+            ],
+            targets: vec![
+                StreamSearchTarget {
+                    target_key: Some("S01E01".to_string()),
+                    title: Some("Fullmetal Alchemist".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    air_date: Some("2009-04-05".to_string()),
+                    runtime_seconds: Some(1440),
+                    metadata: Some(json!({
+                        "episodeProviderKey": "anilist:5114:A0001",
+                        "sourceUrl": "https://metadata.example/episode?token=secret"
+                    })),
+                },
+                StreamSearchTarget {
+                    target_key: Some("S01E02".to_string()),
+                    title: Some("The First Day".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(2),
+                    absolute_episode_number: Some(2),
+                    air_date: Some("2009-04-12".to_string()),
+                    runtime_seconds: Some(1440),
+                    metadata: None,
+                },
+            ],
+            preferences: StreamSearchPreferences {
+                allowed_qualities: vec![
+                    "1080p".to_string(),
+                    "720p".to_string(),
+                    "1080p".to_string(),
+                ],
+                required_languages: vec!["jpn".to_string(), "eng".to_string()],
+                subtitle_mode: Some("Allowed".to_string()),
+                max_size_bytes: Some(2_000_000_000),
+            },
+            limit,
+        }
+    }
+
+    fn stream_candidate(id: &str, target_key: &str) -> Value {
+        json!({
+            "id": id,
+            "candidateKind": "stream",
+            "title": format!("Fullmetal Alchemist: Brotherhood - {target_key} - 1080p"),
+            "source": format!("provider://fixture/{id}"),
+            "sourceKind": "http_stream",
+            "quality": "1080p",
+            "language": "jpn",
+            "rank": 1,
+            "score": 82.0,
+            "supportedRoutes": ["acquisition.http_stream.default"],
+            "defaultRoute": "acquisition.http_stream.default",
+            "targetEvidence": {
+                "mediaType": "anime",
+                "targetKey": target_key,
+                "seasonNumber": 1,
+                "episodeNumber": 2,
+                "absoluteEpisodeNumber": 2,
+                "episodeTitle": "The First Day",
+                "confidence": "high",
+                "reasons": ["provider episode number matched"]
+            },
+            "delivery": {
+                "streamType": "hls",
+                "url": format!("https://stream.example/{id}/master.m3u8?token=secret-token"),
+                "headers": {
+                    "authorization": "Bearer secret-token"
+                },
+                "referer": "https://source.example/",
+                "resolveRequired": false,
+                "resolveHandle": null
+            },
+            "sourceModule": {
+                "id": "fixture-source",
+                "name": "Fixture Source",
+                "type": "cloudstream"
+            },
+            "raw": {
+                "hosterUrl": format!("https://hoster.example/{id}?api_key=secret")
+            }
+        })
+    }
+
     fn suite_search_request(limit: Option<u32>) -> CandidateSearchRequest {
         CandidateSearchRequest {
             provider_id: None,
@@ -2204,6 +2963,375 @@ mod tests {
                 .any(|warning| warning.contains("no_results"))
         );
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess2_stream_suite_invocation_sends_canonical_target_payload() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (base_url, requests, server) = start_stream_provider_fixture(
+            json!({
+                "candidates": [stream_candidate("candidate-1", "S01E02")],
+                "warnings": ["stream fixture warning"]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.payload",
+            "Stream Payload",
+            Url::parse(&base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(provider, base_url);
+        let response = search_stream_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            stream_search_request(Some(10)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.provider.provider_id, Uuid::nil());
+        assert_eq!(
+            response.provider.capability,
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY
+        );
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stream fixture warning"))
+        );
+        let payload = requests.lock().expect("requests")[0].clone();
+        assert_eq!(
+            payload.pointer("/schemaVersion").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/providerId")
+                .and_then(Value::as_str),
+            Some(provider.to_string().as_str())
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/mediaType")
+                .and_then(Value::as_str),
+            Some("anime")
+        );
+        assert_eq!(
+            payload.pointer("/request/externalIds/anilist"),
+            Some(&json!("5114"))
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/titles/0/value")
+                .and_then(Value::as_str),
+            Some("Fullmetal Alchemist: Brotherhood")
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/titles/0/kind")
+                .and_then(Value::as_str),
+            Some("canonical")
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/targets/1/targetKey")
+                .and_then(Value::as_str),
+            Some("S01E02")
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/targets/1/title")
+                .and_then(Value::as_str),
+            Some("The First Day")
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/targets/1/runtimeSeconds")
+                .and_then(Value::as_u64),
+            Some(1440)
+        );
+        assert_eq!(
+            payload.pointer("/request/preferences/allowedQualities"),
+            Some(&json!(["1080p", "720p"]))
+        );
+        assert_eq!(
+            payload
+                .pointer("/request/preferences/subtitleMode")
+                .and_then(Value::as_str),
+            Some("allowed")
+        );
+        assert_eq!(
+            payload
+                .pointer("/provider/config/sourcePack")
+                .and_then(Value::as_str),
+            Some("fixture-pack")
+        );
+        assert!(payload.pointer("/provider/config/apiToken").is_none());
+        assert_eq!(
+            payload
+                .pointer("/request/targets/0/metadata/sourceUrl")
+                .and_then(Value::as_str),
+            Some("https://metadata.example/episode?token=%5BREDACTED%5D")
+        );
+        let response_text = serde_json::to_string(&response.candidates)?;
+        assert!(!response_text.contains("secret-token"));
+        assert!(response_text.contains("%5BREDACTED%5D"));
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess2_stream_suite_fanout_keeps_partial_results_when_provider_fails() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (success_base_url, _success_requests, success_server) = start_stream_provider_fixture(
+            json!({
+                "candidates": [stream_candidate("candidate-success", "S01E01")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (failure_base_url, _failure_requests, failure_server) = start_stream_provider_fixture(
+            json!({ "error": "source failed" }),
+            StatusCode::BAD_GATEWAY,
+            0,
+        )
+        .await?;
+        let success_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.partial_a",
+            "A Stream Source",
+            Url::parse(&success_base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+        let failure_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.partial_b",
+            "B Stream Source",
+            Url::parse(&failure_base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(success_provider, success_base_url);
+        base_urls.insert(failure_provider, failure_base_url);
+        let response = search_stream_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            stream_search_request(Some(10)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stream_provider_failed"))
+        );
+        success_server.abort();
+        failure_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess2_stream_suite_filters_by_health_and_media_scope() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (anime_base_url, anime_requests, anime_server) = start_stream_provider_fixture(
+            json!({
+                "candidates": [stream_candidate("candidate-anime", "S01E01")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (movie_base_url, movie_requests, movie_server) = start_stream_provider_fixture(
+            json!({
+                "candidates": [stream_candidate("candidate-movie", "S01E01")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (unhealthy_base_url, unhealthy_requests, unhealthy_server) =
+            start_stream_provider_fixture(
+                json!({
+                    "candidates": [stream_candidate("candidate-unhealthy", "S01E01")]
+                }),
+                StatusCode::OK,
+                0,
+            )
+            .await?;
+        let anime_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.scope_anime",
+            "Anime Stream",
+            Url::parse(&anime_base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+        let movie_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.scope_movie",
+            "Movie Stream",
+            Url::parse(&movie_base_url)?.port().unwrap(),
+            vec!["movie"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+        let unhealthy_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.scope_unhealthy",
+            "Unhealthy Stream",
+            Url::parse(&unhealthy_base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Unhealthy,
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(anime_provider, anime_base_url);
+        base_urls.insert(movie_provider, movie_base_url);
+        base_urls.insert(unhealthy_provider, unhealthy_base_url);
+        let response = search_stream_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            stream_search_request(Some(10)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        assert_eq!(anime_requests.lock().expect("anime requests").len(), 1);
+        assert!(movie_requests.lock().expect("movie requests").is_empty());
+        assert!(
+            unhealthy_requests
+                .lock()
+                .expect("unhealthy requests")
+                .is_empty()
+        );
+        anime_server.abort();
+        movie_server.abort();
+        unhealthy_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess2_stream_suite_clamps_provider_and_response_candidate_limits() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let candidates = (0..150)
+            .map(|index| stream_candidate(&format!("candidate-{index}"), "S01E01"))
+            .collect::<Vec<_>>();
+        let (base_url, requests, server) =
+            start_stream_provider_fixture(json!({ "candidates": candidates }), StatusCode::OK, 0)
+                .await?;
+        let provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.limit",
+            "Limit Stream",
+            Url::parse(&base_url)?.port().unwrap(),
+            vec!["anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(provider, base_url);
+        let response = search_stream_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            stream_search_request(Some(500)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(
+            requests.lock().expect("requests")[0]
+                .pointer("/request/limit")
+                .and_then(Value::as_u64),
+            Some(u64::from(STREAM_CANDIDATE_MAX_LIMIT))
+        );
+        assert_eq!(
+            response.candidates.len(),
+            usize::try_from(STREAM_CANDIDATE_MAX_LIMIT).unwrap()
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess2_failing_stream_provider_does_not_poison_release_suite_search() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (release_base_url, _release_requests, release_server) = start_suite_provider_fixture(
+            json!({
+                "candidates": [suite_candidate("Release Candidate", "ffffffffffffffffffffffffffffffffffffffff")]
+            }),
+            StatusCode::OK,
+            0,
+        )
+        .await?;
+        let (stream_base_url, stream_requests, stream_server) = start_stream_provider_fixture(
+            json!({ "error": "stream source failed" }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            0,
+        )
+        .await?;
+        let release_provider = seed_suite_provider(
+            &store,
+            "elixir.sources.release.isolated",
+            "Release Source",
+            Url::parse(&release_base_url)?.port().unwrap(),
+        )
+        .await?;
+        let stream_provider = seed_stream_suite_provider(
+            &store,
+            "elixir.sources.stream.isolated",
+            "Failing Stream Source",
+            Url::parse(&stream_base_url)?.port().unwrap(),
+            vec!["movie", "anime"],
+            ProviderHealthState::Healthy,
+        )
+        .await?;
+
+        let mut base_urls = HashMap::new();
+        base_urls.insert(release_provider, release_base_url);
+        base_urls.insert(stream_provider, stream_base_url);
+        let response = search_candidate_suite_with_store_at_base_urls(
+            &database.pool,
+            suite_search_request(Some(10)),
+            base_urls,
+        )
+        .await?;
+
+        assert_eq!(response.candidates.len(), 1, "{:?}", response.warnings);
+        assert_eq!(response.candidates[0].title, "Release Candidate");
+        assert!(stream_requests.lock().expect("stream requests").is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("stream_provider_failed"))
+        );
+        release_server.abort();
+        stream_server.abort();
         Ok(())
     }
 

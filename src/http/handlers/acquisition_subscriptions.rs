@@ -38,7 +38,7 @@ use crate::{
         handlers::{
             acquisition_sources::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
-                normalize_acquisition_candidate,
+                is_extension_suite_source_provider_capability, normalize_acquisition_candidate,
             },
             download_broker::{
                 DownloadBrokerSubmitRequest, cancel_download_item, generic_debrid_error_message,
@@ -289,12 +289,9 @@ async fn apply_source_provider_config_defaults(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::bad_request("source provider was not found"))?;
-    if !provider
-        .capability
-        .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
-    {
+    if !is_extension_suite_source_provider_capability(&provider.capability) {
         return Err(ApiError::bad_request(
-            "source provider must be an acquisition candidate provider",
+            "source provider must be an Extension Suite source provider",
         ));
     }
     let instance = store

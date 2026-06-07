@@ -22,7 +22,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
-    acquisition_sources::ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+    acquisition_sources::{
+        ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+        ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+        is_extension_suite_source_provider_capability,
+    },
     download_broker::generic_debrid_error_message,
 };
 use crate::{
@@ -2416,11 +2420,8 @@ async fn apply_find_media_source_provider_config_defaults(
         .get_provider(source_provider_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("source provider was not found"))?;
-    if !provider
-        .capability
-        .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
-    {
-        bail!("source provider must be an acquisition candidate provider");
+    if !is_extension_suite_source_provider_capability(&provider.capability) {
+        bail!("source provider must be an Extension Suite source provider");
     }
     let instance = store
         .get_instance(provider.instance_id)
@@ -9105,11 +9106,7 @@ async fn source_suite_provider_statuses(
 
     let mut out = Vec::new();
     for detail in details {
-        if !detail
-            .provider
-            .capability
-            .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
-        {
+        if !is_extension_suite_source_provider_capability(&detail.provider.capability) {
             continue;
         }
         let Some(instance) = instances.get(&detail.provider.instance_id) else {
@@ -9405,11 +9402,7 @@ fn collect_extension_suite_provider_candidates(
     let mut out: Vec<_> = providers
         .iter()
         .filter(|provider| {
-            provider
-                .detail
-                .provider
-                .capability
-                .eq_ignore_ascii_case(ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY)
+            is_extension_suite_source_provider_capability(&provider.detail.provider.capability)
         })
         .filter(|provider| provider.media_types.contains(&media_type))
         .filter(|provider| provider_supports_action(provider, "search"))
@@ -9559,6 +9552,9 @@ fn infer_media_types_from_capability(capability: &str) -> Vec<MediaType> {
         ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY => {
             vec![MediaType::Movie, MediaType::Series, MediaType::Anime]
         }
+        ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY => {
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime]
+        }
         _ => Vec::new(),
     }
 }
@@ -9570,6 +9566,7 @@ fn infer_actions_from_capability(capability: &str) -> Vec<&'static str> {
         }
         value if value.starts_with("media.search.") => vec!["search"],
         ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY => vec!["search"],
+        ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY => vec!["search"],
         _ => Vec::new(),
     }
 }
@@ -13137,6 +13134,26 @@ mod tests {
         health_state: ProviderHealthState,
         has_endpoint: bool,
     ) -> ProviderContext {
+        test_suite_source_provider_context(
+            extension_id,
+            instance_name,
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            implementation,
+            media_types,
+            health_state,
+            has_endpoint,
+        )
+    }
+
+    fn test_suite_source_provider_context(
+        extension_id: &str,
+        instance_name: &str,
+        capability: &str,
+        implementation: &str,
+        media_types: Vec<MediaType>,
+        health_state: ProviderHealthState,
+        has_endpoint: bool,
+    ) -> ProviderContext {
         let now = Utc::now();
         let instance_id = Uuid::new_v4();
         let scope_media_types = media_types
@@ -13148,7 +13165,7 @@ mod tests {
                 provider: crate::db::models::Provider {
                     provider_id: Uuid::new_v4(),
                     instance_id,
-                    capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                    capability: capability.to_string(),
                     slot_id: "default".to_string(),
                     cardinality: crate::db::models::SlotCardinality::Many,
                     implementation: Some(implementation.to_string()),
@@ -13263,6 +13280,78 @@ mod tests {
         assert_eq!(
             extension_ids,
             vec!["elixir.sources.alpha", "elixir.sources.zeta"]
+        );
+    }
+
+    #[test]
+    fn ess1_stream_candidate_providers_are_suite_eligible() {
+        let release_provider = test_suite_source_provider_context(
+            "elixir.sources.torrentio",
+            "default",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "torrentio_stremio",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let stream_provider = test_suite_source_provider_context(
+            "elixir.sources.cloudstream",
+            "default",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "cloudstream_compat",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let unhealthy_stream = test_suite_source_provider_context(
+            "elixir.sources.unhealthy_stream",
+            "default",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "cloudstream_compat",
+            vec![MediaType::Movie],
+            ProviderHealthState::Unhealthy,
+            true,
+        );
+        let series_only_stream = test_suite_source_provider_context(
+            "elixir.sources.series_stream",
+            "default",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "aniyomi_compat",
+            vec![MediaType::Series],
+            ProviderHealthState::Healthy,
+            true,
+        );
+
+        let providers = vec![
+            unhealthy_stream,
+            series_only_stream,
+            stream_provider.clone(),
+            release_provider.clone(),
+        ];
+        let eligible = collect_extension_suite_provider_candidates(&providers, MediaType::Movie);
+        let capabilities = eligible
+            .iter()
+            .map(|provider| provider.detail.provider.capability.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            capabilities,
+            vec![
+                ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+                ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY
+            ]
+        );
+        assert!(
+            eligible
+                .iter()
+                .any(|provider| provider.detail.provider.provider_id
+                    == stream_provider.detail.provider.provider_id)
+        );
+        assert!(
+            eligible
+                .iter()
+                .any(|provider| provider.detail.provider.provider_id
+                    == release_provider.detail.provider.provider_id)
         );
     }
 
