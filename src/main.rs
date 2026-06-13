@@ -29,7 +29,17 @@ use crate::extensions::ExtensionManager;
 use crate::extensions::auto_managed::{
     filter_auto_managed_runtime_missing, is_nzbget_extension_id, is_qbittorrent_extension_id,
 };
+use crate::extensions::cloudstream_registry::{
+    CLOUDSTREAM_COMPAT_EXTENSION_ID, CloudStreamRecommendedPackMigrationSummary,
+    migrate_cloudstream_recommended_source_pack_for_installed_instances,
+    seed_cloudstream_recommended_source_pack_for_instance,
+};
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
+use crate::extensions::nuvio_registry::{
+    PRISM_EXTENSION_ID, PrismRecommendedPackMigrationSummary,
+    migrate_prism_recommended_source_pack_for_installed_instances,
+    seed_prism_recommended_source_pack_for_instance,
+};
 use crate::extensions::package::{
     compute_sha256, read_manifest_from_dir, unpack_package, write_manifest_to_dir,
 };
@@ -158,6 +168,36 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("core extension instance bootstrap failed: {err}");
         }
     };
+    match migrate_cloudstream_recommended_pack_for_existing_instances(&state).await {
+        Ok(summary) if summary.migrated_instances > 0 => {
+            tracing::info!(
+                instances = summary.instances_seen,
+                migrated = summary.migrated_instances,
+                modules = summary.modules,
+                versions = summary.versions,
+                "migrated existing CloudStream Compat instance(s) to the recommended source pack"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("CloudStream recommended source-pack migration failed: {err}");
+        }
+    }
+    match migrate_prism_recommended_pack_for_existing_instances(&state).await {
+        Ok(summary) if summary.migrated_instances > 0 => {
+            tracing::info!(
+                instances = summary.instances_seen,
+                migrated = summary.migrated_instances,
+                modules = summary.modules,
+                versions = summary.versions,
+                "migrated existing Prism instance(s) to the recommended source pack"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("Prism recommended source-pack migration failed: {err}");
+        }
+    }
     if let Err(err) = debrid::ensure_debrid_builtin(&state).await {
         tracing::warn!("debrid provider bootstrap failed: {err}");
     }
@@ -248,6 +288,14 @@ async fn start_post_listener_background_tasks(state: AppState, reconcile_config:
     let debrid_materializer_state = state.clone();
     tokio::spawn(async move {
         debrid::start_debrid_materializer_loop(debrid_materializer_state).await;
+    });
+
+    let http_stream_materializer_state = state.clone();
+    tokio::spawn(async move {
+        acquisition::stream_materializer::start_http_stream_materializer_loop(
+            http_stream_materializer_state,
+        )
+        .await;
     });
 
     // Refresh extension registries on an interval.
@@ -447,6 +495,16 @@ fn core_runtime_bootstrap_blocker(snapshot: &DockerRuntimeHealthSnapshot) -> Opt
                 .unwrap_or_else(|| "Docker runtime requires a host reboot".to_string()),
         );
     }
+    if let Some(until) = snapshot.dependency_actions_deferred_until {
+        let reason = snapshot.reason.clone().unwrap_or_else(|| {
+            "Docker recovered recently and Elixir is waiting for core runtimes.".to_string()
+        });
+        return Some(format!(
+            "{} Dependency work is deferred until {}.",
+            reason,
+            until.to_rfc3339()
+        ));
+    }
 
     match snapshot.state {
         DockerRuntimeHealthState::Degraded => Some(
@@ -547,19 +605,79 @@ async fn ensure_core_extension_instances(state: &AppState) -> anyhow::Result<u32
         if !store.list_instances(Some(extension_id)).await?.is_empty() {
             continue;
         }
+        let instance_id = Uuid::new_v4();
         store
             .create_instance(&NewExtensionInstance {
-                instance_id: Uuid::new_v4(),
+                instance_id,
                 extension_id: extension_id.clone(),
                 instance_name: "default".to_string(),
                 config_json: None,
                 enabled: true,
             })
             .await?;
+        if extension_id == CLOUDSTREAM_COMPAT_EXTENSION_ID {
+            let package_dir = PathBuf::from(&state.settings.extensions.storage_root)
+                .join("unpacked")
+                .join(extension_id)
+                .join(&extension.version);
+            seed_cloudstream_recommended_source_pack_for_instance(
+                &store,
+                instance_id,
+                Some(&package_dir),
+            )
+            .await?;
+        }
+        if extension_id == PRISM_EXTENSION_ID {
+            let package_dir = PathBuf::from(&state.settings.extensions.storage_root)
+                .join("unpacked")
+                .join(extension_id)
+                .join(&extension.version);
+            seed_prism_recommended_source_pack_for_instance(
+                &store,
+                instance_id,
+                Some(&package_dir),
+                Some(&state.settings.extensions.storage_root),
+            )
+            .await?;
+        }
         created += 1;
     }
 
     Ok(created)
+}
+
+async fn migrate_cloudstream_recommended_pack_for_existing_instances(
+    state: &AppState,
+) -> anyhow::Result<CloudStreamRecommendedPackMigrationSummary> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let Some(extension) = store.get_extension(CLOUDSTREAM_COMPAT_EXTENSION_ID).await? else {
+        return Ok(CloudStreamRecommendedPackMigrationSummary::default());
+    };
+    let package_dir = PathBuf::from(&state.settings.extensions.storage_root)
+        .join("unpacked")
+        .join(CLOUDSTREAM_COMPAT_EXTENSION_ID)
+        .join(&extension.version);
+    migrate_cloudstream_recommended_source_pack_for_installed_instances(&store, Some(&package_dir))
+        .await
+}
+
+async fn migrate_prism_recommended_pack_for_existing_instances(
+    state: &AppState,
+) -> anyhow::Result<PrismRecommendedPackMigrationSummary> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let Some(extension) = store.get_extension(PRISM_EXTENSION_ID).await? else {
+        return Ok(PrismRecommendedPackMigrationSummary::default());
+    };
+    let package_dir = PathBuf::from(&state.settings.extensions.storage_root)
+        .join("unpacked")
+        .join(PRISM_EXTENSION_ID)
+        .join(&extension.version);
+    migrate_prism_recommended_source_pack_for_installed_instances(
+        &store,
+        Some(&package_dir),
+        Some(&state.settings.extensions.storage_root),
+    )
+    .await
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1171,11 +1289,13 @@ mod tests {
     }
 
     #[test]
-    fn core_runtime_bootstrap_can_run_during_recovery() {
+    fn core_runtime_bootstrap_waits_while_recovery_defers_dependencies() {
         let mut snapshot = runtime_snapshot(DockerRuntimeHealthState::Recovering);
         snapshot.dependency_actions_deferred_until = Some(Utc::now());
 
-        assert!(core_runtime_bootstrap_blocker(&snapshot).is_none());
+        let blocker = core_runtime_bootstrap_blocker(&snapshot).expect("blocked");
+
+        assert!(blocker.contains("Dependency work is deferred"));
     }
 
     #[test]

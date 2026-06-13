@@ -399,6 +399,195 @@ pub struct NewRuntimeLog {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewExtensionSourceRegistry {
+    pub registry_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_key: String,
+    pub registry_type: String,
+    pub trust_class: String,
+    pub display_name: String,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub auto_refresh: bool,
+    pub trusted_for_executable_updates: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceRegistry {
+    pub registry_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_key: String,
+    pub registry_type: String,
+    pub trust_class: String,
+    pub display_name: String,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub auto_refresh: bool,
+    pub trusted_for_executable_updates: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub last_fetch_status: String,
+    pub last_fetch_error: Option<String>,
+    pub last_fetched_at: Option<DateTime<Utc>>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceModule {
+    pub source_module_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_id: Uuid,
+    pub module_key: String,
+    pub display_name: String,
+    pub ecosystem: String,
+    pub plugin_package: Option<String>,
+    pub active_version: Option<String>,
+    pub rollback_version: Option<String>,
+    pub media_types_json: Option<serde_json::Value>,
+    pub language_tags_json: Option<serde_json::Value>,
+    pub region_tags_json: Option<serde_json::Value>,
+    pub source_domains_json: Option<serde_json::Value>,
+    pub account_required: bool,
+    pub unsupported: bool,
+    pub unsupported_reason: Option<String>,
+    pub enabled: bool,
+    pub installed: bool,
+    pub pinned_version: Option<String>,
+    pub health_state: String,
+    pub replacement_recommendation_key: Option<String>,
+    pub last_error: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceModule {
+    pub source_module_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_id: Uuid,
+    pub module_key: String,
+    pub display_name: String,
+    pub ecosystem: String,
+    pub plugin_package: Option<String>,
+    pub active_version: Option<String>,
+    pub rollback_version: Option<String>,
+    pub media_types_json: Option<serde_json::Value>,
+    pub language_tags_json: Option<serde_json::Value>,
+    pub region_tags_json: Option<serde_json::Value>,
+    pub source_domains_json: Option<serde_json::Value>,
+    pub account_required: bool,
+    pub unsupported: bool,
+    pub unsupported_reason: Option<String>,
+    pub enabled: bool,
+    pub installed: bool,
+    pub pinned_version: Option<String>,
+    pub health_state: String,
+    pub replacement_recommendation_key: Option<String>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceModuleVersion {
+    pub version_id: Uuid,
+    pub source_module_id: Uuid,
+    pub version: String,
+    pub artifact_url: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub signature: Option<String>,
+    pub install_state: String,
+    pub smoke_status: String,
+    pub smoke_error: Option<String>,
+    pub rollback_of_version_id: Option<Uuid>,
+    pub installed_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceModuleVersion {
+    pub version_id: Uuid,
+    pub source_module_id: Uuid,
+    pub version: String,
+    pub artifact_url: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub signature: Option<String>,
+    pub install_state: String,
+    pub smoke_status: String,
+    pub smoke_error: Option<String>,
+    pub rollback_of_version_id: Option<Uuid>,
+    pub installed_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceHealthEvent {
+    pub health_event_id: Uuid,
+    pub source_module_id: Uuid,
+    pub event_type: String,
+    pub state: String,
+    pub severity: String,
+    pub reason: Option<String>,
+    pub evidence_json: Option<serde_json::Value>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceHealthEvent {
+    pub health_event_id: Uuid,
+    pub source_module_id: Uuid,
+    pub event_type: String,
+    pub state: String,
+    pub severity: String,
+    pub reason: Option<String>,
+    pub evidence_json: Option<serde_json::Value>,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceReplacementRecommendation {
+    pub recommendation_id: Uuid,
+    pub source_module_id: Uuid,
+    pub replacement_source_module_id: Option<Uuid>,
+    pub replacement_registry_id: Option<Uuid>,
+    pub recommendation_key: String,
+    pub action: String,
+    pub recommended_version: Option<String>,
+    pub reason: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceReplacementRecommendation {
+    pub recommendation_id: Uuid,
+    pub source_module_id: Uuid,
+    pub replacement_source_module_id: Option<Uuid>,
+    pub replacement_registry_id: Option<Uuid>,
+    pub recommendation_key: String,
+    pub action: String,
+    pub recommended_version: Option<String>,
+    pub reason: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub active: bool,
+    pub applied_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderOwnershipContext {
     instance_id: Option<Uuid>,
     implementation: Option<String>,
@@ -3058,6 +3247,837 @@ impl<'a> ExtensionStore<'a> {
             .await?;
         Ok(())
     }
+
+    pub async fn upsert_source_registry(&self, data: &NewExtensionSourceRegistry) -> Result<()> {
+        validate_source_registry(data)?;
+        let metadata_json = json_to_string(data.metadata_json.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_registries (
+                registry_id,
+                instance_id,
+                registry_key,
+                registry_type,
+                trust_class,
+                display_name,
+                url,
+                enabled,
+                auto_refresh,
+                trusted_for_executable_updates,
+                etag,
+                last_modified,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id, registry_key) DO UPDATE SET
+                registry_type = excluded.registry_type,
+                trust_class = excluded.trust_class,
+                display_name = excluded.display_name,
+                url = excluded.url,
+                enabled = excluded.enabled,
+                auto_refresh = excluded.auto_refresh,
+                trusted_for_executable_updates = excluded.trusted_for_executable_updates,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                metadata_json = excluded.metadata_json,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.registry_id.to_string())
+        .bind(data.instance_id.to_string())
+        .bind(data.registry_key.trim())
+        .bind(data.registry_type.trim())
+        .bind(data.trust_class.trim())
+        .bind(data.display_name.trim())
+        .bind(data.url.as_deref().map(str::trim))
+        .bind(data.enabled)
+        .bind(data.auto_refresh)
+        .bind(data.trusted_for_executable_updates)
+        .bind(data.etag.as_deref().map(str::trim))
+        .bind(data.last_modified.as_deref().map(str::trim))
+        .bind(metadata_json)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_source_registries(
+        &self,
+        instance_id: Option<Uuid>,
+    ) -> Result<Vec<ExtensionSourceRegistry>> {
+        let rows = if let Some(instance_id) = instance_id {
+            sqlx::query(
+                "SELECT
+                    registry_id,
+                    instance_id,
+                    registry_key,
+                    registry_type,
+                    trust_class,
+                    display_name,
+                    CAST(url AS TEXT) AS url,
+                    CAST(enabled AS INTEGER) AS enabled,
+                    CAST(auto_refresh AS INTEGER) AS auto_refresh,
+                    CAST(trusted_for_executable_updates AS INTEGER) AS trusted_for_executable_updates,
+                    CAST(etag AS TEXT) AS etag,
+                    CAST(last_modified AS TEXT) AS last_modified,
+                    last_fetch_status,
+                    CAST(last_fetch_error AS TEXT) AS last_fetch_error,
+                    CAST(last_fetched_at AS TEXT) AS last_fetched_at,
+                    CAST(metadata_json AS TEXT) AS metadata_json,
+                    CAST(created_at AS TEXT) AS created_at,
+                    CAST(updated_at AS TEXT) AS updated_at
+                 FROM extension_source_registries
+                 WHERE instance_id = ?
+                 ORDER BY created_at ASC",
+            )
+            .bind(instance_id.to_string())
+            .fetch_all(self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT
+                    registry_id,
+                    instance_id,
+                    registry_key,
+                    registry_type,
+                    trust_class,
+                    display_name,
+                    CAST(url AS TEXT) AS url,
+                    CAST(enabled AS INTEGER) AS enabled,
+                    CAST(auto_refresh AS INTEGER) AS auto_refresh,
+                    CAST(trusted_for_executable_updates AS INTEGER) AS trusted_for_executable_updates,
+                    CAST(etag AS TEXT) AS etag,
+                    CAST(last_modified AS TEXT) AS last_modified,
+                    last_fetch_status,
+                    CAST(last_fetch_error AS TEXT) AS last_fetch_error,
+                    CAST(last_fetched_at AS TEXT) AS last_fetched_at,
+                    CAST(metadata_json AS TEXT) AS metadata_json,
+                    CAST(created_at AS TEXT) AS created_at,
+                    CAST(updated_at AS TEXT) AS updated_at
+                 FROM extension_source_registries
+                 ORDER BY created_at ASC",
+            )
+            .fetch_all(self.pool)
+            .await?
+        };
+        rows.iter().map(map_source_registry).collect()
+    }
+
+    pub async fn record_source_registry_fetch(
+        &self,
+        registry_id: Uuid,
+        status: &str,
+        error: Option<&str>,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_registries.last_fetch_status",
+            status,
+            SOURCE_REGISTRY_FETCH_STATUSES,
+        )?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_registries
+             SET last_fetch_status = ?,
+                 last_fetch_error = ?,
+                 etag = COALESCE(?, etag),
+                 last_modified = COALESCE(?, last_modified),
+                 last_fetched_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE registry_id = ?",
+        )
+        .bind(status.trim())
+        .bind(error.map(str::trim))
+        .bind(etag.map(str::trim))
+        .bind(last_modified.map(str::trim))
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_registry_enabled_state(
+        &self,
+        registry_id: Uuid,
+        enabled: bool,
+        auto_refresh: bool,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_registries
+             SET enabled = ?,
+                 auto_refresh = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE registry_id = ?",
+        )
+        .bind(enabled)
+        .bind(auto_refresh)
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_registry_trust(
+        &self,
+        registry_id: Uuid,
+        trust_class: &str,
+        trusted_for_executable_updates: bool,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_registries.trust_class",
+            trust_class,
+            SOURCE_REGISTRY_TRUST_CLASSES,
+        )?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_registries
+             SET trust_class = ?,
+                 trusted_for_executable_updates = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE registry_id = ?",
+        )
+        .bind(trust_class.trim())
+        .bind(trusted_for_executable_updates)
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_source_module(&self, data: &NewExtensionSourceModule) -> Result<()> {
+        validate_source_module(data)?;
+        let media_types_json = json_to_string(data.media_types_json.as_ref())?;
+        let language_tags_json = json_to_string(data.language_tags_json.as_ref())?;
+        let region_tags_json = json_to_string(data.region_tags_json.as_ref())?;
+        let source_domains_json = json_to_string(data.source_domains_json.as_ref())?;
+        let metadata_json = json_to_string(data.metadata_json.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_modules (
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key,
+                display_name,
+                ecosystem,
+                plugin_package,
+                active_version,
+                rollback_version,
+                media_types_json,
+                language_tags_json,
+                region_tags_json,
+                source_domains_json,
+                account_required,
+                unsupported,
+                unsupported_reason,
+                enabled,
+                installed,
+                pinned_version,
+                health_state,
+                replacement_recommendation_key,
+                last_error,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id, module_key) DO UPDATE SET
+                registry_id = excluded.registry_id,
+                display_name = excluded.display_name,
+                ecosystem = excluded.ecosystem,
+                plugin_package = excluded.plugin_package,
+                active_version = excluded.active_version,
+                rollback_version = excluded.rollback_version,
+                media_types_json = excluded.media_types_json,
+                language_tags_json = excluded.language_tags_json,
+                region_tags_json = excluded.region_tags_json,
+                source_domains_json = excluded.source_domains_json,
+                account_required = excluded.account_required,
+                unsupported = excluded.unsupported,
+                unsupported_reason = excluded.unsupported_reason,
+                enabled = excluded.enabled,
+                installed = excluded.installed,
+                pinned_version = excluded.pinned_version,
+                health_state = excluded.health_state,
+                replacement_recommendation_key = excluded.replacement_recommendation_key,
+                last_error = excluded.last_error,
+                metadata_json = excluded.metadata_json,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.source_module_id.to_string())
+        .bind(data.instance_id.to_string())
+        .bind(data.registry_id.to_string())
+        .bind(data.module_key.trim())
+        .bind(data.display_name.trim())
+        .bind(data.ecosystem.trim())
+        .bind(data.plugin_package.as_deref().map(str::trim))
+        .bind(data.active_version.as_deref().map(str::trim))
+        .bind(data.rollback_version.as_deref().map(str::trim))
+        .bind(media_types_json)
+        .bind(language_tags_json)
+        .bind(region_tags_json)
+        .bind(source_domains_json)
+        .bind(data.account_required)
+        .bind(data.unsupported)
+        .bind(data.unsupported_reason.as_deref().map(str::trim))
+        .bind(data.enabled)
+        .bind(data.installed)
+        .bind(data.pinned_version.as_deref().map(str::trim))
+        .bind(data.health_state.trim())
+        .bind(
+            data.replacement_recommendation_key
+                .as_deref()
+                .map(str::trim),
+        )
+        .bind(data.last_error.as_deref().map(str::trim))
+        .bind(metadata_json)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_source_modules(
+        &self,
+        instance_id: Option<Uuid>,
+        registry_id: Option<Uuid>,
+    ) -> Result<Vec<ExtensionSourceModule>> {
+        let base = "SELECT
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key,
+                display_name,
+                ecosystem,
+                CAST(plugin_package AS TEXT) AS plugin_package,
+                CAST(active_version AS TEXT) AS active_version,
+                CAST(rollback_version AS TEXT) AS rollback_version,
+                CAST(media_types_json AS TEXT) AS media_types_json,
+                CAST(language_tags_json AS TEXT) AS language_tags_json,
+                CAST(region_tags_json AS TEXT) AS region_tags_json,
+                CAST(source_domains_json AS TEXT) AS source_domains_json,
+                CAST(account_required AS INTEGER) AS account_required,
+                CAST(unsupported AS INTEGER) AS unsupported,
+                CAST(unsupported_reason AS TEXT) AS unsupported_reason,
+                CAST(enabled AS INTEGER) AS enabled,
+                CAST(installed AS INTEGER) AS installed,
+                CAST(pinned_version AS TEXT) AS pinned_version,
+                health_state,
+                CAST(replacement_recommendation_key AS TEXT) AS replacement_recommendation_key,
+                CAST(last_success_at AS TEXT) AS last_success_at,
+                CAST(last_failure_at AS TEXT) AS last_failure_at,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(metadata_json AS TEXT) AS metadata_json,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+            FROM extension_source_modules";
+        let rows = match (instance_id, registry_id) {
+            (Some(instance_id), Some(registry_id)) => {
+                sqlx::query(&format!(
+                    "{base} WHERE instance_id = ? AND registry_id = ? ORDER BY display_name ASC"
+                ))
+                .bind(instance_id.to_string())
+                .bind(registry_id.to_string())
+                .fetch_all(self.pool)
+                .await?
+            }
+            (Some(instance_id), None) => {
+                sqlx::query(&format!(
+                    "{base} WHERE instance_id = ? ORDER BY display_name ASC"
+                ))
+                .bind(instance_id.to_string())
+                .fetch_all(self.pool)
+                .await?
+            }
+            (None, Some(registry_id)) => {
+                sqlx::query(&format!(
+                    "{base} WHERE registry_id = ? ORDER BY display_name ASC"
+                ))
+                .bind(registry_id.to_string())
+                .fetch_all(self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query(&format!("{base} ORDER BY display_name ASC"))
+                    .fetch_all(self.pool)
+                    .await?
+            }
+        };
+        rows.iter().map(map_source_module).collect()
+    }
+
+    pub async fn set_source_modules_enabled_for_registry(
+        &self,
+        registry_id: Uuid,
+        enabled: bool,
+        health_state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_modules.health_state",
+            health_state,
+            SOURCE_MODULE_HEALTH_STATES,
+        )?;
+        let failure_state = matches!(
+            health_state,
+            "degraded" | "broken" | "unsupported" | "account_required" | "disabled"
+        );
+        let clears_last_error = matches!(health_state, "available" | "healthy");
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET enabled = ?,
+                 health_state = CASE
+                    WHEN unsupported = 1 THEN 'unsupported'
+                    WHEN account_required = 1 THEN 'account_required'
+                    ELSE ?
+                 END,
+                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+                 last_error = CASE
+                    WHEN ? = 1 THEN COALESCE(?, ?)
+                    WHEN ? = 1 THEN NULL
+                    ELSE last_error
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE registry_id = ?",
+        )
+        .bind(enabled)
+        .bind(health_state.trim())
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(last_error.map(str::trim))
+        .bind(health_state.trim())
+        .bind(if clears_last_error { 1_i64 } else { 0_i64 })
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_module_active_version(
+        &self,
+        source_module_id: Uuid,
+        active_version: Option<&str>,
+        rollback_version: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET active_version = ?,
+                 rollback_version = ?,
+                 installed = CASE WHEN ? IS NULL THEN installed ELSE 1 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(active_version.map(str::trim))
+        .bind(rollback_version.map(str::trim))
+        .bind(active_version.map(str::trim))
+        .bind(source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_module_pinned_version(
+        &self,
+        source_module_id: Uuid,
+        pinned_version: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET pinned_version = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(pinned_version.map(str::trim))
+        .bind(source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_module_enabled_state(
+        &self,
+        source_module_id: Uuid,
+        enabled: bool,
+        health_state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_modules.health_state",
+            health_state,
+            SOURCE_MODULE_HEALTH_STATES,
+        )?;
+        let failure_state = matches!(
+            health_state,
+            "degraded" | "broken" | "unsupported" | "account_required" | "disabled"
+        );
+        let clears_last_error = matches!(health_state, "available" | "healthy");
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET enabled = ?,
+                 health_state = ?,
+                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+                 last_error = CASE
+                    WHEN ? = 1 THEN COALESCE(?, ?)
+                    WHEN ? = 1 THEN NULL
+                    ELSE last_error
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(enabled)
+        .bind(health_state.trim())
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(last_error.map(str::trim))
+        .bind(health_state.trim())
+        .bind(if clears_last_error { 1_i64 } else { 0_i64 })
+        .bind(source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_source_module_replacement_recommendation_key(
+        &self,
+        source_module_id: Uuid,
+        recommendation_key: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET replacement_recommendation_key = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(recommendation_key.map(str::trim))
+        .bind(source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_source_module_version(
+        &self,
+        data: &NewExtensionSourceModuleVersion,
+    ) -> Result<()> {
+        validate_source_module_version(data)?;
+        let metadata_json = json_to_string(data.metadata_json.as_ref())?;
+        let installed_at = data.installed_at.map(db_datetime_string);
+        let activated_at = data.activated_at.map(db_datetime_string);
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_module_versions (
+                version_id,
+                source_module_id,
+                version,
+                artifact_url,
+                artifact_sha256,
+                signature,
+                install_state,
+                smoke_status,
+                smoke_error,
+                rollback_of_version_id,
+                installed_at,
+                activated_at,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source_module_id, version) DO UPDATE SET
+                artifact_url = excluded.artifact_url,
+                artifact_sha256 = excluded.artifact_sha256,
+                signature = excluded.signature,
+                install_state = excluded.install_state,
+                smoke_status = excluded.smoke_status,
+                smoke_error = excluded.smoke_error,
+                rollback_of_version_id = excluded.rollback_of_version_id,
+                installed_at = excluded.installed_at,
+                activated_at = excluded.activated_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.version_id.to_string())
+        .bind(data.source_module_id.to_string())
+        .bind(data.version.trim())
+        .bind(data.artifact_url.as_deref().map(str::trim))
+        .bind(data.artifact_sha256.as_deref().map(str::trim))
+        .bind(data.signature.as_deref().map(str::trim))
+        .bind(data.install_state.trim())
+        .bind(data.smoke_status.trim())
+        .bind(data.smoke_error.as_deref().map(str::trim))
+        .bind(data.rollback_of_version_id.map(|id| id.to_string()))
+        .bind(installed_at)
+        .bind(activated_at)
+        .bind(metadata_json)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_source_module_versions(
+        &self,
+        source_module_id: Uuid,
+    ) -> Result<Vec<ExtensionSourceModuleVersion>> {
+        let rows = sqlx::query(
+            "SELECT
+                version_id,
+                source_module_id,
+                version,
+                CAST(artifact_url AS TEXT) AS artifact_url,
+                CAST(artifact_sha256 AS TEXT) AS artifact_sha256,
+                CAST(signature AS TEXT) AS signature,
+                install_state,
+                smoke_status,
+                CAST(smoke_error AS TEXT) AS smoke_error,
+                CAST(rollback_of_version_id AS TEXT) AS rollback_of_version_id,
+                CAST(installed_at AS TEXT) AS installed_at,
+                CAST(activated_at AS TEXT) AS activated_at,
+                CAST(metadata_json AS TEXT) AS metadata_json,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_module_versions
+             WHERE source_module_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(source_module_id.to_string())
+        .fetch_all(self.pool)
+        .await?;
+        rows.iter().map(map_source_module_version).collect()
+    }
+
+    pub async fn set_source_module_version_state(
+        &self,
+        version_id: Uuid,
+        install_state: &str,
+        smoke_status: &str,
+        smoke_error: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_module_versions.install_state",
+            install_state,
+            SOURCE_MODULE_VERSION_STATES,
+        )?;
+        validate_allowed_value(
+            "extension_source_module_versions.smoke_status",
+            smoke_status,
+            SOURCE_MODULE_SMOKE_STATUSES,
+        )?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_module_versions
+             SET install_state = ?,
+                 smoke_status = ?,
+                 smoke_error = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE version_id = ?",
+        )
+        .bind(install_state.trim())
+        .bind(smoke_status.trim())
+        .bind(smoke_error.map(str::trim))
+        .bind(version_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_source_health_event(
+        &self,
+        data: &NewExtensionSourceHealthEvent,
+    ) -> Result<()> {
+        validate_source_health_event(data)?;
+        let evidence_json = json_to_string(data.evidence_json.as_ref())?;
+        let observed_at = data.observed_at.map(db_datetime_string);
+        let state = data.state.trim();
+        let reason = data
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_health_events (
+                health_event_id,
+                source_module_id,
+                event_type,
+                state,
+                severity,
+                reason,
+                evidence_json,
+                observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+        )
+        .bind(data.health_event_id.to_string())
+        .bind(data.source_module_id.to_string())
+        .bind(data.event_type.trim())
+        .bind(state)
+        .bind(data.severity.trim())
+        .bind(reason)
+        .bind(evidence_json)
+        .bind(observed_at.as_deref())
+        .execute(self.pool)
+        .await?;
+
+        let success_event = state == "healthy";
+        let failure_event = matches!(
+            state,
+            "degraded" | "broken" | "unsupported" | "account_required"
+        );
+        let clears_last_error = matches!(state, "available" | "healthy");
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET health_state = ?,
+                 last_success_at = CASE WHEN ? = 1 THEN COALESCE(?, CURRENT_TIMESTAMP) ELSE last_success_at END,
+                 last_failure_at = CASE WHEN ? = 1 THEN COALESCE(?, CURRENT_TIMESTAMP) ELSE last_failure_at END,
+                 last_error = CASE
+                    WHEN ? = 1 THEN COALESCE(?, ?)
+                    WHEN ? = 1 THEN NULL
+                    ELSE last_error
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(state)
+        .bind(if success_event { 1_i64 } else { 0_i64 })
+        .bind(observed_at.as_deref())
+        .bind(if failure_event { 1_i64 } else { 0_i64 })
+        .bind(observed_at.as_deref())
+        .bind(if failure_event { 1_i64 } else { 0_i64 })
+        .bind(reason)
+        .bind(state)
+        .bind(if clears_last_error { 1_i64 } else { 0_i64 })
+        .bind(data.source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_source_health_events(
+        &self,
+        source_module_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ExtensionSourceHealthEvent>> {
+        let rows = sqlx::query(
+            "SELECT
+                health_event_id,
+                source_module_id,
+                event_type,
+                state,
+                severity,
+                CAST(reason AS TEXT) AS reason,
+                CAST(evidence_json AS TEXT) AS evidence_json,
+                CAST(observed_at AS TEXT) AS observed_at,
+                CAST(created_at AS TEXT) AS created_at
+             FROM extension_source_health_events
+             WHERE source_module_id = ?
+             ORDER BY observed_at DESC, created_at DESC
+             LIMIT ?",
+        )
+        .bind(source_module_id.to_string())
+        .bind(limit.max(1))
+        .fetch_all(self.pool)
+        .await?;
+        rows.iter().map(map_source_health_event).collect()
+    }
+
+    pub async fn upsert_source_replacement_recommendation(
+        &self,
+        data: &NewExtensionSourceReplacementRecommendation,
+    ) -> Result<()> {
+        validate_source_replacement_recommendation(data)?;
+        let metadata_json = json_to_string(data.metadata_json.as_ref())?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_replacement_recommendations (
+                recommendation_id,
+                source_module_id,
+                replacement_source_module_id,
+                replacement_registry_id,
+                recommendation_key,
+                action,
+                recommended_version,
+                reason,
+                metadata_json,
+                active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source_module_id, recommendation_key) DO UPDATE SET
+                replacement_source_module_id = excluded.replacement_source_module_id,
+                replacement_registry_id = excluded.replacement_registry_id,
+                action = excluded.action,
+                recommended_version = excluded.recommended_version,
+                reason = excluded.reason,
+                metadata_json = excluded.metadata_json,
+                active = excluded.active,
+                applied_at = CASE WHEN excluded.active THEN NULL ELSE applied_at END,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.recommendation_id.to_string())
+        .bind(data.source_module_id.to_string())
+        .bind(data.replacement_source_module_id.map(|id| id.to_string()))
+        .bind(data.replacement_registry_id.map(|id| id.to_string()))
+        .bind(data.recommendation_key.trim())
+        .bind(data.action.trim())
+        .bind(data.recommended_version.as_deref().map(str::trim))
+        .bind(data.reason.as_deref().map(str::trim))
+        .bind(metadata_json)
+        .bind(data.active)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_source_replacement_recommendations(
+        &self,
+        source_module_id: Option<Uuid>,
+        active_only: bool,
+    ) -> Result<Vec<ExtensionSourceReplacementRecommendation>> {
+        let base = "SELECT
+                recommendation_id,
+                source_module_id,
+                CAST(replacement_source_module_id AS TEXT) AS replacement_source_module_id,
+                CAST(replacement_registry_id AS TEXT) AS replacement_registry_id,
+                recommendation_key,
+                action,
+                CAST(recommended_version AS TEXT) AS recommended_version,
+                CAST(reason AS TEXT) AS reason,
+                CAST(metadata_json AS TEXT) AS metadata_json,
+                CAST(active AS INTEGER) AS active,
+                CAST(applied_at AS TEXT) AS applied_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_replacement_recommendations";
+        let rows = match (source_module_id, active_only) {
+            (Some(source_module_id), true) => {
+                sqlx::query(&format!(
+                    "{base} WHERE source_module_id = ? AND active = 1 ORDER BY created_at DESC"
+                ))
+                .bind(source_module_id.to_string())
+                .fetch_all(self.pool)
+                .await?
+            }
+            (Some(source_module_id), false) => {
+                sqlx::query(&format!(
+                    "{base} WHERE source_module_id = ? ORDER BY created_at DESC"
+                ))
+                .bind(source_module_id.to_string())
+                .fetch_all(self.pool)
+                .await?
+            }
+            (None, true) => {
+                sqlx::query(&format!("{base} WHERE active = 1 ORDER BY created_at DESC"))
+                    .fetch_all(self.pool)
+                    .await?
+            }
+            (None, false) => {
+                sqlx::query(&format!("{base} ORDER BY created_at DESC"))
+                    .fetch_all(self.pool)
+                    .await?
+            }
+        };
+        rows.iter()
+            .map(map_source_replacement_recommendation)
+            .collect()
+    }
+
+    pub async fn mark_source_replacement_recommendation_applied(
+        &self,
+        recommendation_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_replacement_recommendations
+             SET active = 0,
+                 applied_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE recommendation_id = ?",
+        )
+        .bind(recommendation_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn json_to_string(value: Option<&serde_json::Value>) -> Result<Option<String>> {
@@ -3067,6 +4087,158 @@ fn json_to_string(value: Option<&serde_json::Value>) -> Result<Option<String>> {
         )),
         None => Ok(None),
     }
+}
+
+const SOURCE_REGISTRY_TYPES: &[&str] = &[
+    "elixir_curated_cloudstream_pack",
+    "cloudstream_repo_json",
+    "cloudstream_plugins_json",
+    "elixir_curated_nuvio_pack",
+    "nuvio_manifest_json",
+    "stremio_manifest_json",
+];
+const SOURCE_REGISTRY_TRUST_CLASSES: &[&str] = &["curated", "maintainer_known", "custom"];
+const SOURCE_REGISTRY_FETCH_STATUSES: &[&str] = &["unknown", "success", "failed", "skipped"];
+const SOURCE_MODULE_ECOSYSTEMS: &[&str] = &["cloudstream", "aniyomi", "nuvio", "stremio"];
+const SOURCE_MODULE_HEALTH_STATES: &[&str] = &[
+    "unknown",
+    "available",
+    "healthy",
+    "degraded",
+    "broken",
+    "unsupported",
+    "account_required",
+    "disabled",
+];
+const SOURCE_MODULE_VERSION_STATES: &[&str] = &[
+    "available",
+    "staged",
+    "installed",
+    "active",
+    "failed",
+    "rolled_back",
+];
+const SOURCE_MODULE_SMOKE_STATUSES: &[&str] = &["unknown", "passed", "failed", "skipped"];
+const SOURCE_HEALTH_SEVERITIES: &[&str] = &["info", "warning", "error"];
+const SOURCE_REPLACEMENT_ACTIONS: &[&str] = &["replace", "disable", "pin", "none"];
+
+fn validate_source_registry(data: &NewExtensionSourceRegistry) -> Result<()> {
+    ensure_store_non_empty(
+        &data.registry_key,
+        "extension_source_registries.registry_key",
+    )?;
+    ensure_store_non_empty(
+        &data.display_name,
+        "extension_source_registries.display_name",
+    )?;
+    validate_allowed_value(
+        "extension_source_registries.registry_type",
+        &data.registry_type,
+        SOURCE_REGISTRY_TYPES,
+    )?;
+    validate_allowed_value(
+        "extension_source_registries.trust_class",
+        &data.trust_class,
+        SOURCE_REGISTRY_TRUST_CLASSES,
+    )?;
+    Ok(())
+}
+
+fn validate_source_module(data: &NewExtensionSourceModule) -> Result<()> {
+    ensure_store_non_empty(&data.module_key, "extension_source_modules.module_key")?;
+    ensure_store_non_empty(&data.display_name, "extension_source_modules.display_name")?;
+    validate_allowed_value(
+        "extension_source_modules.ecosystem",
+        &data.ecosystem,
+        SOURCE_MODULE_ECOSYSTEMS,
+    )?;
+    validate_allowed_value(
+        "extension_source_modules.health_state",
+        &data.health_state,
+        SOURCE_MODULE_HEALTH_STATES,
+    )?;
+    if data.unsupported
+        && data
+            .unsupported_reason
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        anyhow::bail!("unsupported source modules must include unsupported_reason");
+    }
+    Ok(())
+}
+
+fn validate_source_module_version(data: &NewExtensionSourceModuleVersion) -> Result<()> {
+    ensure_store_non_empty(&data.version, "extension_source_module_versions.version")?;
+    validate_allowed_value(
+        "extension_source_module_versions.install_state",
+        &data.install_state,
+        SOURCE_MODULE_VERSION_STATES,
+    )?;
+    validate_allowed_value(
+        "extension_source_module_versions.smoke_status",
+        &data.smoke_status,
+        SOURCE_MODULE_SMOKE_STATUSES,
+    )?;
+    Ok(())
+}
+
+fn validate_source_health_event(data: &NewExtensionSourceHealthEvent) -> Result<()> {
+    ensure_store_non_empty(
+        &data.event_type,
+        "extension_source_health_events.event_type",
+    )?;
+    validate_allowed_value(
+        "extension_source_health_events.state",
+        &data.state,
+        SOURCE_MODULE_HEALTH_STATES,
+    )?;
+    validate_allowed_value(
+        "extension_source_health_events.severity",
+        &data.severity,
+        SOURCE_HEALTH_SEVERITIES,
+    )?;
+    Ok(())
+}
+
+fn validate_source_replacement_recommendation(
+    data: &NewExtensionSourceReplacementRecommendation,
+) -> Result<()> {
+    ensure_store_non_empty(
+        &data.recommendation_key,
+        "extension_source_replacement_recommendations.recommendation_key",
+    )?;
+    validate_allowed_value(
+        "extension_source_replacement_recommendations.action",
+        &data.action,
+        SOURCE_REPLACEMENT_ACTIONS,
+    )?;
+    if data.action == "replace" && data.replacement_source_module_id.is_none() {
+        anyhow::bail!("replace recommendations must include replacement_source_module_id");
+    }
+    Ok(())
+}
+
+fn ensure_store_non_empty(value: &str, field: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_allowed_value(field: &str, value: &str, allowed: &[&str]) -> Result<()> {
+    let trimmed = value.trim();
+    if allowed.contains(&trimmed) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} must be one of [{}], got '{}'",
+        field,
+        allowed.join(", "),
+        value
+    )
 }
 
 fn media_ownership_identity_metadata(
@@ -3080,6 +4252,227 @@ fn media_ownership_identity_metadata(
         "title": title,
         "year": year,
         "externalIds": external_ids,
+    })
+}
+
+fn map_source_registry(row: &AnyRow) -> Result<ExtensionSourceRegistry> {
+    let registry_id_raw: String = row.try_get("registry_id")?;
+    let instance_id_raw: String = row.try_get("instance_id")?;
+    let last_fetched_at_raw = row_get_opt_string(row, "last_fetched_at")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSourceRegistry {
+        registry_id: parse_uuid(&registry_id_raw, "extension_source_registries.registry_id")?,
+        instance_id: parse_uuid(&instance_id_raw, "extension_source_registries.instance_id")?,
+        registry_key: row.try_get("registry_key")?,
+        registry_type: row.try_get("registry_type")?,
+        trust_class: row.try_get("trust_class")?,
+        display_name: row.try_get("display_name")?,
+        url: row_get_opt_string(row, "url")?,
+        enabled: row_get_bool(row, "enabled")?,
+        auto_refresh: row_get_bool(row, "auto_refresh")?,
+        trusted_for_executable_updates: row_get_bool(row, "trusted_for_executable_updates")?,
+        etag: row_get_opt_string(row, "etag")?,
+        last_modified: row_get_opt_string(row, "last_modified")?,
+        last_fetch_status: row.try_get("last_fetch_status")?,
+        last_fetch_error: row_get_opt_string(row, "last_fetch_error")?,
+        last_fetched_at: parse_datetime_opt(
+            last_fetched_at_raw,
+            "extension_source_registries.last_fetched_at",
+        )?,
+        metadata_json: parse_json_opt(
+            row_get_opt_string(row, "metadata_json")?,
+            "extension_source_registries.metadata_json",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "extension_source_registries.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "extension_source_registries.updated_at")?,
+    })
+}
+
+fn map_source_module(row: &AnyRow) -> Result<ExtensionSourceModule> {
+    let source_module_id_raw: String = row.try_get("source_module_id")?;
+    let instance_id_raw: String = row.try_get("instance_id")?;
+    let registry_id_raw: String = row.try_get("registry_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSourceModule {
+        source_module_id: parse_uuid(
+            &source_module_id_raw,
+            "extension_source_modules.source_module_id",
+        )?,
+        instance_id: parse_uuid(&instance_id_raw, "extension_source_modules.instance_id")?,
+        registry_id: parse_uuid(&registry_id_raw, "extension_source_modules.registry_id")?,
+        module_key: row.try_get("module_key")?,
+        display_name: row.try_get("display_name")?,
+        ecosystem: row.try_get("ecosystem")?,
+        plugin_package: row_get_opt_string(row, "plugin_package")?,
+        active_version: row_get_opt_string(row, "active_version")?,
+        rollback_version: row_get_opt_string(row, "rollback_version")?,
+        media_types_json: parse_json_opt(
+            row_get_opt_string(row, "media_types_json")?,
+            "extension_source_modules.media_types_json",
+        )?,
+        language_tags_json: parse_json_opt(
+            row_get_opt_string(row, "language_tags_json")?,
+            "extension_source_modules.language_tags_json",
+        )?,
+        region_tags_json: parse_json_opt(
+            row_get_opt_string(row, "region_tags_json")?,
+            "extension_source_modules.region_tags_json",
+        )?,
+        source_domains_json: parse_json_opt(
+            row_get_opt_string(row, "source_domains_json")?,
+            "extension_source_modules.source_domains_json",
+        )?,
+        account_required: row_get_bool(row, "account_required")?,
+        unsupported: row_get_bool(row, "unsupported")?,
+        unsupported_reason: row_get_opt_string(row, "unsupported_reason")?,
+        enabled: row_get_bool(row, "enabled")?,
+        installed: row_get_bool(row, "installed")?,
+        pinned_version: row_get_opt_string(row, "pinned_version")?,
+        health_state: row.try_get("health_state")?,
+        replacement_recommendation_key: row_get_opt_string(row, "replacement_recommendation_key")?,
+        last_success_at: parse_datetime_opt(
+            row_get_opt_string(row, "last_success_at")?,
+            "extension_source_modules.last_success_at",
+        )?,
+        last_failure_at: parse_datetime_opt(
+            row_get_opt_string(row, "last_failure_at")?,
+            "extension_source_modules.last_failure_at",
+        )?,
+        last_error: row_get_opt_string(row, "last_error")?,
+        metadata_json: parse_json_opt(
+            row_get_opt_string(row, "metadata_json")?,
+            "extension_source_modules.metadata_json",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "extension_source_modules.created_at")?,
+        updated_at: parse_datetime(&updated_at_raw, "extension_source_modules.updated_at")?,
+    })
+}
+
+fn map_source_module_version(row: &AnyRow) -> Result<ExtensionSourceModuleVersion> {
+    let version_id_raw: String = row.try_get("version_id")?;
+    let source_module_id_raw: String = row.try_get("source_module_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSourceModuleVersion {
+        version_id: parse_uuid(
+            &version_id_raw,
+            "extension_source_module_versions.version_id",
+        )?,
+        source_module_id: parse_uuid(
+            &source_module_id_raw,
+            "extension_source_module_versions.source_module_id",
+        )?,
+        version: row.try_get("version")?,
+        artifact_url: row_get_opt_string(row, "artifact_url")?,
+        artifact_sha256: row_get_opt_string(row, "artifact_sha256")?,
+        signature: row_get_opt_string(row, "signature")?,
+        install_state: row.try_get("install_state")?,
+        smoke_status: row.try_get("smoke_status")?,
+        smoke_error: row_get_opt_string(row, "smoke_error")?,
+        rollback_of_version_id: parse_uuid_opt(
+            row_get_opt_string(row, "rollback_of_version_id")?,
+            "extension_source_module_versions.rollback_of_version_id",
+        )?,
+        installed_at: parse_datetime_opt(
+            row_get_opt_string(row, "installed_at")?,
+            "extension_source_module_versions.installed_at",
+        )?,
+        activated_at: parse_datetime_opt(
+            row_get_opt_string(row, "activated_at")?,
+            "extension_source_module_versions.activated_at",
+        )?,
+        metadata_json: parse_json_opt(
+            row_get_opt_string(row, "metadata_json")?,
+            "extension_source_module_versions.metadata_json",
+        )?,
+        created_at: parse_datetime(
+            &created_at_raw,
+            "extension_source_module_versions.created_at",
+        )?,
+        updated_at: parse_datetime(
+            &updated_at_raw,
+            "extension_source_module_versions.updated_at",
+        )?,
+    })
+}
+
+fn map_source_health_event(row: &AnyRow) -> Result<ExtensionSourceHealthEvent> {
+    let health_event_id_raw: String = row.try_get("health_event_id")?;
+    let source_module_id_raw: String = row.try_get("source_module_id")?;
+    let observed_at_raw: String = row.try_get("observed_at")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    Ok(ExtensionSourceHealthEvent {
+        health_event_id: parse_uuid(
+            &health_event_id_raw,
+            "extension_source_health_events.health_event_id",
+        )?,
+        source_module_id: parse_uuid(
+            &source_module_id_raw,
+            "extension_source_health_events.source_module_id",
+        )?,
+        event_type: row.try_get("event_type")?,
+        state: row.try_get("state")?,
+        severity: row.try_get("severity")?,
+        reason: row_get_opt_string(row, "reason")?,
+        evidence_json: parse_json_opt(
+            row_get_opt_string(row, "evidence_json")?,
+            "extension_source_health_events.evidence_json",
+        )?,
+        observed_at: parse_datetime(
+            &observed_at_raw,
+            "extension_source_health_events.observed_at",
+        )?,
+        created_at: parse_datetime(&created_at_raw, "extension_source_health_events.created_at")?,
+    })
+}
+
+fn map_source_replacement_recommendation(
+    row: &AnyRow,
+) -> Result<ExtensionSourceReplacementRecommendation> {
+    let recommendation_id_raw: String = row.try_get("recommendation_id")?;
+    let source_module_id_raw: String = row.try_get("source_module_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSourceReplacementRecommendation {
+        recommendation_id: parse_uuid(
+            &recommendation_id_raw,
+            "extension_source_replacement_recommendations.recommendation_id",
+        )?,
+        source_module_id: parse_uuid(
+            &source_module_id_raw,
+            "extension_source_replacement_recommendations.source_module_id",
+        )?,
+        replacement_source_module_id: parse_uuid_opt(
+            row_get_opt_string(row, "replacement_source_module_id")?,
+            "extension_source_replacement_recommendations.replacement_source_module_id",
+        )?,
+        replacement_registry_id: parse_uuid_opt(
+            row_get_opt_string(row, "replacement_registry_id")?,
+            "extension_source_replacement_recommendations.replacement_registry_id",
+        )?,
+        recommendation_key: row.try_get("recommendation_key")?,
+        action: row.try_get("action")?,
+        recommended_version: row_get_opt_string(row, "recommended_version")?,
+        reason: row_get_opt_string(row, "reason")?,
+        metadata_json: parse_json_opt(
+            row_get_opt_string(row, "metadata_json")?,
+            "extension_source_replacement_recommendations.metadata_json",
+        )?,
+        active: row_get_bool(row, "active")?,
+        applied_at: parse_datetime_opt(
+            row_get_opt_string(row, "applied_at")?,
+            "extension_source_replacement_recommendations.applied_at",
+        )?,
+        created_at: parse_datetime(
+            &created_at_raw,
+            "extension_source_replacement_recommendations.created_at",
+        )?,
+        updated_at: parse_datetime(
+            &updated_at_raw,
+            "extension_source_replacement_recommendations.updated_at",
+        )?,
     })
 }
 
@@ -3795,4 +5188,376 @@ fn row_get_bool(row: &AnyRow, field: &str) -> Result<bool> {
         .try_get(field)
         .with_context(|| format!("missing {field}"))?;
     Ok(matches!(value.as_str(), "1" | "true" | "TRUE"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::DatabaseConfig,
+        db::{Database, models::ExtensionKind},
+    };
+    use serde_json::json;
+
+    async fn test_store() -> Result<(Database, Uuid)> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "elixir.sources.cloudstream_compat".to_string(),
+                name: "CloudStream Compat".to_string(),
+                version: "0.1.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir".to_string()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: json!({"id": "elixir.sources.cloudstream_compat"}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.sources.cloudstream_compat".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        Ok((database, instance_id))
+    }
+
+    #[tokio::test]
+    async fn cs1_source_registry_model_round_trips_update_health_and_replacement_state()
+    -> Result<()> {
+        let (database, instance_id) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let registry_id = Uuid::new_v4();
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "cloudstream.recommended".to_string(),
+                registry_type: "elixir_curated_cloudstream_pack".to_string(),
+                trust_class: "curated".to_string(),
+                display_name: "Recommended CloudStream Sources".to_string(),
+                url: None,
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: Some("etag-1".to_string()),
+                last_modified: None,
+                metadata_json: Some(json!({"channel": "stable"})),
+            })
+            .await?;
+        store
+            .record_source_registry_fetch(registry_id, "success", None, Some("etag-2"), None)
+            .await?;
+
+        let registries = store.list_source_registries(Some(instance_id)).await?;
+        assert_eq!(registries.len(), 1);
+        assert_eq!(registries[0].registry_key, "cloudstream.recommended");
+        assert_eq!(registries[0].last_fetch_status, "success");
+        assert_eq!(registries[0].etag.as_deref(), Some("etag-2"));
+        assert!(registries[0].trusted_for_executable_updates);
+
+        let source_module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key: "example.module".to_string(),
+                display_name: "Example Module".to_string(),
+                ecosystem: "cloudstream".to_string(),
+                plugin_package: Some("com.example.cloudstream".to_string()),
+                active_version: Some("1.0.0".to_string()),
+                rollback_version: None,
+                media_types_json: Some(json!(["movie", "tv"])),
+                language_tags_json: Some(json!(["eng"])),
+                region_tags_json: Some(json!(["us"])),
+                source_domains_json: Some(json!(["example.invalid"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: true,
+                installed: true,
+                pinned_version: None,
+                health_state: "healthy".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: Some(json!({"sourcePack": "recommended"})),
+            })
+            .await?;
+
+        let version_100 = Uuid::new_v4();
+        let version_110 = Uuid::new_v4();
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: version_100,
+                source_module_id,
+                version: "1.0.0".to_string(),
+                artifact_url: Some("https://repo.example/plugin-1.0.0.jar".to_string()),
+                artifact_sha256: Some("sha256-a".to_string()),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "passed".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: Some(Utc::now()),
+                activated_at: Some(Utc::now()),
+                metadata_json: None,
+            })
+            .await?;
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: version_110,
+                source_module_id,
+                version: "1.1.0".to_string(),
+                artifact_url: Some("https://repo.example/plugin-1.1.0.jar".to_string()),
+                artifact_sha256: Some("sha256-b".to_string()),
+                signature: Some("sig-b".to_string()),
+                install_state: "staged".to_string(),
+                smoke_status: "passed".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: Some(version_100),
+                installed_at: Some(Utc::now()),
+                activated_at: None,
+                metadata_json: Some(json!({"rollsBackTo": "1.0.0"})),
+            })
+            .await?;
+        store
+            .set_source_module_active_version(source_module_id, Some("1.1.0"), Some("1.0.0"))
+            .await?;
+
+        store
+            .create_source_health_event(&NewExtensionSourceHealthEvent {
+                health_event_id: Uuid::new_v4(),
+                source_module_id,
+                event_type: "smoke_probe".to_string(),
+                state: "broken".to_string(),
+                severity: "error".to_string(),
+                reason: Some("link extraction failed".to_string()),
+                evidence_json: Some(json!({"stage": "load_links"})),
+                observed_at: Some(Utc::now()),
+            })
+            .await?;
+
+        let replacement_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id: replacement_id,
+                instance_id,
+                registry_id,
+                module_key: "example.replacement".to_string(),
+                display_name: "Example Replacement".to_string(),
+                ecosystem: "cloudstream".to_string(),
+                plugin_package: Some("com.example.replacement".to_string()),
+                active_version: Some("1.0.0".to_string()),
+                rollback_version: None,
+                media_types_json: Some(json!(["movie", "tv"])),
+                language_tags_json: Some(json!(["eng"])),
+                region_tags_json: None,
+                source_domains_json: Some(json!(["replacement.invalid"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: true,
+                installed: true,
+                pinned_version: None,
+                health_state: "healthy".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: None,
+            })
+            .await?;
+        let recommendation_id = Uuid::new_v4();
+        store
+            .upsert_source_replacement_recommendation(
+                &NewExtensionSourceReplacementRecommendation {
+                    recommendation_id,
+                    source_module_id,
+                    replacement_source_module_id: Some(replacement_id),
+                    replacement_registry_id: Some(registry_id),
+                    recommendation_key: "replace-example-module".to_string(),
+                    action: "replace".to_string(),
+                    recommended_version: Some("1.0.0".to_string()),
+                    reason: Some("upstream source moved".to_string()),
+                    metadata_json: Some(json!({"maintainer": "elixir"})),
+                    active: true,
+                },
+            )
+            .await?;
+
+        let modules = store
+            .list_source_modules(Some(instance_id), Some(registry_id))
+            .await?;
+        let source_module = modules
+            .iter()
+            .find(|module| module.source_module_id == source_module_id)
+            .expect("source module");
+        assert_eq!(source_module.active_version.as_deref(), Some("1.1.0"));
+        assert_eq!(source_module.rollback_version.as_deref(), Some("1.0.0"));
+        assert_eq!(source_module.health_state, "broken");
+        assert_eq!(
+            source_module.last_error.as_deref(),
+            Some("link extraction failed")
+        );
+        assert!(source_module.last_failure_at.is_some());
+
+        let versions = store.list_source_module_versions(source_module_id).await?;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[1].rollback_of_version_id, Some(version_100));
+        assert_eq!(versions[1].signature.as_deref(), Some("sig-b"));
+
+        let events = store
+            .list_source_health_events(source_module_id, 10)
+            .await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, "broken");
+        assert_eq!(events[0].severity, "error");
+
+        let recommendations = store
+            .list_source_replacement_recommendations(Some(source_module_id), true)
+            .await?;
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(
+            recommendations[0].replacement_source_module_id,
+            Some(replacement_id)
+        );
+        store
+            .mark_source_replacement_recommendation_applied(recommendation_id)
+            .await?;
+        let active = store
+            .list_source_replacement_recommendations(Some(source_module_id), true)
+            .await?;
+        assert!(active.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cs1_source_registry_model_rejects_invalid_state_before_sql() -> Result<()> {
+        let (database, instance_id) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let registry_id = Uuid::new_v4();
+        let invalid_registry = store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "bad".to_string(),
+                registry_type: "unknown_repo".to_string(),
+                trust_class: "custom".to_string(),
+                display_name: "Bad Repo".to_string(),
+                url: None,
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: false,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await;
+        assert!(invalid_registry.is_err());
+
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "cloudstream.recommended".to_string(),
+                registry_type: "elixir_curated_cloudstream_pack".to_string(),
+                trust_class: "curated".to_string(),
+                display_name: "Recommended CloudStream Sources".to_string(),
+                url: None,
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await?;
+        let unsupported_without_reason = store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id: Uuid::new_v4(),
+                instance_id,
+                registry_id,
+                module_key: "unsupported".to_string(),
+                display_name: "Unsupported".to_string(),
+                ecosystem: "cloudstream".to_string(),
+                plugin_package: None,
+                active_version: None,
+                rollback_version: None,
+                media_types_json: None,
+                language_tags_json: None,
+                region_tags_json: None,
+                source_domains_json: None,
+                account_required: false,
+                unsupported: true,
+                unsupported_reason: None,
+                enabled: false,
+                installed: false,
+                pinned_version: None,
+                health_state: "unsupported".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: None,
+            })
+            .await;
+        assert!(unsupported_without_reason.is_err());
+
+        let module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id: module_id,
+                instance_id,
+                registry_id,
+                module_key: "valid".to_string(),
+                display_name: "Valid".to_string(),
+                ecosystem: "cloudstream".to_string(),
+                plugin_package: None,
+                active_version: None,
+                rollback_version: None,
+                media_types_json: None,
+                language_tags_json: None,
+                region_tags_json: None,
+                source_domains_json: None,
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: true,
+                installed: false,
+                pinned_version: None,
+                health_state: "available".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: None,
+            })
+            .await?;
+        let replace_without_target = store
+            .upsert_source_replacement_recommendation(
+                &NewExtensionSourceReplacementRecommendation {
+                    recommendation_id: Uuid::new_v4(),
+                    source_module_id: module_id,
+                    replacement_source_module_id: None,
+                    replacement_registry_id: None,
+                    recommendation_key: "missing-target".to_string(),
+                    action: "replace".to_string(),
+                    recommended_version: None,
+                    reason: None,
+                    metadata_json: None,
+                    active: true,
+                },
+            )
+            .await;
+        assert!(replace_without_target.is_err());
+        Ok(())
+    }
 }

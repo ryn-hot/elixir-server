@@ -16,40 +16,43 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    acquisition::release_resolution::{
-        anime::{
-            AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
-            AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
-            parse_anime_release_title, plan_anime_file_coverage_with_options,
-            score_anime_candidate,
-        },
-        fingerprint::{
-            ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
-        },
-        hashing::{HashFileJob, queue_anime_hash_file},
-        models::{
-            AcquisitionRelease, AcquisitionReleaseCoverage, AcquisitionReleaseFile,
-            AcquisitionReleaseState, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
-            NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
-            ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
-            ReleaseResolverKind,
-        },
-        movie::{
-            MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput,
-            select_movie_main_file,
-        },
-        movie_radarr_parser::MovieRadarrStyleParser,
-        store::{
-            get_release_by_download_id, get_release_by_fingerprint, list_active_releases_by_route,
-            list_release_coverage, list_release_files, list_release_jobs,
-            update_release_coverage_review_state, upsert_release, upsert_release_coverage,
-            upsert_release_file, upsert_release_job,
-        },
-        tv::{TvCoverageOptions, TvReleaseFileInput, TvSonarrStyleResolver, TvTarget},
-    },
     acquisition::subscriptions::{
         AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
         list_subscription_targets, reset_target_for_candidate_retry, update_target_state,
+    },
+    acquisition::{
+        release_resolution::{
+            anime::{
+                AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
+                AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
+                parse_anime_release_title, plan_anime_file_coverage_with_options,
+                score_anime_candidate,
+            },
+            fingerprint::{
+                ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
+            },
+            hashing::{HashFileJob, queue_anime_hash_file},
+            models::{
+                AcquisitionRelease, AcquisitionReleaseCoverage, AcquisitionReleaseFile,
+                AcquisitionReleaseState, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
+                NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
+                ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseJobStateUpdate,
+                ReleaseKind, ReleaseResolverKind,
+            },
+            movie::{
+                MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput,
+                select_movie_main_file,
+            },
+            movie_radarr_parser::MovieRadarrStyleParser,
+            store::{
+                get_release_by_download_id, get_release_by_fingerprint,
+                list_active_releases_by_route, list_release_coverage, list_release_files,
+                list_release_jobs, update_release_coverage_review_state, update_release_job_state,
+                upsert_release, upsert_release_coverage, upsert_release_file, upsert_release_job,
+            },
+            tv::{TvCoverageOptions, TvReleaseFileInput, TvSonarrStyleResolver, TvTarget},
+        },
+        stream_materializer::cleanup_http_stream_partial_from_plan,
     },
     db::models::MediaType,
     debrid::{
@@ -61,25 +64,27 @@ use crate::{
         DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE, DEBRID_SERVICE_UNAVAILABLE_MESSAGE,
         DownloadBrokerBindingKind, DownloadBrokerInventory, DownloadBrokerProviderRecord,
         DownloadBrokerRole, DownloadBrokerRouteInventory, DownloadBrokerRouteRecord,
-        DownloadBrokerRouteUpdate, ResolvedDownloadBrokerProvider, TORRENT_DEFAULT_LOGICAL_ID,
-        USENET_DEFAULT_LOGICAL_ID, list_acquisition_routes, list_logical_downloaders,
-        resolve_logical_downloader_for_owner, upsert_acquisition_route,
+        DownloadBrokerRouteUpdate, HTTP_STREAM_DEFAULT_LOGICAL_ID, ResolvedDownloadBrokerProvider,
+        TORRENT_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID, list_acquisition_routes,
+        list_logical_downloaders, resolve_logical_downloader_for_owner, upsert_acquisition_route,
     },
     extensions::store::ExtensionStore,
     http::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
         handlers::{
-            acquisition_sources::AcquisitionCandidate,
+            acquisition_sources::{AcquisitionCandidate, validate_stream_candidate_for_broker},
             extensions::{request_instance_service_form, request_instance_service_json},
         },
     },
     network::protection::observed_download_protection_status,
+    runtime::RuntimePaths,
     state::AppState,
 };
 
 const QBITTORRENT_STAGING_RESOLVER_VERSION: &str = "rr5a-qbittorrent-staging-v1";
 const QBITTORRENT_SELECTION_POLICY_VERSION: &str = "rr5b-qbittorrent-file-priority-v1";
+const HTTP_STREAM_BROKER_RESOLVER_VERSION: &str = "ess5-http-stream-broker-v1";
 const QBITTORRENT_WANTED_FILE_PRIORITY: i64 = 1;
 const QBITTORRENT_SKIPPED_FILE_PRIORITY: i64 = 0;
 const QBITTORRENT_METADATA_BACKOFF_INITIAL_SECONDS: u64 = 5;
@@ -160,6 +165,8 @@ pub struct DownloadBrokerSubmitRequest {
     #[serde(default)]
     pub selected_candidate: Option<AcquisitionCandidate>,
     #[serde(default)]
+    pub selected_stream_candidate: Option<Value>,
+    #[serde(default)]
     pub release_fingerprint: Option<String>,
 }
 
@@ -208,6 +215,8 @@ pub struct DownloadBrokerProgressItem {
     debrid: Option<DownloadBrokerDebridEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     torrent: Option<DownloadBrokerTorrentEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<DownloadBrokerStreamEvidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +235,20 @@ pub struct DownloadBrokerDebridEvidence {
     failure_class: Option<String>,
     last_error: Option<String>,
     fallback_state: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadBrokerStreamEvidence {
+    provider_name: Option<String>,
+    provider_implementation: Option<String>,
+    stream_type: Option<String>,
+    source_kind: Option<String>,
+    source_module: Option<String>,
+    target_key: Option<String>,
+    materializer_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -353,6 +376,10 @@ pub(crate) async fn submit_to_broker(
         DownloadBrokerRole::DebridResolver => {
             Some(submit_debrid_broker(state, store, &resolved, source, &request, owner_id).await?)
         }
+        DownloadBrokerRole::HttpStream => Some(
+            submit_http_stream_broker(&state.db_pool, &resolved, source, &request, owner_id)
+                .await?,
+        ),
     };
 
     Ok(DownloadBrokerSubmitResponse {
@@ -387,6 +414,9 @@ pub async fn progress(
         }
         DownloadBrokerRole::DebridResolver => {
             load_debrid_broker_progress(&state, &store, &resolved.record).await?
+        }
+        DownloadBrokerRole::HttpStream => {
+            load_http_stream_broker_progress(&state.db_pool, &resolved.record).await?
         }
     };
     Ok(Json(DownloadBrokerProgressResponse {
@@ -434,6 +464,19 @@ pub async fn cancel_download_item(
         }
         DownloadBrokerRole::DebridResolver => {
             cancel_debrid_broker(state, store, &resolved.record, download_id).await?
+        }
+        DownloadBrokerRole::HttpStream => {
+            let runtime_paths = RuntimePaths::from_roots(
+                &state.settings.extensions.storage_root,
+                &state.settings.library.local_root,
+            );
+            cancel_http_stream_broker(
+                &state.db_pool,
+                &resolved.record,
+                download_id,
+                Some(FsPath::new(&runtime_paths.downloads_root)),
+            )
+            .await?
         }
     };
     Ok(DownloadBrokerCancelResponse {
@@ -505,6 +548,11 @@ async fn ensure_route_allows_submit(
         DownloadBrokerRole::DebridResolver => {
             return Err(ApiError::conflict(
                 "debrid resolver routes cannot use protected local downloader binding",
+            ));
+        }
+        DownloadBrokerRole::HttpStream => {
+            return Err(ApiError::conflict(
+                "http stream materializer routes cannot use protected local downloader binding",
             ));
         }
     };
@@ -679,6 +727,167 @@ async fn submit_debrid_broker(
         }
     })?;
     Ok(job_id.to_string())
+}
+
+async fn submit_http_stream_broker(
+    pool: &sqlx::AnyPool,
+    resolved: &ResolvedDownloadBrokerProvider,
+    source: &str,
+    request: &DownloadBrokerSubmitRequest,
+    owner_id: Option<&str>,
+) -> ApiResult<String> {
+    let Some(raw_candidate) = request.selected_stream_candidate.clone() else {
+        return Err(ApiError::bad_request(
+            "selectedStreamCandidate is required for the http stream materializer route",
+        ));
+    };
+    let (candidate, warnings) = validate_stream_candidate_for_broker(raw_candidate)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let candidate_source = stream_candidate_string(&candidate, "/source").ok_or_else(|| {
+        ApiError::bad_request("selectedStreamCandidate.source is required for stream submit")
+    })?;
+    if candidate_source.trim() != source {
+        return Err(ApiError::bad_request(
+            "request source must match selectedStreamCandidate.source",
+        ));
+    }
+    let media_type = request
+        .media_type
+        .or_else(|| {
+            stream_candidate_string(&candidate, "/targetEvidence/mediaType")
+                .and_then(|value| parse_stream_media_type(&value))
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "mediaType or selectedStreamCandidate.targetEvidence.mediaType is required",
+            )
+        })?;
+    let source_extension_id = request
+        .source_extension_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| stream_candidate_string(&candidate, "/sourceModule/id"))
+        .or_else(|| {
+            owner_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "elixir.extension_suite.stream".to_string());
+    let owner_id = owner_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::download_broker::DEFAULT_ROUTE_OWNER_ID)
+        .to_string();
+    let release_title = stream_candidate_string(&candidate, "/title")
+        .ok_or_else(|| ApiError::bad_request("selectedStreamCandidate.title is required"))?;
+    let title = request
+        .media_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| release_title.clone());
+    let source_kind = stream_candidate_string(&candidate, "/sourceKind")
+        .unwrap_or_else(|| "http_stream".to_string());
+    let fingerprint = request.release_fingerprint.clone().unwrap_or_else(|| {
+        build_http_stream_release_fingerprint(&HttpStreamFingerprintInput {
+            source_extension_id: &source_extension_id,
+            source_provider_id: request.source_provider_id,
+            source,
+            source_kind: &source_kind,
+            release_title: &release_title,
+            candidate: &candidate,
+        })
+    });
+    let download_id = http_stream_download_id(&fingerprint);
+    let confidence = stream_candidate_string(&candidate, "/targetEvidence/confidence")
+        .as_deref()
+        .map(stream_release_confidence)
+        .unwrap_or(ReleaseConfidence::Low);
+    let score = stream_candidate_f64(&candidate, "/score");
+    let delivery_stream_type = stream_candidate_string(&candidate, "/delivery/streamType");
+    let target_key = stream_candidate_string(&candidate, "/targetEvidence/targetKey");
+    let source_module = stream_candidate_string(&candidate, "/sourceModule/name")
+        .or_else(|| stream_candidate_string(&candidate, "/sourceModule/id"));
+
+    let release = upsert_release(
+        pool,
+        NewAcquisitionRelease {
+            release_id: None,
+            subscription_id: request.subscription_id,
+            source_provider_id: request.source_provider_id,
+            source_extension_id: source_extension_id.clone(),
+            owner_id: owner_id.clone(),
+            media_type,
+            title,
+            release_title: release_title.clone(),
+            source: source.to_string(),
+            source_kind: source_kind.clone(),
+            info_hash: None,
+            fingerprint,
+            release_kind: ReleaseKind::Unknown,
+            resolver_kind: ReleaseResolverKind::Unresolved,
+            resolver_version: HTTP_STREAM_BROKER_RESOLVER_VERSION.to_string(),
+            confidence,
+            score,
+            selected_route_logical_id: Some(HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string()),
+            selected_provider_id: None,
+            download_id: Some(download_id.clone()),
+            remote_release_id: Some(download_id.clone()),
+            state: AcquisitionReleaseState::Submitted,
+            state_reason: Some(
+                "HTTP stream candidate accepted for Elixir-managed materialization.".to_string(),
+            ),
+            selected_candidate: Some(candidate.clone()),
+            coverage_plan: Some(json!({
+                "source": "http_stream_broker",
+                "resolverVersion": HTTP_STREAM_BROKER_RESOLVER_VERSION,
+                "routeOwnerId": owner_id,
+                "routeLogicalId": HTTP_STREAM_DEFAULT_LOGICAL_ID,
+                "providerId": resolved.record.provider_id,
+                "providerImplementation": resolved.record.implementation,
+                "materializerState": "submitted",
+                "sourceKind": source_kind,
+                "streamType": delivery_stream_type,
+                "targetKey": target_key,
+                "sourceModule": source_module,
+                "validationWarnings": warnings
+            })),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    upsert_release_job(
+        pool,
+        NewAcquisitionReleaseJob {
+            release_job_id: None,
+            release_id: release.release_id,
+            route_logical_id: HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string(),
+            provider_id: None,
+            download_id: Some(download_id.clone()),
+            remote_release_id: Some(download_id.clone()),
+            state: ReleaseJobState::Submitted,
+            state_reason: Some("HTTP stream materializer job accepted by the broker.".to_string()),
+            active: true,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(download_id)
 }
 
 pub(crate) fn generic_debrid_error_message(message: &str) -> Option<&'static str> {
@@ -1105,6 +1314,7 @@ async fn load_qbittorrent_progress(
             upload_rate_bps: number_field(item, "upspeed"),
             debrid: None,
             torrent,
+            stream: None,
         });
     }
     Ok(progress)
@@ -3070,6 +3280,31 @@ async fn update_qbittorrent_release_state_only(
     Ok(())
 }
 
+async fn update_http_stream_release_state_only(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    state: AcquisitionReleaseState,
+    reason: &str,
+    coverage_plan: Value,
+) -> anyhow::Result<()> {
+    let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = ?,
+             state_reason = ?,
+             coverage_plan_json = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?",
+    )
+    .bind(state.as_str())
+    .bind(reason)
+    .bind(coverage_plan_json)
+    .bind(release_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn update_release_file_selected(
     pool: &sqlx::AnyPool,
     release_file_id: Uuid,
@@ -3432,6 +3667,7 @@ async fn load_nzbget_progress(
                 upload_rate_bps: None,
                 debrid: None,
                 torrent: None,
+                stream: None,
             })
         })
         .collect())
@@ -3479,8 +3715,111 @@ async fn load_debrid_broker_progress(
                 fallback_state: evidence.fallback_state,
             }),
             torrent: None,
+            stream: None,
         })
         .collect())
+}
+
+async fn load_http_stream_broker_progress(
+    pool: &sqlx::AnyPool,
+    record: &DownloadBrokerProviderRecord,
+) -> ApiResult<Vec<DownloadBrokerProgressItem>> {
+    let releases = list_active_releases_by_route(pool, HTTP_STREAM_DEFAULT_LOGICAL_ID, 100)
+        .await
+        .map_err(ApiError::from)?;
+    let mut items = Vec::with_capacity(releases.len());
+    for release in releases {
+        if release.selected_provider_id.is_some()
+            && release.selected_provider_id != Some(record.provider_id)
+        {
+            continue;
+        }
+        let jobs = list_release_jobs(pool, release.release_id)
+            .await
+            .map_err(ApiError::from)?;
+        let job = jobs
+            .iter()
+            .find(|job| {
+                job.route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID
+                    && (job.provider_id.is_none() || job.provider_id == Some(record.provider_id))
+                    && job.active
+            })
+            .or_else(|| {
+                jobs.iter()
+                    .find(|job| job.route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID)
+            });
+        let state = job
+            .map(|job| job.state.as_str().to_string())
+            .unwrap_or_else(|| release.state.as_str().to_string());
+        let candidate = release.selected_candidate.as_ref();
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"));
+        let materializer_state = runtime
+            .and_then(|value| value.get("runtimeState"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| state.clone());
+        let downloaded_bytes =
+            runtime.and_then(|value| stream_runtime_u64(value, "downloadedBytes"));
+        let total_bytes = runtime.and_then(|value| stream_runtime_u64(value, "totalBytes"));
+        let warnings = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("validationWarnings"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        items.push(DownloadBrokerProgressItem {
+            id: release
+                .download_id
+                .clone()
+                .or_else(|| job.and_then(|job| job.download_id.clone()))
+                .unwrap_or_else(|| release.release_id.to_string()),
+            name: Some(release.release_title.clone()),
+            state: Some(materializer_state.clone()),
+            category: None,
+            local_path: runtime.and_then(|value| stream_runtime_string(value, "localPath")),
+            progress: runtime.and_then(|value| stream_runtime_f64(value, "progress")),
+            downloaded_bytes,
+            total_bytes,
+            remaining_bytes: match (downloaded_bytes, total_bytes) {
+                (Some(downloaded), Some(total)) => Some(total.saturating_sub(downloaded)),
+                _ => None,
+            },
+            download_rate_bps: runtime
+                .and_then(|value| stream_runtime_u64(value, "downloadRateBps")),
+            upload_rate_bps: None,
+            debrid: None,
+            torrent: None,
+            stream: Some(DownloadBrokerStreamEvidence {
+                provider_name: Some("Elixir HTTP stream materializer".to_string()),
+                provider_implementation: record.implementation.clone(),
+                stream_type: candidate
+                    .and_then(|value| stream_candidate_string(value, "/delivery/streamType")),
+                source_kind: candidate
+                    .and_then(|value| stream_candidate_string(value, "/sourceKind")),
+                source_module: candidate
+                    .and_then(|value| stream_candidate_string(value, "/sourceModule/name"))
+                    .or_else(|| {
+                        candidate
+                            .and_then(|value| stream_candidate_string(value, "/sourceModule/id"))
+                    }),
+                target_key: candidate
+                    .and_then(|value| stream_candidate_string(value, "/targetEvidence/targetKey")),
+                materializer_state,
+                warnings,
+            }),
+        });
+    }
+    Ok(items)
 }
 
 async fn cancel_qbittorrent(
@@ -3599,6 +3938,70 @@ async fn cancel_debrid_broker(
     )
     .await
     .map_err(ApiError::from)
+}
+
+async fn cancel_http_stream_broker(
+    pool: &sqlx::AnyPool,
+    record: &DownloadBrokerProviderRecord,
+    download_id: &str,
+    downloads_root: Option<&FsPath>,
+) -> ApiResult<bool> {
+    let id = normalized_source(download_id)?;
+    let Some(release) = get_release_by_download_id(pool, id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(false);
+    };
+    if release.selected_route_logical_id.as_deref() != Some(HTTP_STREAM_DEFAULT_LOGICAL_ID)
+        || (release.selected_provider_id.is_some()
+            && release.selected_provider_id != Some(record.provider_id))
+    {
+        return Ok(false);
+    }
+    let reason = "HTTP stream materializer job was cancelled.";
+    let coverage_plan = merge_http_stream_runtime_evidence(
+        release.coverage_plan.clone(),
+        json!({
+            "runtimeState": "cancelled",
+            "downloadId": id,
+            "message": reason
+        }),
+    );
+    update_http_stream_release_state_only(
+        pool,
+        release.release_id,
+        AcquisitionReleaseState::Cancelled,
+        reason,
+        coverage_plan,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if let Some(downloads_root) = downloads_root {
+        cleanup_http_stream_partial_from_plan(downloads_root, release.coverage_plan.as_ref()).await;
+    }
+    let jobs = list_release_jobs(pool, release.release_id)
+        .await
+        .map_err(ApiError::from)?;
+    for job in jobs
+        .into_iter()
+        .filter(|job| job.route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID)
+    {
+        update_release_job_state(
+            pool,
+            job.release_job_id,
+            ReleaseJobStateUpdate {
+                state: ReleaseJobState::Cancelled,
+                state_reason: Some(reason.to_string()),
+                active: Some(false),
+                completed_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
+    Ok(true)
 }
 
 fn resolve_nzbget_group_id(groups: &[Value], download_id: &str) -> Option<i64> {
@@ -3884,6 +4287,148 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+#[derive(Debug)]
+struct HttpStreamFingerprintInput<'a> {
+    source_extension_id: &'a str,
+    source_provider_id: Option<Uuid>,
+    source: &'a str,
+    source_kind: &'a str,
+    release_title: &'a str,
+    candidate: &'a Value,
+}
+
+fn build_http_stream_release_fingerprint(input: &HttpStreamFingerprintInput<'_>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"http-stream-v1\n");
+    hasher.update(input.source_extension_id.trim().as_bytes());
+    hasher.update(b"\n");
+    if let Some(provider_id) = input.source_provider_id {
+        hasher.update(provider_id.to_string().as_bytes());
+    }
+    hasher.update(b"\n");
+    hasher.update(input.source_kind.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(input.source.trim().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(input.release_title.trim().as_bytes());
+    hasher.update(b"\n");
+    for pointer in [
+        "/id",
+        "/targetEvidence/mediaType",
+        "/targetEvidence/targetKey",
+        "/delivery/streamType",
+        "/sourceModule/id",
+    ] {
+        if let Some(value) = stream_candidate_string(input.candidate, pointer) {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\n");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn http_stream_download_id(fingerprint: &str) -> String {
+    let suffix = fingerprint
+        .strip_prefix("sha256:")
+        .unwrap_or(fingerprint)
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(32)
+        .collect::<String>();
+    if suffix.len() >= 16 {
+        format!("http-stream:{suffix}")
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(fingerprint.trim().as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        format!("http-stream:{}", &hash[..32])
+    }
+}
+
+fn parse_stream_media_type(value: &str) -> Option<MediaType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "movie" | "movies" => Some(MediaType::Movie),
+        "series" | "tv" | "show" | "shows" => Some(MediaType::Series),
+        "anime" => Some(MediaType::Anime),
+        _ => None,
+    }
+}
+
+fn stream_release_confidence(value: &str) -> ReleaseConfidence {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "high" => ReleaseConfidence::High,
+        "medium" => ReleaseConfidence::Medium,
+        "review_required" | "review-required" => ReleaseConfidence::ReviewRequired,
+        _ => ReleaseConfidence::Low,
+    }
+}
+
+fn stream_candidate_string(candidate: &Value, pointer: &str) -> Option<String> {
+    candidate
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn stream_candidate_f64(candidate: &Value, pointer: &str) -> Option<f64> {
+    candidate.pointer(pointer).and_then(Value::as_f64)
+}
+
+fn stream_runtime_string(runtime: &Value, key: &str) -> Option<String> {
+    runtime
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn stream_runtime_u64(runtime: &Value, key: &str) -> Option<u64> {
+    runtime.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| value.try_into().ok()))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            })
+    })
+}
+
+fn stream_runtime_f64(runtime: &Value, key: &str) -> Option<f64> {
+    runtime.get(key).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|value| value as f64))
+            .or_else(|| value.as_u64().map(|value| value as f64))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+            })
+    })
+}
+
+fn merge_http_stream_runtime_evidence(
+    coverage_plan: Option<Value>,
+    runtime_evidence: Value,
+) -> Value {
+    match coverage_plan {
+        Some(Value::Object(mut object)) => {
+            object.insert("streamRuntime".to_string(), runtime_evidence);
+            Value::Object(object)
+        }
+        Some(value) => json!({
+            "previousCoveragePlan": value,
+            "streamRuntime": runtime_evidence
+        }),
+        None => json!({ "streamRuntime": runtime_evidence }),
+    }
+}
+
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -3959,7 +4504,9 @@ mod tests {
             models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality},
         },
         download_broker::{
-            DownloadBrokerEndpointContract, DownloadBrokerProviderKind, TORRENT_DEFAULT_LOGICAL_ID,
+            DownloadBrokerEndpointContract, DownloadBrokerProviderKind,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID,
+            resolve_logical_downloader_for_owner,
         },
         extensions::store::{NewExtension, NewExtensionInstance, NewProvider},
     };
@@ -4217,8 +4764,44 @@ mod tests {
             media_type: acquisition_owned.then_some(MediaType::Series),
             media_title: acquisition_owned.then(|| "Show".to_string()),
             selected_candidate: acquisition_owned.then(sample_candidate),
+            selected_stream_candidate: None,
             release_fingerprint: None,
         }
+    }
+
+    fn sample_stream_candidate() -> Value {
+        json!({
+            "candidateKind": "stream",
+            "id": "stream-fixture-1",
+            "title": "Fullmetal Alchemist Brotherhood S01E01",
+            "source": "https://stream.example.test/fmab/s01e01/master.m3u8",
+            "sourceKind": "http_stream",
+            "score": 91.5,
+            "supportedRoutes": [HTTP_STREAM_DEFAULT_LOGICAL_ID],
+            "defaultRoute": HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            "targetEvidence": {
+                "mediaType": "anime",
+                "targetKey": "anilist:5114:A0001",
+                "confidence": "high",
+                "reasons": ["provider episode id matched target"]
+            },
+            "delivery": {
+                "streamType": "hls",
+                "url": "https://cdn.example.test/fmab/s01e01/master.m3u8",
+                "referer": "https://stream.example.test/title/fmab",
+                "headers": {
+                    "user-agent": "ElixirTest/1.0"
+                }
+            },
+            "sourceModule": {
+                "id": "fixture.cloudstream",
+                "name": "Fixture CloudStream",
+                "type": "cloudstream"
+            },
+            "raw": {
+                "hosterUrl": "https://stream.example.test/watch?api_key=secret"
+            }
+        })
     }
 
     fn empty_target() -> NewAcquisitionTarget {
@@ -4263,6 +4846,134 @@ mod tests {
         hoster_request.source = hoster_candidate.source.clone();
         hoster_request.selected_candidate = Some(hoster_candidate);
         assert!(validate_nzb_submit_source(&hoster_request.source, &hoster_request).is_err());
+    }
+
+    #[tokio::test]
+    async fn ess5_http_stream_submit_progress_and_cancel_are_ledger_backed() -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let resolved = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            crate::download_broker::DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await?;
+        let candidate = sample_stream_candidate();
+        let mut request = sample_request(false);
+        request.source = candidate
+            .get("source")
+            .and_then(Value::as_str)
+            .expect("candidate source")
+            .to_string();
+        request.name = Some("Fullmetal Alchemist Brotherhood S01E01".to_string());
+        request.source_extension_id = Some("elixir.extension_suite.stream".to_string());
+        request.media_type = Some(MediaType::Anime);
+        request.media_title = Some("Fullmetal Alchemist Brotherhood".to_string());
+        request.selected_stream_candidate = Some(candidate);
+
+        let download_id =
+            submit_http_stream_broker(&database.pool, &resolved, &request.source, &request, None)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        assert!(download_id.starts_with("http-stream:"));
+
+        let release = get_release_by_download_id(&database.pool, &download_id)
+            .await?
+            .expect("submitted stream release");
+        assert_eq!(release.state, AcquisitionReleaseState::Submitted);
+        assert_eq!(
+            release.selected_route_logical_id.as_deref(),
+            Some(HTTP_STREAM_DEFAULT_LOGICAL_ID)
+        );
+        assert_eq!(release.selected_provider_id, None);
+        let provider_id = resolved.record.provider_id.to_string();
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.get("providerId"))
+                .and_then(Value::as_str),
+            Some(provider_id.as_str())
+        );
+        assert_eq!(
+            release.resolver_version,
+            HTTP_STREAM_BROKER_RESOLVER_VERSION
+        );
+        assert_eq!(release.confidence, ReleaseConfidence::High);
+        assert_eq!(release.score, Some(91.5));
+        assert_eq!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/raw/hosterUrl"))
+                .and_then(Value::as_str),
+            Some("https://stream.example.test/watch?api_key=%5BREDACTED%5D")
+        );
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Submitted);
+        assert!(jobs[0].active);
+
+        let items = load_http_stream_broker_progress(&database.pool, &resolved.record)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, download_id);
+        assert_eq!(items[0].state.as_deref(), Some("submitted"));
+        let stream = items[0].stream.as_ref().expect("stream evidence");
+        assert_eq!(stream.stream_type.as_deref(), Some("hls"));
+        assert_eq!(stream.source_kind.as_deref(), Some("http_stream"));
+        assert_eq!(stream.target_key.as_deref(), Some("anilist:5114:A0001"));
+        assert_eq!(stream.materializer_state, "submitted");
+
+        let removed =
+            cancel_http_stream_broker(&database.pool, &resolved.record, &download_id, None)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        assert!(removed);
+        let cancelled = get_release(&database.pool, release.release_id)
+            .await?
+            .expect("cancelled stream release");
+        assert_eq!(cancelled.state, AcquisitionReleaseState::Cancelled);
+        assert_eq!(
+            cancelled
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.get("streamRuntime"))
+                .and_then(|value| value.get("runtimeState"))
+                .and_then(Value::as_str),
+            Some("cancelled")
+        );
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs[0].state, ReleaseJobState::Cancelled);
+        assert!(!jobs[0].active);
+        let items = load_http_stream_broker_progress(&database.pool, &resolved.record)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        assert!(items.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess5_http_stream_submit_rejects_missing_stream_candidate() -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let resolved = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            crate::download_broker::DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await?;
+        let mut request = sample_request(false);
+        request.source = "https://stream.example.test/fmab/s01e01/master.m3u8".to_string();
+        request.media_type = Some(MediaType::Anime);
+        let result =
+            submit_http_stream_broker(&database.pool, &resolved, &request.source, &request, None)
+                .await;
+        assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
@@ -5998,6 +6709,7 @@ mod tests {
                 fallback_state: "not_attempted_review_required".to_string(),
             }),
             torrent: None,
+            stream: None,
         };
 
         let value = serde_json::to_value(&item).unwrap();
@@ -6064,6 +6776,7 @@ mod tests {
                 blocker: None,
                 failure_state: None,
             }),
+            stream: None,
         };
 
         let value = serde_json::to_value(&item).unwrap();

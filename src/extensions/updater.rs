@@ -23,6 +23,7 @@ use crate::http::handlers::extensions::{
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::reconcile::ReconcileConfig;
 use crate::runtime::docker::{DockerImageMetadata, DockerRuntimeManager};
+use crate::runtime::health::DockerRuntimeHealthState;
 use crate::state::AppState;
 use uuid::Uuid;
 
@@ -126,6 +127,11 @@ pub async fn start_proxy_runtime_update_loop(state: AppState, interval: Duration
 }
 
 pub async fn run_proxy_runtime_update_once(state: &AppState) -> Result<()> {
+    if let Some(description) = proxy_runtime_update_docker_defer_description(state) {
+        persist_proxy_runtime_update_deferred(state, &description).await?;
+        return Ok(());
+    }
+
     let client = build_github_client()?;
     let docker = DockerRuntimeManager::new(None);
     for definition in PROXY_RUNTIME_DEFINITIONS {
@@ -135,6 +141,47 @@ pub async fn run_proxy_runtime_update_once(state: &AppState) -> Result<()> {
                 "proxy runtime auto-update failed: {err}"
             );
         }
+    }
+    Ok(())
+}
+
+fn proxy_runtime_update_docker_defer_description(state: &AppState) -> Option<String> {
+    let snapshot = state.orchestrator.docker_runtime_snapshot();
+    match snapshot.state {
+        DockerRuntimeHealthState::Healthy => None,
+        DockerRuntimeHealthState::Degraded => Some(snapshot.reason.unwrap_or_else(|| {
+            "Docker is unavailable, so Elixir deferred proxy runtime image verification."
+                .to_string()
+        })),
+        DockerRuntimeHealthState::Recovering => Some(snapshot.reason.unwrap_or_else(|| {
+            "Docker recovered recently and Elixir is waiting for core extension runtimes before checking proxy runtime images."
+                .to_string()
+        })),
+    }
+}
+
+async fn persist_proxy_runtime_update_deferred(state: &AppState, description: &str) -> Result<()> {
+    let store = ExtensionStore::new(&state.db_pool);
+    for definition in PROXY_RUNTIME_DEFINITIONS {
+        let Some(existing_extension) = store.get_extension(definition.extension_id).await? else {
+            continue;
+        };
+        if !existing_extension.enabled {
+            continue;
+        }
+        persist_proxy_runtime_update_state(
+            &store,
+            definition,
+            proxy_runtime_update_state(
+                "ready",
+                "docker_runtime_deferred",
+                "Waiting for Docker",
+                description,
+                Some(existing_extension.version),
+                None,
+            ),
+        )
+        .await?;
     }
     Ok(())
 }

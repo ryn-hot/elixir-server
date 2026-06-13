@@ -1768,6 +1768,12 @@ fn import_audio_policy(
         &["raw", "languages"][..],
         &["raw", "audioLanguage"][..],
         &["raw", "audioLanguages"][..],
+        &[
+            "raw",
+            "serverEvidence",
+            "languagePreference",
+            "matchingAudioLanguages",
+        ][..],
     ] {
         add_policy_languages_from_json_path(
             release.selected_candidate.as_ref(),
@@ -6374,7 +6380,18 @@ mod tests {
             remote_release_id: None,
             state: AcquisitionReleaseState::Completed,
             state_reason: Some("completed".to_string()),
-            selected_candidate: Some(json!({ "language": "eng" })),
+            selected_candidate: Some(json!({
+                "language": "eng",
+                "raw": {
+                    "serverEvidence": {
+                        "languagePreference": {
+                            "state": "match",
+                            "matchingAudioLanguages": ["English"],
+                            "languageIsIdentityEvidence": false
+                        }
+                    }
+                }
+            })),
             coverage_plan: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6417,6 +6434,10 @@ mod tests {
                 .iter()
                 .any(|source| source == "selectedCandidate.language")
         );
+        assert!(policy.sources.iter().any(|source| {
+            source
+                == "selectedCandidate.raw.serverEvidence.languagePreference.matchingAudioLanguages"
+        }));
         assert!(
             policy
                 .sources

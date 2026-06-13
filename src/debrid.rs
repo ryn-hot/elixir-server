@@ -10378,6 +10378,9 @@ fn debrid_manifest_json() -> Value {
         "publisher": { "name": "Elixir" },
         "trust": "verified",
         "permissions": ["network.egress"],
+        "runtime": {
+            "type": "internal"
+        },
         "provides": [{
             "capability": "debrid.resolver",
             "slot": "default",
@@ -13046,6 +13049,16 @@ mod tests {
         assert_eq!(extension.name, "Debrid");
         assert_eq!(extension.manifest_json["id"], DEBRID_EXTENSION_ID);
         assert_eq!(extension.manifest_json["name"], "Debrid");
+        let manifest: crate::extensions::manifest::ExtensionManifest =
+            serde_json::from_value(extension.manifest_json.clone())?;
+        manifest.validate()?;
+        assert_eq!(
+            manifest
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.r#type.as_str()),
+            Some("internal")
+        );
         assert!(
             store
                 .get_extension(LEGACY_REAL_DEBRID_EXTENSION_ID)

@@ -33,6 +33,10 @@ use crate::{
     acquisition::{
         AUTO_RECOVERY_COOLDOWN_SECONDS, IntentRecoveryView,
         imports::{AcquisitionImportRunState, list_import_runs_by_release},
+        language_policy::{
+            AcquisitionLanguagePreference, load_saved_language_preference,
+            quality_profile_with_language_preference, save_language_preference,
+        },
         load_intent_recovery_views,
         release_resolution::anime::{
             AnimeMetadataGraphInput, AnimeSeasonMapping, build_anime_metadata_graph,
@@ -70,7 +74,7 @@ use crate::{
     download_broker::{
         DEBRID_ACCOUNT_MISSING_MESSAGE, DEBRID_DEFAULT_LOGICAL_ID,
         DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE, DEBRID_SERVICE_UNAVAILABLE_MESSAGE,
-        TORRENT_DEFAULT_LOGICAL_ID,
+        HTTP_STREAM_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID,
     },
     drivers::{
         AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
@@ -253,6 +257,7 @@ pub struct FindMediaPreferencesState {
     pub tv_default_source_provider_id: Option<Uuid>,
     pub movies_default_source_provider_id: Option<Uuid>,
     pub anime_default_source_provider_id: Option<Uuid>,
+    pub language_preference: AcquisitionLanguagePreference,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,6 +295,20 @@ pub struct SourceSuiteProviderSummary {
     pub readiness_phase: Option<ProviderReadinessPhase>,
     pub readiness_detail: Option<String>,
     pub last_readiness_checked_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub source_modules: Vec<SourceSuiteModuleSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSuiteModuleSummary {
+    pub id: String,
+    pub name: String,
+    pub module_type: String,
+    pub enabled: bool,
+    pub health_state: String,
+    pub requires_account: bool,
+    pub unsupported_reason: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -1026,6 +1045,12 @@ pub struct PatchFindMediaPreferencesRequest {
         deserialize_with = "deserialize_optional_json_value"
     )]
     pub anime_default_source_provider_id: Option<Value>,
+    #[serde(
+        default,
+        alias = "language_preference",
+        deserialize_with = "deserialize_optional_json_value"
+    )]
+    pub language_preference: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2414,6 +2439,12 @@ async fn apply_find_media_source_provider_config_defaults(
     request: &mut CreateAcquisitionIntent,
 ) -> AnyResult<()> {
     let Some(source_provider_id) = request.source_provider_id else {
+        let language_preference = load_saved_language_preference(store).await?;
+        request.quality_profile = quality_profile_with_language_preference(
+            request.quality_profile.take(),
+            request.media_type,
+            &language_preference,
+        );
         return Ok(());
     };
     let provider = store
@@ -2427,31 +2458,35 @@ async fn apply_find_media_source_provider_config_defaults(
         .get_instance(provider.instance_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("source provider instance was not found"))?;
-    let Some(config) = instance.config_json.as_ref().and_then(Value::as_object) else {
-        return Ok(());
-    };
-
-    if request.route_policy.is_none() {
-        if let Some(route_policy) = config
-            .get("routePolicy")
-            .and_then(Value::as_str)
-            .map(|value| value.parse::<AcquisitionRoutePolicy>())
-            .transpose()?
+    if let Some(config) = instance.config_json.as_ref().and_then(Value::as_object) {
+        if request.route_policy.is_none() {
+            if let Some(route_policy) = config
+                .get("routePolicy")
+                .and_then(Value::as_str)
+                .map(|value| value.parse::<AcquisitionRoutePolicy>())
+                .transpose()?
+            {
+                request.route_policy = Some(route_policy);
+            }
+        }
+        if request.release_delay_seconds.is_none()
+            && let Some(delay) = config.get("releaseDelaySeconds").and_then(Value::as_i64)
         {
-            request.route_policy = Some(route_policy);
+            if delay < 0 {
+                bail!("releaseDelaySeconds cannot be negative");
+            }
+            request.release_delay_seconds = Some(delay);
+        }
+        if request.quality_profile.is_none() {
+            request.quality_profile = find_media_source_quality_profile_from_config(config);
         }
     }
-    if request.release_delay_seconds.is_none()
-        && let Some(delay) = config.get("releaseDelaySeconds").and_then(Value::as_i64)
-    {
-        if delay < 0 {
-            bail!("releaseDelaySeconds cannot be negative");
-        }
-        request.release_delay_seconds = Some(delay);
-    }
-    if request.quality_profile.is_none() {
-        request.quality_profile = find_media_source_quality_profile_from_config(config);
-    }
+    let language_preference = load_saved_language_preference(store).await?;
+    request.quality_profile = quality_profile_with_language_preference(
+        request.quality_profile.take(),
+        request.media_type,
+        &language_preference,
+    );
     Ok(())
 }
 
@@ -5712,6 +5747,7 @@ fn source_route_downloader_label(route: Option<&str>) -> Option<String> {
     match route {
         Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("Direct HTTPS debrid download".to_string()),
         Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("Protected torrent downloader".to_string()),
+        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => Some("Direct HTTP stream download".to_string()),
         Some(_) => Some("Downloader".to_string()),
         None => None,
     }
@@ -5723,6 +5759,7 @@ fn source_route_protocol(route: Option<&str>) -> Option<String> {
         Some(TORRENT_DEFAULT_LOGICAL_ID) => {
             Some("torrent via protected downloader egress".to_string())
         }
+        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => Some("direct HTTP stream download".to_string()),
         Some(value) => Some(value.to_string()),
         None => None,
     }
@@ -6287,6 +6324,7 @@ fn source_route_evidence_label(route: &str) -> String {
     match route {
         DEBRID_DEFAULT_LOGICAL_ID => "Direct HTTPS debrid download".to_string(),
         TORRENT_DEFAULT_LOGICAL_ID => "Torrent via protected downloader egress".to_string(),
+        HTTP_STREAM_DEFAULT_LOGICAL_ID => "Direct HTTP stream download".to_string(),
         value => value.to_string(),
     }
 }
@@ -8760,6 +8798,9 @@ pub async fn find_media_preferences(
     let source_preferences = load_source_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
+    let language_preference = load_saved_language_preference(&store)
+        .await
+        .map_err(ApiError::from)?;
     let source_suite_providers = source_suite_provider_statuses(&state, &store)
         .await
         .map_err(ApiError::from)?;
@@ -8772,6 +8813,7 @@ pub async fn find_media_preferences(
             tv_default_source_provider_id: source_preferences.series_provider_id,
             movies_default_source_provider_id: source_preferences.movie_provider_id,
             anime_default_source_provider_id: source_preferences.anime_provider_id,
+            language_preference,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -8871,11 +8913,22 @@ pub async fn patch_find_media_preferences(
             .await
             .map_err(ApiError::from)?;
     }
+    if let Some(value) = payload.language_preference {
+        let preference = serde_json::from_value::<AcquisitionLanguagePreference>(value)
+            .map_err(|err| ApiError::bad_request(format!("invalid languagePreference: {err}")))?
+            .normalized();
+        save_language_preference(&store, &preference)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     let preferences = load_manager_preferences(&store, &providers)
         .await
         .map_err(ApiError::from)?;
     let source_preferences = load_source_preferences(&store, &providers)
+        .await
+        .map_err(ApiError::from)?;
+    let language_preference = load_saved_language_preference(&store)
         .await
         .map_err(ApiError::from)?;
     let source_suite_providers = source_suite_provider_statuses(&state, &store)
@@ -8890,6 +8943,7 @@ pub async fn patch_find_media_preferences(
             tv_default_source_provider_id: source_preferences.series_provider_id,
             movies_default_source_provider_id: source_preferences.movie_provider_id,
             anime_default_source_provider_id: source_preferences.anime_provider_id,
+            language_preference,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -9185,7 +9239,191 @@ fn source_suite_provider_summary(
             readiness,
             missing_required_fields,
         ),
+        source_modules: source_suite_module_summaries(provider.instance_config.as_ref()),
     }
+}
+
+fn source_suite_module_summaries(config: Option<&Value>) -> Vec<SourceSuiteModuleSummary> {
+    let Some(modules) = source_suite_modules_value(config) else {
+        return Vec::new();
+    };
+    let Some(items) = modules.as_array() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let id = first_json_string(
+            object,
+            &["id", "moduleId", "sourceModuleId", "source_module_id"],
+        )
+        .unwrap_or_else(|| format!("source-{}", index + 1));
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let dedupe_key = id.to_ascii_lowercase();
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let name = first_json_string(object, &["name", "displayName", "label"])
+            .unwrap_or_else(|| id.to_string());
+        let module_type = first_json_string(object, &["type", "ecosystem"])
+            .unwrap_or_else(|| "cloudstream".to_string());
+        let enabled = first_json_bool(object, &["enabled"]).unwrap_or(false);
+        let requires_account =
+            first_json_bool(object, &["requiresAccount", "requires_account"]).unwrap_or(false);
+        let account_configured = first_json_bool(
+            object,
+            &[
+                "accountConfigured",
+                "account_configured",
+                "credentialsConfigured",
+                "credentials_configured",
+                "configured",
+            ],
+        )
+        .unwrap_or(!requires_account);
+        let unsupported_reason =
+            first_json_string(object, &["unsupportedReason", "unsupported_reason"]);
+        let explicit_health = first_json_string(object, &["healthState", "health_state", "health"]);
+        let health_state = source_suite_module_health_state(
+            enabled,
+            requires_account,
+            account_configured,
+            unsupported_reason.as_deref(),
+            explicit_health.as_deref(),
+        );
+        let last_error =
+            first_json_string(object, &["lastError", "last_error", "error"]).or_else(|| {
+                if health_state == "unsupported" {
+                    unsupported_reason.clone()
+                } else {
+                    None
+                }
+            });
+
+        out.push(SourceSuiteModuleSummary {
+            id: id.to_string(),
+            name: name.trim().to_string(),
+            module_type: module_type.trim().to_ascii_lowercase(),
+            enabled,
+            health_state,
+            requires_account,
+            unsupported_reason,
+            last_error,
+        });
+    }
+
+    out.sort_by(|left, right| {
+        let by_enabled = right.enabled.cmp(&left.enabled);
+        if by_enabled != std::cmp::Ordering::Equal {
+            return by_enabled;
+        }
+        let by_health = source_suite_module_health_rank(&left.health_state)
+            .cmp(&source_suite_module_health_rank(&right.health_state));
+        if by_health != std::cmp::Ordering::Equal {
+            return by_health;
+        }
+        left.id.cmp(&right.id)
+    });
+    out
+}
+
+fn source_suite_module_health_rank(health_state: &str) -> u8 {
+    match health_state.trim().to_ascii_lowercase().as_str() {
+        "healthy" => 0,
+        "degraded" => 1,
+        "missing_account" => 2,
+        "unsupported" => 3,
+        "unhealthy" => 4,
+        "unknown" => 5,
+        "disabled" => 6,
+        _ => 7,
+    }
+}
+
+fn source_suite_modules_value(config: Option<&Value>) -> Option<Value> {
+    let object = config.and_then(Value::as_object)?;
+    if let Some(value) = object
+        .get("sourceModules")
+        .or_else(|| object.get("source_modules"))
+        .filter(|value| value.is_array())
+    {
+        return Some(value.clone());
+    }
+    for key in ["sourceModulesJson", "source_modules_json", "modulesJson"] {
+        let Some(text) = object.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(text)
+            && value.is_array()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn source_suite_module_health_state(
+    enabled: bool,
+    requires_account: bool,
+    account_configured: bool,
+    unsupported_reason: Option<&str>,
+    explicit_health: Option<&str>,
+) -> String {
+    let explicit_health = explicit_health
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if unsupported_reason
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return "unsupported".to_string();
+    }
+    if requires_account && !account_configured {
+        return "missing_account".to_string();
+    }
+    if !enabled {
+        return "disabled".to_string();
+    }
+    if let Some(health) = explicit_health {
+        return match health.as_str() {
+            "healthy" | "degraded" | "unhealthy" | "disabled" | "unsupported"
+            | "missing_account" | "unknown" => health,
+            _ => "unknown".to_string(),
+        };
+    }
+    "healthy".to_string()
+}
+
+fn first_json_string(object: &JsonMap<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(value) = object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn first_json_bool(object: &JsonMap<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_bool))
 }
 
 fn source_suite_provider_last_error(
@@ -9401,17 +9639,22 @@ fn collect_extension_suite_provider_candidates(
 ) -> Vec<ProviderContext> {
     let mut out: Vec<_> = providers
         .iter()
-        .filter(|provider| {
-            is_extension_suite_source_provider_capability(&provider.detail.provider.capability)
-        })
-        .filter(|provider| provider.media_types.contains(&media_type))
-        .filter(|provider| provider_supports_action(provider, "search"))
-        .filter(|provider| provider.detail.provider.health_state == ProviderHealthState::Healthy)
-        .filter(|provider| provider.detail.provider.endpoint_json.is_some())
+        .filter(|provider| provider_is_extension_suite_source_candidate(provider, media_type))
         .cloned()
         .collect();
     out.sort_by(compare_source_candidates);
     out
+}
+
+fn provider_is_extension_suite_source_candidate(
+    provider: &ProviderContext,
+    media_type: MediaType,
+) -> bool {
+    is_extension_suite_source_provider_capability(&provider.detail.provider.capability)
+        && provider.media_types.contains(&media_type)
+        && provider_supports_action(provider, "search")
+        && provider.detail.provider.health_state == ProviderHealthState::Healthy
+        && provider.detail.provider.endpoint_json.is_some()
 }
 
 fn collect_search_providers(
@@ -11713,6 +11956,116 @@ mod tests {
     }
 
     #[test]
+    fn ess12_source_acquisition_status_labels_http_stream_route() {
+        let source_provider_id = Uuid::new_v4();
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(source_provider_id),
+            scope: Some(json!({
+                "sourceSelection": {
+                    "mode": "suite",
+                    "route": "suite:default",
+                    "suiteId": "default"
+                }
+            })),
+            ..test_source_subscription(MediaType::Anime)
+        };
+        let target = AcquisitionTarget {
+            selected_provider_id: Some(source_provider_id),
+            selected_route_logical_id: Some(HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string()),
+            selected_candidate: Some(json!({
+                "title": "Example Anime - S01E02 - 1080p",
+                "quality": "1080p",
+                "sourceKind": "http_stream",
+                "sourceSuite": {
+                    "label": "Elixir Extension Suite",
+                    "mode": "suite",
+                    "route": "suite:default",
+                    "primaryProviderId": source_provider_id.to_string(),
+                    "primaryExtensionId": "elixir.sources.cloudstream_compat",
+                    "primaryExtensionName": "CloudStream Compatibility Provider",
+                    "primaryImplementation": "cloudstream_compat",
+                    "contributorCount": 1
+                }
+            })),
+            download_id: Some("stream-job".to_string()),
+            state: AcquisitionTargetState::Submitted,
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Anime,
+                Some(1),
+                Some(2),
+                None,
+            )
+        };
+        let mut progress_index = AcquisitionDownloaderProgressIndex::default();
+        progress_index.insert(
+            "stream-job",
+            AcquisitionDownloaderProgress {
+                release_title: Some("Example Anime - S01E02 - 1080p".to_string()),
+                status: Some("materializing".to_string()),
+                progress_percent: Some(52.0),
+                downloaded_bytes: Some(520),
+                size_bytes: Some(1_000),
+                download_rate_bps: Some(2_048),
+                ..Default::default()
+            },
+        );
+        let provider_map = HashMap::from([(
+            source_provider_id,
+            test_provider_context(
+                source_provider_id,
+                "CloudStream Compatibility Provider",
+                "cloudstream_compat",
+            ),
+        )]);
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &provider_map,
+            &progress_index,
+            &HashMap::new(),
+            &AcquisitionUxContext::default(),
+        )
+        .expect("source acquisition item");
+
+        assert_eq!(item.manager_label, "Elixir Extension Suite");
+        assert_eq!(
+            item.downloader_label.as_deref(),
+            Some("Direct HTTP stream download")
+        );
+        assert_eq!(
+            item.protocol.as_deref(),
+            Some("direct HTTP stream download")
+        );
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Route" && evidence.value == "Direct HTTP stream download"
+        }));
+        let child = item.children.first().expect("child");
+        assert_eq!(
+            child.route_logical_id.as_deref(),
+            Some(HTTP_STREAM_DEFAULT_LOGICAL_ID)
+        );
+        assert_eq!(
+            child.downloader_label.as_deref(),
+            Some("Direct HTTP stream download")
+        );
+        assert_eq!(
+            child.protocol.as_deref(),
+            Some("direct HTTP stream download")
+        );
+        assert_eq!(
+            child.source_provider_label.as_deref(),
+            Some("CloudStream Compatibility Provider (cloudstream_compat)")
+        );
+        let suite = child.source_suite.as_ref().expect("source suite summary");
+        assert_eq!(
+            suite.primary_provider_label.as_deref(),
+            Some("CloudStream Compatibility Provider (cloudstream_compat)")
+        );
+    }
+
+    #[test]
     fn source_acquisition_status_exposes_source_and_route_provider_attribution() {
         let source_provider_id = Uuid::new_v4();
         let route_provider_id = Uuid::new_v4();
@@ -13126,6 +13479,51 @@ mod tests {
         }
     }
 
+    fn test_manager_provider_context(
+        extension_id: &str,
+        instance_name: &str,
+        capability: &str,
+    ) -> ProviderContext {
+        let now = Utc::now();
+        let instance_id = Uuid::new_v4();
+        ProviderContext {
+            detail: crate::extensions::store::ProviderDetails {
+                provider: crate::db::models::Provider {
+                    provider_id: Uuid::new_v4(),
+                    instance_id,
+                    capability: capability.to_string(),
+                    slot_id: "default".to_string(),
+                    cardinality: crate::db::models::SlotCardinality::One,
+                    implementation: Some(extension_id.to_string()),
+                    scope_json: Some(json!({
+                        "media_types": ["movie"],
+                        "actions": ["add", "monitor", "search"]
+                    })),
+                    endpoint_json: None,
+                    health_state: ProviderHealthState::Healthy,
+                    last_healthcheck_at: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                extension_id: extension_id.to_string(),
+                trust_level: ExtensionTrustLevel::Community,
+            },
+            instance_name: instance_name.to_string(),
+            instance_config: None,
+            scope: ProviderScopeDocument {
+                media_types: vec!["movie".to_string()],
+                actions: vec![
+                    "add".to_string(),
+                    "monitor".to_string(),
+                    "search".to_string(),
+                ],
+                requires_account: false,
+                required_fields: Vec::new(),
+            },
+            media_types: vec![MediaType::Movie],
+        }
+    }
+
     fn test_suite_candidate_provider_context(
         extension_id: &str,
         instance_name: &str,
@@ -13356,6 +13754,99 @@ mod tests {
     }
 
     #[test]
+    fn ess13_stream_candidate_providers_are_hidden_from_standalone_route_picker() {
+        let standalone_arr =
+            test_manager_provider_context("elixir.arr.radarr", "radarr", "media.manager.movies");
+        let stream_provider = test_suite_source_provider_context(
+            "elixir.sources.cloudstream",
+            "default",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "cloudstream_compat",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let release_provider = test_suite_source_provider_context(
+            "elixir.sources.torrentio",
+            "default",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "torrentio_stremio",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+
+        let providers = vec![
+            stream_provider.clone(),
+            release_provider,
+            standalone_arr.clone(),
+        ];
+        let managers = collect_manager_providers(&providers, MediaType::Movie);
+
+        assert_eq!(managers.len(), 1);
+        assert_eq!(
+            managers[0].detail.provider.provider_id,
+            standalone_arr.detail.provider.provider_id
+        );
+        assert!(
+            !managers
+                .iter()
+                .any(|provider| provider.detail.provider.provider_id
+                    == stream_provider.detail.provider.provider_id)
+        );
+    }
+
+    #[test]
+    fn cs12_cloudstream_provider_is_extension_suite_only() {
+        let standalone_arr =
+            test_manager_provider_context("elixir.arr.radarr", "radarr", "media.manager.movies");
+        let cloudstream = test_suite_source_provider_context(
+            "elixir.sources.cloudstream_compat",
+            "CloudStream Compat",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "cloudstream_compat",
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let torrentio = test_suite_source_provider_context(
+            "elixir.sources.torrentio",
+            "Torrentio",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "torrentio_stremio",
+            vec![MediaType::Movie],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        let providers = vec![standalone_arr.clone(), cloudstream.clone(), torrentio];
+
+        let standalone = collect_manager_providers(&providers, MediaType::Movie);
+        assert_eq!(standalone.len(), 1);
+        assert_eq!(
+            standalone[0].detail.provider.provider_id,
+            standalone_arr.detail.provider.provider_id
+        );
+        assert!(
+            !standalone
+                .iter()
+                .any(|provider| provider.detail.provider.provider_id
+                    == cloudstream.detail.provider.provider_id)
+        );
+
+        assert!(provider_is_extension_suite_source_candidate(
+            &cloudstream,
+            MediaType::Movie
+        ));
+        let suite = collect_extension_suite_provider_candidates(&providers, MediaType::Movie);
+        assert!(suite.iter().any(|provider| {
+            provider.detail.provider.provider_id == cloudstream.detail.provider.provider_id
+                && provider.detail.provider.capability
+                    == ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY
+                && provider.detail.provider.implementation.as_deref() == Some("cloudstream_compat")
+        }));
+    }
+
+    #[test]
     fn es7_source_suite_provider_summary_reports_settings_status() {
         let now = Utc::now();
         let healthy = test_suite_candidate_provider_context(
@@ -13461,6 +13952,116 @@ mod tests {
             unhealthy_status.last_error.as_deref(),
             Some("HTTP 500 from provider healthcheck.")
         );
+    }
+
+    #[test]
+    fn ess10_source_suite_provider_summary_reports_source_module_health() {
+        let now = Utc::now();
+        let mut provider = test_suite_source_provider_context(
+            "elixir.sources.cloudstream_compat",
+            "default",
+            ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+            "cloudstream_compat",
+            vec![MediaType::Movie, MediaType::Series, MediaType::Anime],
+            ProviderHealthState::Healthy,
+            true,
+        );
+        provider.instance_config = Some(json!({
+            "sourceModulesJson": serde_json::to_string(&json!([
+                {
+                    "id": "example-cloudstream",
+                    "name": "Example CloudStream",
+                    "type": "cloudstream",
+                    "enabled": true,
+                    "healthState": "healthy",
+                    "mediaTypes": ["anime"]
+                },
+                {
+                    "id": "account-source",
+                    "name": "Account Source",
+                    "type": "cloudstream",
+                    "enabled": true,
+                    "requiresAccount": true,
+                    "accountConfigured": false
+                },
+                {
+                    "id": "unsupported-source",
+                    "name": "Unsupported Source",
+                    "type": "cloudstream",
+                    "enabled": true,
+                    "unsupportedReason": "DRM-protected streams are not supported."
+                },
+                {
+                    "id": "disabled-source",
+                    "name": "Disabled Source",
+                    "type": "cloudstream",
+                    "enabled": false
+                },
+                {
+                    "id": "disabled-account-source",
+                    "name": "Disabled Account Source",
+                    "type": "cloudstream",
+                    "enabled": false,
+                    "requiresAccount": true,
+                    "accountConfigured": false
+                },
+                {
+                    "id": "example-cloudstream",
+                    "name": "Duplicate",
+                    "enabled": true,
+                    "healthState": "unhealthy"
+                }
+            ])).expect("source modules json")
+        }));
+        let extension = Extension {
+            extension_id: provider.detail.extension_id.clone(),
+            name: "CloudStream Compatibility Host".to_string(),
+            version: "0.1.0".to_string(),
+            kind: crate::db::models::ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({}),
+            package_hash: None,
+            installed_at: now,
+            enabled: true,
+        };
+        let instance = ExtensionInstance {
+            instance_id: provider.detail.provider.instance_id,
+            extension_id: extension.extension_id.clone(),
+            instance_name: provider.instance_name.clone(),
+            config_json: provider.instance_config.clone(),
+            runtime_version: None,
+            rollback_version: None,
+            created_at: now,
+            updated_at: now,
+            enabled: true,
+        };
+
+        let summary = source_suite_provider_summary(&provider, &extension, &instance, None, &[]);
+        let modules = summary.source_modules;
+
+        assert_eq!(modules.len(), 5);
+        assert_eq!(modules[0].id, "example-cloudstream");
+        assert_eq!(modules[0].health_state, "healthy");
+        assert_eq!(modules[1].id, "account-source");
+        assert_eq!(modules[1].health_state, "missing_account");
+        assert!(modules[1].requires_account);
+        let disabled_account = modules
+            .iter()
+            .find(|module| module.id == "disabled-account-source")
+            .expect("disabled account module summary");
+        assert_eq!(disabled_account.health_state, "missing_account");
+        assert!(!disabled_account.enabled);
+        assert!(disabled_account.requires_account);
+        assert_eq!(modules[2].id, "unsupported-source");
+        assert_eq!(modules[2].health_state, "unsupported");
+        assert_eq!(
+            modules[2].last_error.as_deref(),
+            Some("DRM-protected streams are not supported.")
+        );
+        assert_eq!(modules[4].id, "disabled-source");
+        assert_eq!(modules[4].health_state, "disabled");
     }
 
     #[test]

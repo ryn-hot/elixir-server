@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::control_contract::{
     ExtensionControlProvider, GenericManifestControlProvider, UnsupportedControlProvider,
-    control_notice, control_policy_managed,
+    control_notice, control_policy_managed, control_policy_observed, control_policy_seeded,
 };
 use super::*;
 use crate::debrid::{
@@ -17,10 +17,25 @@ use crate::debrid::{
     test_debrid_service_account, validate_debrid_concurrent_downloads,
 };
 use crate::drivers::render_nzbget_config_text_updates;
+use crate::extensions::cloudstream_registry::{
+    CLOUDSTREAM_RECOMMENDED_REGISTRY_KEY, CloudStreamRegistryClient,
+    CloudStreamRegistryFetchConfig, CloudStreamRegistryStoreInput,
+    apply_cloudstream_source_replacement_recommendation, persist_cloudstream_registry_snapshot,
+    seed_cloudstream_recommended_source_pack_for_instance,
+};
 use crate::extensions::managed_paths::{
     DOWNLOADS_ROOT, NZBGET_CONFIG_TEMPLATE, NZBGET_INCOMPLETE_DIR, NZBGET_LOCK_FILE,
     NZBGET_LOG_FILE, NZBGET_MAIN_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_SCRIPT_DIR,
     NZBGET_TEMP_DIR, NZBGET_WEB_DIR,
+};
+use crate::extensions::nuvio_registry::{
+    NuvioRegistryClient, NuvioRegistryFetchConfig, NuvioRegistryStoreInput,
+    PRISM_RECOMMENDED_REGISTRY_KEY, persist_nuvio_registry_snapshot,
+    seed_prism_recommended_source_pack_for_instance,
+};
+use crate::extensions::source_artifacts::install_source_module_artifact;
+use crate::extensions::store::{
+    ExtensionSourceModule, ExtensionSourceModuleVersion, ExtensionSourceRegistry,
 };
 
 // First-party providers plug into the same platform-owned control contract as
@@ -1376,6 +1391,2877 @@ impl ExtensionControlProvider for DownloaderControlAdapter {
     }
 }
 
+struct CloudStreamControlAdapter;
+
+#[async_trait::async_trait]
+impl ExtensionControlProvider for CloudStreamControlAdapter {
+    async fn build_sections(
+        &self,
+        _state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+    ) -> anyhow::Result<Vec<ExtensionControlSection>> {
+        let Some(instance) = context.selected_instance.as_ref() else {
+            return Ok(vec![ExtensionControlSection {
+                id: "cloudstreamSetup".to_string(),
+                title: "CloudStream Compat".to_string(),
+                description:
+                    "Create the default instance to activate the recommended CloudStream source pack."
+                        .to_string(),
+                policy: Some(control_policy_seeded(
+                    "Elixir owns the CloudStream Compat source registry and routes all candidates through Extension Suite.",
+                )),
+                notices: vec![control_notice(
+                    "info",
+                    "cloudstream_instance_missing",
+                    "Default instance required",
+                    "CloudStream Compat needs one enabled instance before sources can be managed.",
+                )],
+                fields: Vec::new(),
+                entities: Vec::new(),
+                actions: Vec::new(),
+            }]);
+        };
+
+        let registries = store
+            .list_source_registries(Some(instance.instance_id))
+            .await?;
+        let modules = store
+            .list_source_modules(Some(instance.instance_id), None)
+            .await?;
+        let registry_by_id = registries
+            .iter()
+            .map(|registry| (registry.registry_id, registry))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut sections = Vec::new();
+        sections.push(build_cloudstream_recommended_section(
+            context,
+            instance,
+            &registries,
+            &modules,
+        ));
+        if let Some(section) =
+            build_cloudstream_problems_section(store, instance, &modules, &registry_by_id).await?
+        {
+            sections.push(section);
+        }
+        sections.push(build_cloudstream_policy_section(instance));
+        sections.push(build_cloudstream_installed_sources_section(
+            &modules,
+            &registry_by_id,
+        ));
+        sections.push(build_cloudstream_available_sources_section(
+            &modules,
+            &registry_by_id,
+        ));
+        sections.push(build_cloudstream_custom_repositories_section(&registries));
+        sections.push(build_cloudstream_version_pins_section(store, &modules).await?);
+        if let Some(section) = build_cloudstream_diagnostics_section(store, &modules).await? {
+            sections.push(section);
+        }
+        Ok(sections)
+    }
+
+    fn build_actions(&self, context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
+        if context.selected_instance.is_none() {
+            return Vec::new();
+        }
+        vec![
+            cloudstream_refresh_recommended_pack_action(),
+            cloudstream_add_custom_repo_action(),
+        ]
+    }
+
+    async fn update_settings(
+        &self,
+        _state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        values: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let instance = cloudstream_selected_instance(context)?;
+        let allowed = [
+            "curatedExecutableUpdates",
+            "curatedBrokenModuleReplacement",
+            "customRepoExecutableAutoUpdate",
+        ];
+        for key in values.keys() {
+            if !allowed.iter().any(|allowed| allowed == key) {
+                anyhow::bail!("unsupported CloudStream source policy setting '{key}'");
+            }
+        }
+        let mut config = instance
+            .config_json
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut policy = config
+            .get("sourcePackPolicy")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in allowed {
+            if let Some(value) = values.get(key).and_then(serde_json::Value::as_bool) {
+                policy.insert(key.to_string(), serde_json::Value::Bool(value));
+            }
+        }
+        config.insert(
+            "sourcePackPolicy".to_string(),
+            serde_json::Value::Object(policy),
+        );
+        store
+            .update_instance_config(
+                instance.instance_id,
+                Some(&serde_json::Value::Object(config)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn execute_action(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        action_id: &str,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        let instance = cloudstream_selected_instance(context)?;
+        match action_id {
+            "refresh_recommended_pack" => {
+                let summary = seed_cloudstream_recommended_source_pack_for_instance(
+                    store,
+                    instance.instance_id,
+                    None,
+                )
+                .await?;
+                Ok(format!(
+                    "Recommended CloudStream source pack refreshed: {} module(s), {} version(s), {} disabled.",
+                    summary.modules, summary.versions, summary.disabled_modules
+                ))
+            }
+            "add_custom_repo" => cloudstream_add_custom_repo(store, instance, params).await,
+            "refresh_custom_repo" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                cloudstream_refresh_registry(store, instance, registry_id).await
+            }
+            "trust_custom_repo" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    cloudstream_find_registry(store, instance.instance_id, registry_id).await?;
+                if registry.registry_type == "elixir_curated_cloudstream_pack" {
+                    anyhow::bail!("curated source packs are already trusted by package policy");
+                }
+                store
+                    .set_source_registry_trust(registry_id, "maintainer_known", true)
+                    .await?;
+                Ok(format!(
+                    "Trusted '{}'. Modules remain disabled until explicitly enabled.",
+                    registry.display_name
+                ))
+            }
+            "enable_registry" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    cloudstream_find_registry(store, instance.instance_id, registry_id).await?;
+                store
+                    .set_source_registry_enabled_state(registry_id, true, true)
+                    .await?;
+                if registry.trust_class != "custom" || registry.trusted_for_executable_updates {
+                    store
+                        .set_source_modules_enabled_for_registry(
+                            registry_id,
+                            true,
+                            "available",
+                            None,
+                        )
+                        .await?;
+                }
+                Ok(format!(
+                    "Enabled source registry '{}'.",
+                    registry.display_name
+                ))
+            }
+            "disable_registry" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    cloudstream_find_registry(store, instance.instance_id, registry_id).await?;
+                store
+                    .set_source_registry_enabled_state(registry_id, false, false)
+                    .await?;
+                store
+                    .set_source_modules_enabled_for_registry(
+                        registry_id,
+                        false,
+                        "disabled",
+                        Some("source registry disabled"),
+                    )
+                    .await?;
+                Ok(format!(
+                    "Disabled source registry '{}'.",
+                    registry.display_name
+                ))
+            }
+            "enable_source_module" | "install_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    cloudstream_find_module(store, instance.instance_id, source_module_id).await?;
+                cloudstream_validate_module_activation(store, instance.instance_id, &module)
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                if action_id == "install_source_module" {
+                    if let Some(version) =
+                        cloudstream_preferred_module_version(&module, &versions, None)
+                    {
+                        if let Some(version_record) = versions
+                            .iter()
+                            .find(|candidate| candidate.version == version)
+                        {
+                            if version_record.artifact_url.is_some() {
+                                install_source_module_artifact(
+                                    store,
+                                    &state.settings.extensions.storage_root,
+                                    &module,
+                                    version_record,
+                                )
+                                .await?;
+                            }
+                        }
+                        store
+                            .set_source_module_active_version(
+                                source_module_id,
+                                Some(version.as_str()),
+                                module.active_version.as_deref(),
+                            )
+                            .await?;
+                        cloudstream_mark_active_version(store, &versions, &version).await?;
+                    }
+                }
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Enabled CloudStream source '{}'.",
+                    module.display_name
+                ))
+            }
+            "disable_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    cloudstream_find_module(store, instance.instance_id, source_module_id).await?;
+                store
+                    .set_source_module_enabled_state(
+                        source_module_id,
+                        false,
+                        "disabled",
+                        Some("source module disabled by user"),
+                    )
+                    .await?;
+                Ok(format!(
+                    "Disabled CloudStream source '{}'.",
+                    module.display_name
+                ))
+            }
+            "pin_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let requested_version = cloudstream_param_string(params, "version")?;
+                let module =
+                    cloudstream_find_module(store, instance.instance_id, source_module_id).await?;
+                cloudstream_validate_module_activation(store, instance.instance_id, &module)
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                let version = cloudstream_preferred_module_version(
+                    &module,
+                    &versions,
+                    Some(requested_version.as_str()),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "version '{}' is not available for '{}'",
+                        requested_version,
+                        module.display_name
+                    )
+                })?;
+                if let Some(version_record) = versions
+                    .iter()
+                    .find(|candidate| candidate.version == version)
+                {
+                    if version_record.artifact_url.is_some() {
+                        install_source_module_artifact(
+                            store,
+                            &state.settings.extensions.storage_root,
+                            &module,
+                            version_record,
+                        )
+                        .await?;
+                    }
+                }
+                store
+                    .set_source_module_pinned_version(source_module_id, Some(&version))
+                    .await?;
+                store
+                    .set_source_module_active_version(
+                        source_module_id,
+                        Some(&version),
+                        module.active_version.as_deref(),
+                    )
+                    .await?;
+                cloudstream_mark_active_version(store, &versions, &version).await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Pinned '{}' to version {}.",
+                    module.display_name, version
+                ))
+            }
+            "clear_source_module_pin" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    cloudstream_find_module(store, instance.instance_id, source_module_id).await?;
+                store
+                    .set_source_module_pinned_version(source_module_id, None)
+                    .await?;
+                Ok(format!(
+                    "Cleared version pin for '{}'.",
+                    module.display_name
+                ))
+            }
+            "rollback_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    cloudstream_find_module(store, instance.instance_id, source_module_id).await?;
+                let rollback_version = module
+                    .rollback_version
+                    .as_deref()
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'{}' has no rollback version", module.display_name)
+                    })?;
+                store
+                    .set_source_module_pinned_version(source_module_id, None)
+                    .await?;
+                store
+                    .set_source_module_active_version(
+                        source_module_id,
+                        Some(&rollback_version),
+                        module.active_version.as_deref(),
+                    )
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                cloudstream_mark_active_version(store, &versions, &rollback_version).await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Rolled '{}' back to version {}.",
+                    module.display_name, rollback_version
+                ))
+            }
+            "apply_source_replacement" => {
+                let recommendation_key = cloudstream_param_string(params, "recommendationKey")?;
+                let applied = apply_cloudstream_source_replacement_recommendation(
+                    store,
+                    instance.instance_id,
+                    &recommendation_key,
+                )
+                .await?;
+                if applied {
+                    Ok("Applied CloudStream source replacement recommendation.".to_string())
+                } else {
+                    Ok("Replacement recommendation was no longer active.".to_string())
+                }
+            }
+            _ => anyhow::bail!("unsupported control action '{action_id}'"),
+        }
+    }
+}
+
+struct PrismControlAdapter;
+
+#[async_trait::async_trait]
+impl ExtensionControlProvider for PrismControlAdapter {
+    async fn build_sections(
+        &self,
+        _state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+    ) -> anyhow::Result<Vec<ExtensionControlSection>> {
+        let Some(instance) = context.selected_instance.as_ref() else {
+            return Ok(vec![ExtensionControlSection {
+                id: "nuvioSetup".to_string(),
+                title: "Prism".to_string(),
+                description: "Create the default instance to activate Prism source modules."
+                    .to_string(),
+                policy: Some(control_policy_seeded(
+                    "Elixir owns the Prism source registry and routes all candidates through Extension Suite.",
+                )),
+                notices: vec![control_notice(
+                    "info",
+                    "nuvio_instance_missing",
+                    "Default instance required",
+                    "Prism needs one enabled instance before sources can be managed.",
+                )],
+                fields: Vec::new(),
+                entities: Vec::new(),
+                actions: Vec::new(),
+            }]);
+        };
+
+        let registries = store
+            .list_source_registries(Some(instance.instance_id))
+            .await?;
+        let modules = store
+            .list_source_modules(Some(instance.instance_id), None)
+            .await?
+            .into_iter()
+            .filter(|module| module.ecosystem == "nuvio" || module.ecosystem == "stremio")
+            .collect::<Vec<_>>();
+        let registry_by_id = registries
+            .iter()
+            .map(|registry| (registry.registry_id, registry))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut sections = vec![build_prism_recommended_section(
+            context,
+            instance,
+            &registries,
+            &modules,
+        )];
+        if let Some(section) =
+            build_prism_problems_section(store, instance, &modules, &registry_by_id).await?
+        {
+            sections.push(section);
+        }
+        sections.push(build_prism_policy_section(instance));
+        sections.push(build_nuvio_installed_sources_section(
+            &modules,
+            &registry_by_id,
+        ));
+        sections.push(build_nuvio_available_sources_section(
+            &modules,
+            &registry_by_id,
+        ));
+        sections.push(build_nuvio_repositories_section(&registries));
+        sections.push(build_nuvio_version_pins_section(store, &modules).await?);
+        if let Some(section) = build_cloudstream_diagnostics_section(store, &modules).await? {
+            sections.push(section);
+        }
+        Ok(sections)
+    }
+
+    fn build_actions(&self, context: &ExtensionControlContext) -> Vec<ExtensionControlAction> {
+        if context.selected_instance.is_none() {
+            return Vec::new();
+        }
+        vec![
+            prism_refresh_recommended_pack_action(),
+            nuvio_add_custom_repo_action(),
+        ]
+    }
+
+    async fn update_settings(
+        &self,
+        _state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        values: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let instance = nuvio_selected_instance(context)?;
+        let allowed = [
+            "recommendedPackAutoEnable",
+            "recommendedPackExecutableUpdates",
+            "customRepoMetadataRefresh",
+            "customRepoExecutableTrustRequired",
+            "rollbackPinAlwaysAvailable",
+        ];
+        for key in values.keys() {
+            if !allowed.iter().any(|allowed| allowed == key) {
+                anyhow::bail!("unsupported Prism source policy setting '{key}'");
+            }
+        }
+        if values
+            .get("customRepoExecutableTrustRequired")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|value| !value)
+        {
+            anyhow::bail!("custom Prism repository executable trust cannot be disabled");
+        }
+        if values
+            .get("rollbackPinAlwaysAvailable")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|value| !value)
+        {
+            anyhow::bail!("Prism rollback and pin controls cannot be disabled");
+        }
+        let mut config = instance
+            .config_json
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut policy = config
+            .get("sourcePackPolicy")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in allowed {
+            if let Some(value) = values.get(key).and_then(serde_json::Value::as_bool) {
+                policy.insert(key.to_string(), serde_json::Value::Bool(value));
+            }
+        }
+        config.insert(
+            "sourcePackPolicy".to_string(),
+            serde_json::Value::Object(policy),
+        );
+        store
+            .update_instance_config(
+                instance.instance_id,
+                Some(&serde_json::Value::Object(config)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn execute_action(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        action_id: &str,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        let instance = nuvio_selected_instance(context)?;
+        match action_id {
+            "refresh_recommended_pack" => {
+                let summary = seed_prism_recommended_source_pack_for_instance(
+                    store,
+                    instance.instance_id,
+                    None,
+                    Some(&state.settings.extensions.storage_root),
+                )
+                .await?;
+                Ok(format!(
+                    "Recommended Prism source pack refreshed: {} module(s), {} version(s), {} disabled.",
+                    summary.modules, summary.versions, summary.disabled_modules
+                ))
+            }
+            "add_custom_repo" => nuvio_add_custom_repo(store, instance, params).await,
+            "refresh_custom_repo" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                nuvio_refresh_registry(store, instance, registry_id).await
+            }
+            "trust_custom_repo" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                if registry.registry_type == "elixir_curated_nuvio_pack" {
+                    anyhow::bail!(
+                        "curated Prism source packs are already trusted by package policy"
+                    );
+                }
+                store
+                    .set_source_registry_trust(registry_id, "maintainer_known", true)
+                    .await?;
+                Ok(format!(
+                    "Trusted '{}'. Modules remain disabled until explicitly installed.",
+                    registry.display_name
+                ))
+            }
+            "enable_registry" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                store
+                    .set_source_registry_enabled_state(registry_id, true, true)
+                    .await?;
+                if registry.registry_type == "elixir_curated_nuvio_pack"
+                    || registry.trusted_for_executable_updates
+                {
+                    store
+                        .set_source_modules_enabled_for_registry(
+                            registry_id,
+                            true,
+                            "available",
+                            None,
+                        )
+                        .await?;
+                }
+                Ok(format!(
+                    "Enabled source registry '{}'.",
+                    registry.display_name
+                ))
+            }
+            "disable_registry" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                store
+                    .set_source_registry_enabled_state(registry_id, false, false)
+                    .await?;
+                store
+                    .set_source_modules_enabled_for_registry(
+                        registry_id,
+                        false,
+                        "disabled",
+                        Some("source registry disabled"),
+                    )
+                    .await?;
+                Ok(format!(
+                    "Disabled source registry '{}'.",
+                    registry.display_name
+                ))
+            }
+            "install_source_module" | "enable_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                nuvio_validate_module_activation(store, instance.instance_id, &module).await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                let version = cloudstream_preferred_module_version(&module, &versions, None)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'{}' has no available version", module.display_name)
+                    })?;
+                if action_id == "install_source_module" || !module.installed {
+                    let version_record = versions
+                        .iter()
+                        .find(|candidate| candidate.version == version)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "version '{}' is not available for '{}'",
+                                version,
+                                module.display_name
+                            )
+                        })?;
+                    install_source_module_artifact(
+                        store,
+                        &state.settings.extensions.storage_root,
+                        &module,
+                        version_record,
+                    )
+                    .await?;
+                }
+                store
+                    .set_source_module_active_version(
+                        source_module_id,
+                        Some(&version),
+                        module.active_version.as_deref(),
+                    )
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                cloudstream_mark_active_version(store, &versions, &version).await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Enabled Prism source '{}' at version {}.",
+                    module.display_name, version
+                ))
+            }
+            "smoke_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                nuvio_validate_module_activation(store, instance.instance_id, &module).await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                let version = cloudstream_preferred_module_version(&module, &versions, None)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'{}' has no available version", module.display_name)
+                    })?;
+                let version_record = versions
+                    .iter()
+                    .find(|candidate| candidate.version == version)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "version '{}' is not available for '{}'",
+                            version,
+                            module.display_name
+                        )
+                    })?;
+                install_source_module_artifact(
+                    store,
+                    &state.settings.extensions.storage_root,
+                    &module,
+                    version_record,
+                )
+                .await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Prism source '{}' passed artifact health check at version {}.",
+                    module.display_name, version
+                ))
+            }
+            "disable_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                store
+                    .set_source_module_enabled_state(
+                        source_module_id,
+                        false,
+                        "disabled",
+                        Some("source module disabled by user"),
+                    )
+                    .await?;
+                Ok(format!("Disabled Prism source '{}'.", module.display_name))
+            }
+            "pin_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let requested_version = cloudstream_param_string(params, "version")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                nuvio_validate_module_activation(store, instance.instance_id, &module).await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                let version = cloudstream_preferred_module_version(
+                    &module,
+                    &versions,
+                    Some(requested_version.as_str()),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "version '{}' is not available for '{}'",
+                        requested_version,
+                        module.display_name
+                    )
+                })?;
+                let version_record = versions
+                    .iter()
+                    .find(|candidate| candidate.version == version)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "version '{}' is not available for '{}'",
+                            version,
+                            module.display_name
+                        )
+                    })?;
+                install_source_module_artifact(
+                    store,
+                    &state.settings.extensions.storage_root,
+                    &module,
+                    version_record,
+                )
+                .await?;
+                store
+                    .set_source_module_pinned_version(source_module_id, Some(&version))
+                    .await?;
+                store
+                    .set_source_module_active_version(
+                        source_module_id,
+                        Some(&version),
+                        module.active_version.as_deref(),
+                    )
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                cloudstream_mark_active_version(store, &versions, &version).await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Pinned '{}' to version {}.",
+                    module.display_name, version
+                ))
+            }
+            "clear_source_module_pin" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                store
+                    .set_source_module_pinned_version(source_module_id, None)
+                    .await?;
+                Ok(format!(
+                    "Cleared version pin for '{}'.",
+                    module.display_name
+                ))
+            }
+            "rollback_source_module" => {
+                let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                let rollback_version = module
+                    .rollback_version
+                    .as_deref()
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'{}' has no rollback version", module.display_name)
+                    })?;
+                store
+                    .set_source_module_pinned_version(source_module_id, None)
+                    .await?;
+                store
+                    .set_source_module_active_version(
+                        source_module_id,
+                        Some(&rollback_version),
+                        module.active_version.as_deref(),
+                    )
+                    .await?;
+                let versions = store.list_source_module_versions(source_module_id).await?;
+                cloudstream_mark_active_version(store, &versions, &rollback_version).await?;
+                store
+                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .await?;
+                Ok(format!(
+                    "Rolled '{}' back to version {}.",
+                    module.display_name, rollback_version
+                ))
+            }
+            "apply_source_replacement" => {
+                let recommendation_key = cloudstream_param_string(params, "recommendationKey")?;
+                let applied = apply_prism_source_replacement_recommendation(
+                    store,
+                    instance.instance_id,
+                    &recommendation_key,
+                )
+                .await?;
+                if applied {
+                    Ok("Applied Prism source replacement recommendation.".to_string())
+                } else {
+                    Ok("Replacement recommendation was no longer active.".to_string())
+                }
+            }
+            _ => anyhow::bail!("unsupported control action '{action_id}'"),
+        }
+    }
+}
+
+fn build_prism_recommended_section(
+    context: &ExtensionControlContext,
+    instance: &ExtensionInstance,
+    registries: &[ExtensionSourceRegistry],
+    modules: &[ExtensionSourceModule],
+) -> ExtensionControlSection {
+    let recommended = registries
+        .iter()
+        .find(|registry| registry.registry_key == PRISM_RECOMMENDED_REGISTRY_KEY);
+    let enabled_modules = modules
+        .iter()
+        .filter(|module| module.enabled && module.health_state != "disabled")
+        .count();
+    let healthyish_modules = modules
+        .iter()
+        .filter(|module| matches!(module.health_state.as_str(), "available" | "healthy"))
+        .count();
+    let problem_modules = modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.health_state.as_str(),
+                "degraded" | "broken" | "unsupported" | "account_required"
+            ) || module.last_error.is_some()
+        })
+        .count();
+
+    let mut notices = Vec::new();
+    if recommended.is_none() {
+        notices.push(ExtensionControlNotice {
+            action: Some(prism_refresh_recommended_pack_action()),
+            ..control_notice(
+                "warning",
+                "prism_recommended_pack_missing",
+                "Recommended pack missing",
+                "Refresh the recommended Prism source pack before using Extension Suite stream acquisition.",
+            )
+        });
+    }
+    if let Some(registry) = recommended {
+        if !registry.enabled {
+            notices.push(ExtensionControlNotice {
+                action: Some(cloudstream_registry_action(
+                    "enable_registry",
+                    "Enable recommended pack",
+                    "Enable the recommended Prism source pack and its safe modules.",
+                    "primary",
+                    registry.registry_id,
+                    None,
+                )),
+                ..control_notice(
+                    "warning",
+                    "prism_recommended_pack_disabled",
+                    "Recommended pack disabled",
+                    "The recommended Prism source pack is installed but disabled.",
+                )
+            });
+        }
+        if registry.last_fetch_status == "failed" {
+            notices.push(ExtensionControlNotice {
+                action: Some(prism_refresh_recommended_pack_action()),
+                ..control_notice(
+                    "warning",
+                    "prism_recommended_pack_refresh_failed",
+                    "Recommended pack refresh failed",
+                    registry
+                        .last_fetch_error
+                        .as_deref()
+                        .unwrap_or("Elixir could not refresh the recommended Prism source pack."),
+                )
+            });
+        }
+    }
+    if problem_modules > 0 {
+        notices.push(control_notice(
+            "warning",
+            "prism_source_problems",
+            "Some sources need attention",
+            format!(
+                "{} Prism source module(s) are degraded, broken, unsupported, account-required, or reporting an error.",
+                problem_modules
+            ),
+        ));
+    }
+
+    let mut entities = Vec::new();
+    if let Some(registry) = recommended {
+        entities.push(ExtensionControlEntity {
+            id: registry.registry_id.to_string(),
+            title: registry.display_name.clone(),
+            subtitle: Some(if registry.enabled {
+                "Ready".to_string()
+            } else {
+                "Disabled".to_string()
+            }),
+            details: vec![
+                format!("Instance: {}", instance.instance_name),
+                format!("Implementation: {}", context.summary.label),
+                format!("Enabled modules: {}", enabled_modules),
+                format!("Healthy or available modules: {}", healthyish_modules),
+                format!("Problem modules: {}", problem_modules),
+                format!(
+                    "Last refresh: {}",
+                    registry
+                        .last_fetched_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "never".to_string())
+                ),
+            ],
+            actions: vec![prism_refresh_recommended_pack_action()],
+        });
+    }
+
+    ExtensionControlSection {
+        id: "prismRecommended".to_string(),
+        title: "Recommended".to_string(),
+        description:
+            "Recommended Prism sources are active through Extension Suite. Custom repositories and source pins are managed below."
+                .to_string(),
+        policy: Some(control_policy_seeded(
+            "Elixir seeds the recommended pack and invokes Prism only as a stream candidate provider. Download routing and import verification stay inside Elixir.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities,
+        actions: vec![prism_refresh_recommended_pack_action()],
+    }
+}
+
+async fn build_prism_problems_section(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let mut entities = Vec::new();
+    for module in modules.iter().filter(|module| {
+        matches!(
+            module.health_state.as_str(),
+            "degraded" | "broken" | "unsupported" | "account_required"
+        ) || module.last_error.is_some()
+            || module.replacement_recommendation_key.is_some()
+    }) {
+        let mut actions =
+            nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied());
+        let recommendations = store
+            .list_source_replacement_recommendations(Some(module.source_module_id), true)
+            .await?;
+        for recommendation in recommendations {
+            actions.insert(
+                0,
+                cloudstream_apply_replacement_action(&recommendation.recommendation_key),
+            );
+        }
+        entities.push(ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions,
+        });
+    }
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ExtensionControlSection {
+        id: "prismNeedsAttention".to_string(),
+        title: "Needs attention".to_string(),
+        description: format!(
+            "{} source module(s) for '{}' need action.",
+            entities.len(),
+            instance.instance_name
+        ),
+        policy: Some(control_policy_observed(
+            "Elixir reports source health and replacement recommendations. It only changes module state when you choose an action here.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrismSourcePolicy {
+    recommended_pack_auto_enable: bool,
+    recommended_pack_executable_updates: bool,
+    custom_repo_metadata_refresh: bool,
+    custom_repo_executable_trust_required: bool,
+    rollback_pin_always_available: bool,
+}
+
+fn prism_source_policy(instance: &ExtensionInstance) -> PrismSourcePolicy {
+    let policy = instance
+        .config_json
+        .as_ref()
+        .and_then(|config| config.get("sourcePackPolicy"))
+        .and_then(serde_json::Value::as_object);
+    PrismSourcePolicy {
+        recommended_pack_auto_enable: policy
+            .and_then(|policy| policy.get("recommendedPackAutoEnable"))
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                policy
+                    .and_then(|policy| policy.get("curatedExecutableUpdates"))
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(true),
+        recommended_pack_executable_updates: policy
+            .and_then(|policy| policy.get("recommendedPackExecutableUpdates"))
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                policy
+                    .and_then(|policy| policy.get("curatedBrokenModuleReplacement"))
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(true),
+        custom_repo_metadata_refresh: policy
+            .and_then(|policy| policy.get("customRepoMetadataRefresh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        custom_repo_executable_trust_required: policy
+            .and_then(|policy| policy.get("customRepoExecutableTrustRequired"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        rollback_pin_always_available: policy
+            .and_then(|policy| policy.get("rollbackPinAlwaysAvailable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
+fn build_prism_policy_section(instance: &ExtensionInstance) -> ExtensionControlSection {
+    let policy = prism_source_policy(instance);
+    ExtensionControlSection {
+        id: "prismSourcePolicy".to_string(),
+        title: "Source policy".to_string(),
+        description:
+            "Recommended Prism sources can receive maintainer updates. Custom executable installs stay explicit unless trusted."
+                .to_string(),
+        policy: Some(control_policy_seeded(
+            "These settings are sent to Prism with Extension Suite requests and never grant downloader credentials or library mutation rights.",
+        )),
+        notices: Vec::new(),
+        fields: vec![
+            prism_policy_field(
+                "recommendedPackAutoEnable",
+                "Recommended pack auto-enable",
+                "Keep the maintainer-recommended Prism pack enabled by default.",
+                policy.recommended_pack_auto_enable,
+                false,
+            ),
+            prism_policy_field(
+                "recommendedPackExecutableUpdates",
+                "Recommended executable updates",
+                "Allow executable updates only when the recommended artifact is hash-pinned or signed.",
+                policy.recommended_pack_executable_updates,
+                false,
+            ),
+            prism_policy_field(
+                "customRepoMetadataRefresh",
+                "Custom repo metadata refresh",
+                "Allow user-added repositories to refresh metadata without installing executable code.",
+                policy.custom_repo_metadata_refresh,
+                false,
+            ),
+            prism_policy_field(
+                "customRepoExecutableTrustRequired",
+                "Custom executable trust required",
+                "Custom repositories must be explicitly trusted before executable source installs or updates.",
+                policy.custom_repo_executable_trust_required,
+                true,
+            ),
+            prism_policy_field(
+                "rollbackPinAlwaysAvailable",
+                "Rollback and pin available",
+                "Pin and rollback controls remain available for every installed source module.",
+                policy.rollback_pin_always_available,
+                true,
+            ),
+        ],
+        entities: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+fn prism_policy_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: bool,
+    readonly: bool,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "toggle".to_string(),
+        value: serde_json::Value::Bool(value),
+        required: false,
+        readonly,
+        secret: false,
+        options: Vec::new(),
+        validation: None,
+    }
+}
+
+fn build_nuvio_installed_sources_section(
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> ExtensionControlSection {
+    let entities = modules
+        .iter()
+        .filter(|module| module.enabled || module.installed)
+        .map(|module| ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions: nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied()),
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "nuvioInstalledSources".to_string(),
+        title: "Installed sources".to_string(),
+        description: "Source modules currently enabled or installed for Prism.".to_string(),
+        policy: Some(control_policy_seeded(
+            "Elixir decides which module descriptors are sent to Prism. The source runtime cannot mutate this list.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }
+}
+
+fn build_nuvio_available_sources_section(
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> ExtensionControlSection {
+    let entities = modules
+        .iter()
+        .filter(|module| !module.enabled && !module.installed)
+        .map(|module| ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions: nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied()),
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "nuvioAvailableSources".to_string(),
+        title: "Available sources".to_string(),
+        description:
+            "Discovered Prism source modules that are not active. Repository trust and module install are explicit."
+                .to_string(),
+        policy: Some(control_policy_observed(
+            "Elixir inventories Nuvio manifests but does not download or execute source code as a background side effect.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }
+}
+
+fn build_nuvio_repositories_section(
+    registries: &[ExtensionSourceRegistry],
+) -> ExtensionControlSection {
+    let entities = registries
+        .iter()
+        .filter(|registry| registry.registry_key != PRISM_RECOMMENDED_REGISTRY_KEY)
+        .map(|registry| {
+            let mut actions = vec![cloudstream_registry_action(
+                "refresh_custom_repo",
+                "Refresh",
+                "Fetch the repository metadata again and update discovered source modules.",
+                "secondary",
+                registry.registry_id,
+                None,
+            )];
+            if registry.enabled {
+                actions.push(cloudstream_registry_action(
+                    "disable_registry",
+                    "Disable",
+                    "Disable this repository and its source modules.",
+                    "danger",
+                    registry.registry_id,
+                    Some("Disable this Nuvio repository and its modules?"),
+                ));
+            } else {
+                actions.push(cloudstream_registry_action(
+                    "enable_registry",
+                    "Enable",
+                    "Enable this repository. Modules still require their own explicit install.",
+                    "primary",
+                    registry.registry_id,
+                    None,
+                ));
+            }
+            if registry.trust_class == "custom" || !registry.trusted_for_executable_updates {
+                actions.push(cloudstream_registry_action(
+                    "trust_custom_repo",
+                    "Trust repo",
+                    "Mark this repository as maintainer-known for explicit source module installs.",
+                    "secondary",
+                    registry.registry_id,
+                    Some("Trust this custom Prism repository for executable source installs? Only do this for maintainers you trust."),
+                ));
+            }
+            ExtensionControlEntity {
+                id: registry.registry_id.to_string(),
+                title: registry.display_name.clone(),
+                subtitle: Some(format!(
+                    "{} • {}",
+                    if registry.enabled { "Enabled" } else { "Disabled" },
+                    registry.trust_class.replace('_', " ")
+                )),
+                details: vec![
+                    format!("Registry key: {}", registry.registry_key),
+                    format!("Type: {}", registry.registry_type),
+                    format!(
+                        "Executable install trust: {}",
+                        if registry.trusted_for_executable_updates {
+                            "trusted"
+                        } else {
+                            "blocked"
+                        }
+                    ),
+                    format!("URL: {}", registry.url.as_deref().unwrap_or("none")),
+                    format!("Last fetch: {}", registry.last_fetch_status),
+                    registry
+                        .last_fetch_error
+                        .as_ref()
+                        .map(|error| format!("Last error: {error}"))
+                        .unwrap_or_else(|| "Last error: none".to_string()),
+                ],
+                actions,
+            }
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "nuvioRepositories".to_string(),
+        title: "Repositories".to_string(),
+        description: "Prism source repositories. Adding a repository inventories metadata only."
+            .to_string(),
+        policy: Some(control_policy_observed(
+            "Repository metadata is user-managed. Elixir validates and stores source descriptors but only installs executable code after explicit action.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: vec![nuvio_add_custom_repo_action()],
+    }
+}
+
+async fn build_nuvio_version_pins_section(
+    store: &ExtensionStore<'_>,
+    modules: &[ExtensionSourceModule],
+) -> anyhow::Result<ExtensionControlSection> {
+    build_cloudstream_version_pins_section(store, modules)
+        .await
+        .map(|mut section| {
+            section.id = "nuvioVersionPins".to_string();
+            section.title = "Version pins".to_string();
+            section.description =
+                "Pin or roll back Nuvio source module versions when a source update breaks."
+                    .to_string();
+            section
+        })
+}
+
+fn nuvio_module_actions(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+) -> Vec<ExtensionControlAction> {
+    let mut actions = Vec::new();
+    let registry_allows_activation = registry
+        .map(|registry| {
+            registry.enabled
+                && (registry.registry_type == "elixir_curated_nuvio_pack"
+                    || registry.trusted_for_executable_updates)
+        })
+        .unwrap_or(false);
+    if module.enabled {
+        actions.push(cloudstream_source_module_action(
+            "disable_source_module",
+            "Disable",
+            "Disable this Prism source module.",
+            "danger",
+            module.source_module_id,
+            Some("Disable this Prism source module?"),
+        ));
+    } else if !module.unsupported && !module.account_required && registry_allows_activation {
+        actions.push(cloudstream_source_module_action(
+            if module.installed {
+                "enable_source_module"
+            } else {
+                "install_source_module"
+            },
+            if module.installed {
+                "Enable"
+            } else {
+                "Install"
+            },
+            "Install and enable this source module for Extension Suite searches.",
+            "primary",
+            module.source_module_id,
+            None,
+        ));
+    }
+    if module.installed || module.enabled {
+        actions.push(cloudstream_source_module_action(
+            "smoke_source_module",
+            "Check health",
+            "Fetch, hash-check, and statically validate this Prism source artifact.",
+            "secondary",
+            module.source_module_id,
+            None,
+        ));
+    }
+    if module.rollback_version.is_some() {
+        actions.push(cloudstream_source_module_action(
+            "rollback_source_module",
+            "Rollback",
+            "Return this source module to its previous active version.",
+            "secondary",
+            module.source_module_id,
+            Some("Roll this Prism source module back to its previous active version?"),
+        ));
+    }
+    actions.extend(cloudstream_version_actions(module, &[]));
+    actions
+}
+
+fn nuvio_add_custom_repo_action() -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "add_custom_repo".to_string(),
+        label: "Add repository".to_string(),
+        description: "Add a Prism-compatible manifest.json source repository.".to_string(),
+        kind: "secondary".to_string(),
+        params: Some(json!({
+            "promptTitle": "Add Prism repository",
+            "submitLabel": "Add repository",
+            "promptFields": [
+                {
+                    "id": "registryUrl",
+                    "label": "Repository URL",
+                    "description": "Prism-compatible manifest.json URL.",
+                    "fieldType": "text",
+                    "required": true,
+                    "value": ""
+                },
+                {
+                    "id": "displayName",
+                    "label": "Display name",
+                    "description": "Optional local name for this repository.",
+                    "fieldType": "text",
+                    "required": false,
+                    "value": ""
+                },
+                {
+                    "id": "trustedForExecutableUpdates",
+                    "label": "Trust source installs",
+                    "description": "Only enable for source repositories maintained by someone you trust.",
+                    "fieldType": "toggle",
+                    "required": false,
+                    "value": false
+                }
+            ]
+        })),
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+fn prism_refresh_recommended_pack_action() -> ExtensionControlAction {
+    cloudstream_simple_action(
+        "refresh_recommended_pack",
+        "Refresh recommended",
+        "Refresh the bundled recommended Prism source pack.",
+        "primary",
+        None,
+        None,
+    )
+}
+
+async fn nuvio_add_custom_repo(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let url = cloudstream_param_string(params, "registryUrl")?;
+    let display_name = params
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let trusted = params
+        .get("trustedForExecutableUpdates")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let registry_key = format!(
+        "nuvio.custom.{}",
+        cloudstream_stable_text_id(&format!("nuvio_manifest_json:{url}"))
+    );
+    let registry_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "elixir:nuvio:custom-registry:{}:{}",
+            instance.instance_id, registry_key
+        )
+        .as_bytes(),
+    );
+    let client = NuvioRegistryClient::new(NuvioRegistryFetchConfig::default())?;
+    let snapshot = client.fetch_registry("nuvio_manifest_json", &url).await?;
+    let summary = persist_nuvio_registry_snapshot(
+        store,
+        &NuvioRegistryStoreInput {
+            registry_id,
+            instance_id: instance.instance_id,
+            registry_key: registry_key.clone(),
+            registry_type: "nuvio_manifest_json".to_string(),
+            trust_class: if trusted {
+                "maintainer_known".to_string()
+            } else {
+                "custom".to_string()
+            },
+            display_name,
+            url: Some(url),
+            enabled: true,
+            auto_refresh: true,
+            trusted_for_executable_updates: trusted,
+        },
+        &snapshot,
+    )
+    .await?;
+    Ok(format!(
+        "Added Nuvio repository '{}': {} module(s), {} version(s), {} disabled.",
+        registry_key, summary.modules, summary.versions, summary.disabled_modules
+    ))
+}
+
+async fn nuvio_refresh_registry(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    registry_id: Uuid,
+) -> anyhow::Result<String> {
+    let registry = nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+    let url = registry
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Nuvio registry has no URL"))?;
+    let client = NuvioRegistryClient::new(NuvioRegistryFetchConfig::default())?;
+    let snapshot = client
+        .fetch_registry(&registry.registry_type, url)
+        .await
+        .with_context(|| format!("refreshing Nuvio registry '{}'", registry.display_name))?;
+    let summary = persist_nuvio_registry_snapshot(
+        store,
+        &NuvioRegistryStoreInput {
+            registry_id,
+            instance_id: instance.instance_id,
+            registry_key: registry.registry_key.clone(),
+            registry_type: registry.registry_type.clone(),
+            trust_class: registry.trust_class.clone(),
+            display_name: Some(registry.display_name.clone()),
+            url: registry.url.clone(),
+            enabled: registry.enabled,
+            auto_refresh: registry.auto_refresh,
+            trusted_for_executable_updates: registry.trusted_for_executable_updates,
+        },
+        &snapshot,
+    )
+    .await?;
+    Ok(format!(
+        "Refreshed '{}': {} module(s), {} version(s), {} disabled.",
+        registry.display_name, summary.modules, summary.versions, summary.disabled_modules
+    ))
+}
+
+async fn nuvio_validate_module_activation(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    module: &ExtensionSourceModule,
+) -> anyhow::Result<()> {
+    if module.unsupported {
+        anyhow::bail!(
+            "'{}' is unsupported: {}",
+            module.display_name,
+            module
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("unsupported by Prism")
+        );
+    }
+    if module.account_required {
+        anyhow::bail!(
+            "'{}' requires an account before activation",
+            module.display_name
+        );
+    }
+    let registry = nuvio_find_registry(store, instance_id, module.registry_id).await?;
+    if !registry.enabled {
+        anyhow::bail!(
+            "source registry '{}' is disabled; enable the registry first",
+            registry.display_name
+        );
+    }
+    if registry.registry_type != "elixir_curated_nuvio_pack"
+        && !registry.trusted_for_executable_updates
+    {
+        anyhow::bail!(
+            "source registry '{}' must be explicitly trusted before installing executable modules",
+            registry.display_name
+        );
+    }
+    Ok(())
+}
+
+async fn apply_prism_source_replacement_recommendation(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    recommendation_key: &str,
+) -> anyhow::Result<bool> {
+    let recommendation_key = recommendation_key.trim();
+    if recommendation_key.is_empty() {
+        anyhow::bail!("recommendation key must not be empty");
+    }
+    let modules = store.list_source_modules(Some(instance_id), None).await?;
+    let module_ids = modules
+        .iter()
+        .filter(|module| module.ecosystem == "nuvio" || module.ecosystem == "stremio")
+        .map(|module| module.source_module_id)
+        .collect::<HashSet<_>>();
+    let replacement_by_id = modules
+        .iter()
+        .map(|module| (module.source_module_id, module))
+        .collect::<HashMap<_, _>>();
+    let recommendations = store
+        .list_source_replacement_recommendations(None, true)
+        .await?;
+    let Some(recommendation) = recommendations.into_iter().find(|recommendation| {
+        recommendation.recommendation_key == recommendation_key
+            && module_ids.contains(&recommendation.source_module_id)
+    }) else {
+        return Ok(false);
+    };
+    match recommendation.action.as_str() {
+        "replace" => {
+            let Some(replacement_source_module_id) = recommendation.replacement_source_module_id
+            else {
+                anyhow::bail!(
+                    "replace recommendation '{recommendation_key}' has no replacement module"
+                );
+            };
+            let Some(replacement) = replacement_by_id.get(&replacement_source_module_id) else {
+                anyhow::bail!(
+                    "replace recommendation '{recommendation_key}' references missing replacement module"
+                );
+            };
+            if replacement.unsupported {
+                anyhow::bail!(
+                    "replace recommendation '{}' references unsupported replacement module '{}'",
+                    recommendation_key,
+                    replacement.display_name
+                );
+            }
+            store
+                .set_source_module_enabled_state(
+                    recommendation.source_module_id,
+                    false,
+                    "disabled",
+                    recommendation.reason.as_deref(),
+                )
+                .await?;
+            store
+                .set_source_module_enabled_state(
+                    replacement_source_module_id,
+                    true,
+                    "available",
+                    None,
+                )
+                .await?;
+        }
+        "disable" => {
+            store
+                .set_source_module_enabled_state(
+                    recommendation.source_module_id,
+                    false,
+                    "disabled",
+                    recommendation.reason.as_deref(),
+                )
+                .await?;
+        }
+        "pin" => {
+            if let Some(version) = recommendation.recommended_version.as_deref() {
+                store
+                    .set_source_module_active_version(
+                        recommendation.source_module_id,
+                        Some(version),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        "none" => {}
+        other => anyhow::bail!("unsupported source replacement action '{other}'"),
+    }
+    store
+        .mark_source_replacement_recommendation_applied(recommendation.recommendation_id)
+        .await?;
+    Ok(true)
+}
+
+async fn nuvio_find_registry(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    registry_id: Uuid,
+) -> anyhow::Result<ExtensionSourceRegistry> {
+    store
+        .list_source_registries(Some(instance_id))
+        .await?
+        .into_iter()
+        .find(|registry| registry.registry_id == registry_id)
+        .ok_or_else(|| anyhow::anyhow!("Nuvio registry '{registry_id}' was not found"))
+}
+
+async fn nuvio_find_module(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    source_module_id: Uuid,
+) -> anyhow::Result<ExtensionSourceModule> {
+    store
+        .list_source_modules(Some(instance_id), None)
+        .await?
+        .into_iter()
+        .find(|module| {
+            module.source_module_id == source_module_id
+                && (module.ecosystem == "nuvio" || module.ecosystem == "stremio")
+        })
+        .ok_or_else(|| anyhow::anyhow!("Nuvio source module '{source_module_id}' was not found"))
+}
+
+fn nuvio_selected_instance(
+    context: &ExtensionControlContext,
+) -> anyhow::Result<&ExtensionInstance> {
+    context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active Prism instance is available yet"))
+}
+
+fn build_cloudstream_recommended_section(
+    context: &ExtensionControlContext,
+    instance: &ExtensionInstance,
+    registries: &[ExtensionSourceRegistry],
+    modules: &[ExtensionSourceModule],
+) -> ExtensionControlSection {
+    let recommended = registries
+        .iter()
+        .find(|registry| registry.registry_key == CLOUDSTREAM_RECOMMENDED_REGISTRY_KEY);
+    let enabled_modules = modules
+        .iter()
+        .filter(|module| module.enabled && module.health_state != "disabled")
+        .count();
+    let healthyish_modules = modules
+        .iter()
+        .filter(|module| matches!(module.health_state.as_str(), "available" | "healthy"))
+        .count();
+    let problem_modules = modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.health_state.as_str(),
+                "degraded" | "broken" | "unsupported" | "account_required"
+            ) || module.last_error.is_some()
+        })
+        .count();
+
+    let mut notices = Vec::new();
+    if recommended.is_none() {
+        notices.push(ExtensionControlNotice {
+            action: Some(cloudstream_refresh_recommended_pack_action()),
+            ..control_notice(
+                "warning",
+                "cloudstream_recommended_pack_missing",
+                "Recommended pack missing",
+                "Refresh the recommended CloudStream source pack before using Extension Suite stream acquisition.",
+            )
+        });
+    }
+    if let Some(registry) = recommended {
+        if !registry.enabled {
+            notices.push(ExtensionControlNotice {
+                action: Some(cloudstream_registry_action(
+                    "enable_registry",
+                    "Enable recommended pack",
+                    "Enable the recommended source pack and its safe modules.",
+                    "primary",
+                    registry.registry_id,
+                    None,
+                )),
+                ..control_notice(
+                    "warning",
+                    "cloudstream_recommended_pack_disabled",
+                    "Recommended pack disabled",
+                    "The recommended CloudStream pack is installed but disabled.",
+                )
+            });
+        }
+        if registry.last_fetch_status == "failed" {
+            notices.push(ExtensionControlNotice {
+                action: Some(cloudstream_refresh_recommended_pack_action()),
+                ..control_notice(
+                    "warning",
+                    "cloudstream_recommended_pack_refresh_failed",
+                    "Recommended pack refresh failed",
+                    registry.last_fetch_error.as_deref().unwrap_or(
+                        "Elixir could not refresh the recommended CloudStream source pack.",
+                    ),
+                )
+            });
+        }
+    }
+    if problem_modules > 0 {
+        notices.push(control_notice(
+            "warning",
+            "cloudstream_source_problems",
+            "Some sources need attention",
+            format!(
+                "{} CloudStream source module(s) are degraded, broken, unsupported, account-required, or reporting an error.",
+                problem_modules
+            ),
+        ));
+    }
+
+    let mut entities = Vec::new();
+    if let Some(registry) = recommended {
+        entities.push(ExtensionControlEntity {
+            id: registry.registry_id.to_string(),
+            title: registry.display_name.clone(),
+            subtitle: Some(if registry.enabled {
+                "Ready".to_string()
+            } else {
+                "Disabled".to_string()
+            }),
+            details: vec![
+                format!("Instance: {}", instance.instance_name),
+                format!("Implementation: {}", context.summary.label),
+                format!("Enabled modules: {}", enabled_modules),
+                format!("Healthy or available modules: {}", healthyish_modules),
+                format!("Problem modules: {}", problem_modules),
+                format!(
+                    "Last refresh: {}",
+                    registry
+                        .last_fetched_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "never".to_string())
+                ),
+            ],
+            actions: vec![cloudstream_refresh_recommended_pack_action()],
+        });
+    }
+
+    ExtensionControlSection {
+        id: "cloudstreamRecommended".to_string(),
+        title: "CloudStream Compat".to_string(),
+        description:
+            "Recommended CloudStream sources are active through Extension Suite. Custom repositories and source pins are managed below."
+                .to_string(),
+        policy: Some(control_policy_seeded(
+            "Elixir seeds the recommended pack and invokes CloudStream Compat only as a source provider. Download routing stays inside Elixir.",
+        )),
+        notices,
+        fields: Vec::new(),
+        entities,
+        actions: vec![cloudstream_refresh_recommended_pack_action()],
+    }
+}
+
+async fn build_cloudstream_problems_section(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let mut entities = Vec::new();
+    for module in modules.iter().filter(|module| {
+        matches!(
+            module.health_state.as_str(),
+            "degraded" | "broken" | "unsupported" | "account_required"
+        ) || module.last_error.is_some()
+            || module.replacement_recommendation_key.is_some()
+    }) {
+        let mut actions =
+            cloudstream_module_actions(module, registry_by_id.get(&module.registry_id).copied());
+        let recommendations = store
+            .list_source_replacement_recommendations(Some(module.source_module_id), true)
+            .await?;
+        for recommendation in recommendations {
+            actions.insert(
+                0,
+                cloudstream_apply_replacement_action(&recommendation.recommendation_key),
+            );
+        }
+        entities.push(ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions,
+        });
+    }
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ExtensionControlSection {
+        id: "cloudstreamProblems".to_string(),
+        title: "Problems".to_string(),
+        description: format!(
+            "{} source module(s) for '{}' need action.",
+            entities.len(),
+            instance.instance_name
+        ),
+        policy: Some(control_policy_observed(
+            "Elixir reports source health and replacement recommendations. It only changes module state when you choose an action here.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }))
+}
+
+fn build_cloudstream_policy_section(instance: &ExtensionInstance) -> ExtensionControlSection {
+    let policy = cloudstream_source_policy(instance);
+    ExtensionControlSection {
+        id: "cloudstreamSourcePolicy".to_string(),
+        title: "Source update policy".to_string(),
+        description:
+            "Recommended sources can receive maintainer updates. Custom repository executable updates stay off unless explicitly enabled."
+                .to_string(),
+        policy: Some(control_policy_seeded(
+            "These settings are sent to CloudStream Compat with each Extension Suite request and do not grant downloader or library access.",
+        )),
+        notices: Vec::new(),
+        fields: vec![
+            cloudstream_policy_field(
+                "curatedExecutableUpdates",
+                "Recommended executable updates",
+                "Allow maintainer-approved recommended source updates.",
+                policy.curated_executable_updates,
+            ),
+            cloudstream_policy_field(
+                "curatedBrokenModuleReplacement",
+                "Recommended broken-source replacement",
+                "Allow curated replacement recommendations to disable broken recommended sources and enable their replacement.",
+                policy.curated_broken_module_replacement,
+            ),
+            cloudstream_policy_field(
+                "customRepoExecutableAutoUpdate",
+                "Custom repo auto updates",
+                "Allow trusted custom repositories to apply executable update recommendations. Leave off unless you trust the repository maintainer.",
+                policy.custom_repo_executable_auto_update,
+            ),
+        ],
+        entities: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+fn build_cloudstream_installed_sources_section(
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> ExtensionControlSection {
+    let entities = modules
+        .iter()
+        .filter(|module| module.enabled || module.installed)
+        .map(|module| ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions: cloudstream_module_actions(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "cloudstreamInstalledSources".to_string(),
+        title: "Installed sources".to_string(),
+        description: "Source modules currently enabled or installed for CloudStream Compat."
+            .to_string(),
+        policy: Some(control_policy_seeded(
+            "Elixir decides which module descriptors are sent to CloudStream Compat. The source runtime cannot mutate this list.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }
+}
+
+fn build_cloudstream_available_sources_section(
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+) -> ExtensionControlSection {
+    let entities = modules
+        .iter()
+        .filter(|module| !module.enabled && !module.installed)
+        .map(|module| ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(cloudstream_module_subtitle(module)),
+            details: cloudstream_module_details(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+            actions: cloudstream_module_actions(
+                module,
+                registry_by_id.get(&module.registry_id).copied(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "cloudstreamAvailableSources".to_string(),
+        title: "Available sources".to_string(),
+        description:
+            "Discovered source modules that are not currently active. Custom repository modules require explicit trust before activation."
+                .to_string(),
+        policy: Some(control_policy_observed(
+            "Elixir inventories these sources from explicit source packs or repositories. It does not download third-party code as a background side effect.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }
+}
+
+fn build_cloudstream_custom_repositories_section(
+    registries: &[ExtensionSourceRegistry],
+) -> ExtensionControlSection {
+    let entities = registries
+        .iter()
+        .filter(|registry| registry.registry_key != CLOUDSTREAM_RECOMMENDED_REGISTRY_KEY)
+        .map(|registry| {
+            let mut actions = vec![cloudstream_registry_action(
+                "refresh_custom_repo",
+                "Refresh",
+                "Fetch the repository metadata again and update discovered source modules.",
+                "secondary",
+                registry.registry_id,
+                None,
+            )];
+            if registry.enabled {
+                actions.push(cloudstream_registry_action(
+                    "disable_registry",
+                    "Disable",
+                    "Disable this repository and its source modules.",
+                    "danger",
+                    registry.registry_id,
+                    Some("Disable this CloudStream repository and its modules?"),
+                ));
+            } else {
+                actions.push(cloudstream_registry_action(
+                    "enable_registry",
+                    "Enable",
+                    "Enable this repository. Modules still require their own activation when the repository is custom and untrusted.",
+                    "primary",
+                    registry.registry_id,
+                    None,
+                ));
+            }
+            if registry.trust_class == "custom" || !registry.trusted_for_executable_updates {
+                actions.push(cloudstream_registry_action(
+                    "trust_custom_repo",
+                    "Trust repo",
+                    "Mark this repository as maintainer-known for explicit executable updates.",
+                    "secondary",
+                    registry.registry_id,
+                    Some("Trust this custom CloudStream repository for executable updates? Only do this for maintainers you trust."),
+                ));
+            }
+            ExtensionControlEntity {
+                id: registry.registry_id.to_string(),
+                title: registry.display_name.clone(),
+                subtitle: Some(format!(
+                    "{} • {}",
+                    if registry.enabled { "Enabled" } else { "Disabled" },
+                    registry.trust_class.replace('_', " ")
+                )),
+                details: vec![
+                    format!("Registry key: {}", registry.registry_key),
+                    format!("Type: {}", registry.registry_type),
+                    format!(
+                        "Executable update trust: {}",
+                        if registry.trusted_for_executable_updates {
+                            "trusted"
+                        } else {
+                            "blocked"
+                        }
+                    ),
+                    format!(
+                        "URL: {}",
+                        registry.url.as_deref().unwrap_or("bundled source pack")
+                    ),
+                    format!("Last fetch: {}", registry.last_fetch_status),
+                    registry
+                        .last_fetch_error
+                        .as_ref()
+                        .map(|error| format!("Last error: {error}"))
+                        .unwrap_or_else(|| "Last error: none".to_string()),
+                ],
+                actions,
+            }
+        })
+        .collect::<Vec<_>>();
+    ExtensionControlSection {
+        id: "cloudstreamCustomRepositories".to_string(),
+        title: "Custom repositories".to_string(),
+        description:
+            "Power-user source repositories. Adding a repository inventories metadata; trust and module activation remain explicit."
+                .to_string(),
+        policy: Some(control_policy_observed(
+            "Custom repositories are user-managed. Elixir validates and stores their metadata but does not silently install executable plugin code.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: vec![cloudstream_add_custom_repo_action()],
+    }
+}
+
+async fn build_cloudstream_version_pins_section(
+    store: &ExtensionStore<'_>,
+    modules: &[ExtensionSourceModule],
+) -> anyhow::Result<ExtensionControlSection> {
+    let mut entities = Vec::new();
+    for module in modules {
+        let versions = store
+            .list_source_module_versions(module.source_module_id)
+            .await?;
+        if versions.is_empty()
+            && module.active_version.is_none()
+            && module.rollback_version.is_none()
+            && module.pinned_version.is_none()
+        {
+            continue;
+        }
+        entities.push(ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(format!(
+                "Active: {}{}",
+                module.active_version.as_deref().unwrap_or("none"),
+                module
+                    .pinned_version
+                    .as_deref()
+                    .map(|version| format!(" • pinned {version}"))
+                    .unwrap_or_default()
+            )),
+            details: vec![
+                format!(
+                    "Available versions: {}",
+                    versions
+                        .iter()
+                        .map(|version| version.version.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!(
+                    "Rollback version: {}",
+                    module.rollback_version.as_deref().unwrap_or("none")
+                ),
+            ],
+            actions: cloudstream_version_actions(module, &versions),
+        });
+    }
+    Ok(ExtensionControlSection {
+        id: "cloudstreamVersionPins".to_string(),
+        title: "Version pins".to_string(),
+        description: "Pin or roll back source module versions when a source update breaks."
+            .to_string(),
+        policy: Some(control_policy_seeded(
+            "Pins are Elixir-owned source policy. They affect provider invocation only; they do not mutate downloader or library state.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    })
+}
+
+async fn build_cloudstream_diagnostics_section(
+    store: &ExtensionStore<'_>,
+    modules: &[ExtensionSourceModule],
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    let mut entities = Vec::new();
+    for module in modules.iter().take(25) {
+        let events = store
+            .list_source_health_events(module.source_module_id, 3)
+            .await?;
+        if events.is_empty() && module.last_error.is_none() {
+            continue;
+        }
+        let mut details = Vec::new();
+        if let Some(error) = module.last_error.as_deref() {
+            details.push(format!("Last error: {error}"));
+        }
+        for event in events {
+            details.push(format!(
+                "{} {}: {}",
+                event.observed_at.format("%Y-%m-%d %H:%M UTC"),
+                event.state,
+                event.reason.as_deref().unwrap_or(event.event_type.as_str())
+            ));
+        }
+        entities.push(ExtensionControlEntity {
+            id: module.source_module_id.to_string(),
+            title: module.display_name.clone(),
+            subtitle: Some(format!("Health: {}", module.health_state)),
+            details,
+            actions: Vec::new(),
+        });
+    }
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ExtensionControlSection {
+        id: "cloudstreamDiagnostics".to_string(),
+        title: "Diagnostics".to_string(),
+        description: "Recent source health events and runtime errors.".to_string(),
+        policy: Some(control_policy_observed(
+            "Diagnostics are observed state from provider searches and materialization. They are not shown unless there is something useful to inspect.",
+        )),
+        notices: Vec::new(),
+        fields: Vec::new(),
+        entities,
+        actions: Vec::new(),
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CloudStreamSourcePolicy {
+    curated_executable_updates: bool,
+    curated_broken_module_replacement: bool,
+    custom_repo_executable_auto_update: bool,
+}
+
+fn cloudstream_source_policy(instance: &ExtensionInstance) -> CloudStreamSourcePolicy {
+    let policy = instance
+        .config_json
+        .as_ref()
+        .and_then(|config| config.get("sourcePackPolicy"))
+        .and_then(serde_json::Value::as_object);
+    CloudStreamSourcePolicy {
+        curated_executable_updates: policy
+            .and_then(|policy| policy.get("curatedExecutableUpdates"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        curated_broken_module_replacement: policy
+            .and_then(|policy| policy.get("curatedBrokenModuleReplacement"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        custom_repo_executable_auto_update: policy
+            .and_then(|policy| policy.get("customRepoExecutableAutoUpdate"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn cloudstream_policy_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: bool,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "toggle".to_string(),
+        value: serde_json::Value::Bool(value),
+        required: false,
+        readonly: false,
+        secret: false,
+        options: Vec::new(),
+        validation: None,
+    }
+}
+
+fn cloudstream_module_subtitle(module: &ExtensionSourceModule) -> String {
+    format!(
+        "{} • {}{}{}",
+        if module.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        module.health_state.replace('_', " "),
+        module
+            .active_version
+            .as_deref()
+            .map(|version| format!(" • v{version}"))
+            .unwrap_or_default(),
+        module
+            .pinned_version
+            .as_deref()
+            .map(|version| format!(" • pinned {version}"))
+            .unwrap_or_default()
+    )
+}
+
+fn cloudstream_module_details(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(registry) = registry {
+        details.push(format!("Registry: {}", registry.display_name));
+        details.push(format!("Trust: {}", registry.trust_class.replace('_', " ")));
+    }
+    if let Some(package) = module.plugin_package.as_deref() {
+        details.push(format!("Plugin package: {package}"));
+    }
+    if let Some(media_types) = module.media_types_json.as_ref() {
+        details.push(format!(
+            "Media types: {}",
+            cloudstream_json_list(media_types)
+        ));
+    }
+    if let Some(domains) = module.source_domains_json.as_ref() {
+        details.push(format!("Domains: {}", cloudstream_json_list(domains)));
+    }
+    if module.account_required {
+        details.push("Account required.".to_string());
+    }
+    if module.unsupported {
+        details.push(format!(
+            "Unsupported: {}",
+            module
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("unsupported by CloudStream Compat")
+        ));
+    }
+    if let Some(error) = module.last_error.as_deref() {
+        details.push(format!("Last error: {error}"));
+    }
+    details
+}
+
+fn cloudstream_json_list(value: &serde_json::Value) -> String {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn cloudstream_module_actions(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+) -> Vec<ExtensionControlAction> {
+    let mut actions = Vec::new();
+    let registry_allows_activation = registry
+        .map(|registry| {
+            registry.enabled
+                && (registry.trust_class != "custom" || registry.trusted_for_executable_updates)
+        })
+        .unwrap_or(false);
+    if module.enabled {
+        actions.push(cloudstream_source_module_action(
+            "disable_source_module",
+            "Disable",
+            "Disable this CloudStream source module.",
+            "danger",
+            module.source_module_id,
+            Some("Disable this CloudStream source module?"),
+        ));
+    } else if !module.unsupported && !module.account_required && registry_allows_activation {
+        actions.push(cloudstream_source_module_action(
+            if module.installed {
+                "enable_source_module"
+            } else {
+                "install_source_module"
+            },
+            if module.installed {
+                "Enable"
+            } else {
+                "Install"
+            },
+            "Enable this source module for Extension Suite searches.",
+            "primary",
+            module.source_module_id,
+            None,
+        ));
+    }
+    if module.rollback_version.is_some() {
+        actions.push(cloudstream_source_module_action(
+            "rollback_source_module",
+            "Rollback",
+            "Return this source module to its previous active version.",
+            "secondary",
+            module.source_module_id,
+            Some("Roll this CloudStream source module back to its previous active version?"),
+        ));
+    }
+    actions.extend(cloudstream_version_actions(module, &[]));
+    actions
+}
+
+fn cloudstream_version_actions(
+    module: &ExtensionSourceModule,
+    versions: &[ExtensionSourceModuleVersion],
+) -> Vec<ExtensionControlAction> {
+    let mut actions = Vec::new();
+    if !versions.is_empty() {
+        actions.push(ExtensionControlAction {
+            id: "pin_source_module".to_string(),
+            label: "Pin version".to_string(),
+            description: "Pin this source module to a known-good version.".to_string(),
+            kind: "secondary".to_string(),
+            params: Some(json!({
+                "sourceModuleId": module.source_module_id.to_string(),
+                "promptTitle": format!("Pin {}", module.display_name),
+                "submitLabel": "Pin version",
+                "promptFields": [{
+                    "id": "version",
+                    "label": "Version",
+                    "description": "Choose the exact source module version to keep active.",
+                    "fieldType": "select",
+                    "required": true,
+                    "value": module
+                        .pinned_version
+                        .as_deref()
+                        .or(module.active_version.as_deref())
+                        .unwrap_or_else(|| versions.last().map(|version| version.version.as_str()).unwrap_or("")),
+                    "options": versions
+                        .iter()
+                        .map(|version| json!({
+                            "value": version.version,
+                            "label": version.version,
+                        }))
+                        .collect::<Vec<_>>()
+                }]
+            })),
+            confirm_text: None,
+            navigate_extension_id: None,
+            navigate_view: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
+        });
+    }
+    if module.pinned_version.is_some() {
+        actions.push(cloudstream_source_module_action(
+            "clear_source_module_pin",
+            "Clear pin",
+            "Allow this source module to follow normal update policy again.",
+            "secondary",
+            module.source_module_id,
+            None,
+        ));
+    }
+    actions
+}
+
+fn cloudstream_refresh_recommended_pack_action() -> ExtensionControlAction {
+    cloudstream_simple_action(
+        "refresh_recommended_pack",
+        "Refresh recommended",
+        "Refresh the bundled recommended CloudStream source pack.",
+        "primary",
+        None,
+        None,
+    )
+}
+
+fn cloudstream_add_custom_repo_action() -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: "add_custom_repo".to_string(),
+        label: "Add repository".to_string(),
+        description: "Add a CloudStream repo.json or plugins.json source repository.".to_string(),
+        kind: "secondary".to_string(),
+        params: Some(json!({
+            "promptTitle": "Add CloudStream repository",
+            "submitLabel": "Add repository",
+            "promptFields": [
+                {
+                    "id": "registryUrl",
+                    "label": "Repository URL",
+                    "description": "CloudStream repo.json or plugins.json URL.",
+                    "fieldType": "text",
+                    "required": true,
+                    "value": ""
+                },
+                {
+                    "id": "registryType",
+                    "label": "Registry type",
+                    "description": "Use repo.json when the URL points at a CloudStream repository descriptor. Use plugins.json for a direct plugin list.",
+                    "fieldType": "select",
+                    "required": true,
+                    "value": "cloudstream_repo_json",
+                    "options": [
+                        { "value": "cloudstream_repo_json", "label": "CloudStream repo.json" },
+                        { "value": "cloudstream_plugins_json", "label": "CloudStream plugins.json" }
+                    ]
+                },
+                {
+                    "id": "displayName",
+                    "label": "Display name",
+                    "description": "Optional local name for this repository.",
+                    "fieldType": "text",
+                    "required": false,
+                    "value": ""
+                },
+                {
+                    "id": "trustedForExecutableUpdates",
+                    "label": "Trust executable updates",
+                    "description": "Only enable for repositories maintained by someone you trust.",
+                    "fieldType": "toggle",
+                    "required": false,
+                    "value": false
+                }
+            ]
+        })),
+        confirm_text: None,
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+fn cloudstream_registry_action(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: &str,
+    registry_id: Uuid,
+    confirm_text: Option<&str>,
+) -> ExtensionControlAction {
+    cloudstream_simple_action(
+        id,
+        label,
+        description,
+        kind,
+        Some(json!({ "registryId": registry_id.to_string() })),
+        confirm_text,
+    )
+}
+
+fn cloudstream_source_module_action(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: &str,
+    source_module_id: Uuid,
+    confirm_text: Option<&str>,
+) -> ExtensionControlAction {
+    cloudstream_simple_action(
+        id,
+        label,
+        description,
+        kind,
+        Some(json!({ "sourceModuleId": source_module_id.to_string() })),
+        confirm_text,
+    )
+}
+
+fn cloudstream_apply_replacement_action(recommendation_key: &str) -> ExtensionControlAction {
+    cloudstream_simple_action(
+        "apply_source_replacement",
+        "Apply replacement",
+        "Apply the active replacement recommendation for this source module.",
+        "primary",
+        Some(json!({ "recommendationKey": recommendation_key })),
+        None,
+    )
+}
+
+fn cloudstream_simple_action(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: &str,
+    params: Option<serde_json::Value>,
+    confirm_text: Option<&str>,
+) -> ExtensionControlAction {
+    ExtensionControlAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        kind: kind.to_string(),
+        params,
+        confirm_text: confirm_text.map(str::to_string),
+        navigate_extension_id: None,
+        navigate_view: None,
+        open_url: None,
+        required_fields: Vec::new(),
+        secret_keys: Vec::new(),
+        secret_scope_instance_id: None,
+    }
+}
+
+async fn cloudstream_add_custom_repo(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let url = cloudstream_param_string(params, "registryUrl")?;
+    let registry_type = cloudstream_param_string(params, "registryType")
+        .unwrap_or_else(|_| "cloudstream_repo_json".to_string());
+    if !matches!(
+        registry_type.as_str(),
+        "cloudstream_repo_json" | "cloudstream_plugins_json"
+    ) {
+        anyhow::bail!("registryType must be cloudstream_repo_json or cloudstream_plugins_json");
+    }
+    let display_name = params
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let trusted = params
+        .get("trustedForExecutableUpdates")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let registry_key = format!(
+        "cloudstream.custom.{}",
+        cloudstream_stable_text_id(&format!("{registry_type}:{url}"))
+    );
+    let registry_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "elixir:cloudstream:custom-registry:{}:{}",
+            instance.instance_id, registry_key
+        )
+        .as_bytes(),
+    );
+    let client = CloudStreamRegistryClient::new(CloudStreamRegistryFetchConfig::default())?;
+    let snapshot = client.fetch_registry(&registry_type, &url).await?;
+    let summary = persist_cloudstream_registry_snapshot(
+        store,
+        &CloudStreamRegistryStoreInput {
+            registry_id,
+            instance_id: instance.instance_id,
+            registry_key: registry_key.clone(),
+            registry_type,
+            trust_class: if trusted {
+                "maintainer_known".to_string()
+            } else {
+                "custom".to_string()
+            },
+            display_name,
+            url: Some(url),
+            enabled: true,
+            auto_refresh: true,
+            trusted_for_executable_updates: trusted,
+        },
+        &snapshot,
+    )
+    .await?;
+    Ok(format!(
+        "Added CloudStream repository '{}': {} module(s), {} version(s), {} disabled.",
+        registry_key, summary.modules, summary.versions, summary.disabled_modules
+    ))
+}
+
+async fn cloudstream_refresh_registry(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    registry_id: Uuid,
+) -> anyhow::Result<String> {
+    let registry = cloudstream_find_registry(store, instance.instance_id, registry_id).await?;
+    if registry.registry_type == "elixir_curated_cloudstream_pack" {
+        let summary = seed_cloudstream_recommended_source_pack_for_instance(
+            store,
+            instance.instance_id,
+            None,
+        )
+        .await?;
+        return Ok(format!(
+            "Recommended CloudStream source pack refreshed: {} module(s), {} version(s).",
+            summary.modules, summary.versions
+        ));
+    }
+    let url = registry
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("custom CloudStream registry has no URL"))?;
+    let client = CloudStreamRegistryClient::new(CloudStreamRegistryFetchConfig::default())?;
+    let snapshot = client
+        .fetch_registry(&registry.registry_type, url)
+        .await
+        .with_context(|| {
+            format!(
+                "refreshing CloudStream registry '{}'",
+                registry.display_name
+            )
+        })?;
+    let summary = persist_cloudstream_registry_snapshot(
+        store,
+        &CloudStreamRegistryStoreInput {
+            registry_id,
+            instance_id: instance.instance_id,
+            registry_key: registry.registry_key.clone(),
+            registry_type: registry.registry_type.clone(),
+            trust_class: registry.trust_class.clone(),
+            display_name: Some(registry.display_name.clone()),
+            url: registry.url.clone(),
+            enabled: registry.enabled,
+            auto_refresh: registry.auto_refresh,
+            trusted_for_executable_updates: registry.trusted_for_executable_updates,
+        },
+        &snapshot,
+    )
+    .await?;
+    Ok(format!(
+        "Refreshed '{}': {} module(s), {} version(s), {} disabled.",
+        registry.display_name, summary.modules, summary.versions, summary.disabled_modules
+    ))
+}
+
+async fn cloudstream_validate_module_activation(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    module: &ExtensionSourceModule,
+) -> anyhow::Result<()> {
+    if module.unsupported {
+        anyhow::bail!(
+            "'{}' is unsupported: {}",
+            module.display_name,
+            module
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("unsupported by CloudStream Compat")
+        );
+    }
+    if module.account_required {
+        anyhow::bail!(
+            "'{}' requires an account before activation",
+            module.display_name
+        );
+    }
+    let registry = cloudstream_find_registry(store, instance_id, module.registry_id).await?;
+    if !registry.enabled {
+        anyhow::bail!(
+            "source registry '{}' is disabled; enable the registry first",
+            registry.display_name
+        );
+    }
+    if registry.trust_class == "custom" && !registry.trusted_for_executable_updates {
+        anyhow::bail!(
+            "source registry '{}' must be explicitly trusted before activating modules",
+            registry.display_name
+        );
+    }
+    Ok(())
+}
+
+async fn cloudstream_mark_active_version(
+    store: &ExtensionStore<'_>,
+    versions: &[ExtensionSourceModuleVersion],
+    active_version: &str,
+) -> anyhow::Result<()> {
+    for version in versions {
+        let install_state = if version.version == active_version {
+            "active"
+        } else if version.install_state == "active" {
+            "installed"
+        } else {
+            version.install_state.as_str()
+        };
+        store
+            .set_source_module_version_state(
+                version.version_id,
+                install_state,
+                &version.smoke_status,
+                version.smoke_error.as_deref(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn cloudstream_preferred_module_version(
+    module: &ExtensionSourceModule,
+    versions: &[ExtensionSourceModuleVersion],
+    requested: Option<&str>,
+) -> Option<String> {
+    if let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        return versions
+            .iter()
+            .find(|version| version.version == requested)
+            .map(|version| version.version.clone());
+    }
+    module
+        .pinned_version
+        .clone()
+        .or_else(|| module.active_version.clone())
+        .or_else(|| {
+            versions
+                .iter()
+                .max_by(|left, right| {
+                    cloudstream_version_key(&left.version)
+                        .cmp(&cloudstream_version_key(&right.version))
+                        .then_with(|| left.version.cmp(&right.version))
+                })
+                .map(|version| version.version.clone())
+        })
+}
+
+fn cloudstream_version_key(version: &str) -> Vec<u64> {
+    version
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+async fn cloudstream_find_registry(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    registry_id: Uuid,
+) -> anyhow::Result<ExtensionSourceRegistry> {
+    store
+        .list_source_registries(Some(instance_id))
+        .await?
+        .into_iter()
+        .find(|registry| registry.registry_id == registry_id)
+        .ok_or_else(|| anyhow::anyhow!("CloudStream registry '{registry_id}' was not found"))
+}
+
+async fn cloudstream_find_module(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    source_module_id: Uuid,
+) -> anyhow::Result<ExtensionSourceModule> {
+    store
+        .list_source_modules(Some(instance_id), None)
+        .await?
+        .into_iter()
+        .find(|module| module.source_module_id == source_module_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("CloudStream source module '{source_module_id}' was not found")
+        })
+}
+
+fn cloudstream_selected_instance(
+    context: &ExtensionControlContext,
+) -> anyhow::Result<&ExtensionInstance> {
+    context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active CloudStream Compat instance is available yet"))
+}
+
+fn cloudstream_param_uuid(
+    params: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<Uuid> {
+    let raw = cloudstream_param_string(params, key)?;
+    Uuid::parse_str(&raw).with_context(|| format!("parsing {key}"))
+}
+
+fn cloudstream_param_string(
+    params: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<String> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("{key} is required"))
+}
+
+fn cloudstream_stable_text_id(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !output.is_empty() {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        "source".to_string()
+    } else {
+        output
+    }
+}
+
 pub(super) async fn load_live_snapshot(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -1460,6 +4346,8 @@ fn resolve_adapter(context: &ExtensionControlContext) -> Box<dyn ExtensionContro
             Box::new(DownloaderControlAdapter)
         }
         ExtensionControlBinding::RealDebrid => Box::new(DebridControlAdapter),
+        ExtensionControlBinding::CloudStream => Box::new(CloudStreamControlAdapter),
+        ExtensionControlBinding::Prism => Box::new(PrismControlAdapter),
         ExtensionControlBinding::GenericManifest => Box::new(GenericManifestControlProvider),
         ExtensionControlBinding::Unsupported => Box::new(UnsupportedControlProvider),
     }

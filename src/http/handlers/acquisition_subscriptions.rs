@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::{
+        language_policy::{
+            load_saved_language_preference, quality_profile_with_language_preference,
+        },
         release_resolution::fingerprint::candidate_release_fingerprint,
         route_attempts::{RouteAttemptRecord, RouteAttemptStatus, attach_route_attempt_ledger},
         subscriptions::{
@@ -282,6 +285,14 @@ async fn apply_source_provider_config_defaults(
     request: &mut CreateAcquisitionIntent,
 ) -> ApiResult<()> {
     let Some(source_provider_id) = request.source_provider_id else {
+        let language_preference = load_saved_language_preference(store)
+            .await
+            .map_err(ApiError::from)?;
+        request.quality_profile = quality_profile_with_language_preference(
+            request.quality_profile.take(),
+            request.media_type,
+            &language_preference,
+        );
         return Ok(());
     };
     let provider = store
@@ -299,37 +310,43 @@ async fn apply_source_provider_config_defaults(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::bad_request("source provider instance was not found"))?;
-    let Some(config) = instance.config_json.as_ref().and_then(JsonValue::as_object) else {
-        return Ok(());
-    };
-
-    if request.route_policy.is_none() {
-        if let Some(route_policy) = config
-            .get("routePolicy")
-            .and_then(JsonValue::as_str)
-            .map(AcquisitionRoutePolicy::from_str)
-            .transpose()
-            .map_err(|err| ApiError::bad_request(err.to_string()))?
-        {
-            request.route_policy = Some(route_policy);
-        }
-    }
-    if request.release_delay_seconds.is_none() {
-        if let Some(delay) = config
-            .get("releaseDelaySeconds")
-            .and_then(JsonValue::as_i64)
-        {
-            if delay < 0 {
-                return Err(ApiError::bad_request(
-                    "releaseDelaySeconds cannot be negative",
-                ));
+    if let Some(config) = instance.config_json.as_ref().and_then(JsonValue::as_object) {
+        if request.route_policy.is_none() {
+            if let Some(route_policy) = config
+                .get("routePolicy")
+                .and_then(JsonValue::as_str)
+                .map(AcquisitionRoutePolicy::from_str)
+                .transpose()
+                .map_err(|err| ApiError::bad_request(err.to_string()))?
+            {
+                request.route_policy = Some(route_policy);
             }
-            request.release_delay_seconds = Some(delay);
+        }
+        if request.release_delay_seconds.is_none() {
+            if let Some(delay) = config
+                .get("releaseDelaySeconds")
+                .and_then(JsonValue::as_i64)
+            {
+                if delay < 0 {
+                    return Err(ApiError::bad_request(
+                        "releaseDelaySeconds cannot be negative",
+                    ));
+                }
+                request.release_delay_seconds = Some(delay);
+            }
+        }
+        if request.quality_profile.is_none() {
+            request.quality_profile = source_quality_profile_from_config(config);
         }
     }
-    if request.quality_profile.is_none() {
-        request.quality_profile = source_quality_profile_from_config(config);
-    }
+    let language_preference = load_saved_language_preference(store)
+        .await
+        .map_err(ApiError::from)?;
+    request.quality_profile = quality_profile_with_language_preference(
+        request.quality_profile.take(),
+        request.media_type,
+        &language_preference,
+    );
     Ok(())
 }
 
@@ -593,6 +610,7 @@ pub async fn submit_acquisition_target_candidate(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(candidate.clone()),
+        selected_stream_candidate: None,
         release_fingerprint: Some(candidate_fingerprint.clone()),
     };
 

@@ -42,8 +42,14 @@ use crate::debrid::{
 };
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
+use crate::extensions::cloudstream_registry::{
+    CLOUDSTREAM_COMPAT_EXTENSION_ID, seed_cloudstream_recommended_source_pack_for_instance,
+};
 use crate::extensions::managed_paths::{DOWNLOADS_ROOT, QBITTORRENT_INCOMPLETE_DIR};
 use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
+use crate::extensions::nuvio_registry::{
+    PRISM_EXTENSION_ID, seed_prism_recommended_source_pack_for_instance,
+};
 use crate::extensions::package::{
     PackageManifest, compute_sha256, read_manifest_from_dir, read_package_signature,
     unpack_package, verify_signature, write_manifest_to_dir,
@@ -1694,6 +1700,19 @@ async fn install_extension_internal_with_policy(
 
     let default_instance_created =
         ensure_default_extension_instance(&store, &manifest, false).await?;
+    if extension_id == CLOUDSTREAM_COMPAT_EXTENSION_ID {
+        seed_cloudstream_recommended_pack_for_instances(&store, &extension_id, Some(&unpacked_dir))
+            .await?;
+    }
+    if extension_id == PRISM_EXTENSION_ID {
+        seed_prism_recommended_pack_for_instances(
+            &store,
+            &extension_id,
+            Some(&unpacked_dir),
+            Some(&state.settings.extensions.storage_root),
+        )
+        .await?;
+    }
     let existing_instances_need_reconcile = if existing_extension.is_some()
         && manifest.kind == ExtensionKind::Module
         && manifest.runtime.is_some()
@@ -1943,6 +1962,35 @@ pub async fn create_instance(
         })
         .await
         .map_err(|err| map_unique_violation(err, "instance already exists"))?;
+    if extension.extension_id == CLOUDSTREAM_COMPAT_EXTENSION_ID {
+        let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+        let package_dir = storage_paths
+            .unpacked_dir
+            .join(&extension.extension_id)
+            .join(&extension.version);
+        seed_cloudstream_recommended_source_pack_for_instance(
+            &store,
+            instance_id,
+            Some(&package_dir),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
+    if extension.extension_id == PRISM_EXTENSION_ID {
+        let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+        let package_dir = storage_paths
+            .unpacked_dir
+            .join(&extension.extension_id)
+            .join(&extension.version);
+        seed_prism_recommended_source_pack_for_instance(
+            &store,
+            instance_id,
+            Some(&package_dir),
+            Some(&state.settings.extensions.storage_root),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
 
     let instance = store
         .get_instance(instance_id)
@@ -1959,6 +2007,29 @@ pub(super) async fn create_default_extension_instance(
     manifest: &ExtensionManifest,
 ) -> anyhow::Result<bool> {
     let created = ensure_default_extension_instance(store, manifest, true).await?;
+    if created && manifest.id == CLOUDSTREAM_COMPAT_EXTENSION_ID {
+        let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+        let package_dir = storage_paths
+            .unpacked_dir
+            .join(&manifest.id)
+            .join(&manifest.version);
+        seed_cloudstream_recommended_pack_for_instances(store, &manifest.id, Some(&package_dir))
+            .await?;
+    }
+    if created && manifest.id == PRISM_EXTENSION_ID {
+        let storage_paths = ExtensionStoragePaths::new(&state.settings.extensions.storage_root);
+        let package_dir = storage_paths
+            .unpacked_dir
+            .join(&manifest.id)
+            .join(&manifest.version);
+        seed_prism_recommended_pack_for_instances(
+            store,
+            &manifest.id,
+            Some(&package_dir),
+            Some(&state.settings.extensions.storage_root),
+        )
+        .await?;
+    }
     if created {
         trigger_extensions_reconcile(state, "manual default instance create");
     }
@@ -2035,6 +2106,58 @@ fn default_instance_config_from_manifest(manifest: &ExtensionManifest) -> Option
         json!(format!("{}@{}", manifest.id, manifest.version)),
     );
     Some(Value::Object(config))
+}
+
+async fn seed_cloudstream_recommended_pack_for_instances(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    installed_package_dir: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if extension_id != CLOUDSTREAM_COMPAT_EXTENSION_ID {
+        return Ok(());
+    }
+    for instance in store.list_instances(Some(extension_id)).await? {
+        seed_cloudstream_recommended_source_pack_for_instance(
+            store,
+            instance.instance_id,
+            installed_package_dir,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "seeding CloudStream recommended source pack for instance {}",
+                instance.instance_id
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn seed_prism_recommended_pack_for_instances(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    installed_package_dir: Option<&std::path::Path>,
+    storage_root: Option<&str>,
+) -> anyhow::Result<()> {
+    if extension_id != PRISM_EXTENSION_ID {
+        return Ok(());
+    }
+    for instance in store.list_instances(Some(extension_id)).await? {
+        seed_prism_recommended_source_pack_for_instance(
+            store,
+            instance.instance_id,
+            installed_package_dir,
+            storage_root,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "seeding Prism recommended source pack for instance {}",
+                instance.instance_id
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
@@ -4541,6 +4664,8 @@ pub(super) enum ExtensionControlBinding {
     Qbittorrent,
     Nzbget,
     RealDebrid,
+    CloudStream,
+    Prism,
     GenericManifest,
     Unsupported,
 }
@@ -4576,6 +4701,11 @@ impl ExtensionControlBinding {
             ("indexer.registry", Some("prowlarr")) => Some(Self::Prowlarr),
             ("downloader.torrent", Some("qbittorrent")) => Some(Self::Qbittorrent),
             ("downloader.nzb", Some("nzbget")) => Some(Self::Nzbget),
+            ("acquisition.stream_candidate_provider", Some("cloudstream_compat")) => {
+                Some(Self::CloudStream)
+            }
+            ("acquisition.stream_candidate_provider", Some("prism")) => Some(Self::Prism),
+            ("acquisition.stream_candidate_provider", Some("nuvio_compat")) => Some(Self::Prism),
             ("debrid.resolver", Some(implementation))
                 if DebridServiceKind::from_implementation_id(implementation).is_ok() =>
             {
@@ -7873,6 +8003,31 @@ mod extension_ui_proxy_tests {
         let ports = r#"{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"32801"}]}"#;
         assert_eq!(parse_control_published_host_port(ports, 8080), Some(32801));
         assert_eq!(parse_control_published_host_port(ports, 6789), None);
+    }
+
+    #[test]
+    fn cs11_cloudstream_uses_dedicated_control_binding() {
+        assert_eq!(
+            ExtensionControlBinding::from_signature(
+                "acquisition.stream_candidate_provider",
+                Some("cloudstream_compat"),
+            ),
+            Some(ExtensionControlBinding::CloudStream)
+        );
+        assert_eq!(
+            ExtensionControlBinding::from_signature(
+                "acquisition.stream_candidate_provider",
+                Some("prism"),
+            ),
+            Some(ExtensionControlBinding::Prism)
+        );
+        assert_eq!(
+            ExtensionControlBinding::from_signature(
+                "acquisition.stream_candidate_provider",
+                Some("nuvio_compat"),
+            ),
+            Some(ExtensionControlBinding::Prism)
+        );
     }
 
     #[test]

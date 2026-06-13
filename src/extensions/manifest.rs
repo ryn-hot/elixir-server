@@ -1625,12 +1625,7 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match extension_id {
-        "elixir.blueprints.arr_stack" => ensure_string_array_item_after(
-            raw_json,
-            "connectors",
-            "elixir.connectors.nzbget_defaults",
-            "elixir.connectors.qbittorrent_defaults",
-        ),
+        "elixir.blueprints.arr_stack" => remove_object_field(raw_json, "connectors"),
         "elixir.modules.qbittorrent" => repair_downloader_broker_scope(
             raw_json,
             "downloader.torrent",
@@ -1685,6 +1680,12 @@ fn repair_nzbget_defaults_manifest(root: &mut serde_json::Value) -> bool {
     repaired |= set_driver_patch_string_field(root, "set_preferences", "temp_dir", NZBGET_TEMP_DIR);
     repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
     repaired
+}
+
+fn remove_object_field(root: &mut serde_json::Value, field: &str) -> bool {
+    root.as_object_mut()
+        .and_then(|object| object.remove(field))
+        .is_some()
 }
 
 fn repair_downloader_broker_scope(
@@ -1934,33 +1935,6 @@ fn find_driver_patch_mut<'a>(
                 (patch.get("op").and_then(serde_json::Value::as_str) == Some(op)).then_some(patch)
             })
         })
-}
-
-fn ensure_string_array_item_after(
-    root: &mut serde_json::Value,
-    field: &str,
-    value: &str,
-    after: &str,
-) -> bool {
-    let Some(object) = root.as_object_mut() else {
-        return false;
-    };
-    let entry = object
-        .entry(field.to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let Some(array) = entry.as_array_mut() else {
-        return false;
-    };
-    if array.iter().any(|item| item.as_str() == Some(value)) {
-        return false;
-    }
-    let insert_index = array
-        .iter()
-        .position(|item| item.as_str() == Some(after))
-        .map(|index| index + 1)
-        .unwrap_or(array.len());
-    array.insert(insert_index, serde_json::Value::String(value.to_string()));
-    true
 }
 
 fn default_slot() -> String {
@@ -2821,9 +2795,15 @@ control_surface:
     }
 
     #[test]
-    fn repair_builtin_manifest_adds_missing_arr_stack_nzbget_defaults_connector() {
+    fn repair_builtin_manifest_removes_legacy_arr_stack_connectors() {
         let mut raw = json!({
             "id": "elixir.blueprints.arr_stack",
+            "execution": {
+                "packages": [
+                    "elixir.connectors.qbittorrent_defaults",
+                    "elixir.connectors.nzbget_defaults"
+                ]
+            },
             "connectors": [
                 "elixir.connectors.prowlarr_public_indexers",
                 "elixir.connectors.prowlarr_sonarr_app",
@@ -2835,40 +2815,24 @@ control_surface:
         });
 
         assert!(repair_builtin_manifest_json(&mut raw));
-
-        let connectors = raw
-            .get("connectors")
-            .and_then(serde_json::Value::as_array)
-            .expect("connectors array");
-        let values = connectors
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>();
-
+        assert!(raw.get("connectors").is_none());
         assert_eq!(
-            values,
-            vec![
-                "elixir.connectors.prowlarr_public_indexers",
-                "elixir.connectors.prowlarr_sonarr_app",
-                "elixir.connectors.prowlarr_radarr_app",
-                "elixir.connectors.qbittorrent_defaults",
-                "elixir.connectors.nzbget_defaults",
-                "elixir.connectors.sonarr_qbittorrent",
-                "elixir.connectors.sonarr_nzbget"
-            ]
+            raw.pointer("/execution/packages/1")
+                .and_then(serde_json::Value::as_str),
+            Some("elixir.connectors.nzbget_defaults")
         );
     }
 
     #[test]
-    fn repair_builtin_manifest_is_noop_when_arr_stack_nzbget_defaults_already_present() {
+    fn repair_builtin_manifest_is_noop_when_arr_stack_has_no_legacy_connectors() {
         let mut raw = json!({
             "id": "elixir.blueprints.arr_stack",
-            "connectors": [
-                "elixir.connectors.qbittorrent_defaults",
-                "elixir.connectors.nzbget_defaults",
-                "elixir.connectors.prowlarr_radarr_app",
-                "elixir.connectors.sonarr_nzbget"
-            ]
+            "execution": {
+                "packages": [
+                    "elixir.connectors.qbittorrent_defaults",
+                    "elixir.connectors.nzbget_defaults"
+                ]
+            }
         });
 
         assert!(!repair_builtin_manifest_json(&mut raw));

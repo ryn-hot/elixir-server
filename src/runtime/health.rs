@@ -94,6 +94,8 @@ pub struct PersistedDockerRuntimeHealthState {
     pub last_failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ready_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub consecutive_engine_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +122,7 @@ struct DockerRuntimeSupervisorState {
     last_failure_code: Option<String>,
     last_failure_reason: Option<String>,
     last_failure_at: Option<DateTime<Utc>>,
+    last_ready_at: Option<DateTime<Utc>>,
     consecutive_engine_failures: u32,
     last_reset_attempt_at: Option<DateTime<Utc>>,
     auto_reset_window_started_at: Option<DateTime<Utc>>,
@@ -142,6 +145,7 @@ impl DockerRuntimeSupervisor {
                 last_failure_code: None,
                 last_failure_reason: None,
                 last_failure_at: None,
+                last_ready_at: None,
                 consecutive_engine_failures: 0,
                 last_reset_attempt_at: None,
                 auto_reset_window_started_at: None,
@@ -167,6 +171,7 @@ impl DockerRuntimeSupervisor {
         state.last_failure_code = persisted.last_failure_code;
         state.last_failure_reason = persisted.last_failure_reason;
         state.last_failure_at = persisted.last_failure_at;
+        state.last_ready_at = persisted.last_ready_at;
         state.consecutive_engine_failures = persisted.consecutive_engine_failures;
         state.last_reset_attempt_at = persisted.last_reset_attempt_at;
         state.auto_reset_window_started_at = persisted.auto_reset_window_started_at;
@@ -189,6 +194,7 @@ impl DockerRuntimeSupervisor {
             last_failure_code: state.last_failure_code.clone(),
             last_failure_reason: state.last_failure_reason.clone(),
             last_failure_at: state.last_failure_at,
+            last_ready_at: state.last_ready_at,
             consecutive_engine_failures: state.consecutive_engine_failures,
             last_reset_attempt_at: state.last_reset_attempt_at,
             auto_reset_window_started_at: state.auto_reset_window_started_at,
@@ -228,6 +234,7 @@ impl DockerRuntimeSupervisor {
         let mut state = self.inner.lock().expect("runtime supervisor lock");
         let now = Utc::now();
         state.prune_expired();
+        let had_unresolved_failure = state.has_unresolved_engine_failure();
         let was_degraded = state
             .degraded_until
             .map(|value| value > now)
@@ -235,8 +242,9 @@ impl DockerRuntimeSupervisor {
         state.degraded_until = None;
         state.consecutive_engine_failures = 0;
         state.reboot_recommended = false;
+        state.last_ready_at = Some(now);
 
-        if was_degraded || started_by_elixir {
+        if was_degraded || started_by_elixir || had_unresolved_failure {
             state.recovery_until =
                 Some(now + ChronoDuration::seconds(RUNTIME_RECOVERY_WINDOW_SECONDS));
             state.next_restart_after =
@@ -441,16 +449,48 @@ impl DockerRuntimeSupervisor {
 }
 
 impl DockerRuntimeSupervisorState {
+    fn has_unresolved_engine_failure(&self) -> bool {
+        let Some(last_failure_at) = self.last_failure_at else {
+            return false;
+        };
+        self.last_ready_at
+            .map(|last_ready_at| last_failure_at > last_ready_at)
+            .unwrap_or(true)
+    }
+
     fn prune_expired(&mut self) {
         let now = Utc::now();
         self.quarantined_instances
             .retain(|_, item| item.until > now);
+        let unresolved_engine_failure = self.has_unresolved_engine_failure();
         if self
             .degraded_until
             .map(|value| value <= now)
             .unwrap_or(false)
         {
-            self.degraded_until = None;
+            if unresolved_engine_failure {
+                self.degraded_until =
+                    Some(now + ChronoDuration::seconds(RUNTIME_DEGRADED_COOLDOWN_SECONDS));
+                self.dependency_actions_deferred_until =
+                    Some(now + ChronoDuration::seconds(RUNTIME_DEPENDENCY_DEFER_SECONDS));
+            } else {
+                self.degraded_until = None;
+            }
+        } else if self.degraded_until.is_none()
+            && self.recovery_until.is_none()
+            && !self.reboot_recommended
+            && unresolved_engine_failure
+        {
+            self.degraded_until =
+                Some(now + ChronoDuration::seconds(RUNTIME_DEGRADED_COOLDOWN_SECONDS));
+            self.dependency_actions_deferred_until =
+                Some(now + ChronoDuration::seconds(RUNTIME_DEPENDENCY_DEFER_SECONDS));
+            if self.code.is_none() {
+                self.code = self.last_failure_code.clone();
+            }
+            if self.reason.is_none() {
+                self.reason = self.last_failure_reason.clone();
+            }
         }
         if self
             .recovery_until
@@ -462,6 +502,22 @@ impl DockerRuntimeSupervisorState {
             if !self.reboot_recommended {
                 self.code = None;
                 self.reason = None;
+            }
+        }
+        if self.degraded_until.is_none()
+            && self.recovery_until.is_none()
+            && !self.reboot_recommended
+            && unresolved_engine_failure
+        {
+            self.degraded_until =
+                Some(now + ChronoDuration::seconds(RUNTIME_DEGRADED_COOLDOWN_SECONDS));
+            self.dependency_actions_deferred_until =
+                Some(now + ChronoDuration::seconds(RUNTIME_DEPENDENCY_DEFER_SECONDS));
+            if self.code.is_none() {
+                self.code = self.last_failure_code.clone();
+            }
+            if self.reason.is_none() {
+                self.reason = self.last_failure_reason.clone();
             }
         }
         if self
@@ -774,6 +830,7 @@ mod tests {
             last_failure_code: Some("docker_runtime_unavailable".to_string()),
             last_failure_reason: Some("daemon missing".to_string()),
             last_failure_at: Some(Utc::now()),
+            last_ready_at: None,
             consecutive_engine_failures: 3,
             last_reset_attempt_at: Some(Utc::now()),
             auto_reset_window_started_at: Some(Utc::now()),
@@ -790,6 +847,89 @@ mod tests {
         assert!(snapshot.reboot_recommended);
         assert_eq!(snapshot.auto_reset_attempts_in_window, 1);
         assert_eq!(snapshot.quarantined_instances.len(), 1);
+    }
+
+    #[test]
+    fn supervisor_does_not_expire_unresolved_docker_failure_to_healthy() {
+        let supervisor = DockerRuntimeSupervisor::new(None);
+        supervisor
+            .record_engine_failure("docker_runtime_unavailable", "docker.raw.sock is missing");
+
+        let mut persisted = supervisor.persisted_state();
+        persisted.degraded_until =
+            Some(Utc::now() - ChronoDuration::seconds(RUNTIME_DEGRADED_COOLDOWN_SECONDS + 5));
+        persisted.dependency_actions_deferred_until = None;
+        persisted.last_ready_at = None;
+        supervisor.restore(persisted);
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, DockerRuntimeHealthState::Degraded);
+        assert_eq!(snapshot.code.as_deref(), Some("docker_runtime_unavailable"));
+        assert!(
+            snapshot
+                .until
+                .map(|value| value > Utc::now())
+                .unwrap_or(false)
+        );
+        assert!(supervisor.should_defer_dependency_actions().is_some());
+    }
+
+    #[test]
+    fn supervisor_enters_recovery_after_long_unresolved_docker_failure() {
+        let supervisor = DockerRuntimeSupervisor::new(None);
+        supervisor
+            .record_engine_failure("docker_runtime_unavailable", "docker.raw.sock is missing");
+
+        let mut persisted = supervisor.persisted_state();
+        persisted.degraded_until =
+            Some(Utc::now() - ChronoDuration::seconds(RUNTIME_DEGRADED_COOLDOWN_SECONDS + 5));
+        persisted.dependency_actions_deferred_until = None;
+        persisted.last_ready_at = None;
+        supervisor.restore(persisted);
+
+        supervisor.record_engine_ready(false);
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, DockerRuntimeHealthState::Recovering);
+        assert_eq!(snapshot.code.as_deref(), Some("docker_runtime_recovering"));
+        assert!(supervisor.persisted_state().last_ready_at.is_some());
+    }
+
+    #[test]
+    fn supervisor_resolved_failure_can_become_healthy_after_recovery_window() {
+        let supervisor = DockerRuntimeSupervisor::new(None);
+        supervisor.record_engine_failure("docker_runtime_unavailable", "daemon missing");
+        supervisor.record_engine_ready(false);
+
+        let mut persisted = supervisor.persisted_state();
+        persisted.recovery_until = Some(Utc::now() - ChronoDuration::seconds(5));
+        persisted.next_restart_after = None;
+        persisted.dependency_actions_deferred_until = None;
+        supervisor.restore(persisted);
+
+        assert_eq!(
+            supervisor.snapshot().state,
+            DockerRuntimeHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn supervisor_expired_legacy_recovery_without_ready_marker_returns_to_degraded() {
+        let supervisor = DockerRuntimeSupervisor::new(None);
+        supervisor.record_engine_failure("docker_runtime_unavailable", "daemon missing");
+        supervisor.record_engine_ready(true);
+
+        let mut persisted = supervisor.persisted_state();
+        persisted.recovery_until = Some(Utc::now() - ChronoDuration::seconds(5));
+        persisted.next_restart_after = None;
+        persisted.dependency_actions_deferred_until = None;
+        persisted.last_ready_at = None;
+        supervisor.restore(persisted);
+
+        assert_eq!(
+            supervisor.snapshot().state,
+            DockerRuntimeHealthState::Degraded
+        );
     }
 
     #[test]

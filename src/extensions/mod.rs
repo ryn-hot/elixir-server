@@ -17,12 +17,15 @@ use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
 
 pub mod auto_managed;
+pub mod cloudstream_registry;
 pub mod managed_paths;
 pub mod manifest;
+pub mod nuvio_registry;
 pub mod package;
 pub mod permissions;
 pub mod registry;
 pub mod required_secrets;
+pub mod source_artifacts;
 pub mod store;
 pub mod updater;
 

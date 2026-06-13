@@ -15,10 +15,14 @@ use crate::orchestrator::model::ProviderEndpoint;
 pub const TORRENT_DEFAULT_LOGICAL_ID: &str = "downloaders.torrent.default";
 pub const USENET_DEFAULT_LOGICAL_ID: &str = "downloaders.usenet.default";
 pub const DEBRID_DEFAULT_LOGICAL_ID: &str = "acquisition.debrid.default";
+pub const HTTP_STREAM_DEFAULT_LOGICAL_ID: &str = "acquisition.http_stream.default";
 pub const DEFAULT_ROUTE_OWNER_ID: &str = "default";
 pub const DEBRID_ACCOUNT_MISSING_MESSAGE: &str = "Add debrid account";
 pub const DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE: &str = "Active debrid service is not configured";
 pub const DEBRID_SERVICE_UNAVAILABLE_MESSAGE: &str = "Active debrid service is unavailable";
+pub const HTTP_STREAM_MATERIALIZER_EXTENSION_ID: &str = "elixir.core.http_stream_materializer";
+const HTTP_STREAM_MATERIALIZER_CAPABILITY: &str = "acquisition.http_stream_materializer";
+const HTTP_STREAM_MATERIALIZER_IMPLEMENTATION: &str = "elixir_http_stream_materializer";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +30,7 @@ pub enum DownloadBrokerRole {
     Torrent,
     Usenet,
     DebridResolver,
+    HttpStream,
 }
 
 impl DownloadBrokerRole {
@@ -34,6 +39,7 @@ impl DownloadBrokerRole {
             TORRENT_DEFAULT_LOGICAL_ID => Ok(Self::Torrent),
             USENET_DEFAULT_LOGICAL_ID => Ok(Self::Usenet),
             DEBRID_DEFAULT_LOGICAL_ID => Ok(Self::DebridResolver),
+            HTTP_STREAM_DEFAULT_LOGICAL_ID => Ok(Self::HttpStream),
             other => bail!("unknown downloader logical id '{other}'"),
         }
     }
@@ -43,6 +49,7 @@ impl DownloadBrokerRole {
             Self::Torrent => TORRENT_DEFAULT_LOGICAL_ID,
             Self::Usenet => USENET_DEFAULT_LOGICAL_ID,
             Self::DebridResolver => DEBRID_DEFAULT_LOGICAL_ID,
+            Self::HttpStream => HTTP_STREAM_DEFAULT_LOGICAL_ID,
         }
     }
 
@@ -51,6 +58,7 @@ impl DownloadBrokerRole {
             "downloader.torrent" => Some(Self::Torrent),
             "downloader.nzb" => Some(Self::Usenet),
             "debrid.resolver" => Some(Self::DebridResolver),
+            HTTP_STREAM_MATERIALIZER_CAPABILITY => Some(Self::HttpStream),
             _ => None,
         }
     }
@@ -274,10 +282,36 @@ pub async fn list_logical_downloaders(
         });
     }
 
+    records.push(http_stream_materializer_provider_record());
     mark_selected_defaults(&mut records);
     Ok(DownloadBrokerInventory {
         downloaders: records,
     })
+}
+
+fn http_stream_materializer_provider_record() -> DownloadBrokerProviderRecord {
+    DownloadBrokerProviderRecord {
+        logical_id: HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string(),
+        broker_path: broker_path(HTTP_STREAM_DEFAULT_LOGICAL_ID),
+        endpoints: broker_endpoint_contract(HTTP_STREAM_DEFAULT_LOGICAL_ID),
+        role: DownloadBrokerRole::HttpStream,
+        provider_kind: DownloadBrokerProviderKind::Managed,
+        provider_id: http_stream_materializer_provider_id(),
+        instance_id: http_stream_materializer_instance_id(),
+        extension_id: HTTP_STREAM_MATERIALIZER_EXTENSION_ID.to_string(),
+        capability: HTTP_STREAM_MATERIALIZER_CAPABILITY.to_string(),
+        implementation: Some(HTTP_STREAM_MATERIALIZER_IMPLEMENTATION.to_string()),
+        health_state: ProviderHealthState::Healthy,
+        selected_for_default: false,
+    }
+}
+
+pub fn http_stream_materializer_provider_id() -> Uuid {
+    Uuid::from_u128(0x74d7bfa6_0dd2_4f8a_9e6f_86f43bc6f015)
+}
+
+pub fn http_stream_materializer_instance_id() -> Uuid {
+    Uuid::from_u128(0x89f1cc64_bf6f_40b1_a327_6cb45624fb9e)
 }
 
 pub async fn list_acquisition_routes(
@@ -290,6 +324,7 @@ pub async fn list_acquisition_routes(
         DownloadBrokerRole::Torrent,
         DownloadBrokerRole::Usenet,
         DownloadBrokerRole::DebridResolver,
+        DownloadBrokerRole::HttpStream,
     ] {
         let binding = load_route_binding(pool, role.logical_id(), DEFAULT_ROUTE_OWNER_ID).await?;
         routes.push(route_record_for_binding(
@@ -765,6 +800,15 @@ fn validate_route_update(
     update: &DownloadBrokerRouteUpdate,
 ) -> Result<()> {
     match update.binding_kind {
+        DownloadBrokerBindingKind::ManagedProtected if role == DownloadBrokerRole::HttpStream => {
+            bail!("http stream materializer route cannot use protected local downloader binding")
+        }
+        DownloadBrokerBindingKind::External if role == DownloadBrokerRole::HttpStream => {
+            bail!("http stream materializer route cannot use an external downloader binding")
+        }
+        DownloadBrokerBindingKind::Debrid if role == DownloadBrokerRole::HttpStream => {
+            bail!("http stream materializer route cannot use a debrid binding")
+        }
         DownloadBrokerBindingKind::Debrid if role != DownloadBrokerRole::DebridResolver => {
             bail!("debrid binding can only be used with the debrid resolver route")
         }
@@ -955,6 +999,7 @@ fn default_route_category(owner_id: &str, role: DownloadBrokerRole) -> Option<St
             DownloadBrokerRole::Torrent => "torrent",
             DownloadBrokerRole::Usenet => "usenet",
             DownloadBrokerRole::DebridResolver => "debrid",
+            DownloadBrokerRole::HttpStream => "http-stream",
         }
     ))
 }
@@ -1095,6 +1140,7 @@ fn broker_provider_kind(
             DownloadBrokerProviderKind::Managed
         }
         DownloadBrokerRole::DebridResolver => DownloadBrokerProviderKind::Debrid,
+        DownloadBrokerRole::HttpStream => DownloadBrokerProviderKind::Managed,
         _ => DownloadBrokerProviderKind::External,
     }
 }
@@ -1104,6 +1150,7 @@ fn mark_selected_defaults(records: &mut [DownloadBrokerProviderRecord]) {
         DownloadBrokerRole::Torrent,
         DownloadBrokerRole::Usenet,
         DownloadBrokerRole::DebridResolver,
+        DownloadBrokerRole::HttpStream,
     ] {
         if let Some(provider_id) = select_default_provider_id(records, role) {
             for record in records.iter_mut().filter(|record| record.role == role) {
@@ -1175,6 +1222,109 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    #[tokio::test]
+    async fn ess5_http_stream_route_is_internal_and_resolvable() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        let inventory = list_logical_downloaders(&store).await?;
+        let provider = inventory
+            .downloaders
+            .iter()
+            .find(|record| record.logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID)
+            .expect("http stream materializer provider");
+        assert_eq!(provider.role, DownloadBrokerRole::HttpStream);
+        assert_eq!(provider.provider_kind, DownloadBrokerProviderKind::Managed);
+        assert_eq!(provider.provider_id, http_stream_materializer_provider_id());
+        assert_eq!(
+            provider.implementation.as_deref(),
+            Some(HTTP_STREAM_MATERIALIZER_IMPLEMENTATION)
+        );
+        assert!(provider.selected_for_default);
+
+        let routes = list_acquisition_routes(&database.pool, &store).await?;
+        let route = routes
+            .routes
+            .iter()
+            .find(|route| {
+                route.logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID
+                    && route.owner_id == DEFAULT_ROUTE_OWNER_ID
+            })
+            .expect("http stream route");
+        assert_eq!(route.role, DownloadBrokerRole::HttpStream);
+        assert_eq!(route.binding_kind, DownloadBrokerBindingKind::Auto);
+        assert_eq!(route.selected_provider_id, Some(provider.provider_id));
+        assert_eq!(
+            route.selected_provider_kind,
+            Some(DownloadBrokerProviderKind::Managed)
+        );
+        assert!(route.blocker.is_none());
+        assert_eq!(route.candidates.len(), 1);
+        assert!(route.candidates[0].selected);
+
+        let resolved = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            DEFAULT_ROUTE_OWNER_ID,
+        )
+        .await?;
+        assert_eq!(resolved.record.provider_id, provider.provider_id);
+        assert_eq!(resolved.binding_kind, DownloadBrokerBindingKind::Auto);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess5_http_stream_route_rejects_non_materializer_bindings() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let provider_id = http_stream_materializer_provider_id();
+
+        let route = upsert_acquisition_route(
+            &database.pool,
+            &store,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            DownloadBrokerRouteUpdate {
+                binding_kind: DownloadBrokerBindingKind::ManagedDirect,
+                owner_id: None,
+                provider_id: Some(provider_id),
+                profile_id: None,
+                category: None,
+                download_path: None,
+                allow_shared_path: None,
+                status: None,
+            },
+        )
+        .await?;
+        assert_eq!(route.selected_provider_id, Some(provider_id));
+        assert!(route.blocker.is_none());
+
+        for binding_kind in [
+            DownloadBrokerBindingKind::ManagedProtected,
+            DownloadBrokerBindingKind::External,
+            DownloadBrokerBindingKind::Debrid,
+        ] {
+            let result = upsert_acquisition_route(
+                &database.pool,
+                &store,
+                HTTP_STREAM_DEFAULT_LOGICAL_ID,
+                DownloadBrokerRouteUpdate {
+                    binding_kind,
+                    owner_id: None,
+                    provider_id: None,
+                    profile_id: None,
+                    category: None,
+                    download_path: None,
+                    allow_shared_path: None,
+                    status: None,
+                },
+            )
+            .await;
+            assert!(result.is_err(), "{binding_kind:?} should be rejected");
+        }
+        Ok(())
     }
 
     async fn insert_extension_with_enabled(

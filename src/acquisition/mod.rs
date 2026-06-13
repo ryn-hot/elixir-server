@@ -2,9 +2,11 @@ pub mod audit;
 pub mod automation;
 pub mod episode_state;
 pub mod imports;
+pub mod language_policy;
 pub mod release_resolution;
 pub mod route_attempts;
 pub mod scoped_add;
+pub mod stream_materializer;
 pub mod subscriptions;
 
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +37,7 @@ use crate::{
         extensions::request_instance_service_json,
     },
     orchestrator::model::ProviderEndpoint,
+    runtime::health::DockerRuntimeHealthState,
     state::AppState,
 };
 
@@ -260,6 +263,13 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
     if intents.is_empty() {
         return Ok(());
     }
+    if let Some(reason) = docker_backed_acquisition_work_deferred(state) {
+        tracing::debug!(
+            active_intents = intents.len(),
+            "deferring acquisition recovery while Docker runtime is not ready: {reason}"
+        );
+        return Ok(());
+    }
 
     let contexts = load_provider_contexts(&store).await?;
     let provider_map: HashMap<Uuid, ProviderContext> = contexts
@@ -458,6 +468,34 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
     }
 
     Ok(())
+}
+
+pub(crate) fn docker_backed_acquisition_work_deferred(state: &AppState) -> Option<String> {
+    let snapshot = state.orchestrator.docker_runtime_snapshot();
+    if snapshot.reboot_recommended {
+        return Some(
+            snapshot
+                .reason
+                .unwrap_or_else(|| "Docker runtime requires a host reboot".to_string()),
+        );
+    }
+    if snapshot.state == DockerRuntimeHealthState::Degraded {
+        return Some(
+            snapshot
+                .reason
+                .unwrap_or_else(|| "Docker runtime is degraded".to_string()),
+        );
+    }
+    snapshot.dependency_actions_deferred_until.map(|until| {
+        let reason = snapshot.reason.unwrap_or_else(|| {
+            "Docker recovered recently and Elixir is waiting for core runtimes.".to_string()
+        });
+        format!(
+            "{} Dependency work is deferred until {}.",
+            reason,
+            until.to_rfc3339()
+        )
+    })
 }
 
 async fn execute_release_recovery(

@@ -5794,6 +5794,7 @@ fn resolve_volume_mount(raw: &str, paths: &RuntimePaths) -> Result<VolumeMount> 
 fn resolve_placeholders(raw: &str, paths: &RuntimePaths) -> Result<String> {
     let mut resolved = raw.to_string();
     resolved = resolved.replace("{data}", &paths.data_root);
+    resolved = resolved.replace("{extensions}", &paths.extensions_root);
     resolved = resolved.replace("{downloads}", &paths.downloads_root);
     resolved = resolved.replace("{media}", &paths.media_root);
     if resolved.contains('{') {

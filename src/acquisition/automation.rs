@@ -22,6 +22,7 @@ use crate::{
         EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_ROUTE_FALLBACK, NewAcquisitionAuditEvent,
         record_acquisition_audit_event,
     },
+    acquisition::language_policy::language_preference_from_quality_profile,
     acquisition::release_resolution::{
         anime::{
             ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
@@ -85,8 +86,10 @@ use crate::{
         get_debrid_job_status, list_eligible_debrid_route_attempts, submit_debrid,
     },
     download_broker::{
-        DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
-        USENET_DEFAULT_LOGICAL_ID, resolve_logical_downloader_for_owner,
+        DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, HTTP_STREAM_DEFAULT_LOGICAL_ID,
+        HTTP_STREAM_MATERIALIZER_EXTENSION_ID, TORRENT_DEFAULT_LOGICAL_ID,
+        USENET_DEFAULT_LOGICAL_ID, http_stream_materializer_provider_id,
+        resolve_logical_downloader_for_owner,
     },
     extensions::{ExternalIds, store::ExtensionStore},
     http::{
@@ -94,11 +97,15 @@ use crate::{
         handlers::{
             acquisition_sources::{
                 ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY, AcquisitionCandidate,
-                CandidateProviderSummary, CandidateRouteOption, CandidateScoreBadge,
-                CandidateSearchIntent, CandidateSearchPreferences, CandidateSearchRequest,
-                CandidateSearchResponse, CandidateSearchTarget,
-                acquisition_candidate_tracker_count, search_candidate_suite_with_store,
-                search_candidates_with_store,
+                AcquisitionCandidateFile, CandidateProviderSummary, CandidateRouteOption,
+                CandidateScoreBadge, CandidateSearchIntent, CandidateSearchPreferences,
+                CandidateSearchRequest, CandidateSearchResponse, CandidateSearchTarget,
+                StreamCandidateSearchRequest, StreamSearchPreferences, StreamSearchTarget,
+                StreamTitleVariant, acquisition_candidate_tracker_count,
+                search_candidate_suite_with_store, search_candidates_with_store,
+                search_stream_candidate_suite_with_store, stream_delivery_resolution_score,
+                stream_delivery_type_score, stream_target_confidence_score,
+                validate_stream_candidate_for_broker,
             },
             download_broker::{
                 DownloadBrokerSubmitRequest, DownloadBrokerSubmitResponse,
@@ -131,6 +138,8 @@ const DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP: i64 = 2;
 const DEFAULT_GLOBAL_USENET_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_SUBSCRIPTION_USENET_RELEASE_JOB_CAP: i64 = 2;
+const DEFAULT_GLOBAL_HTTP_STREAM_RELEASE_JOB_CAP: i64 = 2;
+const DEFAULT_SUBSCRIPTION_HTTP_STREAM_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_GLOBAL_RELEASE_JOB_CAP: i64 = 12;
 const DEFAULT_SUBSCRIPTION_RELEASE_JOB_CAP: i64 = 5;
 const DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK: usize = SEARCH_BATCH_LIMIT as usize;
@@ -393,7 +402,7 @@ struct SchedulerPlanScoreEvidence {
     overfetch_count: usize,
     source_rank: Option<u32>,
     source_score: Option<f64>,
-    score_tuple: (i32, usize, i32, i32, i32, i32, i32, i32, i64, i32, i32, i32),
+    score_tuple: [i64; 13],
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -510,6 +519,8 @@ struct QueueGovernorCaps {
     subscription_torrent: i64,
     global_usenet: i64,
     subscription_usenet: i64,
+    global_http_stream: i64,
+    subscription_http_stream: i64,
     max_candidate_searches_per_tick: usize,
     max_submissions_per_tick: usize,
     stale_active_job_seconds: i64,
@@ -528,6 +539,8 @@ impl Default for QueueGovernorCaps {
             subscription_torrent: DEFAULT_SUBSCRIPTION_TORRENT_RELEASE_JOB_CAP,
             global_usenet: DEFAULT_GLOBAL_USENET_RELEASE_JOB_CAP,
             subscription_usenet: DEFAULT_SUBSCRIPTION_USENET_RELEASE_JOB_CAP,
+            global_http_stream: DEFAULT_GLOBAL_HTTP_STREAM_RELEASE_JOB_CAP,
+            subscription_http_stream: DEFAULT_SUBSCRIPTION_HTTP_STREAM_RELEASE_JOB_CAP,
             max_candidate_searches_per_tick: DEFAULT_MAX_CANDIDATE_SEARCHES_PER_TICK,
             max_submissions_per_tick: DEFAULT_MAX_SUBMISSIONS_PER_TICK,
             stale_active_job_seconds: DEFAULT_STALE_ACTIVE_JOB_SECONDS,
@@ -588,6 +601,7 @@ impl QueueGovernor {
             DEBRID_DEFAULT_LOGICAL_ID,
             TORRENT_DEFAULT_LOGICAL_ID,
             USENET_DEFAULT_LOGICAL_ID,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
         ] {
             active_by_route.insert(
                 route.to_string(),
@@ -984,6 +998,10 @@ impl QueueGovernor {
             USENET_DEFAULT_LOGICAL_ID => {
                 Some((self.caps.global_usenet, self.caps.subscription_usenet))
             }
+            HTTP_STREAM_DEFAULT_LOGICAL_ID => Some((
+                self.caps.global_http_stream,
+                self.caps.subscription_http_stream,
+            )),
             _ => None,
         }
     }
@@ -1003,6 +1021,13 @@ pub async fn start_acquisition_automation_loop(state: AppState) {
 
 pub(crate) async fn run_acquisition_automation_iteration(state: &AppState) -> Result<()> {
     refresh_due_metadata(state).await?;
+    if let Some(reason) = super::docker_backed_acquisition_work_deferred(state) {
+        debug!(
+            "deferring Docker-backed acquisition automation while runtime is not ready: {reason}"
+        );
+        reconcile_terminal_acquisition_requests(state).await?;
+        return Ok(());
+    }
     process_stale_qbittorrent_acquisition_releases(state, FALLBACK_BATCH_LIMIT).await?;
     search_due_targets(state).await?;
     retry_failed_debrid_targets_with_next_route(state).await?;
@@ -1298,7 +1323,8 @@ async fn search_and_submit_group(
         candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
     let response = if subscription_uses_extension_suite(subscription) {
         request.provider_id = None;
-        search_candidate_suite_with_store(&state.db_pool, request).await?
+        search_extension_suite_candidates_for_group(state, subscription, group, &target, request)
+            .await?
     } else {
         search_candidates_with_store(&state.db_pool, request).await?
     };
@@ -1312,6 +1338,61 @@ async fn search_and_submit_group(
         governor,
     )
     .await
+}
+
+async fn search_extension_suite_candidates_for_group(
+    state: &AppState,
+    subscription: &AcquisitionSubscription,
+    group: &TargetSearchGroup,
+    target: &AcquisitionTarget,
+    request: CandidateSearchRequest,
+) -> Result<CandidateSearchResponse> {
+    let grouped_targets = if group.targets.is_empty() {
+        vec![target.clone()]
+    } else {
+        group.targets.clone()
+    };
+    let mut response = search_candidate_suite_with_store(&state.db_pool, request.clone()).await?;
+    let stream_request =
+        stream_candidate_search_request_for_group(subscription, target, &grouped_targets, &request);
+    match search_stream_candidate_suite_with_store(&state.db_pool, stream_request).await {
+        Ok(stream_response) => {
+            for warning in stream_response.warnings {
+                response.warnings.push(warning);
+            }
+            let mut converted = stream_response
+                .candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    match stream_candidate_to_acquisition_candidate(
+                        subscription,
+                        &grouped_targets,
+                        candidate,
+                    ) {
+                        Ok(Some(candidate)) => Some(candidate),
+                        Ok(None) => None,
+                        Err(err) => {
+                            response
+                                .warnings
+                                .push(format!("extension_suite:stream_bridge_rejected: {err}"));
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !converted.is_empty() {
+                response.route_options.push(http_stream_route_option());
+                response.candidates.append(&mut converted);
+                response.candidates.sort_by(|left, right| {
+                    compare_extension_suite_lane_candidates(right, left, subscription.route_policy)
+                });
+            }
+        }
+        Err(err) => response
+            .warnings
+            .push(format!("extension_suite:stream_provider_failed: {err}")),
+    }
+    Ok(response)
 }
 
 async fn process_candidate_search_response_for_group(
@@ -1491,6 +1572,7 @@ async fn build_candidate_release_plans(
         };
         if coverage.confidence == ReleaseConfidence::ReviewRequired
             || coverage.confidence == ReleaseConfidence::Low
+            || synthetic_stream_candidate_requires_manual_review(candidate)
             || coverage.covered_target_ids.is_empty()
         {
             batch.resolver_rejected_count += 1;
@@ -2385,6 +2467,14 @@ fn route_decision_reason(route_policy: AcquisitionRoutePolicy, route_logical_id:
             "debrid-first policy selected torrent fallback due to debrid capacity or availability"
                 .to_string()
         }
+        (AcquisitionRoutePolicy::DebridFirst, USENET_DEFAULT_LOGICAL_ID) => {
+            "debrid-first policy selected usenet fallback due to debrid capacity or availability"
+                .to_string()
+        }
+        (AcquisitionRoutePolicy::DebridFirst, HTTP_STREAM_DEFAULT_LOGICAL_ID) => {
+            "debrid-first policy selected stream materializer after stronger release routes were unavailable"
+                .to_string()
+        }
         (AcquisitionRoutePolicy::DebridOnly, _) => {
             "debrid-only policy selected debrid route".to_string()
         }
@@ -2745,6 +2835,28 @@ fn json_string_value(value: &JsonValue) -> Option<String> {
         .or_else(|| value.as_u64().map(|number| number.to_string()))
 }
 
+fn json_string_pointer(value: &JsonValue, pointer: &str) -> Option<String> {
+    value.pointer(pointer).and_then(json_string_value)
+}
+
+fn json_u64_pointer(value: &JsonValue, pointer: &str) -> Option<u64> {
+    value.pointer(pointer).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    })
+}
+
+fn json_f64_pointer(value: &JsonValue, pointer: &str) -> Option<f64> {
+    value.pointer(pointer).and_then(|value| {
+        value.as_f64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+        })
+    })
+}
+
 fn json_i32_field(value: &JsonValue, keys: &[&str]) -> Option<i32> {
     keys.iter()
         .filter_map(|key| value.get(*key))
@@ -2903,22 +3015,31 @@ fn compare_release_plans(
 fn release_plan_score_tuple(
     plan: &CandidateReleasePlan,
     route_policy: AcquisitionRoutePolicy,
-) -> (i32, usize, i32, i32, i32, i32, i32, i32, i64, i32, i32, i32) {
+) -> [i64; 13] {
     let candidate = &plan.selection.candidate;
-    (
-        confidence_rank(plan.confidence),
-        plan.covered_target_ids.len(),
-        route_preference_score(&plan.route_logical_id, route_policy),
-        cached_debrid_score(candidate.cached_debrid),
-        candidate_freshness_score(candidate),
-        candidate_safety_score(candidate),
-        quality_score(candidate.quality.as_deref()),
-        release_kind_rank(plan.release_kind),
+    [
+        i64::from(confidence_rank(plan.confidence)),
+        i64::try_from(plan.covered_target_ids.len()).unwrap_or(i64::MAX),
+        i64::from(route_preference_score(&plan.route_logical_id, route_policy)),
+        i64::from(cached_debrid_score(candidate.cached_debrid)),
+        i64::from(stream_candidate_delivery_score(candidate)),
+        i64::from(candidate_freshness_score(candidate)),
+        i64::from(candidate_safety_score(candidate)),
+        i64::from(quality_score(candidate.quality.as_deref())),
+        i64::from(release_kind_rank(plan.release_kind)),
         candidate.seeders.unwrap_or_default() as i64,
-        -(plan.overfetch_count as i32),
-        (candidate.score.unwrap_or(0.0) * 1000.0).round() as i32,
-        source_rank_score(candidate.rank),
-    )
+        -i64::try_from(plan.overfetch_count).unwrap_or(i64::MAX),
+        (candidate.score.unwrap_or(0.0) * 1000.0).round() as i64,
+        i64::from(source_rank_score(candidate.rank)),
+    ]
+}
+
+fn stream_candidate_delivery_score(candidate: &AcquisitionCandidate) -> i32 {
+    let Some(stream_candidate) = synthetic_stream_candidate_payload(candidate) else {
+        return 0;
+    };
+    stream_delivery_resolution_score(stream_candidate) * 10
+        + stream_delivery_type_score(stream_candidate)
 }
 
 fn confidence_rank(confidence: ReleaseConfidence) -> i32 {
@@ -2948,8 +3069,10 @@ fn route_preference_score(route: &str, route_policy: AcquisitionRoutePolicy) -> 
                 2
             } else if route == TORRENT_DEFAULT_LOGICAL_ID || route == USENET_DEFAULT_LOGICAL_ID {
                 1
-            } else {
+            } else if route == HTTP_STREAM_DEFAULT_LOGICAL_ID {
                 0
+            } else {
+                -1
             }
         }
         AcquisitionRoutePolicy::DebridOnly => (route == DEBRID_DEFAULT_LOGICAL_ID) as i32,
@@ -2971,8 +3094,13 @@ fn source_rank_score(rank: Option<u32>) -> i32 {
 }
 
 fn candidate_freshness_score(candidate: &AcquisitionCandidate) -> i32 {
-    if candidate.source_kind.eq_ignore_ascii_case("http") {
+    if candidate.source_kind.eq_ignore_ascii_case("http")
+        || candidate.source_kind.eq_ignore_ascii_case("http_file")
+    {
         return 4;
+    }
+    if candidate.source_kind.eq_ignore_ascii_case("http_stream") {
+        return 2;
     }
     let mut score = match candidate.cached_debrid {
         Some(true) => 8,
@@ -3170,6 +3298,7 @@ fn route_preference_order(
                 DEBRID_DEFAULT_LOGICAL_ID,
                 TORRENT_DEFAULT_LOGICAL_ID,
                 USENET_DEFAULT_LOGICAL_ID,
+                HTTP_STREAM_DEFAULT_LOGICAL_ID,
             ]
         }
         AcquisitionRoutePolicy::DebridOnly => vec![DEBRID_DEFAULT_LOGICAL_ID],
@@ -3179,6 +3308,7 @@ fn route_preference_order(
                 DEBRID_DEFAULT_LOGICAL_ID => Some(DEBRID_DEFAULT_LOGICAL_ID),
                 TORRENT_DEFAULT_LOGICAL_ID => Some(TORRENT_DEFAULT_LOGICAL_ID),
                 USENET_DEFAULT_LOGICAL_ID => Some(USENET_DEFAULT_LOGICAL_ID),
+                HTTP_STREAM_DEFAULT_LOGICAL_ID => Some(HTTP_STREAM_DEFAULT_LOGICAL_ID),
                 _ => None,
             }) {
                 Some(route) => vec![route],
@@ -3186,6 +3316,7 @@ fn route_preference_order(
                     DEBRID_DEFAULT_LOGICAL_ID,
                     TORRENT_DEFAULT_LOGICAL_ID,
                     USENET_DEFAULT_LOGICAL_ID,
+                    HTTP_STREAM_DEFAULT_LOGICAL_ID,
                 ],
             }
         }
@@ -4681,10 +4812,14 @@ fn broker_route_success_reason(
     match route_override {
         Some(TORRENT_DEFAULT_LOGICAL_ID) => "Submitted through torrent fallback.",
         Some(USENET_DEFAULT_LOGICAL_ID) => "Submitted through usenet fallback.",
+        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => "Submitted through stream materializer.",
         _ if route_logical_id == TORRENT_DEFAULT_LOGICAL_ID => {
             "Submitted through torrent fallback."
         }
         _ if route_logical_id == USENET_DEFAULT_LOGICAL_ID => "Submitted through usenet fallback.",
+        _ if route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID => {
+            "Submitted through stream materializer."
+        }
         _ => "Submitted through acquisition route.",
     }
 }
@@ -4985,6 +5120,9 @@ async fn submit_candidate_to_route(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(submission.candidate.clone()),
+        selected_stream_candidate: (route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID)
+            .then(|| synthetic_stream_candidate_payload(&submission.candidate).cloned())
+            .flatten(),
         release_fingerprint: Some(candidate_release_fingerprint(
             &submission.candidate,
             Some(submission.provider_id),
@@ -6615,12 +6753,433 @@ fn preferences_from_subscription(
     subscription: &AcquisitionSubscription,
 ) -> CandidateSearchPreferences {
     let profile = subscription.quality_profile.as_ref();
+    let media_type = subscription.media_type;
+    let language_preference = language_preference_from_quality_profile(profile, media_type);
+    let mut required_languages = json_string_array(profile, &["requiredLanguages", "languages"]);
+    if required_languages.is_empty() {
+        required_languages = language_preference.provider_language_hints(media_type);
+    }
     CandidateSearchPreferences {
         route_policy: Some(subscription.route_policy.as_str().to_string()),
         allowed_qualities: json_string_array(profile, &["allowedQualities", "qualities"]),
         max_size_bytes: json_u64(profile, &["maxSizeBytes", "max_size_bytes"]),
-        required_languages: json_string_array(profile, &["requiredLanguages", "languages"]),
+        required_languages,
+        language_preference: language_preference.active().then_some(language_preference),
     }
+}
+
+fn stream_candidate_search_request_for_group(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    request: &CandidateSearchRequest,
+) -> StreamCandidateSearchRequest {
+    let stream_targets = if targets.is_empty() {
+        vec![stream_search_target_for_acquisition_target(representative)]
+    } else {
+        targets
+            .iter()
+            .map(stream_search_target_for_acquisition_target)
+            .collect()
+    };
+    StreamCandidateSearchRequest {
+        provider_id: None,
+        media_type: request.media_type.clone(),
+        title: request.title.clone(),
+        year: request.year,
+        external_ids: request.external_ids.clone(),
+        titles: stream_title_variants_for_group(subscription, representative, targets, request),
+        targets: stream_targets,
+        preferences: stream_preferences_from_candidate_preferences(&request.preferences),
+        limit: request.limit,
+    }
+}
+
+fn stream_search_target_for_acquisition_target(target: &AcquisitionTarget) -> StreamSearchTarget {
+    StreamSearchTarget {
+        target_key: Some(target.target_key.clone()),
+        title: Some(target.title.clone()),
+        season_number: target.season_number,
+        episode_number: target.episode_number,
+        absolute_episode_number: target.absolute_episode_number,
+        air_date: target.air_date.clone(),
+        runtime_seconds: target_runtime_seconds(target),
+        metadata: target.metadata.clone(),
+    }
+}
+
+fn stream_preferences_from_candidate_preferences(
+    preferences: &CandidateSearchPreferences,
+) -> StreamSearchPreferences {
+    StreamSearchPreferences {
+        allowed_qualities: preferences.allowed_qualities.clone(),
+        required_languages: preferences.required_languages.clone(),
+        language_preference: preferences.language_preference.clone(),
+        language_profiles: preferences
+            .language_preference
+            .as_ref()
+            .map(|preference| preference.rule_for_media_type(MediaType::Anime).profiles)
+            .unwrap_or_default(),
+        subtitle_mode: None,
+        max_size_bytes: preferences.max_size_bytes,
+    }
+}
+
+fn stream_title_variants_for_group(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    request: &CandidateSearchRequest,
+) -> Vec<StreamTitleVariant> {
+    let mut variants = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_stream_title_variant(&mut variants, &mut seen, &request.title, "request");
+    push_stream_title_variant(&mut variants, &mut seen, &subscription.title, "canonical");
+    if let Some(scope) = subscription.scope.as_ref() {
+        if let Some(title) = scope
+            .get("media")
+            .and_then(|value| value.get("title"))
+            .and_then(JsonValue::as_str)
+        {
+            push_stream_title_variant(&mut variants, &mut seen, title, "scope");
+        }
+        push_stream_title_aliases(
+            &mut variants,
+            &mut seen,
+            scope.get("media").and_then(|value| value.get("aliases")),
+            "alias",
+        );
+    }
+    let targets = if targets.is_empty() {
+        vec![representative]
+    } else {
+        targets.iter().collect()
+    };
+    for target in targets {
+        push_stream_title_variant(&mut variants, &mut seen, &target.title, "target");
+        push_stream_title_aliases(
+            &mut variants,
+            &mut seen,
+            target
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("aliases")),
+            "alias",
+        );
+        push_stream_scoped_title_aliases(
+            &mut variants,
+            &mut seen,
+            target
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("scopedAliases")),
+        );
+    }
+    variants
+}
+
+fn push_stream_title_variant(
+    variants: &mut Vec<StreamTitleVariant>,
+    seen: &mut BTreeSet<String>,
+    value: &str,
+    kind: &str,
+) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    let kind = if kind.trim().is_empty() {
+        "alias"
+    } else {
+        kind.trim()
+    };
+    let key = format!(
+        "{}\u{1f}{}",
+        value.to_ascii_lowercase(),
+        kind.to_ascii_lowercase()
+    );
+    if seen.insert(key) {
+        variants.push(StreamTitleVariant {
+            value: value.to_string(),
+            kind: kind.to_string(),
+        });
+    }
+}
+
+fn push_stream_title_aliases(
+    variants: &mut Vec<StreamTitleVariant>,
+    seen: &mut BTreeSet<String>,
+    value: Option<&JsonValue>,
+    kind: &str,
+) {
+    let Some(values) = value.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for value in values {
+        if let Some(alias) = value.as_str() {
+            push_stream_title_variant(variants, seen, alias, kind);
+        }
+    }
+}
+
+fn push_stream_scoped_title_aliases(
+    variants: &mut Vec<StreamTitleVariant>,
+    seen: &mut BTreeSet<String>,
+    value: Option<&JsonValue>,
+) {
+    let Some(values) = value.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for value in values {
+        if let Some(display) = value.get("display").and_then(JsonValue::as_str) {
+            push_stream_title_variant(variants, seen, display, "scoped_alias");
+        }
+    }
+}
+
+fn target_runtime_seconds(target: &AcquisitionTarget) -> Option<u32> {
+    json_u64(
+        target.metadata.as_ref(),
+        &["runtimeSeconds", "runtime_seconds", "runtime"],
+    )
+    .and_then(|value| u32::try_from(value).ok())
+}
+
+fn stream_candidate_to_acquisition_candidate(
+    subscription: &AcquisitionSubscription,
+    targets: &[AcquisitionTarget],
+    candidate: JsonValue,
+) -> Result<Option<AcquisitionCandidate>> {
+    let (candidate, validation_warnings) = validate_stream_candidate_for_broker(candidate)?;
+    let target_key = json_string_pointer(&candidate, "/targetEvidence/targetKey")
+        .ok_or_else(|| anyhow!("stream targetEvidence.targetKey is missing"))?;
+    let Some(target) = targets
+        .iter()
+        .find(|target| target.target_key == target_key)
+    else {
+        return Ok(None);
+    };
+    let source = json_string_pointer(&candidate, "/source")
+        .ok_or_else(|| anyhow!("stream candidate source is missing"))?;
+    let source_kind = json_string_pointer(&candidate, "/sourceKind")
+        .ok_or_else(|| anyhow!("stream candidate sourceKind is missing"))?;
+    let title = synthetic_stream_release_title(subscription, target, &candidate);
+    let file_path = synthetic_stream_file_path(&title);
+    let stream_type = json_string_pointer(&candidate, "/delivery/streamType")
+        .unwrap_or_else(|| "unknown".to_string());
+    let quality = json_string_pointer(&candidate, "/quality");
+    let size_bytes = json_u64_pointer(&candidate, "/sizeBytes");
+    let language = json_string_pointer(&candidate, "/language");
+    let rank = json_u64_pointer(&candidate, "/rank").and_then(|value| u32::try_from(value).ok());
+    let score = json_f64_pointer(&candidate, "/score");
+    let id = json_string_pointer(&candidate, "/id");
+
+    let mut acquisition_candidate = AcquisitionCandidate {
+        id: id.as_ref().map(|value| format!("stream:{value}")),
+        title: title.clone(),
+        source,
+        source_kind,
+        info_hash: None,
+        file_index: Some(0),
+        quality,
+        size_bytes,
+        seeders: None,
+        language,
+        cached_debrid: None,
+        rank,
+        score,
+        score_badges: vec![
+            CandidateScoreBadge {
+                label: "Stream target".to_string(),
+                detail: Some(format!(
+                    "{} confidence for {} via stream provider evidence.",
+                    json_string_pointer(&candidate, "/targetEvidence/confidence")
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    target.target_key
+                )),
+                score: Some(f64::from(stream_target_confidence_score(&candidate))),
+            },
+            CandidateScoreBadge {
+                label: "Stream delivery".to_string(),
+                detail: Some(format!(
+                    "{stream_type} delivery through Elixir stream materializer."
+                )),
+                score: Some(f64::from(stream_delivery_type_score(&candidate))),
+            },
+        ],
+        files: vec![AcquisitionCandidateFile {
+            file_id: id.clone().or_else(|| Some(target_key.clone())),
+            file_index: Some(0),
+            path: file_path,
+            size_bytes,
+            selectable: Some(true),
+        }],
+        supported_routes: vec![HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string()],
+        default_route: Some(HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string()),
+        raw: Some(synthetic_stream_candidate_raw(
+            subscription,
+            target,
+            &candidate,
+            &validation_warnings,
+            &title,
+        )),
+    };
+    if !validation_warnings.is_empty() {
+        acquisition_candidate
+            .score_badges
+            .push(CandidateScoreBadge {
+                label: "Stream validation".to_string(),
+                detail: Some(validation_warnings.join("; ")),
+                score: Some(-0.05),
+            });
+    }
+    Ok(Some(acquisition_candidate))
+}
+
+fn synthetic_stream_release_title(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    candidate: &JsonValue,
+) -> String {
+    match subscription.media_type {
+        MediaType::Movie => match subscription.year {
+            Some(year) => format!("{} ({year})", subscription.title),
+            None => subscription.title.clone(),
+        },
+        MediaType::Series | MediaType::Anime => {
+            let target_key = json_string_pointer(candidate, "/targetEvidence/targetKey")
+                .unwrap_or_else(|| target.target_key.clone());
+            format!("{} {target_key}", subscription.title)
+        }
+    }
+}
+
+fn synthetic_stream_file_path(title: &str) -> String {
+    format!("{title}.mkv")
+}
+
+fn synthetic_stream_candidate_raw(
+    subscription: &AcquisitionSubscription,
+    target: &AcquisitionTarget,
+    stream_candidate: &JsonValue,
+    validation_warnings: &[String],
+    synthetic_title: &str,
+) -> JsonValue {
+    let mut raw = stream_candidate
+        .get("raw")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut server_evidence = raw
+        .remove("serverEvidence")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut suite_evidence = server_evidence
+        .remove("extensionSuite")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    suite_evidence
+        .entry("lane".to_string())
+        .or_insert_with(|| json!("stream"));
+    suite_evidence.insert(
+        "routeOptions".to_string(),
+        json!([http_stream_route_option()]),
+    );
+    server_evidence.insert(
+        "extensionSuite".to_string(),
+        JsonValue::Object(suite_evidence),
+    );
+    server_evidence.insert("streamCandidate".to_string(), stream_candidate.clone());
+    server_evidence.insert(
+        "extensionSuiteRanking".to_string(),
+        json!({
+            "policyVersion": "ess9-extension-suite-lane-ranking-v1",
+            "lane": "stream",
+            "routePolicy": subscription.route_policy.as_str(),
+            "targetKey": target.target_key,
+            "targetConfidence": json_string_pointer(stream_candidate, "/targetEvidence/confidence"),
+            "targetConfidenceScore": stream_target_confidence_score(stream_candidate),
+            "deliveryStreamType": json_string_pointer(stream_candidate, "/delivery/streamType"),
+            "deliveryResolutionScore": stream_delivery_resolution_score(stream_candidate),
+            "deliveryTypeScore": stream_delivery_type_score(stream_candidate),
+            "sourceScore": json_f64_pointer(stream_candidate, "/score"),
+            "sourceRank": json_u64_pointer(stream_candidate, "/rank"),
+            "syntheticTitle": synthetic_title,
+            "originalStreamTitle": json_string_pointer(stream_candidate, "/title"),
+            "routeLogicalId": HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            "validationWarnings": validation_warnings,
+        }),
+    );
+    raw.insert(
+        "serverEvidence".to_string(),
+        JsonValue::Object(server_evidence),
+    );
+    JsonValue::Object(raw)
+}
+
+fn http_stream_route_option() -> CandidateRouteOption {
+    CandidateRouteOption {
+        logical_id: HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string(),
+        label: "Elixir stream materializer".to_string(),
+        available: true,
+        selected_provider_id: Some(http_stream_materializer_provider_id()),
+        selected_extension_id: Some(HTTP_STREAM_MATERIALIZER_EXTENSION_ID.to_string()),
+        blocker: None,
+    }
+}
+
+fn synthetic_stream_candidate_payload(candidate: &AcquisitionCandidate) -> Option<&JsonValue> {
+    candidate
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.pointer("/serverEvidence/streamCandidate"))
+}
+
+fn synthetic_stream_candidate_requires_manual_review(candidate: &AcquisitionCandidate) -> bool {
+    synthetic_stream_candidate_payload(candidate)
+        .map(stream_target_confidence_score)
+        .is_some_and(|score| score < 3)
+}
+
+fn compare_extension_suite_lane_candidates(
+    left: &AcquisitionCandidate,
+    right: &AcquisitionCandidate,
+    route_policy: AcquisitionRoutePolicy,
+) -> Ordering {
+    extension_suite_lane_candidate_score_tuple(left, route_policy)
+        .cmp(&extension_suite_lane_candidate_score_tuple(
+            right,
+            route_policy,
+        ))
+        .then_with(|| right.title.cmp(&left.title))
+}
+
+fn extension_suite_lane_candidate_score_tuple(
+    candidate: &AcquisitionCandidate,
+    route_policy: AcquisitionRoutePolicy,
+) -> (i32, i32, i32, i32, i32, i32, i32, i32, i64, i32) {
+    let stream_candidate = synthetic_stream_candidate_payload(candidate);
+    (
+        route_preference_score(
+            candidate.default_route.as_deref().unwrap_or_default(),
+            route_policy,
+        ),
+        cached_debrid_score(candidate.cached_debrid),
+        stream_candidate
+            .map(stream_target_confidence_score)
+            .unwrap_or_default(),
+        stream_candidate
+            .map(stream_delivery_resolution_score)
+            .unwrap_or_default(),
+        stream_candidate
+            .map(stream_delivery_type_score)
+            .unwrap_or_default(),
+        candidate_freshness_score(candidate),
+        candidate_safety_score(candidate),
+        quality_score(candidate.quality.as_deref()),
+        candidate.seeders.unwrap_or_default() as i64,
+        source_rank_score(candidate.rank),
+    )
 }
 
 fn anime_candidate_scoring_context(
@@ -6971,6 +7530,8 @@ fn candidate_score_tuple(
         AcquisitionRoutePolicy::DebridFirst | AcquisitionRoutePolicy::Manual => {
             if candidate_supports_route(candidate, DEBRID_DEFAULT_LOGICAL_ID) {
                 2
+            } else if candidate_supports_route(candidate, HTTP_STREAM_DEFAULT_LOGICAL_ID) {
+                0
             } else {
                 1
             }
@@ -7015,6 +7576,7 @@ fn candidate_allowed_by_policy(
             candidate_supports_debrid(candidate)
                 || candidate_supports_torrent(candidate)
                 || candidate_supports_usenet(candidate)
+                || candidate_supports_http_stream(candidate)
         }
     }
 }
@@ -7051,6 +7613,7 @@ fn validate_selected_candidate_route(route: &str, candidate: &AcquisitionCandida
     if route != DEBRID_DEFAULT_LOGICAL_ID
         && route != TORRENT_DEFAULT_LOGICAL_ID
         && route != USENET_DEFAULT_LOGICAL_ID
+        && route != HTTP_STREAM_DEFAULT_LOGICAL_ID
     {
         bail!("unsupported selected route '{route}'");
     }
@@ -7065,6 +7628,7 @@ enum CandidateRouteFamily {
     Debrid,
     Torrent,
     Usenet,
+    HttpStream,
 }
 
 fn candidate_route_family(route: &str) -> Option<CandidateRouteFamily> {
@@ -7072,6 +7636,7 @@ fn candidate_route_family(route: &str) -> Option<CandidateRouteFamily> {
         DEBRID_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Debrid),
         TORRENT_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Torrent),
         USENET_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::Usenet),
+        HTTP_STREAM_DEFAULT_LOGICAL_ID => Some(CandidateRouteFamily::HttpStream),
         _ => None,
     }
 }
@@ -7098,6 +7663,10 @@ fn candidate_supports_usenet(candidate: &AcquisitionCandidate) -> bool {
     candidate_supports_route(candidate, USENET_DEFAULT_LOGICAL_ID)
 }
 
+fn candidate_supports_http_stream(candidate: &AcquisitionCandidate) -> bool {
+    candidate_supports_route(candidate, HTTP_STREAM_DEFAULT_LOGICAL_ID)
+}
+
 fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bool {
     if !candidate.supported_routes.is_empty() {
         return candidate
@@ -7116,6 +7685,9 @@ fn candidate_supports_route(candidate: &AcquisitionCandidate, route: &str) -> bo
             matches!(source_kind.as_str(), "nzb" | "usenet")
                 || (matches!(source_kind.as_str(), "http" | "url")
                     && candidate_source_looks_like_nzb(&candidate.source))
+        }
+        Some(CandidateRouteFamily::HttpStream) => {
+            matches!(source_kind.as_str(), "http_file" | "http_stream")
         }
         None => false,
     }
@@ -7161,12 +7733,6 @@ fn candidate_allowed_by_subscription_preferences(
     {
         return false;
     }
-    let required_languages = json_string_array(profile, &["requiredLanguages", "languages"]);
-    if !required_languages.is_empty()
-        && !language_matches_any(candidate.language.as_deref(), &required_languages)
-    {
-        return false;
-    }
     true
 }
 
@@ -7176,17 +7742,6 @@ fn quality_matches_any(value: Option<&str>, allowed: &[String]) -> bool {
     };
     let lower = value.to_ascii_lowercase();
     allowed
-        .iter()
-        .map(|item| item.to_ascii_lowercase())
-        .any(|item| lower.contains(&item))
-}
-
-fn language_matches_any(value: Option<&str>, required: &[String]) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let lower = value.to_ascii_lowercase();
-    required
         .iter()
         .map(|item| item.to_ascii_lowercase())
         .any(|item| lower.contains(&item))
@@ -9003,6 +9558,71 @@ mod tests {
         }
     }
 
+    fn stream_candidate_value(
+        id: &str,
+        target_key: &str,
+        confidence: &str,
+        stream_type: &str,
+    ) -> JsonValue {
+        let provider_id = Uuid::new_v4();
+        let source_kind = if stream_type.eq_ignore_ascii_case("direct_file") {
+            "http_file"
+        } else {
+            "http_stream"
+        };
+        json!({
+            "id": id,
+            "candidateKind": "stream",
+            "title": format!("Hoster Display Title {id}"),
+            "source": format!("https://stream.example/{id}/master.m3u8"),
+            "sourceKind": source_kind,
+            "quality": "1080p",
+            "language": "eng",
+            "rank": 1,
+            "score": 88.0,
+            "supportedRoutes": [HTTP_STREAM_DEFAULT_LOGICAL_ID],
+            "defaultRoute": HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            "targetEvidence": {
+                "mediaType": "series",
+                "targetKey": target_key,
+                "seasonNumber": 1,
+                "episodeNumber": 2,
+                "confidence": confidence,
+                "reasons": ["provider target id matched"]
+            },
+            "delivery": {
+                "streamType": stream_type,
+                "url": format!("https://cdn.example/{id}/playlist.m3u8"),
+                "resolveRequired": false
+            },
+            "mediaEvidence": {
+                "resolution": 1080,
+                "audioLanguages": ["eng"]
+            },
+            "sourceModule": {
+                "id": "fixture-stream-source",
+                "name": "Fixture Stream Source",
+                "type": "cloudstream"
+            },
+            "raw": {
+                "serverEvidence": {
+                    "extensionSuite": {
+                        "providerId": provider_id.to_string(),
+                        "extensionId": "elixir.sources.stream.fixture",
+                        "extensionName": "Fixture Stream Source",
+                        "instanceId": Uuid::new_v4().to_string(),
+                        "instanceName": "default",
+                        "capability": "acquisition.stream_candidate_provider",
+                        "implementation": "fixture_stream",
+                        "mediaTypes": ["series"],
+                        "actions": ["search"],
+                        "warnings": []
+                    }
+                }
+            }
+        })
+    }
+
     #[test]
     fn candidate_supports_route_accepts_usenet_nzb() {
         let mut nzb = candidate("Example.Release.1080p-GROUP", Vec::new(), None, None);
@@ -9024,6 +9644,337 @@ mod tests {
         hoster_url.source_kind = "http".to_string();
         assert!(candidate_supports_debrid(&hoster_url));
         assert!(!candidate_supports_usenet(&hoster_url));
+    }
+
+    #[test]
+    fn ess9_candidate_supports_http_stream_route() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("stream-route", "S01E02", "high", "hls"),
+        )?
+        .expect("stream candidate should map to target");
+
+        assert!(candidate_supports_http_stream(&stream));
+        assert!(!candidate_supports_debrid(&stream));
+        assert_eq!(
+            select_candidate_route(None, AcquisitionRoutePolicy::DebridFirst, &stream)?,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID
+        );
+        assert_eq!(
+            stream
+                .raw
+                .as_ref()
+                .and_then(
+                    |raw| raw.pointer("/serverEvidence/extensionSuite/routeOptions/0/logicalId")
+                )
+                .and_then(JsonValue::as_str),
+            Some(HTTP_STREAM_DEFAULT_LOGICAL_ID)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ess9_stream_bridge_uses_canonical_target_title_and_preserves_payload() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("bridge", "S01E02", "high", "hls"),
+        )?
+        .expect("stream candidate should map to target");
+
+        assert_eq!(stream.title, "Show S01E02");
+        assert_eq!(stream.files[0].path, "Show S01E02.mkv");
+        assert_eq!(
+            synthetic_stream_candidate_payload(&stream)
+                .and_then(|value| value.pointer("/title"))
+                .and_then(JsonValue::as_str),
+            Some("Hoster Display Title bridge")
+        );
+        let coverage = analyze_candidate_coverage(
+            &subscription,
+            &target,
+            std::slice::from_ref(&target),
+            &stream,
+        )
+        .expect("synthetic stream candidate should resolve through TV resolver");
+        assert_eq!(coverage.confidence, ReleaseConfidence::High);
+        assert!(coverage.covered_target_ids.contains(&target.target_id));
+        Ok(())
+    }
+
+    #[test]
+    fn ess9_cached_and_local_release_candidates_outrank_stream_candidates() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("rank-stream", "S01E02", "high", "hls"),
+        )?
+        .expect("stream candidate should map to target");
+        let stream_plan = release_plan_for_test(
+            stream,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let cached_debrid = release_plan_for_test(
+            candidate(
+                "Show.S01E02.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(0),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let healthy_torrent = release_plan_for_test(
+            candidate(
+                "Show.S01E02.1080p.WEB-DL-GROUP",
+                vec![TORRENT_DEFAULT_LOGICAL_ID],
+                None,
+                Some(40),
+            ),
+            TORRENT_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+
+        assert_eq!(
+            compare_release_plans(
+                &cached_debrid,
+                &stream_plan,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_release_plans(
+                &healthy_torrent,
+                &stream_plan,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cs12_cached_debrid_release_outranks_cloudstream_candidate() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let mut cloudstream_value =
+            stream_candidate_value("cloudstream-hls", "S01E02", "high", "hls");
+        cloudstream_value["sourceModule"]["id"] = json!("cloudstream.fixture");
+        cloudstream_value["sourceModule"]["type"] = json!("cloudstream");
+        cloudstream_value["raw"]["serverEvidence"]["extensionSuite"]["extensionId"] =
+            json!("elixir.sources.cloudstream_compat");
+        cloudstream_value["raw"]["serverEvidence"]["extensionSuite"]["implementation"] =
+            json!("cloudstream_compat");
+        let stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            cloudstream_value,
+        )?
+        .expect("cloudstream candidate should map to target");
+        let stream_plan = release_plan_for_test(
+            stream,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let cached_debrid = release_plan_for_test(
+            candidate(
+                "Show.S01E02.1080p.WEB-DL-GROUP",
+                vec![DEBRID_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(0),
+            ),
+            DEBRID_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+
+        assert_eq!(
+            compare_release_plans(
+                &cached_debrid,
+                &stream_plan,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cs12_stream_wins_when_release_lane_has_no_valid_route() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("stream-only", "S01E02", "high", "direct_file"),
+        )?
+        .expect("stream candidate should map to target");
+        let invalid_release = candidate(
+            "Show.S01E02.1080p.WEB-DL-GROUP",
+            vec!["unsupported.route"],
+            Some(true),
+            Some(250),
+        );
+
+        let selection = select_best_candidate(
+            &[invalid_release, stream],
+            AcquisitionRoutePolicy::DebridFirst,
+            None,
+        )
+        .expect("stream should be the only policy-valid candidate");
+
+        assert!(candidate_supports_http_stream(&selection.candidate));
+        assert!(!candidate_supports_debrid(&selection.candidate));
+        assert!(!candidate_supports_torrent(&selection.candidate));
+        assert!(!candidate_supports_usenet(&selection.candidate));
+        assert_eq!(
+            select_candidate_route(
+                None,
+                AcquisitionRoutePolicy::DebridFirst,
+                &selection.candidate,
+            )?,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ess9_high_confidence_stream_beats_weaker_release_and_ambiguous_stream_requires_review()
+    -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let high_stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("high-stream", "S01E02", "high", "hls"),
+        )?
+        .expect("stream candidate should map to target");
+        let medium_stream = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("medium-stream", "S01E02", "medium", "hls"),
+        )?
+        .expect("stream candidate should map to target");
+        let high_stream_plan = release_plan_for_test(
+            high_stream,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::High,
+            std::slice::from_ref(&target),
+        );
+        let weak_release = release_plan_for_test(
+            candidate(
+                "Show.S01E02.1080p.WEB-DL-GROUP",
+                vec![TORRENT_DEFAULT_LOGICAL_ID],
+                None,
+                Some(40),
+            ),
+            TORRENT_DEFAULT_LOGICAL_ID,
+            ReleaseKind::Single,
+            ReleaseConfidence::Medium,
+            std::slice::from_ref(&target),
+        );
+
+        assert_eq!(
+            compare_release_plans(
+                &high_stream_plan,
+                &weak_release,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        assert!(synthetic_stream_candidate_requires_manual_review(
+            &medium_stream
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ess9_direct_file_stream_outranks_hls_when_other_evidence_matches() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let direct_file = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("direct", "S01E02", "high", "direct_file"),
+        )?
+        .expect("direct file should map to target");
+        let hls = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("hls", "S01E02", "high", "hls"),
+        )?
+        .expect("hls should map to target");
+
+        assert_eq!(
+            compare_extension_suite_lane_candidates(
+                &direct_file,
+                &hls,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cs12_direct_stream_delivery_outranks_hls_and_dash() -> Result<()> {
+        let subscription = test_subscription();
+        let target = episode_target(&subscription, 1, 2);
+        let direct_file = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("direct-cs12", "S01E02", "high", "direct_file"),
+        )?
+        .expect("direct file should map to target");
+        let hls = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("hls-cs12", "S01E02", "high", "hls"),
+        )?
+        .expect("hls should map to target");
+        let dash = stream_candidate_to_acquisition_candidate(
+            &subscription,
+            std::slice::from_ref(&target),
+            stream_candidate_value("dash-cs12", "S01E02", "high", "dash"),
+        )?
+        .expect("dash should map to target");
+
+        assert_eq!(
+            compare_extension_suite_lane_candidates(
+                &direct_file,
+                &hls,
+                AcquisitionRoutePolicy::DebridFirst,
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_extension_suite_lane_candidates(
+                &hls,
+                &dash,
+                AcquisitionRoutePolicy::DebridFirst
+            ),
+            Ordering::Greater
+        );
+        Ok(())
     }
 
     #[test]

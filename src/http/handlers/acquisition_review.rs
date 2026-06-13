@@ -1029,6 +1029,7 @@ async fn submit_review_release_to_broker(
             media_type: Some(release.media_type),
             media_title: Some(release.title.clone()),
             selected_candidate: Some(candidate),
+            selected_stream_candidate: None,
             release_fingerprint: Some(release.fingerprint.clone()),
         },
     )
