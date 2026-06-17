@@ -152,6 +152,9 @@ async fn migrations_create_cloudstream_source_registry_tables() -> Result<()> {
         "extension_source_module_versions",
         "extension_source_health_events",
         "extension_source_replacement_recommendations",
+        "extension_source_module_certifications",
+        "extension_source_module_quarantines",
+        "extension_source_certification_jobs",
     ] {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",

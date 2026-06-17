@@ -557,6 +557,103 @@ pub struct ExtensionSourceHealthEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewExtensionSourceModuleCertification {
+    pub certification_id: Uuid,
+    pub source_module_id: Uuid,
+    pub source_module_version_id: Option<Uuid>,
+    pub instance_id: Uuid,
+    pub adapter: String,
+    pub status: String,
+    pub failure_class: Option<String>,
+    pub summary: Option<String>,
+    pub media_type_results_json: serde_json::Value,
+    pub materialization_results_json: serde_json::Value,
+    pub probe_targets_json: serde_json::Value,
+    pub candidate_evidence_json: serde_json::Value,
+    pub runtime_version: Option<String>,
+    pub policy_version: String,
+    pub certified_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceModuleCertification {
+    pub certification_id: Uuid,
+    pub source_module_id: Uuid,
+    pub source_module_version_id: Option<Uuid>,
+    pub instance_id: Uuid,
+    pub adapter: String,
+    pub status: String,
+    pub failure_class: Option<String>,
+    pub summary: Option<String>,
+    pub media_type_results_json: serde_json::Value,
+    pub materialization_results_json: serde_json::Value,
+    pub probe_targets_json: serde_json::Value,
+    pub candidate_evidence_json: serde_json::Value,
+    pub runtime_version: Option<String>,
+    pub policy_version: String,
+    pub certified_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceCertificationJob {
+    pub job_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_id: Option<Uuid>,
+    pub source_module_id: Option<Uuid>,
+    pub requested_by: String,
+    pub reason: String,
+    pub status: String,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub language_eligibility: Option<String>,
+    pub marketplace_state: Option<String>,
+    pub summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSourceCertificationJob {
+    pub job_id: Uuid,
+    pub instance_id: Uuid,
+    pub registry_id: Option<Uuid>,
+    pub source_module_id: Option<Uuid>,
+    pub requested_by: String,
+    pub reason: String,
+    pub status: String,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub language_eligibility: Option<String>,
+    pub marketplace_state: Option<String>,
+    pub summary: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExtensionSourceModuleQuarantine {
+    pub quarantine_id: Uuid,
+    pub source_module_id: Uuid,
+    pub source_module_version_id: Option<Uuid>,
+    pub instance_id: Uuid,
+    pub failure_class: String,
+    pub hoster_domain: Option<String>,
+    pub candidate_fingerprint: Option<String>,
+    pub media_type: Option<String>,
+    pub reason: Option<String>,
+    pub evidence_json: Option<serde_json::Value>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewExtensionSourceReplacementRecommendation {
     pub recommendation_id: Uuid,
     pub source_module_id: Uuid,
@@ -3440,6 +3537,18 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn delete_source_registry(&self, registry_id: Uuid) -> Result<u64> {
+        let affected = sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_registries
+             WHERE registry_id = ?",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
     pub async fn upsert_source_module(&self, data: &NewExtensionSourceModule) -> Result<()> {
         validate_source_module(data)?;
         let media_types_json = json_to_string(data.media_types_json.as_ref())?;
@@ -3728,6 +3837,52 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
+    pub async fn set_source_module_installed_state(
+        &self,
+        source_module_id: Uuid,
+        installed: bool,
+        active_version: Option<&str>,
+        health_state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_modules.health_state",
+            health_state,
+            SOURCE_MODULE_HEALTH_STATES,
+        )?;
+        let failure_state = matches!(
+            health_state,
+            "degraded" | "broken" | "unsupported" | "account_required" | "disabled"
+        );
+        let clears_last_error = matches!(health_state, "available" | "healthy");
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET installed = ?,
+                 active_version = ?,
+                 health_state = ?,
+                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+                 last_error = CASE
+                    WHEN ? = 1 THEN COALESCE(?, ?)
+                    WHEN ? = 1 THEN NULL
+                    ELSE last_error
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind(installed)
+        .bind(active_version.map(str::trim))
+        .bind(health_state.trim())
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(if failure_state { 1_i64 } else { 0_i64 })
+        .bind(last_error.map(str::trim))
+        .bind(health_state.trim())
+        .bind(if clears_last_error { 1_i64 } else { 0_i64 })
+        .bind(source_module_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_source_module_replacement_recommendation_key(
         &self,
         source_module_id: Uuid,
@@ -3964,6 +4119,581 @@ impl<'a> ExtensionStore<'a> {
         rows.iter().map(map_source_health_event).collect()
     }
 
+    pub async fn upsert_source_module_certification(
+        &self,
+        data: &NewExtensionSourceModuleCertification,
+    ) -> Result<()> {
+        validate_source_module_certification(data)?;
+        let media_type_results_json = json_to_string(Some(&data.media_type_results_json))?;
+        let materialization_results_json =
+            json_to_string(Some(&data.materialization_results_json))?;
+        let probe_targets_json = json_to_string(Some(&data.probe_targets_json))?;
+        let candidate_evidence_json = json_to_string(Some(&data.candidate_evidence_json))?;
+        let certified_at = data.certified_at.map(db_datetime_string);
+        let expires_at = data.expires_at.map(db_datetime_string);
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_module_certifications (
+                certification_id,
+                source_module_id,
+                source_module_version_id,
+                instance_id,
+                adapter,
+                status,
+                failure_class,
+                summary,
+                media_type_results_json,
+                materialization_results_json,
+                probe_targets_json,
+                candidate_evidence_json,
+                runtime_version,
+                policy_version,
+                certified_at,
+                expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source_module_id, source_module_version_id, instance_id, adapter) DO UPDATE SET
+                certification_id = excluded.certification_id,
+                status = excluded.status,
+                failure_class = excluded.failure_class,
+                summary = excluded.summary,
+                media_type_results_json = excluded.media_type_results_json,
+                materialization_results_json = excluded.materialization_results_json,
+                probe_targets_json = excluded.probe_targets_json,
+                candidate_evidence_json = excluded.candidate_evidence_json,
+                runtime_version = excluded.runtime_version,
+                policy_version = excluded.policy_version,
+                certified_at = excluded.certified_at,
+                expires_at = excluded.expires_at,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.certification_id.to_string())
+        .bind(data.source_module_id.to_string())
+        .bind(data.source_module_version_id.map(|id| id.to_string()))
+        .bind(data.instance_id.to_string())
+        .bind(data.adapter.trim())
+        .bind(data.status.trim())
+        .bind(data.failure_class.as_deref().map(str::trim))
+        .bind(data.summary.as_deref().map(str::trim))
+        .bind(media_type_results_json)
+        .bind(materialization_results_json)
+        .bind(probe_targets_json)
+        .bind(candidate_evidence_json)
+        .bind(data.runtime_version.as_deref().map(str::trim))
+        .bind(data.policy_version.trim())
+        .bind(certified_at.as_deref())
+        .bind(expires_at.as_deref())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_latest_source_module_certifications(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Vec<ExtensionSourceModuleCertification>> {
+        let rows = sqlx::query(
+            "SELECT
+                certification_id,
+                source_module_id,
+                CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                instance_id,
+                adapter,
+                status,
+                CAST(failure_class AS TEXT) AS failure_class,
+                CAST(summary AS TEXT) AS summary,
+                media_type_results_json,
+                materialization_results_json,
+                probe_targets_json,
+                candidate_evidence_json,
+                CAST(runtime_version AS TEXT) AS runtime_version,
+                policy_version,
+                CAST(certified_at AS TEXT) AS certified_at,
+                CAST(expires_at AS TEXT) AS expires_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_module_certifications
+             WHERE instance_id = ?
+             ORDER BY updated_at DESC, created_at DESC",
+        )
+        .bind(instance_id.to_string())
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let certification = map_source_module_certification(&row)?;
+            if seen.insert(certification.source_module_id) {
+                out.push(certification);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn latest_source_module_certification(
+        &self,
+        source_module_id: Uuid,
+    ) -> Result<Option<ExtensionSourceModuleCertification>> {
+        let row = sqlx::query(
+            "SELECT
+                certification_id,
+                source_module_id,
+                CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                instance_id,
+                adapter,
+                status,
+                CAST(failure_class AS TEXT) AS failure_class,
+                CAST(summary AS TEXT) AS summary,
+                media_type_results_json,
+                materialization_results_json,
+                probe_targets_json,
+                candidate_evidence_json,
+                CAST(runtime_version AS TEXT) AS runtime_version,
+                policy_version,
+                CAST(certified_at AS TEXT) AS certified_at,
+                CAST(expires_at AS TEXT) AS expires_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_module_certifications
+             WHERE source_module_id = ?
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1",
+        )
+        .bind(source_module_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.as_ref()
+            .map(map_source_module_certification)
+            .transpose()
+    }
+
+    pub async fn list_source_module_certifications(
+        &self,
+        source_module_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ExtensionSourceModuleCertification>> {
+        let rows = sqlx::query(
+            "SELECT
+                certification_id,
+                source_module_id,
+                CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                instance_id,
+                adapter,
+                status,
+                CAST(failure_class AS TEXT) AS failure_class,
+                CAST(summary AS TEXT) AS summary,
+                media_type_results_json,
+                materialization_results_json,
+                probe_targets_json,
+                candidate_evidence_json,
+                CAST(runtime_version AS TEXT) AS runtime_version,
+                policy_version,
+                CAST(certified_at AS TEXT) AS certified_at,
+                CAST(expires_at AS TEXT) AS expires_at,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_module_certifications
+             WHERE source_module_id = ?
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT ?",
+        )
+        .bind(source_module_id.to_string())
+        .bind(limit.max(1))
+        .fetch_all(self.pool)
+        .await?;
+        rows.iter().map(map_source_module_certification).collect()
+    }
+
+    pub async fn create_source_certification_job(
+        &self,
+        data: &NewExtensionSourceCertificationJob,
+    ) -> Result<()> {
+        validate_source_certification_job(data)?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_certification_jobs (
+                job_id,
+                instance_id,
+                registry_id,
+                source_module_id,
+                requested_by,
+                reason,
+                status,
+                priority,
+                attempts,
+                max_attempts,
+                language_eligibility,
+                marketplace_state,
+                summary,
+                last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(data.job_id.to_string())
+        .bind(data.instance_id.to_string())
+        .bind(data.registry_id.map(|id| id.to_string()))
+        .bind(data.source_module_id.map(|id| id.to_string()))
+        .bind(data.requested_by.trim())
+        .bind(data.reason.trim())
+        .bind(data.status.trim())
+        .bind(data.priority)
+        .bind(data.attempts)
+        .bind(data.max_attempts)
+        .bind(data.language_eligibility.as_deref().map(str::trim))
+        .bind(data.marketplace_state.as_deref().map(str::trim))
+        .bind(data.summary.as_deref().map(str::trim))
+        .bind(data.last_error.as_deref().map(str::trim))
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn claim_next_source_certification_job(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<ExtensionSourceCertificationJob>> {
+        let row = sqlx::query(
+            "SELECT
+                job_id
+             FROM extension_source_certification_jobs
+             WHERE instance_id = ?
+               AND status = 'queued'
+               AND attempts < max_attempts
+             ORDER BY priority ASC, created_at ASC, updated_at ASC
+             LIMIT 1",
+        )
+        .bind(instance_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let job_id_raw: String = row.try_get("job_id")?;
+        let job_id = parse_uuid(&job_id_raw, "extension_source_certification_jobs.job_id")?;
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_certification_jobs
+             SET status = 'running',
+                 attempts = attempts + 1,
+                 started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                 finished_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE job_id = ?
+               AND status = 'queued'
+               AND attempts < max_attempts",
+        )
+        .bind(job_id.to_string())
+        .execute(self.pool)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_source_certification_job(job_id).await
+    }
+
+    pub async fn get_source_certification_job(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<ExtensionSourceCertificationJob>> {
+        let row = sqlx::query(
+            "SELECT
+                job_id,
+                instance_id,
+                CAST(registry_id AS TEXT) AS registry_id,
+                CAST(source_module_id AS TEXT) AS source_module_id,
+                requested_by,
+                reason,
+                status,
+                priority,
+                attempts,
+                max_attempts,
+                CAST(language_eligibility AS TEXT) AS language_eligibility,
+                CAST(marketplace_state AS TEXT) AS marketplace_state,
+                CAST(summary AS TEXT) AS summary,
+                CAST(started_at AS TEXT) AS started_at,
+                CAST(finished_at AS TEXT) AS finished_at,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_certification_jobs
+             WHERE job_id = ?",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.as_ref().map(map_source_certification_job).transpose()
+    }
+
+    pub async fn requeue_running_source_certification_jobs(
+        &self,
+        instance_id: Uuid,
+        reason: &str,
+    ) -> Result<u64> {
+        let affected = sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_certification_jobs
+             SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
+                 summary = ?,
+                 last_error = ?,
+                 finished_at = CASE WHEN attempts >= max_attempts THEN CURRENT_TIMESTAMP ELSE NULL END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE instance_id = ?
+               AND status = 'running'",
+        )
+        .bind(reason.trim())
+        .bind(reason.trim())
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    pub async fn finish_source_certification_job(
+        &self,
+        job_id: Uuid,
+        status: &str,
+        marketplace_state: Option<&str>,
+        summary: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        validate_allowed_value(
+            "extension_source_certification_jobs.status",
+            status,
+            SOURCE_CERTIFICATION_JOB_STATUSES,
+        )?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_certification_jobs
+             SET status = ?,
+                 marketplace_state = COALESCE(?, marketplace_state),
+                 summary = ?,
+                 last_error = ?,
+                 finished_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE job_id = ?",
+        )
+        .bind(status.trim())
+        .bind(marketplace_state.map(str::trim))
+        .bind(summary.map(str::trim))
+        .bind(last_error.map(str::trim))
+        .bind(job_id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cancel_source_certification_jobs(
+        &self,
+        instance_id: Uuid,
+        registry_id: Option<Uuid>,
+        source_module_id: Option<Uuid>,
+        reason: &str,
+    ) -> Result<u64> {
+        let affected = match (registry_id, source_module_id) {
+            (Some(registry_id), Some(source_module_id)) => sqlx::query::<sqlx::Any>(
+                "UPDATE extension_source_certification_jobs
+                     SET status = 'cancelled',
+                         summary = ?,
+                         last_error = ?,
+                         finished_at = CURRENT_TIMESTAMP,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE instance_id = ?
+                       AND registry_id = ?
+                       AND source_module_id = ?
+                       AND status IN ('queued', 'running')",
+            )
+            .bind(reason.trim())
+            .bind(reason.trim())
+            .bind(instance_id.to_string())
+            .bind(registry_id.to_string())
+            .bind(source_module_id.to_string())
+            .execute(self.pool)
+            .await?
+            .rows_affected(),
+            (Some(registry_id), None) => sqlx::query::<sqlx::Any>(
+                "UPDATE extension_source_certification_jobs
+                     SET status = 'cancelled',
+                         summary = ?,
+                         last_error = ?,
+                         finished_at = CURRENT_TIMESTAMP,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE instance_id = ?
+                       AND registry_id = ?
+                       AND status IN ('queued', 'running')",
+            )
+            .bind(reason.trim())
+            .bind(reason.trim())
+            .bind(instance_id.to_string())
+            .bind(registry_id.to_string())
+            .execute(self.pool)
+            .await?
+            .rows_affected(),
+            (None, Some(source_module_id)) => sqlx::query::<sqlx::Any>(
+                "UPDATE extension_source_certification_jobs
+                     SET status = 'cancelled',
+                         summary = ?,
+                         last_error = ?,
+                         finished_at = CURRENT_TIMESTAMP,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE instance_id = ?
+                       AND source_module_id = ?
+                       AND status IN ('queued', 'running')",
+            )
+            .bind(reason.trim())
+            .bind(reason.trim())
+            .bind(instance_id.to_string())
+            .bind(source_module_id.to_string())
+            .execute(self.pool)
+            .await?
+            .rows_affected(),
+            (None, None) => sqlx::query::<sqlx::Any>(
+                "UPDATE extension_source_certification_jobs
+                     SET status = 'cancelled',
+                         summary = ?,
+                         last_error = ?,
+                         finished_at = CURRENT_TIMESTAMP,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE instance_id = ?
+                       AND status IN ('queued', 'running')",
+            )
+            .bind(reason.trim())
+            .bind(reason.trim())
+            .bind(instance_id.to_string())
+            .execute(self.pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected)
+    }
+
+    pub async fn list_latest_source_certification_jobs(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Vec<ExtensionSourceCertificationJob>> {
+        let rows = sqlx::query(
+            "SELECT
+                job_id,
+                instance_id,
+                CAST(registry_id AS TEXT) AS registry_id,
+                CAST(source_module_id AS TEXT) AS source_module_id,
+                requested_by,
+                reason,
+                status,
+                priority,
+                attempts,
+                max_attempts,
+                CAST(language_eligibility AS TEXT) AS language_eligibility,
+                CAST(marketplace_state AS TEXT) AS marketplace_state,
+                CAST(summary AS TEXT) AS summary,
+                CAST(started_at AS TEXT) AS started_at,
+                CAST(finished_at AS TEXT) AS finished_at,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_certification_jobs
+             WHERE instance_id = ?
+             ORDER BY updated_at DESC, created_at DESC",
+        )
+        .bind(instance_id.to_string())
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let job = map_source_certification_job(&row)?;
+            if let Some(source_module_id) = job.source_module_id {
+                if seen.insert(source_module_id) {
+                    out.push(job);
+                }
+            } else {
+                out.push(job);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_source_certification_jobs_for_registry(
+        &self,
+        registry_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ExtensionSourceCertificationJob>> {
+        let rows = sqlx::query(
+            "SELECT
+                job_id,
+                instance_id,
+                CAST(registry_id AS TEXT) AS registry_id,
+                CAST(source_module_id AS TEXT) AS source_module_id,
+                requested_by,
+                reason,
+                status,
+                priority,
+                attempts,
+                max_attempts,
+                CAST(language_eligibility AS TEXT) AS language_eligibility,
+                CAST(marketplace_state AS TEXT) AS marketplace_state,
+                CAST(summary AS TEXT) AS summary,
+                CAST(started_at AS TEXT) AS started_at,
+                CAST(finished_at AS TEXT) AS finished_at,
+                CAST(last_error AS TEXT) AS last_error,
+                CAST(created_at AS TEXT) AS created_at,
+                CAST(updated_at AS TEXT) AS updated_at
+             FROM extension_source_certification_jobs
+             WHERE registry_id = ?
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT ?",
+        )
+        .bind(registry_id.to_string())
+        .bind(limit.max(1))
+        .fetch_all(self.pool)
+        .await?;
+        rows.iter().map(map_source_certification_job).collect()
+    }
+
+    pub async fn record_source_module_quarantine(
+        &self,
+        data: &NewExtensionSourceModuleQuarantine,
+    ) -> Result<()> {
+        validate_source_module_quarantine(data)?;
+        let evidence_json = json_to_string(data.evidence_json.as_ref())?;
+        let expires_at = data.expires_at.map(db_datetime_string);
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO extension_source_module_quarantines (
+                quarantine_id,
+                source_module_id,
+                source_module_version_id,
+                instance_id,
+                failure_class,
+                hoster_domain,
+                candidate_fingerprint,
+                media_type,
+                failure_count,
+                reason,
+                evidence_json,
+                expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+             ON CONFLICT(source_module_id, source_module_version_id, failure_class, hoster_domain, candidate_fingerprint, media_type)
+             DO UPDATE SET
+                failure_count = extension_source_module_quarantines.failure_count + 1,
+                reason = excluded.reason,
+                evidence_json = excluded.evidence_json,
+                last_observed_at = CURRENT_TIMESTAMP,
+                expires_at = excluded.expires_at,
+                cleared_at = NULL,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(data.quarantine_id.to_string())
+        .bind(data.source_module_id.to_string())
+        .bind(data.source_module_version_id.map(|id| id.to_string()))
+        .bind(data.instance_id.to_string())
+        .bind(data.failure_class.trim())
+        .bind(data.hoster_domain.as_deref().map(str::trim))
+        .bind(data.candidate_fingerprint.as_deref().map(str::trim))
+        .bind(data.media_type.as_deref().map(str::trim))
+        .bind(data.reason.as_deref().map(str::trim))
+        .bind(evidence_json)
+        .bind(expires_at.as_deref())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn upsert_source_replacement_recommendation(
         &self,
         data: &NewExtensionSourceReplacementRecommendation,
@@ -4120,6 +4850,26 @@ const SOURCE_MODULE_VERSION_STATES: &[&str] = &[
 ];
 const SOURCE_MODULE_SMOKE_STATUSES: &[&str] = &["unknown", "passed", "failed", "skipped"];
 const SOURCE_HEALTH_SEVERITIES: &[&str] = &["info", "warning", "error"];
+const SOURCE_MODULE_CERTIFICATION_STATUSES: &[&str] = &[
+    "certified",
+    "degraded",
+    "unsupported",
+    "broken",
+    "account_required",
+    "network_blocked",
+    "unknown",
+    "probation",
+];
+const SOURCE_CERTIFICATION_JOB_STATUSES: &[&str] = &[
+    "queued",
+    "running",
+    "succeeded",
+    "degraded",
+    "blocked",
+    "failed",
+    "cancelled",
+    "skipped",
+];
 const SOURCE_REPLACEMENT_ACTIONS: &[&str] = &["replace", "disable", "pin", "none"];
 
 fn validate_source_registry(data: &NewExtensionSourceRegistry) -> Result<()> {
@@ -4199,6 +4949,53 @@ fn validate_source_health_event(data: &NewExtensionSourceHealthEvent) -> Result<
         "extension_source_health_events.severity",
         &data.severity,
         SOURCE_HEALTH_SEVERITIES,
+    )?;
+    Ok(())
+}
+
+fn validate_source_module_certification(
+    data: &NewExtensionSourceModuleCertification,
+) -> Result<()> {
+    ensure_store_non_empty(
+        &data.adapter,
+        "extension_source_module_certifications.adapter",
+    )?;
+    validate_allowed_value(
+        "extension_source_module_certifications.status",
+        &data.status,
+        SOURCE_MODULE_CERTIFICATION_STATUSES,
+    )?;
+    ensure_store_non_empty(
+        &data.policy_version,
+        "extension_source_module_certifications.policy_version",
+    )?;
+    Ok(())
+}
+
+fn validate_source_certification_job(data: &NewExtensionSourceCertificationJob) -> Result<()> {
+    ensure_store_non_empty(
+        &data.requested_by,
+        "extension_source_certification_jobs.requested_by",
+    )?;
+    ensure_store_non_empty(&data.reason, "extension_source_certification_jobs.reason")?;
+    validate_allowed_value(
+        "extension_source_certification_jobs.status",
+        &data.status,
+        SOURCE_CERTIFICATION_JOB_STATUSES,
+    )?;
+    if data.max_attempts < 1 {
+        anyhow::bail!("extension_source_certification_jobs.max_attempts must be positive");
+    }
+    if data.attempts < 0 {
+        anyhow::bail!("extension_source_certification_jobs.attempts must not be negative");
+    }
+    Ok(())
+}
+
+fn validate_source_module_quarantine(data: &NewExtensionSourceModuleQuarantine) -> Result<()> {
+    ensure_store_non_empty(
+        &data.failure_class,
+        "extension_source_module_quarantines.failure_class",
     )?;
     Ok(())
 }
@@ -4425,6 +5222,122 @@ fn map_source_health_event(row: &AnyRow) -> Result<ExtensionSourceHealthEvent> {
             "extension_source_health_events.observed_at",
         )?,
         created_at: parse_datetime(&created_at_raw, "extension_source_health_events.created_at")?,
+    })
+}
+
+fn map_source_module_certification(row: &AnyRow) -> Result<ExtensionSourceModuleCertification> {
+    let certification_id_raw: String = row.try_get("certification_id")?;
+    let source_module_id_raw: String = row.try_get("source_module_id")?;
+    let instance_id_raw: String = row.try_get("instance_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    let media_type_results_raw: String = row.try_get("media_type_results_json")?;
+    let materialization_results_raw: String = row.try_get("materialization_results_json")?;
+    let probe_targets_raw: String = row.try_get("probe_targets_json")?;
+    let candidate_evidence_raw: String = row.try_get("candidate_evidence_json")?;
+    Ok(ExtensionSourceModuleCertification {
+        certification_id: parse_uuid(
+            &certification_id_raw,
+            "extension_source_module_certifications.certification_id",
+        )?,
+        source_module_id: parse_uuid(
+            &source_module_id_raw,
+            "extension_source_module_certifications.source_module_id",
+        )?,
+        source_module_version_id: parse_uuid_opt(
+            row_get_opt_string(row, "source_module_version_id")?,
+            "extension_source_module_certifications.source_module_version_id",
+        )?,
+        instance_id: parse_uuid(
+            &instance_id_raw,
+            "extension_source_module_certifications.instance_id",
+        )?,
+        adapter: row.try_get("adapter")?,
+        status: row.try_get("status")?,
+        failure_class: row_get_opt_string(row, "failure_class")?,
+        summary: row_get_opt_string(row, "summary")?,
+        media_type_results_json: parse_json(
+            &media_type_results_raw,
+            "extension_source_module_certifications.media_type_results_json",
+        )?,
+        materialization_results_json: parse_json(
+            &materialization_results_raw,
+            "extension_source_module_certifications.materialization_results_json",
+        )?,
+        probe_targets_json: parse_json(
+            &probe_targets_raw,
+            "extension_source_module_certifications.probe_targets_json",
+        )?,
+        candidate_evidence_json: parse_json(
+            &candidate_evidence_raw,
+            "extension_source_module_certifications.candidate_evidence_json",
+        )?,
+        runtime_version: row_get_opt_string(row, "runtime_version")?,
+        policy_version: row.try_get("policy_version")?,
+        certified_at: parse_datetime_opt(
+            row_get_opt_string(row, "certified_at")?,
+            "extension_source_module_certifications.certified_at",
+        )?,
+        expires_at: parse_datetime_opt(
+            row_get_opt_string(row, "expires_at")?,
+            "extension_source_module_certifications.expires_at",
+        )?,
+        created_at: parse_datetime(
+            &created_at_raw,
+            "extension_source_module_certifications.created_at",
+        )?,
+        updated_at: parse_datetime(
+            &updated_at_raw,
+            "extension_source_module_certifications.updated_at",
+        )?,
+    })
+}
+
+fn map_source_certification_job(row: &AnyRow) -> Result<ExtensionSourceCertificationJob> {
+    let job_id_raw: String = row.try_get("job_id")?;
+    let instance_id_raw: String = row.try_get("instance_id")?;
+    let created_at_raw: String = row.try_get("created_at")?;
+    let updated_at_raw: String = row.try_get("updated_at")?;
+    Ok(ExtensionSourceCertificationJob {
+        job_id: parse_uuid(&job_id_raw, "extension_source_certification_jobs.job_id")?,
+        instance_id: parse_uuid(
+            &instance_id_raw,
+            "extension_source_certification_jobs.instance_id",
+        )?,
+        registry_id: parse_uuid_opt(
+            row_get_opt_string(row, "registry_id")?,
+            "extension_source_certification_jobs.registry_id",
+        )?,
+        source_module_id: parse_uuid_opt(
+            row_get_opt_string(row, "source_module_id")?,
+            "extension_source_certification_jobs.source_module_id",
+        )?,
+        requested_by: row.try_get("requested_by")?,
+        reason: row.try_get("reason")?,
+        status: row.try_get("status")?,
+        priority: row.try_get("priority")?,
+        attempts: row.try_get("attempts")?,
+        max_attempts: row.try_get("max_attempts")?,
+        language_eligibility: row_get_opt_string(row, "language_eligibility")?,
+        marketplace_state: row_get_opt_string(row, "marketplace_state")?,
+        summary: row_get_opt_string(row, "summary")?,
+        started_at: parse_datetime_opt(
+            row_get_opt_string(row, "started_at")?,
+            "extension_source_certification_jobs.started_at",
+        )?,
+        finished_at: parse_datetime_opt(
+            row_get_opt_string(row, "finished_at")?,
+            "extension_source_certification_jobs.finished_at",
+        )?,
+        last_error: row_get_opt_string(row, "last_error")?,
+        created_at: parse_datetime(
+            &created_at_raw,
+            "extension_source_certification_jobs.created_at",
+        )?,
+        updated_at: parse_datetime(
+            &updated_at_raw,
+            "extension_source_certification_jobs.updated_at",
+        )?,
     })
 }
 
@@ -5440,6 +6353,369 @@ mod tests {
             .list_source_replacement_recommendations(Some(source_module_id), true)
             .await?;
         assert!(active.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prism_source_certification_and_quarantine_round_trip() -> Result<()> {
+        let (database, instance_id) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let registry_id = Uuid::new_v4();
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "prism.fixture".to_string(),
+                registry_type: "nuvio_manifest_json".to_string(),
+                trust_class: "maintainer_known".to_string(),
+                display_name: "Prism Fixture".to_string(),
+                url: Some("https://example.test/manifest.json".to_string()),
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await?;
+        let source_module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key: "nuvio:fixture:movies".to_string(),
+                display_name: "Movies".to_string(),
+                ecosystem: "nuvio".to_string(),
+                plugin_package: Some("movies".to_string()),
+                active_version: Some("1.0.0".to_string()),
+                rollback_version: None,
+                media_types_json: Some(json!(["movie"])),
+                language_tags_json: None,
+                region_tags_json: None,
+                source_domains_json: Some(json!(["example.test"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: false,
+                installed: true,
+                pinned_version: None,
+                health_state: "available".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: Some(json!({"nuvio": {"moduleId": "movies"}})),
+            })
+            .await?;
+        let version_id = Uuid::new_v4();
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id,
+                source_module_id,
+                version: "1.0.0".to_string(),
+                artifact_url: Some("https://example.test/movies.js".to_string()),
+                artifact_sha256: Some("sha256".to_string()),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "unknown".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: Some(Utc::now()),
+                activated_at: Some(Utc::now()),
+                metadata_json: Some(
+                    json!({"nuvio": {"scriptPath": "/app/source-modules/movies.js"}}),
+                ),
+            })
+            .await?;
+
+        store
+            .upsert_source_module_certification(&NewExtensionSourceModuleCertification {
+                certification_id: Uuid::new_v4(),
+                source_module_id,
+                source_module_version_id: Some(version_id),
+                instance_id,
+                adapter: "nuvio_js_v1".to_string(),
+                status: "certified".to_string(),
+                failure_class: None,
+                summary: Some("probe passed".to_string()),
+                media_type_results_json: json!({"movie": {"status": "certified"}}),
+                materialization_results_json: json!({"inspected": []}),
+                probe_targets_json: json!([{"mediaType": "movie"}]),
+                candidate_evidence_json: json!([]),
+                runtime_version: Some("1.0.0".to_string()),
+                policy_version: "test-policy".to_string(),
+                certified_at: Some(Utc::now()),
+                expires_at: Some(Utc::now() + chrono::Duration::days(1)),
+            })
+            .await?;
+
+        let latest = store
+            .latest_source_module_certification(source_module_id)
+            .await?
+            .expect("certification");
+        assert_eq!(latest.status, "certified");
+        assert_eq!(latest.source_module_version_id, Some(version_id));
+        assert_eq!(
+            latest
+                .media_type_results_json
+                .pointer("/movie/status")
+                .and_then(serde_json::Value::as_str),
+            Some("certified")
+        );
+
+        let skipped_job_id = Uuid::new_v4();
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id: skipped_job_id,
+                instance_id,
+                registry_id: Some(registry_id),
+                source_module_id: Some(source_module_id),
+                requested_by: "test".to_string(),
+                reason: "repository_added".to_string(),
+                status: "skipped".to_string(),
+                priority: 200,
+                attempts: 0,
+                max_attempts: 1,
+                language_eligibility: Some(
+                    json!({"state": "skipped_language", "normalizedTags": ["hi"]}).to_string(),
+                ),
+                marketplace_state: Some("skipped_language".to_string()),
+                summary: Some("language mismatch".to_string()),
+                last_error: None,
+            })
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let job_id = Uuid::new_v4();
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id,
+                instance_id,
+                registry_id: Some(registry_id),
+                source_module_id: Some(source_module_id),
+                requested_by: "test".to_string(),
+                reason: "manual_repository_certification".to_string(),
+                status: "queued".to_string(),
+                priority: 100,
+                attempts: 0,
+                max_attempts: 2,
+                language_eligibility: Some(
+                    json!({"state": "preferred_language", "normalizedTags": ["en"]}).to_string(),
+                ),
+                marketplace_state: Some("certifying".to_string()),
+                summary: Some("queued".to_string()),
+                last_error: None,
+            })
+            .await?;
+        let claimed = store
+            .claim_next_source_certification_job(instance_id)
+            .await?
+            .expect("queued certification job should be claimed");
+        assert_eq!(claimed.job_id, job_id);
+        assert_eq!(claimed.status, "running");
+        assert_eq!(claimed.attempts, 1);
+        let requeued = store
+            .requeue_running_source_certification_jobs(instance_id, "server restarted")
+            .await?;
+        assert_eq!(requeued, 1);
+        let requeued_job = store
+            .get_source_certification_job(job_id)
+            .await?
+            .expect("requeued job should remain visible");
+        assert_eq!(requeued_job.status, "queued");
+        assert_eq!(requeued_job.attempts, 1);
+        let claimed = store
+            .claim_next_source_certification_job(instance_id)
+            .await?
+            .expect("requeued certification job should be claimed again");
+        assert_eq!(claimed.job_id, job_id);
+        assert_eq!(claimed.status, "running");
+        assert_eq!(claimed.attempts, 2);
+        store
+            .finish_source_certification_job(
+                job_id,
+                "succeeded",
+                Some("certified"),
+                Some("runtime probe passed"),
+                None,
+            )
+            .await?;
+
+        let latest_jobs = store
+            .list_latest_source_certification_jobs(instance_id)
+            .await?;
+        assert_eq!(latest_jobs.len(), 1);
+        assert_eq!(latest_jobs[0].job_id, job_id);
+        assert_eq!(
+            latest_jobs[0].marketplace_state.as_deref(),
+            Some("certified")
+        );
+        assert_eq!(latest_jobs[0].attempts, 2);
+        let registry_jobs = store
+            .list_source_certification_jobs_for_registry(registry_id, 10)
+            .await?;
+        assert_eq!(registry_jobs.len(), 2);
+
+        let cancellable_job_id = Uuid::new_v4();
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id: cancellable_job_id,
+                instance_id,
+                registry_id: Some(registry_id),
+                source_module_id: Some(source_module_id),
+                requested_by: "test".to_string(),
+                reason: "repository_refreshed".to_string(),
+                status: "queued".to_string(),
+                priority: 100,
+                attempts: 0,
+                max_attempts: 2,
+                language_eligibility: None,
+                marketplace_state: Some("certifying".to_string()),
+                summary: Some("queued".to_string()),
+                last_error: None,
+            })
+            .await?;
+        let cancelled = store
+            .cancel_source_certification_jobs(
+                instance_id,
+                Some(registry_id),
+                None,
+                "cancelled by test",
+            )
+            .await?;
+        assert_eq!(cancelled, 1);
+
+        store
+            .record_source_module_quarantine(&NewExtensionSourceModuleQuarantine {
+                quarantine_id: Uuid::new_v4(),
+                source_module_id,
+                source_module_version_id: Some(version_id),
+                instance_id,
+                failure_class: "source_returned_non_media_response".to_string(),
+                hoster_domain: Some("hoster.example".to_string()),
+                candidate_fingerprint: Some("candidate-1".to_string()),
+                media_type: Some("movie".to_string()),
+                reason: Some("returned HTML".to_string()),
+                evidence_json: Some(json!({"candidate": "candidate-1"})),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(6)),
+            })
+            .await?;
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT failure_count FROM extension_source_module_quarantines WHERE source_module_id = ?",
+        )
+        .bind(source_module_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_registry_delete_cascades_modules_versions_and_certification_jobs() -> Result<()>
+    {
+        let (database, instance_id) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let registry_id = Uuid::new_v4();
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "prism.remove.fixture".to_string(),
+                registry_type: "nuvio_manifest_json".to_string(),
+                trust_class: "maintainer_known".to_string(),
+                display_name: "Remove Fixture".to_string(),
+                url: Some("https://example.test/manifest.json".to_string()),
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await?;
+        let source_module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key: "nuvio:remove:fixture".to_string(),
+                display_name: "Remove Fixture".to_string(),
+                ecosystem: "nuvio".to_string(),
+                plugin_package: Some("remove_fixture".to_string()),
+                active_version: Some("1.0.0".to_string()),
+                rollback_version: None,
+                media_types_json: Some(json!(["movie"])),
+                language_tags_json: Some(json!(["en"])),
+                region_tags_json: None,
+                source_domains_json: Some(json!(["example.test"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: false,
+                installed: true,
+                pinned_version: None,
+                health_state: "available".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: None,
+            })
+            .await?;
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: Uuid::new_v4(),
+                source_module_id,
+                version: "1.0.0".to_string(),
+                artifact_url: Some("https://example.test/remove.js".to_string()),
+                artifact_sha256: Some("sha256".to_string()),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "passed".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: Some(Utc::now()),
+                activated_at: Some(Utc::now()),
+                metadata_json: None,
+            })
+            .await?;
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id: Uuid::new_v4(),
+                instance_id,
+                registry_id: Some(registry_id),
+                source_module_id: Some(source_module_id),
+                requested_by: "test".to_string(),
+                reason: "repository_added".to_string(),
+                status: "queued".to_string(),
+                priority: 100,
+                attempts: 0,
+                max_attempts: 2,
+                language_eligibility: None,
+                marketplace_state: Some("certifying".to_string()),
+                summary: Some("queued".to_string()),
+                last_error: None,
+            })
+            .await?;
+
+        let deleted = store.delete_source_registry(registry_id).await?;
+        assert_eq!(deleted, 1);
+        assert!(
+            store
+                .list_source_modules(None, Some(registry_id))
+                .await?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_source_module_versions(source_module_id)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_source_certification_jobs_for_registry(registry_id, 10)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 

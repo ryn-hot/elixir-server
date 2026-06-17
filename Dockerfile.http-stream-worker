@@ -1,0 +1,16 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY elixir-server ./elixir-server
+RUN cargo build --release -p elixir-server --bin elixir-http-stream-worker
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/elixir-http-stream-worker /usr/local/bin/elixir-http-stream-worker
+ENTRYPOINT ["/usr/local/bin/elixir-http-stream-worker"]

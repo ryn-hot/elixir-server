@@ -1448,7 +1448,7 @@ async fn process_candidate_search_response_for_group(
             update_group_targets_terminal_no_results(
                 state,
                 &grouped_targets,
-                response.provider.provider_id,
+                persisted_source_provider_id(response.provider.provider_id),
                 state_reason,
             )
             .await?;
@@ -1468,7 +1468,7 @@ async fn process_candidate_search_response_for_group(
             AcquisitionTargetStateUpdate {
                 state: AcquisitionTargetState::Pending,
                 state_reason: Some(state_reason),
-                selected_provider_id: Some(response.provider.provider_id),
+                selected_provider_id: persisted_source_provider_id(response.provider.provider_id),
                 next_search_after: Some(next_after),
                 increment_search_attempts: true,
                 ..Default::default()
@@ -3549,7 +3549,7 @@ fn common_season_number(targets: &[AcquisitionTarget]) -> Option<i32> {
 async fn update_group_targets_terminal_no_results(
     state: &AppState,
     targets: &[AcquisitionTarget],
-    provider_id: Uuid,
+    provider_id: Option<Uuid>,
     state_reason: String,
 ) -> Result<()> {
     let Some(first) = targets.first() else {
@@ -3562,7 +3562,7 @@ async fn update_group_targets_terminal_no_results(
             AcquisitionTargetStateUpdate {
                 state: AcquisitionTargetState::Excluded,
                 state_reason: Some(state_reason.clone()),
-                selected_provider_id: Some(provider_id),
+                selected_provider_id: provider_id,
                 next_search_after: None,
                 increment_search_attempts: target.target_id == first.target_id,
                 ..Default::default()
@@ -3571,6 +3571,10 @@ async fn update_group_targets_terminal_no_results(
         .await?;
     }
     Ok(())
+}
+
+fn persisted_source_provider_id(provider_id: Uuid) -> Option<Uuid> {
+    (!provider_id.is_nil()).then_some(provider_id)
 }
 
 async fn update_group_targets_for_retry(
@@ -11099,6 +11103,101 @@ mod tests {
                 .state_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("No acquisition candidates were returned"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_suite_empty_response_does_not_persist_nil_provider_id() -> Result<()> {
+        let state = setup_test_state().await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Movie,
+                title: "Batman: Mask of the Phantasm".to_string(),
+                year: Some(1993),
+                external_ids: Some(ExternalIds {
+                    tmdb: Some("14919".to_string()),
+                    imdb: Some("tt0106364".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![new_movie_target("Batman: Mask of the Phantasm", None)],
+        )
+        .await?;
+        let group = TargetSearchGroup {
+            group_key: "extension-suite-empty-stream-source".to_string(),
+            representative: targets[0].clone(),
+            targets: Vec::new(),
+            search_intent: None,
+        };
+        let response = CandidateSearchResponse {
+            schema_version: 1,
+            provider: CandidateProviderSummary {
+                provider_id: Uuid::nil(),
+                extension_id: "elixir.extension_suite".to_string(),
+                extension_name: "Elixir Extension Suite".to_string(),
+                instance_id: Uuid::nil(),
+                instance_name: "default".to_string(),
+                capability: ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY.to_string(),
+                implementation: Some("extension_suite".to_string()),
+                health_state: ProviderHealthState::Healthy,
+                media_types: vec!["movie".to_string()],
+                actions: vec!["search".to_string()],
+            },
+            route_options: Vec::new(),
+            candidates: Vec::new(),
+            warnings: vec![
+                "extension_suite:elixir.sources.prism:prism:moviesdrive: runtime_error: [Moviesdrive] Scraping error: fetch failed".to_string(),
+                "extension_suite:stream:all_failed_or_no_results: no stream provider returned usable candidates".to_string(),
+            ],
+        };
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+
+        process_candidate_search_response_for_group(
+            &state,
+            &subscription,
+            &group,
+            &response,
+            &targets[0],
+            Utc::now(),
+            &mut governor,
+        )
+        .await?;
+
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(updated_targets.len(), 1);
+        assert_eq!(updated_targets[0].state, AcquisitionTargetState::Pending);
+        assert_eq!(updated_targets[0].selected_provider_id, None);
+        assert!(
+            updated_targets[0]
+                .state_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason
+                        .contains("Extension Suite source providers returned no usable candidates")
+                        && reason.contains("moviesdrive")
+                        && reason.contains("fetch failed")
+                })
         );
         Ok(())
     }

@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -150,10 +151,11 @@ pub async fn install_source_module_artifact(
             health_event_id: Uuid::new_v4(),
             source_module_id: module.source_module_id,
             event_type: "static_smoke".to_string(),
-            state: "healthy".to_string(),
+            state: "available".to_string(),
             severity: "info".to_string(),
             reason: Some(
-                "source artifact fetched, hash-verified, and statically validated".to_string(),
+                "source artifact fetched, hash-verified, and statically validated; runtime probe not yet run"
+                    .to_string(),
             ),
             evidence_json: Some(json!({
                 "artifactKind": kind,
@@ -172,6 +174,113 @@ pub async fn install_source_module_artifact(
         container_path,
         version: version.version.clone(),
     })
+}
+
+pub async fn remove_source_module_artifacts(
+    store: &ExtensionStore<'_>,
+    module: &ExtensionSourceModule,
+    reason: &str,
+) -> Result<usize> {
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    let mut removed = 0usize;
+    for version in versions.iter().filter(|version| {
+        matches!(
+            version.install_state.as_str(),
+            "staged" | "installed" | "active" | "failed"
+        )
+    }) {
+        if let Some(host_path) = version
+            .metadata_json
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/artifact/hostPath"))
+            .and_then(serde_json::Value::as_str)
+        {
+            match fs::remove_file(host_path).await {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        source_module_id = %module.source_module_id,
+                        version_id = %version.version_id,
+                        path = %host_path,
+                        error = %err,
+                        "failed to remove source module artifact"
+                    );
+                }
+            }
+        }
+        store
+            .set_source_module_version_state(version.version_id, "failed", "failed", Some(reason))
+            .await?;
+    }
+    store
+        .set_source_module_installed_state(
+            module.source_module_id,
+            false,
+            None,
+            "broken",
+            Some(reason),
+        )
+        .await?;
+    Ok(removed)
+}
+
+pub async fn uninstall_source_module_artifacts(
+    store: &ExtensionStore<'_>,
+    module: &ExtensionSourceModule,
+    reason: &str,
+) -> Result<usize> {
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    let mut removed = 0usize;
+    for version in versions.iter().filter(|version| {
+        matches!(
+            version.install_state.as_str(),
+            "staged" | "installed" | "active" | "failed"
+        )
+    }) {
+        if let Some(host_path) = version
+            .metadata_json
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/artifact/hostPath"))
+            .and_then(serde_json::Value::as_str)
+        {
+            match fs::remove_file(host_path).await {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        source_module_id = %module.source_module_id,
+                        version_id = %version.version_id,
+                        path = %host_path,
+                        error = %err,
+                        "failed to uninstall source module artifact"
+                    );
+                }
+            }
+        }
+        store
+            .set_source_module_version_state(
+                version.version_id,
+                "available",
+                "skipped",
+                Some(reason),
+            )
+            .await?;
+    }
+    store
+        .set_source_module_installed_state(
+            module.source_module_id,
+            false,
+            None,
+            "disabled",
+            Some(reason),
+        )
+        .await?;
+    Ok(removed)
 }
 
 fn smoke_source_artifact(kind: &str, bytes: &[u8]) -> Result<()> {

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use reqwest::header::{ETAG, LAST_MODIFIED};
+use reqwest::header::{ETAG, LAST_MODIFIED, USER_AGENT};
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +37,8 @@ const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_SCRAPERS: usize = 2_000;
 const DEFAULT_MAX_REDIRECTS: usize = 5;
+const GITHUB_PROVIDER_DISCOVERY_DIRS: &[&str] = &["providers", "src/providers"];
+const GITHUB_PROVIDER_DISCOVERY_USER_AGENT: &str = "Elixir-Prism-Nuvio-Compat";
 const BUNDLED_PRISM_RECOMMENDED_SOURCE_PACK: &str = include_str!(
     "../../../extensions/marketplace/prism-source-provider/source-packs/prism-recommended.json"
 );
@@ -267,6 +269,22 @@ struct FetchedText {
     last_modified: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GitHubRawRepositoryContext {
+    owner: String,
+    repository: String,
+    reference: String,
+    root_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubContentEntry {
+    name: String,
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawManifest {
@@ -371,11 +389,91 @@ impl NuvioRegistryClient {
     }
 
     async fn fetch_manifest_json(&self, url: &str) -> Result<NuvioRegistrySnapshot> {
-        let fetched = self.fetch_text(url, None).await?;
+        let registry_url = normalize_nuvio_manifest_url(url, &self.config)?;
+        let fetched = self.fetch_text(&registry_url, None).await?;
         let mut snapshot = parse_nuvio_manifest_json(&fetched.text, &fetched.url, &self.config)?;
+        self.enrich_manifest_snapshot_from_provider_files(&mut snapshot)
+            .await?;
         snapshot.etag = fetched.etag;
         snapshot.last_modified = fetched.last_modified;
         Ok(snapshot)
+    }
+
+    async fn enrich_manifest_snapshot_from_provider_files(
+        &self,
+        snapshot: &mut NuvioRegistrySnapshot,
+    ) -> Result<()> {
+        let Some(context) = github_raw_repository_context(&snapshot.source_url) else {
+            return Ok(());
+        };
+        let mut provider_entries = Vec::new();
+        for provider_dir in GITHUB_PROVIDER_DISCOVERY_DIRS {
+            match self
+                .fetch_github_provider_directory(&context, provider_dir)
+                .await
+            {
+                Ok(mut entries) => provider_entries.append(&mut entries),
+                Err(err) => snapshot.warnings.push(format!(
+                    "nuvio_manifest_json:{}: provider-file discovery skipped for {}: {err}",
+                    snapshot.source_url, provider_dir
+                )),
+            }
+        }
+        if provider_entries.is_empty() {
+            return Ok(());
+        }
+        let mut modules = std::mem::take(&mut snapshot.modules);
+        synthesize_missing_provider_file_modules(
+            &mut modules,
+            provider_entries,
+            &snapshot.source_url,
+            snapshot.repository.version.as_deref(),
+            &self.config,
+            &mut snapshot.warnings,
+        )?;
+        snapshot.modules = dedupe_modules(modules, &mut snapshot.warnings);
+        Ok(())
+    }
+
+    async fn fetch_github_provider_directory(
+        &self,
+        context: &GitHubRawRepositoryContext,
+        provider_dir: &str,
+    ) -> Result<Vec<GitHubContentEntry>> {
+        let dir_path = join_url_path(&context.root_path, provider_dir);
+        let mut url = Url::parse(&format!(
+            "https://api.github.com/repos/{}/{}/contents/{}",
+            context.owner, context.repository, dir_path
+        ))
+        .context("building GitHub provider directory URL")?;
+        url.query_pairs_mut().append_pair("ref", &context.reference);
+        validate_safe_http_url(&url, self.config.allow_private_hosts)?;
+        let response = self
+            .client
+            .get(url.clone())
+            .header(USER_AGENT, GITHUB_PROVIDER_DISCOVERY_USER_AGENT)
+            .send()
+            .await
+            .with_context(|| format!("fetching GitHub provider directory {url}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("GitHub provider directory {url} returned an error status"))?;
+        let entries = response
+            .json::<Vec<GitHubContentEntry>>()
+            .await
+            .with_context(|| format!("parsing GitHub provider directory {url}"))?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                entry.entry_type == "file"
+                    && entry.name.ends_with(".js")
+                    && !entry.name.starts_with('.')
+                    && !entry.name.to_ascii_lowercase().contains("extractor")
+            })
+            .collect())
     }
 
     async fn fetch_text(&self, url: &str, base_url: Option<&str>) -> Result<FetchedText> {
@@ -439,11 +537,18 @@ pub fn parse_nuvio_manifest_json(
     config: &NuvioRegistryFetchConfig,
 ) -> Result<NuvioRegistrySnapshot> {
     let value: Value = serde_json::from_str(text).context("parsing Nuvio manifest.json")?;
-    if !value.is_object() {
-        bail!("Nuvio manifest.json must be a JSON object");
-    }
-    let raw: RawManifest =
-        serde_json::from_value(value.clone()).context("normalizing Nuvio manifest.json")?;
+    let raw: RawManifest = match &value {
+        Value::Object(_) => {
+            serde_json::from_value(value.clone()).context("normalizing Nuvio manifest.json")?
+        }
+        Value::Array(scrapers) => RawManifest {
+            name: None,
+            version: None,
+            description: None,
+            scrapers: scrapers.clone(),
+        },
+        _ => bail!("Nuvio manifest.json must be a JSON object or scraper array"),
+    };
     if raw.scrapers.len() > config.max_scrapers {
         bail!(
             "Nuvio manifest.json contains {} scrapers, exceeding limit {}",
@@ -1578,6 +1683,243 @@ fn dedupe_modules(
     deduped
 }
 
+fn synthesize_missing_provider_file_modules(
+    modules: &mut Vec<NuvioSourceModuleDescriptor>,
+    provider_entries: Vec<GitHubContentEntry>,
+    source_url: &str,
+    repository_version: Option<&str>,
+    config: &NuvioRegistryFetchConfig,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let mut existing_ids = modules
+        .iter()
+        .map(|module| module.module_id.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut seen_paths = HashSet::new();
+    for entry in provider_entries {
+        if !seen_paths.insert(entry.path.to_ascii_lowercase()) {
+            continue;
+        }
+        let Some(provider_id) = provider_id_from_js_path(&entry.path) else {
+            continue;
+        };
+        let module_id = stable_text_id(&provider_id);
+        if !existing_ids.insert(module_id.to_ascii_lowercase()) {
+            continue;
+        }
+        if modules.len() >= config.max_scrapers {
+            bail!(
+                "Nuvio provider-file discovery exceeded scraper limit {}",
+                config.max_scrapers
+            );
+        }
+        let supported_types = infer_provider_file_media_types(&provider_id);
+        let raw = json!({
+            "id": provider_id,
+            "name": humanize_provider_id(&provider_id),
+            "description": "Discovered from a repository provider file because manifest.json does not list this scraper.",
+            "version": repository_version.unwrap_or("0.0.0"),
+            "supportedTypes": supported_types,
+            "filename": entry.path,
+            "enabled": false,
+            "formats": ["mp4", "mkv", "m3u8"],
+            "contentLanguage": ["en"],
+            "xPrismDiscoveredFromProviderFile": true,
+        });
+        match normalize_scraper_entry(raw, modules.len(), source_url, config) {
+            Ok(Some(module)) => modules.push(module),
+            Ok(None) => warnings.push(format!(
+                "nuvio_manifest_json:{source_url}: skipped discovered provider file {}",
+                entry.path
+            )),
+            Err(err) => warnings.push(format!(
+                "nuvio_manifest_json:{source_url}: discovered provider file {} rejected: {err}",
+                entry.path
+            )),
+        }
+    }
+    Ok(())
+}
+
+fn provider_id_from_js_path(path: &str) -> Option<String> {
+    let file = path.rsplit('/').next()?.trim();
+    let stem = file.strip_suffix(".js")?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let lower = stem.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "index" | "test" | "server" | "build" | "extractor" | "http" | "utils" | "common"
+    ) {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn infer_provider_file_media_types(provider_id: &str) -> Vec<String> {
+    let lower = provider_id.to_ascii_lowercase();
+    if lower.contains("anime")
+        || lower.contains("anichi")
+        || lower.contains("hianime")
+        || lower.contains("kickassanime")
+        || lower.contains("donghua")
+        || lower.contains("toon")
+        || lower.contains("cartoon")
+        || lower.contains("onepace")
+        || lower.contains("tokusatsu")
+        || lower.contains("tokuzilla")
+    {
+        vec!["anime".to_string(), "tv".to_string(), "movie".to_string()]
+    } else {
+        vec!["movie".to_string(), "tv".to_string()]
+    }
+}
+
+fn humanize_provider_id(provider_id: &str) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in provider_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(current.clone());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return provider_id.to_string();
+    }
+    words
+        .into_iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = first.to_ascii_uppercase().to_string();
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => word,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_nuvio_manifest_url(input: &str, config: &NuvioRegistryFetchConfig) -> Result<String> {
+    let normalized = normalize_http_url(input, None, config)?;
+    let mut url = Url::parse(&normalized).context("parsing normalized Nuvio registry URL")?;
+    let Some(host) = url.host_str() else {
+        return Ok(normalized);
+    };
+    if host.eq_ignore_ascii_case("github.com") {
+        return github_page_url_to_raw_manifest_url(&url, config).unwrap_or(Ok(normalized));
+    }
+    if !host.eq_ignore_ascii_case("raw.githubusercontent.com") {
+        return Ok(normalized);
+    }
+    let path = url.path();
+    if path.ends_with(".json") {
+        return Ok(normalized);
+    }
+    let manifest_path = format!("{}/manifest.json", path.trim_end_matches('/'));
+    url.set_path(&manifest_path);
+    Ok(url.to_string())
+}
+
+fn github_page_url_to_raw_manifest_url(
+    url: &Url,
+    config: &NuvioRegistryFetchConfig,
+) -> Option<Result<String>> {
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+    let owner = segments[0];
+    let repository = segments[1];
+    if owner.is_empty() || repository.is_empty() {
+        return None;
+    }
+    let (reference, root_path, is_file) = match segments.get(2).copied() {
+        Some("blob") => {
+            if segments.len() < 5 {
+                return None;
+            }
+            (segments[3], segments[4..].join("/"), true)
+        }
+        Some("tree") => {
+            if segments.len() < 4 {
+                return None;
+            }
+            (
+                segments[3],
+                segments.get(4..).unwrap_or_default().join("/"),
+                false,
+            )
+        }
+        Some(_) | None => ("main", String::new(), false),
+    };
+    let manifest_path = if is_file {
+        root_path
+    } else {
+        join_url_path(&root_path, "manifest.json")
+    };
+    let raw = format!(
+        "https://raw.githubusercontent.com/{owner}/{repository}/refs/heads/{reference}/{manifest_path}"
+    );
+    Some(normalize_http_url(&raw, None, config))
+}
+
+fn github_raw_repository_context(source_url: &str) -> Option<GitHubRawRepositoryContext> {
+    let url = Url::parse(source_url).ok()?;
+    let host = url.host_str()?;
+    if !host.eq_ignore_ascii_case("raw.githubusercontent.com") {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    if segments.len() < 4 {
+        return None;
+    }
+    let owner = segments[0].to_string();
+    let repository = segments[1].to_string();
+    let (reference, file_index) =
+        if segments.get(2) == Some(&"refs") && segments.get(3) == Some(&"heads") {
+            if segments.len() < 6 {
+                return None;
+            }
+            (segments[4].to_string(), 5usize)
+        } else {
+            (segments[2].to_string(), 3usize)
+        };
+    let file_path = segments[file_index..].join("/");
+    if !file_path.ends_with("manifest.json") {
+        return None;
+    }
+    let root_path = file_path
+        .strip_suffix("manifest.json")
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string();
+    Some(GitHubRawRepositoryContext {
+        owner,
+        repository,
+        reference,
+        root_path,
+    })
+}
+
+fn join_url_path(left: &str, right: &str) -> String {
+    match (left.trim_matches('/'), right.trim_matches('/')) {
+        ("", right) => right.to_string(),
+        (left, "") => left.to_string(),
+        (left, right) => format!("{left}/{right}"),
+    }
+}
+
 fn normalize_http_url(
     input: &str,
     base_url: Option<&str>,
@@ -1847,6 +2189,144 @@ mod tests {
             )
         );
         assert!(!module.unsupported);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_top_level_array_nuvio_manifest() -> Result<()> {
+        let snapshot = parse_nuvio_manifest_json(
+            r#"[{
+                "id": "ArrayProvider",
+                "name": "Array Provider",
+                "version": "2.0.0",
+                "mediaTypes": ["movie"],
+                "path": "providers/array-provider.js"
+            }]"#,
+            "https://raw.githubusercontent.com/example/repo/main/manifest.json",
+            &NuvioRegistryFetchConfig::default(),
+        )?;
+        assert_eq!(snapshot.modules.len(), 1);
+        let module = &snapshot.modules[0];
+        assert_eq!(module.module_id, "arrayprovider");
+        assert_eq!(module.display_name, "Array Provider");
+        assert_eq!(module.media_types, vec!["movie"]);
+        assert_eq!(
+            module.artifact_url.as_deref(),
+            Some("https://raw.githubusercontent.com/example/repo/main/providers/array-provider.js")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_raw_github_repo_root_to_manifest_json() -> Result<()> {
+        let normalized = normalize_nuvio_manifest_url(
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/",
+            &NuvioRegistryFetchConfig::default(),
+        )?;
+        assert_eq!(
+            normalized,
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_github_page_urls_to_raw_manifest_json() -> Result<()> {
+        let config = NuvioRegistryFetchConfig::default();
+        let root = normalize_nuvio_manifest_url(
+            "https://github.com/phisher98/phisher-nuvio-providers",
+            &config,
+        )?;
+        assert_eq!(
+            root,
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json"
+        );
+
+        let tree = normalize_nuvio_manifest_url(
+            "https://github.com/phisher98/phisher-nuvio-providers/tree/main",
+            &config,
+        )?;
+        assert_eq!(
+            tree,
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json"
+        );
+
+        let blob = normalize_nuvio_manifest_url(
+            "https://github.com/phisher98/phisher-nuvio-providers/blob/main/manifest.json",
+            &config,
+        )?;
+        assert_eq!(
+            blob,
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_raw_github_repository_context() {
+        let context = github_raw_repository_context(
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json",
+        )
+        .expect("raw GitHub manifest should be recognized");
+        assert_eq!(context.owner, "phisher98");
+        assert_eq!(context.repository, "phisher-nuvio-providers");
+        assert_eq!(context.reference, "main");
+        assert_eq!(context.root_path, "");
+    }
+
+    #[test]
+    fn synthesizes_missing_provider_file_modules_without_duplicates() -> Result<()> {
+        let config = NuvioRegistryFetchConfig::default();
+        let mut modules = vec![
+            normalize_scraper_entry(
+                json!({
+                    "id": "MoviesDrive",
+                    "name": "MoviesDrive",
+                    "version": "1.1.1",
+                    "supportedTypes": ["movie", "tv"],
+                    "filename": "src/providers/moviesdrive.js",
+                    "enabled": true
+                }),
+                0,
+                "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json",
+                &config,
+            )?
+            .expect("fixture module should normalize"),
+        ];
+        let mut warnings = Vec::new();
+        synthesize_missing_provider_file_modules(
+            &mut modules,
+            vec![
+                GitHubContentEntry {
+                    name: "moviesdrive.js".to_string(),
+                    path: "src/providers/moviesdrive.js".to_string(),
+                    entry_type: "file".to_string(),
+                },
+                GitHubContentEntry {
+                    name: "cinefreak.js".to_string(),
+                    path: "src/providers/cinefreak.js".to_string(),
+                    entry_type: "file".to_string(),
+                },
+            ],
+            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/manifest.json",
+            Some("1.0.0"),
+            &config,
+            &mut warnings,
+        )?;
+        assert_eq!(modules.len(), 2);
+        let cinefreak = modules
+            .iter()
+            .find(|module| module.module_id == "cinefreak")
+            .expect("cinefreak should be synthesized");
+        assert_eq!(cinefreak.display_name, "Cinefreak");
+        assert_eq!(cinefreak.media_types, vec!["movie", "tv"]);
+        assert_eq!(
+            cinefreak.artifact_url.as_deref(),
+            Some(
+                "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/refs/heads/main/src/providers/cinefreak.js"
+            )
+        );
+        assert!(warnings.is_empty());
         Ok(())
     }
 

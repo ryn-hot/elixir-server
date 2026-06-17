@@ -54,6 +54,10 @@ use crate::{
             ScopedAddMediaIdentity, ScopedAddScopeDocument, ScopedAddSelection,
             ScopedAddSelectionType, canonical_target_keys,
         },
+        stream_egress::{
+            StreamHttpEgressPolicy, load_saved_stream_http_egress_policy,
+            save_stream_http_egress_policy, stream_http_egress_policy_from_json,
+        },
         subscriptions::{
             AcquisitionCompletionPolicy, AcquisitionIntentTarget, AcquisitionMetadataPolicy,
             AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
@@ -258,6 +262,7 @@ pub struct FindMediaPreferencesState {
     pub movies_default_source_provider_id: Option<Uuid>,
     pub anime_default_source_provider_id: Option<Uuid>,
     pub language_preference: AcquisitionLanguagePreference,
+    pub stream_http_egress_policy: StreamHttpEgressPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -875,6 +880,7 @@ struct SourceTargetReleaseRuntime {
     coverage_state: Option<ReleaseCoverageState>,
     coverage_reason: Option<String>,
     selected_route_logical_id: Option<String>,
+    stream_route_label: Option<String>,
     download_id: Option<String>,
     job_state: Option<ReleaseJobState>,
     job_state_reason: Option<String>,
@@ -1051,6 +1057,12 @@ pub struct PatchFindMediaPreferencesRequest {
         deserialize_with = "deserialize_optional_json_value"
     )]
     pub language_preference: Option<Value>,
+    #[serde(
+        default,
+        alias = "stream_http_egress_policy",
+        deserialize_with = "deserialize_optional_json_value"
+    )]
+    pub stream_http_egress_policy: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3768,6 +3780,9 @@ async fn load_source_release_runtime_by_target(
                     .selected_route_logical_id
                     .clone()
                     .or_else(|| latest_job.as_ref().map(|job| job.route_logical_id.clone())),
+                stream_route_label: stream_route_label_from_coverage_plan(
+                    release.coverage_plan.as_ref(),
+                ),
                 download_id: release
                     .download_id
                     .clone()
@@ -4352,8 +4367,10 @@ fn build_source_acquisition_child(
         release_runtime.and_then(|runtime| runtime.selected_route_logical_id.as_deref())
     });
     let route_logical_id = route.map(str::to_string);
-    let downloader_label = source_route_downloader_label(route);
-    let protocol = source_route_protocol(route);
+    let stream_route_label =
+        release_runtime.and_then(|runtime| runtime.stream_route_label.as_deref());
+    let downloader_label = source_route_downloader_label(route, stream_route_label);
+    let protocol = source_route_protocol(route, stream_route_label);
     let source_provider_id =
         source_provider_id_for_target(subscription_source_provider_id, target, release_runtime);
     let route_provider_id = route_provider_id_for_target(target, release_runtime);
@@ -5743,26 +5760,44 @@ fn selected_candidate_quality(target: &AcquisitionTarget) -> Option<String> {
         .map(str::to_string)
 }
 
-fn source_route_downloader_label(route: Option<&str>) -> Option<String> {
+fn source_route_downloader_label(
+    route: Option<&str>,
+    stream_route_label: Option<&str>,
+) -> Option<String> {
     match route {
         Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("Direct HTTPS debrid download".to_string()),
         Some(TORRENT_DEFAULT_LOGICAL_ID) => Some("Protected torrent downloader".to_string()),
-        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => Some("Direct HTTP stream download".to_string()),
+        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => stream_route_label
+            .map(str::to_string)
+            .or_else(|| Some("Direct HTTP stream download".to_string())),
         Some(_) => Some("Downloader".to_string()),
         None => None,
     }
 }
 
-fn source_route_protocol(route: Option<&str>) -> Option<String> {
+fn source_route_protocol(route: Option<&str>, stream_route_label: Option<&str>) -> Option<String> {
     match route {
         Some(DEBRID_DEFAULT_LOGICAL_ID) => Some("direct HTTPS debrid download".to_string()),
         Some(TORRENT_DEFAULT_LOGICAL_ID) => {
             Some("torrent via protected downloader egress".to_string())
         }
-        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => Some("direct HTTP stream download".to_string()),
+        Some(HTTP_STREAM_DEFAULT_LOGICAL_ID) => stream_route_label
+            .map(str::to_string)
+            .or_else(|| Some("direct HTTP stream download".to_string())),
         Some(value) => Some(value.to_string()),
         None => None,
     }
+}
+
+fn stream_route_label_from_coverage_plan(coverage_plan: Option<&Value>) -> Option<String> {
+    coverage_plan
+        .and_then(|plan| plan.get("streamRuntime"))
+        .and_then(|runtime| runtime.get("egress"))
+        .and_then(|egress| egress.get("routeLabel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn route_policy_allows_debrid(policy: AcquisitionRoutePolicy) -> bool {
@@ -8801,6 +8836,9 @@ pub async fn find_media_preferences(
     let language_preference = load_saved_language_preference(&store)
         .await
         .map_err(ApiError::from)?;
+    let stream_http_egress_policy = load_saved_stream_http_egress_policy(&store)
+        .await
+        .map_err(ApiError::from)?;
     let source_suite_providers = source_suite_provider_statuses(&state, &store)
         .await
         .map_err(ApiError::from)?;
@@ -8814,6 +8852,7 @@ pub async fn find_media_preferences(
             movies_default_source_provider_id: source_preferences.movie_provider_id,
             anime_default_source_provider_id: source_preferences.anime_provider_id,
             language_preference,
+            stream_http_egress_policy,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -8921,6 +8960,16 @@ pub async fn patch_find_media_preferences(
             .await
             .map_err(ApiError::from)?;
     }
+    if let Some(value) = payload.stream_http_egress_policy {
+        let policy = stream_http_egress_policy_from_json(Some(&value)).ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid streamHttpEgressPolicy; expected auto_http_only, always_protected, or direct_only",
+            )
+        })?;
+        save_stream_http_egress_policy(&store, policy)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     let preferences = load_manager_preferences(&store, &providers)
         .await
@@ -8929,6 +8978,9 @@ pub async fn patch_find_media_preferences(
         .await
         .map_err(ApiError::from)?;
     let language_preference = load_saved_language_preference(&store)
+        .await
+        .map_err(ApiError::from)?;
+    let stream_http_egress_policy = load_saved_stream_http_egress_policy(&store)
         .await
         .map_err(ApiError::from)?;
     let source_suite_providers = source_suite_provider_statuses(&state, &store)
@@ -8944,6 +8996,7 @@ pub async fn patch_find_media_preferences(
             movies_default_source_provider_id: source_preferences.movie_provider_id,
             anime_default_source_provider_id: source_preferences.anime_provider_id,
             language_preference,
+            stream_http_egress_policy,
         },
         tv_manager_candidates: collect_manager_providers(&providers, MediaType::Series)
             .iter()
@@ -12106,6 +12159,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("qb-fallback".to_string()),
             job_state: Some(ReleaseJobState::Submitted),
             job_state_reason: None,
@@ -12440,6 +12494,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("debrid-materializing".to_string()),
             job_state: Some(ReleaseJobState::Materializing),
             job_state_reason: None,
@@ -12512,6 +12567,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("northman-qb".to_string()),
             job_state: Some(ReleaseJobState::Staging),
             job_state_reason: Some(
@@ -12594,6 +12650,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("northman-debrid".to_string()),
             job_state: Some(ReleaseJobState::Completed),
             job_state_reason: Some("Debrid materializer completed selected files.".to_string()),
@@ -12683,6 +12740,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("debrid-complete".to_string()),
             job_state: Some(ReleaseJobState::Completed),
             job_state_reason: None,
@@ -12781,6 +12839,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::ReviewRequired),
             coverage_reason: Some("Episode coverage needs review.".to_string()),
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("rd-review".to_string()),
             job_state: None,
             job_state_reason: None,
@@ -12874,6 +12933,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::ReviewRequired),
             coverage_reason: Some("coverage needed review".to_string()),
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("manual-review-download".to_string()),
             job_state: Some(ReleaseJobState::Downloading),
             job_state_reason: Some("manual review approved selected files".to_string()),
@@ -13079,6 +13139,7 @@ mod tests {
             coverage_state: Some(ReleaseCoverageState::Submitted),
             coverage_reason: None,
             selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+            stream_route_label: None,
             download_id: Some("rd-quarantine".to_string()),
             job_state: Some(ReleaseJobState::Completed),
             job_state_reason: None,
@@ -13192,6 +13253,50 @@ mod tests {
         assert_eq!(blocker.detail, reason);
         assert!(item.evidence.iter().any(|evidence| {
             evidence.label == "Route" && evidence.value == "Torrent via protected downloader egress"
+        }));
+    }
+
+    #[test]
+    fn source_acquisition_http_stream_route_error_is_not_debrid_account_blocker() {
+        let subscription = test_source_subscription(MediaType::Movie);
+        let reason = "Acquisition route blocked: no acquisition route 'acquisition.http_stream.default' is registered for owner 'elixir.sources.prism'";
+        let target = AcquisitionTarget {
+            state: AcquisitionTargetState::Blocked,
+            state_reason: Some(reason.to_string()),
+            selected_route_logical_id: Some(HTTP_STREAM_DEFAULT_LOGICAL_ID.to_string()),
+            ..test_source_target(
+                subscription.subscription_id,
+                MediaType::Movie,
+                None,
+                None,
+                Some(json!({ "title": "Batman Begins (2005)", "quality": "2160p" })),
+            )
+        };
+
+        let item = build_source_acquisition_item(
+            &subscription,
+            &[target],
+            &HashMap::new(),
+            &AcquisitionDownloaderProgressIndex::default(),
+            &HashMap::new(),
+            &AcquisitionUxContext {
+                debrid_account_missing: true,
+            },
+        )
+        .expect("source acquisition item");
+
+        let blocker = item.blocker.expect("parent blocker");
+        assert_eq!(blocker.code, "acquisition_route_unavailable");
+        assert_eq!(blocker.title, "Acquisition route unavailable");
+        assert_eq!(blocker.detail, reason);
+        assert!(item.children.iter().all(|child| {
+            child
+                .blocker
+                .as_ref()
+                .is_none_or(|blocker| blocker.code != "debrid_service_not_configured")
+        }));
+        assert!(item.evidence.iter().any(|evidence| {
+            evidence.label == "Route" && evidence.value == "Direct HTTP stream download"
         }));
     }
 

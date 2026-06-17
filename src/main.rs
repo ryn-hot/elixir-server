@@ -51,7 +51,9 @@ use crate::extensions::store::{
     ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
 };
 use crate::extensions::updater::start_proxy_runtime_update_loop;
-use crate::http::handlers::extensions::{InstallPolicy, install_internal_extension_from_dir};
+use crate::http::handlers::extensions::{
+    InstallPolicy, install_internal_extension_from_dir, resume_prism_certification_jobs,
+};
 use crate::http::router;
 use crate::library::LinkerService;
 use crate::library::start_periodic_scan;
@@ -322,6 +324,11 @@ async fn start_post_listener_background_tasks(state: AppState, reconcile_config:
             std::time::Duration::from_secs(proxy_runtime_update_interval),
         )
         .await;
+    });
+
+    let prism_certification_state = state.clone();
+    tokio::spawn(async move {
+        resume_prism_certification_jobs(prism_certification_state).await;
     });
 
     // Announce via mDNS if enabled; keep guard alive for process lifetime.

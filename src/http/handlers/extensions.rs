@@ -1239,6 +1239,12 @@ pub async fn run_extension_control_action(
     }))
 }
 
+pub async fn resume_prism_certification_jobs(state: AppState) {
+    if let Err(err) = control::resume_prism_certification_jobs(state).await {
+        tracing::warn!("failed to resume Prism certification jobs: {err}");
+    }
+}
+
 pub async fn start_extension_ui_session(
     State(state): State<AppState>,
     Path(instance_id): Path<Uuid>,

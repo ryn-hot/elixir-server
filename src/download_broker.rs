@@ -404,7 +404,7 @@ pub async fn resolve_logical_downloader_for_owner(
     owner_id: &str,
 ) -> Result<ResolvedDownloadBrokerProvider> {
     let role = DownloadBrokerRole::from_logical_id(logical_id)?;
-    let owner_id = route_owner_id(Some(owner_id));
+    let owner_id = route_resolution_owner_id(role, Some(owner_id));
     let routes = list_acquisition_routes(pool, store).await?;
     let route = routes
         .routes
@@ -988,6 +988,13 @@ fn route_owner_id(value: Option<&str>) -> String {
         .to_string()
 }
 
+fn route_resolution_owner_id(role: DownloadBrokerRole, owner_id: Option<&str>) -> String {
+    if role == DownloadBrokerRole::HttpStream {
+        return DEFAULT_ROUTE_OWNER_ID.to_string();
+    }
+    route_owner_id(owner_id)
+}
+
 fn default_route_category(owner_id: &str, role: DownloadBrokerRole) -> Option<String> {
     if owner_id == DEFAULT_ROUTE_OWNER_ID {
         return None;
@@ -1273,6 +1280,16 @@ mod tests {
         .await?;
         assert_eq!(resolved.record.provider_id, provider.provider_id);
         assert_eq!(resolved.binding_kind, DownloadBrokerBindingKind::Auto);
+
+        let prism_owned = resolve_logical_downloader_for_owner(
+            &database.pool,
+            &store,
+            HTTP_STREAM_DEFAULT_LOGICAL_ID,
+            "elixir.sources.prism",
+        )
+        .await?;
+        assert_eq!(prism_owned.record.provider_id, provider.provider_id);
+        assert_eq!(prism_owned.binding_kind, DownloadBrokerBindingKind::Auto);
         Ok(())
     }
 

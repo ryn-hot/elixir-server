@@ -1,22 +1,24 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::{
-    collections::{BTreeSet, HashSet},
-    io,
+    collections::{BTreeSet, HashMap, HashSet},
+    error::Error,
+    fmt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use quick_xml::{Reader, events::Event};
 use reqwest::{
-    Client, StatusCode, Url,
+    Client, Method, StatusCode, Url,
     header::{
-        CONTENT_DISPOSITION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RANGE, REFERER,
+        CONTENT_DISPOSITION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION, REFERER,
     },
-    redirect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
@@ -43,11 +45,16 @@ use crate::{
                 upsert_release_coverage, upsert_release_file,
             },
         },
+        stream_egress::{
+            StreamEgressDecision, StreamHttpEgressPolicy, load_saved_stream_http_egress_policy,
+        },
         subscriptions::{AcquisitionTarget, list_subscription_targets},
     },
-    db::models::{MediaType, ProviderHealthState},
+    db::models::{MediaType, ProviderHealthState, SecretScope},
     download_broker::HTTP_STREAM_DEFAULT_LOGICAL_ID,
-    extensions::store::ExtensionStore,
+    extensions::store::{
+        ExtensionStore, NewExtensionSourceHealthEvent, NewExtensionSourceModuleQuarantine,
+    },
     http::handlers::{
         acquisition_sources::{
             ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
@@ -57,8 +64,20 @@ use crate::{
         extensions::resolve_control_provider_transport_base_url,
     },
     media::ffprobe,
+    network::protection::{
+        ActiveManagedDownloaderRuntime, CloudflareWarpGatewayRuntime,
+        DownloadProtectionCompileInput, DownloadProtectionProfile, GluetunOpenvpnGatewayRuntime,
+        GluetunWireguardGatewayRuntime, active_managed_downloader_runtime,
+    },
     orchestrator::model::ProviderEndpoint,
-    runtime::RuntimePaths,
+    runtime::{
+        RuntimeManager, RuntimePaths,
+        docker::DockerRuntimeManager,
+        model::{
+            ContainerSpec, VolumeMount, VolumeMountSourceKind, apply_container_spec_fingerprint,
+        },
+    },
+    secrets::SecretsManager,
     state::AppState,
 };
 
@@ -76,6 +95,14 @@ const STREAM_CANDIDATE_RESOLVE_TIMEOUT_SECONDS: u64 = 30;
 const STREAM_CANDIDATE_RESOLVE_RESPONSE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STREAM_FILE_NAME_LEN: usize = 180;
 const FFMPEG_STDERR_TAIL_BYTES: usize = 16 * 1024;
+const STREAM_MANIFEST_CLASSIFY_TIMEOUT_SECONDS: u64 = 30;
+const STREAM_MANIFEST_CLASSIFY_MAX_BYTES: usize = 512 * 1024;
+const STREAM_MANIFEST_CLASSIFY_MAX_REFERENCES: usize = 256;
+const STREAM_MANIFEST_CLASSIFY_MAX_DEPTH: usize = 4;
+const PROTECTED_STREAM_WORKER_IMAGE: &str = "elixir/http-stream-materializer-worker:0.1.0";
+const PROTECTED_STREAM_WORKER_EXTENSION_ID: &str = "elixir.core.http-stream-materializer";
+const PROTECTED_STREAM_WORKER_NETWORK: &str = "elixir_net";
+const PROTECTED_STREAM_WORKER_MOUNT: &str = "/work";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpStreamMaterializerStats {
@@ -122,6 +149,169 @@ impl HttpStreamMaterializerConfig {
             batch_limit: STREAM_MATERIALIZER_BATCH_LIMIT,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamEgressRoute {
+    policy: StreamHttpEgressPolicy,
+    decision: StreamEgressDecision,
+    initial_url_scheme: String,
+    final_url_scheme: Option<String>,
+    protected_profile_id: Option<String>,
+    protected_runtime_kind: Option<String>,
+    worker_runtime_id: Option<String>,
+    reason: String,
+    manifest_summary: Option<StreamManifestClassificationSummary>,
+}
+
+impl StreamEgressRoute {
+    fn direct_https(
+        policy: StreamHttpEgressPolicy,
+        initial_url_scheme: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy,
+            decision: StreamEgressDecision::DirectHttps,
+            initial_url_scheme: initial_url_scheme.into(),
+            final_url_scheme: None,
+            protected_profile_id: None,
+            protected_runtime_kind: None,
+            worker_runtime_id: None,
+            reason: reason.into(),
+            manifest_summary: None,
+        }
+    }
+
+    fn protected(
+        policy: StreamHttpEgressPolicy,
+        decision: StreamEgressDecision,
+        initial_url_scheme: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy,
+            decision,
+            initial_url_scheme: initial_url_scheme.into(),
+            final_url_scheme: None,
+            protected_profile_id: None,
+            protected_runtime_kind: None,
+            worker_runtime_id: None,
+            reason: reason.into(),
+            manifest_summary: None,
+        }
+    }
+
+    fn rejected(
+        policy: StreamHttpEgressPolicy,
+        initial_url_scheme: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy,
+            decision: StreamEgressDecision::RejectedByPolicy,
+            initial_url_scheme: initial_url_scheme.into(),
+            final_url_scheme: None,
+            protected_profile_id: None,
+            protected_runtime_kind: None,
+            worker_runtime_id: None,
+            reason: reason.into(),
+            manifest_summary: None,
+        }
+    }
+
+    fn blocked(
+        mut self,
+        reason: impl Into<String>,
+        profile_id: Option<String>,
+        runtime_kind: Option<String>,
+    ) -> Self {
+        self.decision = StreamEgressDecision::BlockedProtectedEgressUnavailable;
+        self.reason = reason.into();
+        self.protected_profile_id = profile_id;
+        self.protected_runtime_kind = runtime_kind;
+        self
+    }
+
+    fn with_final_url(mut self, final_url: &str) -> Self {
+        if let Ok(url) = Url::parse(final_url) {
+            self.final_url_scheme = Some(url.scheme().to_string());
+        }
+        self
+    }
+
+    fn with_protected_runtime(
+        mut self,
+        profile_id: Option<String>,
+        runtime_kind: Option<String>,
+        worker_runtime_id: Option<String>,
+    ) -> Self {
+        self.protected_profile_id = profile_id;
+        self.protected_runtime_kind = runtime_kind;
+        self.worker_runtime_id = worker_runtime_id;
+        self
+    }
+
+    fn requires_protected(&self) -> bool {
+        matches!(
+            self.decision,
+            StreamEgressDecision::ProtectedHttp | StreamEgressDecision::ProtectedMixedManifest
+        )
+    }
+
+    fn is_terminal_rejection(&self) -> bool {
+        matches!(
+            self.decision,
+            StreamEgressDecision::BlockedProtectedEgressUnavailable
+                | StreamEgressDecision::RejectedByPolicy
+        )
+    }
+
+    fn route_label(&self) -> &'static str {
+        self.decision.route_label()
+    }
+
+    fn runtime_json(&self) -> Value {
+        json!({
+            "policy": self.policy.as_str(),
+            "decision": self.decision.as_str(),
+            "routeLabel": self.route_label(),
+            "initialUrlScheme": self.initial_url_scheme,
+            "finalUrlScheme": self.final_url_scheme,
+            "requiresProtected": self.requires_protected(),
+            "protectedProfileId": self.protected_profile_id,
+            "protectedRuntimeKind": self.protected_runtime_kind,
+            "workerRuntimeId": self.worker_runtime_id,
+            "reason": self.reason,
+            "manifest": self.manifest_summary.as_ref().map(StreamManifestClassificationSummary::runtime_json),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamManifestClassificationSummary {
+    inspected_manifests: usize,
+    inspected_references: usize,
+    http_component_kind: Option<String>,
+    http_component_scheme: Option<String>,
+}
+
+impl StreamManifestClassificationSummary {
+    fn runtime_json(&self) -> Value {
+        json!({
+            "inspectedManifests": self.inspected_manifests,
+            "inspectedReferences": self.inspected_references,
+            "httpComponentKind": self.http_component_kind,
+            "httpComponentScheme": self.http_component_scheme,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamManifestClassification {
+    requires_protected: bool,
+    reason: String,
+    summary: StreamManifestClassificationSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +380,631 @@ trait DirectFileHttpClient: Send + Sync {
     async fn open(&self, request: DirectFileDownloadRequest) -> Result<DirectFileHttpResponse>;
 }
 
+#[async_trait]
+trait StreamEgressClassifier: Send + Sync {
+    async fn classify_direct_file(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &DirectFileDownloadRequest,
+    ) -> Result<StreamEgressRoute>;
+
+    async fn classify_remux_stream(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &StreamRemuxRequest,
+    ) -> Result<StreamEgressRoute>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReqwestStreamEgressClassifier;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct InitialSchemeStreamEgressClassifier;
+
+#[derive(Debug, Clone)]
+struct ProtectedDirectFileRequest {
+    download: DirectFileDownloadRequest,
+    partial_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtectedDirectFileResult {
+    final_url: String,
+    content_length: Option<u64>,
+    content_type: Option<String>,
+    content_disposition: Option<String>,
+    downloaded_bytes: u64,
+    worker_runtime_id: Option<String>,
+    stderr_tail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProtectedRemuxRequest {
+    remux: StreamRemuxRequest,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtectedRemuxResult {
+    remux: StreamRemuxResult,
+    worker_runtime_id: Option<String>,
+}
+
+#[async_trait]
+trait ProtectedStreamMaterializer: Send + Sync {
+    async fn materialize_direct_file(
+        &self,
+        request: ProtectedDirectFileRequest,
+    ) -> Result<ProtectedDirectFileResult>;
+
+    async fn remux_stream(
+        &self,
+        request: ProtectedRemuxRequest,
+        progress: &mut dyn StreamRemuxProgressSink,
+    ) -> Result<ProtectedRemuxResult>;
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(test)]
+struct UnavailableProtectedStreamMaterializer;
+
+#[derive(Clone)]
+struct DockerProtectedStreamMaterializer {
+    pool: AnyPool,
+    secrets: Arc<SecretsManager>,
+    runtime_paths: RuntimePaths,
+    runtime: Arc<DockerRuntimeManager>,
+    wireguard_gateway_image: String,
+    worker_image: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtectedWorkerRequestFile {
+    mode: String,
+    url: String,
+    headers: Vec<ProtectedWorkerHeader>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referer: Option<String>,
+    partial_path: String,
+    result_path: String,
+    progress_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtectedWorkerHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtectedWorkerResultFile {
+    success: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    final_url: Option<String>,
+    #[serde(default)]
+    content_length: Option<u64>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    content_disposition: Option<String>,
+    #[serde(default)]
+    output_bytes: Option<u64>,
+    #[serde(default)]
+    final_progress: Option<StreamRemuxProgress>,
+    #[serde(default)]
+    stderr_tail: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProtectedWorkerRunResult {
+    runtime_id: String,
+    result: ProtectedWorkerResultFile,
+    logs_tail: Option<String>,
+}
+
+impl DockerProtectedStreamMaterializer {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            pool: state.db_pool.clone(),
+            secrets: state.secrets.clone(),
+            runtime_paths: RuntimePaths::from_roots(
+                &state.settings.extensions.storage_root,
+                &state.settings.library.local_root,
+            ),
+            runtime: Arc::new(DockerRuntimeManager::new(None)),
+            wireguard_gateway_image: state.settings.network.vpn.wireguard_gateway_image.clone(),
+            worker_image: PROTECTED_STREAM_WORKER_IMAGE.to_string(),
+        }
+    }
+
+    async fn run_worker(
+        &self,
+        host_partial_path: &Path,
+        request: ProtectedWorkerRequestFile,
+        timeout_duration: Duration,
+    ) -> Result<ProtectedWorkerRunResult> {
+        let job_dir = host_partial_path
+            .parent()
+            .ok_or_else(|| anyhow!("protected worker partial path has no parent directory"))?;
+        fs::create_dir_all(job_dir).await.with_context(|| {
+            format!("creating protected worker job dir '{}'", job_dir.display())
+        })?;
+        let runtime_id = Uuid::new_v4().to_string();
+        let request_name = format!("worker-request-{runtime_id}.json");
+        let result_name = format!("worker-result-{runtime_id}.json");
+        let progress_name = format!("worker-progress-{runtime_id}.json");
+        let request_path = job_dir.join(&request_name);
+        let result_path = job_dir.join(&result_name);
+        let progress_path = job_dir.join(&progress_name);
+        let container_request = ProtectedWorkerRequestFile {
+            result_path: format!("{PROTECTED_STREAM_WORKER_MOUNT}/{result_name}"),
+            progress_path: format!("{PROTECTED_STREAM_WORKER_MOUNT}/{progress_name}"),
+            ..request
+        };
+        let request_json = serde_json::to_vec_pretty(&container_request)
+            .context("serializing protected stream worker request")?;
+        fs::write(&request_path, request_json)
+            .await
+            .with_context(|| {
+                format!(
+                    "writing protected stream worker request '{}'",
+                    request_path.display()
+                )
+            })?;
+
+        let worker_name = format!("elixir-http-stream-worker-{}", Uuid::new_v4().simple());
+        let (worker_spec, gateway_spec) = self
+            .compile_protected_worker_specs(
+                &worker_name,
+                &runtime_id,
+                job_dir,
+                vec![
+                    "--request".to_string(),
+                    format!("{PROTECTED_STREAM_WORKER_MOUNT}/{request_name}"),
+                ],
+            )
+            .await?;
+        let mut worker_handle = None;
+        let mut gateway_handle = None;
+        let run_result = async {
+            if let Some(gateway_spec) = gateway_spec.as_ref() {
+                self.runtime.ensure_network(&gateway_spec.network).await?;
+                let handle = self
+                    .runtime
+                    .ensure_container(gateway_spec)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensuring protected stream gateway container '{}'",
+                            gateway_spec.name
+                        )
+                    })?;
+                gateway_handle = Some(handle);
+            }
+            let handle = self
+                .runtime
+                .ensure_container(&worker_spec)
+                .await
+                .with_context(|| {
+                    format!(
+                        "starting protected stream worker container '{}'",
+                        worker_spec.name
+                    )
+                })?;
+            worker_handle = Some(handle.clone());
+            let started = Instant::now();
+            loop {
+                let state = self.runtime.inspect(&handle).await.with_context(|| {
+                    format!("inspecting protected stream worker '{worker_name}'")
+                })?;
+                if !state.running {
+                    break;
+                }
+                if started.elapsed() > timeout_duration {
+                    bail!("protected stream worker timed out");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let logs = self
+                .runtime
+                .container_logs(&handle, None)
+                .await
+                .ok()
+                .map(|value| truncate_stream_diagnostic(&value, FFMPEG_STDERR_TAIL_BYTES));
+            let bytes = fs::read(&result_path).await.with_context(|| {
+                format!(
+                    "reading protected stream worker result '{}'",
+                    result_path.display()
+                )
+            })?;
+            let result: ProtectedWorkerResultFile =
+                serde_json::from_slice(&bytes).context("parsing protected stream worker result")?;
+            if !result.success {
+                bail!(
+                    "protected stream worker reported failure: {}",
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+            }
+            Ok::<ProtectedWorkerRunResult, anyhow::Error>(ProtectedWorkerRunResult {
+                runtime_id: runtime_id.clone(),
+                result,
+                logs_tail: logs,
+            })
+        }
+        .await;
+
+        if let Some(handle) = worker_handle.as_ref() {
+            let _ = self.runtime.remove_container(handle).await;
+        }
+        if let Some(handle) = gateway_handle.as_ref() {
+            let _ = self.runtime.remove_container(handle).await;
+        }
+        let _ = fs::remove_file(request_path).await;
+        let _ = fs::remove_file(result_path).await;
+        let _ = fs::remove_file(progress_path).await;
+        let _ = fs::remove_dir_all(self.worker_secret_runtime_root(&runtime_id)).await;
+        run_result
+    }
+
+    async fn compile_protected_worker_specs(
+        &self,
+        worker_name: &str,
+        runtime_id: &str,
+        job_dir: &Path,
+        command: Vec<String>,
+    ) -> Result<(ContainerSpec, Option<ContainerSpec>)> {
+        let mut labels = HashMap::new();
+        labels.insert("elixir.instance_id".to_string(), runtime_id.to_string());
+        labels.insert(
+            "elixir.instance_name".to_string(),
+            "HTTP stream materializer".to_string(),
+        );
+        labels.insert(
+            "elixir.extension_id".to_string(),
+            PROTECTED_STREAM_WORKER_EXTENSION_ID.to_string(),
+        );
+        labels.insert("elixir.managed".to_string(), "true".to_string());
+        labels.insert(
+            "elixir.network_role".to_string(),
+            "http_stream_materializer".to_string(),
+        );
+        let mut app_spec = ContainerSpec {
+            name: worker_name.to_string(),
+            image: self.worker_image.clone(),
+            network: PROTECTED_STREAM_WORKER_NETWORK.to_string(),
+            network_mode: None,
+            aliases: Vec::new(),
+            env: Vec::new(),
+            volumes: vec![VolumeMount {
+                source_kind: VolumeMountSourceKind::Bind,
+                host_path: job_dir.to_string_lossy().to_string(),
+                container_path: PROTECTED_STREAM_WORKER_MOUNT.to_string(),
+                read_only: false,
+            }],
+            ports: Vec::new(),
+            labels: labels.clone(),
+            command,
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+        };
+        apply_container_spec_fingerprint(&mut app_spec);
+
+        let profile = self.active_protected_profile(runtime_id).await?;
+        let compiled = profile.compile(DownloadProtectionCompileInput {
+            app_container_name: worker_name,
+            app_spec: &app_spec,
+            base_labels: &labels,
+        })?;
+        Ok((compiled.protected_app_spec, compiled.gateway_spec))
+    }
+
+    async fn active_protected_profile(
+        &self,
+        runtime_id: &str,
+    ) -> Result<DownloadProtectionProfile> {
+        match active_managed_downloader_runtime(&self.pool).await? {
+            ActiveManagedDownloaderRuntime::WireguardConfig {
+                profile_id,
+                secret_ref,
+                gateway_image,
+            } => {
+                let config = resolve_stream_secret_value(
+                    &ExtensionStore::new(&self.pool),
+                    self.secrets.as_ref(),
+                    Uuid::parse_str(runtime_id).unwrap_or_else(|_| Uuid::new_v4()),
+                    &secret_ref,
+                )
+                .await?;
+                let config_path = self
+                    .write_worker_secret_file(runtime_id, "wireguard", "wg0.conf", &config)
+                    .await?;
+                Ok(DownloadProtectionProfile::wireguard_config(
+                    profile_id,
+                    "HTTP stream materializer WireGuard",
+                    true,
+                    GluetunWireguardGatewayRuntime {
+                        image: gateway_image
+                            .unwrap_or_else(|| self.wireguard_gateway_image.clone()),
+                        config_host_path: config_path,
+                    },
+                ))
+            }
+            ActiveManagedDownloaderRuntime::OpenvpnConfig {
+                profile_id,
+                config_secret_ref,
+                username_secret_ref,
+                password_secret_ref,
+                gateway_image,
+            } => {
+                let store = ExtensionStore::new(&self.pool);
+                let instance_id = Uuid::parse_str(runtime_id).unwrap_or_else(|_| Uuid::new_v4());
+                let config = resolve_stream_secret_value(
+                    &store,
+                    self.secrets.as_ref(),
+                    instance_id,
+                    &config_secret_ref,
+                )
+                .await?;
+                let username = match username_secret_ref.as_deref() {
+                    Some(secret_ref) => Some(
+                        resolve_stream_secret_value(
+                            &store,
+                            self.secrets.as_ref(),
+                            instance_id,
+                            secret_ref,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                let password = match password_secret_ref.as_deref() {
+                    Some(secret_ref) => Some(
+                        resolve_stream_secret_value(
+                            &store,
+                            self.secrets.as_ref(),
+                            instance_id,
+                            secret_ref,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                if username.is_some() != password.is_some() {
+                    bail!("OpenVPN protected stream profile has incomplete credentials");
+                }
+                let auth_path = if let (Some(username), Some(password)) = (username, password) {
+                    Some(
+                        self.write_worker_secret_file(
+                            runtime_id,
+                            "openvpn",
+                            "auth.txt",
+                            &format!("{}\n{}\n", username.trim(), password.trim()),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let rendered_config = render_stream_openvpn_config(&config, auth_path.is_some());
+                let config_path = self
+                    .write_worker_secret_file(
+                        runtime_id,
+                        "openvpn",
+                        "custom.conf",
+                        &rendered_config,
+                    )
+                    .await?;
+                Ok(DownloadProtectionProfile::openvpn_config(
+                    profile_id,
+                    "HTTP stream materializer OpenVPN",
+                    true,
+                    GluetunOpenvpnGatewayRuntime {
+                        image: gateway_image
+                            .unwrap_or_else(|| self.wireguard_gateway_image.clone()),
+                        config_host_path: config_path,
+                        auth_host_path: auth_path,
+                    },
+                ))
+            }
+            ActiveManagedDownloaderRuntime::CloudflareWarp {
+                profile_id,
+                enrollment_id,
+                identity_secret_ref,
+                gateway_image,
+                state_volume_name,
+            } => Ok(DownloadProtectionProfile::cloudflare_warp(
+                profile_id,
+                "HTTP stream materializer WARP",
+                true,
+                CloudflareWarpGatewayRuntime {
+                    image: gateway_image,
+                    state_volume_name,
+                    enrollment_id,
+                    identity_secret_ref,
+                },
+            )),
+            ActiveManagedDownloaderRuntime::Direct => {
+                bail!("active stream egress profile is direct")
+            }
+            ActiveManagedDownloaderRuntime::NoStoredProfile => {
+                bail!("no protected stream egress profile is configured")
+            }
+            ActiveManagedDownloaderRuntime::UnsupportedProtected { profile_id, kind } => {
+                bail!(
+                    "active stream egress profile '{}' uses unsupported runtime '{kind:?}'",
+                    profile_id
+                )
+            }
+        }
+    }
+
+    async fn write_worker_secret_file(
+        &self,
+        runtime_id: &str,
+        scope: &str,
+        name: &str,
+        contents: &str,
+    ) -> Result<String> {
+        let root = self.worker_secret_runtime_root(runtime_id).join(scope);
+        fs::create_dir_all(&root).await.with_context(|| {
+            format!("creating protected stream secret dir '{}'", root.display())
+        })?;
+        let path = root.join(name);
+        fs::write(&path, contents)
+            .await
+            .with_context(|| format!("writing protected stream secret '{}'", path.display()))?;
+        set_stream_private_file_permissions(&path).await?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    fn worker_secret_runtime_root(&self, runtime_id: &str) -> PathBuf {
+        Path::new(&self.runtime_paths.data_root)
+            .join("http-stream-materializer")
+            .join("protected-egress")
+            .join(runtime_id)
+    }
+}
+
+#[async_trait]
+#[cfg(test)]
+impl ProtectedStreamMaterializer for UnavailableProtectedStreamMaterializer {
+    async fn materialize_direct_file(
+        &self,
+        _request: ProtectedDirectFileRequest,
+    ) -> Result<ProtectedDirectFileResult> {
+        bail!("protected stream materializer worker is unavailable")
+    }
+
+    async fn remux_stream(
+        &self,
+        _request: ProtectedRemuxRequest,
+        _progress: &mut dyn StreamRemuxProgressSink,
+    ) -> Result<ProtectedRemuxResult> {
+        bail!("protected stream materializer worker is unavailable")
+    }
+}
+
+#[async_trait]
+impl ProtectedStreamMaterializer for DockerProtectedStreamMaterializer {
+    async fn materialize_direct_file(
+        &self,
+        request: ProtectedDirectFileRequest,
+    ) -> Result<ProtectedDirectFileResult> {
+        let file_name = request
+            .partial_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("protected direct-file partial path has no file name"))?;
+        let worker_request = ProtectedWorkerRequestFile {
+            mode: "direct_file".to_string(),
+            url: request.download.url.to_string(),
+            headers: request
+                .download
+                .headers
+                .iter()
+                .map(|(name, value)| ProtectedWorkerHeader {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            referer: request.download.referer.clone(),
+            partial_path: format!("{PROTECTED_STREAM_WORKER_MOUNT}/{file_name}"),
+            result_path: String::new(),
+            progress_path: String::new(),
+            stream_type: None,
+            duration_seconds: None,
+        };
+        let run = self
+            .run_worker(
+                &request.partial_path,
+                worker_request,
+                Duration::from_secs(STREAM_MATERIALIZER_DOWNLOAD_TIMEOUT_SECONDS),
+            )
+            .await?;
+        Ok(ProtectedDirectFileResult {
+            final_url: run
+                .result
+                .final_url
+                .unwrap_or_else(|| request.download.url.to_string()),
+            content_length: run.result.content_length,
+            content_type: run.result.content_type,
+            content_disposition: run.result.content_disposition,
+            downloaded_bytes: run.result.output_bytes.unwrap_or_default(),
+            worker_runtime_id: Some(run.runtime_id),
+            stderr_tail: run.result.stderr_tail.or(run.logs_tail),
+        })
+    }
+
+    async fn remux_stream(
+        &self,
+        request: ProtectedRemuxRequest,
+        progress: &mut dyn StreamRemuxProgressSink,
+    ) -> Result<ProtectedRemuxResult> {
+        let file_name = request
+            .remux
+            .partial_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("protected remux partial path has no file name"))?;
+        let worker_request = ProtectedWorkerRequestFile {
+            mode: "remux".to_string(),
+            url: request.remux.url.to_string(),
+            headers: request
+                .remux
+                .headers
+                .iter()
+                .map(|(name, value)| ProtectedWorkerHeader {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            referer: request.remux.referer.clone(),
+            partial_path: format!("{PROTECTED_STREAM_WORKER_MOUNT}/{file_name}"),
+            result_path: String::new(),
+            progress_path: String::new(),
+            stream_type: Some(request.remux.stream_type.as_str().to_string()),
+            duration_seconds: request.remux.duration_seconds,
+        };
+        let run = self
+            .run_worker(
+                &request.remux.partial_path,
+                worker_request,
+                remux_timeout_duration(request.remux.duration_seconds),
+            )
+            .await?;
+        if let Some(final_progress) = run.result.final_progress.clone() {
+            if progress.observe(final_progress).await? == StreamRemuxControl::Cancel {
+                bail!("protected stream remux was cancelled");
+            }
+        }
+        Ok(ProtectedRemuxResult {
+            remux: StreamRemuxResult {
+                final_url: run
+                    .result
+                    .final_url
+                    .or_else(|| Some(request.remux.url.to_string())),
+                output_bytes: run.result.output_bytes.unwrap_or_default(),
+                final_progress: run.result.final_progress,
+                stderr_tail: run.result.stderr_tail.or(run.logs_tail),
+            },
+            worker_runtime_id: Some(run.runtime_id),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StreamRemuxRequest {
     stream_type: StreamDeliveryType,
@@ -200,7 +1015,8 @@ struct StreamRemuxRequest {
     duration_seconds: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StreamRemuxProgress {
     out_time_seconds: Option<f64>,
     out_time_raw: Option<u64>,
@@ -486,17 +1302,21 @@ pub async fn start_http_stream_materializer_loop(state: AppState) {
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let downloader = ReqwestDirectFileClient;
     let remuxer = FfmpegStreamRemuxer;
+    let egress_classifier = ReqwestStreamEgressClassifier;
+    let protected_materializer = DockerProtectedStreamMaterializer::from_state(&state);
     let probe = FfprobeStreamFileProbe;
     let resolver = ProviderStreamCandidateLateResolver::default();
     let config = HttpStreamMaterializerConfig::from_state(&state);
 
     loop {
         interval.tick().await;
-        if let Err(err) = process_http_stream_materializer_once_with_services(
+        if let Err(err) = process_http_stream_materializer_once_with_all_services(
             &state.db_pool,
             &config,
             &downloader,
             &remuxer,
+            &egress_classifier,
+            &protected_materializer,
             &probe,
             &resolver,
         )
@@ -513,24 +1333,54 @@ pub async fn process_http_stream_materializer_once(
 ) -> Result<HttpStreamMaterializerStats> {
     let downloader = ReqwestDirectFileClient;
     let remuxer = FfmpegStreamRemuxer;
+    let egress_classifier = ReqwestStreamEgressClassifier;
+    let protected_materializer = DockerProtectedStreamMaterializer::from_state(state);
     let probe = FfprobeStreamFileProbe;
     let resolver = ProviderStreamCandidateLateResolver::default();
-    process_http_stream_materializer_once_with_services(
+    process_http_stream_materializer_once_with_all_services(
         &state.db_pool,
         &HttpStreamMaterializerConfig::from_state(state),
         &downloader,
         &remuxer,
+        &egress_classifier,
+        &protected_materializer,
         &probe,
         &resolver,
     )
     .await
 }
 
+#[cfg(test)]
 async fn process_http_stream_materializer_once_with_services(
     pool: &AnyPool,
     config: &HttpStreamMaterializerConfig,
     downloader: &dyn DirectFileHttpClient,
     remuxer: &dyn StreamRemuxer,
+    probe: &dyn StreamFileProbe,
+    late_resolver: &dyn StreamCandidateLateResolver,
+) -> Result<HttpStreamMaterializerStats> {
+    let egress_classifier = InitialSchemeStreamEgressClassifier;
+    let protected_materializer = UnavailableProtectedStreamMaterializer;
+    process_http_stream_materializer_once_with_all_services(
+        pool,
+        config,
+        downloader,
+        remuxer,
+        &egress_classifier,
+        &protected_materializer,
+        probe,
+        late_resolver,
+    )
+    .await
+}
+
+async fn process_http_stream_materializer_once_with_all_services(
+    pool: &AnyPool,
+    config: &HttpStreamMaterializerConfig,
+    downloader: &dyn DirectFileHttpClient,
+    remuxer: &dyn StreamRemuxer,
+    egress_classifier: &dyn StreamEgressClassifier,
+    protected_materializer: &dyn ProtectedStreamMaterializer,
     probe: &dyn StreamFileProbe,
     late_resolver: &dyn StreamCandidateLateResolver,
 ) -> Result<HttpStreamMaterializerStats> {
@@ -543,6 +1393,10 @@ async fn process_http_stream_materializer_once_with_services(
             )
         })?;
 
+    let store = ExtensionStore::new(pool);
+    let egress_policy = load_saved_stream_http_egress_policy(&store)
+        .await
+        .context("loading stream HTTP egress policy")?;
     let pending = list_pending_direct_file_jobs(pool, config.batch_limit).await?;
     let mut stats = HttpStreamMaterializerStats {
         scanned: pending.len(),
@@ -566,10 +1420,30 @@ async fn process_http_stream_materializer_once_with_services(
             };
         let outcome = match StreamDeliveryType::from_candidate(&pending_job.candidate) {
             Some(StreamDeliveryType::DirectFile) => {
-                materialize_direct_file_job(pool, config, downloader, probe, &pending_job).await?
+                materialize_direct_file_job(
+                    pool,
+                    config,
+                    downloader,
+                    egress_classifier,
+                    protected_materializer,
+                    probe,
+                    &pending_job,
+                    egress_policy,
+                )
+                .await?
             }
             Some(StreamDeliveryType::Hls | StreamDeliveryType::Dash) => {
-                materialize_remux_stream_job(pool, config, remuxer, probe, &pending_job).await?
+                materialize_remux_stream_job(
+                    pool,
+                    config,
+                    remuxer,
+                    egress_classifier,
+                    protected_materializer,
+                    probe,
+                    &pending_job,
+                    egress_policy,
+                )
+                .await?
             }
             None => {
                 stats.skipped += 1;
@@ -711,7 +1585,8 @@ async fn refresh_stream_candidate_if_needed(
         runtime,
         json!({
             "runtimeState": "resolved",
-            "sourceUrl": stream_candidate_string(&candidate, "/delivery/url"),
+            "sourceUrl": stream_candidate_string(&candidate, "/delivery/url")
+                .map(|value| runtime_safe_stream_url(&value)),
             "headerNames": stream_candidate_header_names(&candidate),
             "refererApplied": stream_candidate_string(&candidate, "/delivery/referer").is_some(),
             "lateResolve": {
@@ -788,8 +1663,11 @@ async fn materialize_direct_file_job(
     pool: &AnyPool,
     config: &HttpStreamMaterializerConfig,
     downloader: &dyn DirectFileHttpClient,
+    egress_classifier: &dyn StreamEgressClassifier,
+    protected_materializer: &dyn ProtectedStreamMaterializer,
     probe: &dyn StreamFileProbe,
     pending: &PendingDirectFileJob,
+    egress_policy: StreamHttpEgressPolicy,
 ) -> Result<DirectFileMaterializationOutcome> {
     let download_id = pending
         .job
@@ -799,6 +1677,10 @@ async fn materialize_direct_file_job(
         .ok_or_else(|| anyhow!("HTTP stream job is missing download id"))?
         .to_string();
     let request = direct_file_download_request(&pending.candidate)?;
+    let mut egress_route = egress_classifier
+        .classify_direct_file(egress_policy, &request)
+        .await
+        .context("classifying direct-file stream egress")?;
     let header_names = request
         .headers
         .iter()
@@ -813,13 +1695,15 @@ async fn materialize_direct_file_job(
             "runtimeState": "materializing",
             "streamType": "direct_file",
             "downloadId": download_id,
-            "sourceUrl": request.url.as_str(),
+            "sourceUrl": runtime_safe_stream_url(request.url.as_str()),
             "redirectPolicy": {
                 "maxRedirects": STREAM_MATERIALIZER_MAX_REDIRECTS,
                 "validated": true
             },
             "headerNames": header_names,
             "refererApplied": referer_applied,
+            "routeLabel": egress_route.route_label(),
+            "egress": egress_route.runtime_json(),
             "startedAt": started_at,
         }),
     );
@@ -836,9 +1720,86 @@ async fn materialize_direct_file_job(
     )
     .await?;
 
+    if egress_route.is_terminal_rejection() {
+        fail_stream_job(
+            pool,
+            pending,
+            &base_runtime,
+            stream_egress_failure_class(&egress_route),
+            &egress_route.reason,
+            None,
+        )
+        .await?;
+        return Ok(DirectFileMaterializationOutcome::Failed);
+    }
+
+    if egress_route.requires_protected() {
+        return materialize_direct_file_job_via_protected_egress(
+            pool,
+            config,
+            protected_materializer,
+            probe,
+            pending,
+            request,
+            egress_route,
+            base_runtime,
+        )
+        .await;
+    }
+
     let mut response = match downloader.open(request).await {
         Ok(response) => response,
         Err(err) => {
+            if err.downcast_ref::<HttpStreamDowngradeRedirect>().is_some() {
+                egress_route = StreamEgressRoute::protected(
+                    egress_policy,
+                    StreamEgressDecision::ProtectedHttp,
+                    "https",
+                    "direct-file HTTPS request redirects to HTTP",
+                );
+                let base_runtime = merge_runtime_object(
+                    base_runtime,
+                    json!({
+                        "routeLabel": egress_route.route_label(),
+                        "egress": egress_route.runtime_json(),
+                    }),
+                );
+                if egress_policy == StreamHttpEgressPolicy::DirectOnly {
+                    let rejected = StreamEgressRoute::rejected(
+                        egress_policy,
+                        "https",
+                        "stream egress policy rejects HTTP redirect target",
+                    );
+                    let runtime = merge_runtime_object(
+                        base_runtime,
+                        json!({
+                            "routeLabel": rejected.route_label(),
+                            "egress": rejected.runtime_json(),
+                        }),
+                    );
+                    fail_stream_job(
+                        pool,
+                        pending,
+                        &runtime,
+                        stream_egress_failure_class(&rejected),
+                        &rejected.reason,
+                        None,
+                    )
+                    .await?;
+                    return Ok(DirectFileMaterializationOutcome::Failed);
+                }
+                return materialize_direct_file_job_via_protected_egress(
+                    pool,
+                    config,
+                    protected_materializer,
+                    probe,
+                    pending,
+                    direct_file_download_request(&pending.candidate)?,
+                    egress_route,
+                    base_runtime,
+                )
+                .await;
+            }
             fail_stream_job(
                 pool,
                 pending,
@@ -871,21 +1832,38 @@ async fn materialize_direct_file_job(
             .unwrap_or_default()
     ));
 
+    let response_final_url = response.final_url.clone();
+    let response_final_url_evidence = runtime_safe_stream_url(&response_final_url);
+    let response_content_type = response.content_type.clone();
+    let response_content_length = response.content_length;
     let mut runtime = merge_runtime_object(
         base_runtime.clone(),
         json!({
             "runtimeState": "downloading",
-            "finalUrl": response.final_url,
-            "contentType": response.content_type,
-            "contentLength": response.content_length,
+            "finalUrl": response_final_url_evidence,
+            "egress": egress_route.clone().with_final_url(&response_final_url).runtime_json(),
+            "contentType": response_content_type,
+            "contentLength": response_content_length,
             "localPath": target_path.to_string_lossy(),
             "partialPath": partial_path.to_string_lossy(),
             "downloadedBytes": 0,
-            "totalBytes": response.content_length,
+            "totalBytes": response_content_length,
             "progress": 0.0,
             "downloadRateBps": 0
         }),
     );
+    if let Some(reason) = direct_file_non_media_response_reason(&response) {
+        fail_stream_job(
+            pool,
+            pending,
+            &runtime,
+            "source_returned_non_media_response",
+            &reason,
+            None,
+        )
+        .await?;
+        return Ok(DirectFileMaterializationOutcome::Failed);
+    }
     update_stream_runtime(
         pool,
         &pending.release,
@@ -1045,12 +2023,415 @@ async fn materialize_direct_file_job(
     .await
 }
 
+enum ProtectedStreamEgressAvailability {
+    Available(StreamEgressRoute),
+    Blocked(StreamEgressRoute),
+}
+
+async fn resolve_protected_stream_egress(
+    pool: &AnyPool,
+    route: StreamEgressRoute,
+) -> Result<ProtectedStreamEgressAvailability> {
+    if !route.requires_protected() {
+        return Ok(ProtectedStreamEgressAvailability::Available(route));
+    }
+    match active_managed_downloader_runtime(pool).await {
+        Ok(ActiveManagedDownloaderRuntime::WireguardConfig { profile_id, .. }) => {
+            Ok(ProtectedStreamEgressAvailability::Available(
+                route.with_protected_runtime(
+                    Some(profile_id),
+                    Some("wireguard_config".to_string()),
+                    None,
+                ),
+            ))
+        }
+        Ok(ActiveManagedDownloaderRuntime::OpenvpnConfig { profile_id, .. }) => {
+            Ok(ProtectedStreamEgressAvailability::Available(
+                route.with_protected_runtime(
+                    Some(profile_id),
+                    Some("openvpn_config".to_string()),
+                    None,
+                ),
+            ))
+        }
+        Ok(ActiveManagedDownloaderRuntime::CloudflareWarp { profile_id, .. }) => {
+            Ok(ProtectedStreamEgressAvailability::Available(
+                route.with_protected_runtime(
+                    Some(profile_id),
+                    Some("cloudflare_warp".to_string()),
+                    None,
+                ),
+            ))
+        }
+        Ok(ActiveManagedDownloaderRuntime::UnsupportedProtected { profile_id, kind }) => {
+            Ok(ProtectedStreamEgressAvailability::Blocked(route.blocked(
+                format!(
+                    "Stream download blocked: active protected profile '{profile_id}' uses unsupported runtime '{kind:?}'."
+                ),
+                Some(profile_id),
+                Some(format!("{kind:?}")),
+            )))
+        }
+        Ok(ActiveManagedDownloaderRuntime::Direct) => Ok(ProtectedStreamEgressAvailability::Blocked(
+            route.blocked(
+                "Stream download blocked: active egress profile is direct.",
+                None,
+                Some("direct".to_string()),
+            ),
+        )),
+        Ok(ActiveManagedDownloaderRuntime::NoStoredProfile) => {
+            Ok(ProtectedStreamEgressAvailability::Blocked(route.blocked(
+                "Stream download blocked: no protected egress profile is configured.",
+                None,
+                None,
+            )))
+        }
+        Err(err) => Ok(ProtectedStreamEgressAvailability::Blocked(route.blocked(
+            format!("Stream download blocked: protected egress is unavailable: {err}"),
+            None,
+            None,
+        ))),
+    }
+}
+
+fn stream_egress_failure_class(route: &StreamEgressRoute) -> &'static str {
+    match route.decision {
+        StreamEgressDecision::RejectedByPolicy => "stream_egress_policy_rejected",
+        StreamEgressDecision::BlockedProtectedEgressUnavailable => {
+            "protected_stream_egress_unavailable"
+        }
+        _ => "stream_egress_failed",
+    }
+}
+
+fn choose_direct_file_name_from_request(
+    candidate: &Value,
+    request: &DirectFileDownloadRequest,
+) -> String {
+    filename_from_url(request.url.as_str())
+        .or_else(|| stream_candidate_string(candidate, "/title"))
+        .map(|value| safe_file_name(&value))
+        .filter(|value| !value.is_empty())
+        .map(|value| ensure_media_extension(value, None))
+        .unwrap_or_else(|| ensure_media_extension("http-stream-download".to_string(), None))
+}
+
+struct StreamSecretReference {
+    scope: SecretScope,
+    scope_id: Option<Uuid>,
+    key: String,
+}
+
+async fn resolve_stream_secret_value(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    raw: &str,
+) -> Result<String> {
+    let reference = parse_stream_secret_reference(raw, instance_id)?;
+    let secret = store
+        .get_secret(reference.scope, reference.scope_id, &reference.key)
+        .await?
+        .ok_or_else(|| anyhow!("secret '{}' not found", reference.key))?;
+    secrets
+        .decrypt(&secret.value_encrypted)
+        .with_context(|| format!("decrypting secret '{}'", reference.key))
+}
+
+fn parse_stream_secret_reference(raw: &str, instance_id: Uuid) -> Result<StreamSecretReference> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("secret reference must not be empty");
+    }
+    let parts = trimmed.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["instance", key] if !key.trim().is_empty() => Ok(StreamSecretReference {
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: (*key).to_string(),
+        }),
+        ["global", key] if !key.trim().is_empty() => Ok(StreamSecretReference {
+            scope: SecretScope::Global,
+            scope_id: None,
+            key: (*key).to_string(),
+        }),
+        ["provider", provider_id, key] if !key.trim().is_empty() => {
+            let provider_id = Uuid::parse_str(provider_id)
+                .map_err(|_| anyhow!("provider secret reference id is invalid"))?;
+            Ok(StreamSecretReference {
+                scope: SecretScope::Provider,
+                scope_id: Some(provider_id),
+                key: (*key).to_string(),
+            })
+        }
+        _ => {
+            bail!("secret reference must be instance:<key>, global:<key>, or provider:<uuid>:<key>")
+        }
+    }
+}
+
+fn render_stream_openvpn_config(config: &str, has_auth_file: bool) -> String {
+    if !has_auth_file {
+        return config.to_string();
+    }
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in config.lines() {
+        if line.trim_start().starts_with("auth-user-pass") {
+            lines.push("auth-user-pass /gluetun/auth.txt".to_string());
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push("auth-user-pass /gluetun/auth.txt".to_string());
+    }
+    lines.join("\n") + "\n"
+}
+
+async fn set_stream_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_direct_file_job_via_protected_egress(
+    pool: &AnyPool,
+    config: &HttpStreamMaterializerConfig,
+    protected_materializer: &dyn ProtectedStreamMaterializer,
+    probe: &dyn StreamFileProbe,
+    pending: &PendingDirectFileJob,
+    request: DirectFileDownloadRequest,
+    egress_route: StreamEgressRoute,
+    base_runtime: Value,
+) -> Result<DirectFileMaterializationOutcome> {
+    let egress_route = match resolve_protected_stream_egress(pool, egress_route).await? {
+        ProtectedStreamEgressAvailability::Available(route) => route,
+        ProtectedStreamEgressAvailability::Blocked(route) => {
+            let runtime = merge_runtime_object(
+                base_runtime,
+                json!({
+                    "routeLabel": route.route_label(),
+                    "egress": route.runtime_json(),
+                }),
+            );
+            fail_stream_job(
+                pool,
+                pending,
+                &runtime,
+                stream_egress_failure_class(&route),
+                &route.reason,
+                None,
+            )
+            .await?;
+            return Ok(DirectFileMaterializationOutcome::Failed);
+        }
+    };
+    let download_id = pending
+        .job
+        .download_id
+        .as_deref()
+        .or(pending.release.download_id.as_deref())
+        .ok_or_else(|| anyhow!("HTTP stream job is missing download id"))?
+        .to_string();
+    let file_name = choose_direct_file_name_from_request(&pending.candidate, &request);
+    let target_dir = config
+        .paths
+        .staging_root
+        .join(media_type_segment(pending.release.media_type))
+        .join(safe_path_segment(&download_id));
+    fs::create_dir_all(&target_dir)
+        .await
+        .with_context(|| format!("creating stream target dir '{}'", target_dir.display()))?;
+    let target_path = unique_target_path(&target_dir, &file_name).await;
+    let partial_path = target_path.with_extension(format!(
+        "{}elixir-part",
+        target_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}."))
+            .unwrap_or_default()
+    ));
+
+    let mut runtime = merge_runtime_object(
+        base_runtime,
+        json!({
+            "runtimeState": "downloading",
+            "routeLabel": egress_route.route_label(),
+            "egress": egress_route.runtime_json(),
+            "localPath": target_path.to_string_lossy(),
+            "partialPath": partial_path.to_string_lossy(),
+            "downloadedBytes": 0,
+            "progress": Value::Null,
+            "downloadRateBps": 0,
+        }),
+    );
+    update_stream_runtime(
+        pool,
+        &pending.release,
+        &pending.job,
+        AcquisitionReleaseState::Downloading,
+        ReleaseJobState::Downloading,
+        "Downloading HTTP stream file via protected egress.",
+        true,
+        None,
+        runtime.clone(),
+    )
+    .await?;
+
+    let protected_result = match protected_materializer
+        .materialize_direct_file(ProtectedDirectFileRequest {
+            download: request,
+            partial_path: partial_path.clone(),
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            cleanup_partial(&partial_path, &config.paths.staging_root).await;
+            fail_stream_job(
+                pool,
+                pending,
+                &runtime,
+                "protected_stream_materializer_failed",
+                &format!("Protected stream materializer failed: {err}"),
+                Some(&partial_path),
+            )
+            .await?;
+            return Ok(DirectFileMaterializationOutcome::Failed);
+        }
+    };
+
+    if job_cancelled(pool, pending.job.release_job_id).await? {
+        cleanup_partial(&partial_path, &config.paths.staging_root).await;
+        mark_stream_cancelled(pool, pending, &runtime, &partial_path).await?;
+        return Ok(DirectFileMaterializationOutcome::Cancelled);
+    }
+    let output_bytes = fs::metadata(&partial_path)
+        .await
+        .with_context(|| {
+            format!(
+                "reading protected stream partial '{}'",
+                partial_path.display()
+            )
+        })?
+        .len();
+    if output_bytes == 0 {
+        cleanup_partial(&partial_path, &config.paths.staging_root).await;
+        fail_stream_job(
+            pool,
+            pending,
+            &runtime,
+            "protected_stream_empty_output",
+            "Protected stream materializer produced an empty output file.",
+            Some(&partial_path),
+        )
+        .await?;
+        return Ok(DirectFileMaterializationOutcome::Failed);
+    }
+    fs::rename(&partial_path, &target_path)
+        .await
+        .with_context(|| {
+            format!(
+                "moving protected stream partial '{}' to '{}'",
+                partial_path.display(),
+                target_path.display()
+            )
+        })?;
+    let egress_route = egress_route.clone().with_protected_runtime(
+        egress_route.protected_profile_id.clone(),
+        egress_route.protected_runtime_kind.clone(),
+        protected_result.worker_runtime_id.clone(),
+    );
+    let protected_final_url = protected_result.final_url.clone();
+    let protected_content_type = protected_result.content_type.clone();
+    let protected_content_length = protected_result.content_length;
+    let protected_content_disposition = protected_result.content_disposition.clone();
+    let protected_downloaded_bytes = protected_result.downloaded_bytes.max(output_bytes);
+    let protected_stderr_tail = protected_result.stderr_tail.clone();
+    runtime = merge_runtime_object(
+        runtime,
+        json!({
+            "runtimeState": "probing",
+            "finalUrl": runtime_safe_stream_url(&protected_final_url),
+            "egress": egress_route.with_final_url(&protected_final_url).runtime_json(),
+            "contentType": protected_content_type,
+            "contentLength": protected_content_length,
+            "contentDisposition": protected_content_disposition,
+            "downloadedBytes": protected_downloaded_bytes,
+            "totalBytes": protected_content_length.or(Some(output_bytes)),
+            "progress": 1.0,
+            "downloadRateBps": 0,
+            "protectedWorker": {
+                "stderrTail": protected_stderr_tail
+            },
+            "updatedAt": Utc::now()
+        }),
+    );
+    update_stream_runtime(
+        pool,
+        &pending.release,
+        &pending.job,
+        AcquisitionReleaseState::Materializing,
+        ReleaseJobState::Materializing,
+        "Probing completed protected HTTP stream file before import.",
+        true,
+        None,
+        runtime.clone(),
+    )
+    .await?;
+
+    let probe_evidence = match probe.probe(&target_path).await {
+        Ok(probe) => probe,
+        Err(err) => {
+            fail_stream_job(
+                pool,
+                pending,
+                &runtime,
+                "ffprobe_failed",
+                &format!("ffprobe failed for completed protected HTTP stream file: {err}"),
+                None,
+            )
+            .await?;
+            return Ok(DirectFileMaterializationOutcome::Failed);
+        }
+    };
+
+    finish_materialized_stream_job(
+        pool,
+        config,
+        pending,
+        &target_path,
+        output_bytes,
+        protected_result.content_length.or(Some(output_bytes)),
+        &probe_evidence,
+        StreamDeliveryType::DirectFile,
+        "hse_protected_direct_file_stream_candidate",
+        "hse_protected_direct_file_materializer",
+        "hse_protected_direct_file",
+        runtime,
+    )
+    .await
+}
+
 async fn materialize_remux_stream_job(
     pool: &AnyPool,
     config: &HttpStreamMaterializerConfig,
     remuxer: &dyn StreamRemuxer,
+    egress_classifier: &dyn StreamEgressClassifier,
+    protected_materializer: &dyn ProtectedStreamMaterializer,
     probe: &dyn StreamFileProbe,
     pending: &PendingDirectFileJob,
+    egress_policy: StreamHttpEgressPolicy,
 ) -> Result<DirectFileMaterializationOutcome> {
     let stream_type = StreamDeliveryType::from_candidate(&pending.candidate)
         .ok_or_else(|| anyhow!("stream candidate is missing delivery.streamType"))?;
@@ -1082,6 +2463,22 @@ async fn materialize_remux_stream_job(
         .ok_or_else(|| anyhow!("HTTP stream job is missing download id"))?
         .to_string();
     let request = stream_delivery_request(&pending.candidate)?;
+    let duration_seconds =
+        stream_candidate_f64(&pending.candidate, "/targetEvidence/runtimeSeconds")
+            .or_else(|| stream_candidate_f64(&pending.candidate, "/mediaEvidence/runtimeSeconds"))
+            .or_else(|| stream_candidate_f64(&pending.candidate, "/mediaEvidence/durationSeconds"));
+    let initial_remux_request = StreamRemuxRequest {
+        stream_type,
+        url: request.url.clone(),
+        headers: request.headers.clone(),
+        referer: request.referer.clone(),
+        partial_path: PathBuf::new(),
+        duration_seconds,
+    };
+    let egress_route = egress_classifier
+        .classify_remux_stream(egress_policy, &initial_remux_request)
+        .await
+        .context("classifying remux stream egress")?;
     let header_names = request
         .headers
         .iter()
@@ -1100,6 +2497,8 @@ async fn materialize_remux_stream_job(
         runtime,
         json!({
             "runtimeState": "materializing",
+            "routeLabel": egress_route.route_label(),
+            "egress": egress_route.runtime_json(),
             "startedAt": started_at,
         }),
     );
@@ -1137,10 +2536,6 @@ async fn materialize_remux_stream_job(
             .map(|value| format!("{value}."))
             .unwrap_or_default()
     ));
-    let duration_seconds =
-        stream_candidate_f64(&pending.candidate, "/targetEvidence/runtimeSeconds")
-            .or_else(|| stream_candidate_f64(&pending.candidate, "/mediaEvidence/runtimeSeconds"))
-            .or_else(|| stream_candidate_f64(&pending.candidate, "/mediaEvidence/durationSeconds"));
 
     runtime = merge_runtime_object(
         runtime,
@@ -1185,7 +2580,77 @@ async fn materialize_remux_stream_job(
         partial_path: partial_path.clone(),
         duration_seconds,
     };
-    let remux_result = match remuxer.remux(remux_request, &mut progress_sink).await {
+    let remux_result = if egress_route.is_terminal_rejection() {
+        fail_stream_job(
+            pool,
+            pending,
+            &progress_sink.runtime,
+            stream_egress_failure_class(&egress_route),
+            &egress_route.reason,
+            None,
+        )
+        .await?;
+        return Ok(DirectFileMaterializationOutcome::Failed);
+    } else if egress_route.requires_protected() {
+        match resolve_protected_stream_egress(pool, egress_route.clone()).await? {
+            ProtectedStreamEgressAvailability::Available(route) => {
+                progress_sink.runtime = merge_runtime_object(
+                    progress_sink.runtime.clone(),
+                    json!({
+                        "routeLabel": route.route_label(),
+                        "egress": route.runtime_json(),
+                    }),
+                );
+                let protected = protected_materializer
+                    .remux_stream(
+                        ProtectedRemuxRequest {
+                            remux: remux_request,
+                        },
+                        &mut progress_sink,
+                    )
+                    .await;
+                match protected {
+                    Ok(result) => {
+                        let worker_route = route.clone().with_protected_runtime(
+                            route.protected_profile_id.clone(),
+                            route.protected_runtime_kind.clone(),
+                            result.worker_runtime_id.clone(),
+                        );
+                        progress_sink.runtime = merge_runtime_object(
+                            progress_sink.runtime.clone(),
+                            json!({
+                                "egress": worker_route.runtime_json(),
+                            }),
+                        );
+                        Ok(result.remux)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            ProtectedStreamEgressAvailability::Blocked(route) => {
+                progress_sink.runtime = merge_runtime_object(
+                    progress_sink.runtime.clone(),
+                    json!({
+                        "routeLabel": route.route_label(),
+                        "egress": route.runtime_json(),
+                    }),
+                );
+                fail_stream_job(
+                    pool,
+                    pending,
+                    &progress_sink.runtime,
+                    stream_egress_failure_class(&route),
+                    &route.reason,
+                    None,
+                )
+                .await?;
+                return Ok(DirectFileMaterializationOutcome::Failed);
+            }
+        }
+    } else {
+        remuxer.remux(remux_request, &mut progress_sink).await
+    };
+    let remux_result = match remux_result {
         Ok(result) => result,
         Err(err) => {
             cleanup_partial(&partial_path, &config.paths.staging_root).await;
@@ -1225,11 +2690,15 @@ async fn materialize_remux_stream_job(
             )
         })?;
 
+    let remux_final_url = remux_result.final_url.clone();
+    let remux_final_egress = runtime_egress_with_final_url(&runtime, remux_final_url.as_deref());
+    let remux_final_url_evidence = remux_final_url.as_deref().map(runtime_safe_stream_url);
     runtime = merge_runtime_object(
         runtime,
         json!({
             "runtimeState": "probing",
-            "finalUrl": remux_result.final_url,
+            "finalUrl": remux_final_url_evidence,
+            "egress": remux_final_egress,
             "downloadedBytes": remux_result.output_bytes,
             "totalBytes": remux_result.output_bytes,
             "progress": 1.0,
@@ -1841,45 +3310,100 @@ fn stream_candidate_headers(candidate: &Value) -> Result<Vec<(String, String)>> 
 #[derive(Debug, Clone, Copy)]
 struct ReqwestDirectFileClient;
 
+#[derive(Debug, Clone)]
+struct HttpStreamDowngradeRedirect {
+    from_scheme: String,
+    to_scheme: String,
+}
+
+impl fmt::Display for HttpStreamDowngradeRedirect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "stream redirect changed scheme from {} to {}; protected egress is required",
+            self.from_scheme, self.to_scheme
+        )
+    }
+}
+
+impl Error for HttpStreamDowngradeRedirect {}
+
 #[async_trait]
 impl DirectFileHttpClient for ReqwestDirectFileClient {
     async fn open(&self, request: DirectFileDownloadRequest) -> Result<DirectFileHttpResponse> {
         validate_safe_http_url(request.url.as_str()).context("initial URL is unsafe")?;
+        if request.url.scheme() == "http" {
+            return Err(HttpStreamDowngradeRedirect {
+                from_scheme: "http".to_string(),
+                to_scheme: "http".to_string(),
+            }
+            .into());
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(
                 STREAM_MATERIALIZER_DOWNLOAD_TIMEOUT_SECONDS,
             ))
-            .redirect(redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() > STREAM_MATERIALIZER_MAX_REDIRECTS {
-                    return attempt.error(io::Error::other("too many stream redirects"));
-                }
-                if let Err(err) = validate_safe_http_url(attempt.url().as_str()) {
-                    return attempt.error(io::Error::other(format!(
-                        "unsafe stream redirect target: {err}"
-                    )));
-                }
-                attempt.follow()
-            }))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building HTTP stream materializer client")?;
         let mut header_map = HeaderMap::new();
-        for (name, value) in request.headers {
+        for (name, value) in &request.headers {
             header_map.insert(
                 HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(&value)?,
+                HeaderValue::from_str(value)?,
             );
         }
-        if let Some(referer) = request.referer
+        if let Some(referer) = request.referer.as_deref()
             && !header_map.contains_key(REFERER)
         {
-            header_map.insert(REFERER, HeaderValue::from_str(&referer)?);
+            header_map.insert(REFERER, HeaderValue::from_str(referer)?);
         }
-        let response = client
-            .get(request.url)
-            .headers(header_map)
-            .send()
-            .await
-            .context("requesting direct HTTP stream file")?;
+
+        let mut next_url = request.url.clone();
+        let mut redirects = 0usize;
+        let response = loop {
+            validate_safe_http_url(next_url.as_str()).context("redirect target is unsafe")?;
+            if next_url.scheme() == "http" {
+                return Err(HttpStreamDowngradeRedirect {
+                    from_scheme: request.url.scheme().to_string(),
+                    to_scheme: next_url.scheme().to_string(),
+                }
+                .into());
+            }
+            let response = client
+                .get(next_url.clone())
+                .headers(header_map.clone())
+                .send()
+                .await
+                .context("requesting direct HTTP stream file")?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                break response;
+            };
+            redirects += 1;
+            if redirects > STREAM_MATERIALIZER_MAX_REDIRECTS {
+                bail!("too many stream redirects");
+            }
+            let redirected = next_url
+                .join(location)
+                .with_context(|| format!("parsing stream redirect location for {next_url}"))?;
+            validate_safe_http_url(redirected.as_str())
+                .context("stream redirect target is unsafe")?;
+            if redirected.scheme() == "http" {
+                return Err(HttpStreamDowngradeRedirect {
+                    from_scheme: next_url.scheme().to_string(),
+                    to_scheme: redirected.scheme().to_string(),
+                }
+                .into());
+            }
+            next_url = redirected;
+        };
         let status = response.status();
         if !status.is_success() {
             bail!("direct HTTP stream file returned {status}");
@@ -2118,27 +3642,23 @@ fn ffmpeg_header_block(headers: &[(String, String)]) -> String {
 
 async fn preflight_stream_manifest_url(request: &StreamRemuxRequest) -> Result<String> {
     validate_safe_http_url(request.url.as_str()).context("initial stream URL is unsafe")?;
+    if request.url.scheme() != "https" {
+        bail!("host stream manifest preflight requires HTTPS-only input");
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
-        .redirect(redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > STREAM_MATERIALIZER_MAX_REDIRECTS {
-                return attempt.error(io::Error::other("too many stream redirects"));
-            }
-            if let Err(err) = validate_safe_http_url(attempt.url().as_str()) {
-                return attempt.error(io::Error::other(format!(
-                    "unsafe stream redirect target: {err}"
-                )));
-            }
-            attempt.follow()
-        }))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP stream preflight client")?;
     let headers = stream_header_map(&request.headers, request.referer.as_deref())?;
-    let head = client
-        .head(request.url.clone())
-        .headers(headers.clone())
-        .send()
-        .await;
+    let head = send_https_stream_request_following_https_redirects(
+        &client,
+        Method::HEAD,
+        request.url.clone(),
+        headers.clone(),
+        None,
+    )
+    .await;
     let response = match head {
         Ok(response) if response.status().is_success() => response,
         Ok(response)
@@ -2147,13 +3667,15 @@ async fn preflight_stream_manifest_url(request: &StreamRemuxRequest) -> Result<S
                 StatusCode::METHOD_NOT_ALLOWED | StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
             ) =>
         {
-            client
-                .get(request.url.clone())
-                .headers(headers)
-                .header(RANGE, "bytes=0-0")
-                .send()
-                .await
-                .context("fallback GET preflight for stream manifest URL")?
+            send_https_stream_request_following_https_redirects(
+                &client,
+                Method::GET,
+                request.url.clone(),
+                headers,
+                Some(("range", "bytes=0-0")),
+            )
+            .await
+            .context("fallback GET preflight for stream manifest URL")?
         }
         Ok(response) => bail!("stream manifest preflight returned {}", response.status()),
         Err(err) => bail!("stream manifest preflight failed: {err}"),
@@ -2163,6 +3685,62 @@ async fn preflight_stream_manifest_url(request: &StreamRemuxRequest) -> Result<S
     }
     validate_safe_http_url(response.url().as_str()).context("final stream URL is unsafe")?;
     Ok(response.url().to_string())
+}
+
+async fn send_https_stream_request_following_https_redirects(
+    client: &Client,
+    method: Method,
+    initial_url: Url,
+    headers: HeaderMap,
+    extra_header: Option<(&str, &str)>,
+) -> Result<reqwest::Response> {
+    let mut next_url = initial_url.clone();
+    for redirect_count in 0..=STREAM_MATERIALIZER_MAX_REDIRECTS {
+        validate_safe_http_url(next_url.as_str()).context("stream preflight URL is unsafe")?;
+        if next_url.scheme() != "https" {
+            return Err(HttpStreamDowngradeRedirect {
+                from_scheme: initial_url.scheme().to_string(),
+                to_scheme: next_url.scheme().to_string(),
+            }
+            .into());
+        }
+        let mut request = client
+            .request(method.clone(), next_url.clone())
+            .headers(headers.clone());
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .context("requesting stream manifest URL")?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(location) = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(response);
+        };
+        if redirect_count == STREAM_MATERIALIZER_MAX_REDIRECTS {
+            bail!("too many stream redirects");
+        }
+        let redirected = next_url
+            .join(location)
+            .with_context(|| format!("parsing stream redirect location for {next_url}"))?;
+        validate_safe_http_url(redirected.as_str()).context("stream redirect target is unsafe")?;
+        if redirected.scheme() != "https" {
+            return Err(HttpStreamDowngradeRedirect {
+                from_scheme: next_url.scheme().to_string(),
+                to_scheme: redirected.scheme().to_string(),
+            }
+            .into());
+        }
+        next_url = redirected;
+    }
+    bail!("too many stream redirects")
 }
 
 fn stream_header_map(headers: &[(String, String)], referer: Option<&str>) -> Result<HeaderMap> {
@@ -2179,6 +3757,442 @@ fn stream_header_map(headers: &[(String, String)], referer: Option<&str>) -> Res
         header_map.insert(REFERER, HeaderValue::from_str(referer)?);
     }
     Ok(header_map)
+}
+
+#[async_trait]
+#[cfg(test)]
+impl StreamEgressClassifier for InitialSchemeStreamEgressClassifier {
+    async fn classify_direct_file(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &DirectFileDownloadRequest,
+    ) -> Result<StreamEgressRoute> {
+        classify_initial_stream_url(policy, &request.url, StreamDeliveryType::DirectFile)
+    }
+
+    async fn classify_remux_stream(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &StreamRemuxRequest,
+    ) -> Result<StreamEgressRoute> {
+        classify_initial_stream_url(policy, &request.url, request.stream_type)
+    }
+}
+
+#[async_trait]
+impl StreamEgressClassifier for ReqwestStreamEgressClassifier {
+    async fn classify_direct_file(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &DirectFileDownloadRequest,
+    ) -> Result<StreamEgressRoute> {
+        classify_initial_stream_url(policy, &request.url, StreamDeliveryType::DirectFile)
+    }
+
+    async fn classify_remux_stream(
+        &self,
+        policy: StreamHttpEgressPolicy,
+        request: &StreamRemuxRequest,
+    ) -> Result<StreamEgressRoute> {
+        let mut route = classify_initial_stream_url(policy, &request.url, request.stream_type)?;
+        if route.decision != StreamEgressDecision::DirectHttps
+            || policy == StreamHttpEgressPolicy::AlwaysProtected
+        {
+            return Ok(route);
+        }
+
+        let classification = classify_https_manifest_delivery_graph(request).await?;
+        route.manifest_summary = Some(classification.summary);
+        if !classification.requires_protected {
+            route.reason = classification.reason;
+            return Ok(route);
+        }
+
+        if policy == StreamHttpEgressPolicy::DirectOnly {
+            Ok(StreamEgressRoute::rejected(
+                policy,
+                request.url.scheme(),
+                classification.reason,
+            ))
+        } else {
+            Ok(StreamEgressRoute {
+                manifest_summary: route.manifest_summary,
+                ..StreamEgressRoute::protected(
+                    policy,
+                    StreamEgressDecision::ProtectedMixedManifest,
+                    request.url.scheme(),
+                    classification.reason,
+                )
+            })
+        }
+    }
+}
+
+fn classify_initial_stream_url(
+    policy: StreamHttpEgressPolicy,
+    url: &Url,
+    stream_type: StreamDeliveryType,
+) -> Result<StreamEgressRoute> {
+    validate_safe_http_url(url.as_str()).context("stream delivery URL is unsafe")?;
+    let scheme = url.scheme();
+    if policy == StreamHttpEgressPolicy::AlwaysProtected {
+        return Ok(StreamEgressRoute::protected(
+            policy,
+            if scheme == "http" || stream_type == StreamDeliveryType::DirectFile {
+                StreamEgressDecision::ProtectedHttp
+            } else {
+                StreamEgressDecision::ProtectedMixedManifest
+            },
+            scheme,
+            "stream egress policy requires protected egress",
+        ));
+    }
+
+    match scheme {
+        "https" => Ok(StreamEgressRoute::direct_https(
+            policy,
+            scheme,
+            "stream delivery URL is HTTPS",
+        )),
+        "http" if policy == StreamHttpEgressPolicy::DirectOnly => Ok(StreamEgressRoute::rejected(
+            policy,
+            scheme,
+            "stream egress policy rejects HTTP delivery",
+        )),
+        "http" => Ok(StreamEgressRoute::protected(
+            policy,
+            StreamEgressDecision::ProtectedHttp,
+            scheme,
+            match stream_type {
+                StreamDeliveryType::DirectFile => "direct-file delivery URL is HTTP",
+                StreamDeliveryType::Hls => "HLS manifest URL is HTTP",
+                StreamDeliveryType::Dash => "DASH manifest URL is HTTP",
+            },
+        )),
+        _ => bail!("stream delivery URL scheme must be http or https"),
+    }
+}
+
+async fn classify_https_manifest_delivery_graph(
+    request: &StreamRemuxRequest,
+) -> Result<StreamManifestClassification> {
+    if request.url.scheme() != "https" {
+        bail!("HTTPS manifest graph classification requires HTTPS initial URL");
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(
+            STREAM_MANIFEST_CLASSIFY_TIMEOUT_SECONDS,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building stream manifest classification client")?;
+    let headers = stream_header_map(&request.headers, request.referer.as_deref())?;
+    let mut queue = vec![(request.url.clone(), 0usize)];
+    let mut visited = BTreeSet::new();
+    let mut inspected_manifests = 0usize;
+    let mut inspected_references = 0usize;
+
+    while let Some((url, depth)) = queue.pop() {
+        if !visited.insert(url.to_string()) {
+            continue;
+        }
+        if depth > STREAM_MANIFEST_CLASSIFY_MAX_DEPTH {
+            bail!("stream manifest nesting exceeds classification depth limit");
+        }
+        let body =
+            match fetch_https_manifest_for_classification(&client, url.clone(), headers.clone())
+                .await
+            {
+                Ok(body) => body,
+                Err(err) if err.downcast_ref::<HttpStreamDowngradeRedirect>().is_some() => {
+                    return Ok(StreamManifestClassification {
+                        requires_protected: true,
+                        reason: "stream manifest redirect downgrades to HTTP".to_string(),
+                        summary: StreamManifestClassificationSummary {
+                            inspected_manifests,
+                            inspected_references,
+                            http_component_kind: Some("manifest_redirect".to_string()),
+                            http_component_scheme: Some("http".to_string()),
+                        },
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+        inspected_manifests += 1;
+        let references = match request.stream_type {
+            StreamDeliveryType::Hls => hls_manifest_references(&url, &body)?,
+            StreamDeliveryType::Dash => dash_manifest_references(&url, &body)?,
+            StreamDeliveryType::DirectFile => Vec::new(),
+        };
+
+        for reference in references {
+            inspected_references += 1;
+            if inspected_references > STREAM_MANIFEST_CLASSIFY_MAX_REFERENCES {
+                bail!("stream manifest reference count exceeds classification limit");
+            }
+            validate_safe_http_url(reference.url.as_str())
+                .with_context(|| format!("stream manifest {} URL is unsafe", reference.kind))?;
+            if reference.url.scheme() == "http" {
+                return Ok(StreamManifestClassification {
+                    requires_protected: true,
+                    reason: format!("stream manifest includes HTTP {}", reference.kind),
+                    summary: StreamManifestClassificationSummary {
+                        inspected_manifests,
+                        inspected_references,
+                        http_component_kind: Some(reference.kind),
+                        http_component_scheme: Some("http".to_string()),
+                    },
+                });
+            }
+            if reference.nested_manifest && depth < STREAM_MANIFEST_CLASSIFY_MAX_DEPTH {
+                queue.push((reference.url, depth + 1));
+            } else if reference.nested_manifest {
+                bail!("stream manifest nesting exceeds classification depth limit");
+            }
+        }
+    }
+
+    Ok(StreamManifestClassification {
+        requires_protected: false,
+        reason: "stream manifest delivery graph is HTTPS-only".to_string(),
+        summary: StreamManifestClassificationSummary {
+            inspected_manifests,
+            inspected_references,
+            http_component_kind: None,
+            http_component_scheme: None,
+        },
+    })
+}
+
+async fn fetch_https_manifest_for_classification(
+    client: &Client,
+    url: Url,
+    headers: HeaderMap,
+) -> Result<String> {
+    let response = send_https_stream_request_following_https_redirects(
+        client,
+        Method::GET,
+        url,
+        headers,
+        None,
+    )
+    .await?;
+    if !response.status().is_success() {
+        bail!(
+            "stream manifest classification returned {}",
+            response.status()
+        );
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("reading stream manifest classification body")?
+    {
+        bytes.extend_from_slice(&chunk);
+        ensure_stream_manifest_classification_byte_limit(bytes.len())?;
+    }
+    String::from_utf8(bytes).context("stream manifest is not valid UTF-8")
+}
+
+fn ensure_stream_manifest_classification_byte_limit(byte_len: usize) -> Result<()> {
+    if byte_len > STREAM_MANIFEST_CLASSIFY_MAX_BYTES {
+        bail!("stream manifest exceeds classification byte limit");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct StreamManifestReference {
+    kind: String,
+    url: Url,
+    nested_manifest: bool,
+}
+
+fn hls_manifest_references(base_url: &Url, body: &str) -> Result<Vec<StreamManifestReference>> {
+    let mut references = Vec::new();
+    let mut next_uri_is_playlist = false;
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("#EXT-X-STREAM-INF") {
+            next_uri_is_playlist = true;
+        }
+        if line.starts_with('#') {
+            for uri in hls_tag_uri_attributes(line) {
+                let kind = hls_tag_reference_kind(line);
+                references.push(manifest_reference_from_raw(base_url, &uri, kind)?);
+            }
+            continue;
+        }
+        let kind = if next_uri_is_playlist || looks_like_manifest_url(line) {
+            "nested_playlist"
+        } else {
+            "segment"
+        };
+        next_uri_is_playlist = false;
+        references.push(manifest_reference_from_raw(base_url, line, kind)?);
+    }
+    Ok(references)
+}
+
+fn hls_tag_uri_attributes(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = line;
+    while let Some(index) = rest.find("URI=") {
+        rest = &rest[index + 4..];
+        if let Some(stripped) = rest.strip_prefix('"') {
+            if let Some(end) = stripped.find('"') {
+                values.push(stripped[..end].to_string());
+                rest = &stripped[end + 1..];
+            } else {
+                break;
+            }
+        } else {
+            let end = rest
+                .find(',')
+                .or_else(|| rest.find(char::is_whitespace))
+                .unwrap_or(rest.len());
+            values.push(rest[..end].trim().to_string());
+            rest = &rest[end..];
+        }
+    }
+    values
+}
+
+fn hls_tag_reference_kind(line: &str) -> &'static str {
+    if line.starts_with("#EXT-X-KEY") || line.starts_with("#EXT-X-SESSION-KEY") {
+        "key"
+    } else if line.starts_with("#EXT-X-MAP") {
+        "initialization"
+    } else if line.starts_with("#EXT-X-MEDIA") {
+        "rendition"
+    } else if line.starts_with("#EXT-X-I-FRAME-STREAM-INF") {
+        "nested_playlist"
+    } else {
+        "uri"
+    }
+}
+
+fn dash_manifest_references(base_url: &Url, body: &str) -> Result<Vec<StreamManifestReference>> {
+    let mut reader = Reader::from_str(body);
+    reader.trim_text(true);
+    let mut buf = Vec::new();
+    let mut references = Vec::new();
+    let mut current_text_element: Option<Vec<u8>> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => {
+                let name = event.name().as_ref().to_vec();
+                collect_dash_attribute_references(base_url, &mut references, &event)?;
+                if matches!(
+                    name.as_slice(),
+                    b"BaseURL" | b"Location" | b"SegmentURL" | b"Initialization"
+                ) {
+                    current_text_element = Some(name);
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                collect_dash_attribute_references(base_url, &mut references, &event)?;
+            }
+            Ok(Event::Text(text)) => {
+                if let Some(name) = current_text_element.as_deref() {
+                    let raw = text.unescape().context("unescaping DASH manifest text")?;
+                    let raw = raw.trim();
+                    if !raw.is_empty() {
+                        let kind = if name == b"BaseURL" {
+                            "base_url"
+                        } else if name == b"Location" {
+                            "nested_manifest"
+                        } else {
+                            "segment"
+                        };
+                        references.push(manifest_reference_from_raw(base_url, raw, kind)?);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                current_text_element = None;
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => bail!("parsing DASH manifest failed: {err}"),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(references)
+}
+
+fn collect_dash_attribute_references(
+    base_url: &Url,
+    references: &mut Vec<StreamManifestReference>,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Result<()> {
+    for attr in event.attributes().with_checks(false) {
+        let attr = attr.context("reading DASH manifest attribute")?;
+        let key = attr.key.as_ref();
+        if !matches!(
+            key,
+            b"media" | b"index" | b"sourceURL" | b"initialization" | b"href"
+        ) {
+            continue;
+        }
+        let value = attr
+            .unescape_value()
+            .context("unescaping DASH manifest attribute")?;
+        let value = value.trim();
+        if value.is_empty() || value.contains('$') {
+            continue;
+        }
+        references.push(manifest_reference_from_raw(base_url, value, "segment")?);
+    }
+    Ok(())
+}
+
+fn manifest_reference_from_raw(
+    base_url: &Url,
+    raw: &str,
+    kind: &str,
+) -> Result<StreamManifestReference> {
+    let value = raw.trim();
+    if value.is_empty()
+        || value.starts_with("data:")
+        || value.starts_with("urn:")
+        || value.starts_with("skd:")
+    {
+        bail!("unsupported stream manifest URL reference scheme");
+    }
+    let url = if value.starts_with("//") {
+        Url::parse(&format!("{}:{value}", base_url.scheme()))?
+    } else if value.starts_with("http://") || value.starts_with("https://") {
+        Url::parse(value)?
+    } else {
+        base_url.join(value)?
+    };
+    let nested_manifest = kind == "nested_playlist"
+        || kind == "nested_manifest"
+        || looks_like_manifest_url(url.path());
+    Ok(StreamManifestReference {
+        kind: kind.to_string(),
+        url,
+        nested_manifest,
+    })
+}
+
+fn looks_like_manifest_url(value: &str) -> bool {
+    let path = value
+        .split('?')
+        .next()
+        .unwrap_or(value)
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    path.ends_with(".m3u8") || path.ends_with(".mpd")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2584,6 +4598,17 @@ async fn fail_stream_job(
             "completedAt": Utc::now()
         }),
     );
+    if let Err(err) =
+        record_source_module_materialization_failure(pool, pending, failure_class, reason, &runtime)
+            .await
+    {
+        tracing::warn!(
+            release_id = %pending.release.release_id,
+            failure_class,
+            error = %err,
+            "failed to record stream source module materialization failure"
+        );
+    }
     update_stream_runtime(
         pool,
         &pending.release,
@@ -2595,7 +4620,274 @@ async fn fail_stream_job(
         Some(Utc::now()),
         runtime,
     )
+    .await?;
+    mark_stream_release_targets_failed(pool, pending, reason).await
+}
+
+async fn record_source_module_materialization_failure(
+    pool: &AnyPool,
+    pending: &PendingDirectFileJob,
+    failure_class: &str,
+    reason: &str,
+    runtime: &Value,
+) -> Result<()> {
+    let Some(candidate) = pending.release.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    let Some(module_id) = stream_candidate_string(candidate, "/sourceModule/id")
+        .map(|value| stable_source_module_invocation_id(&value))
+    else {
+        return Ok(());
+    };
+    let store = ExtensionStore::new(pool);
+    let modules = store.list_source_modules(None, None).await?;
+    let Some(module) = modules
+        .iter()
+        .find(|module| stream_materializer_source_module_invocation_id(module) == module_id)
+    else {
+        return Ok(());
+    };
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    let active_version = module
+        .active_version
+        .as_deref()
+        .and_then(|active| versions.iter().find(|version| version.version == active))
+        .or_else(|| {
+            versions
+                .iter()
+                .find(|version| version.install_state == "active")
+        })
+        .or_else(|| {
+            versions
+                .iter()
+                .find(|version| version.install_state == "installed")
+        });
+    let hoster_domain = stream_candidate_string(candidate, "/delivery/url")
+        .and_then(|url| Url::parse(&url).ok())
+        .and_then(|url| url.host_str().map(str::to_string));
+    let media_type = Some(pending.release.media_type.as_str().to_string());
+    let source_health = source_health_state_for_materialization_failure(failure_class);
+    let severity = if source_health == "broken" {
+        "error"
+    } else {
+        "warning"
+    };
+    let observed_at = Utc::now();
+    store
+        .record_source_module_quarantine(&NewExtensionSourceModuleQuarantine {
+            quarantine_id: Uuid::new_v4(),
+            source_module_id: module.source_module_id,
+            source_module_version_id: active_version.map(|version| version.version_id),
+            instance_id: module.instance_id,
+            failure_class: failure_class.to_string(),
+            hoster_domain: hoster_domain.clone(),
+            candidate_fingerprint: Some(pending.release.fingerprint.clone()),
+            media_type: media_type.clone(),
+            reason: Some(reason.to_string()),
+            evidence_json: Some(json!({
+                "releaseId": pending.release.release_id,
+                "releaseJobId": pending.job.release_job_id,
+                "downloadId": pending.job.download_id,
+                "moduleId": module_id,
+                "hosterDomain": hoster_domain,
+                "mediaType": media_type,
+                "runtime": runtime,
+            })),
+            expires_at: Some(observed_at + chrono::Duration::hours(6)),
+        })
+        .await?;
+    store
+        .create_source_health_event(&NewExtensionSourceHealthEvent {
+            health_event_id: Uuid::new_v4(),
+            source_module_id: module.source_module_id,
+            event_type: "materialization_failure".to_string(),
+            state: source_health.to_string(),
+            severity: severity.to_string(),
+            reason: Some(reason.to_string()),
+            evidence_json: Some(json!({
+                "releaseId": pending.release.release_id,
+                "releaseJobId": pending.job.release_job_id,
+                "downloadId": pending.job.download_id,
+                "moduleId": module_id,
+                "failureClass": failure_class,
+                "candidateFingerprint": pending.release.fingerprint,
+            })),
+            observed_at: Some(observed_at),
+        })
+        .await?;
+    Ok(())
+}
+
+fn source_health_state_for_materialization_failure(failure_class: &str) -> &'static str {
+    match failure_class {
+        "account_required" | "provider_auth_missing" => "account_required",
+        "source_returned_non_media_response"
+        | "hoster_resolver_missing"
+        | "captcha_or_browser_required"
+        | "drm_or_license_required" => "unsupported",
+        "protected_stream_egress_unavailable" => "degraded",
+        _ => "broken",
+    }
+}
+
+fn stream_materializer_source_module_invocation_id(
+    module: &crate::extensions::store::ExtensionSourceModule,
+) -> String {
+    module
+        .metadata_json
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .get("nuvio")
+                .or_else(|| metadata.get("cloudstream"))
+        })
+        .and_then(|metadata| metadata.get("moduleId"))
+        .and_then(Value::as_str)
+        .map(stable_source_module_invocation_id)
+        .unwrap_or_else(|| {
+            module
+                .module_key
+                .rsplit(':')
+                .next()
+                .map(stable_source_module_invocation_id)
+                .unwrap_or_else(|| stable_source_module_invocation_id(&module.display_name))
+        })
+}
+
+fn stable_source_module_invocation_id(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !output.is_empty() {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        "source".to_string()
+    } else {
+        output
+    }
+}
+
+fn direct_file_non_media_response_reason(response: &DirectFileHttpResponse) -> Option<String> {
+    let content_type = response
+        .content_type
+        .as_deref()
+        .map(normalize_content_type)?;
+    if direct_file_content_type_is_non_media(&content_type) {
+        Some(format!(
+            "Direct HTTP stream URL returned {content_type}; this looks like a hoster, login, or error page instead of a playable media file. The scraper must resolve a direct media URL before Elixir can materialize it."
+        ))
+    } else {
+        None
+    }
+}
+
+fn normalize_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn direct_file_content_type_is_non_media(content_type: &str) -> bool {
+    content_type == "text/html"
+        || content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "application/json"
+                | "application/problem+json"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "application/javascript"
+                | "application/x-javascript"
+        )
+        || content_type.ends_with("+json")
+        || content_type.ends_with("+xml")
+}
+
+async fn mark_stream_release_targets_failed(
+    pool: &AnyPool,
+    pending: &PendingDirectFileJob,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_coverage
+         SET state = ?,
+             reason = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = ?",
+    )
+    .bind(ReleaseCoverageState::Rejected.as_str())
+    .bind(reason)
+    .bind(pending.release.release_id.to_string())
+    .execute(pool)
     .await
+    .context("marking HTTP stream release coverage failed")?;
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = ?,
+             state_reason = ?,
+             selected_route_logical_id = COALESCE(selected_route_logical_id, ?),
+             download_id = COALESCE(download_id, ?),
+             next_search_after = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE state NOT IN ('imported', 'excluded')
+           AND target_id IN (
+               SELECT target_id
+               FROM acquisition_release_coverage
+               WHERE release_id = ?
+           )",
+    )
+    .bind(crate::acquisition::subscriptions::AcquisitionTargetState::Blocked.as_str())
+    .bind(reason)
+    .bind(pending.job.route_logical_id.as_str())
+    .bind(pending.job.download_id.as_deref())
+    .bind(pending.release.release_id.to_string())
+    .execute(pool)
+    .await
+    .context("marking HTTP stream release targets failed")?;
+
+    if let Some(subscription_id) = pending.release.subscription_id {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_targets
+             SET state = ?,
+                 state_reason = ?,
+                 selected_route_logical_id = COALESCE(selected_route_logical_id, ?),
+                 download_id = COALESCE(download_id, ?),
+                 next_search_after = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE subscription_id = ?
+               AND state NOT IN ('imported', 'excluded')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM acquisition_release_coverage
+                   WHERE release_id = ?
+               )",
+        )
+        .bind(crate::acquisition::subscriptions::AcquisitionTargetState::Blocked.as_str())
+        .bind(reason)
+        .bind(pending.job.route_logical_id.as_str())
+        .bind(pending.job.download_id.as_deref())
+        .bind(subscription_id.to_string())
+        .bind(pending.release.release_id.to_string())
+        .execute(pool)
+        .await
+        .context("marking fallback HTTP stream subscription targets failed")?;
+    }
+    Ok(())
 }
 
 async fn update_http_stream_release_state(
@@ -2709,6 +5001,37 @@ fn merge_runtime_object(existing: Value, update: Value) -> Value {
     Value::Object(object)
 }
 
+fn runtime_egress_with_final_url(runtime: &Value, final_url: Option<&str>) -> Value {
+    let mut egress = runtime
+        .get("egress")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(JsonMap::new);
+    if let Some(final_url) = final_url
+        && let Ok(url) = Url::parse(final_url)
+    {
+        egress.insert(
+            "finalUrlScheme".to_string(),
+            Value::String(url.scheme().to_string()),
+        );
+    }
+    Value::Object(egress)
+}
+
+fn runtime_safe_stream_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "[redacted-stream-url]".to_string();
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return format!("{}:[redacted]", url.scheme());
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 fn existing_stream_runtime(pending: &PendingDirectFileJob) -> Value {
     pending
         .release
@@ -2744,7 +5067,7 @@ fn base_stream_runtime(
             "runtimeState": "materializing",
             "streamType": stream_type.as_str(),
             "downloadId": download_id,
-            "sourceUrl": source_url,
+            "sourceUrl": source_url.map(runtime_safe_stream_url),
             "redirectPolicy": {
                 "maxRedirects": STREAM_MATERIALIZER_MAX_REDIRECTS,
                 "validated": true,
@@ -3693,8 +6016,9 @@ mod tests {
                 },
             },
             subscriptions::{
-                AcquisitionMonitorPolicy, AcquisitionRoutePolicy, NewAcquisitionSubscription,
-                NewAcquisitionTarget, create_subscription, upsert_subscription_targets,
+                AcquisitionMonitorPolicy, AcquisitionRoutePolicy, AcquisitionTargetState,
+                NewAcquisitionSubscription, NewAcquisitionTarget, create_subscription,
+                upsert_subscription_targets,
             },
         },
         config::DatabaseConfig,
@@ -3708,7 +6032,7 @@ mod tests {
     use axum::{Json, Router, extract::State, http::StatusCode as AxumStatusCode, routing::post};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -3741,6 +6065,61 @@ mod tests {
                     block_on_second_chunk: self.block_on_second_chunk.clone(),
                 }),
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DowngradeRedirectDirectFileClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DirectFileHttpClient for DowngradeRedirectDirectFileClient {
+        async fn open(
+            &self,
+            _request: DirectFileDownloadRequest,
+        ) -> Result<DirectFileHttpResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(HttpStreamDowngradeRedirect {
+                from_scheme: "https".to_string(),
+                to_scheme: "http".to_string(),
+            }
+            .into())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FixedStreamEgressClassifier {
+        direct_route: Option<StreamEgressRoute>,
+        remux_route: Option<StreamEgressRoute>,
+    }
+
+    #[async_trait]
+    impl StreamEgressClassifier for FixedStreamEgressClassifier {
+        async fn classify_direct_file(
+            &self,
+            policy: StreamHttpEgressPolicy,
+            request: &DirectFileDownloadRequest,
+        ) -> Result<StreamEgressRoute> {
+            match self.direct_route.clone() {
+                Some(route) => Ok(route),
+                None => classify_initial_stream_url(
+                    policy,
+                    &request.url,
+                    StreamDeliveryType::DirectFile,
+                ),
+            }
+        }
+
+        async fn classify_remux_stream(
+            &self,
+            policy: StreamHttpEgressPolicy,
+            request: &StreamRemuxRequest,
+        ) -> Result<StreamEgressRoute> {
+            match self.remux_route.clone() {
+                Some(route) => Ok(route),
+                None => classify_initial_stream_url(policy, &request.url, request.stream_type),
+            }
         }
     }
 
@@ -3823,6 +6202,59 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct FakeProtectedStreamMaterializer {
+        direct_calls: Arc<tokio::sync::Mutex<Vec<ProtectedDirectFileRequest>>>,
+        remux_calls: Arc<tokio::sync::Mutex<Vec<ProtectedRemuxRequest>>>,
+    }
+
+    #[async_trait]
+    impl ProtectedStreamMaterializer for FakeProtectedStreamMaterializer {
+        async fn materialize_direct_file(
+            &self,
+            request: ProtectedDirectFileRequest,
+        ) -> Result<ProtectedDirectFileResult> {
+            self.direct_calls.lock().await.push(request.clone());
+            fs::write(&request.partial_path, b"protected-video-bytes").await?;
+            Ok(ProtectedDirectFileResult {
+                final_url: request.download.url.to_string(),
+                content_length: Some(21),
+                content_type: Some("video/mp4".to_string()),
+                content_disposition: None,
+                downloaded_bytes: 21,
+                worker_runtime_id: Some("fake-protected-worker".to_string()),
+                stderr_tail: None,
+            })
+        }
+
+        async fn remux_stream(
+            &self,
+            request: ProtectedRemuxRequest,
+            progress: &mut dyn StreamRemuxProgressSink,
+        ) -> Result<ProtectedRemuxResult> {
+            self.remux_calls.lock().await.push(request.clone());
+            fs::write(&request.remux.partial_path, b"protected-remux-bytes").await?;
+            let final_progress = StreamRemuxProgress {
+                out_time_seconds: request.remux.duration_seconds,
+                out_time_raw: None,
+                speed: Some("5.0x".to_string()),
+                output_bytes: Some(21),
+            };
+            if progress.observe(final_progress.clone()).await? == StreamRemuxControl::Cancel {
+                bail!("fake protected remux cancelled");
+            }
+            Ok(ProtectedRemuxResult {
+                remux: StreamRemuxResult {
+                    final_url: Some(request.remux.url.to_string()),
+                    output_bytes: 21,
+                    final_progress: Some(final_progress),
+                    stderr_tail: None,
+                },
+                worker_runtime_id: Some("fake-protected-worker".to_string()),
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
     struct FakeLateResolver {
         calls: Arc<tokio::sync::Mutex<Vec<Value>>>,
         result: Option<StreamCandidateResolveResult>,
@@ -3888,6 +6320,34 @@ mod tests {
         .await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    async fn seed_active_wireguard_stream_profile(pool: &AnyPool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("hse-wireguard")
+        .bind("HSE WireGuard")
+        .bind("wireguard_config")
+        .bind(true)
+        .bind(true)
+        .bind("managed_downloaders")
+        .bind("fixture-vpn")
+        .bind("gluetun_wireguard")
+        .bind("{}")
+        .bind("ready")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES (?, ?, ?)",
+        )
+        .bind("hse-wireguard")
+        .bind("wireguard_config")
+        .bind("global:wireguard_config")
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     fn direct_file_candidate() -> Value {
@@ -4580,6 +7040,635 @@ mod tests {
             .await?
             .expect("release by download id");
         assert_eq!(release_by_download_id.release_id, release_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess6_direct_file_materializer_rejects_html_landing_page_before_probe() -> Result<()> {
+        let database = setup_db().await?;
+        let temp = TempDir::new()?;
+        let candidate = direct_file_candidate();
+        let (release_id, download_id) = seed_direct_file_release(&database.pool, candidate).await?;
+        let downloader = FakeDirectFileClient {
+            chunks: vec![b"<!DOCTYPE html><title>Login required</title>".to_vec()],
+            content_length: Some(42),
+            content_type: Some("text/html; charset=UTF-8".to_string()),
+            content_disposition: None,
+            observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+            block_on_second_chunk: None,
+        };
+        let probe = fake_probe(verified_probe_evidence());
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &probe,
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.failed, 1);
+        assert!(!probe.called.load(Ordering::SeqCst));
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("failed stream release");
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        assert!(
+            release
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Direct HTTP stream URL returned text/html")
+        );
+        assert_eq!(release.download_id.as_deref(), Some(download_id.as_str()));
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.get("failureClass").and_then(Value::as_str),
+            Some("source_returned_non_media_response")
+        );
+        assert_eq!(
+            runtime.get("contentType").and_then(Value::as_str),
+            Some("text/html; charset=UTF-8")
+        );
+
+        let jobs = list_release_jobs(&database.pool, release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Failed);
+        assert!(
+            jobs[0]
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("hoster, login, or error page")
+        );
+
+        let subscription_id = release
+            .subscription_id
+            .expect("stream release subscription id");
+        let targets = list_subscription_targets(&database.pool, subscription_id).await?;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].state, AcquisitionTargetState::Blocked);
+        assert_eq!(
+            targets[0].selected_route_logical_id.as_deref(),
+            Some(HTTP_STREAM_DEFAULT_LOGICAL_ID)
+        );
+        assert_eq!(
+            targets[0].download_id.as_deref(),
+            Some(download_id.as_str())
+        );
+        assert!(
+            targets[0]
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Direct HTTP stream URL returned text/html")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_direct_https_stream_records_direct_https_egress() -> Result<()> {
+        let database = setup_db().await?;
+        let temp = TempDir::new()?;
+        let candidate = direct_file_candidate();
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let downloader = FakeDirectFileClient {
+            chunks: vec![b"video".to_vec(), b"bytes".to_vec()],
+            content_length: Some(10),
+            content_type: Some("video/mp4".to_string()),
+            content_disposition: None,
+            observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+            block_on_second_chunk: None,
+        };
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.completed, 1);
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("direct_https")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/routeLabel")
+                .and_then(Value::as_str),
+            Some("Direct HTTPS stream download")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_direct_http_stream_fails_closed_without_protected_profile() -> Result<()> {
+        let database = setup_db().await?;
+        let temp = TempDir::new()?;
+        let mut candidate = direct_file_candidate();
+        candidate["delivery"]["url"] = json!("http://cdn.example.test/show/s01e02/file.mp4");
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let observed_headers = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let downloader = FakeDirectFileClient {
+            chunks: vec![b"must-not-run".to_vec()],
+            content_length: Some(12),
+            content_type: Some("video/mp4".to_string()),
+            content_disposition: None,
+            observed_headers: observed_headers.clone(),
+            observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+            block_on_second_chunk: None,
+        };
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &InitialSchemeStreamEgressClassifier,
+            &UnavailableProtectedStreamMaterializer,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.failed, 1);
+        assert!(observed_headers.lock().await.is_empty());
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.get("failureClass").and_then(Value::as_str),
+            Some("protected_stream_egress_unavailable")
+        );
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("blocked_protected_egress_unavailable")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/routeLabel")
+                .and_then(Value::as_str),
+            Some("Stream download blocked: protected egress unavailable")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_direct_http_stream_uses_protected_worker_with_active_profile() -> Result<()> {
+        let database = setup_db().await?;
+        seed_active_wireguard_stream_profile(&database.pool).await?;
+        let temp = TempDir::new()?;
+        let mut candidate = direct_file_candidate();
+        candidate["delivery"]["url"] = json!("http://cdn.example.test/show/s01e02/file.mp4");
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let observed_headers = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let downloader = FakeDirectFileClient {
+            chunks: vec![b"must-not-run".to_vec()],
+            content_length: Some(12),
+            content_type: Some("video/mp4".to_string()),
+            content_disposition: None,
+            observed_headers: observed_headers.clone(),
+            observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+            block_on_second_chunk: None,
+        };
+        let protected = FakeProtectedStreamMaterializer::default();
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &InitialSchemeStreamEgressClassifier,
+            &protected,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.completed, 1);
+        assert!(observed_headers.lock().await.is_empty());
+        assert_eq!(protected.direct_calls.lock().await.len(), 1);
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        assert_eq!(release.state, AcquisitionReleaseState::Completed);
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("protected_http")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/protectedProfileId")
+                .and_then(Value::as_str),
+            Some("hse-wireguard")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/workerRuntimeId")
+                .and_then(Value::as_str),
+            Some("fake-protected-worker")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_https_to_http_redirect_reroutes_to_protected_worker_before_http_fetch()
+    -> Result<()> {
+        let database = setup_db().await?;
+        seed_active_wireguard_stream_profile(&database.pool).await?;
+        let temp = TempDir::new()?;
+        let candidate = direct_file_candidate();
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let downloader = DowngradeRedirectDirectFileClient::default();
+        let protected = FakeProtectedStreamMaterializer::default();
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &InitialSchemeStreamEgressClassifier,
+            &protected,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.completed, 1);
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 1);
+        let protected_calls = protected.direct_calls.lock().await.clone();
+        assert_eq!(protected_calls.len(), 1);
+        assert_eq!(
+            protected_calls[0].download.url.as_str(),
+            "https://cdn.example.test/show/s01e02/file"
+        );
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("protected_http")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/initialUrlScheme")
+                .and_then(Value::as_str),
+            Some("https")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_direct_only_rejects_http_stream_without_worker() -> Result<()> {
+        let database = setup_db().await?;
+        ExtensionStore::new(&database.pool)
+            .upsert_extension_setting(
+                crate::acquisition::stream_egress::STREAM_HTTP_EGRESS_POLICY_SETTING_KEY,
+                &json!("direct_only"),
+            )
+            .await?;
+        let temp = TempDir::new()?;
+        let mut candidate = direct_file_candidate();
+        candidate["delivery"]["url"] = json!("http://cdn.example.test/show/s01e02/file.mp4");
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let protected = FakeProtectedStreamMaterializer::default();
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &FakeDirectFileClient {
+                chunks: Vec::new(),
+                content_length: None,
+                content_type: None,
+                content_disposition: None,
+                observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+                block_on_second_chunk: None,
+            },
+            &FakeStreamRemuxer::default(),
+            &InitialSchemeStreamEgressClassifier,
+            &protected,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.failed, 1);
+        assert!(protected.direct_calls.lock().await.is_empty());
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.get("failureClass").and_then(Value::as_str),
+            Some("stream_egress_policy_rejected")
+        );
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("rejected_by_policy")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_https_hls_stays_on_host_remux_when_delivery_graph_is_direct() -> Result<()> {
+        let database = setup_db().await?;
+        let temp = TempDir::new()?;
+        let candidate = hls_candidate();
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let remuxer = FakeStreamRemuxer::default();
+        let protected = FakeProtectedStreamMaterializer::default();
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &FakeDirectFileClient {
+                chunks: Vec::new(),
+                content_length: None,
+                content_type: None,
+                content_disposition: None,
+                observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+                block_on_second_chunk: None,
+            },
+            &remuxer,
+            &InitialSchemeStreamEgressClassifier,
+            &protected,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.completed, 1);
+        assert_eq!(remuxer.observed.lock().await.len(), 1);
+        assert!(protected.remux_calls.lock().await.is_empty());
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("direct_https")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hse_mixed_hls_manifest_uses_protected_remux_worker() -> Result<()> {
+        let database = setup_db().await?;
+        seed_active_wireguard_stream_profile(&database.pool).await?;
+        let temp = TempDir::new()?;
+        let candidate = hls_candidate();
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let remuxer = FakeStreamRemuxer::default();
+        let protected = FakeProtectedStreamMaterializer::default();
+        let classifier = FixedStreamEgressClassifier {
+            direct_route: None,
+            remux_route: Some(StreamEgressRoute::protected(
+                StreamHttpEgressPolicy::AutoHttpOnly,
+                StreamEgressDecision::ProtectedMixedManifest,
+                "https",
+                "test manifest includes HTTP segment",
+            )),
+        };
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_all_services(
+            &database.pool,
+            &config,
+            &FakeDirectFileClient {
+                chunks: Vec::new(),
+                content_length: None,
+                content_type: None,
+                content_disposition: None,
+                observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+                block_on_second_chunk: None,
+            },
+            &remuxer,
+            &classifier,
+            &protected,
+            &fake_probe(verified_probe_evidence()),
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.completed, 1);
+        assert!(remuxer.observed.lock().await.is_empty());
+        assert_eq!(protected.remux_calls.lock().await.len(), 1);
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("release");
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.pointer("/egress/decision").and_then(Value::as_str),
+            Some("protected_mixed_manifest")
+        );
+        assert_eq!(
+            runtime
+                .pointer("/egress/workerRuntimeId")
+                .and_then(Value::as_str),
+            Some("fake-protected-worker")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hse_initial_http_manifests_require_protected_worker_route() -> Result<()> {
+        for (url, stream_type, reason) in [
+            (
+                "http://cdn.example.test/master.m3u8",
+                StreamDeliveryType::Hls,
+                "HLS manifest URL is HTTP",
+            ),
+            (
+                "http://cdn.example.test/manifest.mpd",
+                StreamDeliveryType::Dash,
+                "DASH manifest URL is HTTP",
+            ),
+        ] {
+            let route = classify_initial_stream_url(
+                StreamHttpEgressPolicy::AutoHttpOnly,
+                &Url::parse(url)?,
+                stream_type,
+            )?;
+
+            assert_eq!(route.decision, StreamEgressDecision::ProtectedHttp);
+            assert_eq!(route.initial_url_scheme, "http");
+            assert_eq!(route.reason, reason);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hse_stream_classifier_rejects_private_ip_delivery_urls() -> Result<()> {
+        let err = classify_initial_stream_url(
+            StreamHttpEgressPolicy::AutoHttpOnly,
+            &Url::parse("http://127.0.0.1/master.m3u8")?,
+            StreamDeliveryType::Hls,
+        )
+        .expect_err("private stream delivery IP should be rejected");
+
+        assert!(err.to_string().contains("stream delivery URL is unsafe"));
+        Ok(())
+    }
+
+    #[test]
+    fn hse_stream_manifest_classification_rejects_oversized_manifests() {
+        let err = ensure_stream_manifest_classification_byte_limit(
+            STREAM_MANIFEST_CLASSIFY_MAX_BYTES + 1,
+        )
+        .expect_err("oversized manifests should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("stream manifest exceeds classification byte limit")
+        );
+    }
+
+    #[test]
+    fn hse_hls_manifest_parser_detects_http_keys_subtitles_and_nested_playlists() -> Result<()> {
+        let base = Url::parse("https://cdn.example.test/master.m3u8")?;
+        let body = r#"
+#EXTM3U
+#EXT-X-KEY:METHOD=AES-128,URI="http://keys.example.test/key.bin"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",URI="https://cdn.example.test/subs/en.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=800000
+variant.m3u8
+http://segments.example.test/seg-1.ts
+"#;
+        let references = hls_manifest_references(&base, body)?;
+
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.kind == "key" && reference.url.scheme() == "http")
+        );
+        assert!(references.iter().any(|reference| {
+            reference.kind == "rendition" && reference.url.as_str().contains("/subs/en.m3u8")
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.kind == "nested_playlist" && reference.url.as_str().ends_with("/variant.m3u8")
+        }));
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.kind == "segment" && reference.url.scheme() == "http")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hse_dash_manifest_parser_detects_http_base_and_segment_urls() -> Result<()> {
+        let base = Url::parse("https://cdn.example.test/manifest.mpd")?;
+        let body = r#"
+<MPD>
+  <Period>
+    <BaseURL>http://segments.example.test/video/</BaseURL>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="http://segments.example.test/init.m4s" />
+        <SegmentList>
+          <SegmentURL media="http://segments.example.test/seg-1.m4s" />
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#;
+        let references = dash_manifest_references(&base, body)?;
+
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.kind == "base_url" && reference.url.scheme() == "http")
+        );
+        assert!(references.iter().any(|reference| {
+            reference.kind == "segment" && reference.url.as_str().ends_with("/init.m4s")
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.kind == "segment"
+                && reference.url.as_str() == "http://segments.example.test/seg-1.m4s"
+        }));
         Ok(())
     }
 

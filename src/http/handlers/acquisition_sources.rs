@@ -10,6 +10,7 @@ use axum::{
     Json,
     extract::{Query, State},
 };
+use chrono::Utc;
 use reqwest::{
     Url,
     header::{HeaderName, HeaderValue},
@@ -37,8 +38,9 @@ use crate::{
         manifest::ExtensionManifest,
         nuvio_registry::is_prism_extension_id,
         store::{
-            ExtensionSourceModule, ExtensionSourceModuleVersion, ExtensionSourceRegistry,
-            ExtensionStore,
+            ExtensionSourceModule, ExtensionSourceModuleCertification,
+            ExtensionSourceModuleVersion, ExtensionSourceRegistry, ExtensionStore,
+            NewExtensionSourceHealthEvent,
         },
     },
     http::{
@@ -676,6 +678,13 @@ async fn search_stream_candidate_suite_with_providers(
                 upstream,
                 &provider_request,
             );
+            let _ = record_stream_source_module_runtime_health(
+                &store,
+                &selected,
+                &provider_request,
+                &response,
+            )
+            .await;
             let provider = response.provider.clone();
             let warnings = response.warnings.clone();
             for candidate in &mut response.candidates {
@@ -2184,6 +2193,165 @@ fn stream_candidate_search_response_from_upstream(
         candidates,
         warnings,
     }
+}
+
+async fn record_stream_source_module_runtime_health(
+    store: &ExtensionStore<'_>,
+    selected: &CandidateProviderSelection,
+    request: &StreamCandidateSearchRequest,
+    response: &StreamCandidateSearchResponse,
+) -> Result<()> {
+    let modules = store
+        .list_source_modules(Some(selected.instance.instance_id), None)
+        .await?;
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let module_by_invocation_id = modules
+        .into_iter()
+        .map(|module| (source_module_runtime_invocation_id(&module), module))
+        .collect::<BTreeMap<_, _>>();
+    let warnings_by_module = source_module_runtime_warnings(&response.warnings);
+    let successful_module_ids = stream_candidate_source_module_ids(&response.candidates);
+    let observed_at = Utc::now();
+
+    for (module_id, warnings) in warnings_by_module {
+        let Some(module) = module_by_invocation_id.get(&module_id) else {
+            continue;
+        };
+        let reason = warnings.join(" | ");
+        if !source_module_runtime_warning_is_health_signal(&reason) {
+            continue;
+        }
+        let (state, severity) = source_module_runtime_warning_health(&reason);
+        store
+            .create_source_health_event(&NewExtensionSourceHealthEvent {
+                health_event_id: Uuid::new_v4(),
+                source_module_id: module.source_module_id,
+                event_type: "runtime_smoke".to_string(),
+                state: state.to_string(),
+                severity: severity.to_string(),
+                reason: Some(reason.clone()),
+                evidence_json: Some(json!({
+                    "providerId": selected.provider.provider_id,
+                    "extensionId": selected.extension.extension_id,
+                    "instanceId": selected.instance.instance_id,
+                    "moduleId": module_id,
+                    "mediaType": request.media_type,
+                    "title": request.title,
+                    "year": request.year,
+                    "candidateCount": response.candidates.len(),
+                    "warnings": warnings,
+                })),
+                observed_at: Some(observed_at),
+            })
+            .await?;
+    }
+
+    for module_id in successful_module_ids {
+        let Some(module) = module_by_invocation_id.get(&module_id) else {
+            continue;
+        };
+        if response
+            .warnings
+            .iter()
+            .any(|warning| source_module_warning_matches_id(warning, &module_id))
+        {
+            continue;
+        }
+        store
+            .create_source_health_event(&NewExtensionSourceHealthEvent {
+                health_event_id: Uuid::new_v4(),
+                source_module_id: module.source_module_id,
+                event_type: "runtime_smoke".to_string(),
+                state: "healthy".to_string(),
+                severity: "info".to_string(),
+                reason: Some("source module returned at least one stream candidate".to_string()),
+                evidence_json: Some(json!({
+                    "providerId": selected.provider.provider_id,
+                    "extensionId": selected.extension.extension_id,
+                    "instanceId": selected.instance.instance_id,
+                    "moduleId": module_id,
+                    "mediaType": request.media_type,
+                    "title": request.title,
+                    "year": request.year,
+                    "candidateCount": response.candidates.len(),
+                })),
+                observed_at: Some(observed_at),
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn source_module_runtime_invocation_id(module: &ExtensionSourceModule) -> String {
+    match module.ecosystem.as_str() {
+        "cloudstream" => cloudstream_invocation_module_id(module),
+        _ => nuvio_invocation_module_id(module),
+    }
+}
+
+fn source_module_runtime_warnings(warnings: &[String]) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::<String, Vec<String>>::new();
+    for warning in warnings {
+        let Some((module_id, detail)) = parse_source_module_runtime_warning(warning) else {
+            continue;
+        };
+        out.entry(module_id).or_default().push(detail);
+    }
+    out
+}
+
+fn parse_source_module_runtime_warning(warning: &str) -> Option<(String, String)> {
+    let trimmed = warning.trim();
+    let prism_prefix = trimmed
+        .strip_prefix("prism:")
+        .or_else(|| trimmed.split_once(":prism:").map(|(_, rest)| rest))?;
+    let (module_id, detail) = prism_prefix.split_once(':')?;
+    let module_id = cloudstream_stable_invocation_id(module_id);
+    if module_id.is_empty() || matches!(module_id.as_str(), "no-source-modules") {
+        return None;
+    }
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    Some((module_id, detail.to_string()))
+}
+
+fn stream_candidate_source_module_ids(candidates: &[Value]) -> BTreeSet<String> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .pointer("/sourceModule/id")
+                .and_then(Value::as_str)
+                .map(cloudstream_stable_invocation_id)
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn source_module_warning_matches_id(warning: &str, module_id: &str) -> bool {
+    parse_source_module_runtime_warning(warning)
+        .is_some_and(|(warning_module_id, _)| warning_module_id == module_id)
+}
+
+fn source_module_runtime_warning_is_health_signal(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    !normalized.contains("tmdb id is unavailable") && !normalized.contains("skipped because")
+}
+
+fn source_module_runtime_warning_health(reason: &str) -> (&'static str, &'static str) {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("unsupported") {
+        return ("unsupported", "warning");
+    }
+    if normalized.contains("account") && normalized.contains("not configured") {
+        return ("account_required", "warning");
+    }
+    ("degraded", "warning")
 }
 
 fn apply_release_candidate_language_preference(
@@ -3838,6 +4006,13 @@ async fn nuvio_candidate_provider_invocation_config(
         .into_iter()
         .map(|registry| (registry.registry_id, registry))
         .collect::<BTreeMap<_, _>>();
+    let certifications = store
+        .list_latest_source_module_certifications(instance.instance_id)
+        .await?;
+    let certification_by_module = certifications
+        .iter()
+        .map(|certification| (certification.source_module_id, certification))
+        .collect::<BTreeMap<_, _>>();
 
     let mut object = base
         .and_then(|value| value.as_object().cloned())
@@ -3853,7 +4028,17 @@ async fn nuvio_candidate_provider_invocation_config(
         let Some(registry) = registry_by_id.get(&module.registry_id) else {
             continue;
         };
-        projected.push(nuvio_source_module_invocation_descriptor(store, module, registry).await?);
+        projected.push(
+            nuvio_source_module_invocation_descriptor(
+                store,
+                module,
+                registry,
+                certification_by_module
+                    .get(&module.source_module_id)
+                    .copied(),
+            )
+            .await?,
+        );
     }
 
     let mut seen = BTreeSet::new();
@@ -3874,6 +4059,7 @@ async fn nuvio_source_module_invocation_descriptor(
     store: &ExtensionStore<'_>,
     module: &ExtensionSourceModule,
     registry: &ExtensionSourceRegistry,
+    certification: Option<&ExtensionSourceModuleCertification>,
 ) -> Result<Value> {
     let metadata = module.metadata_json.as_ref();
     let nuvio = metadata
@@ -3898,10 +4084,11 @@ async fn nuvio_source_module_invocation_descriptor(
                 .unwrap_or("nuvio_js_v1")
         ),
     );
-    descriptor.insert(
-        "enabled".to_string(),
-        json!(registry.enabled && module.enabled),
-    );
+    let certification_eligible = certification.is_some_and(nuvio_certification_allows_acquisition);
+    let health_eligible = nuvio_module_health_allows_acquisition(module);
+    let acquisition_enabled =
+        registry.enabled && module.enabled && certification_eligible && health_eligible;
+    descriptor.insert("enabled".to_string(), json!(acquisition_enabled));
     descriptor.insert("installed".to_string(), json!(module.installed));
     descriptor.insert(
         "requiresAccount".to_string(),
@@ -3920,12 +4107,33 @@ async fn nuvio_source_module_invocation_descriptor(
     );
     descriptor.insert(
         "healthState".to_string(),
-        json!(if registry.enabled && module.enabled {
+        json!(if acquisition_enabled {
+            module.health_state.as_str()
+        } else if registry.enabled && module.enabled && !certification_eligible {
+            "unknown"
+        } else if registry.enabled && module.enabled {
             module.health_state.as_str()
         } else {
             "disabled"
         }),
     );
+    if let Some(certification) = certification {
+        descriptor.insert(
+            "certificationStatus".to_string(),
+            json!(certification.status.as_str()),
+        );
+        if let Some(value) = certification.failure_class.as_deref() {
+            descriptor.insert("certificationFailureClass".to_string(), json!(value));
+        }
+        if let Some(value) = certification.summary.as_deref() {
+            descriptor.insert("certificationSummary".to_string(), json!(value));
+        }
+        if let Some(value) = certification.certified_at {
+            descriptor.insert("certifiedAt".to_string(), json!(value));
+        }
+    } else {
+        descriptor.insert("certificationStatus".to_string(), json!("unknown"));
+    }
     if let Some(value) = module.media_types_json.clone() {
         descriptor.insert("mediaTypes".to_string(), value);
     }
@@ -4000,6 +4208,27 @@ async fn nuvio_source_module_invocation_descriptor(
         }
     }
     Ok(Value::Object(descriptor))
+}
+
+fn nuvio_certification_allows_acquisition(
+    certification: &ExtensionSourceModuleCertification,
+) -> bool {
+    if !matches!(
+        certification.status.as_str(),
+        "certified" | "degraded" | "probation"
+    ) {
+        return false;
+    }
+    certification
+        .expires_at
+        .is_none_or(|expires_at| expires_at > Utc::now())
+}
+
+fn nuvio_module_health_allows_acquisition(module: &ExtensionSourceModule) -> bool {
+    !matches!(
+        module.health_state.as_str(),
+        "broken" | "unsupported" | "account_required" | "disabled"
+    )
 }
 
 fn cloudstream_explicit_source_modules_from_config(object: &JsonMap<String, Value>) -> Vec<Value> {
@@ -4318,7 +4547,8 @@ mod tests {
         extensions::nuvio_registry::PRISM_EXTENSION_ID,
         extensions::store::{
             NewExtension, NewExtensionInstance, NewExtensionSourceModule,
-            NewExtensionSourceModuleVersion, NewExtensionSourceRegistry, NewProvider,
+            NewExtensionSourceModuleCertification, NewExtensionSourceModuleVersion,
+            NewExtensionSourceRegistry, NewProvider,
         },
         orchestrator::planner::stable_provider_id,
     };
@@ -4619,9 +4849,10 @@ mod tests {
                 })),
             })
             .await?;
+        let version_id = Uuid::new_v4();
         store
             .upsert_source_module_version(&NewExtensionSourceModuleVersion {
-                version_id: Uuid::new_v4(),
+                version_id,
                 source_module_id,
                 version: "1.1.1".to_string(),
                 artifact_url: Some(
@@ -4687,10 +4918,97 @@ mod tests {
             moviesdrive.get("artifactSha256").and_then(Value::as_str),
             Some("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationStatus")
+                .and_then(Value::as_str),
+            Some("unknown")
+        );
         assert!(
             modules
                 .iter()
                 .any(|module| { module.get("id").and_then(Value::as_str) == Some("legacy-nuvio") })
+        );
+
+        store
+            .upsert_source_module_certification(&NewExtensionSourceModuleCertification {
+                certification_id: Uuid::new_v4(),
+                source_module_id,
+                source_module_version_id: Some(version_id),
+                instance_id,
+                adapter: "nuvio_js_v1".to_string(),
+                status: "certified".to_string(),
+                failure_class: None,
+                summary: Some("movie and tv probes passed".to_string()),
+                media_type_results_json: json!({
+                    "movie": { "status": "certified", "candidateCount": 1, "materializableCount": 1 },
+                    "tv": { "status": "certified", "candidateCount": 1, "materializableCount": 1 }
+                }),
+                materialization_results_json: json!({}),
+                probe_targets_json: json!([]),
+                candidate_evidence_json: json!([]),
+                runtime_version: Some("1.1.1".to_string()),
+                policy_version: "test-policy".to_string(),
+                certified_at: Some(Utc::now()),
+                expires_at: Some(Utc::now() + chrono::Duration::days(7)),
+            })
+            .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let config = candidate_provider_invocation_config_for_store(&store, &extension, &instance)
+            .await?
+            .expect("provider config");
+        let moviesdrive = config
+            .pointer("/sourceModules")
+            .and_then(Value::as_array)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module.get("id").and_then(Value::as_str) == Some("moviesdrive"))
+            })
+            .expect("certified moviesdrive module");
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationStatus")
+                .and_then(Value::as_str),
+            Some("certified")
+        );
+
+        store
+            .set_source_module_enabled_state(
+                source_module_id,
+                true,
+                "broken",
+                Some("runtime materialization failure"),
+            )
+            .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let config = candidate_provider_invocation_config_for_store(&store, &extension, &instance)
+            .await?
+            .expect("provider config");
+        let moviesdrive = config
+            .pointer("/sourceModules")
+            .and_then(Value::as_array)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module.get("id").and_then(Value::as_str) == Some("moviesdrive"))
+            })
+            .expect("broken moviesdrive module");
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive.get("healthState").and_then(Value::as_str),
+            Some("broken")
         );
         Ok(())
     }
@@ -7183,5 +7501,30 @@ mod tests {
         assert!(payload.pointer("/provider/config/api_key").is_none());
         server.abort();
         Ok(())
+    }
+
+    #[test]
+    fn runtime_source_warning_parser_extracts_prism_module_diagnostics() {
+        let direct = parse_source_module_runtime_warning(
+            "prism:moviesdrive: runtime_error: [Moviesdrive] Scraping error: fetch failed",
+        )
+        .expect("direct prism warning");
+        assert_eq!(direct.0, "moviesdrive");
+        assert!(direct.1.contains("fetch failed"));
+
+        let suite = parse_source_module_runtime_warning(
+            "extension_suite:elixir.sources.prism:prism:MoviesDrive: runtime_warning: API returned HTML",
+        )
+        .expect("suite prism warning");
+        assert_eq!(suite.0, "moviesdrive");
+        assert!(suite.1.contains("API returned HTML"));
+
+        assert!(parse_source_module_runtime_warning("prism:no_source_modules: none").is_none());
+        assert!(!source_module_runtime_warning_is_health_signal(
+            "skipped because TMDB id is unavailable for this target"
+        ));
+        assert!(source_module_runtime_warning_is_health_signal(
+            "runtime_error: fetch failed"
+        ));
     }
 }

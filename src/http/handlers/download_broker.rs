@@ -903,7 +903,7 @@ pub(crate) fn generic_debrid_error_message(message: &str) -> Option<&'static str
         || normalized.contains("authentication failed")
     {
         Some(DEBRID_ACCOUNT_MISSING_MESSAGE)
-    } else if debrid_error_is_not_configured(&normalized) {
+    } else if generic_debrid_error_is_not_configured(&normalized) {
         Some(DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE)
     } else if normalized.contains(&DEBRID_SERVICE_UNAVAILABLE_MESSAGE.to_ascii_lowercase())
         || normalized.contains("provider_unavailable")
@@ -924,9 +924,17 @@ pub(crate) fn generic_debrid_error_message(message: &str) -> Option<&'static str
     }
 }
 
-fn debrid_error_is_not_configured(message: &str) -> bool {
+fn generic_debrid_error_is_not_configured(message: &str) -> bool {
     let normalized = message.trim().to_ascii_lowercase();
     normalized.contains(&DEBRID_SERVICE_NOT_CONFIGURED_MESSAGE.to_ascii_lowercase())
+        || normalized.contains("active debrid service")
+        || normalized.contains("debrid service is not configured")
+        || normalized.contains("multiple debrid resolver providers")
+}
+
+fn debrid_error_is_not_configured(message: &str) -> bool {
+    let normalized = message.trim().to_ascii_lowercase();
+    generic_debrid_error_is_not_configured(&normalized)
         || normalized.contains("no downloader provider")
         || normalized.contains("no provider is registered")
         || normalized.contains("no acquisition route")

@@ -9,6 +9,13 @@ use super::control_contract::{
     control_notice, control_policy_managed, control_policy_observed, control_policy_seeded,
 };
 use super::*;
+use crate::acquisition::stream_preflight::{
+    FAILURE_ACCOUNT_REQUIRED, FAILURE_CAPTCHA_OR_BROWSER_REQUIRED, FAILURE_DRM_OR_LICENSE_REQUIRED,
+    FAILURE_HOSTER_RESOLVER_MISSING, FAILURE_INVALID_CANDIDATE_SHAPE,
+    FAILURE_MATERIALIZATION_PREFLIGHT_FAILED, FAILURE_NETWORK_BLOCKED,
+    FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE, FAILURE_UNSAFE_URL, StreamCandidatePreflightReport,
+    preflight_stream_candidate,
+};
 use crate::debrid::{
     DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY, DebridAccount, DebridServiceKind,
     MAX_DEBRID_CONCURRENT_DOWNLOADS, MIN_DEBRID_CONCURRENT_DOWNLOADS,
@@ -29,13 +36,18 @@ use crate::extensions::managed_paths::{
     NZBGET_TEMP_DIR, NZBGET_WEB_DIR,
 };
 use crate::extensions::nuvio_registry::{
-    NuvioRegistryClient, NuvioRegistryFetchConfig, NuvioRegistryStoreInput,
+    NuvioRegistryClient, NuvioRegistryFetchConfig, NuvioRegistryStoreInput, PRISM_EXTENSION_ID,
     PRISM_RECOMMENDED_REGISTRY_KEY, persist_nuvio_registry_snapshot,
     seed_prism_recommended_source_pack_for_instance,
 };
-use crate::extensions::source_artifacts::install_source_module_artifact;
+use crate::extensions::source_artifacts::{
+    install_source_module_artifact, remove_source_module_artifacts,
+    uninstall_source_module_artifacts,
+};
 use crate::extensions::store::{
-    ExtensionSourceModule, ExtensionSourceModuleVersion, ExtensionSourceRegistry,
+    ExtensionSourceCertificationJob, ExtensionSourceModule, ExtensionSourceModuleCertification,
+    ExtensionSourceModuleVersion, ExtensionSourceRegistry, NewExtensionSourceCertificationJob,
+    NewExtensionSourceHealthEvent, NewExtensionSourceModuleCertification,
 };
 
 // First-party providers plug into the same platform-owned control contract as
@@ -1780,6 +1792,15 @@ impl ExtensionControlProvider for CloudStreamControlAdapter {
 
 struct PrismControlAdapter;
 
+const PRISM_PROVIDER_SCHEMA_VERSION: u32 = 1;
+const PRISM_PROVIDER_SEARCH_PATH: &str = "search";
+const PRISM_RUNTIME_SMOKE_TIMEOUT: Duration = Duration::from_secs(40);
+const PRISM_RUNTIME_SMOKE_PROVIDER_TIMEOUT_MS: u64 = 30_000;
+const PRISM_CERTIFICATION_POLICY_VERSION: &str = "prism-enable-time-cert-v1";
+const PRISM_CERTIFICATION_MAX_PREFLIGHT_CANDIDATES: usize = 5;
+const PRISM_AUTO_CERTIFICATION_DEFAULT_MAX_MODULES: usize = 50;
+const PRISM_MARKETPLACE_POLICY_CONFIG_KEY: &str = "prismMarketplacePolicy";
+
 #[async_trait::async_trait]
 impl ExtensionControlProvider for PrismControlAdapter {
     async fn build_sections(
@@ -1822,29 +1843,59 @@ impl ExtensionControlProvider for PrismControlAdapter {
             .iter()
             .map(|registry| (registry.registry_id, registry))
             .collect::<BTreeMap<_, _>>();
+        let certifications = store
+            .list_latest_source_module_certifications(instance.instance_id)
+            .await?;
+        let certification_by_module = certifications
+            .iter()
+            .map(|certification| (certification.source_module_id, certification))
+            .collect::<BTreeMap<_, _>>();
+        let certification_jobs = store
+            .list_latest_source_certification_jobs(instance.instance_id)
+            .await?;
+        let job_by_module = certification_jobs
+            .iter()
+            .filter_map(|job| job.source_module_id.map(|module_id| (module_id, job)))
+            .collect::<BTreeMap<_, _>>();
+        let marketplace_policy = prism_marketplace_policy(instance);
 
-        let mut sections = vec![build_prism_recommended_section(
-            context,
-            instance,
+        let mut sections = vec![build_nuvio_repositories_section(
             &registries,
             &modules,
+            &job_by_module,
         )];
-        if let Some(section) =
-            build_prism_problems_section(store, instance, &modules, &registry_by_id).await?
-        {
-            sections.push(section);
-        }
-        sections.push(build_prism_policy_section(instance));
         sections.push(build_nuvio_installed_sources_section(
             &modules,
             &registry_by_id,
+            &certification_by_module,
+            &job_by_module,
         ));
         sections.push(build_nuvio_available_sources_section(
             &modules,
             &registry_by_id,
+            &certification_by_module,
+            &job_by_module,
         ));
-        sections.push(build_nuvio_repositories_section(&registries));
+        if let Some(section) = build_prism_problems_section(
+            store,
+            instance,
+            &modules,
+            &registry_by_id,
+            &certification_by_module,
+            &job_by_module,
+        )
+        .await?
+        {
+            sections.push(section);
+        }
+        sections.push(build_prism_recommended_section(
+            context,
+            instance,
+            &registries,
+            &modules,
+        ));
         sections.push(build_nuvio_version_pins_section(store, &modules).await?);
+        sections.push(build_prism_policy_section(instance, &marketplace_policy));
         if let Some(section) = build_cloudstream_diagnostics_section(store, &modules).await? {
             sections.push(section);
         }
@@ -1857,6 +1908,7 @@ impl ExtensionControlProvider for PrismControlAdapter {
         }
         vec![
             prism_refresh_recommended_pack_action(),
+            prism_certify_enabled_sources_action(),
             nuvio_add_custom_repo_action(),
         ]
     }
@@ -1869,15 +1921,26 @@ impl ExtensionControlProvider for PrismControlAdapter {
         values: &HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
         let instance = nuvio_selected_instance(context)?;
-        let allowed = [
+        let source_pack_allowed = [
             "recommendedPackAutoEnable",
             "recommendedPackExecutableUpdates",
             "customRepoMetadataRefresh",
             "customRepoExecutableTrustRequired",
             "rollbackPinAlwaysAvailable",
         ];
+        let marketplace_allowed = [
+            "preferredLanguageTags",
+            "unknownLanguageBehavior",
+            "autoCertifyTrustedRepositories",
+            "autoCertifyCustomRepositories",
+            "retainFailedArtifacts",
+            "maxAutoCertifyModulesPerRepo",
+            "maxConcurrentCertificationJobs",
+        ];
         for key in values.keys() {
-            if !allowed.iter().any(|allowed| allowed == key) {
+            if !source_pack_allowed.iter().any(|allowed| allowed == key)
+                && !marketplace_allowed.iter().any(|allowed| allowed == key)
+            {
                 anyhow::bail!("unsupported Prism source policy setting '{key}'");
             }
         }
@@ -1905,7 +1968,7 @@ impl ExtensionControlProvider for PrismControlAdapter {
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default();
-        for key in allowed {
+        for key in source_pack_allowed {
             if let Some(value) = values.get(key).and_then(serde_json::Value::as_bool) {
                 policy.insert(key.to_string(), serde_json::Value::Bool(value));
             }
@@ -1913,6 +1976,61 @@ impl ExtensionControlProvider for PrismControlAdapter {
         config.insert(
             "sourcePackPolicy".to_string(),
             serde_json::Value::Object(policy),
+        );
+        let mut marketplace_policy = config
+            .get(PRISM_MARKETPLACE_POLICY_CONFIG_KEY)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(value) = values.get("preferredLanguageTags") {
+            let languages = prism_parse_preferred_language_setting(value)?;
+            marketplace_policy.insert("preferredLanguageTags".to_string(), json!(languages));
+        }
+        if let Some(value) = values
+            .get("unknownLanguageBehavior")
+            .and_then(serde_json::Value::as_str)
+        {
+            let value = value.trim();
+            if !matches!(value, "certify" | "skip") {
+                anyhow::bail!("unknownLanguageBehavior must be certify or skip");
+            }
+            marketplace_policy.insert(
+                "unknownLanguageBehavior".to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+        if let Some(value) = values
+            .get("autoCertifyCustomRepositories")
+            .and_then(serde_json::Value::as_str)
+        {
+            let value = value.trim();
+            if !matches!(value, "after_trust" | "never") {
+                anyhow::bail!("autoCertifyCustomRepositories must be after_trust or never");
+            }
+            marketplace_policy.insert(
+                "autoCertifyCustomRepositories".to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+        for key in ["autoCertifyTrustedRepositories", "retainFailedArtifacts"] {
+            if let Some(value) = values.get(key).and_then(serde_json::Value::as_bool) {
+                marketplace_policy.insert(key.to_string(), serde_json::Value::Bool(value));
+            }
+        }
+        for key in [
+            "maxAutoCertifyModulesPerRepo",
+            "maxConcurrentCertificationJobs",
+        ] {
+            if let Some(value) = values.get(key).and_then(serde_json::Value::as_u64) {
+                if value == 0 || value > 500 {
+                    anyhow::bail!("{key} must be between 1 and 500");
+                }
+                marketplace_policy.insert(key.to_string(), json!(value));
+            }
+        }
+        config.insert(
+            PRISM_MARKETPLACE_POLICY_CONFIG_KEY.to_string(),
+            serde_json::Value::Object(marketplace_policy),
         );
         store
             .update_instance_config(
@@ -1941,15 +2059,220 @@ impl ExtensionControlProvider for PrismControlAdapter {
                     Some(&state.settings.extensions.storage_root),
                 )
                 .await?;
-                Ok(format!(
+                let mut message = format!(
                     "Recommended Prism source pack refreshed: {} module(s), {} version(s), {} disabled.",
                     summary.modules, summary.versions, summary.disabled_modules
+                );
+                if let Some(registry) = store
+                    .list_source_registries(Some(instance.instance_id))
+                    .await?
+                    .into_iter()
+                    .find(|registry| registry.registry_key == PRISM_RECOMMENDED_REGISTRY_KEY)
+                {
+                    let certification_summary = prism_enqueue_repository_certification_jobs(
+                        store,
+                        instance,
+                        registry.registry_id,
+                        "refresh_recommended_pack",
+                        "recommended_repository_refresh",
+                        false,
+                    )
+                    .await?;
+                    if certification_summary.processed > 0 {
+                        prism_spawn_certification_worker(
+                            state.clone(),
+                            context.clone(),
+                            instance.instance_id,
+                        );
+                    }
+                    message.push(' ');
+                    message.push_str(&certification_summary.message(&registry.display_name));
+                }
+                Ok(message)
+            }
+            "add_custom_repo" => {
+                let (registry_id, message) = nuvio_add_custom_repo(store, instance, params).await?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                let certification_summary = prism_enqueue_repository_certification_jobs(
+                    store,
+                    instance,
+                    registry_id,
+                    "add_custom_repo",
+                    "repository_added",
+                    false,
+                )
+                .await?;
+                if certification_summary.processed > 0 {
+                    prism_spawn_certification_worker(
+                        state.clone(),
+                        context.clone(),
+                        instance.instance_id,
+                    );
+                }
+                Ok(format!(
+                    "{message} {}",
+                    certification_summary.message(&registry.display_name)
                 ))
             }
-            "add_custom_repo" => nuvio_add_custom_repo(store, instance, params).await,
+            "certify_enabled_sources" | "certifyEnabledSources" => {
+                let modules = store
+                    .list_source_modules(Some(instance.instance_id), None)
+                    .await?
+                    .into_iter()
+                    .filter(|module| {
+                        (module.ecosystem == "nuvio" || module.ecosystem == "stremio")
+                            && (module.enabled || module.installed)
+                    })
+                    .collect::<Vec<_>>();
+                let mut certified = 0usize;
+                let mut degraded = 0usize;
+                let mut blocked = 0usize;
+                for module in modules {
+                    if module.unsupported || module.account_required {
+                        continue;
+                    }
+                    let outcome =
+                        smoke_prism_source_module_runtime(store, context, instance, &module)
+                            .await?;
+                    if prism_certification_is_eligible(&outcome.status) {
+                        if outcome.status == "degraded" {
+                            degraded += 1;
+                        } else {
+                            certified += 1;
+                        }
+                        store
+                            .set_source_module_enabled_state(
+                                module.source_module_id,
+                                module.enabled,
+                                &outcome.health_state,
+                                outcome.failure_class.as_deref(),
+                            )
+                            .await?;
+                    } else {
+                        blocked += 1;
+                        store
+                            .set_source_module_enabled_state(
+                                module.source_module_id,
+                                false,
+                                &outcome.health_state,
+                                Some(&outcome.reason),
+                            )
+                            .await?;
+                    }
+                }
+                Ok(format!(
+                    "Prism certification finished: {certified} certified, {degraded} degraded, {blocked} blocked."
+                ))
+            }
+            "cancel_certification" | "cancelCertification" => {
+                let registry_id = params
+                    .get("registryId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| {
+                        Uuid::parse_str(value.trim()).with_context(|| "parsing registryId")
+                    })
+                    .transpose()?;
+                let source_module_id = params
+                    .get("sourceModuleId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| {
+                        Uuid::parse_str(value.trim()).with_context(|| "parsing sourceModuleId")
+                    })
+                    .transpose()?;
+                let cancelled = store
+                    .cancel_source_certification_jobs(
+                        instance.instance_id,
+                        registry_id,
+                        source_module_id,
+                        "cancelled by user",
+                    )
+                    .await?;
+                Ok(format!("Cancelled {cancelled} Prism certification job(s)."))
+            }
+            "get_certification_report" | "getCertificationReport" => {
+                let report =
+                    prism_certification_report(store, instance.instance_id, params).await?;
+                Ok(report.to_string())
+            }
+            "set_certification_policy" | "setCertificationPolicy" => {
+                let allowed = [
+                    "recommendedPackAutoEnable",
+                    "recommendedPackExecutableUpdates",
+                    "customRepoMetadataRefresh",
+                    "customRepoExecutableTrustRequired",
+                    "rollbackPinAlwaysAvailable",
+                    "preferredLanguageTags",
+                    "unknownLanguageBehavior",
+                    "autoCertifyTrustedRepositories",
+                    "autoCertifyCustomRepositories",
+                    "retainFailedArtifacts",
+                    "maxAutoCertifyModulesPerRepo",
+                    "maxConcurrentCertificationJobs",
+                ];
+                let values = params
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        allowed
+                            .iter()
+                            .any(|allowed| allowed == key)
+                            .then(|| (key.clone(), value.clone()))
+                    })
+                    .collect::<HashMap<_, _>>();
+                if values.is_empty() {
+                    return Ok("No Prism certification policy changes supplied.".to_string());
+                }
+                self.update_settings(state, store, context, &values).await?;
+                Ok("Prism certification policy updated.".to_string())
+            }
             "refresh_custom_repo" => {
                 let registry_id = cloudstream_param_uuid(params, "registryId")?;
-                nuvio_refresh_registry(store, instance, registry_id).await
+                let (registry_id, message) =
+                    nuvio_refresh_registry(store, instance, registry_id).await?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                let certification_summary = prism_enqueue_repository_certification_jobs(
+                    store,
+                    instance,
+                    registry_id,
+                    "refresh_custom_repo",
+                    "repository_refreshed",
+                    false,
+                )
+                .await?;
+                if certification_summary.processed > 0 {
+                    prism_spawn_certification_worker(
+                        state.clone(),
+                        context.clone(),
+                        instance.instance_id,
+                    );
+                }
+                Ok(format!(
+                    "{message} {}",
+                    certification_summary.message(&registry.display_name)
+                ))
+            }
+            "certify_repository" | "certifyRepository" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                let summary = prism_enqueue_repository_certification_jobs(
+                    store,
+                    instance,
+                    registry_id,
+                    "certify_repository",
+                    "manual_repository_certification",
+                    true,
+                )
+                .await?;
+                if summary.processed > 0 {
+                    prism_spawn_certification_worker(
+                        state.clone(),
+                        context.clone(),
+                        instance.instance_id,
+                    );
+                }
+                Ok(summary.message(&registry.display_name))
             }
             "trust_custom_repo" => {
                 let registry_id = cloudstream_param_uuid(params, "registryId")?;
@@ -1963,9 +2286,26 @@ impl ExtensionControlProvider for PrismControlAdapter {
                 store
                     .set_source_registry_trust(registry_id, "maintainer_known", true)
                     .await?;
+                let summary = prism_enqueue_repository_certification_jobs(
+                    store,
+                    instance,
+                    registry_id,
+                    "trust_custom_repo",
+                    "repository_trusted",
+                    false,
+                )
+                .await?;
+                if summary.processed > 0 {
+                    prism_spawn_certification_worker(
+                        state.clone(),
+                        context.clone(),
+                        instance.instance_id,
+                    );
+                }
                 Ok(format!(
-                    "Trusted '{}'. Modules remain disabled until explicitly installed.",
-                    registry.display_name
+                    "Trusted '{}'. Modules remain disabled until explicitly enabled. {}",
+                    registry.display_name,
+                    summary.message(&registry.display_name)
                 ))
             }
             "enable_registry" => {
@@ -1975,20 +2315,8 @@ impl ExtensionControlProvider for PrismControlAdapter {
                 store
                     .set_source_registry_enabled_state(registry_id, true, true)
                     .await?;
-                if registry.registry_type == "elixir_curated_nuvio_pack"
-                    || registry.trusted_for_executable_updates
-                {
-                    store
-                        .set_source_modules_enabled_for_registry(
-                            registry_id,
-                            true,
-                            "available",
-                            None,
-                        )
-                        .await?;
-                }
                 Ok(format!(
-                    "Enabled source registry '{}'.",
+                    "Enabled source registry '{}'. Scrapers remain disabled until certified and explicitly enabled.",
                     registry.display_name
                 ))
             }
@@ -2010,6 +2338,50 @@ impl ExtensionControlProvider for PrismControlAdapter {
                 Ok(format!(
                     "Disabled source registry '{}'.",
                     registry.display_name
+                ))
+            }
+            "remove_registry" | "removeRepository" => {
+                let registry_id = cloudstream_param_uuid(params, "registryId")?;
+                let registry =
+                    nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+                if registry.registry_key == PRISM_RECOMMENDED_REGISTRY_KEY
+                    || registry.registry_type == "elixir_curated_nuvio_pack"
+                {
+                    anyhow::bail!(
+                        "The Prism recommended source pack cannot be removed; disable it instead."
+                    );
+                }
+                let modules = store.list_source_modules(None, Some(registry_id)).await?;
+                let cancelled = store
+                    .cancel_source_certification_jobs(
+                        instance.instance_id,
+                        Some(registry_id),
+                        None,
+                        "repository removed",
+                    )
+                    .await?;
+                let mut removed_artifacts = 0usize;
+                for module in &modules {
+                    removed_artifacts += uninstall_source_module_artifacts(
+                        store,
+                        module,
+                        "source repository removed",
+                    )
+                    .await?;
+                }
+                let deleted = store.delete_source_registry(registry_id).await?;
+                if deleted == 0 {
+                    anyhow::bail!(
+                        "Prism source repository '{}' was already removed",
+                        registry.display_name
+                    );
+                }
+                Ok(format!(
+                    "Removed Prism repository '{}': {} scraper(s), {} artifact(s), {} queued/running certification job(s) cancelled.",
+                    registry.display_name,
+                    modules.len(),
+                    removed_artifacts,
+                    cancelled
                 ))
             }
             "install_source_module" | "enable_source_module" => {
@@ -2050,15 +2422,39 @@ impl ExtensionControlProvider for PrismControlAdapter {
                     .await?;
                 let versions = store.list_source_module_versions(source_module_id).await?;
                 cloudstream_mark_active_version(store, &versions, &version).await?;
-                store
-                    .set_source_module_enabled_state(source_module_id, true, "available", None)
-                    .await?;
-                Ok(format!(
-                    "Enabled Prism source '{}' at version {}.",
-                    module.display_name, version
-                ))
+                let module =
+                    nuvio_find_module(store, instance.instance_id, source_module_id).await?;
+                let outcome =
+                    smoke_prism_source_module_runtime(store, context, instance, &module).await?;
+                if prism_certification_is_eligible(&outcome.status) {
+                    store
+                        .set_source_module_enabled_state(
+                            source_module_id,
+                            true,
+                            &outcome.health_state,
+                            outcome.failure_class.as_deref(),
+                        )
+                        .await?;
+                    Ok(format!(
+                        "Enabled Prism source '{}' at version {} after {} certification: {}",
+                        module.display_name, version, outcome.status, outcome.reason
+                    ))
+                } else {
+                    store
+                        .set_source_module_enabled_state(
+                            source_module_id,
+                            false,
+                            &outcome.health_state,
+                            Some(&outcome.reason),
+                        )
+                        .await?;
+                    Ok(format!(
+                        "Prism source '{}' was not enabled because certification finished as {}: {}",
+                        module.display_name, outcome.status, outcome.reason
+                    ))
+                }
             }
-            "smoke_source_module" => {
+            "smoke_source_module" | "certify_source_module" | "certifySourceModule" => {
                 let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
                 let module =
                     nuvio_find_module(store, instance.instance_id, source_module_id).await?;
@@ -2085,12 +2481,22 @@ impl ExtensionControlProvider for PrismControlAdapter {
                     version_record,
                 )
                 .await?;
+                let outcome =
+                    smoke_prism_source_module_runtime(store, context, instance, &module).await?;
                 store
-                    .set_source_module_enabled_state(source_module_id, true, "available", None)
+                    .set_source_module_enabled_state(
+                        source_module_id,
+                        module.enabled && prism_certification_is_eligible(&outcome.status),
+                        &outcome.health_state,
+                        outcome
+                            .failure_class
+                            .as_deref()
+                            .or(Some(outcome.reason.as_str())),
+                    )
                     .await?;
                 Ok(format!(
-                    "Prism source '{}' passed artifact health check at version {}.",
-                    module.display_name, version
+                    "Prism source '{}' certification finished as {} at version {}: {}",
+                    module.display_name, outcome.status, version, outcome.reason
                 ))
             }
             "disable_source_module" => {
@@ -2105,7 +2511,16 @@ impl ExtensionControlProvider for PrismControlAdapter {
                         Some("source module disabled by user"),
                     )
                     .await?;
-                Ok(format!("Disabled Prism source '{}'.", module.display_name))
+                let removed_artifacts = uninstall_source_module_artifacts(
+                    store,
+                    &module,
+                    "source module disabled by user",
+                )
+                .await?;
+                Ok(format!(
+                    "Disabled Prism source '{}' and moved it back to the scraper marketplace. Removed {} artifact(s); certification history was preserved.",
+                    module.display_name, removed_artifacts
+                ))
             }
             "pin_source_module" => {
                 let source_module_id = cloudstream_param_uuid(params, "sourceModuleId")?;
@@ -2340,12 +2755,10 @@ fn build_prism_recommended_section(
 
     ExtensionControlSection {
         id: "prismRecommended".to_string(),
-        title: "Recommended".to_string(),
-        description:
-            "Recommended Prism sources are active through Extension Suite. Custom repositories and source pins are managed below."
-                .to_string(),
+        title: "Maintainer presets".to_string(),
+        description: "Bundled scraper presets and maintainer refresh state.".to_string(),
         policy: Some(control_policy_seeded(
-            "Elixir seeds the recommended pack and invokes Prism only as a stream candidate provider. Download routing and import verification stay inside Elixir.",
+            "Preset updates can add or revise recommended scraper descriptors.",
         )),
         notices,
         fields: Vec::new(),
@@ -2359,14 +2772,28 @@ async fn build_prism_problems_section(
     instance: &ExtensionInstance,
     modules: &[ExtensionSourceModule],
     registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+    certification_by_module: &BTreeMap<Uuid, &ExtensionSourceModuleCertification>,
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
 ) -> anyhow::Result<Option<ExtensionControlSection>> {
     let mut entities = Vec::new();
     for module in modules.iter().filter(|module| {
+        let job_needs_attention = job_by_module
+            .get(&module.source_module_id)
+            .is_some_and(|job| {
+                matches!(
+                    job.status.as_str(),
+                    "blocked" | "failed" | "cancelled" | "skipped"
+                ) && !matches!(
+                    job.marketplace_state.as_deref(),
+                    Some("skipped_language" | "skipped_unknown_language" | "skipped_trust")
+                )
+            });
         matches!(
             module.health_state.as_str(),
             "degraded" | "broken" | "unsupported" | "account_required"
         ) || module.last_error.is_some()
             || module.replacement_recommendation_key.is_some()
+            || job_needs_attention
     }) {
         let mut actions =
             nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied());
@@ -2382,10 +2809,20 @@ async fn build_prism_problems_section(
         entities.push(ExtensionControlEntity {
             id: module.source_module_id.to_string(),
             title: module.display_name.clone(),
-            subtitle: Some(cloudstream_module_subtitle(module)),
-            details: cloudstream_module_details(
+            subtitle: Some(nuvio_module_subtitle(
+                module,
+                certification_by_module
+                    .get(&module.source_module_id)
+                    .copied(),
+                job_by_module.get(&module.source_module_id).copied(),
+            )),
+            details: nuvio_module_details(
                 module,
                 registry_by_id.get(&module.registry_id).copied(),
+                certification_by_module
+                    .get(&module.source_module_id)
+                    .copied(),
+                job_by_module.get(&module.source_module_id).copied(),
             ),
             actions,
         });
@@ -2397,12 +2834,12 @@ async fn build_prism_problems_section(
         id: "prismNeedsAttention".to_string(),
         title: "Needs attention".to_string(),
         description: format!(
-            "{} source module(s) for '{}' need action.",
+            "{} scraper(s) for '{}' need action.",
             entities.len(),
             instance.instance_name
         ),
         policy: Some(control_policy_observed(
-            "Elixir reports source health and replacement recommendations. It only changes module state when you choose an action here.",
+            "Runtime health is observed from Prism scraper probes and stream searches.",
         )),
         notices: Vec::new(),
         fields: Vec::new(),
@@ -2418,6 +2855,17 @@ struct PrismSourcePolicy {
     custom_repo_metadata_refresh: bool,
     custom_repo_executable_trust_required: bool,
     rollback_pin_always_available: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PrismMarketplacePolicy {
+    preferred_language_tags: Vec<String>,
+    unknown_language_behavior: String,
+    auto_certify_trusted_repositories: bool,
+    auto_certify_custom_repositories: String,
+    retain_failed_artifacts: bool,
+    max_auto_certify_modules_per_repo: usize,
+    max_concurrent_certification_jobs: usize,
 }
 
 fn prism_source_policy(instance: &ExtensionInstance) -> PrismSourcePolicy {
@@ -2460,19 +2908,127 @@ fn prism_source_policy(instance: &ExtensionInstance) -> PrismSourcePolicy {
     }
 }
 
-fn build_prism_policy_section(instance: &ExtensionInstance) -> ExtensionControlSection {
+fn prism_marketplace_policy(instance: &ExtensionInstance) -> PrismMarketplacePolicy {
+    let policy = instance
+        .config_json
+        .as_ref()
+        .and_then(|config| config.get(PRISM_MARKETPLACE_POLICY_CONFIG_KEY))
+        .and_then(serde_json::Value::as_object);
+    let preferred_language_tags = policy
+        .and_then(|policy| policy.get("preferredLanguageTags"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(normalize_prism_language_tag)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec!["en".to_string(), "ja".to_string()]);
+    let unknown_language_behavior = policy
+        .and_then(|policy| policy.get("unknownLanguageBehavior"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "certify" | "skip"))
+        .unwrap_or("certify")
+        .to_string();
+    let auto_certify_custom_repositories = policy
+        .and_then(|policy| policy.get("autoCertifyCustomRepositories"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "after_trust" | "never"))
+        .unwrap_or("after_trust")
+        .to_string();
+    PrismMarketplacePolicy {
+        preferred_language_tags,
+        unknown_language_behavior,
+        auto_certify_trusted_repositories: policy
+            .and_then(|policy| policy.get("autoCertifyTrustedRepositories"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        auto_certify_custom_repositories,
+        retain_failed_artifacts: policy
+            .and_then(|policy| policy.get("retainFailedArtifacts"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        max_auto_certify_modules_per_repo: policy
+            .and_then(|policy| policy.get("maxAutoCertifyModulesPerRepo"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.clamp(1, 500) as usize)
+            .unwrap_or(PRISM_AUTO_CERTIFICATION_DEFAULT_MAX_MODULES),
+        max_concurrent_certification_jobs: policy
+            .and_then(|policy| policy.get("maxConcurrentCertificationJobs"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.clamp(1, 16) as usize)
+            .unwrap_or(2),
+    }
+}
+
+fn build_prism_policy_section(
+    instance: &ExtensionInstance,
+    marketplace_policy: &PrismMarketplacePolicy,
+) -> ExtensionControlSection {
     let policy = prism_source_policy(instance);
     ExtensionControlSection {
         id: "prismSourcePolicy".to_string(),
-        title: "Source policy".to_string(),
-        description:
-            "Recommended Prism sources can receive maintainer updates. Custom executable installs stay explicit unless trusted."
-                .to_string(),
+        title: "Advanced policy".to_string(),
+        description: "Preset updates, repository trust, certification, and rollback controls."
+            .to_string(),
         policy: Some(control_policy_seeded(
-            "These settings are sent to Prism with Extension Suite requests and never grant downloader credentials or library mutation rights.",
+            "These settings do not grant downloader credentials or library mutation rights.",
         )),
         notices: Vec::new(),
         fields: vec![
+            prism_text_policy_field(
+                "preferredLanguageTags",
+                "Preferred languages",
+                "Comma-separated language tags used when auto-certifying repository scrapers.",
+                &marketplace_policy.preferred_language_tags.join(", "),
+                false,
+            ),
+            prism_select_policy_field(
+                "unknownLanguageBehavior",
+                "Unknown language",
+                "Choose whether scrapers without language metadata are still certified.",
+                &marketplace_policy.unknown_language_behavior,
+                &[("certify", "Certify"), ("skip", "Skip")],
+                false,
+            ),
+            prism_policy_field(
+                "autoCertifyTrustedRepositories",
+                "Auto-certify trusted repositories",
+                "Install and certify eligible scrapers after trusted repository add or refresh.",
+                marketplace_policy.auto_certify_trusted_repositories,
+                false,
+            ),
+            prism_select_policy_field(
+                "autoCertifyCustomRepositories",
+                "Custom repository auto-cert",
+                "Choose when custom repositories can install executable scraper code for certification.",
+                &marketplace_policy.auto_certify_custom_repositories,
+                &[("after_trust", "After trust"), ("never", "Never")],
+                false,
+            ),
+            prism_policy_field(
+                "retainFailedArtifacts",
+                "Retain failed artifacts",
+                "Keep downloaded scraper artifacts after certification failure for debugging.",
+                marketplace_policy.retain_failed_artifacts,
+                false,
+            ),
+            prism_number_policy_field(
+                "maxAutoCertifyModulesPerRepo",
+                "Max repo certification batch",
+                "Maximum number of repository scrapers certified from one add or refresh action.",
+                marketplace_policy.max_auto_certify_modules_per_repo,
+                false,
+            ),
+            prism_number_policy_field(
+                "maxConcurrentCertificationJobs",
+                "Certification concurrency",
+                "Maximum certification workers reserved for Prism repository batches.",
+                marketplace_policy.max_concurrent_certification_jobs,
+                false,
+            ),
             prism_policy_field(
                 "recommendedPackAutoEnable",
                 "Recommended pack auto-enable",
@@ -2514,6 +3070,76 @@ fn build_prism_policy_section(instance: &ExtensionInstance) -> ExtensionControlS
     }
 }
 
+fn prism_text_policy_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: &str,
+    readonly: bool,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "text".to_string(),
+        value: serde_json::Value::String(value.to_string()),
+        required: false,
+        readonly,
+        secret: false,
+        options: Vec::new(),
+        validation: None,
+    }
+}
+
+fn prism_number_policy_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: usize,
+    readonly: bool,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "number".to_string(),
+        value: json!(value),
+        required: false,
+        readonly,
+        secret: false,
+        options: Vec::new(),
+        validation: None,
+    }
+}
+
+fn prism_select_policy_field(
+    id: &str,
+    label: &str,
+    description: &str,
+    value: &str,
+    options: &[(&str, &str)],
+    readonly: bool,
+) -> ExtensionControlField {
+    ExtensionControlField {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        field_type: "select".to_string(),
+        value: serde_json::Value::String(value.to_string()),
+        required: false,
+        readonly,
+        secret: false,
+        options: options
+            .iter()
+            .map(|(value, label)| ExtensionControlOption {
+                value: json!(value),
+                label: label.to_string(),
+            })
+            .collect(),
+        validation: None,
+    }
+}
+
 fn prism_policy_field(
     id: &str,
     label: &str,
@@ -2535,30 +3161,195 @@ fn prism_policy_field(
     }
 }
 
+#[derive(Debug, Clone)]
+struct PrismLanguageEligibility {
+    certifiable: bool,
+    state: String,
+    summary: String,
+    normalized_tags: Vec<String>,
+}
+
+fn prism_module_language_eligibility(
+    module: &ExtensionSourceModule,
+    policy: &PrismMarketplacePolicy,
+) -> PrismLanguageEligibility {
+    let normalized_tags = prism_module_language_tags(module);
+    if normalized_tags.is_empty() {
+        if policy.unknown_language_behavior == "skip" {
+            return PrismLanguageEligibility {
+                certifiable: false,
+                state: "skipped_unknown_language".to_string(),
+                summary: "Skipped because this scraper does not declare supported languages."
+                    .to_string(),
+                normalized_tags,
+            };
+        }
+        return PrismLanguageEligibility {
+            certifiable: true,
+            state: "unknown_language".to_string(),
+            summary:
+                "No language metadata declared; certifying because unknown-language scrapers are allowed."
+                    .to_string(),
+            normalized_tags,
+        };
+    }
+    let preferred = policy
+        .preferred_language_tags
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let matches_preferred = normalized_tags
+        .iter()
+        .any(|tag| tag == "multi" || tag == "all" || preferred.contains(tag));
+    if matches_preferred {
+        PrismLanguageEligibility {
+            certifiable: true,
+            state: "preferred_language".to_string(),
+            summary: format!(
+                "Language tags match preferred languages: {}.",
+                normalized_tags.join(", ")
+            ),
+            normalized_tags,
+        }
+    } else {
+        PrismLanguageEligibility {
+            certifiable: false,
+            state: "skipped_language".to_string(),
+            summary: format!(
+                "Skipped because languages {} do not match preferred languages {}.",
+                normalized_tags.join(", "),
+                policy.preferred_language_tags.join(", ")
+            ),
+            normalized_tags,
+        }
+    }
+}
+
+fn prism_module_language_tags(module: &ExtensionSourceModule) -> Vec<String> {
+    let mut tags = Vec::new();
+    if let Some(value) = module.language_tags_json.as_ref() {
+        collect_prism_language_tags(value, &mut tags);
+    }
+    if let Some(metadata) = module.metadata_json.as_ref() {
+        for pointer in [
+            "/language",
+            "/languages",
+            "/languageTags",
+            "/nuvio/language",
+            "/nuvio/languages",
+            "/nuvio/languageTags",
+            "/nuvio/lang",
+        ] {
+            if let Some(value) = metadata.pointer(pointer) {
+                collect_prism_language_tags(value, &mut tags);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    tags.into_iter()
+        .filter_map(|tag| normalize_prism_language_tag(&tag))
+        .filter(|tag| seen.insert(tag.clone()))
+        .collect()
+}
+
+fn collect_prism_language_tags(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(value) => {
+            for part in value.split([',', ';', '|', '/']) {
+                let part = part.trim();
+                if !part.is_empty() {
+                    out.push(part.to_string());
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_prism_language_tags(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["code", "tag", "language", "name"] {
+                if let Some(value) = map.get(key) {
+                    collect_prism_language_tags(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_prism_language_tag(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let lower = value
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let primary = lower.split('-').next().unwrap_or(lower.as_str());
+    match primary {
+        "en" | "eng" | "english" => Some("en".to_string()),
+        "ja" | "jp" | "jpn" | "japanese" | "nihongo" => Some("ja".to_string()),
+        "hi" | "hin" | "hindi" => Some("hi".to_string()),
+        "ta" | "tam" | "tamil" => Some("ta".to_string()),
+        "te" | "tel" | "telugu" => Some("te".to_string()),
+        "ml" | "mal" | "malayalam" => Some("ml".to_string()),
+        "ko" | "kor" | "korean" => Some("ko".to_string()),
+        "zh" | "chi" | "zho" | "chinese" => Some("zh".to_string()),
+        "es" | "spa" | "spanish" => Some("es".to_string()),
+        "fr" | "fra" | "fre" | "french" => Some("fr".to_string()),
+        "de" | "deu" | "ger" | "german" => Some("de".to_string()),
+        "multi" | "multilingual" | "dual" | "all" => Some("multi".to_string()),
+        other if other.len() == 2 || other.len() == 3 => Some(other.to_string()),
+        _ => None,
+    }
+}
+
+fn prism_parse_preferred_language_setting(value: &Value) -> anyhow::Result<Vec<String>> {
+    let mut raw = Vec::new();
+    collect_prism_language_tags(value, &mut raw);
+    let mut seen = HashSet::new();
+    let languages = raw
+        .into_iter()
+        .filter_map(|value| normalize_prism_language_tag(&value))
+        .filter(|value| seen.insert(value.clone()))
+        .collect::<Vec<_>>();
+    if languages.is_empty() {
+        anyhow::bail!("preferredLanguageTags must include at least one language tag");
+    }
+    Ok(languages)
+}
+
+fn prism_language_eligibility_json(eligibility: &PrismLanguageEligibility) -> String {
+    json!({
+        "state": eligibility.state,
+        "summary": eligibility.summary,
+        "normalizedTags": eligibility.normalized_tags,
+    })
+    .to_string()
+}
+
 fn build_nuvio_installed_sources_section(
     modules: &[ExtensionSourceModule],
     registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+    certification_by_module: &BTreeMap<Uuid, &ExtensionSourceModuleCertification>,
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
 ) -> ExtensionControlSection {
-    let entities = modules
-        .iter()
-        .filter(|module| module.enabled || module.installed)
-        .map(|module| ExtensionControlEntity {
-            id: module.source_module_id.to_string(),
-            title: module.display_name.clone(),
-            subtitle: Some(cloudstream_module_subtitle(module)),
-            details: cloudstream_module_details(
-                module,
-                registry_by_id.get(&module.registry_id).copied(),
-            ),
-            actions: nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied()),
-        })
-        .collect::<Vec<_>>();
+    let active_group_keys = nuvio_active_group_keys(modules);
+    let entities = nuvio_coalesced_module_entities(
+        modules,
+        registry_by_id,
+        certification_by_module,
+        job_by_module,
+        |module| active_group_keys.contains(&nuvio_module_coalesce_key(module)),
+    );
     ExtensionControlSection {
         id: "nuvioInstalledSources".to_string(),
-        title: "Installed sources".to_string(),
-        description: "Source modules currently enabled or installed for Prism.".to_string(),
+        title: "Enabled scrapers".to_string(),
+        description: "Scrapers Prism can run during stream searches.".to_string(),
         policy: Some(control_policy_seeded(
-            "Elixir decides which module descriptors are sent to Prism. The source runtime cannot mutate this list.",
+            "Health shown here comes from artifact checks, runtime probes, and stream searches.",
         )),
         notices: Vec::new(),
         fields: Vec::new(),
@@ -2570,29 +3361,27 @@ fn build_nuvio_installed_sources_section(
 fn build_nuvio_available_sources_section(
     modules: &[ExtensionSourceModule],
     registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+    certification_by_module: &BTreeMap<Uuid, &ExtensionSourceModuleCertification>,
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
 ) -> ExtensionControlSection {
-    let entities = modules
-        .iter()
-        .filter(|module| !module.enabled && !module.installed)
-        .map(|module| ExtensionControlEntity {
-            id: module.source_module_id.to_string(),
-            title: module.display_name.clone(),
-            subtitle: Some(cloudstream_module_subtitle(module)),
-            details: cloudstream_module_details(
-                module,
-                registry_by_id.get(&module.registry_id).copied(),
-            ),
-            actions: nuvio_module_actions(module, registry_by_id.get(&module.registry_id).copied()),
-        })
-        .collect::<Vec<_>>();
+    let active_group_keys = nuvio_active_group_keys(modules);
+    let entities = nuvio_coalesced_module_entities(
+        modules,
+        registry_by_id,
+        certification_by_module,
+        job_by_module,
+        |module| {
+            !module.enabled
+                && !module.installed
+                && !active_group_keys.contains(&nuvio_module_coalesce_key(module))
+        },
+    );
     ExtensionControlSection {
         id: "nuvioAvailableSources".to_string(),
-        title: "Available sources".to_string(),
-        description:
-            "Discovered Prism source modules that are not active. Repository trust and module install are explicit."
-                .to_string(),
+        title: "Scraper marketplace".to_string(),
+        description: "Discovered Nuvio-compatible scrapers that are not enabled yet.".to_string(),
         policy: Some(control_policy_observed(
-            "Elixir inventories Nuvio manifests but does not download or execute source code as a background side effect.",
+            "Repository manifests are inventoried before scraper code is installed.",
         )),
         notices: Vec::new(),
         fields: Vec::new(),
@@ -2601,13 +3390,281 @@ fn build_nuvio_available_sources_section(
     }
 }
 
+fn nuvio_active_group_keys(modules: &[ExtensionSourceModule]) -> HashSet<String> {
+    modules
+        .iter()
+        .filter(|module| module.enabled || module.installed)
+        .map(nuvio_module_coalesce_key)
+        .collect()
+}
+
+fn nuvio_coalesced_module_entities<F>(
+    modules: &[ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+    certification_by_module: &BTreeMap<Uuid, &ExtensionSourceModuleCertification>,
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
+    include: F,
+) -> Vec<ExtensionControlEntity>
+where
+    F: Fn(&ExtensionSourceModule) -> bool,
+{
+    let mut groups = BTreeMap::<String, Vec<&ExtensionSourceModule>>::new();
+    for module in modules.iter().filter(|module| include(module)) {
+        groups
+            .entry(nuvio_module_coalesce_key(module))
+            .or_default()
+            .push(module);
+    }
+    let mut entities = groups
+        .into_values()
+        .filter(|variants| !variants.is_empty())
+        .map(|mut variants| {
+            variants.sort_by_key(|module| {
+                nuvio_module_primary_sort_key(
+                    module,
+                    registry_by_id.get(&module.registry_id).copied(),
+                    certification_by_module
+                        .get(&module.source_module_id)
+                        .copied(),
+                    job_by_module.get(&module.source_module_id).copied(),
+                )
+            });
+            nuvio_coalesced_module_entity(
+                &variants,
+                registry_by_id,
+                certification_by_module,
+                job_by_module,
+            )
+        })
+        .collect::<Vec<_>>();
+    entities.sort_by(|left, right| {
+        left.title
+            .to_ascii_lowercase()
+            .cmp(&right.title.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entities
+}
+
+fn nuvio_coalesced_module_entity(
+    variants: &[&ExtensionSourceModule],
+    registry_by_id: &BTreeMap<Uuid, &ExtensionSourceRegistry>,
+    certification_by_module: &BTreeMap<Uuid, &ExtensionSourceModuleCertification>,
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
+) -> ExtensionControlEntity {
+    let primary = variants[0];
+    let primary_registry = registry_by_id.get(&primary.registry_id).copied();
+    let primary_certification = certification_by_module
+        .get(&primary.source_module_id)
+        .copied();
+    let primary_job = job_by_module.get(&primary.source_module_id).copied();
+    let mut subtitle = nuvio_module_subtitle(primary, primary_certification, primary_job);
+    if variants.len() > 1 {
+        subtitle.push_str(&format!(" • {} repos", variants.len()));
+    }
+    let mut details = nuvio_module_details(
+        primary,
+        primary_registry,
+        primary_certification,
+        primary_job,
+    );
+    if variants.len() > 1 {
+        details.push(format!("Repository variants: {}", variants.len()));
+        for variant in variants {
+            details.push(nuvio_module_variant_detail(
+                variant,
+                registry_by_id.get(&variant.registry_id).copied(),
+                certification_by_module
+                    .get(&variant.source_module_id)
+                    .copied(),
+                job_by_module.get(&variant.source_module_id).copied(),
+            ));
+        }
+    }
+
+    let mut actions = Vec::new();
+    let mut seen_actions = HashSet::new();
+    for variant in variants {
+        let registry = registry_by_id.get(&variant.registry_id).copied();
+        let repo_label = registry
+            .map(|registry| registry.display_name.as_str())
+            .unwrap_or("unknown repo");
+        for mut action in nuvio_module_actions(variant, registry) {
+            if variants.len() > 1 {
+                action.label = format!("{} - {}", action.label, repo_label);
+                if action.description.trim().is_empty() {
+                    action.description = format!("Repository variant: {repo_label}.");
+                } else {
+                    action.description =
+                        format!("{} Repository variant: {repo_label}.", action.description);
+                }
+            }
+            let action_key = format!(
+                "{}:{}:{}",
+                action.id, variant.source_module_id, action.label
+            );
+            if seen_actions.insert(action_key) {
+                actions.push(action);
+            }
+        }
+    }
+
+    ExtensionControlEntity {
+        id: primary.source_module_id.to_string(),
+        title: primary.display_name.clone(),
+        subtitle: Some(subtitle),
+        details,
+        actions,
+    }
+}
+
+fn nuvio_module_coalesce_key(module: &ExtensionSourceModule) -> String {
+    let raw = module
+        .plugin_package
+        .as_deref()
+        .or_else(|| {
+            module
+                .metadata_json
+                .as_ref()
+                .and_then(|value| value.pointer("/nuvio/moduleId"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or(module.display_name.as_str());
+    cloudstream_stable_text_id(raw)
+}
+
+fn nuvio_module_primary_sort_key(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+    certification: Option<&ExtensionSourceModuleCertification>,
+    job: Option<&ExtensionSourceCertificationJob>,
+) -> (i64, i64, i64, String) {
+    let state_rank = if module.enabled {
+        0
+    } else if module.installed {
+        1
+    } else {
+        2
+    };
+    let status_rank = nuvio_status_rank(nuvio_module_status(module, certification, job).as_deref());
+    let trust_rank = registry
+        .map(|registry| match registry.trust_class.as_str() {
+            "curated" => 0,
+            "maintainer_known" => 1,
+            "custom" => 2,
+            _ => 3,
+        })
+        .unwrap_or(4);
+    (
+        state_rank,
+        status_rank,
+        trust_rank,
+        module.module_key.to_ascii_lowercase(),
+    )
+}
+
+fn nuvio_status_rank(status: Option<&str>) -> i64 {
+    match status.unwrap_or("unknown") {
+        "certified" | "healthy" => 0,
+        "degraded" | "probation" => 1,
+        "available" => 2,
+        "certifying" | "queued" | "running" => 3,
+        "unknown" => 4,
+        "broken" | "network_blocked" => 5,
+        "unsupported" | "account_required" => 6,
+        _ => 7,
+    }
+}
+
+fn nuvio_module_status(
+    module: &ExtensionSourceModule,
+    certification: Option<&ExtensionSourceModuleCertification>,
+    job: Option<&ExtensionSourceCertificationJob>,
+) -> Option<String> {
+    certification
+        .map(|certification| certification.status.clone())
+        .or_else(|| {
+            job.and_then(|job| {
+                job.marketplace_state
+                    .clone()
+                    .or_else(|| Some(job.status.clone()))
+            })
+        })
+        .or_else(|| Some(module.health_state.clone()))
+}
+
+fn nuvio_module_variant_detail(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+    certification: Option<&ExtensionSourceModuleCertification>,
+    job: Option<&ExtensionSourceCertificationJob>,
+) -> String {
+    let repo = registry
+        .map(|registry| registry.display_name.as_str())
+        .unwrap_or("unknown repo");
+    let state = if module.enabled {
+        "Enabled"
+    } else if module.installed {
+        "Installed"
+    } else {
+        "Available"
+    };
+    let status = nuvio_module_status(module, certification, job)
+        .unwrap_or_else(|| "unknown".to_string())
+        .replace('_', " ");
+    format!(
+        "Variant: {repo} - {state} - {status} - v{}",
+        module.active_version.as_deref().unwrap_or("none")
+    )
+}
+
 fn build_nuvio_repositories_section(
     registries: &[ExtensionSourceRegistry],
+    modules: &[ExtensionSourceModule],
+    job_by_module: &BTreeMap<Uuid, &ExtensionSourceCertificationJob>,
 ) -> ExtensionControlSection {
     let entities = registries
         .iter()
         .filter(|registry| registry.registry_key != PRISM_RECOMMENDED_REGISTRY_KEY)
         .map(|registry| {
+            let registry_modules = modules
+                .iter()
+                .filter(|module| module.registry_id == registry.registry_id)
+                .collect::<Vec<_>>();
+            let registry_jobs = registry_modules
+                .iter()
+                .filter_map(|module| job_by_module.get(&module.source_module_id).copied())
+                .collect::<Vec<_>>();
+            let queued_or_running = registry_jobs
+                .iter()
+                .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
+                .count();
+            let certified = registry_jobs
+                .iter()
+                .filter(|job| matches!(job.marketplace_state.as_deref(), Some("certified")))
+                .count();
+            let degraded = registry_jobs
+                .iter()
+                .filter(|job| matches!(job.marketplace_state.as_deref(), Some("degraded")))
+                .count();
+            let broken = registry_jobs
+                .iter()
+                .filter(|job| {
+                    matches!(
+                        job.marketplace_state.as_deref(),
+                        Some("broken" | "unsupported" | "account_required" | "network_blocked")
+                    )
+                })
+                .count();
+            let skipped = registry_jobs
+                .iter()
+                .filter(|job| {
+                    matches!(
+                        job.marketplace_state.as_deref(),
+                        Some("skipped_language" | "skipped_trust" | "skipped_unknown_language")
+                    )
+                })
+                .count();
             let mut actions = vec![cloudstream_registry_action(
                 "refresh_custom_repo",
                 "Refresh",
@@ -2616,6 +3673,26 @@ fn build_nuvio_repositories_section(
                 registry.registry_id,
                 None,
             )];
+            if registry.enabled {
+                actions.push(cloudstream_registry_action(
+                    "certify_repository",
+                    "Certify repo",
+                    "Install and certify discovered scrapers from this repository without auto-enabling disabled modules.",
+                    "secondary",
+                    registry.registry_id,
+                    Some("Certify scrapers from this Prism repository now?"),
+                ));
+            }
+            if queued_or_running > 0 {
+                actions.push(cloudstream_registry_action(
+                    "cancel_certification",
+                    "Cancel certification",
+                    "Cancel queued Prism certification jobs for this repository.",
+                    "secondary",
+                    registry.registry_id,
+                    Some("Cancel queued Prism certification jobs for this repository?"),
+                ));
+            }
             if registry.enabled {
                 actions.push(cloudstream_registry_action(
                     "disable_registry",
@@ -2645,6 +3722,18 @@ fn build_nuvio_repositories_section(
                     Some("Trust this custom Prism repository for executable source installs? Only do this for maintainers you trust."),
                 ));
             }
+            if registry.registry_key != PRISM_RECOMMENDED_REGISTRY_KEY
+                && registry.registry_type != "elixir_curated_nuvio_pack"
+            {
+                actions.push(cloudstream_registry_action(
+                    "remove_registry",
+                    "Remove",
+                    "Remove this repository, its scraper descriptors, queued certification jobs, and local scraper artifacts.",
+                    "danger",
+                    registry.registry_id,
+                    Some("Remove this Prism repository and all scrapers discovered from it? Certification evidence for those scraper rows will also be deleted."),
+                ));
+            }
             ExtensionControlEntity {
                 id: registry.registry_id.to_string(),
                 title: registry.display_name.clone(),
@@ -2665,6 +3754,12 @@ fn build_nuvio_repositories_section(
                         }
                     ),
                     format!("URL: {}", registry.url.as_deref().unwrap_or("none")),
+                    format!("Discovered scrapers: {}", registry_modules.len()),
+                    format!("Certification queued or running: {queued_or_running}"),
+                    format!("Certified: {certified}"),
+                    format!("Degraded: {degraded}"),
+                    format!("Broken or blocked: {broken}"),
+                    format!("Skipped by policy: {skipped}"),
                     format!("Last fetch: {}", registry.last_fetch_status),
                     registry
                         .last_fetch_error
@@ -2678,11 +3773,10 @@ fn build_nuvio_repositories_section(
         .collect::<Vec<_>>();
     ExtensionControlSection {
         id: "nuvioRepositories".to_string(),
-        title: "Repositories".to_string(),
-        description: "Prism source repositories. Adding a repository inventories metadata only."
-            .to_string(),
+        title: "Add scraper repository".to_string(),
+        description: "Add a Nuvio manifest URL, then enable scrapers from it.".to_string(),
         policy: Some(control_policy_observed(
-            "Repository metadata is user-managed. Elixir validates and stores source descriptors but only installs executable code after explicit action.",
+            "Custom repositories stay explicit; scraper installs still require an action.",
         )),
         notices: Vec::new(),
         fields: Vec::new(),
@@ -2701,8 +3795,7 @@ async fn build_nuvio_version_pins_section(
             section.id = "nuvioVersionPins".to_string();
             section.title = "Version pins".to_string();
             section.description =
-                "Pin or roll back Nuvio source module versions when a source update breaks."
-                    .to_string();
+                "Pin or roll back scraper versions when a source update breaks.".to_string();
             section
         })
 }
@@ -2716,6 +3809,7 @@ fn nuvio_module_actions(
         .map(|registry| {
             registry.enabled
                 && (registry.registry_type == "elixir_curated_nuvio_pack"
+                    || registry.trust_class != "custom"
                     || registry.trusted_for_executable_updates)
         })
         .unwrap_or(false);
@@ -2723,7 +3817,7 @@ fn nuvio_module_actions(
         actions.push(cloudstream_source_module_action(
             "disable_source_module",
             "Disable",
-            "Disable this Prism source module.",
+            "Disable and uninstall this Prism source module. Certification history stays visible in the marketplace.",
             "danger",
             module.source_module_id,
             Some("Disable this Prism source module?"),
@@ -2746,11 +3840,21 @@ fn nuvio_module_actions(
             None,
         ));
     }
+    if module.installed && !module.enabled {
+        actions.push(cloudstream_source_module_action(
+            "disable_source_module",
+            "Uninstall",
+            "Remove this Prism scraper from installed modules and return it to the marketplace.",
+            "danger",
+            module.source_module_id,
+            Some("Uninstall this Prism scraper and keep its certification history?"),
+        ));
+    }
     if module.installed || module.enabled {
         actions.push(cloudstream_source_module_action(
-            "smoke_source_module",
-            "Check health",
-            "Fetch, hash-check, and statically validate this Prism source artifact.",
+            "certify_source_module",
+            "Retry certification",
+            "Run this scraper through Prism with a canary search and bounded materialization preflight.",
             "secondary",
             module.source_module_id,
             None,
@@ -2770,6 +3874,89 @@ fn nuvio_module_actions(
     actions
 }
 
+fn nuvio_module_subtitle(
+    module: &ExtensionSourceModule,
+    certification: Option<&ExtensionSourceModuleCertification>,
+    job: Option<&ExtensionSourceCertificationJob>,
+) -> String {
+    let status = certification
+        .map(|certification| certification.status.as_str())
+        .or_else(|| job.and_then(|job| job.marketplace_state.as_deref()))
+        .or_else(|| job.map(|job| job.status.as_str()))
+        .unwrap_or("unknown");
+    format!(
+        "{} • {} • v{}",
+        if module.enabled {
+            "Enabled"
+        } else if module.installed {
+            "Installed"
+        } else {
+            "Available"
+        },
+        status.replace('_', " "),
+        module.active_version.as_deref().unwrap_or("none")
+    )
+}
+
+fn nuvio_module_details(
+    module: &ExtensionSourceModule,
+    registry: Option<&ExtensionSourceRegistry>,
+    certification: Option<&ExtensionSourceModuleCertification>,
+    job: Option<&ExtensionSourceCertificationJob>,
+) -> Vec<String> {
+    let mut details = cloudstream_module_details(module, registry);
+    if let Some(job) = job {
+        details.insert(0, format!("Marketplace: {}", job.status.replace('_', " ")));
+        if let Some(marketplace_state) = job.marketplace_state.as_deref() {
+            details.insert(
+                1,
+                format!("Marketplace state: {}", marketplace_state.replace('_', " ")),
+            );
+        }
+        if let Some(language_eligibility) = job.language_eligibility.as_deref() {
+            details.push(format!("Language eligibility: {language_eligibility}"));
+        }
+        if let Some(summary) = job.summary.as_deref() {
+            details.push(format!("Certification job: {summary}"));
+        }
+        if let Some(last_error) = job.last_error.as_deref() {
+            details.push(format!("Certification error: {last_error}"));
+        }
+        details.push(format!(
+            "Last certification job: {}",
+            job.updated_at.format("%Y-%m-%d %H:%M UTC")
+        ));
+    }
+    match certification {
+        Some(certification) => {
+            details.insert(
+                0,
+                format!("Certification: {}", certification.status.replace('_', " ")),
+            );
+            if let Some(failure_class) = certification.failure_class.as_deref() {
+                details.insert(1, format!("Failure class: {failure_class}"));
+            }
+            if let Some(summary) = certification.summary.as_deref() {
+                details.insert(2, format!("Probe: {summary}"));
+            }
+            details.push(format!(
+                "Last certified: {}",
+                certification
+                    .certified_at
+                    .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        None => {
+            details.insert(
+                0,
+                "Certification: unknown; enable runs certification before activation".to_string(),
+            );
+        }
+    }
+    details
+}
+
 fn nuvio_add_custom_repo_action() -> ExtensionControlAction {
     ExtensionControlAction {
         id: "add_custom_repo".to_string(),
@@ -2783,7 +3970,7 @@ fn nuvio_add_custom_repo_action() -> ExtensionControlAction {
                 {
                     "id": "registryUrl",
                     "label": "Repository URL",
-                    "description": "Prism-compatible manifest.json URL.",
+                    "description": "Nuvio repository root URL or direct manifest.json URL.",
                     "fieldType": "text",
                     "required": true,
                     "value": ""
@@ -2827,11 +4014,1262 @@ fn prism_refresh_recommended_pack_action() -> ExtensionControlAction {
     )
 }
 
+fn prism_certify_enabled_sources_action() -> ExtensionControlAction {
+    cloudstream_simple_action(
+        "certify_enabled_sources",
+        "Certify enabled",
+        "Re-run enable-time certification for installed and enabled Prism scrapers.",
+        "secondary",
+        None,
+        Some("Re-run certification for enabled Prism scrapers? Broken scrapers will be disabled."),
+    )
+}
+
+async fn prism_certification_report(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<Value> {
+    if let Some(source_module_id) = params
+        .get("sourceModuleId")
+        .and_then(serde_json::Value::as_str)
+    {
+        let source_module_id = Uuid::parse_str(source_module_id)
+            .with_context(|| format!("invalid sourceModuleId '{source_module_id}'"))?;
+        let certifications = store
+            .list_source_module_certifications(source_module_id, 25)
+            .await?
+            .into_iter()
+            .map(prism_certification_report_entry)
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "sourceModuleId": source_module_id,
+            "certifications": certifications,
+        }));
+    }
+    let certifications = store
+        .list_latest_source_module_certifications(instance_id)
+        .await?
+        .into_iter()
+        .map(prism_certification_report_entry)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "instanceId": instance_id,
+        "certifications": certifications,
+    }))
+}
+
+fn prism_certification_report_entry(certification: ExtensionSourceModuleCertification) -> Value {
+    json!({
+        "certificationId": certification.certification_id,
+        "sourceModuleId": certification.source_module_id,
+        "sourceModuleVersionId": certification.source_module_version_id,
+        "instanceId": certification.instance_id,
+        "adapter": certification.adapter,
+        "status": certification.status,
+        "failureClass": certification.failure_class,
+        "summary": certification.summary,
+        "mediaTypeResults": certification.media_type_results_json,
+        "materializationResults": certification.materialization_results_json,
+        "probeTargets": certification.probe_targets_json,
+        "candidateEvidence": certification.candidate_evidence_json,
+        "runtimeVersion": certification.runtime_version,
+        "policyVersion": certification.policy_version,
+        "certifiedAt": certification.certified_at,
+        "expiresAt": certification.expires_at,
+        "createdAt": certification.created_at,
+        "updatedAt": certification.updated_at,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct PrismRuntimeSmokeOutcome {
+    status: String,
+    health_state: String,
+    severity: String,
+    reason: String,
+    failure_class: Option<String>,
+    candidate_count: usize,
+    materializable_count: usize,
+    warnings: Vec<String>,
+    media_type_results: Value,
+    materialization_results: Value,
+    candidate_evidence: Value,
+}
+
+impl PrismRuntimeSmokeOutcome {
+    fn new(
+        status: &str,
+        severity: &str,
+        reason: impl Into<String>,
+        candidate_count: usize,
+        warnings: Vec<String>,
+    ) -> Self {
+        let health_state = prism_certification_status_health_state(status);
+        Self {
+            status: status.to_string(),
+            health_state: health_state.to_string(),
+            severity: severity.to_string(),
+            reason: reason.into(),
+            failure_class: None,
+            candidate_count,
+            materializable_count: 0,
+            warnings,
+            media_type_results: json!({}),
+            materialization_results: json!({}),
+            candidate_evidence: json!([]),
+        }
+    }
+
+    fn with_failure_class(mut self, failure_class: impl Into<String>) -> Self {
+        self.failure_class = Some(failure_class.into());
+        self
+    }
+
+    fn with_preflight(
+        mut self,
+        materializable_count: usize,
+        media_type_results: Value,
+        materialization_results: Value,
+        candidate_evidence: Value,
+    ) -> Self {
+        self.materializable_count = materializable_count;
+        self.media_type_results = media_type_results;
+        self.materialization_results = materialization_results;
+        self.candidate_evidence = candidate_evidence;
+        self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrismRuntimeSmokeResponse {
+    #[serde(default)]
+    candidates: Vec<Value>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+async fn smoke_prism_source_module_runtime(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    instance: &ExtensionInstance,
+    module: &ExtensionSourceModule,
+) -> anyhow::Result<PrismRuntimeSmokeOutcome> {
+    let registry = nuvio_find_registry(store, instance.instance_id, module.registry_id).await?;
+    let descriptor = prism_source_module_runtime_descriptor(store, module, &registry).await?;
+    let module_id = prism_source_module_invocation_key(&descriptor);
+    let smoke_requests = prism_runtime_smoke_requests(module);
+    let provider = match context.selected_provider.as_ref() {
+        Some(provider) => provider,
+        None => {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                "Prism runtime provider is not registered for this instance",
+                Vec::new(),
+            )
+            .await;
+        }
+    };
+    let endpoint_json = match provider.endpoint_json.clone() {
+        Some(value) => value,
+        None => {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                "Prism runtime provider endpoint is missing",
+                Vec::new(),
+            )
+            .await;
+        }
+    };
+    let endpoint: ProviderEndpoint = match serde_json::from_value(endpoint_json) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                format!("Prism runtime provider endpoint is invalid: {err}"),
+                Vec::new(),
+            )
+            .await;
+        }
+    };
+    let base_url =
+        match super::resolve_control_provider_transport_base_url(instance.instance_id, &endpoint)
+            .await
+        {
+            Ok(base_url) => base_url,
+            Err(err) => {
+                return prism_runtime_smoke_failure(
+                    store,
+                    context,
+                    module,
+                    &module_id,
+                    &smoke_requests,
+                    format!("Prism runtime provider transport is unavailable: {err}"),
+                    Vec::new(),
+                )
+                .await;
+            }
+        };
+    let search_url = match prism_provider_search_url(&base_url) {
+        Ok(url) => url,
+        Err(err) => {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                format!("Prism runtime search URL could not be built: {err}"),
+                Vec::new(),
+            )
+            .await;
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(PRISM_RUNTIME_SMOKE_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                format!("Prism runtime probe client could not be built: {err}"),
+                Vec::new(),
+            )
+            .await;
+        }
+    };
+    let mut outcomes = Vec::new();
+    for smoke_request in &smoke_requests {
+        let invocation = json!({
+            "schemaVersion": PRISM_PROVIDER_SCHEMA_VERSION,
+            "request": smoke_request,
+            "provider": {
+                "providerId": provider.provider_id,
+                "extensionId": context.extension.extension_id,
+                "instanceId": instance.instance_id,
+                "implementation": provider.implementation.as_deref().unwrap_or("prism"),
+                "config": {
+                    "sourceModules": [descriptor.clone()],
+                    "resultLimit": 5,
+                    "timeoutMs": PRISM_RUNTIME_SMOKE_PROVIDER_TIMEOUT_MS
+                }
+            }
+        });
+        let response = match client
+            .post(search_url.clone())
+            .json(&invocation)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return prism_runtime_smoke_failure(
+                    store,
+                    context,
+                    module,
+                    &module_id,
+                    &smoke_requests,
+                    format!("Prism runtime probe request failed: {err}"),
+                    Vec::new(),
+                )
+                .await;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                format!(
+                    "Prism runtime probe returned {status}: {}",
+                    prism_truncate_diagnostic(&body, 512)
+                ),
+                Vec::new(),
+            )
+            .await;
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return prism_runtime_smoke_failure(
+                    store,
+                    context,
+                    module,
+                    &module_id,
+                    &smoke_requests,
+                    format!("Prism runtime probe response could not be read: {err}"),
+                    Vec::new(),
+                )
+                .await;
+            }
+        };
+        if bytes.len() > 2 * 1024 * 1024 {
+            return prism_runtime_smoke_failure(
+                store,
+                context,
+                module,
+                &module_id,
+                &smoke_requests,
+                "Prism runtime probe response exceeded 2 MiB",
+                Vec::new(),
+            )
+            .await;
+        }
+        let upstream: PrismRuntimeSmokeResponse = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(err) => {
+                return prism_runtime_smoke_failure(
+                    store,
+                    context,
+                    module,
+                    &module_id,
+                    &smoke_requests,
+                    format!("Prism runtime probe response was not valid JSON: {err}"),
+                    Vec::new(),
+                )
+                .await;
+            }
+        };
+        outcomes.push(
+            certify_prism_runtime_smoke(
+                &module_id,
+                smoke_request,
+                &upstream.candidates,
+                &upstream.warnings,
+            )
+            .await,
+        );
+    }
+    let outcome = aggregate_prism_runtime_smoke_outcomes(&smoke_requests, outcomes);
+    record_prism_runtime_smoke_event(
+        store,
+        context,
+        module,
+        &module_id,
+        &smoke_requests,
+        &outcome,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+async fn prism_runtime_smoke_failure(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    module: &ExtensionSourceModule,
+    module_id: &str,
+    probe_targets: &[Value],
+    reason: impl Into<String>,
+    warnings: Vec<String>,
+) -> anyhow::Result<PrismRuntimeSmokeOutcome> {
+    let reason = reason.into();
+    let failure_class = prism_failure_class_from_diagnostic(&reason);
+    let outcome = PrismRuntimeSmokeOutcome::new("broken", "error", reason, 0, warnings)
+        .with_failure_class(failure_class);
+    record_prism_runtime_smoke_event(store, context, module, module_id, probe_targets, &outcome)
+        .await?;
+    Ok(outcome)
+}
+
+async fn record_prism_runtime_smoke_event(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    module: &ExtensionSourceModule,
+    module_id: &str,
+    probe_targets: &[Value],
+    outcome: &PrismRuntimeSmokeOutcome,
+) -> anyhow::Result<()> {
+    let active_version = nuvio_active_source_module_version(store, module).await?;
+    let source_module_version_id = active_version.as_ref().map(|version| version.version_id);
+    let runtime_version = active_version
+        .as_ref()
+        .map(|version| version.version.clone())
+        .or_else(|| module.active_version.clone());
+    let now = Utc::now();
+    store
+        .upsert_source_module_certification(&NewExtensionSourceModuleCertification {
+            certification_id: Uuid::new_v4(),
+            source_module_id: module.source_module_id,
+            source_module_version_id,
+            instance_id: module.instance_id,
+            adapter: "nuvio_js_v1".to_string(),
+            status: outcome.status.clone(),
+            failure_class: outcome.failure_class.clone(),
+            summary: Some(outcome.reason.clone()),
+            media_type_results_json: outcome.media_type_results.clone(),
+            materialization_results_json: outcome.materialization_results.clone(),
+            probe_targets_json: Value::Array(probe_targets.to_vec()),
+            candidate_evidence_json: outcome.candidate_evidence.clone(),
+            runtime_version,
+            policy_version: PRISM_CERTIFICATION_POLICY_VERSION.to_string(),
+            certified_at: Some(now),
+            expires_at: Some(now + chrono::Duration::days(7)),
+        })
+        .await?;
+    store
+        .create_source_health_event(&NewExtensionSourceHealthEvent {
+            health_event_id: Uuid::new_v4(),
+            source_module_id: module.source_module_id,
+            event_type: "certification".to_string(),
+            state: outcome.health_state.clone(),
+            severity: outcome.severity.clone(),
+            reason: Some(outcome.reason.clone()),
+            evidence_json: Some(json!({
+                "providerId": context.selected_provider.as_ref().map(|provider| provider.provider_id),
+                "extensionId": context.extension.extension_id,
+                "instanceId": context.selected_instance.as_ref().map(|instance| instance.instance_id),
+                "moduleId": module_id,
+                "certificationStatus": outcome.status.clone(),
+                "failureClass": outcome.failure_class.clone(),
+                "mediaTypes": probe_targets.iter().map(prism_smoke_request_media_type).collect::<Vec<_>>(),
+                "probeTargets": probe_targets,
+                "candidateCount": outcome.candidate_count,
+                "materializableCount": outcome.materializable_count,
+                "mediaTypeResults": outcome.media_type_results.clone(),
+                "materializationResults": outcome.materialization_results.clone(),
+                "candidateEvidence": outcome.candidate_evidence.clone(),
+                "warnings": outcome.warnings.clone(),
+            })),
+            observed_at: Some(now),
+        })
+        .await
+}
+
+async fn certify_prism_runtime_smoke(
+    module_id: &str,
+    smoke_request: &Value,
+    candidates: &[Value],
+    warnings: &[String],
+) -> PrismRuntimeSmokeOutcome {
+    let module_warnings = warnings
+        .iter()
+        .filter_map(|warning| {
+            let (warning_module_id, detail) = parse_prism_runtime_warning(warning)?;
+            (warning_module_id == module_id).then_some(detail)
+        })
+        .collect::<Vec<_>>();
+    let health_warnings = module_warnings
+        .iter()
+        .filter(|warning| prism_runtime_warning_is_health_signal(warning))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !health_warnings.is_empty() {
+        let reason = health_warnings.join(" | ");
+        let (status, severity, failure_class) = prism_runtime_warning_certification(&reason);
+        return PrismRuntimeSmokeOutcome::new(
+            status,
+            severity,
+            prism_truncate_diagnostic(&reason, 700),
+            candidates.len(),
+            module_warnings,
+        )
+        .with_failure_class(failure_class);
+    }
+    let module_candidates = candidates
+        .iter()
+        .filter(|candidate| {
+            let candidate_module_id = candidate
+                .pointer("/sourceModule/id")
+                .and_then(Value::as_str)
+                .map(cloudstream_stable_text_id);
+            candidate_module_id
+                .as_deref()
+                .is_none_or(|candidate_module_id| candidate_module_id == module_id)
+        })
+        .take(PRISM_CERTIFICATION_MAX_PREFLIGHT_CANDIDATES)
+        .cloned()
+        .collect::<Vec<_>>();
+    if module_candidates.is_empty() {
+        let media_type = smoke_request
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let media_type_results = json!({
+            media_type: {
+                "status": "broken",
+                "failureClass": "no_results",
+                "candidateCount": 0,
+                "materializableCount": 0,
+                "summary": "runtime probe completed without stream candidates for the canary title"
+            }
+        });
+        return PrismRuntimeSmokeOutcome::new(
+            "broken",
+            "error",
+            "runtime probe completed without stream candidates for the canary title",
+            0,
+            module_warnings,
+        )
+        .with_failure_class("no_results")
+        .with_preflight(0, media_type_results, json!({ "inspected": [] }), json!([]));
+    }
+    let mut reports = Vec::new();
+    for candidate in &module_candidates {
+        reports.push(preflight_stream_candidate(candidate).await);
+    }
+    classify_prism_preflight_reports(smoke_request, &module_candidates, reports, module_warnings)
+}
+
+fn aggregate_prism_runtime_smoke_outcomes(
+    probe_targets: &[Value],
+    outcomes: Vec<PrismRuntimeSmokeOutcome>,
+) -> PrismRuntimeSmokeOutcome {
+    if outcomes.is_empty() {
+        return PrismRuntimeSmokeOutcome::new(
+            "broken",
+            "error",
+            "certification did not run any media-type probes",
+            0,
+            Vec::new(),
+        )
+        .with_failure_class("no_probes");
+    }
+
+    let candidate_count = outcomes
+        .iter()
+        .map(|outcome| outcome.candidate_count)
+        .sum::<usize>();
+    let materializable_count = outcomes
+        .iter()
+        .map(|outcome| outcome.materializable_count)
+        .sum::<usize>();
+    let warnings = outcomes
+        .iter()
+        .flat_map(|outcome| outcome.warnings.iter().cloned())
+        .collect::<Vec<_>>();
+    let eligible_count = outcomes
+        .iter()
+        .filter(|outcome| prism_certification_is_eligible(&outcome.status))
+        .count();
+    let status = if eligible_count == outcomes.len() {
+        if outcomes
+            .iter()
+            .any(|outcome| outcome.status.as_str() != "certified")
+        {
+            "degraded"
+        } else {
+            "certified"
+        }
+    } else if eligible_count > 0 {
+        "degraded"
+    } else {
+        outcomes
+            .iter()
+            .max_by_key(|outcome| prism_certification_failure_priority(&outcome.status))
+            .map(|outcome| outcome.status.as_str())
+            .unwrap_or("broken")
+    };
+    let severity = match status {
+        "certified" => "info",
+        "degraded" | "unsupported" | "account_required" | "network_blocked" => "warning",
+        _ => "error",
+    };
+
+    let media_type_pairs = probe_targets
+        .iter()
+        .zip(outcomes.iter())
+        .map(|(request, outcome)| (prism_smoke_request_media_type(request), outcome))
+        .collect::<Vec<_>>();
+    let passed_media = media_type_pairs
+        .iter()
+        .filter(|(_, outcome)| prism_certification_is_eligible(&outcome.status))
+        .map(|(media_type, _)| *media_type)
+        .collect::<Vec<_>>();
+    let failed_media = media_type_pairs
+        .iter()
+        .filter(|(_, outcome)| !prism_certification_is_eligible(&outcome.status))
+        .map(|(media_type, outcome)| format!("{media_type}: {}", outcome.reason))
+        .collect::<Vec<_>>();
+    let summary = if failed_media.is_empty() && status == "certified" {
+        format!(
+            "certification probes returned materializable stream candidates for {}",
+            passed_media.join(", ")
+        )
+    } else if failed_media.is_empty() {
+        format!(
+            "certification probes returned materializable candidates with degraded evidence for {}",
+            passed_media.join(", ")
+        )
+    } else if passed_media.is_empty() {
+        format!("certification failed for {}", failed_media.join("; "))
+    } else {
+        format!(
+            "certification passed for {}; failed for {}",
+            passed_media.join(", "),
+            failed_media.join("; ")
+        )
+    };
+
+    let mut media_type_results = serde_json::Map::new();
+    let mut materialization_results = Vec::new();
+    let mut candidate_evidence = Vec::new();
+    for (request, outcome) in probe_targets.iter().zip(outcomes.iter()) {
+        let media_type = prism_smoke_request_media_type(request);
+        if let Some(results) = outcome.media_type_results.as_object() {
+            for (key, value) in results {
+                media_type_results.insert(key.clone(), value.clone());
+            }
+        } else {
+            media_type_results.insert(
+                media_type.to_string(),
+                json!({
+                    "status": outcome.status.clone(),
+                    "failureClass": outcome.failure_class.clone(),
+                    "candidateCount": outcome.candidate_count,
+                    "materializableCount": outcome.materializable_count,
+                    "summary": outcome.reason.clone(),
+                }),
+            );
+        }
+        materialization_results.push(json!({
+            "mediaType": media_type,
+            "result": outcome.materialization_results.clone(),
+        }));
+        if let Some(items) = outcome.candidate_evidence.as_array() {
+            for item in items {
+                let mut item = item.clone();
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("mediaType".to_string(), json!(media_type));
+                }
+                candidate_evidence.push(item);
+            }
+        }
+    }
+
+    let mut aggregate = PrismRuntimeSmokeOutcome::new(
+        status,
+        severity,
+        prism_truncate_diagnostic(&summary, 700),
+        candidate_count,
+        warnings,
+    )
+    .with_preflight(
+        materializable_count,
+        Value::Object(media_type_results),
+        json!({ "mediaTypes": materialization_results }),
+        Value::Array(candidate_evidence),
+    );
+    if status != "certified" {
+        aggregate.failure_class = outcomes
+            .iter()
+            .find_map(|outcome| outcome.failure_class.clone());
+    }
+    aggregate
+}
+
+fn prism_certification_failure_priority(status: &str) -> u8 {
+    match status {
+        "broken" => 6,
+        "network_blocked" => 5,
+        "unsupported" => 4,
+        "account_required" => 3,
+        "unknown" => 2,
+        _ => 1,
+    }
+}
+
+fn prism_smoke_request_media_type(request: &Value) -> &str {
+    request
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn classify_prism_preflight_reports(
+    smoke_request: &Value,
+    candidates: &[Value],
+    reports: Vec<StreamCandidatePreflightReport>,
+    warnings: Vec<String>,
+) -> PrismRuntimeSmokeOutcome {
+    let media_type = smoke_request
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let materializable_count = reports.iter().filter(|report| report.passed).count();
+    let candidate_count = candidates.len();
+    let first_failure = reports.iter().find(|report| !report.passed);
+    let failure_class = first_failure
+        .and_then(|report| report.failure_class.clone())
+        .or_else(|| (materializable_count == 0).then(|| "no_results".to_string()));
+    let status = if materializable_count == 0 {
+        prism_certification_status_from_failure(failure_class.as_deref())
+    } else if materializable_count < candidate_count {
+        "degraded"
+    } else {
+        "certified"
+    };
+    let severity = match status {
+        "certified" => "info",
+        "degraded" | "unsupported" | "account_required" | "network_blocked" => "warning",
+        _ => "error",
+    };
+    let summary = match (status, materializable_count, first_failure) {
+        ("certified", count, _) => {
+            format!("certification probe returned {count} materializable stream candidate(s)")
+        }
+        ("degraded", count, Some(report)) => format!(
+            "certification found {count} materializable candidate(s), but at least one candidate failed preflight: {}",
+            report.summary
+        ),
+        (_, 0, Some(report)) => report.summary.clone(),
+        _ => "certification probe did not find a materializable stream candidate".to_string(),
+    };
+    let media_type_results = json!({
+        media_type: {
+            "status": status,
+            "failureClass": failure_class,
+            "candidateCount": candidate_count,
+            "materializableCount": materializable_count,
+            "summary": summary,
+        }
+    });
+    let inspected = reports
+        .iter()
+        .map(StreamCandidatePreflightReport::evidence_json)
+        .collect::<Vec<_>>();
+    let candidate_evidence = candidates
+        .iter()
+        .zip(reports.iter())
+        .enumerate()
+        .map(|(index, (candidate, report))| {
+            json!({
+                "index": index,
+                "title": candidate.get("title").cloned().unwrap_or(Value::Null),
+                "quality": candidate.get("quality").cloned().unwrap_or(Value::Null),
+                "sourceModule": candidate.get("sourceModule").cloned().unwrap_or(Value::Null),
+                "delivery": prism_certification_delivery_evidence(candidate),
+                "preflight": report,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut outcome = PrismRuntimeSmokeOutcome::new(
+        status,
+        severity,
+        prism_truncate_diagnostic(&summary, 700),
+        candidate_count,
+        warnings,
+    )
+    .with_preflight(
+        materializable_count,
+        media_type_results,
+        json!({ "inspected": inspected }),
+        Value::Array(candidate_evidence),
+    );
+    outcome.failure_class = failure_class;
+    outcome
+}
+
+fn prism_certification_delivery_evidence(candidate: &Value) -> Value {
+    let Some(delivery) = candidate.get("delivery").and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut object = serde_json::Map::new();
+    for key in ["streamType", "resolveRequired", "expiresAt"] {
+        if let Some(value) = delivery.get(key) {
+            object.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(url) = delivery.get("url").and_then(Value::as_str) {
+        object.insert(
+            "url".to_string(),
+            Value::String(prism_redacted_url_for_evidence(url)),
+        );
+    }
+    if let Some(referer) = delivery.get("referer").and_then(Value::as_str) {
+        object.insert(
+            "referer".to_string(),
+            Value::String(prism_redacted_url_for_evidence(referer)),
+        );
+    }
+    if let Some(headers) = delivery.get("headers").and_then(Value::as_object) {
+        object.insert(
+            "headerNames".to_string(),
+            Value::Array(headers.keys().cloned().map(Value::String).collect()),
+        );
+    }
+    Value::Object(object)
+}
+
+fn prism_redacted_url_for_evidence(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "<invalid-url>".to_string();
+    };
+    if url.query().is_some() {
+        url.set_query(Some("redacted=1"));
+    }
+    url.to_string()
+}
+
+fn parse_prism_runtime_warning(warning: &str) -> Option<(String, String)> {
+    let trimmed = warning.trim();
+    let prism_prefix = trimmed
+        .strip_prefix("prism:")
+        .or_else(|| trimmed.split_once(":prism:").map(|(_, rest)| rest))?;
+    let (module_id, detail) = prism_prefix.split_once(':')?;
+    let module_id = cloudstream_stable_text_id(module_id);
+    if matches!(module_id.as_str(), "source" | "no-source-modules") {
+        return None;
+    }
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    Some((module_id, detail.to_string()))
+}
+
+fn prism_runtime_warning_is_health_signal(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    !normalized.contains("tmdb id is unavailable") && !normalized.contains("skipped because")
+}
+
+fn prism_runtime_warning_certification(reason: &str) -> (&'static str, &'static str, &'static str) {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("unsupported") {
+        return (
+            "unsupported",
+            "warning",
+            FAILURE_MATERIALIZATION_PREFLIGHT_FAILED,
+        );
+    }
+    if normalized.contains("account") && normalized.contains("not configured") {
+        return ("account_required", "warning", FAILURE_ACCOUNT_REQUIRED);
+    }
+    if normalized.contains("runtime_error")
+        || normalized.contains("scraping error")
+        || normalized.contains("fetch failed")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("enotfound")
+        || normalized.contains("econn")
+        || normalized.contains("404")
+        || normalized.contains("returned html")
+        || normalized.contains("is not installed")
+        || normalized.contains("outside configured roots")
+    {
+        return (
+            "broken",
+            "error",
+            prism_failure_class_from_diagnostic(reason),
+        );
+    }
+    (
+        "degraded",
+        "warning",
+        FAILURE_MATERIALIZATION_PREFLIGHT_FAILED,
+    )
+}
+
+fn prism_failure_class_from_diagnostic(reason: &str) -> &'static str {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("account") || normalized.contains("login") {
+        FAILURE_ACCOUNT_REQUIRED
+    } else if normalized.contains("captcha")
+        || normalized.contains("cloudflare")
+        || normalized.contains("browser")
+    {
+        FAILURE_CAPTCHA_OR_BROWSER_REQUIRED
+    } else if normalized.contains("unsafe") {
+        FAILURE_UNSAFE_URL
+    } else if normalized.contains("html")
+        || normalized.contains("<!doctype")
+        || normalized.contains("json")
+        || normalized.contains("xml")
+    {
+        FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE
+    } else if normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("enotfound")
+        || normalized.contains("econn")
+        || normalized.contains("tls")
+        || normalized.contains("dns")
+        || normalized.contains("fetch failed")
+    {
+        FAILURE_NETWORK_BLOCKED
+    } else if normalized.contains("shape") || normalized.contains("getstreams") {
+        FAILURE_INVALID_CANDIDATE_SHAPE
+    } else {
+        "runtime_exception"
+    }
+}
+
+fn prism_certification_status_from_failure(failure_class: Option<&str>) -> &'static str {
+    match failure_class {
+        Some(class) if class == FAILURE_ACCOUNT_REQUIRED => "account_required",
+        Some(class)
+            if class == FAILURE_CAPTCHA_OR_BROWSER_REQUIRED
+                || class == FAILURE_DRM_OR_LICENSE_REQUIRED
+                || class == FAILURE_HOSTER_RESOLVER_MISSING
+                || class == FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE =>
+        {
+            "unsupported"
+        }
+        Some(class) if class == FAILURE_NETWORK_BLOCKED => "network_blocked",
+        Some(class) if class == FAILURE_MATERIALIZATION_PREFLIGHT_FAILED => "broken",
+        Some(class) if class == FAILURE_INVALID_CANDIDATE_SHAPE || class == FAILURE_UNSAFE_URL => {
+            "broken"
+        }
+        Some("no_results") => "broken",
+        Some(_) | None => "broken",
+    }
+}
+
+fn prism_certification_status_health_state(status: &str) -> &'static str {
+    match status {
+        "certified" => "healthy",
+        "degraded" | "probation" => "degraded",
+        "unsupported" => "unsupported",
+        "account_required" => "account_required",
+        "network_blocked" | "broken" => "broken",
+        _ => "unknown",
+    }
+}
+
+fn prism_certification_is_eligible(status: &str) -> bool {
+    matches!(status, "certified" | "degraded" | "probation")
+}
+
+fn prism_provider_search_url(base_url: &str) -> anyhow::Result<reqwest::Url> {
+    let mut base = reqwest::Url::parse(base_url).context("parsing Prism provider base URL")?;
+    let mut path = base.path().trim_end_matches('/').to_string();
+    path.push('/');
+    base.set_path(&path);
+    base.join(PRISM_PROVIDER_SEARCH_PATH)
+        .context("building Prism provider search URL")
+}
+
+fn prism_runtime_smoke_requests(module: &ExtensionSourceModule) -> Vec<Value> {
+    prism_runtime_smoke_media_types(module)
+        .into_iter()
+        .map(prism_runtime_smoke_request_for_media_type)
+        .collect()
+}
+
+fn prism_runtime_smoke_request(module: &ExtensionSourceModule) -> Value {
+    let media_type = prism_runtime_smoke_media_types(module)
+        .into_iter()
+        .next()
+        .unwrap_or("movie");
+    prism_runtime_smoke_request_for_media_type(media_type)
+}
+
+fn prism_runtime_smoke_request_for_media_type(media_type: &str) -> Value {
+    match media_type {
+        "anime" => json!({
+            "mediaType": "anime",
+            "title": "Cowboy Bebop",
+            "year": 1998,
+            "externalIds": {
+                "tmdb": "30991",
+                "tmdbSeries": "30991",
+                "imdb": "tt0213338"
+            },
+            "titles": [
+                { "value": "Cowboy Bebop", "kind": "primary" }
+            ],
+            "targets": [
+                {
+                    "targetKey": "s01e01",
+                    "title": "Asteroid Blues",
+                    "seasonNumber": 1,
+                    "episodeNumber": 1
+                }
+            ],
+            "preferences": {},
+            "limit": 5
+        }),
+        "tv" => json!({
+            "mediaType": "tv",
+            "title": "Breaking Bad",
+            "year": 2008,
+            "externalIds": {
+                "tmdb": "1396",
+                "tmdbSeries": "1396",
+                "imdb": "tt0903747",
+                "tvdb": "81189"
+            },
+            "titles": [
+                { "value": "Breaking Bad", "kind": "primary" }
+            ],
+            "targets": [
+                {
+                    "targetKey": "s01e01",
+                    "title": "Pilot",
+                    "seasonNumber": 1,
+                    "episodeNumber": 1
+                }
+            ],
+            "preferences": {},
+            "limit": 5
+        }),
+        _ => json!({
+            "mediaType": "movie",
+            "title": "Batman: Mask of the Phantasm",
+            "year": 1993,
+            "externalIds": {
+                "tmdb": "14919",
+                "tmdbMovie": "14919",
+                "imdb": "tt0106364"
+            },
+            "titles": [
+                { "value": "Batman: Mask of the Phantasm", "kind": "primary" }
+            ],
+            "targets": [
+                {
+                    "targetKey": "movie",
+                    "title": "Batman: Mask of the Phantasm"
+                }
+            ],
+            "preferences": {},
+            "limit": 5
+        }),
+    }
+}
+
+fn prism_runtime_smoke_media_types(module: &ExtensionSourceModule) -> Vec<&'static str> {
+    let media_types = module
+        .media_types_json
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    if media_types.is_empty() || media_types.contains("all") {
+        return vec!["movie", "tv", "anime"];
+    }
+    let mut selected = Vec::new();
+    if media_types.contains("movie") {
+        selected.push("movie");
+    }
+    if media_types.contains("tv") || media_types.contains("series") {
+        selected.push("tv");
+    }
+    if media_types.contains("anime") {
+        selected.push("anime");
+    }
+    if selected.is_empty() {
+        selected.push("movie");
+    }
+    selected
+}
+
+async fn prism_source_module_runtime_descriptor(
+    store: &ExtensionStore<'_>,
+    module: &ExtensionSourceModule,
+    registry: &ExtensionSourceRegistry,
+) -> anyhow::Result<Value> {
+    let metadata = module.metadata_json.as_ref();
+    let nuvio = metadata
+        .and_then(|value| value.get("nuvio"))
+        .and_then(Value::as_object);
+    let active_version = nuvio_active_source_module_version(store, module).await?;
+    let active_version_metadata = active_version
+        .as_ref()
+        .and_then(|version| version.metadata_json.as_ref());
+
+    let mut descriptor = serde_json::Map::new();
+    let module_id = nuvio_invocation_module_id(module);
+    descriptor.insert("id".to_string(), json!(module_id));
+    descriptor.insert("name".to_string(), json!(module.display_name));
+    descriptor.insert("type".to_string(), json!(module.ecosystem));
+    descriptor.insert(
+        "adapter".to_string(),
+        json!(
+            nuvio
+                .and_then(|value| value.get("adapter"))
+                .and_then(Value::as_str)
+                .unwrap_or("nuvio_js_v1")
+        ),
+    );
+    descriptor.insert("enabled".to_string(), json!(true));
+    descriptor.insert("installed".to_string(), json!(true));
+    descriptor.insert(
+        "requiresAccount".to_string(),
+        json!(module.account_required),
+    );
+    descriptor.insert(
+        "accountConfigured".to_string(),
+        json!(!module.account_required),
+    );
+    descriptor.insert("registryKey".to_string(), json!(registry.registry_key));
+    descriptor.insert("registryType".to_string(), json!(registry.registry_type));
+    descriptor.insert("trustClass".to_string(), json!(registry.trust_class));
+    descriptor.insert(
+        "trustedForExecutableUpdates".to_string(),
+        json!(registry.trusted_for_executable_updates),
+    );
+    descriptor.insert("healthState".to_string(), json!("available"));
+    if let Some(value) = module.media_types_json.clone() {
+        descriptor.insert("mediaTypes".to_string(), value);
+    }
+    if let Some(value) = module.language_tags_json.clone() {
+        descriptor.insert("languageTags".to_string(), value);
+    }
+    if let Some(value) = module.source_domains_json.clone() {
+        descriptor.insert("sourceDomains".to_string(), value);
+    }
+    if let Some(version) = active_version.as_ref() {
+        descriptor.insert("activeVersion".to_string(), json!(version.version));
+        descriptor.insert("version".to_string(), json!(version.version));
+        if let Some(value) = version.artifact_url.as_deref() {
+            descriptor.insert("artifactUrl".to_string(), json!(value));
+        }
+    } else if let Some(value) = module.active_version.as_deref() {
+        descriptor.insert("activeVersion".to_string(), json!(value));
+        descriptor.insert("version".to_string(), json!(value));
+    }
+    if let Some(value) = module.rollback_version.as_deref() {
+        descriptor.insert("rollbackVersion".to_string(), json!(value));
+    }
+    if let Some(value) = module.pinned_version.as_deref() {
+        descriptor.insert("pinnedVersion".to_string(), json!(value));
+    }
+    if let Some(value) = module.last_error.as_deref() {
+        descriptor.insert("lastError".to_string(), json!(value));
+    }
+    if module.unsupported {
+        descriptor.insert(
+            "unsupportedReason".to_string(),
+            json!(
+                module
+                    .unsupported_reason
+                    .as_deref()
+                    .unwrap_or("unsupported by Elixir source registry")
+            ),
+        );
+    }
+    if let Some(value) = nuvio.and_then(|value| value.get("moduleId")).cloned() {
+        descriptor.insert("moduleId".to_string(), value);
+    }
+    if let Some(value) = nuvio.and_then(|value| value.get("hasSettings")).cloned() {
+        descriptor.insert("hasSettings".to_string(), value);
+    }
+    if let Some(value) = nuvio.and_then(|value| value.get("formats")).cloned() {
+        descriptor.insert("formats".to_string(), value);
+    }
+    if let Some(value) = active_version_metadata
+        .and_then(|metadata| metadata.get("nuvio"))
+        .and_then(|value| value.get("scriptPath"))
+        .cloned()
+        .or_else(|| {
+            active_version_metadata
+                .and_then(|metadata| metadata.get("artifact"))
+                .and_then(|value| value.get("containerPath"))
+                .cloned()
+        })
+    {
+        descriptor.insert("scriptPath".to_string(), value);
+    }
+    if let Some(value) = active_version_metadata
+        .and_then(|metadata| metadata.get("nuvio"))
+        .and_then(|value| value.get("artifactSha256"))
+        .cloned()
+        .or_else(|| {
+            active_version_metadata
+                .and_then(|metadata| metadata.get("artifact"))
+                .and_then(|value| value.get("sha256"))
+                .cloned()
+        })
+    {
+        descriptor.insert("artifactSha256".to_string(), value);
+    }
+    Ok(Value::Object(descriptor))
+}
+
+fn prism_source_module_invocation_key(value: &Value) -> String {
+    value
+        .get("id")
+        .or_else(|| value.get("moduleId"))
+        .or_else(|| value.get("sourceModuleId"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(cloudstream_stable_text_id)
+        .unwrap_or_else(|| "source".to_string())
+}
+
+fn nuvio_invocation_module_id(module: &ExtensionSourceModule) -> String {
+    module
+        .metadata_json
+        .as_ref()
+        .and_then(|metadata| metadata.get("nuvio"))
+        .and_then(|nuvio| nuvio.get("moduleId"))
+        .and_then(Value::as_str)
+        .map(cloudstream_stable_text_id)
+        .unwrap_or_else(|| {
+            module
+                .module_key
+                .rsplit(':')
+                .next()
+                .map(cloudstream_stable_text_id)
+                .unwrap_or_else(|| cloudstream_stable_text_id(&module.display_name))
+        })
+}
+
+async fn nuvio_active_source_module_version(
+    store: &ExtensionStore<'_>,
+    module: &ExtensionSourceModule,
+) -> anyhow::Result<Option<ExtensionSourceModuleVersion>> {
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    if let Some(active) = module.active_version.as_deref() {
+        if let Some(version) = versions.iter().find(|version| version.version == active) {
+            return Ok(Some(version.clone()));
+        }
+    }
+    Ok(versions
+        .iter()
+        .find(|version| version.install_state == "active")
+        .or_else(|| {
+            versions
+                .iter()
+                .find(|version| version.install_state == "installed")
+        })
+        .cloned())
+}
+
+fn prism_truncate_diagnostic(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
 async fn nuvio_add_custom_repo(
     store: &ExtensionStore<'_>,
     instance: &ExtensionInstance,
     params: &HashMap<String, serde_json::Value>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(Uuid, String)> {
     let url = cloudstream_param_string(params, "registryUrl")?;
     let display_name = params
         .get("displayName")
@@ -2878,9 +5316,12 @@ async fn nuvio_add_custom_repo(
         &snapshot,
     )
     .await?;
-    Ok(format!(
-        "Added Nuvio repository '{}': {} module(s), {} version(s), {} disabled.",
-        registry_key, summary.modules, summary.versions, summary.disabled_modules
+    Ok((
+        registry_id,
+        format!(
+            "Added Nuvio repository '{}': {} module(s), {} version(s), {} disabled.",
+            registry_key, summary.modules, summary.versions, summary.disabled_modules
+        ),
     ))
 }
 
@@ -2888,7 +5329,7 @@ async fn nuvio_refresh_registry(
     store: &ExtensionStore<'_>,
     instance: &ExtensionInstance,
     registry_id: Uuid,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(Uuid, String)> {
     let registry = nuvio_find_registry(store, instance.instance_id, registry_id).await?;
     let url = registry
         .url
@@ -2916,10 +5357,643 @@ async fn nuvio_refresh_registry(
         &snapshot,
     )
     .await?;
-    Ok(format!(
-        "Refreshed '{}': {} module(s), {} version(s), {} disabled.",
-        registry.display_name, summary.modules, summary.versions, summary.disabled_modules
+    Ok((
+        registry_id,
+        format!(
+            "Refreshed '{}': {} module(s), {} version(s), {} disabled.",
+            registry.display_name, summary.modules, summary.versions, summary.disabled_modules
+        ),
     ))
+}
+
+#[derive(Debug, Default, Clone)]
+struct PrismRepositoryCertificationSummary {
+    discovered: usize,
+    processed: usize,
+    certified: usize,
+    degraded: usize,
+    blocked: usize,
+    failed: usize,
+    skipped_language: usize,
+    skipped_trust: usize,
+    skipped_policy: usize,
+    skipped_account: usize,
+    skipped_unsupported: usize,
+    skipped_unavailable: usize,
+    capped: usize,
+}
+
+impl PrismRepositoryCertificationSummary {
+    fn message(&self, registry_name: &str) -> String {
+        format!(
+            "Prism repository '{}' certification queued: {} discovered, {} queued, {} already certified, {} degraded, {} blocked, {} failed, {} skipped language, {} skipped trust, {} skipped policy, {} skipped account-required, {} skipped unsupported, {} unavailable, {} capped.",
+            registry_name,
+            self.discovered,
+            self.processed,
+            self.certified,
+            self.degraded,
+            self.blocked,
+            self.failed,
+            self.skipped_language,
+            self.skipped_trust,
+            self.skipped_policy,
+            self.skipped_account,
+            self.skipped_unsupported,
+            self.skipped_unavailable,
+            self.capped,
+        )
+    }
+}
+
+async fn prism_enqueue_repository_certification_jobs(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    registry_id: Uuid,
+    requested_by: &str,
+    reason: &str,
+    manual: bool,
+) -> anyhow::Result<PrismRepositoryCertificationSummary> {
+    let registry = nuvio_find_registry(store, instance.instance_id, registry_id).await?;
+    if !registry.enabled {
+        if manual {
+            anyhow::bail!(
+                "Prism source repository '{}' is disabled",
+                registry.display_name
+            );
+        }
+        return Ok(PrismRepositoryCertificationSummary::default());
+    }
+    let policy = prism_marketplace_policy(instance);
+    let latest_certifications = store
+        .list_latest_source_module_certifications(instance.instance_id)
+        .await?
+        .into_iter()
+        .map(|certification| (certification.source_module_id, certification))
+        .collect::<BTreeMap<_, _>>();
+    let all_modules = store
+        .list_source_modules(Some(instance.instance_id), None)
+        .await?
+        .into_iter()
+        .filter(|module| {
+            module.registry_id == registry_id
+                && (module.ecosystem == "nuvio" || module.ecosystem == "stremio")
+        })
+        .collect::<Vec<_>>();
+    let mut summary = PrismRepositoryCertificationSummary {
+        discovered: all_modules.len(),
+        capped: all_modules
+            .len()
+            .saturating_sub(policy.max_auto_certify_modules_per_repo),
+        ..Default::default()
+    };
+    let modules = all_modules
+        .into_iter()
+        .take(policy.max_auto_certify_modules_per_repo)
+        .collect::<Vec<_>>();
+
+    let custom_untrusted = registry.trust_class == "custom"
+        && !registry.trusted_for_executable_updates
+        && registry.registry_type != "elixir_curated_nuvio_pack";
+    if custom_untrusted {
+        for module in modules {
+            let eligibility = prism_module_language_eligibility(&module, &policy);
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "skipped_trust",
+                "Repository must be trusted before Prism installs executable scraper code.",
+                Some(&eligibility),
+            )
+            .await?;
+            summary.skipped_trust += 1;
+        }
+        return Ok(summary);
+    }
+
+    if !manual {
+        let auto_allowed = if registry.trust_class == "custom" {
+            policy.auto_certify_custom_repositories == "after_trust"
+        } else {
+            policy.auto_certify_trusted_repositories
+        };
+        if !auto_allowed {
+            for module in modules {
+                let eligibility = prism_module_language_eligibility(&module, &policy);
+                prism_record_repository_certification_skip(
+                    store,
+                    instance,
+                    &registry,
+                    &module,
+                    requested_by,
+                    reason,
+                    "skipped_policy",
+                    "Repository auto-certification is disabled by Prism marketplace policy.",
+                    Some(&eligibility),
+                )
+                .await?;
+                summary.skipped_policy += 1;
+            }
+            return Ok(summary);
+        }
+    }
+
+    for module in modules {
+        if module.unsupported {
+            let eligibility = prism_module_language_eligibility(&module, &policy);
+            let skip_reason = module
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("unsupported by Prism");
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "unsupported",
+                skip_reason,
+                Some(&eligibility),
+            )
+            .await?;
+            store
+                .set_source_module_enabled_state(
+                    module.source_module_id,
+                    false,
+                    "unsupported",
+                    Some(skip_reason),
+                )
+                .await?;
+            summary.skipped_unsupported += 1;
+            continue;
+        }
+        if module.account_required {
+            let eligibility = prism_module_language_eligibility(&module, &policy);
+            let reason = "Scraper requires an account before Prism can certify it.";
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "account_required",
+                reason,
+                Some(&eligibility),
+            )
+            .await?;
+            store
+                .set_source_module_enabled_state(
+                    module.source_module_id,
+                    false,
+                    "account_required",
+                    Some(reason),
+                )
+                .await?;
+            summary.skipped_account += 1;
+            continue;
+        }
+
+        let eligibility = prism_module_language_eligibility(&module, &policy);
+        if !eligibility.certifiable {
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                &eligibility.state,
+                &eligibility.summary,
+                Some(&eligibility),
+            )
+            .await?;
+            summary.skipped_language += 1;
+            continue;
+        }
+
+        if let Err(err) =
+            nuvio_validate_module_activation(store, instance.instance_id, &module).await
+        {
+            let message = err.to_string();
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "skipped_policy",
+                &message,
+                Some(&eligibility),
+            )
+            .await?;
+            summary.skipped_policy += 1;
+            continue;
+        }
+
+        let versions = store
+            .list_source_module_versions(module.source_module_id)
+            .await?;
+        let Some(version) = cloudstream_preferred_module_version(&module, &versions, None) else {
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "unavailable",
+                "Scraper has no available version to install.",
+                Some(&eligibility),
+            )
+            .await?;
+            summary.skipped_unavailable += 1;
+            continue;
+        };
+        if !versions
+            .iter()
+            .any(|candidate| candidate.version == version)
+        {
+            prism_record_repository_certification_skip(
+                store,
+                instance,
+                &registry,
+                &module,
+                requested_by,
+                reason,
+                "unavailable",
+                "Selected scraper version was not present in the repository snapshot.",
+                Some(&eligibility),
+            )
+            .await?;
+            summary.skipped_unavailable += 1;
+            continue;
+        }
+        if !manual
+            && latest_certifications
+                .get(&module.source_module_id)
+                .is_some_and(|certification| {
+                    certification.runtime_version.as_deref() == Some(version.as_str())
+                        && certification
+                            .expires_at
+                            .is_none_or(|expires_at| expires_at > Utc::now())
+                        && prism_certification_is_eligible(&certification.status)
+                })
+        {
+            summary.certified += 1;
+            continue;
+        }
+
+        let job_id = Uuid::new_v4();
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id,
+                instance_id: instance.instance_id,
+                registry_id: Some(registry.registry_id),
+                source_module_id: Some(module.source_module_id),
+                requested_by: requested_by.to_string(),
+                reason: reason.to_string(),
+                status: "queued".to_string(),
+                priority: 100,
+                attempts: 0,
+                max_attempts: 2,
+                language_eligibility: Some(prism_language_eligibility_json(&eligibility)),
+                marketplace_state: Some("certifying".to_string()),
+                summary: Some(format!("Queued certification for version {version}.")),
+                last_error: None,
+            })
+            .await?;
+        summary.processed += 1;
+    }
+
+    Ok(summary)
+}
+
+fn prism_spawn_certification_worker(
+    state: AppState,
+    context: ExtensionControlContext,
+    instance_id: Uuid,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = prism_run_certification_worker(state, context, instance_id).await {
+            tracing::warn!(
+                instance_id = %instance_id,
+                error = %err,
+                "Prism certification worker stopped with error"
+            );
+        }
+    });
+}
+
+pub(super) async fn resume_prism_certification_jobs(state: AppState) -> anyhow::Result<()> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let context = super::load_extension_control_context(&state, &store, PRISM_EXTENSION_ID).await?;
+    let Some(instance) = context.selected_instance.as_ref() else {
+        return Ok(());
+    };
+    let instance_id = instance.instance_id;
+    let requeued = store
+        .requeue_running_source_certification_jobs(
+            instance_id,
+            "server restarted before Prism certification finished",
+        )
+        .await?;
+    if requeued > 0 {
+        tracing::info!(
+            instance_id = %instance_id,
+            jobs = requeued,
+            "requeued interrupted Prism certification jobs"
+        );
+    }
+    prism_spawn_certification_worker(state, context, instance_id);
+    Ok(())
+}
+
+async fn prism_run_certification_worker(
+    state: AppState,
+    context: ExtensionControlContext,
+    instance_id: Uuid,
+) -> anyhow::Result<()> {
+    let store = ExtensionStore::new(&state.db_pool);
+    loop {
+        let Some(job) = store
+            .claim_next_source_certification_job(instance_id)
+            .await?
+        else {
+            break;
+        };
+        if let Err(err) =
+            prism_process_certification_job(&state, &store, &context, job.clone()).await
+        {
+            let message = prism_truncate_diagnostic(&err.to_string(), 700);
+            store
+                .finish_source_certification_job(
+                    job.job_id,
+                    "failed",
+                    Some("broken"),
+                    Some(&message),
+                    Some(&message),
+                )
+                .await?;
+            tracing::warn!(
+                job_id = %job.job_id,
+                source_module_id = ?job.source_module_id,
+                error = %err,
+                "Prism certification job failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn prism_process_certification_job(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    job: ExtensionSourceCertificationJob,
+) -> anyhow::Result<()> {
+    let instance = prism_find_instance(store, job.instance_id).await?;
+    let Some(source_module_id) = job.source_module_id else {
+        anyhow::bail!("Prism certification job has no source module id");
+    };
+    let module = nuvio_find_module(store, job.instance_id, source_module_id).await?;
+    if module.unsupported {
+        let reason = module
+            .unsupported_reason
+            .as_deref()
+            .unwrap_or("unsupported by Prism");
+        store
+            .set_source_module_enabled_state(
+                module.source_module_id,
+                false,
+                "unsupported",
+                Some(reason),
+            )
+            .await?;
+        store
+            .finish_source_certification_job(
+                job.job_id,
+                "skipped",
+                Some("unsupported"),
+                Some(reason),
+                None,
+            )
+            .await?;
+        return Ok(());
+    }
+    if module.account_required {
+        let reason = "Scraper requires an account before Prism can certify it.";
+        store
+            .set_source_module_enabled_state(
+                module.source_module_id,
+                false,
+                "account_required",
+                Some(reason),
+            )
+            .await?;
+        store
+            .finish_source_certification_job(
+                job.job_id,
+                "skipped",
+                Some("account_required"),
+                Some(reason),
+                None,
+            )
+            .await?;
+        return Ok(());
+    }
+    nuvio_validate_module_activation(store, job.instance_id, &module).await?;
+    let policy = prism_marketplace_policy(&instance);
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    let version = cloudstream_preferred_module_version(&module, &versions, None)
+        .ok_or_else(|| anyhow::anyhow!("'{}' has no available version", module.display_name))?;
+    let version_record = versions
+        .iter()
+        .find(|candidate| candidate.version == version)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "version '{}' is not available for '{}'",
+                version,
+                module.display_name
+            )
+        })?;
+
+    if let Err(err) = install_source_module_artifact(
+        store,
+        &state.settings.extensions.storage_root,
+        &module,
+        version_record,
+    )
+    .await
+    {
+        let message = prism_truncate_diagnostic(&err.to_string(), 700);
+        if !policy.retain_failed_artifacts {
+            let _ = remove_source_module_artifacts(store, &module, &message).await;
+        } else {
+            store
+                .set_source_module_installed_state(
+                    module.source_module_id,
+                    false,
+                    None,
+                    "broken",
+                    Some(&message),
+                )
+                .await?;
+        }
+        store
+            .finish_source_certification_job(
+                job.job_id,
+                "failed",
+                Some("broken"),
+                Some(&message),
+                Some(&message),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    store
+        .set_source_module_active_version(
+            module.source_module_id,
+            Some(&version),
+            module.active_version.as_deref(),
+        )
+        .await?;
+    let versions = store
+        .list_source_module_versions(module.source_module_id)
+        .await?;
+    cloudstream_mark_active_version(store, &versions, &version).await?;
+    let module = nuvio_find_module(store, job.instance_id, module.source_module_id).await?;
+    let outcome = match smoke_prism_source_module_runtime(store, context, &instance, &module).await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => PrismRuntimeSmokeOutcome::new(
+            "broken",
+            "error",
+            prism_truncate_diagnostic(&err.to_string(), 700),
+            0,
+            Vec::new(),
+        )
+        .with_failure_class("runtime_error"),
+    };
+    if store
+        .get_source_certification_job(job.job_id)
+        .await?
+        .is_some_and(|current| current.status == "cancelled")
+    {
+        if !policy.retain_failed_artifacts {
+            let _ = remove_source_module_artifacts(store, &module, "certification cancelled").await;
+        }
+        return Ok(());
+    }
+    let marketplace_state = prism_marketplace_state_from_certification_status(&outcome.status);
+    if prism_certification_is_eligible(&outcome.status) {
+        store
+            .set_source_module_enabled_state(
+                module.source_module_id,
+                module.enabled,
+                &outcome.health_state,
+                outcome.failure_class.as_deref(),
+            )
+            .await?;
+        store
+            .finish_source_certification_job(
+                job.job_id,
+                if outcome.status == "degraded" {
+                    "degraded"
+                } else {
+                    "succeeded"
+                },
+                Some(marketplace_state),
+                Some(&outcome.reason),
+                None,
+            )
+            .await?;
+    } else {
+        if !policy.retain_failed_artifacts {
+            let _ = remove_source_module_artifacts(store, &module, &outcome.reason).await;
+        }
+        store
+            .set_source_module_enabled_state(
+                module.source_module_id,
+                false,
+                &outcome.health_state,
+                Some(&outcome.reason),
+            )
+            .await?;
+        store
+            .finish_source_certification_job(
+                job.job_id,
+                "blocked",
+                Some(marketplace_state),
+                Some(&outcome.reason),
+                Some(&outcome.reason),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn prism_find_instance(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<ExtensionInstance> {
+    store
+        .list_instances(None)
+        .await?
+        .into_iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .ok_or_else(|| anyhow::anyhow!("Prism instance '{instance_id}' was not found"))
+}
+
+async fn prism_record_repository_certification_skip(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    registry: &ExtensionSourceRegistry,
+    module: &ExtensionSourceModule,
+    requested_by: &str,
+    reason: &str,
+    marketplace_state: &str,
+    summary: &str,
+    eligibility: Option<&PrismLanguageEligibility>,
+) -> anyhow::Result<()> {
+    store
+        .create_source_certification_job(&NewExtensionSourceCertificationJob {
+            job_id: Uuid::new_v4(),
+            instance_id: instance.instance_id,
+            registry_id: Some(registry.registry_id),
+            source_module_id: Some(module.source_module_id),
+            requested_by: requested_by.to_string(),
+            reason: reason.to_string(),
+            status: "skipped".to_string(),
+            priority: 200,
+            attempts: 0,
+            max_attempts: 1,
+            language_eligibility: eligibility.map(prism_language_eligibility_json),
+            marketplace_state: Some(marketplace_state.to_string()),
+            summary: Some(summary.to_string()),
+            last_error: None,
+        })
+        .await
+}
+
+fn prism_marketplace_state_from_certification_status(status: &str) -> &'static str {
+    match status {
+        "certified" => "certified",
+        "degraded" | "probation" => "degraded",
+        "unsupported" => "unsupported",
+        "account_required" => "account_required",
+        "network_blocked" => "network_blocked",
+        "broken" => "broken",
+        _ => "unknown",
+    }
 }
 
 async fn nuvio_validate_module_activation(
@@ -2950,9 +6024,7 @@ async fn nuvio_validate_module_activation(
             registry.display_name
         );
     }
-    if registry.registry_type != "elixir_curated_nuvio_pack"
-        && !registry.trusted_for_executable_updates
-    {
+    if registry.trust_class == "custom" && !registry.trusted_for_executable_updates {
         anyhow::bail!(
             "source registry '{}' must be explicitly trusted before installing executable modules",
             registry.display_name
@@ -6463,6 +9535,14 @@ fn log_nzbget_control_availability(message: &str, err: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::DatabaseConfig,
+        db::{Database, models::ExtensionKind},
+        extensions::store::{
+            NewExtension, NewExtensionInstance, NewExtensionSourceModule,
+            NewExtensionSourceModuleVersion, NewExtensionSourceRegistry,
+        },
+    };
     use chrono::Utc;
 
     fn arr_context(status_code: &str) -> ExtensionControlContext {
@@ -6580,6 +9660,400 @@ mod tests {
             }),
             control_binding: ExtensionControlBinding::Sonarr,
         }
+    }
+
+    fn prism_language_test_module(language_tags_json: Option<Value>) -> ExtensionSourceModule {
+        ExtensionSourceModule {
+            source_module_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            registry_id: Uuid::new_v4(),
+            module_key: "nuvio:test".to_string(),
+            display_name: "Test Scraper".to_string(),
+            ecosystem: "nuvio".to_string(),
+            plugin_package: Some("test".to_string()),
+            active_version: Some("1.0.0".to_string()),
+            rollback_version: None,
+            media_types_json: Some(json!(["movie"])),
+            language_tags_json,
+            region_tags_json: None,
+            source_domains_json: None,
+            account_required: false,
+            unsupported: false,
+            unsupported_reason: None,
+            enabled: false,
+            installed: false,
+            pinned_version: None,
+            health_state: "available".to_string(),
+            replacement_recommendation_key: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_error: None,
+            metadata_json: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    async fn insert_prism_test_module(
+        store: &ExtensionStore<'_>,
+        instance_id: Uuid,
+        registry_id: Uuid,
+        module_key: &str,
+        display_name: &str,
+        language_tags_json: Option<Value>,
+    ) -> anyhow::Result<Uuid> {
+        let source_module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key: module_key.to_string(),
+                display_name: display_name.to_string(),
+                ecosystem: "nuvio".to_string(),
+                plugin_package: Some(module_key.replace(':', "_")),
+                active_version: None,
+                rollback_version: None,
+                media_types_json: Some(json!(["movie"])),
+                language_tags_json,
+                region_tags_json: None,
+                source_domains_json: Some(json!(["example.test"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: false,
+                installed: false,
+                pinned_version: None,
+                health_state: "available".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: Some(json!({"nuvio": {"moduleId": module_key}})),
+            })
+            .await?;
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: Uuid::new_v4(),
+                source_module_id,
+                version: "1.0.0".to_string(),
+                artifact_url: Some(format!("https://example.test/{module_key}.js")),
+                artifact_sha256: Some("fixture-sha256".to_string()),
+                signature: None,
+                install_state: "available".to_string(),
+                smoke_status: "unknown".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: None,
+                activated_at: None,
+                metadata_json: Some(
+                    json!({"nuvio": {"scriptPath": format!("/app/source-modules/{module_key}.js")}}),
+                ),
+            })
+            .await?;
+        Ok(source_module_id)
+    }
+
+    #[test]
+    fn prism_language_eligibility_prefers_english_japanese_and_allows_unknown_by_default() {
+        let instance = crate::db::models::ExtensionInstance {
+            instance_id: Uuid::new_v4(),
+            extension_id: "elixir.sources.prism".to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            runtime_version: None,
+            rollback_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            enabled: true,
+        };
+        let policy = prism_marketplace_policy(&instance);
+        assert_eq!(policy.preferred_language_tags, vec!["en", "ja"]);
+
+        let english = prism_language_test_module(Some(json!(["English"])));
+        let eligibility = prism_module_language_eligibility(&english, &policy);
+        assert!(eligibility.certifiable);
+        assert_eq!(eligibility.normalized_tags, vec!["en"]);
+
+        let japanese = prism_language_test_module(Some(json!(["jpn"])));
+        let eligibility = prism_module_language_eligibility(&japanese, &policy);
+        assert!(eligibility.certifiable);
+        assert_eq!(eligibility.normalized_tags, vec!["ja"]);
+
+        let hindi = prism_language_test_module(Some(json!(["Hindi"])));
+        let eligibility = prism_module_language_eligibility(&hindi, &policy);
+        assert!(!eligibility.certifiable);
+        assert_eq!(eligibility.state, "skipped_language");
+
+        let unknown = prism_language_test_module(None);
+        let eligibility = prism_module_language_eligibility(&unknown, &policy);
+        assert!(eligibility.certifiable);
+        assert_eq!(eligibility.state, "unknown_language");
+    }
+
+    #[test]
+    fn prism_installed_disabled_module_can_be_enabled_or_uninstalled() {
+        let mut module = prism_language_test_module(Some(json!(["English"])));
+        module.installed = true;
+        module.enabled = false;
+        module.active_version = Some("1.0.0".to_string());
+        let registry = ExtensionSourceRegistry {
+            registry_id: module.registry_id,
+            instance_id: module.instance_id,
+            registry_key: "prism.fixture".to_string(),
+            registry_type: "nuvio_manifest_json".to_string(),
+            trust_class: "maintainer_known".to_string(),
+            display_name: "Prism Fixture".to_string(),
+            url: Some("https://example.test/manifest.json".to_string()),
+            enabled: true,
+            auto_refresh: true,
+            trusted_for_executable_updates: true,
+            etag: None,
+            last_modified: None,
+            last_fetch_status: "success".to_string(),
+            last_fetch_error: None,
+            last_fetched_at: Some(Utc::now()),
+            metadata_json: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let actions = nuvio_module_actions(&module, Some(&registry));
+        assert!(
+            actions
+                .iter()
+                .any(|action| { action.id == "enable_source_module" && action.label == "Enable" })
+        );
+        assert!(
+            actions.iter().any(|action| {
+                action.id == "disable_source_module" && action.label == "Uninstall"
+            })
+        );
+    }
+
+    #[test]
+    fn prism_duplicate_repo_modules_are_coalesced_in_installed_section() {
+        let instance_id = Uuid::new_v4();
+        let curated_registry_id = Uuid::new_v4();
+        let phisher_registry_id = Uuid::new_v4();
+        let mut curated = prism_language_test_module(Some(json!(["English"])));
+        curated.instance_id = instance_id;
+        curated.registry_id = curated_registry_id;
+        curated.module_key = "nuvio:prism-recommended:allwish".to_string();
+        curated.display_name = "AllWish".to_string();
+        curated.plugin_package = Some("allwish".to_string());
+        curated.enabled = true;
+        curated.installed = true;
+        curated.active_version = Some("1.0.0".to_string());
+        curated.health_state = "degraded".to_string();
+
+        let mut phisher = curated.clone();
+        phisher.source_module_id = Uuid::new_v4();
+        phisher.registry_id = phisher_registry_id;
+        phisher.module_key = "nuvio:prism-repo-phisher-nuvio:allwish".to_string();
+        phisher.enabled = false;
+        phisher.installed = true;
+
+        let curated_registry = ExtensionSourceRegistry {
+            registry_id: curated_registry_id,
+            instance_id,
+            registry_key: PRISM_RECOMMENDED_REGISTRY_KEY.to_string(),
+            registry_type: "elixir_curated_nuvio_pack".to_string(),
+            trust_class: "curated".to_string(),
+            display_name: "Prism Recommended Sources".to_string(),
+            url: None,
+            enabled: true,
+            auto_refresh: true,
+            trusted_for_executable_updates: true,
+            etag: None,
+            last_modified: None,
+            last_fetch_status: "success".to_string(),
+            last_fetch_error: None,
+            last_fetched_at: Some(Utc::now()),
+            metadata_json: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let phisher_registry = ExtensionSourceRegistry {
+            registry_id: phisher_registry_id,
+            instance_id,
+            registry_key: "prism.repo.phisher.nuvio".to_string(),
+            registry_type: "nuvio_manifest_json".to_string(),
+            trust_class: "maintainer_known".to_string(),
+            display_name: "Phisher Nuvio Providers".to_string(),
+            url: Some("https://example.test/manifest.json".to_string()),
+            enabled: true,
+            auto_refresh: true,
+            trusted_for_executable_updates: false,
+            etag: None,
+            last_modified: None,
+            last_fetch_status: "success".to_string(),
+            last_fetch_error: None,
+            last_fetched_at: Some(Utc::now()),
+            metadata_json: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let modules = vec![curated, phisher];
+        let mut registry_by_id = BTreeMap::new();
+        registry_by_id.insert(curated_registry_id, &curated_registry);
+        registry_by_id.insert(phisher_registry_id, &phisher_registry);
+        let certification_by_module = BTreeMap::new();
+        let job_by_module = BTreeMap::new();
+
+        let installed = build_nuvio_installed_sources_section(
+            &modules,
+            &registry_by_id,
+            &certification_by_module,
+            &job_by_module,
+        );
+        assert_eq!(installed.entities.len(), 1);
+        let entity = &installed.entities[0];
+        assert_eq!(entity.title, "AllWish");
+        assert!(
+            entity
+                .subtitle
+                .as_deref()
+                .is_some_and(|subtitle| subtitle.contains("2 repos"))
+        );
+        assert!(
+            entity
+                .details
+                .iter()
+                .any(|detail| detail == "Repository variants: 2")
+        );
+        assert!(
+            entity
+                .details
+                .iter()
+                .any(|detail| detail.contains("Prism Recommended Sources"))
+        );
+        assert!(
+            entity
+                .details
+                .iter()
+                .any(|detail| detail.contains("Phisher Nuvio Providers"))
+        );
+        assert!(
+            entity
+                .actions
+                .iter()
+                .any(|action| action.label.contains("Prism Recommended Sources"))
+        );
+        assert!(
+            entity
+                .actions
+                .iter()
+                .any(|action| action.label.contains("Phisher Nuvio Providers"))
+        );
+
+        let available = build_nuvio_available_sources_section(
+            &modules,
+            &registry_by_id,
+            &certification_by_module,
+            &job_by_module,
+        );
+        assert!(available.entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prism_repository_certification_enqueue_skips_nonpreferred_languages()
+    -> anyhow::Result<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: PRISM_EXTENSION_ID.to_string(),
+                name: "Prism".to_string(),
+                version: "0.1.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Elixir".to_string()),
+                signing_key_id: None,
+                trust_level: crate::db::models::ExtensionTrustLevel::Community,
+                manifest_json: json!({"id": PRISM_EXTENSION_ID}),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: PRISM_EXTENSION_ID.to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let registry_id = Uuid::new_v4();
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "prism.fixture".to_string(),
+                registry_type: "nuvio_manifest_json".to_string(),
+                trust_class: "maintainer_known".to_string(),
+                display_name: "Prism Fixture".to_string(),
+                url: Some("https://example.test/manifest.json".to_string()),
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await?;
+        insert_prism_test_module(
+            &store,
+            instance_id,
+            registry_id,
+            "nuvio:test:english",
+            "English Fixture",
+            Some(json!(["English"])),
+        )
+        .await?;
+        insert_prism_test_module(
+            &store,
+            instance_id,
+            registry_id,
+            "nuvio:test:hindi",
+            "Hindi Fixture",
+            Some(json!(["Hindi"])),
+        )
+        .await?;
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("Prism test instance");
+        let summary = prism_enqueue_repository_certification_jobs(
+            &store,
+            &instance,
+            registry_id,
+            "test",
+            "repository_added",
+            false,
+        )
+        .await?;
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.skipped_language, 1);
+
+        let jobs = store
+            .list_source_certification_jobs_for_registry(registry_id, 10)
+            .await?;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| {
+            job.status == "queued" && job.marketplace_state.as_deref() == Some("certifying")
+        }));
+        assert!(jobs.iter().any(|job| {
+            job.status == "skipped" && job.marketplace_state.as_deref() == Some("skipped_language")
+        }));
+        Ok(())
     }
 
     #[test]
@@ -6716,6 +10190,167 @@ mod tests {
             as_map.get("DestDir").map(String::as_str),
             Some("/downloads")
         );
+    }
+
+    #[tokio::test]
+    async fn prism_runtime_smoke_classifies_moviesdrive_fetch_failure_as_broken() {
+        let warnings = vec![
+            "prism:MoviesDrive: runtime_error: [Moviesdrive] Scraping error: fetch failed"
+                .to_string(),
+        ];
+        let outcome = certify_prism_runtime_smoke("moviesdrive", &json!({}), &[], &warnings).await;
+
+        assert_eq!(outcome.status, "broken");
+        assert_eq!(outcome.health_state, "broken");
+        assert_eq!(outcome.severity, "error");
+        assert!(outcome.reason.contains("fetch failed"));
+        assert_eq!(outcome.candidate_count, 0);
+    }
+
+    #[test]
+    fn prism_runtime_smoke_marks_preflighted_stream_candidates_certified() {
+        let candidates = vec![json!({
+            "sourceModule": {
+                "id": "MoviesDrive"
+            },
+            "delivery": {
+                "streamType": "direct_file",
+                "url": "https://cdn.example.test/movie.mp4"
+            }
+        })];
+        let outcome = classify_prism_preflight_reports(
+            &json!({ "mediaType": "movie" }),
+            &candidates,
+            vec![StreamCandidatePreflightReport::passed("direct file passed")],
+            Vec::new(),
+        );
+
+        assert_eq!(outcome.status, "certified");
+        assert_eq!(outcome.health_state, "healthy");
+        assert_eq!(outcome.severity, "info");
+        assert_eq!(outcome.candidate_count, 1);
+        assert_eq!(outcome.materializable_count, 1);
+    }
+
+    #[tokio::test]
+    async fn prism_runtime_smoke_without_candidates_is_broken_no_results() {
+        let outcome =
+            certify_prism_runtime_smoke("moviesdrive", &json!({ "mediaType": "movie" }), &[], &[])
+                .await;
+
+        assert_eq!(outcome.status, "broken");
+        assert_eq!(outcome.failure_class.as_deref(), Some("no_results"));
+        assert_eq!(outcome.severity, "error");
+        assert_eq!(outcome.candidate_count, 0);
+    }
+
+    #[test]
+    fn prism_runtime_smoke_requests_cover_declared_media_types() {
+        let module = prism_test_source_module(json!(["movie", "tv"]));
+        let requests = prism_runtime_smoke_requests(&module);
+        let media_types = requests
+            .iter()
+            .map(prism_smoke_request_media_type)
+            .collect::<Vec<_>>();
+
+        assert_eq!(media_types, vec!["movie", "tv"]);
+        assert_eq!(
+            prism_smoke_request_media_type(&prism_runtime_smoke_request(&module)),
+            "movie"
+        );
+    }
+
+    #[test]
+    fn prism_runtime_smoke_aggregates_mixed_media_results_as_degraded() {
+        let requests = vec![
+            prism_runtime_smoke_request_for_media_type("movie"),
+            prism_runtime_smoke_request_for_media_type("tv"),
+        ];
+        let movie = PrismRuntimeSmokeOutcome::new(
+            "certified",
+            "info",
+            "movie candidate passed",
+            1,
+            Vec::new(),
+        )
+        .with_preflight(
+            1,
+            json!({
+                "movie": {
+                    "status": "certified",
+                    "candidateCount": 1,
+                    "materializableCount": 1,
+                    "summary": "movie candidate passed"
+                }
+            }),
+            json!({ "inspected": [] }),
+            json!([]),
+        );
+        let tv = PrismRuntimeSmokeOutcome::new(
+            "broken",
+            "error",
+            "runtime probe completed without stream candidates for the canary title",
+            0,
+            Vec::new(),
+        )
+        .with_failure_class("no_results")
+        .with_preflight(
+            0,
+            json!({
+                "tv": {
+                    "status": "broken",
+                    "failureClass": "no_results",
+                    "candidateCount": 0,
+                    "materializableCount": 0,
+                    "summary": "runtime probe completed without stream candidates for the canary title"
+                }
+            }),
+            json!({ "inspected": [] }),
+            json!([]),
+        );
+
+        let outcome = aggregate_prism_runtime_smoke_outcomes(&requests, vec![movie, tv]);
+
+        assert_eq!(outcome.status, "degraded");
+        assert_eq!(outcome.health_state, "degraded");
+        assert_eq!(outcome.failure_class.as_deref(), Some("no_results"));
+        assert_eq!(outcome.candidate_count, 1);
+        assert_eq!(outcome.materializable_count, 1);
+        assert!(outcome.media_type_results.get("movie").is_some());
+        assert!(outcome.media_type_results.get("tv").is_some());
+    }
+
+    fn prism_test_source_module(media_types_json: Value) -> ExtensionSourceModule {
+        let now = Utc::now();
+        ExtensionSourceModule {
+            source_module_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            registry_id: Uuid::new_v4(),
+            module_key: "test.module".to_string(),
+            display_name: "Test Module".to_string(),
+            ecosystem: "nuvio".to_string(),
+            plugin_package: Some("test".to_string()),
+            active_version: Some("1.0.0".to_string()),
+            rollback_version: None,
+            media_types_json: Some(media_types_json),
+            language_tags_json: None,
+            region_tags_json: None,
+            source_domains_json: None,
+            account_required: false,
+            unsupported: false,
+            unsupported_reason: None,
+            enabled: false,
+            installed: false,
+            pinned_version: None,
+            health_state: "available".to_string(),
+            replacement_recommendation_key: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_error: None,
+            metadata_json: None,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[test]

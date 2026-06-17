@@ -6,7 +6,9 @@ pub mod language_policy;
 pub mod release_resolution;
 pub mod route_attempts;
 pub mod scoped_add;
+pub mod stream_egress;
 pub mod stream_materializer;
+pub mod stream_preflight;
 pub mod subscriptions;
 
 use std::collections::{BTreeMap, HashMap};
