@@ -1341,7 +1341,7 @@ fn plan_existing_module_instance(
     })
 }
 
-pub(crate) fn stable_provider_id(instance_id: Uuid, capability: &str, slot: &str) -> Uuid {
+pub fn stable_provider_id(instance_id: Uuid, capability: &str, slot: &str) -> Uuid {
     let key = provider_identity_key(instance_id, capability, slot);
     Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes())
 }
@@ -1350,7 +1350,7 @@ fn provider_identity_key(instance_id: Uuid, capability: &str, slot: &str) -> Str
     format!("{instance_id}:{capability}:{slot}")
 }
 
-pub(crate) fn build_provider_endpoint(
+pub fn build_provider_endpoint(
     provide: &crate::extensions::manifest::ManifestProvide,
     networking: &Option<ManifestNetworking>,
     host: &str,

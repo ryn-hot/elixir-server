@@ -8,6 +8,7 @@ anyhow = "1.0"
 axum = { version = "0.7", features = ["macros", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 config = "0.14"
+dashmap = "6.1"
 dotenvy = "0.15"
 globwalk = "0.9"
 jsonwebtoken = "9.3"

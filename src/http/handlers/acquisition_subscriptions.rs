@@ -1031,7 +1031,10 @@ async fn set_target_state_after_submission(
 }
 
 fn should_record_target_blocker(err: &ApiError) -> bool {
-    matches!(err, ApiError::Conflict(_) | ApiError::NotFound(_))
+    matches!(
+        err,
+        ApiError::Conflict(_) | ApiError::ConflictWithDetails { .. } | ApiError::NotFound(_)
+    )
 }
 
 fn api_error_message(err: &ApiError) -> &str {
@@ -1041,6 +1044,8 @@ fn api_error_message(err: &ApiError) -> &str {
         | ApiError::Forbidden(message)
         | ApiError::NotFound(message)
         | ApiError::Conflict(message)
+        | ApiError::ConflictWithDetails { message, .. }
+        | ApiError::Structured { message, .. }
         | ApiError::Internal(message) => message,
     }
 }

@@ -128,7 +128,7 @@ struct InstallResult {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct InstallPolicy {
+pub struct InstallPolicy {
     pub allow_internal_directory_install: bool,
     pub allow_internal_unsigned: bool,
     pub allow_downgrade: bool,
@@ -1480,7 +1480,7 @@ async fn install_extension_internal(
     install_extension_internal_with_policy(state, payload, InstallPolicy::default()).await
 }
 
-pub(crate) async fn install_internal_extension_from_dir(
+pub async fn install_internal_extension_from_dir(
     state: &AppState,
     package_dir: &std::path::Path,
     policy: InstallPolicy,

@@ -533,6 +533,8 @@ fn api_error_message(error: &ApiError) -> String {
         | ApiError::Forbidden(message)
         | ApiError::NotFound(message)
         | ApiError::Conflict(message)
+        | ApiError::ConflictWithDetails { message, .. }
+        | ApiError::Structured { message, .. }
         | ApiError::Internal(message) => message.clone(),
     }
 }

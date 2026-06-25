@@ -1,75 +1,56 @@
-mod acquisition;
-mod artwork;
-mod auth;
-mod config;
-mod db;
-mod debrid;
-mod download_broker;
-mod drivers;
-mod extensions;
-mod http;
-mod library;
-mod media;
-mod metadata;
-mod metrics;
-mod network;
-mod orchestrator;
-mod playback;
-mod runtime;
-mod secrets;
-mod state;
-mod telemetry;
-
-use crate::artwork::ArtworkService;
-use crate::auth::AuthService;
-use crate::config::Settings;
-use crate::db::Database;
-use crate::db::models::{ExtensionInstance, ExtensionKind, SlotCardinality};
-use crate::extensions::ExtensionManager;
-use crate::extensions::auto_managed::{
+use anyhow::Context;
+use elixir_server::acquisition;
+use elixir_server::artwork::ArtworkService;
+use elixir_server::auth::AuthService;
+use elixir_server::config::Settings;
+use elixir_server::db::Database;
+use elixir_server::db::models::{ExtensionInstance, ExtensionKind, SlotCardinality};
+use elixir_server::debrid;
+use elixir_server::extensions::ExtensionManager;
+use elixir_server::extensions::auto_managed::{
     filter_auto_managed_runtime_missing, is_nzbget_extension_id, is_qbittorrent_extension_id,
 };
-use crate::extensions::cloudstream_registry::{
+use elixir_server::extensions::cloudstream_registry::{
     CLOUDSTREAM_COMPAT_EXTENSION_ID, CloudStreamRecommendedPackMigrationSummary,
     migrate_cloudstream_recommended_source_pack_for_installed_instances,
     seed_cloudstream_recommended_source_pack_for_instance,
 };
-use crate::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
-use crate::extensions::nuvio_registry::{
+use elixir_server::extensions::manifest::{ExtensionManifest, repair_builtin_manifest_json};
+use elixir_server::extensions::nuvio_registry::{
     PRISM_EXTENSION_ID, PrismRecommendedPackMigrationSummary,
     migrate_prism_recommended_source_pack_for_installed_instances,
     seed_prism_recommended_source_pack_for_instance,
 };
-use crate::extensions::package::{
+use elixir_server::extensions::package::{
     compute_sha256, read_manifest_from_dir, unpack_package, write_manifest_to_dir,
 };
-use crate::extensions::registry::start_registry_refresh_loop;
-use crate::extensions::required_secrets::{
+use elixir_server::extensions::registry::start_registry_refresh_loop;
+use elixir_server::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_manifest,
 };
-use crate::extensions::store::{
+use elixir_server::extensions::store::{
     ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
 };
-use crate::extensions::updater::start_proxy_runtime_update_loop;
-use crate::http::handlers::extensions::{
+use elixir_server::extensions::updater::start_proxy_runtime_update_loop;
+use elixir_server::http::handlers::extensions::{
     InstallPolicy, install_internal_extension_from_dir, resume_prism_certification_jobs,
 };
-use crate::http::router;
-use crate::library::LinkerService;
-use crate::library::start_periodic_scan;
-use crate::metadata::MetadataService;
-use crate::network::{start_mdns, wan::start_wan_tasks};
-use crate::orchestrator::executor::ExecutorAction;
-use crate::orchestrator::naming::build_aliases;
-use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
-use crate::orchestrator::reconcile::ReconcileConfig;
-use crate::playback::start_session_cleanup;
-use crate::runtime::health::{
+use elixir_server::http::router;
+use elixir_server::library::LinkerService;
+use elixir_server::library::start_periodic_scan;
+use elixir_server::metadata::MetadataService;
+use elixir_server::network::{start_mdns, wan::start_wan_tasks};
+use elixir_server::orchestrator::executor::ExecutorAction;
+use elixir_server::orchestrator::naming::build_aliases;
+use elixir_server::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
+use elixir_server::orchestrator::reconcile::ReconcileConfig;
+use elixir_server::playback::start_session_cleanup;
+use elixir_server::runtime::health::{
     DockerRuntimeHealthSnapshot, DockerRuntimeHealthState, runtime_health_poll_interval,
 };
-use crate::secrets::SecretsManager;
-use crate::state::AppState;
-use anyhow::Context;
+use elixir_server::secrets::SecretsManager;
+use elixir_server::state::AppState;
+use elixir_server::{metrics, telemetry};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -606,7 +587,8 @@ async fn ensure_core_extension_instances(state: &AppState) -> anyhow::Result<u32
         let Some(extension) = store.get_extension(extension_id).await? else {
             continue;
         };
-        if !extension.enabled || extension.kind != crate::db::models::ExtensionKind::Module {
+        if !extension.enabled || extension.kind != elixir_server::db::models::ExtensionKind::Module
+        {
             continue;
         }
         if !store.list_instances(Some(extension_id)).await?.is_empty() {
@@ -1206,10 +1188,10 @@ mod tests {
         core_instance_needs_startup_bootstrap, core_runtime_bootstrap_blocker,
         should_replace_bundled_package,
     };
-    use crate::db::models::ExtensionInstance;
-    use crate::extensions::manifest::ExtensionManifest;
-    use crate::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
     use chrono::Utc;
+    use elixir_server::db::models::ExtensionInstance;
+    use elixir_server::extensions::manifest::ExtensionManifest;
+    use elixir_server::runtime::health::{DockerRuntimeHealthSnapshot, DockerRuntimeHealthState};
     use serde_json::json;
     use std::path::PathBuf;
     use uuid::Uuid;

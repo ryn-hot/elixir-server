@@ -4,6 +4,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use argon2::{
@@ -23,7 +24,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, json};
 use sqlx::Row;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
@@ -62,6 +63,7 @@ use crate::{
     orchestrator::model::ProviderEndpoint,
     orchestrator::plan_validation::missing_required_secrets_for_plan,
     orchestrator::planner::{DriverPatchSpec, PlanAction, ProviderSpec},
+    playback::plan::{Delivery, PlaybackMode},
     secrets::SecretsManager,
     state::AppState,
 };
@@ -88,6 +90,211 @@ fn test_settings_with_db() -> Settings {
         playback: crate::config::PlaybackConfig::default(),
         network: crate::config::NetworkConfig::default(),
     }
+}
+
+async fn seed_test_media_probe(
+    pool: &sqlx::AnyPool,
+    media_file_id: &str,
+    path: &str,
+    container: &str,
+    video_codec: &str,
+    audio_codec: &str,
+    width: i32,
+    height: i32,
+    bitrate_bps: i64,
+) -> Result<()> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let source_size_bytes = metadata.len() as i64;
+    let source_mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64);
+    let normalized = json!({
+        "probe_version": 1,
+        "ffprobe_version": "test-fixture",
+        "probe_status": "ok",
+        "probe_error": null,
+        "probed_at": null,
+        "path": path,
+        "container": {
+            "format_names": [container],
+            "canonical": container,
+            "major_brand": null,
+            "compatible_brands": []
+        },
+        "duration_seconds": 60.0,
+        "size_bytes": source_size_bytes,
+        "overall_bitrate_bps": bitrate_bps,
+        "start_time_seconds": 0.0,
+        "video_streams": [{
+            "index": 0,
+            "codec": video_codec,
+            "profile": "High",
+            "level": 41,
+            "pixel_format": "yuv420p",
+            "width": width,
+            "height": height,
+            "frame_rate": 24.0,
+            "bit_depth": 8,
+            "bitrate_bps": bitrate_bps,
+            "color_primaries": null,
+            "color_transfer": null,
+            "color_matrix": null,
+            "hdr10": false,
+            "hdr10_plus": false,
+            "dolby_vision": false,
+            "mastering_metadata": false,
+            "content_light_metadata": false,
+            "dolby_vision_profile": null,
+            "dolby_vision_has_hdr10_fallback": false,
+            "is_default": true,
+            "is_forced": false
+        }],
+        "audio_streams": [{
+            "index": 1,
+            "codec": audio_codec,
+            "profile": null,
+            "channels": 2,
+            "channel_layout": "stereo",
+            "sample_rate": 48000,
+            "bitrate_bps": 192000,
+            "language": "eng",
+            "title": null,
+            "is_default": true,
+            "is_forced": false
+        }],
+        "subtitle_streams": [],
+        "chapters_present": false,
+        "attachments_present": false
+    });
+
+    sqlx::query("DELETE FROM media_file_probes WHERE media_file_id = ?")
+        .bind(media_file_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_file_probes
+            (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
+             source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
+             created_at, updated_at)
+         VALUES (?, 1, 'test-fixture', 'ok', CURRENT_TIMESTAMP, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(media_file_id)
+    .bind(source_mtime_ms)
+    .bind(source_size_bytes)
+    .bind(normalized.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+struct PlaybackRouteFixture {
+    app: Router,
+    state: AppState,
+    token: String,
+    item_id: String,
+    media_file_id: String,
+    _dir: TempDir,
+}
+
+async fn setup_playback_route_fixture(
+    settings: Settings,
+    file_name: &str,
+    container: &str,
+    video_codec: &str,
+    audio_codec: &str,
+    width: i32,
+    height: i32,
+    bitrate_bps: i64,
+) -> Result<PlaybackRouteFixture> {
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let extensions = ExtensionManager::new();
+    let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let dir = tempdir()?;
+    let file_path = dir.path().join(file_name);
+    tokio::fs::write(&file_path, b"0123456789").await?;
+    let title = format!("Phase13 {file_name}");
+    let candidate = MediaFileCandidate {
+        identity: MediaIdentity {
+            r#type: crate::db::models::MediaType::Movie,
+            external_ids: ExternalIds::default(),
+            title: title.clone(),
+            year: Some(2026),
+            season: None,
+            episode: None,
+        },
+        files: vec![FileDescriptor {
+            path: file_path.to_string_lossy().to_string(),
+            size_bytes: Some(10),
+            hash: None,
+            container: Some(container.to_string()),
+            video_codec: Some(video_codec.to_string()),
+            audio_codec: Some(audio_codec.to_string()),
+        }],
+        extension_metadata: Default::default(),
+        source_config_id: None,
+    };
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind(format!("phase13-{}@example.com", Uuid::new_v4()))
+        .bind("hashed")
+        .execute(&state.db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM movies WHERE title = ? AND year = 2026 LIMIT 1")
+            .bind(&title)
+            .fetch_one(&state.db_pool)
+            .await?;
+    let media_file_id: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+            .bind(file_path.to_string_lossy().to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    seed_test_media_probe(
+        &state.db_pool,
+        &media_file_id,
+        &file_path.to_string_lossy(),
+        container,
+        video_codec,
+        audio_codec,
+        width,
+        height,
+        bitrate_bps,
+    )
+    .await?;
+
+    Ok(PlaybackRouteFixture {
+        app,
+        state,
+        token,
+        item_id,
+        media_file_id,
+        _dir: dir,
+    })
 }
 
 fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
@@ -10225,15 +10432,33 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
         .execute(&state.db_pool)
         .await?;
 
-    let (item_id,): (String,) = sqlx::query_as("SELECT id FROM movies LIMIT 1")
-        .fetch_one(&state.db_pool)
-        .await?;
+    let (item_id,): (String,) =
+        sqlx::query_as("SELECT id FROM movies WHERE title = 'Play Movie' AND year = 2024 LIMIT 1")
+            .fetch_one(&state.db_pool)
+            .await?;
+    let media_file_id: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+            .bind(file_path.to_string_lossy().to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    seed_test_media_probe(
+        &state.db_pool,
+        &media_file_id,
+        &file_path.to_string_lossy(),
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
 
     let token = state.auth_service.issue_access_token(user_id)?.token;
 
     let play_body = serde_json::json!({
         "media_item_id": item_id,
-        "preferred_file_id": null,
+        "preferred_file_id": media_file_id,
         "network_type": "lan",
         "client_capabilities": {}
     });
@@ -10256,6 +10481,98 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     assert_eq!(
         json.get("mode").and_then(Value::as_str),
         Some("direct_play")
+    );
+    assert_eq!(
+        json.get("delivery").and_then(Value::as_str),
+        Some("direct_file")
+    );
+    assert_eq!(
+        json.get("decision_reason").and_then(Value::as_str),
+        Some("direct_play_all_capabilities_satisfied")
+    );
+    assert_eq!(
+        json.pointer("/playback_plan/probe_version"),
+        None,
+        "probe data should not be embedded directly in the plan"
+    );
+    assert_eq!(
+        json.pointer("/playback_plan/mode").and_then(Value::as_str),
+        Some("direct_play")
+    );
+    assert_eq!(
+        json.pointer("/playback_plan/compatibility_report/media_file_id_valid")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        json.pointer("/playback_plan/expected_outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| outputs.iter().any(|output| {
+                output.get("name").and_then(Value::as_str) == Some("direct_file")
+                    && output.get("kind").and_then(Value::as_str) == Some("direct_file")
+            })),
+        "expected direct file output descriptor in plan: {json}"
+    );
+    assert!(
+        json.get("decision_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("direct_play_all_capabilities_satisfied"))),
+        "play response should include machine-readable decision reasons: {json}"
+    );
+    let session_id = json
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("play response should include session_id")?;
+    let persisted_plan: Option<String> =
+        sqlx::query_scalar("SELECT playback_plan_json FROM playback_sessions WHERE id = ? LIMIT 1")
+            .bind(session_id)
+            .fetch_one(&state.db_pool)
+            .await?;
+    let persisted_plan: Value = serde_json::from_str(
+        persisted_plan
+            .as_deref()
+            .context("playback session should persist playback_plan_json")?,
+    )?;
+    assert_eq!(
+        persisted_plan,
+        *json
+            .get("playback_plan")
+            .context("play response should include playback_plan")?,
+        "stored playback_plan_json must match the plan returned to the client"
+    );
+    assert_eq!(
+        json.get("server_seek_required").and_then(Value::as_bool),
+        Some(false)
+    );
+    let detail_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sessions/{session_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let detail_status = detail_resp.status();
+    let detail_bytes = body::to_bytes(detail_resp.into_body(), 1_048_576).await?;
+    let detail_json: Value = serde_json::from_slice(&detail_bytes)?;
+    assert_eq!(detail_status, StatusCode::OK, "body: {}", detail_json);
+    assert_eq!(
+        detail_json.get("delivery").and_then(Value::as_str),
+        Some("direct_file")
+    );
+    assert_eq!(
+        detail_json
+            .get("server_seek_required")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        detail_json
+            .pointer("/plan_summary/decision_reason")
+            .and_then(Value::as_str),
+        Some("direct_play_all_capabilities_satisfied")
     );
     assert_eq!(json.get("state").and_then(Value::as_str), Some("active"));
     assert_eq!(
@@ -10392,6 +10709,30 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
         .bind(file_later_id.to_string())
         .execute(&state.db_pool)
         .await?;
+    seed_test_media_probe(
+        &state.db_pool,
+        &file_one_id.to_string(),
+        &s1e1_path.to_string_lossy(),
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    seed_test_media_probe(
+        &state.db_pool,
+        &file_later_id.to_string(),
+        &s2e10_path.to_string_lossy(),
+        "mkv",
+        "h265",
+        "aac",
+        3840,
+        2160,
+        18_000_000,
+    )
+    .await?;
 
     let play_body = serde_json::json!({
         "media_item_id": series_id,
@@ -10455,6 +10796,121 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
         .and_then(Value::as_str)
         .context("media file id in legacy play response")?;
     assert_eq!(legacy_selected_file_id, file_one_id.to_string());
+
+    let auto_play_body = serde_json::json!({
+        "media_item_id": series_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv"],
+            "supported_video_codecs": ["h264", "h265"],
+            "supported_audio_codecs": ["aac"]
+        }
+    });
+    let auto_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(auto_play_body.to_string()))?,
+        )
+        .await?;
+    let auto_status = auto_resp.status();
+    let auto_bytes = body::to_bytes(auto_resp.into_body(), 1_048_576).await?;
+    let auto_json: Value = serde_json::from_slice(&auto_bytes)?;
+    assert_eq!(auto_status, StatusCode::OK, "body: {}", auto_json);
+    let file_one_id_text = file_one_id.to_string();
+    let file_later_id_text = file_later_id.to_string();
+    let episode_one_id_text = episode_one_id.to_string();
+    assert_eq!(
+        auto_json.get("media_file_id").and_then(Value::as_str),
+        Some(file_one_id_text.as_str()),
+        "series-level Play must pick the first available episode, not the highest-quality file"
+    );
+    assert_eq!(
+        auto_json.get("selected_episode_id").and_then(Value::as_str),
+        Some(episode_one_id_text.as_str())
+    );
+    assert_eq!(
+        auto_json
+            .get("episode_selection_reason")
+            .and_then(Value::as_str),
+        Some("next_unwatched_episode")
+    );
+
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token)
+         VALUES (?, ?, ?, 'direct_play', 'ended', 'lan', 950, 1000, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(user_id.to_string())
+    .bind(file_one_id.to_string())
+    .bind("completed-episode-token")
+    .execute(&state.db_pool)
+    .await?;
+
+    let next_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(auto_play_body.to_string()))?,
+        )
+        .await?;
+    let next_status = next_resp.status();
+    let next_bytes = body::to_bytes(next_resp.into_body(), 1_048_576).await?;
+    let next_json: Value = serde_json::from_slice(&next_bytes)?;
+    assert_eq!(next_status, StatusCode::OK, "body: {}", next_json);
+    assert_eq!(
+        next_json.get("media_file_id").and_then(Value::as_str),
+        Some(file_later_id_text.as_str())
+    );
+    assert_eq!(
+        next_json
+            .get("episode_selection_reason")
+            .and_then(Value::as_str),
+        Some("next_unwatched_episode")
+    );
+
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token)
+         VALUES (?, ?, ?, 'direct_play', 'active', 'lan', 300, 1000, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(user_id.to_string())
+    .bind(file_later_id.to_string())
+    .bind("continue-episode-token")
+    .execute(&state.db_pool)
+    .await?;
+
+    let continue_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(auto_play_body.to_string()))?,
+        )
+        .await?;
+    let continue_status = continue_resp.status();
+    let continue_bytes = body::to_bytes(continue_resp.into_body(), 1_048_576).await?;
+    let continue_json: Value = serde_json::from_slice(&continue_bytes)?;
+    assert_eq!(continue_status, StatusCode::OK, "body: {}", continue_json);
+    assert_eq!(
+        continue_json.get("media_file_id").and_then(Value::as_str),
+        Some(file_later_id_text.as_str())
+    );
+    assert_eq!(
+        continue_json
+            .get("episode_selection_reason")
+            .and_then(Value::as_str),
+        Some("continue_watching_episode")
+    );
 
     let invalid_preferred_body = serde_json::json!({
         "media_item_id": series_id,
@@ -10578,10 +11034,40 @@ async fn direct_stream_supports_range() -> Result<()> {
     let media_item_id: String = sqlx::query_scalar("SELECT id FROM movies LIMIT 1")
         .fetch_one(&state.db_pool)
         .await?;
+    let selected_file_id: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+            .bind(file_path.to_string_lossy().to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    seed_test_media_probe(
+        &state.db_pool,
+        &selected_file_id,
+        &file_path.to_string_lossy(),
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let other_file_id = Uuid::new_v4();
+    let other_file_path = dir.path().join("Other.RangeTest.2024.mkv");
+    tokio::fs::write(&other_file_path, b"other-file").await?;
+    sqlx::query(
+        "INSERT INTO media_files
+            (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
+         VALUES (?, ?, ?, 10, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+    )
+    .bind(other_file_id.to_string())
+    .bind(&media_item_id)
+    .bind(other_file_path.to_string_lossy().to_string())
+    .execute(&state.db_pool)
+    .await?;
 
     let play_body = serde_json::json!({
         "media_item_id": media_item_id,
-        "preferred_file_id": null,
+        "preferred_file_id": selected_file_id,
         "network_type": "lan",
         "client_capabilities": {}
     });
@@ -10595,14 +11081,50 @@ async fn direct_stream_supports_range() -> Result<()> {
                 .body(Body::from(play_body.to_string()))?,
         )
         .await?;
-    assert_eq!(play_resp.status(), StatusCode::OK);
+    let play_status = play_resp.status();
     let play_bytes = body::to_bytes(play_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        play_status,
+        StatusCode::OK,
+        "play failed: {}",
+        String::from_utf8_lossy(&play_bytes)
+    );
     let play_json: Value = serde_json::from_slice(&play_bytes)?;
     let stream_url = play_json
         .get("streamUrl")
         .or_else(|| play_json.get("stream_url"))
         .and_then(Value::as_str)
         .expect("stream_url");
+    assert!(
+        !stream_url.contains("token=") && !stream_url.contains("access_token="),
+        "direct stream URL should rely on auth headers, not bearer query tokens: {stream_url}"
+    );
+    let session_id = play_json
+        .get("sessionId")
+        .or_else(|| play_json.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("session_id");
+    let media_file_id = play_json
+        .get("mediaFileId")
+        .or_else(|| play_json.get("media_file_id"))
+        .and_then(Value::as_str)
+        .expect("media_file_id");
+
+    let tampered_url = stream_url.replacen(media_file_id, &other_file_id.to_string(), 1);
+    let tampered_resp = app
+        .clone()
+        .oneshot(
+            Request::get(&tampered_url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(tampered_resp.status(), StatusCode::UNAUTHORIZED);
+
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+        .bind(session_id)
+        .execute(&state.db_pool)
+        .await?;
 
     let resp = app
         .clone()
@@ -10615,6 +11137,7 @@ async fn direct_stream_supports_range() -> Result<()> {
         .await?;
 
     let status = resp.status();
+    let partial_headers = resp.headers().clone();
     let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
     assert_eq!(
         status,
@@ -10623,6 +11146,1005 @@ async fn direct_stream_supports_range() -> Result<()> {
         String::from_utf8_lossy(&bytes)
     );
     assert_eq!(&bytes[..], b"abcd");
+    assert_eq!(
+        partial_headers
+            .get("accept-ranges")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+    assert_eq!(
+        partial_headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 0-3/10")
+    );
+    assert_eq!(
+        partial_headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert!(partial_headers.get("etag").is_some());
+    assert!(partial_headers.get("last-modified").is_some());
+    assert!(
+        crate::metrics::DIRECT_STREAM_BYTES
+            .with_label_values(&[
+                session_id,
+                &user_id.to_string(),
+                media_file_id,
+                "direct_file"
+            ])
+            .get()
+            >= 4
+    );
+
+    let open_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=4-")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(open_resp.status(), StatusCode::PARTIAL_CONTENT);
+    let open_headers = open_resp.headers().clone();
+    let open_bytes = body::to_bytes(open_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&open_bytes[..], b"efghij");
+    assert_eq!(
+        open_headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 4-9/10")
+    );
+
+    let suffix_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=-3")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(suffix_resp.status(), StatusCode::PARTIAL_CONTENT);
+    let suffix_headers = suffix_resp.headers().clone();
+    let suffix_bytes = body::to_bytes(suffix_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&suffix_bytes[..], b"hij");
+    assert_eq!(
+        suffix_headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 7-9/10")
+    );
+
+    let etag = partial_headers
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .expect("etag")
+        .to_string();
+    let if_range_match_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=1-2")
+                .header("if-range", etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(if_range_match_resp.status(), StatusCode::PARTIAL_CONTENT);
+    let if_range_match_bytes = body::to_bytes(if_range_match_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&if_range_match_bytes[..], b"bc");
+
+    let if_range_mismatch_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=1-2")
+                .header("if-range", "\"does-not-match\"")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(if_range_mismatch_resp.status(), StatusCode::OK);
+    assert!(
+        if_range_mismatch_resp
+            .headers()
+            .get("content-range")
+            .is_none()
+    );
+    let if_range_mismatch_bytes =
+        body::to_bytes(if_range_mismatch_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&if_range_mismatch_bytes[..], file_bytes);
+
+    let invalid_range_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=99-120")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        invalid_range_resp.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    assert_eq!(
+        invalid_range_resp
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes */10")
+    );
+
+    let multi_range_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=0-1,3-4")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(multi_range_resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    let multi_range_body = body::to_bytes(multi_range_resp.into_body(), 1_048_576).await?;
+    assert!(
+        String::from_utf8_lossy(&multi_range_body).contains("multiple byte ranges"),
+        "{}",
+        String::from_utf8_lossy(&multi_range_body)
+    );
+
+    let head_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(head_resp.status(), StatusCode::OK);
+    assert_eq!(
+        head_resp
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("10")
+    );
+    let head_body = body::to_bytes(head_resp.into_body(), 1_048_576).await?;
+    assert!(head_body.is_empty());
+
+    let head_invalid_range_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=99-120")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        head_invalid_range_resp.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    assert_eq!(
+        head_invalid_range_resp
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes */10")
+    );
+    let head_invalid_range_body =
+        body::to_bytes(head_invalid_range_resp.into_body(), 1_048_576).await?;
+    assert!(head_invalid_range_body.is_empty());
+
+    let updated_at: String =
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_ne!(updated_at.trim(), "2000-01-01 00:00:00");
+
+    sqlx::query("UPDATE playback_sessions SET mode = 'transcode' WHERE id = ?")
+        .bind(session_id)
+        .execute(&state.db_pool)
+        .await?;
+    let wrong_mode_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(wrong_mode_resp.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase13_direct_stream_rollout_gate_returns_structured_error() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase13-direct-stream-gate-secret".to_string();
+    settings.playback.hls_direct_stream_enabled = false;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Direct.Stream.Gate.2026.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+
+    let play_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_version": 1,
+            "client_kind": "web",
+            "direct_play_preferred": false,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supported_hls_segment_types": ["fmp4"],
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 8_000_000
+        }
+    });
+    let resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", json);
+    assert_eq!(
+        json.get("code").and_then(Value::as_str),
+        Some("direct_stream_disabled")
+    );
+    assert_eq!(
+        json.pointer("/details/flag").and_then(Value::as_str),
+        Some("playback.hls_direct_stream_enabled")
+    );
+    assert_eq!(
+        json.pointer("/details/plan_summary/mode")
+            .and_then(Value::as_str),
+        Some("direct_stream")
+    );
+    let session_count: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(
+        session_count, "0",
+        "gate rejection must not persist a session"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase13_video_transcode_disabled_returns_structured_error() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase13-video-disabled-secret".to_string();
+    settings.playback.allow_video_transcode = false;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Video.Transcode.Disabled.2026.mkv",
+        "mkv",
+        "hevc",
+        "aac",
+        1920,
+        1080,
+        8_000_000,
+    )
+    .await?;
+
+    let play_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 1,
+            "client_kind": "web",
+            "direct_play_preferred": false,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supported_hls_segment_types": ["fmp4"],
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 4_000_000
+        }
+    });
+    let resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", json);
+    assert_eq!(
+        json.get("code").and_then(Value::as_str),
+        Some("video_transcode_disabled")
+    );
+    assert!(
+        json.pointer("/details/reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| { reason.as_str() == Some("video_transcode_disabled_by_policy") })),
+        "expected disabled video transcode reason: {json}"
+    );
+    let session_count: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(
+        session_count, "0",
+        "not-playable rejection must not persist a session"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase13_capacity_gate_rejects_before_session_insert_and_records_metric() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase13-capacity-secret".to_string();
+    settings.playback.max_active_sessions = Some(0);
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Capacity.Gate.2026.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let labels = [
+        "active_sessions",
+        "direct_play",
+        "direct_file",
+        "native_mpv",
+        "lan",
+        "transcode_capacity_exhausted",
+    ];
+    let before = crate::metrics::PLAYBACK_CAPACITY_REJECTIONS
+        .with_label_values(&labels)
+        .get();
+
+    let play_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_version": 1,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "quality_mode": "original"
+        }
+    });
+    let resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", json);
+    assert_eq!(
+        json.get("code").and_then(Value::as_str),
+        Some("transcode_capacity_exhausted")
+    );
+    assert_eq!(
+        json.pointer("/details/capacity/resource")
+            .and_then(Value::as_str),
+        Some("active_sessions")
+    );
+    assert_eq!(
+        crate::metrics::PLAYBACK_CAPACITY_REJECTIONS
+            .with_label_values(&labels)
+            .get(),
+        before + 1
+    );
+    let session_count: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(
+        session_count, "0",
+        "capacity rejection must not persist a session"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn hls_segment_serving_requires_registered_artifact_and_containment() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "hls-artifact-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let extensions = ExtensionManager::new();
+    let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("hls-artifact-user@example.com")
+        .bind("hashed")
+        .execute(&state.db_pool)
+        .await?;
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+
+    let media_item_id = Uuid::new_v4();
+    let media_file_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let session_token = "session-token-for-artifacts";
+    let temp = tempdir()?;
+    let media_path = temp.path().join("Artifact.Movie.2024.mkv");
+    tokio::fs::write(&media_path, b"source").await?;
+    tokio::fs::write(temp.path().join("seg_0_00000.ts"), b"segment").await?;
+    tokio::fs::write(temp.path().join("secret.ts"), b"secret").await?;
+    tokio::fs::write(
+        temp.path().join("stream_0.m3u8"),
+        "#EXTM3U\nseg_0_00000.ts\n",
+    )
+    .await?;
+    tokio::fs::write(temp.path().join("sub_0.m3u8"), "#EXTM3U\nsub_0_00000.vtt\n").await?;
+    tokio::fs::write(temp.path().join("sub_0_00000.vtt"), "WEBVTT\n").await?;
+
+    #[cfg(unix)]
+    {
+        let outside = temp
+            .path()
+            .parent()
+            .unwrap_or(temp.path())
+            .join("outside-secret.ts");
+        std::fs::write(&outside, b"outside")?;
+        std::os::unix::fs::symlink(&outside, temp.path().join("seg_0_00001.ts"))?;
+    }
+
+    sqlx::query(
+        "INSERT INTO media_items (id, type, external_ids, title, year)
+         VALUES (?, 'movie', '{}', 'Artifact Movie', 2024)",
+    )
+    .bind(media_item_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_files
+            (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
+         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+    )
+    .bind(media_file_id.to_string())
+    .bind(media_item_id.to_string())
+    .bind(media_path.to_string_lossy().to_string())
+    .execute(&state.db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
+         VALUES (?, ?, ?, 'transcode', 'active', 'lan', 0, 6, ?, '2000-01-01 00:00:00')",
+    )
+    .bind(session_id.to_string())
+    .bind(user_id.to_string())
+    .bind(media_file_id.to_string())
+    .bind(session_token)
+    .execute(&state.db_pool)
+    .await?;
+
+    state
+        .transcodes
+        .insert_test_job(session_id, temp.path().to_path_buf(), 1)
+        .await;
+
+    let valid_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/seg_0_00000.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    let valid_status = valid_resp.status();
+    let valid_bytes = body::to_bytes(valid_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        valid_status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&valid_bytes)
+    );
+    assert_eq!(&valid_bytes[..], b"segment");
+
+    let updated_at: String =
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_ne!(updated_at.trim(), "2000-01-01 00:00:00");
+
+    let playlist_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/stream_0.m3u8?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    let playlist_status = playlist_resp.status();
+    let playlist_bytes = body::to_bytes(playlist_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        playlist_status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&playlist_bytes)
+    );
+    let playlist = String::from_utf8_lossy(&playlist_bytes);
+    assert!(playlist.contains("seg_0_00000.ts?session="));
+
+    let subtitle_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/sub_0_00000.vtt?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    let subtitle_status = subtitle_resp.status();
+    let subtitle_bytes = body::to_bytes(subtitle_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        subtitle_status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&subtitle_bytes)
+    );
+    assert!(String::from_utf8_lossy(&subtitle_bytes).contains("WEBVTT"));
+
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+    let poll_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sessions/{session_id}/poll"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(poll_resp.status(), StatusCode::OK);
+    let poll_updated_at: String =
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_ne!(poll_updated_at.trim(), "2000-01-01 00:00:00");
+
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+    let heartbeat_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/heartbeat"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(heartbeat_resp.status(), StatusCode::OK);
+    let heartbeat_updated_at: String =
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_ne!(heartbeat_updated_at.trim(), "2000-01-01 00:00:00");
+
+    let present_but_unregistered = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/secret.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(present_but_unregistered.status(), StatusCode::NOT_FOUND);
+
+    let encoded_traversal = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/%2e%2e%2Fsecret.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(encoded_traversal.status(), StatusCode::NOT_FOUND);
+
+    #[cfg(unix)]
+    {
+        let symlink_escape = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/sessions/{session_id}/seg_0_00001.ts?session={session_token}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(symlink_escape.status(), StatusCode::NOT_FOUND);
+    }
+
+    let direct_session_id = Uuid::new_v4();
+    let direct_session_token = "direct-stream-session-token";
+    let direct_temp = tempdir()?;
+    tokio::fs::write(
+        direct_temp.path().join("master.m3u8"),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmedia.m3u8\n",
+    )
+    .await?;
+    tokio::fs::write(
+        direct_temp.path().join("media.m3u8"),
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.000,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n",
+    )
+    .await?;
+    tokio::fs::write(direct_temp.path().join("init.mp4"), b"init").await?;
+    tokio::fs::write(direct_temp.path().join("segment_00000.m4s"), b"segment").await?;
+    tokio::fs::write(direct_temp.path().join("seg_0_00000.ts"), b"old-segment").await?;
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
+         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 6, ?, '2000-01-01 00:00:00')",
+    )
+    .bind(direct_session_id.to_string())
+    .bind(user_id.to_string())
+    .bind(media_file_id.to_string())
+    .bind(direct_session_token)
+    .execute(&state.db_pool)
+    .await?;
+    state
+        .transcodes
+        .insert_test_job_for_plan(
+            direct_session_id,
+            direct_temp.path().to_path_buf(),
+            PlaybackMode::DirectStream,
+            Delivery::HlsFmp4,
+            0,
+        )
+        .await;
+
+    let direct_master_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/master.m3u8?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(direct_master_resp.status(), StatusCode::OK);
+    let direct_master_bytes = body::to_bytes(direct_master_resp.into_body(), 1_048_576).await?;
+    let direct_master = String::from_utf8_lossy(&direct_master_bytes);
+    assert!(direct_master.contains("media.m3u8?session=direct-stream-session-token"));
+
+    let direct_media_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/media.m3u8?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(direct_media_resp.status(), StatusCode::OK);
+    let direct_media_bytes = body::to_bytes(direct_media_resp.into_body(), 1_048_576).await?;
+    let direct_media = String::from_utf8_lossy(&direct_media_bytes);
+    assert!(
+        direct_media.contains("#EXT-X-MAP:URI=\"init.mp4?session=direct-stream-session-token\"")
+    );
+    assert!(direct_media.contains("segment_00000.m4s?session=direct-stream-session-token"));
+
+    let direct_init_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/init.mp4?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(direct_init_resp.status(), StatusCode::OK);
+    let direct_init_bytes = body::to_bytes(direct_init_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&direct_init_bytes[..], b"init");
+
+    let direct_segment_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/segment_00000.m4s?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(direct_segment_resp.status(), StatusCode::OK);
+    let direct_segment_bytes = body::to_bytes(direct_segment_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&direct_segment_bytes[..], b"segment");
+
+    let old_transcode_name_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/seg_0_00000.ts?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(old_transcode_name_resp.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ELIXIR_TEST_MEDIA_PATH or default sample file present"]
+async fn direct_play_range_integration_when_media_present() -> Result<()> {
+    use std::path::Path;
+
+    let default_path = "/Users/ryanhotard/downloads/Solo.Leveling.S02E02.I.Suppose.You.Arent.Aware.1080p.CR.WEB-DL.AAC2.0.H.264.DUAL-VARYG.mkv";
+    let media_path =
+        std::env::var("ELIXIR_TEST_MEDIA_PATH").unwrap_or_else(|_| default_path.to_string());
+
+    if !Path::new(&media_path).exists() {
+        return Ok(());
+    }
+
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "direct-live-secret-key".to_string();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let extensions = ExtensionManager::new();
+    let metadata = crate::metadata::MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        extensions,
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let app = router(state.clone());
+
+    let user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(user_id.to_string())
+        .bind("direct-live-user@example.com")
+        .bind("hashed")
+        .execute(&state.db_pool)
+        .await?;
+
+    let candidate = MediaFileCandidate {
+        identity: MediaIdentity {
+            r#type: crate::db::models::MediaType::Movie,
+            external_ids: ExternalIds::default(),
+            title: "Direct Live Sample".to_string(),
+            year: Some(2024),
+            season: None,
+            episode: None,
+        },
+        files: vec![FileDescriptor {
+            path: media_path.clone(),
+            size_bytes: None,
+            hash: None,
+            container: Path::new(&media_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_string()),
+            video_codec: None,
+            audio_codec: None,
+        }],
+        extension_metadata: Default::default(),
+        source_config_id: None,
+    };
+    run_full_scan(&state.db_pool, vec![candidate], false).await?;
+
+    let token = state.auth_service.issue_access_token(user_id)?.token;
+    let media_item_id: String = sqlx::query_scalar("SELECT id FROM movies LIMIT 1")
+        .fetch_one(&state.db_pool)
+        .await?;
+
+    let play_body = serde_json::json!({
+        "media_item_id": media_item_id,
+        "preferred_file_id": null,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mp4", "mkv", "mov", "avi", "webm"],
+            "supported_video_codecs": ["h264", "hevc", "h265", "av1", "mpeg4", "mpeg2video", "vc1"],
+            "supported_audio_codecs": ["aac", "ac3", "eac3", "dts", "truehd", "opus", "vorbis", "flac", "mp3"],
+            "supported_subtitle_codecs": ["srt", "webvtt", "ass", "ssa", "mov_text", "pgs", "dvd_subtitle"],
+            "supports_auth_headers_for_media": true,
+            "quality_mode": "original"
+        }
+    });
+
+    let play_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let play_status = play_resp.status();
+    let play_bytes = body::to_bytes(play_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        play_status,
+        StatusCode::OK,
+        "play failed: {}",
+        String::from_utf8_lossy(&play_bytes)
+    );
+    let play_json: Value = serde_json::from_slice(&play_bytes)?;
+    assert_eq!(
+        play_json.get("mode").and_then(Value::as_str),
+        Some("direct_play")
+    );
+    assert_eq!(
+        play_json
+            .get("server_seek_required")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let stream_url = play_json
+        .get("streamUrl")
+        .or_else(|| play_json.get("stream_url"))
+        .and_then(Value::as_str)
+        .expect("stream_url");
+    assert!(!stream_url.contains("token=") && !stream_url.contains("access_token="));
+    let session_id = play_json
+        .get("sessionId")
+        .or_else(|| play_json.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("session_id");
+
+    let head_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(head_resp.status(), StatusCode::OK);
+    assert_eq!(
+        head_resp
+            .headers()
+            .get("accept-ranges")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+    let head_body = body::to_bytes(head_resp.into_body(), 1_048_576).await?;
+    assert!(head_body.is_empty());
+
+    let range_resp = app
+        .clone()
+        .oneshot(
+            Request::get(stream_url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("range", "bytes=0-1048575")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        range_resp
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("bytes 0-")),
+        Some(true)
+    );
+    let range_body = body::to_bytes(range_resp.into_body(), 2_000_000).await?;
+    assert!(!range_body.is_empty());
+
+    let seek_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/seek"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "position_seconds": 30.0 }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(seek_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let end_resp = app
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/end"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
 
     Ok(())
 }
@@ -10701,7 +12223,8 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
         .fetch_one(&state.db_pool)
         .await?;
 
-    // Use a capability profile that forces transcode (no mkv support).
+    // Use a Plex-style capability profile: MP4/H.264/AAC can direct play, while
+    // MKV/HEVC/AV1/etc. should fall through to the transcoding path.
     let play_body = serde_json::json!({
         "media_item_id": media_item_id,
         "preferred_file_id": null,
@@ -10723,63 +12246,139 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
                 .body(Body::from(play_body.to_string()))?,
         )
         .await?;
-    assert_eq!(play_resp.status(), StatusCode::OK);
+    let play_status = play_resp.status();
     let play_bytes = body::to_bytes(play_resp.into_body(), 1_048_576).await?;
-    let play_json: Value = serde_json::from_slice(&play_bytes)?;
     assert_eq!(
-        play_json.get("mode").and_then(Value::as_str),
-        Some("transcode"),
-        "should choose transcode for mkv"
+        play_status,
+        StatusCode::OK,
+        "play failed: {}",
+        String::from_utf8_lossy(&play_bytes)
     );
+    let play_json: Value = serde_json::from_slice(&play_bytes)?;
+    let mode = play_json.get("mode").and_then(Value::as_str);
     let stream_url = play_json
         .get("streamUrl")
         .or_else(|| play_json.get("stream_url"))
         .and_then(Value::as_str)
         .expect("stream_url");
 
-    // Fetch playlist
-    let playlist_resp = app
-        .clone()
-        .oneshot(
-            Request::get(stream_url)
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())?,
-        )
-        .await?;
-    let playlist_status = playlist_resp.status();
-    let playlist_body = body::to_bytes(playlist_resp.into_body(), 5_000_000).await?;
-    assert_eq!(
-        playlist_status,
-        StatusCode::OK,
-        "playlist failed: {}",
-        String::from_utf8_lossy(&playlist_body)
-    );
-    let playlist_str = String::from_utf8_lossy(&playlist_body);
-    let first_seg = playlist_str
-        .lines()
-        .find(|line| line.starts_with("seg_"))
-        .unwrap_or("seg_00000.ts?session=");
+    match mode {
+        Some("direct_play") => {
+            let direct_resp = app
+                .clone()
+                .oneshot(
+                    Request::get(stream_url)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("range", "bytes=0-65535")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let direct_status = direct_resp.status();
+            let direct_body = body::to_bytes(direct_resp.into_body(), 1_048_576).await?;
+            assert_eq!(
+                direct_status,
+                StatusCode::PARTIAL_CONTENT,
+                "direct stream failed: {}",
+                String::from_utf8_lossy(&direct_body)
+            );
+            assert!(!direct_body.is_empty(), "direct stream should return data");
+        }
+        Some("transcode")
+        | Some("direct_stream")
+        | Some("audio_transcode")
+        | Some("subtitle_transcode")
+        | Some("video_transcode")
+        | Some("adaptive_transcode") => {
+            let playlist_resp = app
+                .clone()
+                .oneshot(
+                    Request::get(stream_url)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let playlist_status = playlist_resp.status();
+            let playlist_body = body::to_bytes(playlist_resp.into_body(), 5_000_000).await?;
+            assert_eq!(
+                playlist_status,
+                StatusCode::OK,
+                "playlist failed: {}",
+                String::from_utf8_lossy(&playlist_body)
+            );
+            let playlist_str = String::from_utf8_lossy(&playlist_body);
+            let session_base = stream_url
+                .split_once("/master.m3u8")
+                .map(|(base, _)| base.to_string())
+                .or_else(|| {
+                    stream_url
+                        .rsplit_once('/')
+                        .map(|(base, _)| base.to_string())
+                })
+                .context("session playlist base")?;
+            let resolve_session_url = |entry: &str| {
+                if entry.starts_with('/') {
+                    entry.to_string()
+                } else {
+                    format!("{session_base}/{entry}")
+                }
+            };
+            let first_entry = playlist_str
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .context("master playlist entry")?;
 
-    let base = stream_url.split('/').take(3).collect::<Vec<_>>().join("/");
-    let segment_url = format!("{base}/{}", first_seg);
+            let media_playlist = if first_entry.contains(".m3u8") {
+                let media_playlist_url = resolve_session_url(first_entry);
+                let media_playlist_resp = app
+                    .clone()
+                    .oneshot(
+                        Request::get(&media_playlist_url)
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                let media_playlist_status = media_playlist_resp.status();
+                let media_playlist_body =
+                    body::to_bytes(media_playlist_resp.into_body(), 5_000_000).await?;
+                assert_eq!(
+                    media_playlist_status,
+                    StatusCode::OK,
+                    "media playlist failed: {}",
+                    String::from_utf8_lossy(&media_playlist_body)
+                );
+                String::from_utf8(media_playlist_body.to_vec())?
+            } else {
+                playlist_str.to_string()
+            };
 
-    let seg_resp = app
-        .clone()
-        .oneshot(
-            Request::get(&segment_url)
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())?,
-        )
-        .await?;
-    let seg_status = seg_resp.status();
-    let seg_bytes = body::to_bytes(seg_resp.into_body(), 20_000_000).await?;
-    assert_eq!(
-        seg_status,
-        StatusCode::OK,
-        "segment failed: {}",
-        String::from_utf8_lossy(&seg_bytes)
-    );
-    assert!(!seg_bytes.is_empty(), "segment should return data");
+            let first_seg = media_playlist
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#') && !line.contains(".m3u8"))
+                .context("media segment entry")?;
+            let segment_url = resolve_session_url(first_seg);
+
+            let seg_resp = app
+                .clone()
+                .oneshot(
+                    Request::get(&segment_url)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let seg_status = seg_resp.status();
+            let seg_bytes = body::to_bytes(seg_resp.into_body(), 20_000_000).await?;
+            assert_eq!(
+                seg_status,
+                StatusCode::OK,
+                "segment failed: {}",
+                String::from_utf8_lossy(&seg_bytes)
+            );
+            assert!(!seg_bytes.is_empty(), "segment should return data");
+        }
+        other => anyhow::bail!("unexpected playback mode: {other:?}"),
+    }
 
     Ok(())
 }

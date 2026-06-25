@@ -1,0 +1,36 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "profile": "High",
+      "level": 41,
+      "pix_fmt": "yuv420p",
+      "width": 1920,
+      "height": 1080,
+      "avg_frame_rate": "24000/1001",
+      "bit_rate": "4200000",
+      "disposition": { "default": 1, "forced": 0 }
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "aac",
+      "profile": "LC",
+      "channels": 2,
+      "channel_layout": "stereo",
+      "sample_rate": "48000",
+      "bit_rate": "192000",
+      "tags": { "language": "eng", "title": "Stereo" },
+      "disposition": { "default": 1, "forced": 0 }
+    }
+  ],
+  "format": {
+    "format_name": "matroska,webm",
+    "duration": "3600.000000",
+    "bit_rate": "4600000",
+    "size": "2070000000"
+  },
+  "chapters": []
+}

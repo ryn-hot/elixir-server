@@ -43,6 +43,7 @@ use crate::{
     extensions::{FileDescriptor, MediaFileCandidate, MediaIdentity},
     media::ffprobe,
     metadata::{MetadataResult, MetadataService},
+    playback::probe as playback_probe,
     state::AppState,
 };
 
@@ -4732,13 +4733,15 @@ async fn upsert_media_file(
     extension_metadata: Option<&HashMap<String, serde_json::Value>>,
     hash_dedupe: bool,
 ) -> Result<MediaFileUpsert> {
-    let metadata = match ffprobe::probe(&file.path).await {
-        Ok(metadata) => metadata,
+    let probe_result = match ffprobe::probe(&file.path).await {
+        Ok(metadata) => Ok(metadata),
         Err(err) => {
+            let message = err.to_string();
             tracing::warn!(path = %file.path, error = %err, "ffprobe failed during ingest");
-            ffprobe::MediaMetadata::default()
+            Err(message)
         }
     };
+    let metadata = probe_result.as_ref().ok();
 
     let mut existing = None;
     if hash_dedupe {
@@ -4772,12 +4775,12 @@ async fn upsert_media_file(
         sqlx::query::<sqlx::Any>("UPDATE media_files SET media_item_id = ?, size_bytes = ?, container = ?, video_codec = ?, audio_codec = ?, width = COALESCE(?, width), height = COALESCE(?, height), bitrate_bps = COALESCE(?, bitrate_bps), hash = COALESCE(?, hash), extension_metadata = COALESCE(?, extension_metadata), updated_at = CURRENT_TIMESTAMP, scan_state = 'ok', source_config_id = COALESCE(source_config_id, ?) WHERE id = ?")
             .bind(legacy_item_id.to_string())
             .bind(file.size_bytes)
-            .bind(metadata.container.as_ref().or(file.container.as_ref()))
-            .bind(metadata.video_codec.as_ref().or(file.video_codec.as_ref()))
-            .bind(metadata.audio_codec.as_ref().or(file.audio_codec.as_ref()))
-            .bind(metadata.width)
-            .bind(metadata.height)
-            .bind(metadata.bitrate_bps)
+            .bind(metadata.and_then(|m| m.container.as_ref()).or(file.container.as_ref()))
+            .bind(metadata.and_then(|m| m.video_codec.as_ref()).or(file.video_codec.as_ref()))
+            .bind(metadata.and_then(|m| m.audio_codec.as_ref()).or(file.audio_codec.as_ref()))
+            .bind(metadata.and_then(|m| m.width))
+            .bind(metadata.and_then(|m| m.height))
+            .bind(metadata.and_then(|m| m.bitrate_bps))
             .bind(file.hash.as_ref())
             .bind(
                 extension_metadata
@@ -4787,11 +4790,18 @@ async fn upsert_media_file(
             .bind(&id_str)
             .execute(pool)
             .await?;
-        sync_media_tracks(pool, id, &metadata).await?;
+        if let Ok(metadata) = &probe_result {
+            playback_probe::upsert_media_file_probe_success(pool, &id_str, &file.path, metadata)
+                .await?;
+            sync_media_tracks(pool, id, metadata).await?;
+        } else if let Err(error) = &probe_result {
+            playback_probe::upsert_media_file_probe_failure(pool, &id_str, &file.path, error)
+                .await?;
+        }
         sync_external_subtitles(pool, id, &file.path).await?;
         return Ok(MediaFileUpsert {
             id,
-            duration_seconds: metadata.duration_seconds,
+            duration_seconds: metadata.and_then(|m| m.duration_seconds),
         });
     }
 
@@ -4802,12 +4812,12 @@ async fn upsert_media_file(
         .bind(source_config_id.map(|u| u.to_string()))
         .bind(&file.path)
         .bind(file.size_bytes)
-        .bind(metadata.container.as_ref().or(file.container.as_ref()))
-        .bind(metadata.video_codec.as_ref().or(file.video_codec.as_ref()))
-        .bind(metadata.audio_codec.as_ref().or(file.audio_codec.as_ref()))
-        .bind(metadata.width)
-        .bind(metadata.height)
-        .bind(metadata.bitrate_bps)
+        .bind(metadata.and_then(|m| m.container.as_ref()).or(file.container.as_ref()))
+        .bind(metadata.and_then(|m| m.video_codec.as_ref()).or(file.video_codec.as_ref()))
+        .bind(metadata.and_then(|m| m.audio_codec.as_ref()).or(file.audio_codec.as_ref()))
+        .bind(metadata.and_then(|m| m.width))
+        .bind(metadata.and_then(|m| m.height))
+        .bind(metadata.and_then(|m| m.bitrate_bps))
         .bind(file.hash.as_ref())
         .bind(
             extension_metadata
@@ -4815,12 +4825,24 @@ async fn upsert_media_file(
         )
         .execute(pool)
         .await?;
-    sync_media_tracks(pool, id, &metadata).await?;
+    if let Ok(metadata) = &probe_result {
+        playback_probe::upsert_media_file_probe_success(
+            pool,
+            &id.to_string(),
+            &file.path,
+            metadata,
+        )
+        .await?;
+        sync_media_tracks(pool, id, metadata).await?;
+    } else if let Err(error) = &probe_result {
+        playback_probe::upsert_media_file_probe_failure(pool, &id.to_string(), &file.path, error)
+            .await?;
+    }
     sync_external_subtitles(pool, id, &file.path).await?;
 
     Ok(MediaFileUpsert {
         id,
-        duration_seconds: metadata.duration_seconds,
+        duration_seconds: metadata.and_then(|m| m.duration_seconds),
     })
 }
 

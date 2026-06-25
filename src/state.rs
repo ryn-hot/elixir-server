@@ -9,12 +9,16 @@ use crate::{
     library::LinkerService,
     metadata::MetadataService,
     orchestrator::OrchestratorService,
-    playback::TranscodeManager,
+    playback::{
+        PlaybackJobCapacityLimits, PlaybackJobLimits, PlaybackJobManager,
+        hardware::HardwareCapabilities,
+    },
     runtime::docker::DockerStartupConfig,
     secrets::SecretsManager,
 };
 use sqlx::AnyPool;
 use std::sync::atomic::AtomicBool;
+use tokio::sync::OnceCell;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,7 +31,8 @@ pub struct AppState {
     pub metadata: Arc<MetadataService>,
     pub linkers: Arc<LinkerService>,
     pub artwork: Arc<ArtworkService>,
-    pub transcodes: Arc<TranscodeManager>,
+    pub transcodes: Arc<PlaybackJobManager>,
+    pub hardware_capabilities: Arc<OnceCell<HardwareCapabilities>>,
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
 }
@@ -72,17 +77,39 @@ impl AppState {
             settings.extensions.downloader_profile,
             secrets.clone(),
         );
+        let playback_job_limits = PlaybackJobLimits {
+            max_log_bytes: settings
+                .playback
+                .max_ffmpeg_log_bytes
+                .unwrap_or_else(|| PlaybackJobLimits::default().max_log_bytes),
+            max_temp_dir_bytes: settings
+                .playback
+                .max_temp_dir_bytes
+                .unwrap_or_else(|| PlaybackJobLimits::default().max_temp_dir_bytes),
+            ..PlaybackJobLimits::default()
+        };
+        let playback_jobs = Arc::new(PlaybackJobManager::with_capacity_limits(
+            db_pool.clone(),
+            PlaybackJobCapacityLimits {
+                max_hls_jobs: settings.playback.max_active_hls_jobs,
+                max_direct_streams: settings.playback.max_active_direct_streams,
+                max_video_transcodes: settings.playback.video_transcode_capacity_limit(),
+                max_hardware_transcodes: settings.playback.max_active_hardware_transcodes,
+            },
+            playback_job_limits,
+        ));
         Self {
             settings: Arc::new(settings),
             db_driver: database.driver,
-            db_pool,
+            db_pool: db_pool.clone(),
             auth_service,
             secrets,
             extensions: Arc::new(extensions),
             metadata: Arc::new(metadata),
             linkers: Arc::new(linkers),
             artwork: Arc::new(artwork),
-            transcodes: Arc::new(TranscodeManager::new()),
+            transcodes: playback_jobs,
+            hardware_capabilities: Arc::new(OnceCell::new()),
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),
         }

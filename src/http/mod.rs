@@ -420,7 +420,10 @@ pub fn router(state: AppState) -> Router {
             post(handlers::review::set_override),
         )
         .route("/api/v1/play", post(handlers::playback::play))
-        .route("/stream/direct/:id", get(handlers::playback::stream_direct))
+        .route(
+            "/stream/direct/:id",
+            get(handlers::playback::stream_direct).head(handlers::playback::stream_direct),
+        )
         .route(
             "/sessions/:id/master.m3u8",
             get(handlers::playback::master_playlist),
@@ -444,6 +447,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/:id/poll",
             get(handlers::playback::poll_session),
+        )
+        .route(
+            "/api/v1/sessions/:id/heartbeat",
+            post(handlers::playback::heartbeat_session),
         )
         .route(
             "/api/v1/sessions/:id/end",

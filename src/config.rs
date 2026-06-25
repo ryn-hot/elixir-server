@@ -213,6 +213,53 @@ impl Settings {
                 "playback.default_lan_max_bitrate_bps",
                 default_lan_bitrate_bps(),
             )?
+            .set_default("playback.allow_direct_play", default_true())?
+            .set_default("playback.allow_direct_stream", default_true())?
+            .set_default("playback.allow_audio_transcode", default_true())?
+            .set_default("playback.allow_video_transcode", default_true())?
+            .set_default("playback.allow_adaptive_transcode", default_false())?
+            .set_default("playback.plan_contract_enabled", default_false())?
+            .set_default("playback.hls_direct_stream_enabled", default_true())?
+            .set_default("playback.audio_transcode_enabled", default_true())?
+            .set_default("playback.subtitle_transcode_enabled", default_true())?
+            .set_default("playback.hardware_acceleration_enabled", default_false())?
+            .set_default("playback.adaptive_quality_enabled", default_false())?
+            .set_default("playback.force_direct_play_for_native_mpv", default_false())?
+            .set_default(
+                "playback.video_encoder_preset",
+                default_video_encoder_preset(),
+            )?
+            .set_default(
+                "playback.video_encoder_profile",
+                default_video_encoder_profile(),
+            )?
+            .set_default(
+                "playback.video_encoder_level",
+                default_video_encoder_level(),
+            )?
+            .set_default("playback.video_encoder_crf", default_video_encoder_crf())?
+            .set_default(
+                "playback.video_encoder_bufsize_multiplier",
+                default_video_encoder_bufsize_multiplier(),
+            )?
+            .set_default(
+                "playback.hardware_acceleration",
+                default_hardware_acceleration(),
+            )?
+            .set_default("playback.allow_hardware_decode", default_true())?
+            .set_default("playback.allow_hardware_encode", default_true())?
+            .set_default("playback.hardware_fallback", default_hardware_fallback())?
+            .set_default("playback.force_sdr_output", default_false())?
+            .set_default("playback.max_active_sessions", None::<u32>)?
+            .set_default("playback.max_active_direct_streams", None::<u32>)?
+            .set_default("playback.max_active_hls_jobs", None::<u32>)?
+            .set_default("playback.max_active_video_transcodes", None::<u32>)?
+            .set_default("playback.max_simultaneous_video_transcodes", None::<u32>)?
+            .set_default("playback.max_active_hardware_transcodes", None::<u32>)?
+            .set_default("playback.max_sessions_per_user", None::<u32>)?
+            .set_default("playback.max_startup_queue_length", None::<u32>)?
+            .set_default("playback.max_temp_dir_bytes", None::<u64>)?
+            .set_default("playback.max_ffmpeg_log_bytes", None::<u64>)?
             .set_default("telemetry.log_directives", default_log_directives())?
             .add_source(File::from(config_paths.default_file.clone()).required(false))
             .add_source(File::from(config_paths.local_file.clone()).required(false))
@@ -641,6 +688,72 @@ pub struct PlaybackConfig {
     pub default_wan_max_bitrate_bps: Option<i64>,
     #[serde(default = "default_lan_bitrate_bps")]
     pub default_lan_max_bitrate_bps: Option<i64>,
+    #[serde(default = "default_true")]
+    pub allow_direct_play: bool,
+    #[serde(default = "default_true")]
+    pub allow_direct_stream: bool,
+    #[serde(default = "default_true")]
+    pub allow_audio_transcode: bool,
+    #[serde(default = "default_true")]
+    pub allow_video_transcode: bool,
+    #[serde(default = "default_false")]
+    pub allow_adaptive_transcode: bool,
+    #[serde(default = "default_false")]
+    pub plan_contract_enabled: bool,
+    #[serde(default = "default_true")]
+    pub hls_direct_stream_enabled: bool,
+    #[serde(default = "default_true")]
+    pub audio_transcode_enabled: bool,
+    #[serde(default = "default_true")]
+    pub subtitle_transcode_enabled: bool,
+    #[serde(default = "default_false")]
+    pub hardware_acceleration_enabled: bool,
+    #[serde(default = "default_false")]
+    pub adaptive_quality_enabled: bool,
+    #[serde(default)]
+    pub server_upload_cap_bps: Option<i64>,
+    #[serde(default)]
+    pub max_simultaneous_video_transcodes: Option<u32>,
+    #[serde(default)]
+    pub max_active_video_transcodes: Option<u32>,
+    #[serde(default = "default_false")]
+    pub force_direct_play_for_native_mpv: bool,
+    #[serde(default = "default_video_encoder_preset")]
+    pub video_encoder_preset: String,
+    #[serde(default = "default_video_encoder_profile")]
+    pub video_encoder_profile: String,
+    #[serde(default = "default_video_encoder_level")]
+    pub video_encoder_level: String,
+    #[serde(default = "default_video_encoder_crf")]
+    pub video_encoder_crf: i32,
+    #[serde(default = "default_video_encoder_bufsize_multiplier")]
+    pub video_encoder_bufsize_multiplier: i32,
+    #[serde(default = "default_hardware_acceleration")]
+    pub hardware_acceleration: String,
+    #[serde(default = "default_true")]
+    pub allow_hardware_decode: bool,
+    #[serde(default = "default_true")]
+    pub allow_hardware_encode: bool,
+    #[serde(default = "default_hardware_fallback")]
+    pub hardware_fallback: String,
+    #[serde(default = "default_false")]
+    pub force_sdr_output: bool,
+    #[serde(default)]
+    pub max_active_sessions: Option<u32>,
+    #[serde(default)]
+    pub max_active_direct_streams: Option<u32>,
+    #[serde(default)]
+    pub max_active_hls_jobs: Option<u32>,
+    #[serde(default)]
+    pub max_active_hardware_transcodes: Option<u32>,
+    #[serde(default)]
+    pub max_sessions_per_user: Option<u32>,
+    #[serde(default)]
+    pub max_startup_queue_length: Option<u32>,
+    #[serde(default)]
+    pub max_temp_dir_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_ffmpeg_log_bytes: Option<u64>,
     #[serde(default)]
     pub profiles: PlaybackProfiles,
 }
@@ -656,8 +769,48 @@ impl Default for PlaybackConfig {
             default_supported_audio_codecs: default_supported_audio_codecs(),
             default_wan_max_bitrate_bps: default_wan_bitrate_bps(),
             default_lan_max_bitrate_bps: default_lan_bitrate_bps(),
+            allow_direct_play: default_true(),
+            allow_direct_stream: default_true(),
+            allow_audio_transcode: default_true(),
+            allow_video_transcode: default_true(),
+            allow_adaptive_transcode: default_false(),
+            plan_contract_enabled: default_false(),
+            hls_direct_stream_enabled: default_true(),
+            audio_transcode_enabled: default_true(),
+            subtitle_transcode_enabled: default_true(),
+            hardware_acceleration_enabled: default_false(),
+            adaptive_quality_enabled: default_false(),
+            server_upload_cap_bps: None,
+            max_simultaneous_video_transcodes: None,
+            max_active_video_transcodes: None,
+            force_direct_play_for_native_mpv: default_false(),
+            video_encoder_preset: default_video_encoder_preset(),
+            video_encoder_profile: default_video_encoder_profile(),
+            video_encoder_level: default_video_encoder_level(),
+            video_encoder_crf: default_video_encoder_crf(),
+            video_encoder_bufsize_multiplier: default_video_encoder_bufsize_multiplier(),
+            hardware_acceleration: default_hardware_acceleration(),
+            allow_hardware_decode: default_true(),
+            allow_hardware_encode: default_true(),
+            hardware_fallback: default_hardware_fallback(),
+            force_sdr_output: default_false(),
+            max_active_sessions: None,
+            max_active_direct_streams: None,
+            max_active_hls_jobs: None,
+            max_active_hardware_transcodes: None,
+            max_sessions_per_user: None,
+            max_startup_queue_length: None,
+            max_temp_dir_bytes: None,
+            max_ffmpeg_log_bytes: None,
             profiles: PlaybackProfiles::default(),
         }
+    }
+}
+
+impl PlaybackConfig {
+    pub fn video_transcode_capacity_limit(&self) -> Option<u32> {
+        self.max_active_video_transcodes
+            .or(self.max_simultaneous_video_transcodes)
     }
 }
 
@@ -870,6 +1023,34 @@ fn default_wan_bitrate_bps() -> Option<i64> {
 
 fn default_lan_bitrate_bps() -> Option<i64> {
     Some(20_000_000)
+}
+
+fn default_video_encoder_preset() -> String {
+    "veryfast".to_string()
+}
+
+fn default_video_encoder_profile() -> String {
+    "high".to_string()
+}
+
+fn default_video_encoder_level() -> String {
+    "4.1".to_string()
+}
+
+fn default_video_encoder_crf() -> i32 {
+    20
+}
+
+fn default_video_encoder_bufsize_multiplier() -> i32 {
+    2
+}
+
+fn default_hardware_acceleration() -> String {
+    "auto".to_string()
+}
+
+fn default_hardware_fallback() -> String {
+    "software".to_string()
 }
 
 fn discover_config_paths() -> ConfigPaths {

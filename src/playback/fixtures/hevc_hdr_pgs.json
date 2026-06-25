@@ -1,0 +1,57 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "hevc",
+      "profile": "Main 10",
+      "level": 153,
+      "pix_fmt": "yuv420p10le",
+      "width": 3840,
+      "height": 2160,
+      "avg_frame_rate": "24000/1001",
+      "bits_per_raw_sample": "10",
+      "bit_rate": "18000000",
+      "color_primaries": "bt2020",
+      "color_transfer": "smpte2084",
+      "color_space": "bt2020nc",
+      "side_data_list": [
+        { "side_data_type": "Mastering display metadata" },
+        { "side_data_type": "Content light level metadata" }
+      ],
+      "disposition": { "default": 1, "forced": 0 }
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "eac3",
+      "channels": 6,
+      "channel_layout": "5.1(side)",
+      "sample_rate": "48000",
+      "bit_rate": "640000",
+      "tags": { "language": "eng", "title": "E-AC-3 5.1" },
+      "disposition": { "default": 1, "forced": 0 }
+    },
+    {
+      "index": 2,
+      "codec_type": "subtitle",
+      "codec_name": "hdmv_pgs_subtitle",
+      "tags": { "language": "eng", "title": "Forced" },
+      "disposition": { "default": 0, "forced": 1 }
+    },
+    {
+      "index": 3,
+      "codec_type": "attachment",
+      "codec_name": "ttf"
+    }
+  ],
+  "format": {
+    "format_name": "matroska,webm",
+    "duration": "7200.000000",
+    "bit_rate": "21000000",
+    "size": "18900000000"
+  },
+  "chapters": [
+    { "id": 0, "start_time": "0.000000", "end_time": "600.000000" }
+  ]
+}

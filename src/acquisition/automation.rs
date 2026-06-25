@@ -8271,6 +8271,8 @@ fn api_error_to_anyhow(err: ApiError) -> anyhow::Error {
         | ApiError::Forbidden(message)
         | ApiError::NotFound(message)
         | ApiError::Conflict(message)
+        | ApiError::ConflictWithDetails { message, .. }
+        | ApiError::Structured { message, .. }
         | ApiError::Internal(message) => message,
     };
     anyhow!(message)
