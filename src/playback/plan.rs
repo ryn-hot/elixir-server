@@ -241,6 +241,12 @@ pub struct SubtitleBurnInPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoToneMapPlan {
     pub algorithm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_primaries: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transfer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_matrix: Option<String>,
     pub output_primaries: String,
     pub output_transfer: String,
     pub output_matrix: String,

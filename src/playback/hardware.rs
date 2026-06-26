@@ -329,7 +329,7 @@ async fn startup_probe_encoder(
         "-f",
         "lavfi",
         "-i",
-        "testsrc=size=64x64:rate=1:duration=0.2",
+        "testsrc=size=1280x720:rate=30:duration=0.2",
         "-frames:v",
         "1",
         "-c:v",
@@ -413,7 +413,14 @@ fn detect_decode_codecs(
                 .map(|codec| HardwareCodecSupport::new(api, codec, "cuda"))
                 .collect()
         }
-        HardwareApi::Amf => Vec::new(),
+        HardwareApi::Amf if hwaccels.contains("d3d11va") => ["h264", "hevc"]
+            .into_iter()
+            .map(|codec| HardwareCodecSupport::new(api, codec, "d3d11va"))
+            .collect(),
+        HardwareApi::Amf if hwaccels.contains("dxva2") => ["h264", "hevc"]
+            .into_iter()
+            .map(|codec| HardwareCodecSupport::new(api, codec, "dxva2"))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -511,6 +518,41 @@ mod tests {
         assert!(encode.iter().any(|support| support.codec == "hevc"));
         assert!(decode.iter().any(|support| support.codec == "h264"));
         assert!(decode.iter().any(|support| support.codec == "hevc"));
+    }
+
+    #[test]
+    fn reports_amf_encode_with_windows_hardware_decode_from_ffmpeg_fixtures() {
+        let hwaccels = parse_hwaccels("Hardware acceleration methods:\nd3d11va\ndxva2\n");
+        let encoders = parse_ffmpeg_components(
+            " V....D h264_amf             AMD AMF H.264 Encoder\n\
+              V....D hevc_amf             AMD AMF H.265 Encoder\n",
+        );
+        let decoders = BTreeSet::new();
+
+        assert!(api_configured(
+            HardwareApi::Amf,
+            &hwaccels,
+            &encoders,
+            &decoders
+        ));
+        let encode = detect_encode_codecs(HardwareApi::Amf, &encoders);
+        let decode = detect_decode_codecs(HardwareApi::Amf, &hwaccels, &decoders);
+
+        assert!(
+            encode
+                .iter()
+                .any(|support| support.ffmpeg_name == "h264_amf")
+        );
+        assert!(
+            decode
+                .iter()
+                .any(|support| { support.codec == "h264" && support.ffmpeg_name == "d3d11va" })
+        );
+        assert!(
+            decode
+                .iter()
+                .any(|support| { support.codec == "hevc" && support.ffmpeg_name == "d3d11va" })
+        );
     }
 
     #[test]

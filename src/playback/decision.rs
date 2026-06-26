@@ -1,5 +1,5 @@
 use crate::playback::{
-    hardware::{HardwareFallbackPolicy, HardwarePreference},
+    hardware::{HardwareApi, HardwareFallbackPolicy, HardwarePreference},
     plan::{
         AdaptiveAudioStrategy, AdaptiveLadderPlan, AdaptiveRungPlan, AudioOutputPlan,
         CompatibilityCheck, CompatibilityReport, Delivery, ExpectedOutput,
@@ -15,6 +15,8 @@ use crate::playback::{
         ClientKind, ClientPlaybackProfile, EffectivePlaybackPolicy, QualityMode, SubtitleBurnPolicy,
     },
 };
+
+const VIDEOTOOLBOX_H264_MIN_OUTPUT_WIDTH: i32 = 640;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaybackSelection {
@@ -803,6 +805,86 @@ fn target_audio_bitrate_bps(codec: &str, channels: i32) -> Option<i64> {
     }
 }
 
+fn planned_tone_map(
+    video: &VideoStreamCapabilities,
+    hdr_action: HdrAction,
+) -> Option<VideoToneMapPlan> {
+    if !matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported) {
+        return None;
+    }
+
+    Some(VideoToneMapPlan {
+        algorithm: "hable".to_string(),
+        input_primaries: tone_map_input_primaries(video),
+        input_transfer: tone_map_input_transfer(video),
+        input_matrix: tone_map_input_matrix(video),
+        output_primaries: "bt709".to_string(),
+        output_transfer: "bt709".to_string(),
+        output_matrix: "bt709".to_string(),
+    })
+}
+
+fn tone_map_input_primaries(video: &VideoStreamCapabilities) -> Option<String> {
+    normalize_zscale_primaries(video.color_primaries.as_deref()).or_else(|| {
+        (video.dolby_vision || video.hdr10 || video.hdr10_plus).then(|| "bt2020".to_string())
+    })
+}
+
+fn tone_map_input_transfer(video: &VideoStreamCapabilities) -> Option<String> {
+    normalize_zscale_transfer(video.color_transfer.as_deref()).or_else(|| {
+        (video.dolby_vision || video.hdr10 || video.hdr10_plus).then(|| "smpte2084".to_string())
+    })
+}
+
+fn tone_map_input_matrix(video: &VideoStreamCapabilities) -> Option<String> {
+    if video.dolby_vision && !video.dolby_vision_has_hdr10_fallback {
+        return Some("ictcp".to_string());
+    }
+    normalize_zscale_matrix(video.color_matrix.as_deref()).or_else(|| {
+        (video.dolby_vision || video.hdr10 || video.hdr10_plus).then(|| "bt2020nc".to_string())
+    })
+}
+
+fn normalize_zscale_primaries(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "unknown" | "unspecified" => None,
+        "bt2020" | "2020" => Some("bt2020".to_string()),
+        "bt709" | "709" => Some("bt709".to_string()),
+        "smpte170m" | "170m" => Some("smpte170m".to_string()),
+        "smpte240m" | "240m" => Some("smpte240m".to_string()),
+        "bt470m" | "bt470bg" | "film" | "smpte428" | "smpte431" | "smpte432" => Some(value),
+        _ => None,
+    }
+}
+
+fn normalize_zscale_transfer(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "unknown" | "unspecified" => None,
+        "smpte2084" | "pq" => Some("smpte2084".to_string()),
+        "arib-std-b67" | "hlg" => Some("arib-std-b67".to_string()),
+        "bt709" | "709" => Some("bt709".to_string()),
+        "bt2020-10" | "bt2020_10" | "2020_10" => Some("bt2020-10".to_string()),
+        "bt2020-12" | "bt2020_12" | "2020_12" => Some("bt2020-12".to_string()),
+        "linear" | "smpte170m" | "smpte240m" | "bt470m" | "bt470bg" => Some(value),
+        _ => None,
+    }
+}
+
+fn normalize_zscale_matrix(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "unknown" | "unspecified" => None,
+        "bt2020nc" | "bt2020_ncl" | "2020_ncl" => Some("bt2020nc".to_string()),
+        "bt2020c" | "bt2020_cl" | "2020_cl" => Some("bt2020c".to_string()),
+        "bt709" | "709" => Some("bt709".to_string()),
+        "ictcp" => Some("ictcp".to_string()),
+        "gbr" | "fcc" | "bt470bg" | "smpte170m" | "smpte240m" | "ycgco" => Some(value),
+        _ => None,
+    }
+}
+
 fn planned_video_output(
     video: &VideoStreamCapabilities,
     subtitle: Option<&SubtitleStreamCapabilities>,
@@ -814,15 +896,7 @@ fn planned_video_output(
     policy: &EffectivePlaybackPolicy,
 ) -> Result<VideoOutputPlan, String> {
     let scale = target_video_scale(video, policy.max_resolution.as_deref());
-    let tone_map =
-        matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported).then(|| {
-            VideoToneMapPlan {
-                algorithm: "hable".to_string(),
-                output_primaries: "bt709".to_string(),
-                output_transfer: "bt709".to_string(),
-                output_matrix: "bt709".to_string(),
-            }
-        });
+    let tone_map = planned_tone_map(video, hdr_action);
     let output_height = scale
         .as_ref()
         .map(|scale| scale.height)
@@ -941,15 +1015,7 @@ fn planned_adaptive_ladder(
         .unwrap_or(24.0);
     let segment_seconds = 4;
     let gop_frames = ((fps_for_gop * segment_seconds as f64).round() as i32).clamp(12, 300);
-    let tone_map =
-        matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported).then(|| {
-            VideoToneMapPlan {
-                algorithm: "hable".to_string(),
-                output_primaries: "bt709".to_string(),
-                output_transfer: "bt709".to_string(),
-                output_matrix: "bt709".to_string(),
-            }
-        });
+    let tone_map = planned_tone_map(video, hdr_action);
 
     let mut rungs = Vec::new();
     for (target_height, default_bitrate_bps) in adaptive_default_ladder() {
@@ -1150,18 +1216,24 @@ fn planned_hardware_acceleration(
     let mut warnings = Vec::new();
     let source_codec = video.codec.as_deref().unwrap_or_default();
     let filter_graph_requires_software = video_filter_graph_requires_software(output);
+    if let Some(reason) = hardware_encoder_unsupported_reason(api, video, output) {
+        return hardware_unavailable_or_software(
+            fail_if_unavailable,
+            fallback_policy,
+            software,
+            reason,
+        );
+    }
 
-    let decoder = if policy.allow_hardware_decode
-        && !filter_graph_requires_software
-        && capabilities.decode_support(api, source_codec).is_some()
-    {
-        Some(api.as_str().to_string())
+    let decode_support = if policy.allow_hardware_decode && !filter_graph_requires_software {
+        capabilities.decode_support(api, source_codec)
     } else {
         if policy.allow_hardware_decode && filter_graph_requires_software {
             push_unique(&mut warnings, "hardware_decode_disabled_filter_graph");
         }
         None
     };
+    let decoder = decode_support.map(|support| support.ffmpeg_name.clone());
 
     let encoder = if policy.allow_hardware_encode {
         capabilities
@@ -1223,6 +1295,26 @@ fn planned_hardware_acceleration(
         fallback,
     };
     Ok((plan, warnings))
+}
+
+fn hardware_encoder_unsupported_reason(
+    api: HardwareApi,
+    video: &VideoStreamCapabilities,
+    output: &VideoOutputPlan,
+) -> Option<String> {
+    let output_width = output
+        .scale
+        .as_ref()
+        .map(|scale| scale.width)
+        .or(video.width)
+        .filter(|width| *width > 0);
+    if api == HardwareApi::VideoToolbox
+        && output.codec == "h264"
+        && output_width.is_some_and(|width| width < VIDEOTOOLBOX_H264_MIN_OUTPUT_WIDTH)
+    {
+        return Some("hardware_encoder_min_width_unsupported:videotoolbox:h264".to_string());
+    }
+    None
 }
 
 fn hardware_unavailable_or_software(
@@ -2088,6 +2180,29 @@ mod tests {
         }
     }
 
+    fn nvenc_capabilities() -> HardwareCapabilities {
+        HardwareCapabilities {
+            platform: "windows-x86_64".to_string(),
+            ffmpeg_version: Some("ffmpeg fixture".to_string()),
+            available_apis: vec!["nvenc".to_string()],
+            supported_decode_codecs: vec![HardwareCodecSupport {
+                api: "nvenc".to_string(),
+                codec: "h264".to_string(),
+                ffmpeg_name: "cuda".to_string(),
+            }],
+            supported_encode_codecs: vec![HardwareCodecSupport {
+                api: "nvenc".to_string(),
+                codec: "h264".to_string(),
+                ffmpeg_name: "h264_nvenc".to_string(),
+            }],
+            max_sessions: None,
+            hdr_tone_mapping: false,
+            subtitle_burn_in_limitations: Vec::new(),
+            startup_probes: Vec::new(),
+            detection_errors: Vec::new(),
+        }
+    }
+
     #[test]
     fn planner_goldens_from_probe_fixtures_without_filesystem() {
         let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
@@ -2323,6 +2438,72 @@ mod tests {
         assert_eq!(output.codec, "ac3");
         assert_eq!(output.channels, Some(6));
         assert_eq!(output.bitrate_bps, Some(448_000));
+    }
+
+    #[test]
+    fn dolby_vision_profile5_tone_map_declares_ictcp_input() {
+        let media = capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                "bit_rate": "13366070",
+                "duration": "29.950000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "hevc",
+                  "codec_tag_string": "dvh1",
+                  "profile": "Main 10",
+                  "pix_fmt": "yuv420p10le",
+                  "width": 1920,
+                  "height": 1080,
+                  "avg_frame_rate": "60/1",
+                  "bit_rate": "13359836",
+                  "side_data_list": [
+                    {
+                      "side_data_type": "DOVI configuration record",
+                      "dv_profile": 5,
+                      "dv_bl_signal_compatibility_id": 0,
+                      "rpu_present_flag": 1,
+                      "bl_present_flag": 1,
+                      "el_present_flag": 0
+                    }
+                  ]
+                }
+              ]
+            }
+            "#,
+        );
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_video_transcode: true,
+            force_sdr_output: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+
+        let plan = plan_playback(
+            "dv-p5-no-hdr10-fallback",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        let tone_map = plan
+            .video_output
+            .as_ref()
+            .unwrap()
+            .tone_map
+            .as_ref()
+            .unwrap();
+        assert_eq!(tone_map.input_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(tone_map.input_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(tone_map.input_matrix.as_deref(), Some("ictcp"));
+        assert_eq!(tone_map.output_matrix, "bt709");
     }
 
     #[test]
@@ -2867,6 +3048,76 @@ mod tests {
                 .as_ref()
                 .map(|output| output.encoder.as_str()),
             Some("h264_videotoolbox")
+        );
+    }
+
+    #[test]
+    fn phase10_planner_records_nvenc_decode_as_ffmpeg_cuda_token() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            hardware_capabilities: nvenc_capabilities(),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(3_000_000);
+
+        let plan = plan_playback(
+            "hardware-file",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        assert!(plan.hardware_acceleration.enabled);
+        assert_eq!(plan.hardware_acceleration.api.as_deref(), Some("nvenc"));
+        assert_eq!(plan.hardware_acceleration.decoder.as_deref(), Some("cuda"));
+        assert_eq!(
+            plan.hardware_acceleration.encoder.as_deref(),
+            Some("h264_nvenc")
+        );
+    }
+
+    #[test]
+    fn phase10_planner_falls_back_for_videotoolbox_h264_width_floor() {
+        let mut media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let video = media.video_streams.first_mut().unwrap();
+        video.width = Some(320);
+        video.height = Some(180);
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            hardware_capabilities: videotoolbox_capabilities(),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(3_000_000);
+
+        let plan = plan_playback(
+            "low-width-hardware-file",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        assert!(plan.playable);
+        assert!(!plan.hardware_acceleration.enabled);
+        assert_eq!(
+            plan.video_output
+                .as_ref()
+                .map(|output| output.encoder.as_str()),
+            Some("libx264")
+        );
+        assert!(
+            plan.warnings
+                .contains(&"hardware_encoder_min_width_unsupported:videotoolbox:h264".to_string()),
+            "{:?}",
+            plan.warnings
         );
     }
 

@@ -21,6 +21,7 @@ use crate::playback::plan::{
     SubtitleBurnInMode, VideoFrameRateMode, VideoOutputPlan,
 };
 
+pub mod certification;
 pub mod decision;
 pub mod hardware;
 pub mod jobs;
@@ -462,6 +463,15 @@ pub(crate) fn build_direct_stream_ffmpeg_args(
     args
 }
 
+fn push_transcode_seek_args(args: &mut Vec<String>, seek_seconds: f32) {
+    if seek_seconds.abs() < f32::EPSILON {
+        args.push("-copyts".to_string());
+        args.push("-start_at_zero".to_string());
+    }
+    args.push("-ss".to_string());
+    args.push(format!("{}", seek_seconds));
+}
+
 fn build_transcode_ffmpeg_args(
     input: &str,
     params: &TranscodeParams,
@@ -492,11 +502,8 @@ fn build_transcode_ffmpeg_args(
         "-nostdin".to_string(),
         "-loglevel".to_string(),
         "warning".to_string(),
-        "-copyts".to_string(),
-        "-start_at_zero".to_string(),
-        "-ss".to_string(),
-        format!("{}", params.seek_seconds),
     ];
+    push_transcode_seek_args(&mut args, params.seek_seconds);
     push_hardware_decode_args(&mut args, playback_plan);
     args.extend(["-i".to_string(), input.to_string()]);
 
@@ -671,11 +678,8 @@ fn build_adaptive_transcode_ffmpeg_args(
         "-nostdin".to_string(),
         "-loglevel".to_string(),
         "warning".to_string(),
-        "-copyts".to_string(),
-        "-start_at_zero".to_string(),
-        "-ss".to_string(),
-        format!("{}", params.seek_seconds),
     ];
+    push_transcode_seek_args(&mut args, params.seek_seconds);
     push_hardware_decode_args(&mut args, Some(plan));
     args.extend(["-i".to_string(), input.to_string()]);
 
@@ -1101,8 +1105,24 @@ fn planned_video_filter(input: &str, playback_plan: Option<&PlaybackPlan>) -> Vi
 fn planned_video_filters(output: &VideoOutputPlan) -> Vec<String> {
     let mut filters = Vec::new();
     if let Some(tone_map) = output.tone_map.as_ref() {
+        let mut linearize = Vec::new();
+        if let Some(input_primaries) = tone_map.input_primaries.as_deref() {
+            linearize.push(format!("pin={}", input_primaries.trim()));
+            linearize.push(format!("p={}", input_primaries.trim()));
+        }
+        if let Some(input_transfer) = tone_map.input_transfer.as_deref() {
+            linearize.push(format!("tin={}", input_transfer.trim()));
+        }
+        if let Some(input_matrix) = tone_map.input_matrix.as_deref() {
+            linearize.push(format!("min={}", input_matrix.trim()));
+        }
+        linearize.extend([
+            "t=linear".to_string(),
+            "m=gbr".to_string(),
+            "npl=100".to_string(),
+        ]);
         filters.extend([
-            "zscale=t=linear:npl=100".to_string(),
+            format!("zscale={}", linearize.join(":")),
             "format=gbrpf32le".to_string(),
             format!("tonemap=tonemap={}:desat=0", tone_map.algorithm),
             format!(
@@ -1272,8 +1292,20 @@ fn push_hardware_decode_args(args: &mut Vec<String>, playback_plan: Option<&Play
     match hardware.api.as_deref().unwrap_or_default() {
         "videotoolbox" => args.extend(["-hwaccel".to_string(), "videotoolbox".to_string()]),
         "vaapi" => args.extend(["-hwaccel".to_string(), "vaapi".to_string()]),
-        "qsv" => args.extend(["-hwaccel".to_string(), "qsv".to_string()]),
+        "qsv" => {
+            args.extend(["-hwaccel".to_string(), "qsv".to_string()]);
+            if let Some(decoder) = hardware.decoder.as_deref() {
+                if decoder.ends_with("_qsv") {
+                    args.extend(["-c:v".to_string(), decoder.to_string()]);
+                }
+            }
+        }
         "nvenc" => args.extend(["-hwaccel".to_string(), "cuda".to_string()]),
+        "amf" => match hardware.decoder.as_deref().unwrap_or_default() {
+            "d3d11va" => args.extend(["-hwaccel".to_string(), "d3d11va".to_string()]),
+            "dxva2" => args.extend(["-hwaccel".to_string(), "dxva2".to_string()]),
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -1760,6 +1792,13 @@ mod tests {
         );
     }
 
+    fn assert_arg_absent(args: &[String], value: &str) {
+        assert!(
+            !args.iter().any(|arg| arg == value),
+            "{value} unexpectedly present in {args:?}"
+        );
+    }
+
     fn adaptive_rung_video(width: i32, height: i32, bitrate_bps: i64) -> VideoOutputPlan {
         VideoOutputPlan {
             codec: "h264".to_string(),
@@ -1896,6 +1935,9 @@ mod tests {
             "-filter_complex",
             "[0:0]split=2[vsrc0][vsrc1];[vsrc0]scale=1280:720[v0];[vsrc1]scale=854:480[v1]",
         );
+        assert_arg_pair(&args, "-ss", "8");
+        assert_arg_absent(&args, "-copyts");
+        assert_arg_absent(&args, "-start_at_zero");
         assert_arg_pair(&args, "-map", "[v0]");
         assert_arg_pair(&args, "-map", "[v1]");
         assert_arg_pair(&args, "-c:v:0", "libx264");
@@ -2117,6 +2159,8 @@ mod tests {
             "-filter_complex",
             "[0:0]scale=1920:1080[vbase];[vbase][0:2]overlay[vout]",
         );
+        assert_arg_pair(&args, "-copyts", "-start_at_zero");
+        assert_arg_pair(&args, "-ss", "0");
         assert_arg_pair(&args, "-map", "[vout]");
         assert_arg_pair(&args, "-map", "0:1");
         assert!(
@@ -2179,6 +2223,9 @@ mod tests {
             scale: None,
             tone_map: Some(VideoToneMapPlan {
                 algorithm: "hable".to_string(),
+                input_primaries: Some("bt2020".to_string()),
+                input_transfer: Some("smpte2084".to_string()),
+                input_matrix: Some("bt2020nc".to_string()),
                 output_primaries: "bt709".to_string(),
                 output_transfer: "bt709".to_string(),
                 output_matrix: "bt709".to_string(),
@@ -2209,7 +2256,7 @@ mod tests {
         assert_arg_pair(
             &args,
             "-vf",
-            "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p",
+            "zscale=pin=bt2020:p=bt2020:tin=smpte2084:min=bt2020nc:t=linear:m=gbr:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p",
         );
         assert_arg_pair(&args, "-color_primaries", "bt709");
         assert_arg_pair(&args, "-color_trc", "bt709");
@@ -2292,6 +2339,150 @@ mod tests {
         assert_arg_pair(&args, "-b:v", "3000k");
         assert!(!args.iter().any(|arg| arg == "-crf"));
         assert!(!args.iter().any(|arg| arg == "-preset"));
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_apply_amf_with_windows_hardware_decode() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Transcode,
+            StreamAction::Disabled,
+            Some(AudioOutputPlan {
+                codec: "aac".to_string(),
+                channels: Some(2),
+                bitrate_bps: Some(128_000),
+                language: None,
+                title: None,
+                reasons: Vec::new(),
+            }),
+        );
+        plan.hardware_acceleration = HardwareAccelerationPlan {
+            enabled: true,
+            api: Some("amf".to_string()),
+            decoder: Some("d3d11va".to_string()),
+            encoder: Some("h264_amf".to_string()),
+            fallback: Some("software".to_string()),
+        };
+        plan.video_output = Some(VideoOutputPlan {
+            codec: "h264".to_string(),
+            encoder: "h264_amf".to_string(),
+            preset: "veryfast".to_string(),
+            profile: Some("high".to_string()),
+            level: Some("4.1".to_string()),
+            crf: None,
+            bitrate_bps: Some(3_000_000),
+            maxrate_bps: Some(3_000_000),
+            bufsize_bps: Some(6_000_000),
+            pixel_format: Some("yuv420p".to_string()),
+            scale: None,
+            tone_map: None,
+            frame_rate: VideoFrameRatePlan {
+                mode: VideoFrameRateMode::Source,
+                source_fps: Some("23.976".to_string()),
+                target_fps: None,
+            },
+            gop_frames: Some(96),
+            segment_seconds: "4".to_string(),
+            keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+            hls_delivery: Delivery::HlsFmp4,
+            burn_in: None,
+            reasons: vec!["hardware_encoder_selected:h264_amf".to_string()],
+        });
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-hwaccel", "d3d11va");
+        assert_arg_pair(&args, "-c:v", "h264_amf");
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_apply_qsv_with_explicit_hardware_decoder() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Transcode,
+            StreamAction::Disabled,
+            Some(AudioOutputPlan {
+                codec: "aac".to_string(),
+                channels: Some(2),
+                bitrate_bps: Some(128_000),
+                language: None,
+                title: None,
+                reasons: Vec::new(),
+            }),
+        );
+        plan.hardware_acceleration = HardwareAccelerationPlan {
+            enabled: true,
+            api: Some("qsv".to_string()),
+            decoder: Some("h264_qsv".to_string()),
+            encoder: Some("h264_qsv".to_string()),
+            fallback: Some("software".to_string()),
+        };
+        plan.video_output = Some(VideoOutputPlan {
+            codec: "h264".to_string(),
+            encoder: "h264_qsv".to_string(),
+            preset: "veryfast".to_string(),
+            profile: Some("high".to_string()),
+            level: Some("4.1".to_string()),
+            crf: None,
+            bitrate_bps: Some(3_000_000),
+            maxrate_bps: Some(3_000_000),
+            bufsize_bps: Some(6_000_000),
+            pixel_format: Some("yuv420p".to_string()),
+            scale: None,
+            tone_map: None,
+            frame_rate: VideoFrameRatePlan {
+                mode: VideoFrameRateMode::Source,
+                source_fps: Some("23.976".to_string()),
+                target_fps: None,
+            },
+            gop_frames: Some(96),
+            segment_seconds: "4".to_string(),
+            keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+            hls_delivery: Delivery::HlsFmp4,
+            burn_in: None,
+            reasons: vec!["hardware_encoder_selected:h264_qsv".to_string()],
+        });
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-hwaccel", "qsv");
+        let input_index = args.iter().position(|arg| arg == "-i").unwrap();
+        assert_arg_pair(&args[..input_index], "-c:v", "h264_qsv");
+        assert_arg_pair(&args[input_index..], "-c:v", "h264_qsv");
     }
 
     #[test]
