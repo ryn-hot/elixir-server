@@ -17,6 +17,70 @@ use crate::playback::{
 };
 
 const VIDEOTOOLBOX_H264_MIN_OUTPUT_WIDTH: i32 = 640;
+const H264_LEVEL_LIMITS: &[H264LevelLimit] = &[
+    H264LevelLimit {
+        level: 30,
+        max_macroblocks_per_second: 40_500,
+        max_macroblocks_per_frame: 1_620,
+    },
+    H264LevelLimit {
+        level: 31,
+        max_macroblocks_per_second: 108_000,
+        max_macroblocks_per_frame: 3_600,
+    },
+    H264LevelLimit {
+        level: 40,
+        max_macroblocks_per_second: 245_760,
+        max_macroblocks_per_frame: 8_192,
+    },
+    H264LevelLimit {
+        level: 41,
+        max_macroblocks_per_second: 245_760,
+        max_macroblocks_per_frame: 8_192,
+    },
+    H264LevelLimit {
+        level: 42,
+        max_macroblocks_per_second: 522_240,
+        max_macroblocks_per_frame: 8_704,
+    },
+    H264LevelLimit {
+        level: 50,
+        max_macroblocks_per_second: 589_824,
+        max_macroblocks_per_frame: 22_080,
+    },
+    H264LevelLimit {
+        level: 51,
+        max_macroblocks_per_second: 983_040,
+        max_macroblocks_per_frame: 36_864,
+    },
+    H264LevelLimit {
+        level: 52,
+        max_macroblocks_per_second: 2_073_600,
+        max_macroblocks_per_frame: 36_864,
+    },
+    H264LevelLimit {
+        level: 60,
+        max_macroblocks_per_second: 4_177_920,
+        max_macroblocks_per_frame: 139_264,
+    },
+    H264LevelLimit {
+        level: 61,
+        max_macroblocks_per_second: 8_355_840,
+        max_macroblocks_per_frame: 139_264,
+    },
+    H264LevelLimit {
+        level: 62,
+        max_macroblocks_per_second: 16_711_680,
+        max_macroblocks_per_frame: 139_264,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct H264LevelLimit {
+    level: u8,
+    max_macroblocks_per_second: i64,
+    max_macroblocks_per_frame: i64,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaybackSelection {
@@ -897,6 +961,11 @@ fn planned_video_output(
 ) -> Result<VideoOutputPlan, String> {
     let scale = target_video_scale(video, policy.max_resolution.as_deref());
     let tone_map = planned_tone_map(video, hdr_action);
+    let output_width = scale
+        .as_ref()
+        .map(|scale| scale.width)
+        .or(video.width)
+        .filter(|width| *width > 0);
     let output_height = scale
         .as_ref()
         .map(|scale| scale.height)
@@ -938,13 +1007,20 @@ fn planned_video_output(
             &format!("video_transcode_reason:{primary_reason}"),
         );
     }
+    let level = planned_h264_level(
+        &policy.video_encoder_level,
+        output_width,
+        output_height,
+        fps_for_gop,
+        &mut output_reasons,
+    );
 
     Ok(VideoOutputPlan {
         codec: "h264".to_string(),
         encoder: "libx264".to_string(),
         preset: clean_or_default(&policy.video_encoder_preset, "veryfast"),
         profile: non_empty_string(&policy.video_encoder_profile),
-        level: non_empty_string(&policy.video_encoder_level),
+        level,
         crf: target_bitrate
             .is_none()
             .then_some(policy.video_encoder_crf.clamp(0, 51)),
@@ -1070,12 +1146,20 @@ fn planned_adaptive_ladder(
 
         let rung_id = rungs.len().to_string();
         let label = format!("{}p {}k", target_height, target_bitrate_bps / 1000);
+        let output_height = even_dimension(target_height);
+        let level = planned_h264_level(
+            &policy.video_encoder_level,
+            Some(target_width),
+            Some(output_height),
+            fps_for_gop,
+            &mut output_reasons,
+        );
         let video = VideoOutputPlan {
             codec: "h264".to_string(),
             encoder: "libx264".to_string(),
             preset: clean_or_default(&policy.video_encoder_preset, "veryfast"),
             profile: non_empty_string(&policy.video_encoder_profile),
-            level: non_empty_string(&policy.video_encoder_level),
+            level,
             crf: None,
             bitrate_bps: Some(target_bitrate_bps),
             maxrate_bps: Some(target_bitrate_bps),
@@ -1099,7 +1183,7 @@ fn planned_adaptive_ladder(
             label,
             bandwidth_bps: target_bitrate_bps,
             width: target_width,
-            height: even_dimension(target_height),
+            height: output_height,
             video,
         });
     }
@@ -1392,6 +1476,72 @@ fn planned_frame_rate(video: &VideoStreamCapabilities) -> VideoFrameRatePlan {
         source_fps,
         target_fps,
     }
+}
+
+fn planned_h264_level(
+    policy_level: &str,
+    output_width: Option<i32>,
+    output_height: Option<i32>,
+    output_fps: f64,
+    reasons: &mut Vec<String>,
+) -> Option<String> {
+    let configured = non_empty_string(policy_level)?;
+    let Some(required) = required_h264_level(output_width, output_height, output_fps) else {
+        return Some(configured);
+    };
+    let configured_level = parse_h264_level(&configured);
+    if configured_level.is_some_and(|level| level >= required) {
+        return Some(configured);
+    }
+
+    push_unique(reasons, "h264_level_raised_for_output_geometry");
+    Some(format_h264_level(required))
+}
+
+fn required_h264_level(width: Option<i32>, height: Option<i32>, fps: f64) -> Option<u8> {
+    let width = width.filter(|value| *value > 0)?;
+    let height = height.filter(|value| *value > 0)?;
+    let fps = if fps.is_finite() && fps > 0.0 {
+        fps
+    } else {
+        24.0
+    };
+    let macroblock_width = ((i64::from(width)) + 15) / 16;
+    let macroblock_height = ((i64::from(height)) + 15) / 16;
+    let macroblocks_per_frame = macroblock_width.saturating_mul(macroblock_height);
+    let macroblocks_per_second = ((macroblocks_per_frame as f64) * fps).ceil() as i64;
+
+    H264_LEVEL_LIMITS
+        .iter()
+        .find(|limit| {
+            macroblocks_per_frame <= limit.max_macroblocks_per_frame
+                && macroblocks_per_second <= limit.max_macroblocks_per_second
+        })
+        .map(|limit| limit.level)
+}
+
+fn parse_h264_level(raw: &str) -> Option<u8> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some((major, minor)) = value.split_once('.') {
+        let major = major.trim().parse::<u8>().ok()?;
+        let minor = minor.trim().chars().find_map(|ch| ch.to_digit(10))? as u8;
+        return Some(major.saturating_mul(10).saturating_add(minor));
+    }
+
+    let numeric = value.parse::<u8>().ok()?;
+    if numeric < 10 {
+        Some(numeric.saturating_mul(10))
+    } else {
+        Some(numeric)
+    }
+}
+
+fn format_h264_level(level: u8) -> String {
+    format!("{}.{}", level / 10, level % 10)
 }
 
 fn target_video_scale(
@@ -2148,6 +2298,43 @@ mod tests {
         }
     }
 
+    fn h264_1080p60_capabilities() -> MediaCapabilities {
+        capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "matroska,webm",
+                "bit_rate": "12000000",
+                "duration": "30.000000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "h264",
+                  "profile": "High",
+                  "pix_fmt": "yuv420p",
+                  "width": 1920,
+                  "height": 1080,
+                  "avg_frame_rate": "60/1",
+                  "bit_rate": "11800000",
+                  "level": 40
+                },
+                {
+                  "index": 1,
+                  "codec_type": "audio",
+                  "codec_name": "aac",
+                  "channels": 2,
+                  "channel_layout": "stereo",
+                  "sample_rate": "48000",
+                  "bit_rate": "192000"
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
     fn videotoolbox_capabilities() -> HardwareCapabilities {
         HardwareCapabilities {
             platform: "macos-x86_64".to_string(),
@@ -2438,6 +2625,92 @@ mod tests {
         assert_eq!(output.codec, "ac3");
         assert_eq!(output.channels, Some(6));
         assert_eq!(output.bitrate_bps, Some(448_000));
+    }
+
+    #[test]
+    fn h264_level_helpers_require_4_2_for_1080p60_and_5_2_for_4k60() {
+        assert_eq!(parse_h264_level("4.1"), Some(41));
+        assert_eq!(parse_h264_level("41"), Some(41));
+        assert_eq!(parse_h264_level("5"), Some(50));
+        assert_eq!(required_h264_level(Some(1280), Some(720), 30.0), Some(31));
+        assert_eq!(required_h264_level(Some(1920), Some(1080), 60.0), Some(42));
+        assert_eq!(required_h264_level(Some(3840), Some(2160), 60.0), Some(52));
+    }
+
+    #[test]
+    fn h264_output_level_raises_for_1080p60_video_transcode() {
+        let media = h264_1080p60_capabilities();
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_play: false,
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            max_bitrate_bps: Some(3_000_000),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.video_encoder_level = "4.1".to_string();
+
+        let plan = plan_playback(
+            "h264-1080p60-output-level",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        let output = plan.video_output.as_ref().unwrap();
+        assert_eq!(output.level.as_deref(), Some("4.2"));
+        assert!(
+            output
+                .reasons
+                .contains(&"h264_level_raised_for_output_geometry".to_string()),
+            "{:?}",
+            output.reasons
+        );
+    }
+
+    #[test]
+    fn adaptive_ladder_raises_1080p60_rung_level() {
+        let media = h264_1080p60_capabilities();
+        let mut client = ClientPlaybackProfile::browser_like();
+        client.quality_mode = QualityMode::Automatic;
+        client.max_bitrate_bps = Some(50_000_000);
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_play: false,
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            allow_adaptive_transcode: true,
+            max_bitrate_bps: Some(50_000_000),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.video_encoder_level = "4.1".to_string();
+
+        let plan = plan_playback(
+            "h264-1080p60-adaptive-level",
+            &media,
+            PlaybackSelection::default(),
+            &client,
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::AdaptiveTranscode);
+        let ladder = plan.adaptive_ladder.as_ref().unwrap();
+        let full_hd_rung = ladder
+            .rungs
+            .iter()
+            .find(|rung| rung.height == 1080)
+            .expect("1080p rung should be present for 1080p source");
+        assert_eq!(full_hd_rung.video.level.as_deref(), Some("4.2"));
+        assert!(
+            full_hd_rung
+                .video
+                .reasons
+                .contains(&"h264_level_raised_for_output_geometry".to_string()),
+            "{:?}",
+            full_hd_rung.video.reasons
+        );
     }
 
     #[test]
