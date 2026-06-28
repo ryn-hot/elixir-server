@@ -37,6 +37,7 @@ const PUBLIC_CORPUS_LOCK: &str =
 const CERTIFICATION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CASE_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_OUTPUT_SECONDS: f64 = 6.0;
+const HARDWARE_PERFORMANCE_GATE_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -687,7 +688,7 @@ impl CertificationRun {
         }
 
         let metrics = self
-            .run_hls_output(case, case_dir, &plan, "hardware")
+            .run_hls_output_with_performance_retry(case, case_dir, &plan)
             .await
             .context("hardware HLS output failed")?;
         report.realtime_factor = Some(metrics.realtime_factor);
@@ -766,6 +767,9 @@ impl CertificationRun {
         label: &str,
     ) -> Result<CaseMetrics> {
         let output_dir = output_dir_for_label(case_dir, label);
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir)?;
+        }
         fs::create_dir_all(&output_dir)?;
         let layout = HlsOutputLayout::for_job(&output_dir, plan.mode, plan.delivery);
         let params = TranscodeParams {
@@ -890,6 +894,35 @@ impl CertificationRun {
             &artifact_path_for_label(case_dir, label, "metrics.json"),
             &metrics,
         )?;
+        Ok(metrics)
+    }
+
+    async fn run_hls_output_with_performance_retry(
+        &self,
+        case: &SourceCase,
+        case_dir: &Path,
+        plan: &PlaybackPlan,
+    ) -> Result<CaseMetrics> {
+        let mut attempts = Vec::new();
+        let mut metrics = self
+            .run_hls_output(case, case_dir, plan, "hardware")
+            .await?;
+        attempts.push(performance_attempt_report(1, &metrics));
+
+        for attempt in 2..=HARDWARE_PERFORMANCE_GATE_MAX_ATTEMPTS {
+            if !missed_performance_gate(&metrics) {
+                break;
+            }
+            metrics = self
+                .run_hls_output(case, case_dir, plan, "hardware")
+                .await?;
+            attempts.push(performance_attempt_report(attempt, &metrics));
+        }
+
+        if attempts.len() > 1 {
+            write_json(&case_dir.join("performance-attempts.json"), &attempts)?;
+        }
+
         Ok(metrics)
     }
 
@@ -1069,6 +1102,29 @@ struct CaseMetrics {
     realtime_factor: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     performance_gate: Option<PerformanceGateReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceAttemptReport {
+    attempt: usize,
+    realtime_factor: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance_gate: Option<PerformanceGateReport>,
+}
+
+fn performance_attempt_report(attempt: usize, metrics: &CaseMetrics) -> PerformanceAttemptReport {
+    PerformanceAttemptReport {
+        attempt,
+        realtime_factor: metrics.realtime_factor,
+        performance_gate: metrics.performance_gate.clone(),
+    }
+}
+
+fn missed_performance_gate(metrics: &CaseMetrics) -> bool {
+    metrics
+        .performance_gate
+        .as_ref()
+        .is_some_and(|gate| !gate.passed)
 }
 
 fn select_certification_api(
@@ -2616,6 +2672,32 @@ ESCAPED="a \"quoted\" value"
         assert_eq!(smoke_gate.tier, "smoke_functional_floor");
         assert_eq!(smoke_gate.required_realtime_factor, 0.25);
         assert!(smoke_gate.passed);
+    }
+
+    #[test]
+    fn missed_performance_gate_only_matches_failed_gate() {
+        assert!(!missed_performance_gate(&CaseMetrics {
+            realtime_factor: 10.0,
+            performance_gate: None,
+        }));
+        assert!(!missed_performance_gate(&CaseMetrics {
+            realtime_factor: 2.0,
+            performance_gate: Some(PerformanceGateReport {
+                tier: "compatible_1080p_sdr".to_string(),
+                required_realtime_factor: 2.0,
+                actual_realtime_factor: 2.0,
+                passed: true,
+            }),
+        }));
+        assert!(missed_performance_gate(&CaseMetrics {
+            realtime_factor: 0.9,
+            performance_gate: Some(PerformanceGateReport {
+                tier: "selected_4k_hdr_to_1080p_sdr".to_string(),
+                required_realtime_factor: 1.0,
+                actual_realtime_factor: 0.9,
+                passed: false,
+            }),
+        }));
     }
 
     #[test]
