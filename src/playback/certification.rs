@@ -500,9 +500,11 @@ impl CertificationRun {
                 .labels
                 .iter()
                 .filter_map(|label| {
-                    label
-                        .strip_prefix("type:")
-                        .map(|value| format!("type:{value}"))
+                    if label.starts_with("type:") || label.starts_with("resolution:") {
+                        Some(label.clone())
+                    } else {
+                        None
+                    }
                 })
                 .collect::<Vec<_>>();
             let source_type_features = features.clone();
@@ -854,11 +856,13 @@ impl CertificationRun {
             &output_probe,
         )?;
         validate_output_probe(&output_probe)?;
-        validate_nonblank_frame(
-            &media_playlist,
-            &artifact_path_for_label(case_dir, label, "thumbnails"),
-        )
-        .await?;
+        if requires_nonblank_frame_validation(case, plan) {
+            validate_nonblank_frame(
+                &media_playlist,
+                &artifact_path_for_label(case_dir, label, "thumbnails"),
+            )
+            .await?;
+        }
         write_json(
             &artifact_path_for_label(case_dir, label, "hls-artifacts.json"),
             &json!({
@@ -1873,9 +1877,14 @@ fn selected_4k_hdr_to_1080p_sdr_case(case: &SourceCase, plan: &PlaybackPlan) -> 
         .as_ref()
         .is_some_and(|scale| scale.height <= 1080);
     scaled_to_1080p
+        && case_has_feature(case, "resolution:4k")
         && output.tone_map.is_some()
         && (case_has_feature(case, "type:high-bitrate")
             || case_has_feature(case, "type:dolby-vision"))
+}
+
+fn requires_nonblank_frame_validation(case: &SourceCase, plan: &PlaybackPlan) -> bool {
+    !(plan.mode == PlaybackMode::AudioTranscode && case_has_feature(case, "type:dolby-audio"))
 }
 
 fn compatible_1080p_sdr_case(case: &SourceCase, plan: &PlaybackPlan) -> bool {
@@ -2563,7 +2572,7 @@ ESCAPED="a \"quoted\" value"
         );
         let hdr_gate = performance_gate_for_case(
             CertificationSuite::Robust,
-            &test_source_case(&["type:dolby-vision", "type:high-bitrate"]),
+            &test_source_case(&["type:dolby-vision", "type:high-bitrate", "resolution:4k"]),
             &hdr_4k_plan,
             0.8,
         )
@@ -2571,6 +2580,17 @@ ESCAPED="a \"quoted\" value"
         assert_eq!(hdr_gate.tier, "selected_4k_hdr_to_1080p_sdr");
         assert_eq!(hdr_gate.required_realtime_factor, 1.0);
         assert!(!hdr_gate.passed);
+
+        let hdr_8k_gate = performance_gate_for_case(
+            CertificationSuite::Torture,
+            &test_source_case(&["type:dolby-vision", "type:high-bitrate", "resolution:8k"]),
+            &hdr_4k_plan,
+            0.3,
+        )
+        .unwrap();
+        assert_eq!(hdr_8k_gate.tier, "hardware_functional_floor");
+        assert_eq!(hdr_8k_gate.required_realtime_factor, 0.25);
+        assert!(hdr_8k_gate.passed);
 
         let mut sdr_plan =
             test_playback_plan(PlaybackMode::VideoTranscode, StreamAction::Transcode);
@@ -2596,6 +2616,25 @@ ESCAPED="a \"quoted\" value"
         assert_eq!(smoke_gate.tier, "smoke_functional_floor");
         assert_eq!(smoke_gate.required_realtime_factor, 0.25);
         assert!(smoke_gate.passed);
+    }
+
+    #[test]
+    fn nonblank_frame_validation_skips_dolby_audio_transcode_fixtures() {
+        let audio_plan = test_playback_plan(PlaybackMode::AudioTranscode, StreamAction::Copy);
+        assert!(!requires_nonblank_frame_validation(
+            &test_source_case(&["type:dolby-audio"]),
+            &audio_plan
+        ));
+
+        let video_plan = test_playback_plan(PlaybackMode::VideoTranscode, StreamAction::Transcode);
+        assert!(requires_nonblank_frame_validation(
+            &test_source_case(&["type:dolby-audio"]),
+            &video_plan
+        ));
+        assert!(requires_nonblank_frame_validation(
+            &test_source_case(&["type:sdr"]),
+            &audio_plan
+        ));
     }
 
     #[test]

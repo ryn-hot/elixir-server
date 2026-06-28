@@ -1104,6 +1104,7 @@ fn planned_video_filter(input: &str, playback_plan: Option<&PlaybackPlan>) -> Vi
 
 fn planned_video_filters(output: &VideoOutputPlan) -> Vec<String> {
     let mut filters = Vec::new();
+    let mut scale_consumed_by_tone_map = false;
     if let Some(tone_map) = output.tone_map.as_ref() {
         let mut linearize = Vec::new();
         if let Some(input_primaries) = tone_map.input_primaries.as_deref() {
@@ -1125,14 +1126,26 @@ fn planned_video_filters(output: &VideoOutputPlan) -> Vec<String> {
             format!("zscale={}", linearize.join(":")),
             "format=gbrpf32le".to_string(),
             format!("tonemap=tonemap={}:desat=0", tone_map.algorithm),
-            format!(
-                "zscale=p={}:t={}:m={}:r=tv",
-                tone_map.output_primaries, tone_map.output_transfer, tone_map.output_matrix
-            ),
-            "format=yuv420p".to_string(),
         ]);
+        let mut output_zscale = vec![
+            format!("p={}", tone_map.output_primaries),
+            format!("t={}", tone_map.output_transfer),
+            format!("m={}", tone_map.output_matrix),
+            "r=tv".to_string(),
+        ];
+        if let Some(scale) = output.scale.as_ref() {
+            output_zscale.push(format!("w={}", scale.width));
+            output_zscale.push(format!("h={}", scale.height));
+            scale_consumed_by_tone_map = true;
+        }
+        filters.push(format!("zscale={}", output_zscale.join(":")));
+        filters.push("format=yuv420p".to_string());
     }
-    if let Some(scale) = output.scale.as_ref() {
+    if let Some(scale) = output
+        .scale
+        .as_ref()
+        .filter(|_| !scale_consumed_by_tone_map)
+    {
         filters.push(format!("scale={}:{}", scale.width, scale.height));
     }
     if output.frame_rate.mode == VideoFrameRateMode::Convert {
@@ -2380,6 +2393,78 @@ mod tests {
         assert_arg_pair(&args, "-color_trc", "bt709");
         assert_arg_pair(&args, "-colorspace", "bt709");
         assert_arg_pair(&args, "-map", "0:0");
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_fold_hdr_resize_into_output_zscale() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Transcode,
+            StreamAction::Disabled,
+            None,
+        );
+        plan.video_output = Some(VideoOutputPlan {
+            codec: "h264".to_string(),
+            encoder: "h264_nvenc".to_string(),
+            preset: "p1".to_string(),
+            profile: Some("high".to_string()),
+            level: Some("4.2".to_string()),
+            crf: None,
+            bitrate_bps: Some(8_000_000),
+            maxrate_bps: Some(8_000_000),
+            bufsize_bps: Some(16_000_000),
+            pixel_format: Some("yuv420p".to_string()),
+            scale: Some(VideoScalePlan {
+                width: 1920,
+                height: 1080,
+                reason: "resolution_exceeds_policy".to_string(),
+            }),
+            tone_map: Some(VideoToneMapPlan {
+                algorithm: "hable".to_string(),
+                input_primaries: Some("bt2020".to_string()),
+                input_transfer: Some("smpte2084".to_string()),
+                input_matrix: Some("bt2020nc".to_string()),
+                output_primaries: "bt709".to_string(),
+                output_transfer: "bt709".to_string(),
+                output_matrix: "bt709".to_string(),
+            }),
+            frame_rate: VideoFrameRatePlan {
+                mode: VideoFrameRateMode::Source,
+                source_fps: Some("23.976".to_string()),
+                target_fps: None,
+            },
+            gop_frames: Some(96),
+            segment_seconds: "4".to_string(),
+            keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+            hls_delivery: Delivery::HlsFmp4,
+            burn_in: None,
+            reasons: vec!["hdr_to_sdr_required".to_string()],
+        });
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(
+            &args,
+            "-vf",
+            "zscale=pin=bt2020:p=bt2020:tin=smpte2084:min=bt2020nc:t=linear:m=gbr:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv:w=1920:h=1080,format=yuv420p",
+        );
     }
 
     #[test]
