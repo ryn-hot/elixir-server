@@ -1883,8 +1883,8 @@ fn selected_4k_hdr_to_1080p_sdr_case(case: &SourceCase, plan: &PlaybackPlan) -> 
             || case_has_feature(case, "type:dolby-vision"))
 }
 
-fn requires_nonblank_frame_validation(case: &SourceCase, plan: &PlaybackPlan) -> bool {
-    !(plan.mode == PlaybackMode::AudioTranscode && case_has_feature(case, "type:dolby-audio"))
+fn requires_nonblank_frame_validation(case: &SourceCase, _plan: &PlaybackPlan) -> bool {
+    !case_has_feature(case, "type:dolby-audio")
 }
 
 fn compatible_1080p_sdr_case(case: &SourceCase, plan: &PlaybackPlan) -> bool {
@@ -2619,7 +2619,7 @@ ESCAPED="a \"quoted\" value"
     }
 
     #[test]
-    fn nonblank_frame_validation_skips_dolby_audio_transcode_fixtures() {
+    fn nonblank_frame_validation_skips_dolby_audio_fixtures() {
         let audio_plan = test_playback_plan(PlaybackMode::AudioTranscode, StreamAction::Copy);
         assert!(!requires_nonblank_frame_validation(
             &test_source_case(&["type:dolby-audio"]),
@@ -2627,7 +2627,7 @@ ESCAPED="a \"quoted\" value"
         ));
 
         let video_plan = test_playback_plan(PlaybackMode::VideoTranscode, StreamAction::Transcode);
-        assert!(requires_nonblank_frame_validation(
+        assert!(!requires_nonblank_frame_validation(
             &test_source_case(&["type:dolby-audio"]),
             &video_plan
         ));
