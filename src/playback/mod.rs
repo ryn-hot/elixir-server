@@ -458,8 +458,8 @@ pub(crate) fn build_direct_stream_ffmpeg_args(
     args.push("-master_pl_name".to_string());
     args.push("master.m3u8".to_string());
     args.push("-hls_segment_filename".to_string());
-    args.push(layout.segment_template_path.to_string_lossy().to_string());
-    args.push(layout.media_playlist_path.to_string_lossy().to_string());
+    args.push(ffmpeg_path(&layout.segment_template_path));
+    args.push(ffmpeg_path(&layout.media_playlist_path));
     args
 }
 
@@ -618,8 +618,8 @@ fn build_transcode_ffmpeg_args(
             "-var_stream_map".to_string(),
             var_stream_map(audio_enabled),
             "-hls_segment_filename".to_string(),
-            layout.segment_template_path.to_string_lossy().to_string(),
-            layout.media_playlist_path.to_string_lossy().to_string(),
+            ffmpeg_path(&layout.segment_template_path),
+            ffmpeg_path(&layout.media_playlist_path),
         ]
         .into_iter(),
     );
@@ -640,14 +640,14 @@ fn build_transcode_ffmpeg_args(
                 "-segment_format".to_string(),
                 "webvtt".to_string(),
                 "-segment_list".to_string(),
-                playlist.to_string_lossy().to_string(),
+                ffmpeg_path(&playlist),
                 "-segment_list_type".to_string(),
                 "m3u8".to_string(),
                 "-segment_list_flags".to_string(),
                 "live".to_string(),
                 "-segment_list_size".to_string(),
                 "0".to_string(),
-                segment.to_string_lossy().to_string(),
+                ffmpeg_path(&segment),
             ]
             .into_iter(),
         );
@@ -755,8 +755,8 @@ fn build_adaptive_transcode_ffmpeg_args(
             "-var_stream_map".to_string(),
             adaptive_var_stream_map(ladder, audio_enabled),
             "-hls_segment_filename".to_string(),
-            layout.segment_template_path.to_string_lossy().to_string(),
-            layout.media_playlist_path.to_string_lossy().to_string(),
+            ffmpeg_path(&layout.segment_template_path),
+            ffmpeg_path(&layout.media_playlist_path),
         ]
         .into_iter(),
     );
@@ -777,14 +777,14 @@ fn build_adaptive_transcode_ffmpeg_args(
                 "-segment_format".to_string(),
                 "webvtt".to_string(),
                 "-segment_list".to_string(),
-                playlist.to_string_lossy().to_string(),
+                ffmpeg_path(&playlist),
                 "-segment_list_type".to_string(),
                 "m3u8".to_string(),
                 "-segment_list_flags".to_string(),
                 "live".to_string(),
                 "-segment_list_size".to_string(),
                 "0".to_string(),
-                segment.to_string_lossy().to_string(),
+                ffmpeg_path(&segment),
             ]
             .into_iter(),
         );
@@ -869,9 +869,9 @@ fn push_indexed_video_transcode_args(
     args.push(format!("-c:v:{index}"));
     args.push(ffmpeg_video_encoder(&output.encoder).to_string());
     push_indexed_hardware_encoder_options(args, &output.encoder, index);
-    if video_encoder_supports_preset(&output.encoder) {
+    if let Some(preset) = ffmpeg_video_preset(&output.encoder, &output.preset) {
         args.push(format!("-preset:v:{index}"));
-        args.push(output.preset.clone());
+        args.push(preset);
     }
     if let Some(profile) = output
         .profile
@@ -1202,9 +1202,9 @@ fn push_video_transcode_args(
     args.push("-c:v".to_string());
     args.push(ffmpeg_video_encoder(&output.encoder).to_string());
     push_hardware_encoder_options(args, &output.encoder);
-    if video_encoder_supports_preset(&output.encoder) {
+    if let Some(preset) = ffmpeg_video_preset(&output.encoder, &output.preset) {
         args.push("-preset".to_string());
-        args.push(output.preset.clone());
+        args.push(preset);
     }
     if let Some(profile) = output
         .profile
@@ -1318,11 +1318,31 @@ fn push_hardware_encoder_options(args: &mut Vec<String>, encoder: &str) {
     }
 }
 
-fn video_encoder_supports_preset(encoder: &str) -> bool {
-    matches!(
-        encoder.to_ascii_lowercase().as_str(),
-        "libx264" | "h264" | "x264" | "h264_nvenc" | "hevc_nvenc"
-    )
+fn ffmpeg_video_preset(encoder: &str, preset: &str) -> Option<String> {
+    let trimmed = preset.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match encoder.to_ascii_lowercase().as_str() {
+        "libx264" | "h264" | "x264" => Some(trimmed.to_string()),
+        "h264_nvenc" | "hevc_nvenc" | "av1_nvenc" => nvenc_preset(trimmed),
+        _ => None,
+    }
+}
+
+fn nvenc_preset(preset: &str) -> Option<String> {
+    let lower = preset.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "ultrafast" | "superfast" | "veryfast" => "p1",
+        "faster" | "fast" => "p2",
+        "medium" | "default" => "p4",
+        "slow" => "p6",
+        "slower" | "veryslow" => "p7",
+        "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7" | "hp" | "hq" | "bd" | "ll" | "llhq"
+        | "llhp" | "lossless" | "losslesshp" => lower.as_str(),
+        _ => return None,
+    };
+    Some(mapped.to_string())
 }
 
 fn video_encoder_supports_crf(encoder: &str) -> bool {
@@ -1416,6 +1436,10 @@ fn ffmpeg_filter_path(path: &str) -> String {
         .replace(':', "\\:")
         .replace('\'', "\\'");
     format!("'{escaped}'")
+}
+
+fn ffmpeg_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn var_stream_map(audio_enabled: bool) -> String {
@@ -1796,6 +1820,100 @@ mod tests {
         assert!(
             !args.iter().any(|arg| arg == value),
             "{value} unexpectedly present in {args:?}"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_hls_output_paths_use_forward_slashes_for_windows_paths() {
+        let layout = HlsOutputLayout::for_job(
+            Path::new(r"C:\Windows\System32\actions-runner\_work\elixir\artifacts\case\hls"),
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+        );
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Disabled,
+            StreamAction::Disabled,
+            None,
+        );
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            Path::new(r"C:\Windows\System32\actions-runner\_work\elixir\artifacts\case\hls"),
+            &[],
+            24.0,
+        );
+
+        assert!(args.iter().any(|arg| {
+            arg == "C:/Windows/System32/actions-runner/_work/elixir/artifacts/case/hls/seg_%v_%05d.m4s"
+        }));
+        assert!(args.iter().any(|arg| {
+            arg == "C:/Windows/System32/actions-runner/_work/elixir/artifacts/case/hls/stream_%v.m3u8"
+        }));
+        assert!(
+            !args.iter().any(|arg| arg.contains('\\')),
+            "FFmpeg HLS output paths must not contain backslashes: {args:?}"
+        );
+    }
+
+    #[test]
+    fn direct_stream_hls_output_paths_use_forward_slashes_for_windows_paths() {
+        let layout = HlsOutputLayout::for_job(
+            Path::new(r"C:\runner\_work\elixir\artifacts\direct\hls"),
+            PlaybackMode::DirectStream,
+            Delivery::HlsFmp4,
+        );
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::DirectStream,
+            delivery: Delivery::HlsFmp4,
+        };
+        let plan = direct_stream_plan(Delivery::HlsFmp4, "mp4", "h264", Some("aac"));
+
+        let args =
+            build_direct_stream_ffmpeg_args("/media/source.mp4", &params, Some(&plan), &layout);
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "C:/runner/_work/elixir/artifacts/direct/hls/segment_%05d.m4s")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "C:/runner/_work/elixir/artifacts/direct/hls/media.m3u8")
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains('\\')),
+            "FFmpeg HLS output paths must not contain backslashes: {args:?}"
+        );
+    }
+
+    #[test]
+    fn nvenc_presets_translate_software_policy_names_to_ffmpeg_values() {
+        assert_eq!(
+            ffmpeg_video_preset("h264_nvenc", "veryfast").as_deref(),
+            Some("p1")
+        );
+        assert_eq!(
+            ffmpeg_video_preset("hevc_nvenc", "slow").as_deref(),
+            Some("p6")
+        );
+        assert_eq!(
+            ffmpeg_video_preset("h264_nvenc", "p4").as_deref(),
+            Some("p4")
+        );
+        assert_eq!(ffmpeg_video_preset("h264_nvenc", "not-a-preset"), None);
+        assert_eq!(
+            ffmpeg_video_preset("libx264", "veryfast").as_deref(),
+            Some("veryfast")
         );
     }
 
@@ -2339,6 +2457,173 @@ mod tests {
         assert_arg_pair(&args, "-b:v", "3000k");
         assert!(!args.iter().any(|arg| arg == "-crf"));
         assert!(!args.iter().any(|arg| arg == "-preset"));
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_translate_nvenc_preset() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Transcode,
+            StreamAction::Disabled,
+            Some(AudioOutputPlan {
+                codec: "aac".to_string(),
+                channels: Some(2),
+                bitrate_bps: Some(128_000),
+                language: None,
+                title: None,
+                reasons: Vec::new(),
+            }),
+        );
+        plan.hardware_acceleration = HardwareAccelerationPlan {
+            enabled: true,
+            api: Some("nvenc".to_string()),
+            decoder: Some("cuda".to_string()),
+            encoder: Some("h264_nvenc".to_string()),
+            fallback: Some("software".to_string()),
+        };
+        plan.video_output = Some(VideoOutputPlan {
+            codec: "h264".to_string(),
+            encoder: "h264_nvenc".to_string(),
+            preset: "veryfast".to_string(),
+            profile: Some("high".to_string()),
+            level: Some("4.1".to_string()),
+            crf: None,
+            bitrate_bps: Some(3_000_000),
+            maxrate_bps: Some(3_000_000),
+            bufsize_bps: Some(6_000_000),
+            pixel_format: Some("yuv420p".to_string()),
+            scale: None,
+            tone_map: None,
+            frame_rate: VideoFrameRatePlan {
+                mode: VideoFrameRateMode::Source,
+                source_fps: Some("23.976".to_string()),
+                target_fps: None,
+            },
+            gop_frames: Some(96),
+            segment_seconds: "4".to_string(),
+            keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+            hls_delivery: Delivery::HlsFmp4,
+            burn_in: None,
+            reasons: vec!["hardware_encoder_selected:h264_nvenc".to_string()],
+        });
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-hwaccel", "cuda");
+        assert_arg_pair(&args, "-c:v", "h264_nvenc");
+        assert_arg_pair(&args, "-preset", "p1");
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "-preset" && pair[1] == "veryfast"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_transcode_ffmpeg_args_translate_indexed_nvenc_presets() {
+        let temp = tempdir().unwrap();
+        let layout = HlsOutputLayout::for_job(
+            temp.path(),
+            PlaybackMode::AdaptiveTranscode,
+            Delivery::HlsAdaptiveFmp4,
+        );
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::AdaptiveTranscode,
+            delivery: Delivery::HlsAdaptiveFmp4,
+        };
+        let mut first_video = adaptive_rung_video(1280, 720, 3_000_000);
+        first_video.encoder = "h264_nvenc".to_string();
+        first_video.preset = "veryfast".to_string();
+        let mut second_video = adaptive_rung_video(854, 480, 1_200_000);
+        second_video.encoder = "h264_nvenc".to_string();
+        second_video.preset = "slow".to_string();
+        let mut plan = hls_playback_plan(
+            PlaybackMode::AdaptiveTranscode,
+            Delivery::HlsAdaptiveFmp4,
+            StreamAction::Transcode,
+            StreamAction::Disabled,
+            Some(AudioOutputPlan {
+                codec: "aac".to_string(),
+                channels: Some(2),
+                bitrate_bps: Some(128_000),
+                language: None,
+                title: None,
+                reasons: Vec::new(),
+            }),
+        );
+        plan.hardware_acceleration = HardwareAccelerationPlan {
+            enabled: true,
+            api: Some("nvenc".to_string()),
+            decoder: Some("cuda".to_string()),
+            encoder: Some("h264_nvenc".to_string()),
+            fallback: Some("software".to_string()),
+        };
+        plan.adaptive = true;
+        plan.video_action = StreamAction::Transcode;
+        plan.video_output = Some(first_video.clone());
+        plan.adaptive_ladder = Some(AdaptiveLadderPlan {
+            rungs: vec![
+                AdaptiveRungPlan {
+                    id: "0".to_string(),
+                    label: "720p 3000k".to_string(),
+                    bandwidth_bps: 3_000_000,
+                    width: 1280,
+                    height: 720,
+                    video: first_video,
+                },
+                AdaptiveRungPlan {
+                    id: "1".to_string(),
+                    label: "480p 1200k".to_string(),
+                    bandwidth_bps: 1_200_000,
+                    width: 854,
+                    height: 480,
+                    video: second_video,
+                },
+            ],
+            starting_rung_id: "0".to_string(),
+            active_rung_id: "0".to_string(),
+            audio_strategy: AdaptiveAudioStrategy::PerRung,
+            reasons: vec!["adaptive_ladder_source_aware".to_string()],
+        });
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            24.0,
+        );
+
+        assert_arg_pair(&args, "-hwaccel", "cuda");
+        assert_arg_pair(&args, "-c:v:0", "h264_nvenc");
+        assert_arg_pair(&args, "-c:v:1", "h264_nvenc");
+        assert_arg_pair(&args, "-preset:v:0", "p1");
+        assert_arg_pair(&args, "-preset:v:1", "p6");
+        assert!(
+            !args.iter().any(|arg| arg == "veryfast" || arg == "slow"),
+            "{args:?}"
+        );
     }
 
     #[test]

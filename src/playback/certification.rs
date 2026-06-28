@@ -21,7 +21,7 @@ use crate::{
             HardwareApi, HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
             detect_hardware_capabilities, parse_ffmpeg_components, parse_hwaccels,
         },
-        plan::{PlaybackMode, PlaybackPlan, StreamAction, VideoFrameRateMode},
+        plan::{Delivery, PlaybackMode, PlaybackPlan, StreamAction, VideoFrameRateMode},
         probe::{MediaCapabilities, normalize_ffprobe_metadata},
         profile::{ClientPlaybackProfile, EffectivePlaybackPolicy},
     },
@@ -847,6 +847,7 @@ impl CertificationRun {
             "missing media playlist {}",
             media_playlist.display()
         );
+        ensure_expected_init_segment(plan, &output_dir)?;
         let output_probe = probe_media(&media_playlist).await?;
         write_json(
             &artifact_path_for_label(case_dir, label, "output-probe.json"),
@@ -1463,7 +1464,7 @@ async fn generate_h264_aac_fixture(path: &Path, duration: f64) -> Result<()> {
         "-c:a".to_string(),
         "aac".to_string(),
         "-shortest".to_string(),
-        path.to_string_lossy().to_string(),
+        command_path(path),
     ];
     run_ffmpeg_generation(path, &args).await
 }
@@ -1491,7 +1492,7 @@ async fn generate_hevc_aac_fixture(path: &Path, duration: f64) -> Result<()> {
         "-c:a".to_string(),
         "aac".to_string(),
         "-shortest".to_string(),
-        path.to_string_lossy().to_string(),
+        command_path(path),
     ];
     run_ffmpeg_generation(path, &args).await
 }
@@ -1629,7 +1630,7 @@ async fn probe_duration_seconds(path: &Path) -> Result<f64> {
             "format=duration".to_string(),
             "-of".to_string(),
             "default=nokey=1:noprint_wrappers=1".to_string(),
-            path.to_string_lossy().to_string(),
+            command_path(path),
         ],
         30,
     )
@@ -1659,15 +1660,40 @@ async fn probe_media(path: &Path) -> Result<Value> {
             "json".to_string(),
             "-show_format".to_string(),
             "-show_streams".to_string(),
-            path.to_string_lossy().to_string(),
+            command_path(path),
         ],
         30,
     )
     .await?;
     if !output.status.success() {
-        bail!("ffprobe failed: {}", tail_lossy(&output.stderr));
+        bail!(
+            "ffprobe failed for {} with {:?}: stderr={} stdout={}",
+            path.display(),
+            output.status.code(),
+            non_empty_tail(&output.stderr),
+            non_empty_tail(&output.stdout)
+        );
     }
-    serde_json::from_slice(&output.stdout).context("parse output ffprobe json")
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse output ffprobe json for {}", path.display()))
+}
+
+fn ensure_expected_init_segment(plan: &PlaybackPlan, output_dir: &Path) -> Result<()> {
+    if !matches!(plan.delivery, Delivery::HlsFmp4 | Delivery::HlsAdaptiveFmp4) {
+        return Ok(());
+    }
+    let init_name = if plan.mode == PlaybackMode::DirectStream {
+        "init.mp4"
+    } else {
+        "init_0.mp4"
+    };
+    let init_segment = output_dir.join(init_name);
+    ensure!(
+        init_segment.exists(),
+        "missing fMP4 init segment {} referenced by HLS playlist",
+        init_segment.display()
+    );
+    Ok(())
 }
 
 fn validate_output_probe(probe: &Value) -> Result<()> {
@@ -1697,12 +1723,12 @@ async fn validate_nonblank_frame(media_playlist: &Path, thumbnail_dir: &Path) ->
             "error".to_string(),
             "-y".to_string(),
             "-i".to_string(),
-            media_playlist.to_string_lossy().to_string(),
+            command_path(media_playlist),
             "-vf".to_string(),
             "fps=1".to_string(),
             "-frames:v".to_string(),
             "6".to_string(),
-            frame_pattern.to_string_lossy().to_string(),
+            command_path(&frame_pattern),
         ],
         30,
     )
@@ -2088,10 +2114,23 @@ fn path_to_str(path: &Path) -> Result<&str> {
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
+fn command_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn tail_lossy(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let lines = text.lines().rev().take(16).collect::<Vec<_>>();
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+fn non_empty_tail(bytes: &[u8]) -> String {
+    let tail = tail_lossy(bytes);
+    if tail.trim().is_empty() {
+        "<empty>".to_string()
+    } else {
+        tail
+    }
 }
 
 fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
@@ -2441,6 +2480,34 @@ ESCAPED="a \"quoted\" value"
             burn_in: None,
             reasons: Vec::new(),
         });
+    }
+
+    #[test]
+    fn fmp4_output_validation_requires_init_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = test_playback_plan(PlaybackMode::VideoTranscode, StreamAction::Transcode);
+        let err = ensure_expected_init_segment(&plan, temp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("missing fMP4 init segment"),
+            "unexpected error: {err:#}"
+        );
+
+        fs::write(temp.path().join("init_0.mp4"), b"init").unwrap();
+        ensure_expected_init_segment(&plan, temp.path()).unwrap();
+    }
+
+    #[test]
+    fn command_path_normalizes_windows_separators() {
+        assert_eq!(
+            command_path(Path::new(r"C:\runner\_work\elixir\hls\stream_0.m3u8")),
+            "C:/runner/_work/elixir/hls/stream_0.m3u8"
+        );
+    }
+
+    #[test]
+    fn empty_process_output_tail_is_explicit() {
+        assert_eq!(non_empty_tail(b""), "<empty>");
+        assert_eq!(non_empty_tail(b"line\n"), "line");
     }
 
     #[test]
