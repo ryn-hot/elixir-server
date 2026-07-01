@@ -172,8 +172,19 @@ struct PublicCorpusSample {
     local_path: PathBuf,
     size_bytes: u64,
     sha256: String,
+    #[serde(default)]
+    sidecars: Vec<PublicCorpusSidecar>,
     expected_probe: PublicExpectedProbe,
     playback: PublicPlaybackExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicCorpusSidecar {
+    role: String,
+    url: String,
+    local_path: PathBuf,
+    size_bytes: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,6 +507,22 @@ fn playback_public_corpus_lock_is_valid_and_labeled_by_type() -> Result<()> {
             .any(|sample| sample.labels.iter().any(|label| label == "type:interlaced")),
         "public corpus must include interlaced raw-video coverage"
     );
+    ensure!(
+        lock.samples.iter().any(|sample| {
+            sample.suite == "smoke"
+                && sample.playback.run_hls_output
+                && public_sample_has_label(sample, "type:hdr10")
+        }),
+        "public corpus smoke suite must include HDR10 HLS output coverage"
+    );
+    ensure!(
+        lock.samples.iter().any(|sample| {
+            sample.suite == "smoke"
+                && sample.playback.run_hls_output
+                && public_sample_has_label(sample, "type:dolby-vision")
+        }),
+        "public corpus smoke suite must include Dolby Vision HLS output coverage"
+    );
 
     for sample in &lock.samples {
         ensure!(
@@ -519,6 +546,40 @@ fn playback_public_corpus_lock_is_valid_and_labeled_by_type() -> Result<()> {
             "{} must pin a lowercase SHA-256 hash",
             sample.id
         );
+        let mut sidecar_roles = BTreeSet::new();
+        for sidecar in &sample.sidecars {
+            ensure!(
+                sidecar_roles.insert(sidecar.role.as_str()),
+                "{} has duplicate public corpus sidecar role {}",
+                sample.id,
+                sidecar.role
+            );
+            ensure!(
+                sidecar.local_path.starts_with(&lock.cache_root),
+                "{} sidecar {} local path must stay under {}",
+                sample.id,
+                sidecar.role,
+                lock.cache_root.display()
+            );
+            ensure!(
+                sidecar.url.starts_with("https://"),
+                "{} sidecar {} must use an HTTPS source URL",
+                sample.id,
+                sidecar.role
+            );
+            ensure!(
+                sidecar.size_bytes > 0,
+                "{} sidecar {} must pin a positive size",
+                sample.id,
+                sidecar.role
+            );
+            ensure!(
+                is_sha256_hex(&sidecar.sha256),
+                "{} sidecar {} must pin a lowercase SHA-256 hash",
+                sample.id,
+                sidecar.role
+            );
+        }
         ensure!(
             sample
                 .labels
@@ -765,8 +826,9 @@ async fn run_public_media_corpus(lock: &PublicCorpusLock, root: &Path) -> Result
 
     let missing = selected
         .iter()
-        .filter(|sample| !public_sample_path(sample).exists())
-        .map(|sample| format!("{} ({})", sample.id, public_sample_path(sample).display()))
+        .flat_map(|sample| public_sample_cache_paths(sample))
+        .filter(|(_id, path)| !path.exists())
+        .map(|(id, path)| format!("{id} ({})", path.display()))
         .collect::<Vec<_>>();
     ensure!(
         missing.is_empty(),
@@ -777,20 +839,42 @@ async fn run_public_media_corpus(lock: &PublicCorpusLock, root: &Path) -> Result
 
     let mut executed_cases = 0usize;
     let mut hls_cases = 0usize;
+    let selected_smoke_hdr10 = selected
+        .iter()
+        .any(|sample| sample.suite == "smoke" && public_sample_has_label(sample, "type:hdr10"));
+    let selected_smoke_dolby_vision = selected.iter().any(|sample| {
+        sample.suite == "smoke" && public_sample_has_label(sample, "type:dolby-vision")
+    });
+    let mut smoke_hdr10_hls_cases = 0usize;
+    let mut smoke_dolby_vision_hls_cases = 0usize;
     for sample in selected {
         let sample_path = public_sample_path(sample);
-        verify_public_sample_cache(sample, &sample_path)?;
+        verify_public_sample_cache(sample)?;
 
         let metadata = ffprobe::probe(path_to_str(&sample_path)?)
             .await
             .with_context(|| format!("ffprobe public media {}", sample.id))?;
-        validate_public_probe(sample, &metadata.raw_json)?;
+        let frame_side_data = if public_expected_hdr_requires_frame_side_data(sample) {
+            let frame_probe = probe_video_frame_side_data(&sample_path)
+                .await
+                .with_context(|| format!("ffprobe frame side data for {}", sample.id))?;
+            Some(frame_probe)
+        } else {
+            None
+        };
+        validate_public_probe(sample, &metadata.raw_json, frame_side_data.as_ref())?;
 
         let capabilities =
             normalize_ffprobe_metadata(&metadata, None, Some(sample_path.display().to_string()));
         let case_dir = root.join(&sample.id);
         fs::create_dir_all(&case_dir)?;
         write_json(&case_dir.join("source_probe.json"), &metadata.raw_json)?;
+        if let Some(frame_side_data) = &frame_side_data {
+            write_json(
+                &case_dir.join("video_frame_side_data_probe.json"),
+                frame_side_data,
+            )?;
+        }
         write_json(
             &case_dir.join("normalized_capabilities.json"),
             &serde_json::to_value(&capabilities)?,
@@ -823,6 +907,12 @@ async fn run_public_media_corpus(lock: &PublicCorpusLock, root: &Path) -> Result
             )
             .await?;
             hls_cases += 1;
+            if sample.suite == "smoke" && public_sample_has_label(sample, "type:hdr10") {
+                smoke_hdr10_hls_cases += 1;
+            }
+            if sample.suite == "smoke" && public_sample_has_label(sample, "type:dolby-vision") {
+                smoke_dolby_vision_hls_cases += 1;
+            }
         }
         executed_cases += 1;
     }
@@ -832,6 +922,8 @@ async fn run_public_media_corpus(lock: &PublicCorpusLock, root: &Path) -> Result
         &json!({
             "executed_cases": executed_cases,
             "hls_cases": hls_cases,
+            "smoke_hdr10_hls_cases": smoke_hdr10_hls_cases,
+            "smoke_dolby_vision_hls_cases": smoke_dolby_vision_hls_cases,
             "suite_filter": suite_filter,
         }),
     )?;
@@ -843,33 +935,67 @@ async fn run_public_media_corpus(lock: &PublicCorpusLock, root: &Path) -> Result
         hls_cases > 0,
         "public playback corpus must include at least one HLS output smoke"
     );
+    if selected_smoke_hdr10 {
+        ensure!(
+            smoke_hdr10_hls_cases > 0,
+            "public playback corpus smoke selection must include at least one HDR10 HLS output artifact"
+        );
+    }
+    if selected_smoke_dolby_vision {
+        ensure!(
+            smoke_dolby_vision_hls_cases > 0,
+            "public playback corpus smoke selection must include at least one Dolby Vision HLS output artifact"
+        );
+    }
     Ok(())
 }
 
-fn verify_public_sample_cache(sample: &PublicCorpusSample, path: &Path) -> Result<()> {
+fn verify_public_sample_cache(sample: &PublicCorpusSample) -> Result<()> {
+    verify_public_cache_file(
+        &sample.id,
+        &public_sample_path(sample),
+        sample.size_bytes,
+        &sample.sha256,
+    )?;
+    for sidecar in &sample.sidecars {
+        verify_public_cache_file(
+            &format!("{}::{}", sample.id, sidecar.role),
+            &public_sidecar_path(sidecar),
+            sidecar.size_bytes,
+            &sidecar.sha256,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_public_cache_file(id: &str, path: &Path, size_bytes: u64, sha256: &str) -> Result<()> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("read public corpus cache file {}", path.display()))?;
     ensure!(
-        metadata.len() == sample.size_bytes,
+        metadata.len() == size_bytes,
         "{} size mismatch: expected {}, got {} at {}",
-        sample.id,
-        sample.size_bytes,
+        id,
+        size_bytes,
         metadata.len(),
         path.display()
     );
     let actual_sha256 = sha256_hex(path)?;
     ensure!(
-        actual_sha256 == sample.sha256,
+        actual_sha256 == sha256,
         "{} SHA-256 mismatch: expected {}, got {} at {}",
-        sample.id,
-        sample.sha256,
+        id,
+        sha256,
         actual_sha256,
         path.display()
     );
     Ok(())
 }
 
-fn validate_public_probe(sample: &PublicCorpusSample, probe: &Value) -> Result<()> {
+fn validate_public_probe(
+    sample: &PublicCorpusSample,
+    probe: &Value,
+    frame_side_data: Option<&Value>,
+) -> Result<()> {
     let format_name = probe
         .get("format")
         .and_then(|format| format.get("format_name"))
@@ -912,7 +1038,7 @@ fn validate_public_probe(sample: &PublicCorpusSample, probe: &Value) -> Result<(
                 stream_u32(video, "height")
             );
         }
-        validate_public_hdr(sample, video)?;
+        validate_public_hdr(sample, video, frame_side_data)?;
     }
 
     match sample.expected_probe.audio_codec.as_deref() {
@@ -966,55 +1092,120 @@ fn validate_public_probe(sample: &PublicCorpusSample, probe: &Value) -> Result<(
     Ok(())
 }
 
-fn validate_public_hdr(sample: &PublicCorpusSample, video: &Value) -> Result<()> {
+fn validate_public_hdr(
+    sample: &PublicCorpusSample,
+    video: &Value,
+    frame_side_data: Option<&Value>,
+) -> Result<()> {
     match sample.expected_probe.hdr.as_str() {
         "none" => Ok(()),
         "hdr10" => {
-            ensure!(
-                stream_string(video, "color_transfer") == Some("smpte2084")
-                    && stream_string(video, "color_primaries") == Some("bt2020"),
-                "{} expected HDR10 signaling, got transfer={:?} primaries={:?}",
-                sample.id,
-                stream_string(video, "color_transfer"),
-                stream_string(video, "color_primaries")
-            );
+            validate_public_hdr10_signaling(sample, video)?;
+            Ok(())
+        }
+        "hdr10_plus" => {
+            validate_public_hdr10_signaling(sample, video)?;
+            validate_public_hdr10_plus_metadata(sample, video, frame_side_data)?;
             Ok(())
         }
         "dolby_vision" => {
-            let dovi = video
-                .get("side_data_list")
-                .and_then(Value::as_array)
-                .and_then(|items| {
-                    items.iter().find(|item| {
-                        item.get("side_data_type")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| value == "DOVI configuration record")
-                    })
-                })
-                .with_context(|| format!("{} missing DOVI configuration record", sample.id))?;
-            if let Some(expected_profile) = sample.expected_probe.dovi_profile {
-                ensure!(
-                    value_u32(dovi, "dv_profile") == Some(expected_profile),
-                    "{} DOVI profile mismatch: expected {}, got {:?}",
-                    sample.id,
-                    expected_profile,
-                    value_u32(dovi, "dv_profile")
-                );
-            }
-            if let Some(expected_compatibility) = sample.expected_probe.dovi_compatibility_id {
-                ensure!(
-                    value_u32(dovi, "dv_bl_signal_compatibility_id")
-                        == Some(expected_compatibility),
-                    "{} DOVI compatibility id mismatch: expected {}, got {:?}",
-                    sample.id,
-                    expected_compatibility,
-                    value_u32(dovi, "dv_bl_signal_compatibility_id")
-                );
-            }
+            validate_public_dolby_vision(sample, video)?;
+            Ok(())
+        }
+        "dolby_vision_hdr10_plus" => {
+            validate_public_hdr10_signaling(sample, video)?;
+            validate_public_dolby_vision(sample, video)?;
+            validate_public_hdr10_plus_metadata(sample, video, frame_side_data)?;
             Ok(())
         }
         other => bail!("{} has unknown expected HDR marker {other}", sample.id),
     }
+}
+
+fn validate_public_hdr10_signaling(sample: &PublicCorpusSample, video: &Value) -> Result<()> {
+    ensure!(
+        stream_string(video, "color_transfer") == Some("smpte2084")
+            && stream_string(video, "color_primaries") == Some("bt2020"),
+        "{} expected HDR10 signaling, got transfer={:?} primaries={:?}",
+        sample.id,
+        stream_string(video, "color_transfer"),
+        stream_string(video, "color_primaries")
+    );
+    Ok(())
+}
+
+fn validate_public_dolby_vision(sample: &PublicCorpusSample, video: &Value) -> Result<()> {
+    let dovi = video
+        .get("side_data_list")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("side_data_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "DOVI configuration record")
+            })
+        })
+        .with_context(|| format!("{} missing DOVI configuration record", sample.id))?;
+    if let Some(expected_profile) = sample.expected_probe.dovi_profile {
+        ensure!(
+            value_u32(dovi, "dv_profile") == Some(expected_profile),
+            "{} DOVI profile mismatch: expected {}, got {:?}",
+            sample.id,
+            expected_profile,
+            value_u32(dovi, "dv_profile")
+        );
+    }
+    if let Some(expected_compatibility) = sample.expected_probe.dovi_compatibility_id {
+        ensure!(
+            value_u32(dovi, "dv_bl_signal_compatibility_id") == Some(expected_compatibility),
+            "{} DOVI compatibility id mismatch: expected {}, got {:?}",
+            sample.id,
+            expected_compatibility,
+            value_u32(dovi, "dv_bl_signal_compatibility_id")
+        );
+    }
+    Ok(())
+}
+
+fn validate_public_hdr10_plus_metadata(
+    sample: &PublicCorpusSample,
+    video: &Value,
+    frame_side_data: Option<&Value>,
+) -> Result<()> {
+    let combined_side_data = format!(
+        "{} {}",
+        side_data_text(video),
+        frame_side_data.map(side_data_text).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    ensure!(
+        combined_side_data.contains("hdr10+")
+            || combined_side_data.contains("smpte2094-40")
+            || combined_side_data.contains("smpte 2094")
+            || combined_side_data.contains("itu-t t.35"),
+        "{} missing HDR10+ frame-side metadata",
+        sample.id
+    );
+    Ok(())
+}
+
+fn public_expected_hdr_requires_frame_side_data(sample: &PublicCorpusSample) -> bool {
+    sample.expected_probe.hdr.contains("hdr10_plus")
+}
+
+fn side_data_text(value: &Value) -> String {
+    let mut side_data = Vec::new();
+    if let Some(items) = value.get("side_data_list").and_then(Value::as_array) {
+        side_data.extend(items.iter().map(Value::to_string));
+    }
+    if let Some(frames) = value.get("frames").and_then(Value::as_array) {
+        for frame in frames {
+            if let Some(items) = frame.get("side_data_list").and_then(Value::as_array) {
+                side_data.extend(items.iter().map(Value::to_string));
+            }
+        }
+    }
+    side_data.join(" ")
 }
 
 async fn run_real_media_corpus(manifest: &PlaybackCorpusManifest, root: &Path) -> Result<()> {
@@ -1312,6 +1503,7 @@ fn validate_expected_profile(
             audio_stream_index: None,
             subtitle_stream_index: expected.selected_subtitle_stream,
             start_position_seconds: None,
+            ..PlaybackSelection::default()
         },
         &client,
         &policy,
@@ -1688,6 +1880,31 @@ async fn probe_media(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+async fn probe_video_frame_side_data(path: &Path) -> Result<Value> {
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-select_streams".to_string(),
+        "v:0".to_string(),
+        "-read_intervals".to_string(),
+        "%+#5".to_string(),
+        "-show_frames".to_string(),
+        "-show_entries".to_string(),
+        "frame=best_effort_timestamp_time,pict_type,side_data_list".to_string(),
+        "-print_format".to_string(),
+        "json".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let output = run_command_capture("ffprobe", &args, 60).await?;
+    ensure!(
+        output.status.success(),
+        "ffprobe frame side-data failed for {}: {}",
+        path.display(),
+        tail_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 async fn run_command_capture(
     tool: &str,
     args: &[String],
@@ -1942,11 +2159,39 @@ fn public_expected_profile(sample: &PublicCorpusSample) -> ExpectedProfile {
     }
 }
 
+fn public_sample_has_label(sample: &PublicCorpusSample, label: &str) -> bool {
+    sample.labels.iter().any(|candidate| candidate == label)
+}
+
 fn public_sample_path(sample: &PublicCorpusSample) -> PathBuf {
     if sample.local_path.is_absolute() {
         return sample.local_path.clone();
     }
     repo_root().join(&sample.local_path)
+}
+
+fn public_sidecar_path(sidecar: &PublicCorpusSidecar) -> PathBuf {
+    if sidecar.local_path.is_absolute() {
+        return sidecar.local_path.clone();
+    }
+    repo_root().join(&sidecar.local_path)
+}
+
+fn public_sample_cache_paths(sample: &PublicCorpusSample) -> Vec<(String, PathBuf)> {
+    let mut paths = vec![(sample.id.clone(), public_sample_path(sample))];
+    paths.extend(sidecar_cache_paths(sample));
+    paths
+}
+
+fn sidecar_cache_paths(
+    sample: &PublicCorpusSample,
+) -> impl Iterator<Item = (String, PathBuf)> + '_ {
+    sample.sidecars.iter().map(|sidecar| {
+        (
+            format!("{}::{}", sample.id, sidecar.role),
+            public_sidecar_path(sidecar),
+        )
+    })
 }
 
 fn repo_root() -> PathBuf {

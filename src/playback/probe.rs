@@ -8,7 +8,7 @@ use sqlx::{AnyPool, Row};
 
 use crate::media::ffprobe;
 
-pub const MEDIA_CAPABILITIES_PROBE_VERSION: i32 = 1;
+pub const MEDIA_CAPABILITIES_PROBE_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,12 +156,14 @@ pub enum SubtitleKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleStreamCapabilities {
     pub index: Option<i32>,
+    pub external_id: Option<String>,
     pub codec: Option<String>,
     pub kind: SubtitleKind,
     pub language: Option<String>,
     pub title: Option<String>,
     pub is_default: bool,
     pub is_forced: bool,
+    pub is_hearing_impaired: bool,
     pub external_path: Option<String>,
 }
 
@@ -191,7 +193,8 @@ pub async fn ensure_media_file_probe(
     let signature = probe_signature(path).await.ok();
 
     if let Some(row) = sqlx::query::<sqlx::Any>(
-        "SELECT probe_status,
+        "SELECT probe_version,
+                probe_status,
                 normalized_json,
                 CAST(source_size_bytes AS TEXT) AS source_size_bytes_text,
                 CAST(source_mtime_ms AS TEXT) AS source_mtime_ms_text,
@@ -202,10 +205,11 @@ pub async fn ensure_media_file_probe(
     .fetch_optional(pool)
     .await?
     {
+        let probe_version: i32 = row.get("probe_version");
         let status: String = row.get("probe_status");
         let source_size_bytes = optional_i64_text(&row, "source_size_bytes_text");
         let source_mtime_ms = optional_i64_text(&row, "source_mtime_ms_text");
-        let stale = signature
+        let source_stale = signature
             .as_ref()
             .map(|current| {
                 let size_stale = match (current.size_bytes, source_size_bytes) {
@@ -219,6 +223,7 @@ pub async fn ensure_media_file_probe(
                 size_stale || mtime_stale
             })
             .unwrap_or(false);
+        let stale = probe_version != MEDIA_CAPABILITIES_PROBE_VERSION || source_stale;
 
         if !stale {
             match status.as_str() {
@@ -521,12 +526,15 @@ fn normalize_subtitle_stream(
         .as_deref()
         .map(subtitle_kind)
         .unwrap_or(SubtitleKind::Unknown);
+    let title = read_tag(stream.tags.as_ref(), "title");
     SubtitleStreamCapabilities {
         index: stream.index,
+        external_id: None,
         codec,
         kind,
         language: normalize_language_tag(read_tag(stream.tags.as_ref(), "language")),
-        title: read_tag(stream.tags.as_ref(), "title"),
+        is_hearing_impaired: subtitle_hearing_impaired(stream, title.as_deref()),
+        title,
         is_default: disposition_flag(stream, |d| d.default_flag),
         is_forced: disposition_flag(stream, |d| d.forced),
         external_path,
@@ -578,8 +586,8 @@ pub fn canonical_subtitle_codec(raw: &str) -> String {
         "ass" => "ass".to_string(),
         "ssa" => "ssa".to_string(),
         "mov_text" | "tx3g" => "mov_text".to_string(),
-        "hdmv_pgs_subtitle" | "pgs" => "pgs".to_string(),
-        "dvd_subtitle" | "vobsub" => "dvd_subtitle".to_string(),
+        "hdmv_pgs_subtitle" | "pgs" | "sup" => "pgs".to_string(),
+        "dvd_subtitle" | "dvdsub" | "vobsub" | "idx" | "sub" => "dvd_subtitle".to_string(),
         value => value.to_string(),
     }
 }
@@ -587,7 +595,7 @@ pub fn canonical_subtitle_codec(raw: &str) -> String {
 pub fn subtitle_kind(codec: &str) -> SubtitleKind {
     match codec {
         "srt" | "webvtt" | "ass" | "ssa" | "mov_text" => SubtitleKind::Text,
-        "pgs" | "dvd_subtitle" => SubtitleKind::Image,
+        "pgs" | "dvd_subtitle" | "xsub" => SubtitleKind::Image,
         _ => SubtitleKind::Unknown,
     }
 }
@@ -633,6 +641,30 @@ where
     F: FnOnce(&ffprobe::Disposition) -> Option<i32>,
 {
     stream.disposition.as_ref().and_then(accessor).unwrap_or(0) == 1
+}
+
+fn subtitle_hearing_impaired(stream: &ffprobe::Stream, title: Option<&str>) -> bool {
+    disposition_flag(stream, |d| d.hearing_impaired)
+        || disposition_flag(stream, |d| d.captions)
+        || disposition_flag(stream, |d| d.descriptions)
+        || subtitle_title_suggests_hearing_impaired(title)
+}
+
+fn subtitle_title_suggests_hearing_impaired(title: Option<&str>) -> bool {
+    let Some(title) = title else {
+        return false;
+    };
+    let lower = title.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("hearingimpaired") || compact.contains("closedcaptions") {
+        return true;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "sdh" | "cc" | "hi"))
 }
 
 fn parse_i32(raw: &str) -> Option<i32> {
@@ -782,13 +814,43 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_subtitle_hearing_impaired_metadata() {
+        let metadata = parse_fixture(
+            r#"{
+              "streams": [{
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip",
+                "tags": { "language": "eng", "title": "English SDH" },
+                "disposition": {
+                  "default": 1,
+                  "forced": 0,
+                  "hearing_impaired": 1
+                }
+              }]
+            }"#,
+        );
+        let normalized =
+            normalize_ffprobe_metadata(&metadata, None, Some("fixture.mkv".to_string()));
+        let subtitle = normalized.subtitle_streams.first().unwrap();
+        assert!(subtitle.is_hearing_impaired);
+        assert_eq!(subtitle.title.as_deref(), Some("English SDH"));
+    }
+
+    #[test]
     fn canonicalizes_common_probe_codecs() {
         assert_eq!(canonical_video_codec("avc1"), "h264");
         assert_eq!(canonical_video_codec("h265"), "hevc");
         assert_eq!(canonical_audio_codec("DCA"), "dts");
         assert_eq!(canonical_subtitle_codec("hdmv_pgs_subtitle"), "pgs");
+        assert_eq!(canonical_subtitle_codec("sup"), "pgs");
+        assert_eq!(canonical_subtitle_codec("idx"), "dvd_subtitle");
+        assert_eq!(canonical_subtitle_codec("sub"), "dvd_subtitle");
+        assert_eq!(canonical_subtitle_codec("dvdsub"), "dvd_subtitle");
         assert_eq!(subtitle_kind("webvtt"), SubtitleKind::Text);
+        assert_eq!(subtitle_kind("pgs"), SubtitleKind::Image);
         assert_eq!(subtitle_kind("dvd_subtitle"), SubtitleKind::Image);
+        assert_eq!(subtitle_kind("xsub"), SubtitleKind::Image);
     }
 
     #[test]
@@ -822,5 +884,35 @@ mod tests {
         assert!(video.dolby_vision);
         assert_eq!(video.dolby_vision_profile, Some(8));
         assert!(video.dolby_vision_has_hdr10_fallback);
+    }
+
+    #[test]
+    fn normalizes_hdr10_plus_from_frame_side_data_merged_into_stream() {
+        let metadata = parse_fixture(
+            r#"{
+              "streams": [{
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "hevc",
+                "profile": "Main 10",
+                "pix_fmt": "yuv420p10le",
+                "width": 3840,
+                "height": 2160,
+                "color_primaries": "bt2020",
+                "color_transfer": "smpte2084",
+                "color_space": "bt2020nc",
+                "side_data_list": [{
+                  "side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+                }]
+              }],
+              "format": { "format_name": "matroska,webm" }
+            }"#,
+        );
+
+        let normalized = normalize_ffprobe_metadata(&metadata, None, None);
+        let video = normalized.primary_video().unwrap();
+
+        assert!(video.hdr10);
+        assert!(video.hdr10_plus);
     }
 }

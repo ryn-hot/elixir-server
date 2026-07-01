@@ -19,7 +19,8 @@ use crate::{
         decision::{PlaybackSelection, plan_playback},
         hardware::{
             HardwareApi, HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
-            detect_hardware_capabilities, parse_ffmpeg_components, parse_hwaccels,
+            HardwareReadinessSnapshot, detect_hardware_readiness, parse_ffmpeg_components,
+            parse_hwaccels,
         },
         plan::{Delivery, PlaybackMode, PlaybackPlan, StreamAction, VideoFrameRateMode},
         probe::{MediaCapabilities, normalize_ffprobe_metadata},
@@ -135,6 +136,8 @@ pub struct CertificationReport {
     pub require_hardware: bool,
     pub ffmpeg: FfmpegInventoryReport,
     pub hardware_capabilities: HardwareCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_readiness: Option<HardwareReadinessSnapshot>,
     pub cases: CaseSummary,
     pub performance: PerformanceSummary,
     pub failure_reasons: Vec<String>,
@@ -293,10 +296,11 @@ pub async fn run_hardware_certification(
         .with_context(|| format!("create artifact dir {}", config.artifact_dir.display()))?;
 
     let ffmpeg = collect_ffmpeg_inventory().await;
-    let hardware_capabilities = detect_hardware_capabilities(&HardwareDetectionConfig {
+    let hardware_readiness = detect_hardware_readiness(&HardwareDetectionConfig {
         preference: config.hardware_preference,
     })
     .await;
+    let hardware_capabilities = hardware_readiness.capabilities.clone();
     let selected_api = select_certification_api(&config, &hardware_capabilities);
     let os = collect_os_report().await;
     let gpu = collect_gpu_report().await;
@@ -319,6 +323,7 @@ pub async fn run_hardware_certification(
             require_hardware: config.require_hardware,
             ffmpeg,
             hardware_capabilities,
+            hardware_readiness: Some(hardware_readiness),
             cases: CaseSummary::default(),
             performance: PerformanceSummary::default(),
             failure_reasons: Vec::new(),
@@ -753,6 +758,7 @@ impl CertificationRun {
                 audio_stream_index: None,
                 subtitle_stream_index: case.selected_subtitle_stream,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &client,
             &policy,
@@ -1479,6 +1485,13 @@ fn write_host_evidence_files(artifact_dir: &Path, report: &CertificationReport) 
     write_json(
         &host_dir.join("hardware-capabilities.json"),
         &report.hardware_capabilities,
+    )?;
+    if let Some(readiness) = report.hardware_readiness.as_ref() {
+        write_json(&host_dir.join("hardware-readiness.json"), readiness)?;
+    }
+    write_json(
+        &host_dir.join("hardware-capability-matrix.json"),
+        &report.hardware_capabilities.capability_matrices,
     )?;
     fs::write(
         host_dir.join("ffmpeg-version.txt"),
@@ -2367,6 +2380,7 @@ ESCAPED="a \"quoted\" value"
                 decoders: vec!["h264_cuvid".to_string()],
             },
             hardware_capabilities: HardwareCapabilities::default(),
+            hardware_readiness: None,
             cases: CaseSummary::default(),
             performance: PerformanceSummary::default(),
             failure_reasons: Vec::new(),
@@ -2376,6 +2390,11 @@ ESCAPED="a \"quoted\" value"
         write_host_evidence_files(temp.path(), &report).unwrap();
         assert!(temp.path().join("host/os.json").exists());
         assert!(temp.path().join("host/gpu.json").exists());
+        assert!(
+            temp.path()
+                .join("host/hardware-capability-matrix.json")
+                .exists()
+        );
         assert!(
             fs::read_to_string(temp.path().join("host/ffmpeg-encoders.txt"))
                 .unwrap()
@@ -2487,6 +2506,7 @@ ESCAPED="a \"quoted\" value"
                 decoder: Some("cuda".to_string()),
                 encoder: Some("h264_nvenc".to_string()),
                 fallback: Some("software".to_string()),
+                ..crate::playback::plan::HardwareAccelerationPlan::default()
             },
             audio_output: None,
             video_output: None,
@@ -2675,6 +2695,51 @@ ESCAPED="a \"quoted\" value"
     }
 
     #[test]
+    fn phase18_hdr_tonemap_gate_applies_to_every_hardware_backend() {
+        let hardware_backends = [
+            ("videotoolbox", "videotoolbox", "h264_videotoolbox"),
+            ("qsv", "h264_qsv", "h264_qsv"),
+            ("nvenc", "h264_cuvid", "h264_nvenc"),
+            ("vaapi", "h264_vaapi", "h264_vaapi"),
+            ("amf", "h264", "h264_amf"),
+        ];
+
+        for (api, decoder, encoder) in hardware_backends {
+            let mut plan =
+                test_playback_plan(PlaybackMode::VideoTranscode, StreamAction::Transcode);
+            plan.hardware_acceleration.api = Some(api.to_string());
+            plan.hardware_acceleration.decoder = Some(decoder.to_string());
+            plan.hardware_acceleration.encoder = Some(encoder.to_string());
+            attach_video_output(
+                &mut plan,
+                Some(crate::playback::plan::VideoScalePlan {
+                    width: 1920,
+                    height: 1080,
+                    reason: "resolution_exceeds_policy".to_string(),
+                }),
+                Some(crate::playback::plan::VideoToneMapPlan {
+                    algorithm: "hable".to_string(),
+                    input_primaries: Some("bt2020".to_string()),
+                    input_transfer: Some("smpte2084".to_string()),
+                    input_matrix: Some("bt2020nc".to_string()),
+                    output_primaries: "bt709".to_string(),
+                    output_transfer: "bt709".to_string(),
+                    output_matrix: "bt709".to_string(),
+                }),
+            );
+
+            let source = test_source_case(&["type:hdr10", "type:high-bitrate", "resolution:4k"]);
+            let gate = performance_gate_for_case(CertificationSuite::Robust, &source, &plan, 1.1)
+                .unwrap_or_else(|| panic!("missing HDR tone-map performance gate for {api}"));
+
+            assert_eq!(gate.tier, "selected_4k_hdr_to_1080p_sdr", "{api}");
+            assert_eq!(gate.required_realtime_factor, 1.0, "{api}");
+            assert!(gate.passed, "{api}");
+            assert!(requires_nonblank_frame_validation(&source, &plan), "{api}");
+        }
+    }
+
+    #[test]
     fn missed_performance_gate_only_matches_failed_gate() {
         assert!(!missed_performance_gate(&CaseMetrics {
             realtime_factor: 10.0,
@@ -2813,6 +2878,7 @@ ESCAPED="a \"quoted\" value"
                     decoders: vec!["h264_cuvid".to_string()],
                 },
                 hardware_capabilities: HardwareCapabilities::default(),
+                hardware_readiness: None,
                 cases: CaseSummary::default(),
                 performance: PerformanceSummary::default(),
                 failure_reasons: Vec::new(),

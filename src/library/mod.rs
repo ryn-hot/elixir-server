@@ -4854,6 +4854,7 @@ struct SidecarSubtitle {
     format: Option<String>,
     is_default: bool,
     is_forced: bool,
+    is_hearing_impaired: bool,
 }
 
 async fn sync_media_tracks(
@@ -4936,7 +4937,7 @@ async fn sync_external_subtitles(
 
     for subtitle in subtitles {
         let id = Uuid::new_v4();
-        sqlx::query::<sqlx::Any>("INSERT INTO external_subtitles (id, media_file_id, path, language, title, format, is_default, is_forced, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+        sqlx::query::<sqlx::Any>("INSERT INTO external_subtitles (id, media_file_id, path, language, title, format, is_default, is_forced, is_hearing_impaired, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(id.to_string())
             .bind(media_file_id.to_string())
             .bind(subtitle.path)
@@ -4945,6 +4946,7 @@ async fn sync_external_subtitles(
             .bind(subtitle.format)
             .bind(subtitle.is_default)
             .bind(subtitle.is_forced)
+            .bind(subtitle.is_hearing_impaired)
             .execute(pool)
             .await?;
     }
@@ -4999,10 +5001,13 @@ fn parse_sidecar_tokens(base_stem: &str, subtitle_stem: &str) -> Option<Vec<Stri
     Some(subtitle_values.into_iter().skip(consumed).collect())
 }
 
-fn parse_sidecar_attributes(tokens: &[String]) -> (Option<String>, Option<String>, bool, bool) {
+fn parse_sidecar_attributes(
+    tokens: &[String],
+) -> (Option<String>, Option<String>, bool, bool, bool) {
     let mut language = None;
     let mut is_default = false;
     let mut is_forced = false;
+    let mut is_hearing_impaired = false;
     let mut title_parts = Vec::new();
 
     let mut idx = 0;
@@ -5017,12 +5022,15 @@ fn parse_sidecar_attributes(tokens: &[String]) -> (Option<String>, Option<String
                 is_forced = true;
             }
             "sdh" | "cc" => {
+                is_hearing_impaired = true;
                 push_title_tag(&mut title_parts, "SDH");
             }
             "hearing_impaired" | "hearing-impaired" | "hearingimpaired" => {
+                is_hearing_impaired = true;
                 push_title_tag(&mut title_parts, "HI");
             }
             "hi" if language.is_some() => {
+                is_hearing_impaired = true;
                 push_title_tag(&mut title_parts, "HI");
             }
             "signs" | "sign" | "songs" | "signsandsongs" | "signs-songs" | "signs_songs" => {
@@ -5080,7 +5088,7 @@ fn parse_sidecar_attributes(tokens: &[String]) -> (Option<String>, Option<String
         Some(title_parts.join(" "))
     };
 
-    (language, title, is_default, is_forced)
+    (language, title, is_default, is_forced, is_hearing_impaired)
 }
 
 fn normalize_language_tag(value: Option<String>) -> Option<String> {
@@ -5641,7 +5649,8 @@ async fn scan_sidecar_dir(
             Some(tokens) => tokens,
             None => continue,
         };
-        let (language, title, is_default, is_forced) = parse_sidecar_attributes(&tokens);
+        let (language, title, is_default, is_forced, is_hearing_impaired) =
+            parse_sidecar_attributes(&tokens);
         let entry_path_string = entry_path.to_string_lossy().to_string();
         if !seen.insert(entry_path_string.clone()) {
             continue;
@@ -5653,6 +5662,7 @@ async fn scan_sidecar_dir(
             format: Some(ext),
             is_default,
             is_forced,
+            is_hearing_impaired,
         });
     }
 

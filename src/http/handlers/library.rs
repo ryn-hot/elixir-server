@@ -730,6 +730,7 @@ pub struct ExternalSubtitleResponse {
     pub format: Option<String>,
     pub is_default: bool,
     pub is_forced: bool,
+    pub is_hearing_impaired: bool,
 }
 
 async fn ensure_series_episode_catalog_for_read(
@@ -2615,7 +2616,7 @@ async fn load_external_subtitles(
     }
 
     let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-        "SELECT id, media_file_id, path, language, title, format, CAST(is_default AS INTEGER) AS is_default, CAST(is_forced AS INTEGER) AS is_forced FROM external_subtitles WHERE media_file_id IN (",
+        "SELECT id, media_file_id, path, language, title, format, CAST(is_default AS INTEGER) AS is_default, CAST(is_forced AS INTEGER) AS is_forced, CAST(is_hearing_impaired AS INTEGER) AS is_hearing_impaired FROM external_subtitles WHERE media_file_id IN (",
     );
     let mut separated = builder.separated(", ");
     for id in file_ids {
@@ -2642,6 +2643,11 @@ async fn load_external_subtitles(
             .ok()
             .map(|v| v != 0)
             .unwrap_or(false);
+        let is_hearing_impaired = row
+            .try_get::<i64, _>("is_hearing_impaired")
+            .ok()
+            .map(|v| v != 0)
+            .unwrap_or(false);
         entry.push(ExternalSubtitleResponse {
             id: row.get::<String, _>("id"),
             path: row.get::<String, _>("path"),
@@ -2650,6 +2656,7 @@ async fn load_external_subtitles(
             format: row.try_get::<String, _>("format").ok(),
             is_default,
             is_forced,
+            is_hearing_impaired,
         });
     }
 

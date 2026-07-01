@@ -29,24 +29,32 @@ use crate::{
         PLAY_DECISIONS, PLAY_ERRORS, PLAY_LATENCY, PLAYBACK_CAPACITY_LEVELS,
         PLAYBACK_CAPACITY_REJECTIONS, PLAYBACK_DECISIONS, PLAYBACK_ERRORS,
         PLAYBACK_HLS_PLAYLIST_STARTUP_LATENCY, PLAYBACK_MISSING_SEGMENTS, PLAYBACK_SEGMENT_LATENCY,
-        SEGMENT_SERVED, TRANSCODE_DURATION, TRANSCODE_ERRORS, TRANSCODE_STARTS,
+        PLAYBACK_SESSION_EXPIRATIONS, SEGMENT_SERVED, TRANSCODE_DURATION, TRANSCODE_ERRORS,
+        TRANSCODE_STARTS,
     },
     network::registry::ensure_server_instance,
     playback::{
         ArtifactKind, HLS_SEGMENT_SECONDS, PlaybackArtifact, PlaybackJobPlan, SubtitleInfo,
         TranscodeParams,
-        decision::{PlaybackSelection, plan_playback},
+        decision::{PlaybackSelection, SubtitleSelectionMode, plan_playback},
         hardware::{
             HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
-            detect_hardware_capabilities,
+            HardwareProviderCandidate, HardwareReadinessRecord, HardwareReadinessStatus,
+            collect_host_hardware_inventory, hardware_capabilities_from_readiness,
+            hardware_provider_candidates, host_hardware_fingerprint,
+            load_current_hardware_readiness_records,
         },
         jobs::playback_temp_root,
-        plan::{Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan},
-        probe::{MediaProbeError, ensure_media_file_probe},
+        plan::{Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan, StreamAction},
+        probe::{
+            MediaCapabilities, MediaProbeError, SubtitleKind, SubtitleStreamCapabilities,
+            canonical_subtitle_codec, ensure_media_file_probe, subtitle_kind,
+        },
         profile::{
-            ClientKind, ClientPlaybackProfile, EffectivePlaybackPolicy, NetworkClass,
+            AssComplexitySupport, ClientKind, ClientPlaybackProfile, DefaultSubtitlePolicy,
+            EffectivePlaybackPolicy, ForcedSubtitlePolicy, ImageSubtitleSupport, NetworkClass,
             NetworkPlaybackPolicy, QualityMode, ServerPlaybackPolicy, SubtitleBurnPolicy,
-            derive_effective_playback_policy,
+            SubtitleRendering, derive_effective_playback_policy,
         },
         range::{
             DirectFileBody, DirectReadMetricLabels, build_direct_file_response, content_type_for,
@@ -61,7 +69,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
     process::Command,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct PlayRequest {
@@ -70,6 +78,16 @@ pub struct PlayRequest {
     pub preferred_episode_id: Option<String>,
     pub network_type: Option<String>,
     pub client_capabilities: Option<Value>,
+    #[serde(alias = "audioStreamIndex")]
+    pub audio_stream_index: Option<i32>,
+    #[serde(alias = "subtitleStreamIndex")]
+    pub subtitle_stream_index: Option<i32>,
+    #[serde(alias = "subtitleMode")]
+    pub subtitle_mode: Option<String>,
+    #[serde(alias = "preferredSubtitleLanguage")]
+    pub preferred_subtitle_language: Option<String>,
+    #[serde(alias = "preferredSubtitleTitle")]
+    pub preferred_subtitle_title: Option<String>,
     pub start_position_seconds: Option<f64>,
 }
 
@@ -79,6 +97,7 @@ pub struct PlayResponse {
     pub mode: &'static str,
     pub delivery: &'static str,
     pub stream_url: String,
+    pub subtitle_url: Option<String>,
     pub duration_seconds: Option<i32>,
     pub logical_start_seconds: i32,
     pub server_seek_required: bool,
@@ -93,6 +112,152 @@ pub struct PlayResponse {
     pub wan_direct_endpoint: Option<String>,
     pub state: String,
     pub logical_position_seconds: f32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HardwareReadinessQuery {
+    pub diagnostics: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HardwareReadinessResponse {
+    pub enabled: bool,
+    pub warmed: bool,
+    pub host_fingerprint: Option<String>,
+    pub candidates: Vec<HardwareProviderCandidate>,
+    pub records: Vec<HardwareReadinessRecordResponse>,
+    pub capabilities: HardwareCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HardwareReadinessRecordResponse {
+    pub id: String,
+    pub accelerator_id: String,
+    pub api: String,
+    pub status: HardwareReadinessStatus,
+    pub status_reason: String,
+    pub user_message_code: String,
+    pub gpu_vendor: Option<String>,
+    pub gpu_model: Option<String>,
+    pub gpu_driver_version: Option<String>,
+    pub capabilities: crate::playback::hardware::HardwareCapabilityMatrix,
+    pub probe_report: crate::playback::hardware::HardwareProbeReport,
+    pub stale: bool,
+    pub last_checked_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_error_excerpt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HardwareWarningResponse {
+    pub accelerator_id: String,
+    pub api: String,
+    pub status: HardwareReadinessStatus,
+    pub user_message_code: String,
+    pub status_reason: String,
+}
+
+pub async fn hardware_readiness(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Query(query): Query<HardwareReadinessQuery>,
+) -> ApiResult<Json<HardwareReadinessResponse>> {
+    if !state.settings.playback.hardware_acceleration_enabled {
+        let warmed = state.hardware_capabilities.read().await.is_some();
+        return Ok(Json(HardwareReadinessResponse {
+            enabled: false,
+            warmed,
+            host_fingerprint: None,
+            candidates: Vec::new(),
+            records: Vec::new(),
+            capabilities: HardwareCapabilities::software_only(),
+        }));
+    }
+
+    let diagnostics = query.diagnostics.unwrap_or(false);
+    let config = HardwareDetectionConfig {
+        preference: HardwarePreference::parse(&state.settings.playback.hardware_acceleration),
+    };
+    let inventory = collect_host_hardware_inventory().await;
+    let host_fingerprint = host_hardware_fingerprint(&inventory);
+    let candidates = hardware_provider_candidates(&inventory, config.preference);
+    let records = load_current_hardware_readiness_records(&state.db_pool, &host_fingerprint)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let warmed_capabilities = state.hardware_capabilities.read().await.clone();
+    let warmed = warmed_capabilities.is_some();
+    let capabilities = warmed_capabilities
+        .unwrap_or_else(|| hardware_capabilities_from_readiness(&inventory, &records));
+
+    Ok(Json(HardwareReadinessResponse {
+        enabled: true,
+        warmed,
+        host_fingerprint: Some(host_fingerprint),
+        candidates,
+        records: records
+            .iter()
+            .map(|record| readiness_record_response(record, diagnostics))
+            .collect(),
+        capabilities,
+    }))
+}
+
+pub async fn hardware_warnings(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+) -> ApiResult<Json<Vec<HardwareWarningResponse>>> {
+    if !state.settings.playback.hardware_acceleration_enabled {
+        return Ok(Json(Vec::new()));
+    }
+
+    let inventory = collect_host_hardware_inventory().await;
+    let host_fingerprint = host_hardware_fingerprint(&inventory);
+    let records = load_current_hardware_readiness_records(&state.db_pool, &host_fingerprint)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let warnings = records
+        .iter()
+        .filter(|record| {
+            !matches!(
+                record.status,
+                HardwareReadinessStatus::Available
+                    | HardwareReadinessStatus::DisabledByConfig
+                    | HardwareReadinessStatus::NotApplicable
+            )
+        })
+        .map(|record| HardwareWarningResponse {
+            accelerator_id: record.accelerator_id.clone(),
+            api: record.api.clone(),
+            status: record.status,
+            user_message_code: record.user_message_code.clone(),
+            status_reason: record.status_reason.clone(),
+        })
+        .collect();
+    Ok(Json(warnings))
+}
+
+fn readiness_record_response(
+    record: &HardwareReadinessRecord,
+    diagnostics: bool,
+) -> HardwareReadinessRecordResponse {
+    HardwareReadinessRecordResponse {
+        id: record.id.clone(),
+        accelerator_id: record.accelerator_id.clone(),
+        api: record.api.clone(),
+        status: record.status,
+        status_reason: record.status_reason.clone(),
+        user_message_code: record.user_message_code.clone(),
+        gpu_vendor: record.gpu_vendor.clone(),
+        gpu_model: record.gpu_model.clone(),
+        gpu_driver_version: record.gpu_driver_version.clone(),
+        capabilities: record.capabilities.clone(),
+        probe_report: record.probe_report.clone(),
+        stale: record.stale,
+        last_checked_at: record.last_checked_at.to_rfc3339(),
+        raw_error_excerpt: diagnostics
+            .then(|| record.raw_error_excerpt.clone())
+            .flatten(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +286,14 @@ pub struct ClientCapabilities {
     pub supports_server_side_hls_seek: Option<bool>,
     pub supports_auth_headers_for_media: Option<bool>,
     pub subtitle_burn_policy: Option<String>,
+    pub subtitle_rendering: Option<String>,
+    pub ass_complexity_support: Option<String>,
+    pub image_subtitle_support: Option<String>,
+    pub forced_subtitle_policy: Option<String>,
+    pub default_subtitle_policy: Option<String>,
+    pub subtitle_mode: Option<String>,
+    pub preferred_subtitle_language: Option<String>,
+    pub preferred_subtitle_title: Option<String>,
     pub quality_mode: Option<String>,
     pub app_version: Option<String>,
     pub max_bitrate_bps: Option<i64>,
@@ -330,9 +503,11 @@ pub async fn play(
     )
     .ok_or_else(|| ApiError::not_found("requested file not found"))?;
 
-    let media_capabilities = ensure_media_file_probe(&state.db_pool, &selected.id, &selected.path)
-        .await
-        .map_err(playback_probe_error)?;
+    let mut media_capabilities =
+        ensure_media_file_probe(&state.db_pool, &selected.id, &selected.path)
+            .await
+            .map_err(playback_probe_error)?;
+    attach_external_subtitles(&state, &selected.id, &mut media_capabilities).await?;
     let client_profile = client_playback_profile_from_caps(&caps);
     if !playback_plan_contract_allowed(&state.settings) {
         record_playback_error_labels(
@@ -357,15 +532,17 @@ pub async fn play(
         ));
     }
     let hardware_capabilities = if state.settings.playback.hardware_acceleration_enabled {
-        let hardware_detection_config =
-            hardware_detection_config_from_config(&state.settings.playback);
         state
             .hardware_capabilities
-            .get_or_init(|| async {
-                detect_hardware_capabilities(&hardware_detection_config).await
-            })
+            .read()
             .await
             .clone()
+            .unwrap_or_else(|| {
+                warn!(
+                    "playback hardware readiness is not warm yet; using software fallback for this request"
+                );
+                HardwareCapabilities::software_only()
+            })
     } else {
         HardwareCapabilities::software_only()
     };
@@ -378,12 +555,27 @@ pub async fn play(
     );
     effective_policy.active_video_transcodes = active_video_transcode_count(&state).await?;
     let start_position_seconds = validated_start_position_seconds(body.start_position_seconds)?;
+    let subtitle_mode = body
+        .subtitle_mode
+        .as_deref()
+        .or(caps.subtitle_mode.as_deref());
+    let preferred_subtitle_language = body
+        .preferred_subtitle_language
+        .clone()
+        .or_else(|| caps.preferred_subtitle_language.clone());
+    let preferred_subtitle_title = body
+        .preferred_subtitle_title
+        .clone()
+        .or_else(|| caps.preferred_subtitle_title.clone());
     let playback_plan = plan_playback(
         &selected.id,
         &media_capabilities,
         PlaybackSelection {
-            audio_stream_index: None,
-            subtitle_stream_index: None,
+            audio_stream_index: body.audio_stream_index,
+            subtitle_stream_index: body.subtitle_stream_index,
+            subtitle_mode: subtitle_selection_mode(subtitle_mode),
+            preferred_subtitle_language,
+            preferred_subtitle_title,
             start_position_seconds,
         },
         &client_profile,
@@ -493,6 +685,13 @@ pub async fn play(
             session_id, session_token
         )
     };
+    let subtitle_url = direct_play_sidecar_subtitle_url(
+        &playback_plan,
+        &media_capabilities,
+        &selected.id,
+        &session_id.to_string(),
+        &session_token,
+    );
 
     let resolved_duration = resolve_duration_seconds(
         &state,
@@ -542,6 +741,7 @@ pub async fn play(
         mode: playback_plan.mode.as_str(),
         delivery: playback_plan.delivery.as_str(),
         stream_url,
+        subtitle_url,
         duration_seconds: resolved_duration,
         logical_start_seconds: start_position_seconds.unwrap_or(0),
         server_seek_required: playback_plan.server_seek_required(),
@@ -867,6 +1067,14 @@ fn default_capabilities(
         supports_server_side_hls_seek: Some(true),
         supports_auth_headers_for_media: Some(true),
         subtitle_burn_policy: Some("automatic".to_string()),
+        subtitle_rendering: Some("hls_webvtt".to_string()),
+        ass_complexity_support: Some("burn_in".to_string()),
+        image_subtitle_support: Some("burn_in".to_string()),
+        forced_subtitle_policy: Some("matching_audio".to_string()),
+        default_subtitle_policy: Some("media_default".to_string()),
+        subtitle_mode: Some("default".to_string()),
+        preferred_subtitle_language: None,
+        preferred_subtitle_title: None,
         quality_mode: Some("fixed".to_string()),
         app_version: None,
         max_bitrate_bps: max_bitrate,
@@ -1024,6 +1232,21 @@ fn client_playback_profile_from_caps(caps: &ClientCapabilities) -> ClientPlaybac
     if let Some(value) = caps.subtitle_burn_policy.as_deref() {
         profile.subtitle_burn_policy = subtitle_burn_policy(value);
     }
+    if let Some(value) = caps.subtitle_rendering.as_deref() {
+        profile.subtitle_rendering = subtitle_rendering(value);
+    }
+    if let Some(value) = caps.ass_complexity_support.as_deref() {
+        profile.ass_complexity_support = ass_complexity_support(value);
+    }
+    if let Some(value) = caps.image_subtitle_support.as_deref() {
+        profile.image_subtitle_support = image_subtitle_support(value);
+    }
+    if let Some(value) = caps.forced_subtitle_policy.as_deref() {
+        profile.forced_subtitle_policy = forced_subtitle_policy(value);
+    }
+    if let Some(value) = caps.default_subtitle_policy.as_deref() {
+        profile.default_subtitle_policy = default_subtitle_policy(value);
+    }
     if let Some(value) = caps.quality_mode.as_deref() {
         profile.quality_mode = quality_mode(value);
     }
@@ -1080,14 +1303,6 @@ fn effective_playback_policy_from_config(
     };
 
     derive_effective_playback_policy(client_profile, &server_policy, &network_policy)
-}
-
-fn hardware_detection_config_from_config(
-    config: &crate::config::PlaybackConfig,
-) -> HardwareDetectionConfig {
-    HardwareDetectionConfig {
-        preference: HardwarePreference::parse(&config.hardware_acceleration),
-    }
 }
 
 fn hardware_metric_label(plan: &HardwareAccelerationPlan) -> &'static str {
@@ -1720,11 +1935,13 @@ fn plan_summary_from_plan(
         "video_action": plan.get("video_action").cloned().unwrap_or(Value::Null),
         "audio_action": plan.get("audio_action").cloned().unwrap_or(Value::Null),
         "subtitle_action": plan.get("subtitle_action").cloned().unwrap_or(Value::Null),
+        "hdr_action": plan.get("hdr_action").cloned().unwrap_or(Value::Null),
         "adaptive": plan.get("adaptive").cloned().unwrap_or(Value::Bool(false)),
         "active_rung": active_rung.cloned(),
         "decision_reason": decision_reason,
         "decision_reasons": reasons,
         "video_transcode_reason": plan.get("video_transcode_reason").cloned().unwrap_or(Value::Null),
+        "tone_map": plan.pointer("/video_output/tone_map").cloned().unwrap_or(Value::Null),
         "hardware_acceleration": plan.get("hardware_acceleration").cloned().unwrap_or(Value::Null),
         "warnings": plan.get("warnings").cloned().unwrap_or(Value::Array(Vec::new())),
     }))
@@ -1987,6 +2204,64 @@ fn subtitle_burn_policy(value: &str) -> SubtitleBurnPolicy {
     }
 }
 
+fn subtitle_rendering(value: &str) -> SubtitleRendering {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native" => SubtitleRendering::Native,
+        "sidecar" => SubtitleRendering::Sidecar,
+        "burn_in_only" | "burn-in-only" | "burnin" => SubtitleRendering::BurnInOnly,
+        _ => SubtitleRendering::HlsWebvtt,
+    }
+}
+
+fn ass_complexity_support(value: &str) -> AssComplexitySupport {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native" | "full_native" | "full-native" => AssComplexitySupport::Native,
+        "simple_webvtt" | "simple-webvtt" | "webvtt" => AssComplexitySupport::SimpleWebvtt,
+        "unsupported" | "none" => AssComplexitySupport::Unsupported,
+        _ => AssComplexitySupport::BurnIn,
+    }
+}
+
+fn image_subtitle_support(value: &str) -> ImageSubtitleSupport {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native" => ImageSubtitleSupport::Native,
+        "native_or_burn_in" | "native-or-burn-in" | "native_burn_in" => {
+            ImageSubtitleSupport::NativeOrBurnIn
+        }
+        "unsupported" | "none" => ImageSubtitleSupport::Unsupported,
+        _ => ImageSubtitleSupport::BurnIn,
+    }
+}
+
+fn forced_subtitle_policy(value: &str) -> ForcedSubtitlePolicy {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" | "none" => ForcedSubtitlePolicy::Disabled,
+        "any" => ForcedSubtitlePolicy::Any,
+        _ => ForcedSubtitlePolicy::MatchingAudio,
+    }
+}
+
+fn default_subtitle_policy(value: &str) -> DefaultSubtitlePolicy {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" | "none" => DefaultSubtitlePolicy::Disabled,
+        _ => DefaultSubtitlePolicy::MediaDefault,
+    }
+}
+
+fn subtitle_selection_mode(value: Option<&str>) -> SubtitleSelectionMode {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "none" | "disabled" => SubtitleSelectionMode::Off,
+        "forced" | "forced_only" | "forced-only" => SubtitleSelectionMode::Forced,
+        "track" | "explicit" => SubtitleSelectionMode::Track,
+        _ => SubtitleSelectionMode::Default,
+    }
+}
+
 fn quality_mode(value: &str) -> QualityMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "automatic" | "auto" => QualityMode::Automatic,
@@ -2147,6 +2422,147 @@ fn effective_bitrate(file: &FileRow, duration_seconds: Option<i32>) -> i64 {
     0
 }
 
+const EXTERNAL_SUBTITLE_INDEX_BASE: i32 = -100_000;
+
+async fn attach_external_subtitles(
+    state: &AppState,
+    media_file_id: &str,
+    capabilities: &mut MediaCapabilities,
+) -> ApiResult<()> {
+    let rows = sqlx::query(
+        "SELECT id, path, language, title, format,
+                CAST(is_default AS INTEGER) AS is_default,
+                CAST(is_forced AS INTEGER) AS is_forced,
+                CAST(is_hearing_impaired AS INTEGER) AS is_hearing_impaired
+         FROM external_subtitles
+         WHERE media_file_id = ?
+         ORDER BY path, id",
+    )
+    .bind(media_file_id)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    for (offset, row) in rows.into_iter().enumerate() {
+        let path: String = row.get("path");
+        let format = row
+            .try_get::<String, _>("format")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                Path::new(&path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(str::to_string)
+            });
+        let codec = format.as_deref().map(canonical_subtitle_codec);
+        let kind = codec
+            .as_deref()
+            .map(subtitle_kind)
+            .unwrap_or(SubtitleKind::Unknown);
+        let is_default = row
+            .try_get::<i64, _>("is_default")
+            .ok()
+            .map(|value| value != 0)
+            .unwrap_or(false);
+        let is_forced = row
+            .try_get::<i64, _>("is_forced")
+            .ok()
+            .map(|value| value != 0)
+            .unwrap_or(false);
+        let is_hearing_impaired = row
+            .try_get::<i64, _>("is_hearing_impaired")
+            .ok()
+            .map(|value| value != 0)
+            .unwrap_or(false);
+
+        capabilities
+            .subtitle_streams
+            .push(SubtitleStreamCapabilities {
+                index: Some(EXTERNAL_SUBTITLE_INDEX_BASE - offset as i32),
+                external_id: Some(row.get("id")),
+                codec,
+                kind,
+                language: row.try_get::<String, _>("language").ok(),
+                title: row.try_get::<String, _>("title").ok(),
+                is_default,
+                is_forced,
+                is_hearing_impaired,
+                external_path: Some(path),
+            });
+    }
+
+    Ok(())
+}
+
+fn direct_play_sidecar_subtitle_url(
+    playback_plan: &PlaybackPlan,
+    capabilities: &MediaCapabilities,
+    media_file_id: &str,
+    session_id: &str,
+    session_token: &str,
+) -> Option<String> {
+    if playback_plan.mode != PlaybackMode::DirectPlay
+        || !matches!(
+            playback_plan.subtitle_action,
+            StreamAction::Copy | StreamAction::Passthrough
+        )
+    {
+        return None;
+    }
+    let selected_track = playback_plan.selected_subtitle_track?;
+    let subtitle = capabilities
+        .subtitle_streams
+        .iter()
+        .find(|stream| stream.index == Some(selected_track))?;
+    let external_id = subtitle.external_id.as_ref()?;
+    Some(format!(
+        "/stream/subtitle/{media_file_id}/{external_id}?sid={session_id}&session={session_token}"
+    ))
+}
+
+async fn canonical_sidecar_subtitle_path(
+    media_path: &str,
+    subtitle_path: &str,
+) -> ApiResult<PathBuf> {
+    let media_parent = Path::new(media_path)
+        .parent()
+        .ok_or_else(|| ApiError::forbidden("media path has no parent"))?;
+    let media_parent = fs::canonicalize(media_parent)
+        .await
+        .map_err(|err| source_unreadable_error(media_path, err.to_string()))?;
+    let subtitle_path = fs::canonicalize(subtitle_path)
+        .await
+        .map_err(|err| source_unreadable_error(subtitle_path, err.to_string()))?;
+    if !subtitle_path.starts_with(&media_parent) {
+        return Err(ApiError::forbidden(
+            "subtitle path is outside the media directory",
+        ));
+    }
+    Ok(subtitle_path)
+}
+
+fn subtitle_content_type(path: &Path, format: Option<&str>) -> String {
+    let ext = format
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "vtt" | "webvtt" => "text/vtt; charset=utf-8".to_string(),
+        "srt" | "subrip" => "application/x-subrip; charset=utf-8".to_string(),
+        "ass" => "text/x-ass; charset=utf-8".to_string(),
+        "ssa" => "text/x-ssa; charset=utf-8".to_string(),
+        "idx" | "sub" => "application/octet-stream".to_string(),
+        _ => "text/plain; charset=utf-8".to_string(),
+    }
+}
+
 pub async fn stream_direct(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -2231,6 +2647,105 @@ pub async fn stream_direct(
                     user_id: user.user_id.to_string(),
                     media_file_id: id.clone(),
                     delivery: "direct_file".to_string(),
+                },
+            )
+        }
+        DirectFileBody::Error(body) => Body::from(body),
+    };
+
+    Ok((direct_response.status, direct_response.headers, body).into_response())
+}
+
+pub async fn stream_subtitle(
+    State(state): State<AppState>,
+    AxumPath((id, subtitle_id)): AxumPath<(String, String)>,
+    Query(params): Query<StreamQuery>,
+    method: Method,
+    headers: HeaderMap,
+    user: CurrentUser,
+) -> ApiResult<Response> {
+    let session_id = params
+        .sid
+        .as_deref()
+        .ok_or_else(|| ApiError::unauthorized("session id required"))?;
+    let session_token = params
+        .session
+        .as_deref()
+        .ok_or_else(|| ApiError::unauthorized("session token required"))?;
+    let session_row = get_session_with_token(
+        &state,
+        &user,
+        session_id,
+        Some("direct_play"),
+        session_token,
+    )
+    .await?;
+    let session_media_file_id: String = session_row.get("media_file_id");
+    if session_media_file_id != id {
+        tracing::warn!(
+            session = %session_id,
+            requested_file = %id,
+            session_file = %session_media_file_id,
+            "sidecar subtitle file mismatch"
+        );
+        return Err(ApiError::unauthorized("invalid session"));
+    }
+
+    let subtitle_row = sqlx::query(
+        "SELECT es.path, es.format, mf.path AS media_path
+         FROM external_subtitles es
+         JOIN media_files mf ON mf.id = es.media_file_id
+         WHERE es.id = ? AND es.media_file_id = ? AND mf.scan_state = 'ok'
+         LIMIT 1",
+    )
+    .bind(&subtitle_id)
+    .bind(&id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .ok_or_else(|| ApiError::not_found("subtitle not found"))?;
+
+    let subtitle_path: String = subtitle_row.get("path");
+    let media_path: String = subtitle_row.get("media_path");
+    let subtitle_path = canonical_sidecar_subtitle_path(&media_path, &subtitle_path).await?;
+    let format: Option<String> = subtitle_row.try_get("format").ok();
+
+    let mut file = File::open(&subtitle_path).await.map_err(|err| {
+        source_unreadable_error(&subtitle_path.to_string_lossy(), err.to_string())
+    })?;
+    let meta = file.metadata().await.map_err(|err| {
+        source_unreadable_error(&subtitle_path.to_string_lossy(), err.to_string())
+    })?;
+    let file_len = meta.len();
+    let modified = meta.modified().ok();
+    let content_type = subtitle_content_type(&subtitle_path, format.as_deref());
+    let direct_response =
+        build_direct_file_response(&method, &headers, file_len, modified, &content_type);
+    record_direct_stream_range_status(&direct_response, &method, "direct_subtitle");
+    touch_playback_session(&state, session_id, PlaybackActivityKind::DirectSubtitleRead).await?;
+
+    let body = match direct_response.body {
+        DirectFileBody::Empty => Body::empty(),
+        DirectFileBody::Full => direct_file_body(
+            file,
+            DirectReadMetricLabels {
+                session_id: session_id.to_string(),
+                user_id: user.user_id.to_string(),
+                media_file_id: id.clone(),
+                delivery: "direct_subtitle".to_string(),
+            },
+        ),
+        DirectFileBody::Range { start, length } => {
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            direct_file_body(
+                file.take(length),
+                DirectReadMetricLabels {
+                    session_id: session_id.to_string(),
+                    user_id: user.user_id.to_string(),
+                    media_file_id: id.clone(),
+                    delivery: "direct_subtitle".to_string(),
                 },
             )
         }
@@ -2601,6 +3116,7 @@ pub struct SessionDetailResponse {
 #[derive(Debug, Clone, Copy)]
 enum PlaybackActivityKind {
     DirectRead,
+    DirectSubtitleRead,
     HlsMasterPlaylist,
     HlsMediaPlaylist,
     HlsSegment,
@@ -2616,6 +3132,7 @@ impl PlaybackActivityKind {
     fn as_str(self) -> &'static str {
         match self {
             PlaybackActivityKind::DirectRead => "direct_read",
+            PlaybackActivityKind::DirectSubtitleRead => "direct_subtitle_read",
             PlaybackActivityKind::HlsMasterPlaylist => "hls_master_playlist",
             PlaybackActivityKind::HlsMediaPlaylist => "hls_media_playlist",
             PlaybackActivityKind::HlsSegment => "hls_segment",
@@ -2716,6 +3233,10 @@ async fn get_session(
         if state_value.to_ascii_lowercase() != "active" {
             return Err(ApiError::unauthorized("invalid session"));
         }
+        if playback_session_expired(&row, state.settings.playback.session_ttl_seconds) {
+            expire_active_playback_session(state, session_id).await?;
+            return Err(ApiError::unauthorized("invalid session"));
+        }
     }
 
     if let Some(expected) = expected_mode {
@@ -2726,6 +3247,50 @@ async fn get_session(
     }
 
     Ok(row)
+}
+
+async fn expire_active_playback_session(state: &AppState, session_id: &str) -> ApiResult<()> {
+    if let Ok(id) = Uuid::parse_str(session_id) {
+        state.transcodes.stop(id, "session_expired").await;
+        PLAYBACK_SESSION_EXPIRATIONS
+            .with_label_values(&["ttl"])
+            .inc();
+    }
+    sqlx::query::<sqlx::Any>(
+        "UPDATE playback_sessions
+         SET state = 'ended', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND state = 'active'",
+    )
+    .bind(session_id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
+}
+
+fn playback_session_expired(row: &AnyRow, ttl_seconds: u64) -> bool {
+    let Ok(updated_at) = row.try_get::<String, _>("updated_at") else {
+        return false;
+    };
+    let Some(updated_at) = parse_playback_session_timestamp(updated_at.trim()) else {
+        return false;
+    };
+    let ttl = chrono::Duration::from_std(Duration::from_secs(ttl_seconds))
+        .unwrap_or(chrono::Duration::MAX);
+    chrono::Utc::now().signed_duration_since(updated_at) > ttl
+}
+
+fn parse_playback_session_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            dt,
+            chrono::Utc,
+        ));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    None
 }
 
 fn session_mode_matches(actual: &str, expected: &str) -> bool {
@@ -2968,6 +3533,7 @@ struct SubtitleRendition {
     language: Option<String>,
     is_default: bool,
     is_forced: bool,
+    is_hearing_impaired: bool,
     uri: String,
 }
 
@@ -2989,6 +3555,7 @@ async fn build_subtitle_renditions(
             language: sub.language.clone(),
             is_default: idx == default_index,
             is_forced: sub.is_forced,
+            is_hearing_impaired: sub.is_hearing_impaired,
             uri: playlist_name,
         });
     }
@@ -3106,6 +3673,12 @@ fn inject_subtitle_media(
         if rendition.is_forced {
             attrs.push("FORCED=YES".to_string());
         }
+        if rendition.is_hearing_impaired {
+            attrs.push(
+                "CHARACTERISTICS=\"public.accessibility.describes-spoken-dialog,public.accessibility.describes-music-and-sound\""
+                    .to_string(),
+            );
+        }
         attrs.push(format!("URI=\"{}\"", subtitle_url));
         media_lines.push(format!("#EXT-X-MEDIA:{}", attrs.join(",")));
     }
@@ -3149,12 +3722,41 @@ fn append_playback_query_params(
     auth_token: Option<&str>,
     cache_bust: Option<&str>,
 ) -> String {
-    let mut rewritten = append_query_param(url, "session", session_token);
+    let sanitized = strip_sensitive_playback_query_params(url);
+    let mut rewritten = append_query_param(&sanitized, "session", session_token);
     if let Some(tok) = auth_token {
         rewritten = append_query_param(&rewritten, "token", tok);
     }
     if let Some(ts) = cache_bust {
         rewritten = append_query_param(&rewritten, "ts", ts);
+    }
+    rewritten
+}
+
+fn strip_sensitive_playback_query_params(url: &str) -> String {
+    let (without_fragment, fragment) = url
+        .split_once('#')
+        .map(|(base, fragment)| (base, Some(fragment)))
+        .unwrap_or((url, None));
+    let Some((path, query)) = without_fragment.split_once('?') else {
+        return url.to_string();
+    };
+    let retained = query
+        .split('&')
+        .filter(|pair| !pair.trim().is_empty())
+        .filter(|pair| {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+            !is_sensitive_playback_query_key(key)
+        })
+        .collect::<Vec<_>>();
+    let mut rewritten = if retained.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, retained.join("&"))
+    };
+    if let Some(fragment) = fragment {
+        rewritten.push('#');
+        rewritten.push_str(fragment);
     }
     rewritten
 }
@@ -3812,8 +4414,20 @@ mod tests {
             "video_action": "transcode",
             "audio_action": "transcode",
             "subtitle_action": "burn_in",
+            "hdr_action": "tone_map_to_sdr",
             "adaptive": true,
             "video_transcode_reason": "subtitle_requires_burn_in",
+            "video_output": {
+                "tone_map": {
+                    "algorithm": "hable",
+                    "input_primaries": "bt2020",
+                    "input_transfer": "smpte2084",
+                    "input_matrix": "bt2020nc",
+                    "output_primaries": "bt709",
+                    "output_transfer": "bt709",
+                    "output_matrix": "bt709"
+                }
+            },
             "hardware_acceleration": {"enabled": false},
             "warnings": ["hardware_fallback_to_software"],
             "reasons": ["adaptive_transcode_automatic_quality_requested", "subtitle_requires_burn_in"]
@@ -3853,6 +4467,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("720p 4000k")
         );
+        assert_eq!(
+            summary.get("hdr_action").and_then(Value::as_str),
+            Some("tone_map_to_sdr")
+        );
+        assert_eq!(
+            summary
+                .pointer("/tone_map/output_primaries")
+                .and_then(Value::as_str),
+            Some("bt709")
+        );
 
         let snapshot = job_snapshot_from_state(Some(&job_state)).expect("snapshot");
         assert!(snapshot.get("temp_dir").is_none(), "{snapshot}");
@@ -3882,6 +4506,106 @@ mod tests {
         assert!(
             rewritten.contains("segment_00000.m4s?session=session-token&token=bearer-token&ts=123")
         );
+    }
+
+    #[test]
+    fn phase17_hls_subtitle_media_preserves_metadata_and_escapes_attributes() {
+        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nstream_0.m3u8\n";
+        let renditions = vec![SubtitleRendition {
+            name: "English \"SDH\"\nTrack".to_string(),
+            language: Some("en\"g".to_string()),
+            is_default: true,
+            is_forced: true,
+            is_hearing_impaired: true,
+            uri: "sub_0.m3u8".to_string(),
+        }];
+
+        let rewritten = inject_subtitle_media(
+            playlist,
+            &renditions,
+            "session-token",
+            Some("bearer-token"),
+            None,
+        );
+
+        assert!(rewritten.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
+        assert!(rewritten.contains("GROUP-ID=\"subs\""));
+        assert!(rewritten.contains("NAME=\"English 'SDH' Track\""));
+        assert!(rewritten.contains("LANGUAGE=\"en'g\""));
+        assert!(rewritten.contains("DEFAULT=YES"));
+        assert!(rewritten.contains("FORCED=YES"));
+        assert!(rewritten.contains("CHARACTERISTICS=\"public.accessibility.describes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
+        assert!(rewritten.contains("URI=\"sub_0.m3u8?session=session-token&token=bearer-token\""));
+        assert!(
+            rewritten.find("#EXT-X-MEDIA").unwrap() < rewritten.find("#EXT-X-STREAM-INF").unwrap(),
+            "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn phase17_vtt_cue_shift_preserves_settings_and_drops_negative_cues() {
+        let shifted = shift_vtt_cues(
+            "WEBVTT\n\n00:00:00.100 --> 00:00:00.300\nexpired\n\n00:00:01.000 --> 00:00:03.250 align:start position:10%\nhello\n\n00:00:05,500 --> 00:00:06,000\ncomma\n",
+            -0.5,
+        );
+
+        assert!(shifted.contains("WEBVTT"));
+        assert!(!shifted.contains("expired"), "{shifted}");
+        assert!(
+            shifted.contains("00:00:00.500 --> 00:00:02.750 align:start position:10%"),
+            "{shifted}"
+        );
+        assert!(shifted.contains("hello"), "{shifted}");
+        assert!(
+            shifted.contains("00:00:05.000 --> 00:00:05.500"),
+            "{shifted}"
+        );
+        assert!(shifted.contains("comma"), "{shifted}");
+    }
+
+    #[test]
+    fn phase17_vtt_timing_stays_within_tolerance_after_start_seek_and_boundary_shift() {
+        fn cue_times(content: &str) -> Vec<(f64, f64)> {
+            content
+                .lines()
+                .filter_map(|line| {
+                    if !line.contains("-->") {
+                        return None;
+                    }
+                    let mut parts = line.splitn(2, "-->");
+                    let start = parse_vtt_time(parts.next()?.trim())?;
+                    let (end_raw, _) = split_time_and_settings(parts.next()?.trim());
+                    let end = parse_vtt_time(end_raw)?;
+                    Some((start, end))
+                })
+                .collect()
+        }
+
+        let shifted = shift_vtt_cues(
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nstart\n\n00:00:03.900 --> 00:00:04.100 line:90%\nboundary\n\n01:02:03,456 --> 01:02:05,789 align:end\nlong\n",
+            0.125,
+        );
+        let actual = cue_times(&shifted);
+        let expected = [(0.125, 1.125), (4.025, 4.225), (3723.581, 3725.914)];
+
+        assert_eq!(actual.len(), expected.len(), "{shifted}");
+        for ((actual_start, actual_end), (expected_start, expected_end)) in
+            actual.into_iter().zip(expected)
+        {
+            assert!(
+                (actual_start - expected_start).abs() <= 0.001,
+                "start drift exceeded 1 ms: actual={actual_start} expected={expected_start}\n{shifted}"
+            );
+            assert!(
+                (actual_end - expected_end).abs() <= 0.001,
+                "end drift exceeded 1 ms: actual={actual_end} expected={expected_end}\n{shifted}"
+            );
+            assert!(
+                (actual_start - expected_start).abs() <= 0.250
+                    && (actual_end - expected_end).abs() <= 0.250,
+                "Phase 17 250 ms timing tolerance breached\n{shifted}"
+            );
+        }
     }
 
     #[test]

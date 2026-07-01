@@ -4,11 +4,12 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 const PACKET_DURATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_SIDE_DATA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FfprobeStreams {
@@ -16,6 +17,20 @@ pub struct FfprobeStreams {
     pub format: Option<Format>,
     #[serde(default)]
     pub chapters: Vec<Chapter>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FfprobeFrames {
+    #[serde(default)]
+    frames: Vec<Frame>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Frame {
+    #[serde(rename = "stream_index")]
+    stream_index: Option<i32>,
+    #[serde(default, rename = "side_data_list")]
+    side_data_list: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,6 +82,9 @@ pub struct Disposition {
     #[serde(rename = "default")]
     pub default_flag: Option<i32>,
     pub forced: Option<i32>,
+    pub hearing_impaired: Option<i32>,
+    pub captions: Option<i32>,
+    pub descriptions: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,8 +150,31 @@ pub async fn probe(path: &str) -> anyhow::Result<MediaMetadata> {
 
     let raw_json: Value =
         serde_json::from_slice(&output.stdout).context("failed to parse ffprobe json")?;
-    let parsed: FfprobeStreams =
+    let mut parsed: FfprobeStreams =
         serde_json::from_value(raw_json.clone()).context("failed to parse ffprobe json")?;
+
+    match timeout(
+        FRAME_SIDE_DATA_PROBE_TIMEOUT,
+        probe_video_frame_side_data(path),
+    )
+    .await
+    {
+        Ok(Ok(frames)) => merge_frame_side_data(&mut parsed.streams, frames),
+        Ok(Err(err)) => {
+            tracing::debug!(
+                path,
+                error = %err,
+                "ffprobe frame side-data probe failed; using stream side data only"
+            );
+        }
+        Err(_) => {
+            tracing::debug!(
+                path,
+                timeout_seconds = FRAME_SIDE_DATA_PROBE_TIMEOUT.as_secs(),
+                "ffprobe frame side-data probe timed out; using stream side data only"
+            );
+        }
+    }
 
     let mut meta = MediaMetadata::default();
     let mut format_duration_seconds: Option<i32> = None;
@@ -281,6 +322,76 @@ async fn probe_video_duration_by_packets(path: &str) -> anyhow::Result<f32> {
     Ok(value)
 }
 
+async fn probe_video_frame_side_data(path: &str) -> anyhow::Result<FfprobeFrames> {
+    let mut command = Command::new("ffprobe");
+    command.kill_on_drop(true);
+    let output = command
+        .arg("-v")
+        .arg("error")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-select_streams")
+        .arg("v")
+        .arg("-read_intervals")
+        .arg("%+#5")
+        .arg("-show_frames")
+        .arg("-show_entries")
+        .arg("frame=stream_index,media_type,side_data_list")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .output()
+        .await
+        .context("failed to probe video frame side data")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe frame side-data probe failed with code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    serde_json::from_slice(&output.stdout).context("failed to parse ffprobe frame side-data json")
+}
+
+fn merge_frame_side_data(streams: &mut [Stream], frames: FfprobeFrames) {
+    for frame in frames.frames {
+        if frame.side_data_list.is_empty() {
+            continue;
+        }
+        let stream = match frame.stream_index {
+            Some(stream_index) => streams.iter_mut().find(|stream| {
+                stream.codec_type.as_deref() == Some("video") && stream.index == Some(stream_index)
+            }),
+            None => streams
+                .iter_mut()
+                .find(|stream| stream.codec_type.as_deref() == Some("video")),
+        };
+        let Some(stream) = stream else {
+            continue;
+        };
+        let mut seen = stream
+            .side_data_list
+            .iter()
+            .map(side_data_key)
+            .collect::<BTreeSet<_>>();
+        for side_data in frame.side_data_list {
+            let key = side_data_key(&side_data);
+            if seen.insert(key) {
+                stream.side_data_list.push(side_data);
+            }
+        }
+    }
+}
+
+fn side_data_key(side_data: &Value) -> String {
+    side_data
+        .get("side_data_type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| side_data.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +420,50 @@ mod tests {
         .expect("ffprobe json should parse");
 
         assert_eq!(parsed.chapters[0].id, Some(6562625086751577810_i64));
+    }
+
+    #[test]
+    fn merges_video_frame_side_data_into_matching_stream_without_duplicates() {
+        let mut streams = vec![
+            Stream {
+                index: Some(0),
+                codec_type: Some("video".to_string()),
+                codec_name: Some("hevc".to_string()),
+                side_data_list: vec![serde_json::json!({
+                    "side_data_type": "Mastering display metadata"
+                })],
+                ..Default::default()
+            },
+            Stream {
+                index: Some(1),
+                codec_type: Some("audio".to_string()),
+                codec_name: Some("aac".to_string()),
+                ..Default::default()
+            },
+        ];
+        let frames = FfprobeFrames {
+            frames: vec![Frame {
+                stream_index: Some(0),
+                side_data_list: vec![
+                    serde_json::json!({
+                        "side_data_type": "Mastering display metadata"
+                    }),
+                    serde_json::json!({
+                        "side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+                    }),
+                ],
+            }],
+        };
+
+        merge_frame_side_data(&mut streams, frames);
+
+        assert_eq!(streams[0].side_data_list.len(), 2);
+        assert!(
+            streams[0]
+                .side_data_list
+                .iter()
+                .any(|value| value.to_string().contains("HDR10+"))
+        );
+        assert!(streams[1].side_data_list.is_empty());
     }
 }

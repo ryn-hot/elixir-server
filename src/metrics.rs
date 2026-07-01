@@ -187,6 +187,31 @@ pub static PLAYBACK_SESSION_EXPIRATIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["reason"]).expect("counter vec created")
 });
 
+pub static PLAYBACK_HARDWARE_READINESS_STATUS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_hardware_readiness_status",
+        "Current playback hardware readiness status by API, OS family, and GPU vendor",
+    );
+    IntGaugeVec::new(opts, &["api", "status", "os_family", "gpu_vendor"])
+        .expect("gauge vec created")
+});
+
+pub static PLAYBACK_HARDWARE_PROBE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_playback_hardware_probe_duration_seconds",
+        "Duration of playback hardware capability probes",
+    );
+    HistogramVec::new(opts, &["api", "operation", "status"]).expect("histogram vec created")
+});
+
+pub static PLAYBACK_HARDWARE_PROBE_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_hardware_probe_failures_total",
+        "Count of playback hardware capability probe failures",
+    );
+    IntCounterVec::new(opts, &["api", "operation", "reason"]).expect("counter vec created")
+});
+
 pub static RECONCILE_RUNS: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(
         "elixir_reconcile_runs_total",
@@ -249,6 +274,15 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(PLAYBACK_SESSION_EXPIRATIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_HARDWARE_READINESS_STATUS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_HARDWARE_PROBE_DURATION.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_HARDWARE_PROBE_FAILURES.clone()))
         .ok();
     REGISTRY.register(Box::new(RECONCILE_RUNS.clone())).ok();
     REGISTRY.register(Box::new(RECONCILE_ACTIONS.clone())).ok();

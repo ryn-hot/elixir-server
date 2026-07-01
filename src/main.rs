@@ -44,7 +44,10 @@ use elixir_server::orchestrator::executor::ExecutorAction;
 use elixir_server::orchestrator::naming::build_aliases;
 use elixir_server::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
 use elixir_server::orchestrator::reconcile::ReconcileConfig;
-use elixir_server::playback::start_session_cleanup;
+use elixir_server::playback::{
+    hardware::{HardwareDetectionConfig, HardwarePreference, load_or_detect_hardware_capabilities},
+    start_session_cleanup,
+};
 use elixir_server::runtime::health::{
     DockerRuntimeHealthSnapshot, DockerRuntimeHealthState, runtime_health_poll_interval,
 };
@@ -226,6 +229,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_post_listener_background_tasks(state: AppState, reconcile_config: ReconcileConfig) {
+    start_playback_hardware_readiness_warmup(state.clone());
+
     // Kick off background periodic scan.
     let scan_interval = state.settings.library.scan_interval_seconds;
     let scan_state = state.clone();
@@ -348,6 +353,34 @@ async fn start_post_listener_background_tasks(state: AppState, reconcile_config:
     if _mdns_guard.is_some() {
         std::future::pending::<()>().await;
     }
+}
+
+fn start_playback_hardware_readiness_warmup(state: AppState) {
+    if !state.settings.playback.hardware_acceleration_enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let config = HardwareDetectionConfig {
+            preference: HardwarePreference::parse(&state.settings.playback.hardware_acceleration),
+        };
+        match load_or_detect_hardware_capabilities(&state.db_pool, &config).await {
+            Ok(capabilities) => {
+                let available_apis = capabilities.available_apis.clone();
+                *state.hardware_capabilities.write().await = Some(capabilities);
+                tracing::info!(
+                    available_apis = ?available_apis,
+                    "playback hardware readiness warm-up completed"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "playback hardware readiness warm-up failed; software fallback remains active"
+                );
+            }
+        }
+    });
 }
 
 async fn ensure_runtime_directories(settings: &Settings) -> anyhow::Result<()> {

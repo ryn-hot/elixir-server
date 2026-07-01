@@ -34,6 +34,8 @@ use super::{
     TranscodeHandle, TranscodeParams, detect_text_subtitles, spawn_ffmpeg,
 };
 
+pub type HardwareFailureCallback = Arc<dyn Fn() + Send + Sync>;
+
 const DEFAULT_REMUX_JOBS: usize = 8;
 const DEFAULT_PARTIAL_TRANSCODE_JOBS: usize = 4;
 const DEFAULT_VIDEO_TRANSCODE_JOBS: usize = 2;
@@ -303,6 +305,7 @@ pub struct PlaybackJobManager {
     startup_queue_len: Arc<AtomicUsize>,
     db_pool: AnyPool,
     limits: PlaybackJobLimits,
+    hardware_failure_callback: Option<HardwareFailureCallback>,
 }
 
 struct JobCapacityPools {
@@ -338,6 +341,20 @@ impl PlaybackJobManager {
         capacity_limits: PlaybackJobCapacityLimits,
         limits: PlaybackJobLimits,
     ) -> Self {
+        Self::with_capacity_limits_and_hardware_failure_callback(
+            db_pool,
+            capacity_limits,
+            limits,
+            None,
+        )
+    }
+
+    pub fn with_capacity_limits_and_hardware_failure_callback(
+        db_pool: AnyPool,
+        capacity_limits: PlaybackJobCapacityLimits,
+        limits: PlaybackJobLimits,
+        hardware_failure_callback: Option<HardwareFailureCallback>,
+    ) -> Self {
         Self {
             jobs: Arc::new(DashMap::new()),
             capacities: Arc::new(JobCapacityPools {
@@ -350,6 +367,7 @@ impl PlaybackJobManager {
             startup_queue_len: Arc::new(AtomicUsize::new(0)),
             db_pool,
             limits,
+            hardware_failure_callback,
         }
     }
 
@@ -664,6 +682,7 @@ impl PlaybackJobManager {
                 title: None,
                 is_default: idx == 0,
                 is_forced: false,
+                is_hearing_impaired: false,
             });
         }
         let artifacts = ArtifactRegistry::for_plan(mode, delivery, subtitle_count);
@@ -1022,12 +1041,25 @@ impl PlaybackJobManager {
         else {
             return;
         };
-        let log_path = { entry.lock().await.log_path.clone() };
+        let (log_path, planned_hardware_api) = {
+            let job = entry.lock().await;
+            (job.log_path.clone(), job_planned_hardware_api(&job))
+        };
         let log_tail = read_log_tail(&log_path, self.limits.log_tail_bytes)
             .await
             .ok()
             .filter(|tail| !tail.trim().is_empty());
         let error_kind = classify_playback_failure(reason, detail.as_deref(), log_tail.as_deref());
+        if error_kind == "hardware_unavailable" && planned_hardware_api.is_some() {
+            if let Some(callback) = self.hardware_failure_callback.as_ref() {
+                callback();
+            }
+            tracing::warn!(
+                api = planned_hardware_api.as_deref().unwrap_or("unknown"),
+                reason,
+                "playback hardware failure invalidated readiness cache"
+            );
+        }
         let message = match detail {
             Some(detail) => format!("{reason}: {detail}"),
             None => reason.to_string(),
@@ -1233,6 +1265,17 @@ fn job_plan_allows_hardware_software_fallback(plan: &PlaybackJobPlan) -> bool {
         .unwrap_or(false)
 }
 
+fn job_planned_hardware_api(job: &PlaybackJob) -> Option<String> {
+    job.plan
+        .parsed_playback_plan()
+        .and_then(|plan| {
+            plan.hardware_acceleration
+                .enabled
+                .then_some(plan.hardware_acceleration.api)
+        })
+        .flatten()
+}
+
 fn active_rung_snapshot(
     playback_plan: Option<&Value>,
     active_rung_id: Option<&str>,
@@ -1303,6 +1346,7 @@ fn software_fallback_job_plan(plan: &PlaybackJobPlan, reason: &str) -> Option<Pl
         decoder: None,
         encoder: None,
         fallback: Some("software_after_hardware_failure".to_string()),
+        ..HardwareAccelerationPlan::default()
     };
     push_plan_reason(
         &mut playback_plan.reasons,
@@ -2247,6 +2291,139 @@ mod tests {
         );
     }
 
+    fn hardware_playback_plan_fixture() -> PlaybackPlan {
+        let mut report = CompatibilityReport::empty("media-file");
+        report.source_video_codec = Some("h264".to_string());
+        PlaybackPlan {
+            plan_version: PLAYBACK_PLAN_VERSION,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+            media_file_id: "media-file".to_string(),
+            selected_video_track: Some(0),
+            video_action: StreamAction::Transcode,
+            audio_action: StreamAction::Transcode,
+            subtitle_action: StreamAction::Disabled,
+            seek_behavior: SeekBehavior::ServerHlsRestart,
+            adaptive: false,
+            selected_audio_track: Some(1),
+            selected_subtitle_track: None,
+            hdr_action: HdrAction::None,
+            hardware_acceleration: HardwareAccelerationPlan {
+                enabled: true,
+                api: Some("videotoolbox".to_string()),
+                decoder: Some("videotoolbox".to_string()),
+                encoder: Some("h264_videotoolbox".to_string()),
+                fallback: Some("software".to_string()),
+                ..HardwareAccelerationPlan::default()
+            },
+            audio_output: None,
+            video_output: Some(VideoOutputPlan {
+                codec: "h264".to_string(),
+                encoder: "h264_videotoolbox".to_string(),
+                preset: "veryfast".to_string(),
+                profile: Some("high".to_string()),
+                level: Some("4.1".to_string()),
+                crf: None,
+                bitrate_bps: Some(3_000_000),
+                maxrate_bps: Some(3_000_000),
+                bufsize_bps: Some(6_000_000),
+                pixel_format: Some("yuv420p".to_string()),
+                scale: None,
+                tone_map: None,
+                frame_rate: VideoFrameRatePlan {
+                    mode: VideoFrameRateMode::Source,
+                    source_fps: Some("24".to_string()),
+                    target_fps: None,
+                },
+                gop_frames: Some(96),
+                segment_seconds: "4".to_string(),
+                keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+                hls_delivery: Delivery::HlsFmp4,
+                burn_in: None,
+                reasons: vec!["hardware_encoder_selected:h264_videotoolbox".to_string()],
+            }),
+            adaptive_ladder: None,
+            video_transcode_reason: Some("source_bitrate_exceeds_policy".to_string()),
+            compatibility_report: report,
+            reasons: vec!["source_bitrate_exceeds_policy".to_string()],
+            warnings: Vec::new(),
+            expected_outputs: Vec::new(),
+            playable: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn hardware_unavailable_failure_invokes_refresh_callback() -> Result<()> {
+        let mut settings = Settings::default();
+        settings.database.url = "sqlite::memory:?cache=shared".to_string();
+        settings.database.max_connections = 1;
+        let database = Database::connect(&settings.database).await?;
+        database.run_migrations().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let manager = PlaybackJobManager::with_capacity_limits_and_hardware_failure_callback(
+            database.pool.clone(),
+            PlaybackJobCapacityLimits::default(),
+            PlaybackJobLimits::default(),
+            Some(Arc::new(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let session_id = Uuid::new_v4();
+        insert_session(&database.pool, session_id).await?;
+        let temp = tempdir()?;
+        let log_path = temp.path().join("ffmpeg.log");
+        fs::write(
+            &log_path,
+            "h264_videotoolbox encoder failed; device creation failed\n",
+        )
+        .await?;
+        let job = PlaybackJob {
+            plan: PlaybackJobPlan::new(
+                session_id,
+                "media-file",
+                "test-media",
+                TranscodeParams {
+                    seek_seconds: 0.0,
+                    mode: PlaybackMode::VideoTranscode,
+                    delivery: Delivery::HlsFmp4,
+                },
+                Some(serde_json::to_value(hardware_playback_plan_fixture())?),
+            ),
+            state: PlaybackJobState::Running,
+            temp_dir: temp.path().to_path_buf(),
+            artifacts: ArtifactRegistry::for_transcode(0),
+            process_id: None,
+            process_group_id: None,
+            child: None,
+            capacity_permits: Vec::new(),
+            started_at: Some(Utc::now()),
+            last_progress_at: Some(Utc::now()),
+            last_segment_at: Some(Utc::now()),
+            log_path,
+            error: None,
+            error_code: None,
+            error_kind: None,
+            log_tail: None,
+            subtitle_delay_seconds: None,
+            subtitles: Vec::new(),
+            active_rung_id: None,
+        };
+        manager.jobs.insert(session_id, Arc::new(Mutex::new(job)));
+
+        manager
+            .fail_job(
+                session_id,
+                "startup_failed",
+                Some("ffmpeg exited before playlist".to_string()),
+                false,
+            )
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[test]
     fn hardware_failure_fallback_rewrites_plan_to_software_once() {
         let session_id = Uuid::new_v4();
@@ -2272,6 +2449,7 @@ mod tests {
                 decoder: Some("videotoolbox".to_string()),
                 encoder: Some("h264_videotoolbox".to_string()),
                 fallback: Some("software".to_string()),
+                ..HardwareAccelerationPlan::default()
             },
             audio_output: None,
             video_output: Some(VideoOutputPlan {

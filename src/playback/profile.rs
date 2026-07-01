@@ -31,6 +31,48 @@ pub enum SubtitleBurnPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SubtitleRendering {
+    Native,
+    HlsWebvtt,
+    Sidecar,
+    BurnInOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssComplexitySupport {
+    Native,
+    SimpleWebvtt,
+    BurnIn,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSubtitleSupport {
+    Native,
+    BurnIn,
+    NativeOrBurnIn,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedSubtitlePolicy {
+    Disabled,
+    MatchingAudio,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultSubtitlePolicy {
+    Disabled,
+    MediaDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkClass {
     Lan,
     Wan,
@@ -66,8 +108,38 @@ pub struct ClientPlaybackProfile {
     pub supports_server_side_hls_seek: bool,
     pub supports_auth_headers_for_media: bool,
     pub subtitle_burn_policy: SubtitleBurnPolicy,
+    #[serde(default = "default_subtitle_rendering")]
+    pub subtitle_rendering: SubtitleRendering,
+    #[serde(default = "default_ass_complexity_support")]
+    pub ass_complexity_support: AssComplexitySupport,
+    #[serde(default = "default_image_subtitle_support")]
+    pub image_subtitle_support: ImageSubtitleSupport,
+    #[serde(default = "default_forced_subtitle_policy")]
+    pub forced_subtitle_policy: ForcedSubtitlePolicy,
+    #[serde(default = "default_default_subtitle_policy")]
+    pub default_subtitle_policy: DefaultSubtitlePolicy,
     pub quality_mode: QualityMode,
     pub app_version: Option<String>,
+}
+
+fn default_subtitle_rendering() -> SubtitleRendering {
+    SubtitleRendering::HlsWebvtt
+}
+
+fn default_ass_complexity_support() -> AssComplexitySupport {
+    AssComplexitySupport::BurnIn
+}
+
+fn default_image_subtitle_support() -> ImageSubtitleSupport {
+    ImageSubtitleSupport::BurnIn
+}
+
+fn default_forced_subtitle_policy() -> ForcedSubtitlePolicy {
+    ForcedSubtitlePolicy::MatchingAudio
+}
+
+fn default_default_subtitle_policy() -> DefaultSubtitlePolicy {
+    DefaultSubtitlePolicy::MediaDefault
 }
 
 impl ClientPlaybackProfile {
@@ -119,6 +191,11 @@ impl ClientPlaybackProfile {
             supports_server_side_hls_seek: true,
             supports_auth_headers_for_media: true,
             subtitle_burn_policy: SubtitleBurnPolicy::Automatic,
+            subtitle_rendering: SubtitleRendering::Native,
+            ass_complexity_support: AssComplexitySupport::Native,
+            image_subtitle_support: ImageSubtitleSupport::NativeOrBurnIn,
+            forced_subtitle_policy: ForcedSubtitlePolicy::MatchingAudio,
+            default_subtitle_policy: DefaultSubtitlePolicy::MediaDefault,
             quality_mode: QualityMode::Original,
             app_version: None,
         }
@@ -143,6 +220,11 @@ impl ClientPlaybackProfile {
             supports_server_side_hls_seek: true,
             supports_auth_headers_for_media: true,
             subtitle_burn_policy: SubtitleBurnPolicy::Automatic,
+            subtitle_rendering: SubtitleRendering::HlsWebvtt,
+            ass_complexity_support: AssComplexitySupport::BurnIn,
+            image_subtitle_support: ImageSubtitleSupport::BurnIn,
+            forced_subtitle_policy: ForcedSubtitlePolicy::MatchingAudio,
+            default_subtitle_policy: DefaultSubtitlePolicy::MediaDefault,
             quality_mode: QualityMode::Fixed,
             app_version: None,
         }

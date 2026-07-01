@@ -11,14 +11,18 @@ use crate::{
     orchestrator::OrchestratorService,
     playback::{
         PlaybackJobCapacityLimits, PlaybackJobLimits, PlaybackJobManager,
-        hardware::HardwareCapabilities,
+        hardware::{
+            HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
+            load_or_detect_hardware_capabilities, mark_all_hardware_readiness_stale,
+        },
+        jobs::HardwareFailureCallback,
     },
     runtime::docker::DockerStartupConfig,
     secrets::SecretsManager,
 };
 use sqlx::AnyPool;
-use std::sync::atomic::AtomicBool;
-use tokio::sync::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,7 +36,7 @@ pub struct AppState {
     pub linkers: Arc<LinkerService>,
     pub artwork: Arc<ArtworkService>,
     pub transcodes: Arc<PlaybackJobManager>,
-    pub hardware_capabilities: Arc<OnceCell<HardwareCapabilities>>,
+    pub hardware_capabilities: Arc<RwLock<Option<HardwareCapabilities>>>,
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
 }
@@ -88,16 +92,73 @@ impl AppState {
                 .unwrap_or_else(|| PlaybackJobLimits::default().max_temp_dir_bytes),
             ..PlaybackJobLimits::default()
         };
-        let playback_jobs = Arc::new(PlaybackJobManager::with_capacity_limits(
-            db_pool.clone(),
-            PlaybackJobCapacityLimits {
-                max_hls_jobs: settings.playback.max_active_hls_jobs,
-                max_direct_streams: settings.playback.max_active_direct_streams,
-                max_video_transcodes: settings.playback.video_transcode_capacity_limit(),
-                max_hardware_transcodes: settings.playback.max_active_hardware_transcodes,
-            },
-            playback_job_limits,
-        ));
+        let hardware_capabilities = Arc::new(RwLock::new(None));
+        let hardware_refresh_active = Arc::new(AtomicBool::new(false));
+        let hardware_acceleration_enabled = settings.playback.hardware_acceleration_enabled;
+        let hardware_acceleration = settings.playback.hardware_acceleration.clone();
+        let hardware_failure_callback: HardwareFailureCallback = {
+            let db_pool = db_pool.clone();
+            let hardware_capabilities = hardware_capabilities.clone();
+            let hardware_refresh_active = hardware_refresh_active.clone();
+            Arc::new(move || {
+                if !hardware_acceleration_enabled {
+                    return;
+                }
+                if hardware_refresh_active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+
+                let db_pool = db_pool.clone();
+                let hardware_capabilities = hardware_capabilities.clone();
+                let hardware_refresh_active = hardware_refresh_active.clone();
+                let hardware_acceleration = hardware_acceleration.clone();
+                tokio::spawn(async move {
+                    *hardware_capabilities.write().await = None;
+                    if let Err(err) = mark_all_hardware_readiness_stale(&db_pool).await {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to mark playback hardware readiness stale after live hardware failure"
+                        );
+                    }
+                    let config = HardwareDetectionConfig {
+                        preference: HardwarePreference::parse(&hardware_acceleration),
+                    };
+                    match load_or_detect_hardware_capabilities(&db_pool, &config).await {
+                        Ok(capabilities) => {
+                            let available_apis = capabilities.available_apis.clone();
+                            *hardware_capabilities.write().await = Some(capabilities);
+                            tracing::info!(
+                                available_apis = ?available_apis,
+                                "playback hardware readiness refreshed after live hardware failure"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "playback hardware readiness refresh failed after live hardware failure"
+                            );
+                        }
+                    }
+                    hardware_refresh_active.store(false, Ordering::Release);
+                });
+            })
+        };
+        let playback_jobs = Arc::new(
+            PlaybackJobManager::with_capacity_limits_and_hardware_failure_callback(
+                db_pool.clone(),
+                PlaybackJobCapacityLimits {
+                    max_hls_jobs: settings.playback.max_active_hls_jobs,
+                    max_direct_streams: settings.playback.max_active_direct_streams,
+                    max_video_transcodes: settings.playback.video_transcode_capacity_limit(),
+                    max_hardware_transcodes: settings.playback.max_active_hardware_transcodes,
+                },
+                playback_job_limits,
+                Some(hardware_failure_callback),
+            ),
+        );
         Self {
             settings: Arc::new(settings),
             db_driver: database.driver,
@@ -109,7 +170,7 @@ impl AppState {
             linkers: Arc::new(linkers),
             artwork: Arc::new(artwork),
             transcodes: playback_jobs,
-            hardware_capabilities: Arc::new(OnceCell::new()),
+            hardware_capabilities,
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),
         }

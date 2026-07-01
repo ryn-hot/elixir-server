@@ -12,7 +12,9 @@ use crate::playback::{
         SubtitleStreamCapabilities, VideoStreamCapabilities,
     },
     profile::{
-        ClientKind, ClientPlaybackProfile, EffectivePlaybackPolicy, QualityMode, SubtitleBurnPolicy,
+        AssComplexitySupport, ClientKind, ClientPlaybackProfile, DefaultSubtitlePolicy,
+        EffectivePlaybackPolicy, ForcedSubtitlePolicy, ImageSubtitleSupport, QualityMode,
+        SubtitleBurnPolicy, SubtitleRendering,
     },
 };
 
@@ -86,7 +88,19 @@ struct H264LevelLimit {
 pub struct PlaybackSelection {
     pub audio_stream_index: Option<i32>,
     pub subtitle_stream_index: Option<i32>,
+    pub subtitle_mode: SubtitleSelectionMode,
+    pub preferred_subtitle_language: Option<String>,
+    pub preferred_subtitle_title: Option<String>,
     pub start_position_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubtitleSelectionMode {
+    Default,
+    #[default]
+    Off,
+    Forced,
+    Track,
 }
 
 pub fn plan_playback(
@@ -186,27 +200,15 @@ pub fn plan_playback(
     report.selected_audio_track = audio.and_then(|stream| stream.index);
     report.checks.push(CompatibilityCheck::pass("audio_track"));
 
-    let subtitle = match selected.subtitle_stream_index {
-        Some(index) => match media
-            .subtitle_streams
-            .iter()
-            .find(|stream| stream.index == Some(index))
-        {
-            Some(stream) => Some(stream),
-            None => {
-                report.selected_subtitle_track = Some(index);
-                report.checks.push(CompatibilityCheck::fail(
-                    "subtitle_track",
-                    "selected_subtitle_track_not_found",
-                ));
-                return not_playable_plan(
-                    media_file_id,
-                    vec!["selected_subtitle_track_not_found".to_string()],
-                    report,
-                );
-            }
-        },
-        None => None,
+    let subtitle = match select_subtitle_stream(media, audio, &selected, client) {
+        Ok(subtitle) => subtitle,
+        Err((index, reason)) => {
+            report.selected_subtitle_track = index;
+            report
+                .checks
+                .push(CompatibilityCheck::fail("subtitle_track", &reason));
+            return not_playable_plan(media_file_id, vec![reason], report);
+        }
     };
     report.selected_subtitle_track = subtitle.and_then(|stream| stream.index);
     report.requested_start_seconds = selected.start_position_seconds;
@@ -309,7 +311,7 @@ pub fn plan_playback(
     push_check(
         &mut report,
         "hdr",
-        !matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported),
+        !hdr_blocks_direct_play(hdr_action),
         "hdr_tone_mapping_required",
     );
     push_check(
@@ -379,8 +381,9 @@ pub fn plan_playback(
         push_unique(&mut blockers, "source_bitrate_exceeds_policy");
         push_unique(&mut blockers, "source_bitrate_exceeds_bandwidth_policy");
     }
-    if matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported) {
-        push_unique(&mut blockers, "hdr_tone_mapping_required");
+    if hdr_blocks_direct_play(hdr_action) {
+        push_unique(&mut blockers, hdr_blocker_reason(hdr_action));
+        push_hdr_detail_reasons(&mut blockers, video, hdr_action);
     }
     if !direct_play_subtitle_supported {
         push_unique(
@@ -398,6 +401,7 @@ pub fn plan_playback(
 
     let adaptive_ladder_candidate = if adaptive_transcode_can_be_considered(client, policy) {
         match planned_adaptive_ladder(
+            media,
             video,
             subtitle,
             video_transcode_subtitle_action(subtitle, client),
@@ -488,6 +492,9 @@ pub fn plan_playback(
     }
 
     if blockers.is_empty() {
+        let mut reasons = vec!["direct_play_all_capabilities_satisfied".to_string()];
+        push_hdr_action_reason(&mut reasons, hdr_action);
+        push_hdr_detail_reasons(&mut reasons, video, hdr_action);
         return PlaybackPlan {
             plan_version: PLAYBACK_PLAN_VERSION,
             mode: PlaybackMode::DirectPlay,
@@ -516,7 +523,7 @@ pub fn plan_playback(
             adaptive_ladder: None,
             video_transcode_reason: None,
             compatibility_report: report,
-            reasons: vec!["direct_play_all_capabilities_satisfied".to_string()],
+            reasons,
             warnings: Vec::new(),
             expected_outputs: direct_file_outputs(),
             playable: true,
@@ -544,7 +551,7 @@ pub fn plan_playback(
         !subtitle_burn_in_requested && (hls_subtitle_copyable || hls_subtitle_convertible);
     let hls_policy_ok = source_within_bitrate_policy
         && source_within_resolution_policy
-        && !matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported);
+        && !hdr_blocks_direct_play(hdr_action);
 
     if let Some(direct_stream_delivery) = direct_stream_delivery.filter(|_| {
         policy.allow_direct_stream
@@ -684,6 +691,7 @@ pub fn plan_playback(
         audio.and_then(|audio| planned_audio_output(audio, client, video_delivery));
     let subtitle_action = video_transcode_subtitle_action(subtitle, client);
     let mut video_output = match planned_video_output(
+        media,
         video,
         subtitle,
         subtitle_action,
@@ -748,6 +756,149 @@ pub fn can_direct_play_container(
         .supported_containers
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(container))
+}
+
+fn select_subtitle_stream<'a>(
+    media: &'a MediaCapabilities,
+    audio: Option<&AudioStreamCapabilities>,
+    selected: &PlaybackSelection,
+    client: &ClientPlaybackProfile,
+) -> Result<Option<&'a SubtitleStreamCapabilities>, (Option<i32>, String)> {
+    if let Some(index) = selected.subtitle_stream_index {
+        return media
+            .subtitle_streams
+            .iter()
+            .find(|stream| stream.index == Some(index))
+            .map(Some)
+            .ok_or_else(|| (Some(index), "selected_subtitle_track_not_found".to_string()));
+    }
+
+    if selected.subtitle_mode == SubtitleSelectionMode::Off {
+        return Ok(None);
+    }
+
+    if selected.subtitle_mode == SubtitleSelectionMode::Track {
+        return Ok(select_preferred_subtitle(media, selected));
+    }
+
+    if !matches!(
+        client.forced_subtitle_policy,
+        ForcedSubtitlePolicy::Disabled
+    ) {
+        if let Some(forced) = select_forced_subtitle(media, audio, client.forced_subtitle_policy) {
+            return Ok(Some(forced));
+        }
+    }
+
+    if selected.subtitle_mode == SubtitleSelectionMode::Forced {
+        return Ok(None);
+    }
+
+    if !matches!(
+        client.default_subtitle_policy,
+        DefaultSubtitlePolicy::Disabled
+    ) {
+        if let Some(preferred) = select_preferred_subtitle(media, selected) {
+            return Ok(Some(preferred));
+        }
+        if let Some(default) = media
+            .subtitle_streams
+            .iter()
+            .find(|stream| stream.is_default && !stream.is_forced)
+        {
+            return Ok(Some(default));
+        }
+    }
+
+    Ok(None)
+}
+
+fn select_forced_subtitle<'a>(
+    media: &'a MediaCapabilities,
+    audio: Option<&AudioStreamCapabilities>,
+    policy: ForcedSubtitlePolicy,
+) -> Option<&'a SubtitleStreamCapabilities> {
+    let audio_language = audio.and_then(|stream| stream.language.as_deref());
+    media
+        .subtitle_streams
+        .iter()
+        .filter(|stream| stream.is_forced)
+        .find(|stream| match policy {
+            ForcedSubtitlePolicy::Disabled => false,
+            ForcedSubtitlePolicy::Any => true,
+            ForcedSubtitlePolicy::MatchingAudio => {
+                language_matches(stream.language.as_deref(), audio_language)
+            }
+        })
+}
+
+fn select_preferred_subtitle<'a>(
+    media: &'a MediaCapabilities,
+    selected: &PlaybackSelection,
+) -> Option<&'a SubtitleStreamCapabilities> {
+    let preferred_language = selected
+        .preferred_subtitle_language
+        .as_deref()
+        .map(normalize_language_key)
+        .filter(|value| !value.is_empty());
+    let preferred_title = selected
+        .preferred_subtitle_title
+        .as_deref()
+        .map(normalize_title_key)
+        .filter(|value| !value.is_empty());
+
+    if preferred_language.is_none() && preferred_title.is_none() {
+        return None;
+    }
+
+    media.subtitle_streams.iter().find(|stream| {
+        preferred_language
+            .as_deref()
+            .map(|language| {
+                normalize_language_key(stream.language.as_deref().unwrap_or_default()) == language
+            })
+            .unwrap_or(true)
+            && preferred_title
+                .as_deref()
+                .map(|title| {
+                    normalize_title_key(stream.title.as_deref().unwrap_or_default()) == title
+                })
+                .unwrap_or(true)
+    })
+}
+
+fn language_matches(subtitle_language: Option<&str>, audio_language: Option<&str>) -> bool {
+    let Some(subtitle_language) = subtitle_language.map(normalize_language_key) else {
+        return false;
+    };
+    let Some(audio_language) = audio_language.map(normalize_language_key) else {
+        return false;
+    };
+    !subtitle_language.is_empty() && subtitle_language == audio_language
+}
+
+fn normalize_language_key(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "english" => "eng".to_string(),
+        "en" => "eng".to_string(),
+        "japanese" => "jpn".to_string(),
+        "ja" => "jpn".to_string(),
+        "spanish" => "spa".to_string(),
+        "es" => "spa".to_string(),
+        "french" => "fra".to_string(),
+        "fr" => "fra".to_string(),
+        _ => normalized,
+    }
+}
+
+fn normalize_title_key(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn can_copy_video_to_delivery(video: &VideoStreamCapabilities, delivery: Delivery) -> bool {
@@ -873,7 +1024,7 @@ fn planned_tone_map(
     video: &VideoStreamCapabilities,
     hdr_action: HdrAction,
 ) -> Option<VideoToneMapPlan> {
-    if !matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported) {
+    if !matches!(hdr_action, HdrAction::ToneMapToSdr) {
         return None;
     }
 
@@ -950,6 +1101,7 @@ fn normalize_zscale_matrix(raw: Option<&str>) -> Option<String> {
 }
 
 fn planned_video_output(
+    media: &MediaCapabilities,
     video: &VideoStreamCapabilities,
     subtitle: Option<&SubtitleStreamCapabilities>,
     subtitle_action: StreamAction,
@@ -990,12 +1142,21 @@ fn planned_video_output(
         .unwrap_or(24.0);
     let segment_seconds = 4;
     let gop_frames = ((fps_for_gop * segment_seconds as f64).round() as i32).clamp(12, 300);
-    let burn_in = planned_burn_in(subtitle, subtitle_action)?;
+    if subtitle.is_some() && subtitle_action == StreamAction::Disabled {
+        return Err("selected_subtitle_unsupported_by_client_profile".to_string());
+    }
+    let burn_in = planned_burn_in(media, subtitle, subtitle_action)?;
     let mut output_reasons = Vec::new();
     for reason in reasons {
         push_unique(&mut output_reasons, reason);
     }
-    if matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported) {
+    if matches!(
+        hdr_action,
+        HdrAction::Unsupported | HdrAction::UnknownFailClosed
+    ) {
+        return Err(hdr_blocker_reason(hdr_action).to_string());
+    }
+    if matches!(hdr_action, HdrAction::ToneMapToSdr) {
         push_unique(&mut output_reasons, "hdr_to_sdr_required");
     }
     if burn_in.is_some() {
@@ -1059,6 +1220,7 @@ fn direct_play_original_quality_required(
 }
 
 fn planned_adaptive_ladder(
+    media: &MediaCapabilities,
     video: &VideoStreamCapabilities,
     subtitle: Option<&SubtitleStreamCapabilities>,
     subtitle_action: StreamAction,
@@ -1122,7 +1284,10 @@ fn planned_adaptive_ladder(
                 reason: "adaptive_ladder_rung".to_string(),
             }
         });
-        let burn_in = planned_burn_in(subtitle, subtitle_action)?;
+        if subtitle.is_some() && subtitle_action == StreamAction::Disabled {
+            return Err("selected_subtitle_unsupported_by_client_profile".to_string());
+        }
+        let burn_in = planned_burn_in(media, subtitle, subtitle_action)?;
         let mut output_reasons = Vec::new();
         for reason in reasons {
             push_unique(&mut output_reasons, reason);
@@ -1131,7 +1296,13 @@ fn planned_adaptive_ladder(
         if target_bitrate_bps < default_bitrate_bps {
             push_unique(&mut output_reasons, "adaptive_ladder_bitrate_capped");
         }
-        if matches!(hdr_action, HdrAction::ToneMapToSdr | HdrAction::Unsupported) {
+        if matches!(
+            hdr_action,
+            HdrAction::Unsupported | HdrAction::UnknownFailClosed
+        ) {
+            return Err(hdr_blocker_reason(hdr_action).to_string());
+        }
+        if matches!(hdr_action, HdrAction::ToneMapToSdr) {
             push_unique(&mut output_reasons, "hdr_to_sdr_required");
         }
         if burn_in.is_some() {
@@ -1309,22 +1480,70 @@ fn planned_hardware_acceleration(
         );
     }
 
-    let decode_support = if policy.allow_hardware_decode && !filter_graph_requires_software {
-        capabilities.decode_support(api, source_codec)
+    let source_bit_depth = video.bit_depth.and_then(i32_to_u8);
+    let output_bit_depth = output
+        .pixel_format
+        .as_deref()
+        .and_then(bit_depth_from_pixel_format_name)
+        .or(Some(8));
+    let decoder = if policy.allow_hardware_decode && !filter_graph_requires_software {
+        if capabilities.capability_matrices.is_empty() {
+            capabilities
+                .decode_support(api, source_codec)
+                .map(|support| support.ffmpeg_name.clone())
+        } else {
+            capabilities
+                .supported_decode_matrix_entry(
+                    api,
+                    source_codec,
+                    video.profile.as_deref(),
+                    source_bit_depth,
+                    video.pixel_format.as_deref(),
+                )
+                .and_then(|entry| entry.ffmpeg_decoder.clone())
+        }
     } else {
         if policy.allow_hardware_decode && filter_graph_requires_software {
             push_unique(&mut warnings, "hardware_decode_disabled_filter_graph");
         }
         None
     };
-    let decoder = decode_support.map(|support| support.ffmpeg_name.clone());
 
     let encoder = if policy.allow_hardware_encode {
-        capabilities
-            .encode_support(api, &output.codec)
-            .map(|support| support.ffmpeg_name.clone())
+        if capabilities.capability_matrices.is_empty() {
+            capabilities
+                .encode_support(api, &output.codec)
+                .map(|support| support.ffmpeg_name.clone())
+        } else {
+            capabilities
+                .supported_encode_matrix_entry(
+                    api,
+                    &output.codec,
+                    output.profile.as_deref(),
+                    output_bit_depth,
+                    output.pixel_format.as_deref(),
+                )
+                .and_then(|entry| entry.ffmpeg_encoder.clone())
+        }
     } else {
         None
+    };
+
+    let decode_status = if decoder.is_some() {
+        "selected"
+    } else if !policy.allow_hardware_decode {
+        "disabled_by_policy"
+    } else if filter_graph_requires_software {
+        "disabled_filter_graph"
+    } else {
+        "unsupported"
+    };
+    let encode_status = if encoder.is_some() {
+        "selected"
+    } else if !policy.allow_hardware_encode {
+        "disabled_by_policy"
+    } else {
+        "unsupported"
     };
 
     if decoder.is_none() && encoder.is_none() {
@@ -1377,6 +1596,10 @@ fn planned_hardware_acceleration(
         decoder,
         encoder,
         fallback,
+        readiness_id: None,
+        decode_status: Some(decode_status.to_string()),
+        encode_status: Some(encode_status.to_string()),
+        warnings: warnings.clone(),
     };
     Ok((plan, warnings))
 }
@@ -1404,12 +1627,13 @@ fn hardware_encoder_unsupported_reason(
 fn hardware_unavailable_or_software(
     fail_if_unavailable: bool,
     fallback_policy: HardwareFallbackPolicy,
-    software: HardwareAccelerationPlan,
+    mut software: HardwareAccelerationPlan,
     reason: String,
 ) -> Result<(HardwareAccelerationPlan, Vec<String>), String> {
     if fail_if_unavailable && fallback_policy == HardwareFallbackPolicy::Fail {
         Err(reason)
     } else {
+        software.warnings.push(reason.clone());
         Ok((software, vec![reason]))
     }
 }
@@ -1421,7 +1645,23 @@ fn video_filter_graph_requires_software(output: &VideoOutputPlan) -> bool {
         || output.frame_rate.mode == VideoFrameRateMode::Convert
 }
 
+fn i32_to_u8(value: i32) -> Option<u8> {
+    u8::try_from(value).ok()
+}
+
+fn bit_depth_from_pixel_format_name(value: &str) -> Option<u8> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "yuv420p" | "nv12" | "videotoolbox_vld" | "cuda" | "vaapi" | "qsv" | "d3d11"
+        | "dxva2_vld" => Some(8),
+        "yuv420p10le" | "p010le" | "p016le" | "yuv422p10le" | "yuv444p10le" => Some(10),
+        "yuv420p12le" | "yuv422p12le" | "yuv444p12le" => Some(12),
+        _ => None,
+    }
+}
+
 fn planned_burn_in(
+    media: &MediaCapabilities,
     subtitle: Option<&SubtitleStreamCapabilities>,
     subtitle_action: StreamAction,
 ) -> Result<Option<SubtitleBurnInPlan>, String> {
@@ -1429,12 +1669,14 @@ fn planned_burn_in(
         return Ok(None);
     }
     let subtitle = subtitle.ok_or_else(|| "subtitle_burn_in_stream_missing".to_string())?;
-    if subtitle.external_path.is_some() {
-        return Err("subtitle_burn_in_external_source_unsupported".to_string());
-    }
-    let stream_index = subtitle
-        .index
-        .ok_or_else(|| "subtitle_burn_in_stream_index_missing".to_string())?;
+    let external_path = subtitle.external_path.clone();
+    let stream_index = if external_path.is_some() {
+        0
+    } else {
+        subtitle
+            .index
+            .ok_or_else(|| "subtitle_burn_in_stream_index_missing".to_string())?
+    };
     let codec = subtitle
         .codec
         .as_deref()
@@ -1449,12 +1691,32 @@ fn planned_burn_in(
         return Err("subtitle_burn_in_filter_unsupported".to_string());
     };
 
+    let filter_stream_index = if mode == SubtitleBurnInMode::AssSsaExactStyle {
+        Some(
+            subtitle_filter_stream_index(media, stream_index)
+                .ok_or_else(|| "subtitle_burn_in_filter_stream_index_missing".to_string())?,
+        )
+    } else {
+        None
+    };
+
     Ok(Some(SubtitleBurnInPlan {
         stream_index,
+        filter_stream_index,
+        external_path,
         codec: codec_lower,
         mode,
         reason: "selected_subtitle_requires_video_burn_in".to_string(),
     }))
+}
+
+fn subtitle_filter_stream_index(media: &MediaCapabilities, stream_index: i32) -> Option<i32> {
+    media
+        .subtitle_streams
+        .iter()
+        .filter(|stream| stream.external_path.is_none())
+        .position(|stream| stream.index == Some(stream_index))
+        .and_then(|position| i32::try_from(position).ok())
 }
 
 fn planned_frame_rate(video: &VideoStreamCapabilities) -> VideoFrameRatePlan {
@@ -1680,10 +1942,28 @@ pub fn can_deliver_subtitle(
         return false;
     };
     match delivery {
-        Delivery::DirectFile => client
-            .supported_subtitle_codecs
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(codec)),
+        Delivery::DirectFile => {
+            if subtitle.kind == SubtitleKind::Image
+                && !matches!(
+                    client.image_subtitle_support,
+                    ImageSubtitleSupport::Native | ImageSubtitleSupport::NativeOrBurnIn
+                )
+            {
+                return false;
+            }
+            if is_ass_ssa_subtitle(codec)
+                && !matches!(client.ass_complexity_support, AssComplexitySupport::Native)
+            {
+                return false;
+            }
+            matches!(
+                client.subtitle_rendering,
+                SubtitleRendering::Native | SubtitleRendering::Sidecar
+            ) && client
+                .supported_subtitle_codecs
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(codec))
+        }
         _ if subtitle.kind == SubtitleKind::Text => {
             can_convert_text_subtitle_to_webvtt(subtitle, client)
         }
@@ -1724,6 +2004,15 @@ fn can_convert_text_subtitle_to_webvtt(
     };
     subtitle.kind == SubtitleKind::Text
         && is_webvtt_convertible_text_subtitle_codec(codec)
+        && matches!(
+            client.subtitle_rendering,
+            SubtitleRendering::HlsWebvtt | SubtitleRendering::Sidecar
+        )
+        && (!is_ass_ssa_subtitle(codec)
+            || matches!(
+                client.ass_complexity_support,
+                AssComplexitySupport::SimpleWebvtt
+            ))
         && client
             .supported_subtitle_codecs
             .iter()
@@ -1811,11 +2100,52 @@ fn push_unique(reasons: &mut Vec<String>, reason: &str) {
     }
 }
 
+fn push_hdr_action_reason(reasons: &mut Vec<String>, action: HdrAction) {
+    let reason = match action {
+        HdrAction::Direct => Some("hdr_direct"),
+        HdrAction::DirectDolbyVision => Some("hdr_direct_dolby_vision"),
+        HdrAction::DirectHdr10Fallback => Some("hdr_direct_hdr10_fallback"),
+        HdrAction::ToneMapToSdr => Some("hdr_tone_mapping_required"),
+        HdrAction::Unsupported => Some("hdr_unsupported"),
+        HdrAction::UnknownFailClosed => Some("hdr_unknown_fail_closed"),
+        HdrAction::None | HdrAction::Unknown => None,
+    };
+    if let Some(reason) = reason {
+        push_unique(reasons, reason);
+    }
+}
+
+fn push_hdr_detail_reasons(
+    reasons: &mut Vec<String>,
+    video: &VideoStreamCapabilities,
+    action: HdrAction,
+) {
+    if video.dolby_vision
+        && matches!(action, HdrAction::Unsupported)
+        && !video.dolby_vision_has_hdr10_fallback
+    {
+        push_unique(reasons, "dolby_vision_hdr10_fallback_missing");
+    }
+    if video.dolby_vision && matches!(action, HdrAction::DirectHdr10Fallback) {
+        push_unique(reasons, "dolby_vision_hdr10_fallback_selected");
+    }
+    if video.dolby_vision
+        && video.dolby_vision_has_hdr10_fallback
+        && matches!(action, HdrAction::ToneMapToSdr)
+    {
+        push_unique(reasons, "dolby_vision_hdr10_fallback_tone_map_to_sdr");
+    }
+    if video.hdr10_plus && matches!(action, HdrAction::DirectHdr10Fallback) {
+        push_unique(reasons, "hdr10_plus_hdr10_fallback_selected");
+    }
+}
+
 fn not_playable_plan(
     media_file_id: String,
     reasons: Vec<String>,
     report: CompatibilityReport,
 ) -> PlaybackPlan {
+    let hdr_action = not_playable_hdr_action(&reasons);
     PlaybackPlan {
         plan_version: PLAYBACK_PLAN_VERSION,
         mode: PlaybackMode::VideoTranscode,
@@ -1829,7 +2159,7 @@ fn not_playable_plan(
         adaptive: false,
         selected_audio_track: None,
         selected_subtitle_track: None,
-        hdr_action: HdrAction::Unknown,
+        hdr_action,
         hardware_acceleration: HardwareAccelerationPlan::default(),
         audio_output: None,
         video_output: None,
@@ -1840,6 +2170,24 @@ fn not_playable_plan(
         warnings: Vec::new(),
         expected_outputs: Vec::new(),
         playable: false,
+    }
+}
+
+fn not_playable_hdr_action(reasons: &[String]) -> HdrAction {
+    if reasons
+        .iter()
+        .any(|reason| reason == "hdr_unknown_fail_closed")
+    {
+        HdrAction::UnknownFailClosed
+    } else if reasons.iter().any(|reason| reason == "hdr_unsupported") {
+        HdrAction::Unsupported
+    } else if reasons
+        .iter()
+        .any(|reason| reason == "hdr_tone_mapping_required")
+    {
+        HdrAction::ToneMapToSdr
+    } else {
+        HdrAction::None
     }
 }
 
@@ -1861,6 +2209,8 @@ fn hls_plan(
     adaptive_ladder: Option<AdaptiveLadderPlan>,
     video_transcode_reason: Option<String>,
 ) -> PlaybackPlan {
+    let mut reasons = reasons;
+    push_hdr_action_reason(&mut reasons, hdr_action);
     PlaybackPlan {
         plan_version: PLAYBACK_PLAN_VERSION,
         mode,
@@ -2031,7 +2381,18 @@ fn video_transcode_subtitle_action(
     };
     match (&subtitle.kind, &client.subtitle_burn_policy) {
         (_, SubtitleBurnPolicy::Always) => StreamAction::BurnIn,
-        (SubtitleKind::Image, SubtitleBurnPolicy::Automatic | SubtitleBurnPolicy::ImageOnly) => {
+        (SubtitleKind::Image, SubtitleBurnPolicy::Automatic | SubtitleBurnPolicy::ImageOnly)
+            if matches!(
+                client.image_subtitle_support,
+                ImageSubtitleSupport::BurnIn | ImageSubtitleSupport::NativeOrBurnIn
+            ) =>
+        {
+            StreamAction::BurnIn
+        }
+        (SubtitleKind::Text, SubtitleBurnPolicy::Automatic)
+            if subtitle.codec.as_deref().is_some_and(is_ass_ssa_subtitle)
+                && matches!(client.ass_complexity_support, AssComplexitySupport::BurnIn) =>
+        {
             StreamAction::BurnIn
         }
         (SubtitleKind::Text, _) if can_convert_text_subtitle_to_webvtt(subtitle, client) => {
@@ -2139,26 +2500,28 @@ fn hdr_action(
 
     if video.dolby_vision {
         if client.supports_dolby_vision && dolby_vision_profile_direct_playable(video) {
-            return HdrAction::Direct;
+            return HdrAction::DirectDolbyVision;
         }
-        if video.dolby_vision_has_hdr10_fallback && client.supports_hdr {
-            return HdrAction::Direct;
+        if video.dolby_vision_has_hdr10_fallback {
+            return if client.supports_hdr {
+                HdrAction::DirectHdr10Fallback
+            } else {
+                HdrAction::ToneMapToSdr
+            };
         }
-        return if client.supports_hdr || client.supports_dolby_vision {
-            HdrAction::Unsupported
-        } else {
-            HdrAction::ToneMapToSdr
-        };
-    }
-    if unknown_hdr_metadata(video) {
         return HdrAction::Unsupported;
     }
+    if unknown_hdr_metadata(video) {
+        return HdrAction::UnknownFailClosed;
+    }
     if video.hdr10_plus {
-        return if client.supports_hdr10_plus {
-            HdrAction::Direct
-        } else {
-            HdrAction::ToneMapToSdr
-        };
+        if client.supports_hdr10_plus {
+            return HdrAction::Direct;
+        }
+        if client.supports_hdr {
+            return HdrAction::DirectHdr10Fallback;
+        }
+        return HdrAction::ToneMapToSdr;
     }
     if video.hdr10 || video.hdr10_plus {
         if client.supports_hdr {
@@ -2168,6 +2531,22 @@ fn hdr_action(
         }
     } else {
         HdrAction::None
+    }
+}
+
+fn hdr_blocks_direct_play(action: HdrAction) -> bool {
+    matches!(
+        action,
+        HdrAction::ToneMapToSdr | HdrAction::Unsupported | HdrAction::UnknownFailClosed
+    )
+}
+
+fn hdr_blocker_reason(action: HdrAction) -> &'static str {
+    match action {
+        HdrAction::ToneMapToSdr => "hdr_tone_mapping_required",
+        HdrAction::Unsupported => "hdr_unsupported",
+        HdrAction::UnknownFailClosed => "hdr_unknown_fail_closed",
+        _ => "hdr_tone_mapping_required",
     }
 }
 
@@ -2216,7 +2595,11 @@ mod tests {
     use crate::{
         media::ffprobe,
         playback::{
-            hardware::{HardwareCapabilities, HardwareCodecSupport},
+            hardware::{
+                HARDWARE_READINESS_SCHEMA_VERSION, HardwareCapabilities, HardwareCapabilityMatrix,
+                HardwareCodecMatrixEntry, HardwareCodecSupport, HardwareFilterMatrix,
+                HardwareReadinessStatus,
+            },
             plan::StreamAction,
             probe::{SubtitleKind, normalize_ffprobe_metadata},
             profile::{
@@ -2340,6 +2723,41 @@ mod tests {
             platform: "macos-x86_64".to_string(),
             ffmpeg_version: Some("ffmpeg fixture".to_string()),
             available_apis: vec!["videotoolbox".to_string()],
+            capability_matrices: vec![HardwareCapabilityMatrix {
+                schema_version: HARDWARE_READINESS_SCHEMA_VERSION,
+                api: "videotoolbox".to_string(),
+                status: HardwareReadinessStatus::Available,
+                encode: vec![HardwareCodecMatrixEntry {
+                    codec: "h264".to_string(),
+                    profile: Some("high".to_string()),
+                    bit_depth: Some(8),
+                    pixel_formats: vec!["yuv420p".to_string(), "nv12".to_string()],
+                    ffmpeg_encoder: Some("h264_videotoolbox".to_string()),
+                    ffmpeg_decoder: None,
+                    status: "supported".to_string(),
+                }],
+                decode: vec![
+                    HardwareCodecMatrixEntry {
+                        codec: "h264".to_string(),
+                        profile: None,
+                        bit_depth: Some(8),
+                        pixel_formats: Vec::new(),
+                        ffmpeg_encoder: None,
+                        ffmpeg_decoder: Some("videotoolbox".to_string()),
+                        status: "supported".to_string(),
+                    },
+                    HardwareCodecMatrixEntry {
+                        codec: "hevc".to_string(),
+                        profile: None,
+                        bit_depth: Some(8),
+                        pixel_formats: Vec::new(),
+                        ffmpeg_encoder: None,
+                        ffmpeg_decoder: Some("videotoolbox".to_string()),
+                        status: "supported".to_string(),
+                    },
+                ],
+                filters: HardwareFilterMatrix::default(),
+            }],
             supported_decode_codecs: vec![
                 HardwareCodecSupport {
                     api: "videotoolbox".to_string(),
@@ -2372,6 +2790,30 @@ mod tests {
             platform: "windows-x86_64".to_string(),
             ffmpeg_version: Some("ffmpeg fixture".to_string()),
             available_apis: vec!["nvenc".to_string()],
+            capability_matrices: vec![HardwareCapabilityMatrix {
+                schema_version: HARDWARE_READINESS_SCHEMA_VERSION,
+                api: "nvenc".to_string(),
+                status: HardwareReadinessStatus::Available,
+                encode: vec![HardwareCodecMatrixEntry {
+                    codec: "h264".to_string(),
+                    profile: Some("high".to_string()),
+                    bit_depth: Some(8),
+                    pixel_formats: vec!["yuv420p".to_string(), "nv12".to_string()],
+                    ffmpeg_encoder: Some("h264_nvenc".to_string()),
+                    ffmpeg_decoder: None,
+                    status: "supported".to_string(),
+                }],
+                decode: vec![HardwareCodecMatrixEntry {
+                    codec: "h264".to_string(),
+                    profile: None,
+                    bit_depth: Some(8),
+                    pixel_formats: Vec::new(),
+                    ffmpeg_encoder: None,
+                    ffmpeg_decoder: Some("cuda".to_string()),
+                    status: "supported".to_string(),
+                }],
+                filters: HardwareFilterMatrix::default(),
+            }],
             supported_decode_codecs: vec![HardwareCodecSupport {
                 api: "nvenc".to_string(),
                 codec: "h264".to_string(),
@@ -2411,7 +2853,8 @@ mod tests {
             ..EffectivePlaybackPolicy::default()
         };
         browser_policy.max_bitrate_bps = Some(20_000_000);
-        let browser = ClientPlaybackProfile::browser_like();
+        let mut browser = ClientPlaybackProfile::browser_like();
+        browser.ass_complexity_support = AssComplexitySupport::SimpleWebvtt;
         let browser_plan = plan_playback(
             "file-1",
             &media,
@@ -2444,7 +2887,8 @@ mod tests {
         );
         assert_eq!(native_plan.mode, PlaybackMode::DirectPlay);
 
-        let browser = ClientPlaybackProfile::browser_like();
+        let mut browser = ClientPlaybackProfile::browser_like();
+        browser.ass_complexity_support = AssComplexitySupport::SimpleWebvtt;
         let browser_lan_policy = derive_effective_playback_policy(
             &browser,
             &server,
@@ -2527,7 +2971,8 @@ mod tests {
             ..EffectivePlaybackPolicy::default()
         };
         policy.max_bitrate_bps = Some(20_000_000);
-        let browser = ClientPlaybackProfile::browser_like();
+        let mut browser = ClientPlaybackProfile::browser_like();
+        browser.ass_complexity_support = AssComplexitySupport::SimpleWebvtt;
 
         let plan = plan_playback(
             "file-2",
@@ -2536,6 +2981,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -2589,6 +3035,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: None,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &aac_surround_client,
             &policy,
@@ -2616,6 +3063,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: None,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &ac3_only_client,
             &policy,
@@ -2802,6 +3250,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &ClientPlaybackProfile::browser_like(),
             &policy,
@@ -2825,6 +3274,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &native,
             &EffectivePlaybackPolicy::default(),
@@ -2841,6 +3291,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &burn_client,
             &EffectivePlaybackPolicy::default(),
@@ -2853,6 +3304,467 @@ mod tests {
                 .contains(&"subtitle_burn_in_requested".to_string()),
             "{:?}",
             burn_plan.reasons
+        );
+    }
+
+    #[test]
+    fn phase17_subtitle_selection_respects_off_default_forced_and_ass_capability() {
+        let mut media = capabilities(include_str!("fixtures/h264_aac_text_subtitles.json"));
+        media.subtitle_streams[0].is_default = true;
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+        let browser = ClientPlaybackProfile::browser_like();
+
+        let off_plan = plan_playback(
+            "phase17-subtitle-off",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Off,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(off_plan.selected_subtitle_track, None);
+        assert_eq!(off_plan.subtitle_action, StreamAction::Disabled);
+
+        let default_plan = plan_playback(
+            "phase17-subtitle-default",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Default,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(default_plan.selected_subtitle_track, Some(2));
+        assert_eq!(default_plan.mode, PlaybackMode::SubtitleTranscode);
+        assert_eq!(
+            default_plan.subtitle_action,
+            StreamAction::ConvertTextToWebvtt
+        );
+
+        let mut forced_media = media.clone();
+        forced_media.subtitle_streams[0].is_default = false;
+        forced_media.subtitle_streams[1].is_forced = true;
+        forced_media.subtitle_streams[1].language = Some("eng".to_string());
+        let forced_plan = plan_playback(
+            "phase17-subtitle-forced",
+            &forced_media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Forced,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(forced_plan.selected_subtitle_track, Some(3));
+        assert_eq!(
+            forced_plan.subtitle_action,
+            StreamAction::ConvertTextToWebvtt
+        );
+
+        let ass_plan = plan_playback(
+            "phase17-ass-default-burn",
+            &media,
+            PlaybackSelection {
+                subtitle_stream_index: Some(4),
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(ass_plan.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(ass_plan.subtitle_action, StreamAction::BurnIn);
+        let ass_burn_in = ass_plan
+            .video_output
+            .as_ref()
+            .and_then(|output| output.burn_in.as_ref())
+            .expect("ASS subtitles should burn in for browser-like clients");
+        assert_eq!(ass_burn_in.stream_index, 4);
+        assert_eq!(ass_burn_in.filter_stream_index, Some(2));
+
+        let mut simple_ass_client = browser.clone();
+        simple_ass_client.ass_complexity_support = AssComplexitySupport::SimpleWebvtt;
+        let simple_ass_plan = plan_playback(
+            "phase17-simple-ass-webvtt",
+            &media,
+            PlaybackSelection {
+                subtitle_stream_index: Some(4),
+                ..PlaybackSelection::default()
+            },
+            &simple_ass_client,
+            &policy,
+        );
+        assert_eq!(simple_ass_plan.mode, PlaybackMode::SubtitleTranscode);
+        assert_eq!(
+            simple_ass_plan.subtitle_action,
+            StreamAction::ConvertTextToWebvtt
+        );
+    }
+
+    #[test]
+    fn phase17_forced_image_subtitles_burn_only_when_policy_selects_them() {
+        let mut media = capabilities(include_str!("fixtures/h264_aac_text_subtitles.json"));
+        let subtitle = media.subtitle_streams.get_mut(0).unwrap();
+        subtitle.codec = Some("pgs".to_string());
+        subtitle.kind = SubtitleKind::Image;
+        subtitle.title = Some("Forced PGS".to_string());
+        subtitle.is_default = false;
+        subtitle.is_forced = true;
+
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+        let browser = ClientPlaybackProfile::browser_like();
+
+        let off_plan = plan_playback(
+            "phase17-forced-image-off",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Off,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(off_plan.selected_subtitle_track, None);
+        assert_eq!(off_plan.subtitle_action, StreamAction::Disabled);
+        assert_eq!(off_plan.video_action, StreamAction::Copy);
+        assert!(
+            !off_plan
+                .reasons
+                .contains(&"subtitle_requires_burn_in".to_string()),
+            "{:?}",
+            off_plan.reasons
+        );
+
+        let forced_plan = plan_playback(
+            "phase17-forced-image-burn",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Forced,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+        assert_eq!(forced_plan.selected_subtitle_track, Some(2));
+        assert_eq!(forced_plan.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(forced_plan.subtitle_action, StreamAction::BurnIn);
+        assert_eq!(
+            forced_plan
+                .video_output
+                .as_ref()
+                .and_then(|output| output.burn_in.as_ref())
+                .map(|burn| burn.mode),
+            Some(SubtitleBurnInMode::Image)
+        );
+        assert!(
+            forced_plan
+                .reasons
+                .contains(&"subtitle_requires_burn_in".to_string()),
+            "{:?}",
+            forced_plan.reasons
+        );
+
+        let mut forced_disabled_client = browser;
+        forced_disabled_client.forced_subtitle_policy = ForcedSubtitlePolicy::Disabled;
+        let disabled_plan = plan_playback(
+            "phase17-forced-image-disabled-policy",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Forced,
+                ..PlaybackSelection::default()
+            },
+            &forced_disabled_client,
+            &policy,
+        );
+        assert_eq!(disabled_plan.selected_subtitle_track, None);
+        assert_eq!(disabled_plan.subtitle_action, StreamAction::Disabled);
+        assert_eq!(disabled_plan.video_action, StreamAction::Copy);
+    }
+
+    #[test]
+    fn phase17_image_subtitle_aliases_plan_image_burn_in() {
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+        let browser = ClientPlaybackProfile::browser_like();
+
+        for codec in [
+            "pgs",
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvdsub",
+            "vobsub",
+            "sub",
+            "idx",
+            "xsub",
+        ] {
+            let mut media = capabilities(include_str!("fixtures/h264_aac_text_subtitles.json"));
+            let subtitle = media.subtitle_streams.get_mut(0).unwrap();
+            subtitle.codec = Some(codec.to_string());
+            subtitle.kind = SubtitleKind::Image;
+            subtitle.title = Some(format!("{codec} forced"));
+            subtitle.is_default = false;
+            subtitle.is_forced = true;
+
+            let plan = plan_playback(
+                &format!("phase17-image-alias-{codec}"),
+                &media,
+                PlaybackSelection {
+                    subtitle_mode: SubtitleSelectionMode::Forced,
+                    ..PlaybackSelection::default()
+                },
+                &browser,
+                &policy,
+            );
+
+            assert_eq!(plan.mode, PlaybackMode::VideoTranscode, "{codec}");
+            assert_eq!(plan.subtitle_action, StreamAction::BurnIn, "{codec}");
+            let burn_in = plan
+                .video_output
+                .as_ref()
+                .and_then(|output| output.burn_in.as_ref());
+            assert_eq!(
+                burn_in.map(|burn| burn.mode),
+                Some(SubtitleBurnInMode::Image),
+                "{codec}: {plan:?}"
+            );
+            assert_eq!(
+                burn_in.map(|burn| burn.codec.as_str()),
+                Some(codec),
+                "{codec}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase17_external_image_subtitle_sidecar_plans_image_burn_in() {
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+        let browser = ClientPlaybackProfile::browser_like();
+        let mut media = capabilities(include_str!("fixtures/h264_aac_text_subtitles.json"));
+        let subtitle = media.subtitle_streams.get_mut(0).unwrap();
+        subtitle.index = Some(-100_000);
+        subtitle.external_id = Some("external-vobsub".to_string());
+        subtitle.external_path = Some("/media/Phase17.External.VobSub.idx".to_string());
+        subtitle.codec = Some("idx".to_string());
+        subtitle.kind = SubtitleKind::Image;
+        subtitle.title = Some("External VobSub".to_string());
+        subtitle.is_default = false;
+        subtitle.is_forced = true;
+
+        let plan = plan_playback(
+            "phase17-external-vobsub-sidecar",
+            &media,
+            PlaybackSelection {
+                subtitle_mode: SubtitleSelectionMode::Forced,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(plan.selected_subtitle_track, Some(-100_000));
+        assert_eq!(plan.subtitle_action, StreamAction::BurnIn);
+        let burn_in = plan
+            .video_output
+            .as_ref()
+            .and_then(|output| output.burn_in.as_ref())
+            .expect("external image subtitle should burn in");
+        assert_eq!(burn_in.mode, SubtitleBurnInMode::Image);
+        assert_eq!(burn_in.stream_index, 0);
+        assert_eq!(burn_in.codec, "idx");
+        assert_eq!(
+            burn_in.external_path.as_deref(),
+            Some("/media/Phase17.External.VobSub.idx")
+        );
+        assert!(
+            plan.reasons
+                .contains(&"subtitle_requires_burn_in".to_string()),
+            "{:?}",
+            plan.reasons
+        );
+    }
+
+    #[test]
+    fn phase18_hdr_actions_are_explicit_and_unknown_hdr_fails_closed() {
+        let base = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let native = ClientPlaybackProfile::native_mpv();
+
+        let mut dolby_vision = base.clone();
+        let video = dolby_vision.video_streams.get_mut(0).unwrap();
+        video.dolby_vision = true;
+        video.dolby_vision_profile = Some(8);
+        video.hdr10 = false;
+        video.dolby_vision_has_hdr10_fallback = false;
+        let mut dv_client = native.clone();
+        dv_client.supports_dolby_vision = true;
+        let dv_plan = plan_playback(
+            "phase18-dv-direct",
+            &dolby_vision,
+            PlaybackSelection::default(),
+            &dv_client,
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(dv_plan.hdr_action, HdrAction::DirectDolbyVision);
+        assert!(
+            dv_plan
+                .reasons
+                .contains(&"hdr_direct_dolby_vision".to_string()),
+            "{:?}",
+            dv_plan.reasons
+        );
+
+        dolby_vision.video_streams[0].dolby_vision_has_hdr10_fallback = true;
+        let fallback_plan = plan_playback(
+            "phase18-dv-hdr10-fallback",
+            &dolby_vision,
+            PlaybackSelection::default(),
+            &native,
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(fallback_plan.hdr_action, HdrAction::DirectHdr10Fallback);
+        assert!(
+            fallback_plan
+                .reasons
+                .contains(&"hdr_direct_hdr10_fallback".to_string()),
+            "{:?}",
+            fallback_plan.reasons
+        );
+        assert!(
+            fallback_plan
+                .reasons
+                .contains(&"dolby_vision_hdr10_fallback_selected".to_string()),
+            "{:?}",
+            fallback_plan.reasons
+        );
+
+        let mut dolby_vision_no_fallback = dolby_vision.clone();
+        dolby_vision_no_fallback.video_streams[0].dolby_vision_has_hdr10_fallback = false;
+        let dv_sdr_plan = plan_playback(
+            "phase18-dv-no-fallback-sdr",
+            &dolby_vision_no_fallback,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(
+            dv_sdr_plan.hdr_action,
+            HdrAction::Unsupported,
+            "reasons={:?}",
+            dv_sdr_plan.reasons
+        );
+        assert!(!dv_sdr_plan.playable);
+        assert!(
+            dv_sdr_plan.reasons.contains(&"hdr_unsupported".to_string()),
+            "{:?}",
+            dv_sdr_plan.reasons
+        );
+        assert!(
+            dv_sdr_plan
+                .reasons
+                .contains(&"dolby_vision_hdr10_fallback_missing".to_string()),
+            "{:?}",
+            dv_sdr_plan.reasons
+        );
+
+        let mut dolby_vision_sdr_fallback = dolby_vision.clone();
+        dolby_vision_sdr_fallback.video_streams[0].dolby_vision_has_hdr10_fallback = true;
+        let dv_sdr_fallback_plan = plan_playback(
+            "phase18-dv-fallback-tonemap-sdr",
+            &dolby_vision_sdr_fallback,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(dv_sdr_fallback_plan.hdr_action, HdrAction::ToneMapToSdr);
+        assert!(
+            dv_sdr_fallback_plan
+                .reasons
+                .contains(&"dolby_vision_hdr10_fallback_tone_map_to_sdr".to_string()),
+            "{:?}",
+            dv_sdr_fallback_plan.reasons
+        );
+        assert!(
+            dv_sdr_fallback_plan
+                .video_output
+                .as_ref()
+                .and_then(|output| output.tone_map.as_ref())
+                .is_some()
+        );
+
+        let mut hdr10_plus = base.clone();
+        hdr10_plus.video_streams[0].hdr10 = true;
+        hdr10_plus.video_streams[0].hdr10_plus = true;
+        let mut hdr_client = native.clone();
+        hdr_client.supports_hdr = true;
+        hdr_client.supports_hdr10_plus = false;
+        let hdr10_plus_plan = plan_playback(
+            "phase18-hdr10-plus-fallback",
+            &hdr10_plus,
+            PlaybackSelection::default(),
+            &hdr_client,
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(hdr10_plus_plan.hdr_action, HdrAction::DirectHdr10Fallback);
+        assert!(
+            hdr10_plus_plan
+                .reasons
+                .contains(&"hdr_direct_hdr10_fallback".to_string()),
+            "{:?}",
+            hdr10_plus_plan.reasons
+        );
+        assert!(
+            hdr10_plus_plan
+                .reasons
+                .contains(&"hdr10_plus_hdr10_fallback_selected".to_string()),
+            "{:?}",
+            hdr10_plus_plan.reasons
+        );
+
+        let mut unknown_hdr = base;
+        let video = unknown_hdr.video_streams.get_mut(0).unwrap();
+        video.bit_depth = Some(10);
+        video.color_transfer = Some("smpte2084".to_string());
+        video.color_primaries = Some("bt2020".to_string());
+        video.color_matrix = Some("bt2020nc".to_string());
+        video.hdr10 = false;
+        video.hdr10_plus = false;
+        video.dolby_vision = false;
+        let unknown_plan = plan_playback(
+            "phase18-unknown-hdr",
+            &unknown_hdr,
+            PlaybackSelection::default(),
+            &native,
+            &EffectivePlaybackPolicy::default(),
+        );
+        assert_eq!(unknown_plan.hdr_action, HdrAction::UnknownFailClosed);
+        assert!(!unknown_plan.playable);
+        assert!(
+            unknown_plan
+                .reasons
+                .contains(&"hdr_unknown_fail_closed".to_string()),
+            "{:?}",
+            unknown_plan.reasons
         );
     }
 
@@ -2975,6 +3887,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: None,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -3006,22 +3919,25 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
         );
-        assert_eq!(subtitle_plan.mode, PlaybackMode::SubtitleTranscode);
-        assert_eq!(subtitle_plan.video_action, StreamAction::Copy);
-        assert_eq!(subtitle_plan.audio_action, StreamAction::Copy);
-        assert_eq!(
-            subtitle_plan.subtitle_action,
-            StreamAction::ConvertTextToWebvtt
+        assert_eq!(subtitle_plan.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(subtitle_plan.video_action, StreamAction::Transcode);
+        assert_eq!(subtitle_plan.audio_action, StreamAction::Transcode);
+        assert_eq!(subtitle_plan.subtitle_action, StreamAction::BurnIn);
+        assert!(subtitle_plan.audio_output.is_some());
+        let subtitle_video = subtitle_plan.video_output.as_ref().unwrap();
+        assert!(subtitle_video.burn_in.is_some());
+        assert!(
+            subtitle_plan
+                .reasons
+                .contains(&"subtitle_not_supported".to_string()),
+            "{:?}",
+            subtitle_plan.reasons
         );
-        assert!(subtitle_plan.audio_output.is_none());
-        assert!(subtitle_plan.video_output.is_none());
-        assert!(subtitle_plan.expected_outputs.iter().any(|output| {
-            output.name == "sub_0.m3u8" && output.kind == "hls_subtitle_playlist"
-        }));
 
         let burn_in_plan = plan_playback(
             "pgs-file",
@@ -3030,6 +3946,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -3352,6 +4269,53 @@ mod tests {
             plan.hardware_acceleration.encoder.as_deref(),
             Some("h264_nvenc")
         );
+        assert_eq!(
+            plan.hardware_acceleration.decode_status.as_deref(),
+            Some("selected")
+        );
+        assert_eq!(
+            plan.hardware_acceleration.encode_status.as_deref(),
+            Some("selected")
+        );
+        assert!(plan.hardware_acceleration.warnings.is_empty());
+    }
+
+    #[test]
+    fn phase10_planner_uses_matrix_over_flat_hardware_codec_lists() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let mut hardware_capabilities = nvenc_capabilities();
+        hardware_capabilities.capability_matrices[0].encode[0].status =
+            "unsupported_gpu".to_string();
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            allow_hardware_decode: false,
+            hardware_capabilities,
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(3_000_000);
+
+        let plan = plan_playback(
+            "hardware-file",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        assert!(!plan.hardware_acceleration.enabled);
+        assert_ne!(
+            plan.video_output
+                .as_ref()
+                .map(|output| output.encoder.as_str()),
+            Some("h264_nvenc")
+        );
+        assert_eq!(
+            plan.hardware_acceleration.warnings,
+            vec!["hardware_unavailable".to_string()]
+        );
     }
 
     #[test]
@@ -3414,6 +4378,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(2),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &ClientPlaybackProfile::browser_like(),
             &policy,
@@ -3572,6 +4537,7 @@ mod tests {
                 audio_stream_index: Some(1),
                 subtitle_stream_index: None,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -3621,7 +4587,7 @@ mod tests {
         let mut text_policy = policy.clone();
         text_policy.max_bitrate_bps = Some(50_000_000);
         text_policy.max_resolution = Some("2160p".to_string());
-        for subtitle_index in [2, 3, 4] {
+        for subtitle_index in [2, 3] {
             let text_subtitle_plan = plan_playback(
                 &format!("phase13-text-subtitle-{subtitle_index}"),
                 &h264_aac_text_subtitles,
@@ -3629,6 +4595,7 @@ mod tests {
                     audio_stream_index: Some(1),
                     subtitle_stream_index: Some(subtitle_index),
                     start_position_seconds: None,
+                    ..PlaybackSelection::default()
                 },
                 &browser,
                 &text_policy,
@@ -3640,6 +4607,36 @@ mod tests {
                 StreamAction::ConvertTextToWebvtt | StreamAction::Passthrough
             ));
         }
+
+        let ass_subtitle_plan = plan_playback(
+            "phase13-ass-subtitle-burn-in",
+            &h264_aac_text_subtitles,
+            PlaybackSelection {
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(4),
+                start_position_seconds: None,
+                ..PlaybackSelection::default()
+            },
+            &browser,
+            &text_policy,
+        );
+        assert_eq!(ass_subtitle_plan.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(ass_subtitle_plan.subtitle_action, StreamAction::BurnIn);
+        assert!(
+            ass_subtitle_plan
+                .video_output
+                .as_ref()
+                .and_then(|output| output.burn_in.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            ass_subtitle_plan
+                .video_output
+                .as_ref()
+                .and_then(|output| output.burn_in.as_ref())
+                .and_then(|burn_in| burn_in.filter_stream_index),
+            Some(2)
+        );
 
         let no_subtitle_plan = plan_playback(
             "phase13-no-subtitle",
@@ -3659,6 +4656,7 @@ mod tests {
                     audio_stream_index: Some(1),
                     subtitle_stream_index: Some(subtitle_index),
                     start_position_seconds: None,
+                    ..PlaybackSelection::default()
                 },
                 &browser,
                 &policy,
@@ -3704,6 +4702,7 @@ mod tests {
                 audio_stream_index: Some(99),
                 subtitle_stream_index: None,
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -3721,6 +4720,7 @@ mod tests {
                 audio_stream_index: None,
                 subtitle_stream_index: Some(99),
                 start_position_seconds: None,
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,
@@ -3738,6 +4738,7 @@ mod tests {
                 audio_stream_index: None,
                 subtitle_stream_index: None,
                 start_position_seconds: Some(-1),
+                ..PlaybackSelection::default()
             },
             &browser,
             &policy,

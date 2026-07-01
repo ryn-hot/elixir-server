@@ -83,8 +83,11 @@ impl SeekBehavior {
 pub enum HdrAction {
     None,
     Direct,
+    DirectDolbyVision,
+    DirectHdr10Fallback,
     ToneMapToSdr,
     Unsupported,
+    UnknownFailClosed,
     Unknown,
 }
 
@@ -178,6 +181,14 @@ pub struct HardwareAccelerationPlan {
     pub decoder: Option<String>,
     pub encoder: Option<String>,
     pub fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Default for HardwareAccelerationPlan {
@@ -188,6 +199,10 @@ impl Default for HardwareAccelerationPlan {
             decoder: None,
             encoder: None,
             fallback: Some("software".to_string()),
+            readiness_id: None,
+            decode_status: None,
+            encode_status: None,
+            warnings: Vec::new(),
         }
     }
 }
@@ -233,6 +248,10 @@ pub enum SubtitleBurnInMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleBurnInPlan {
     pub stream_index: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_stream_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_path: Option<String>,
     pub codec: String,
     pub mode: SubtitleBurnInMode,
     pub reason: String,

@@ -421,8 +421,20 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/play", post(handlers::playback::play))
         .route(
+            "/api/v1/playback/hardware/readiness",
+            get(handlers::playback::hardware_readiness),
+        )
+        .route(
+            "/api/v1/playback/hardware/warnings",
+            get(handlers::playback::hardware_warnings),
+        )
+        .route(
             "/stream/direct/:id",
             get(handlers::playback::stream_direct).head(handlers::playback::stream_direct),
+        )
+        .route(
+            "/stream/subtitle/:id/:subtitle_id",
+            get(handlers::playback::stream_subtitle).head(handlers::playback::stream_subtitle),
         )
         .route(
             "/sessions/:id/master.m3u8",

@@ -167,3 +167,36 @@ async fn migrations_create_cloudstream_source_registry_tables() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn migrations_create_playback_hardware_readiness_tables() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+
+    let database = Database::connect(&config).await?;
+    database.run_migrations().await?;
+
+    let applied_versions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 46")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(applied_versions, 1);
+
+    for table in [
+        "playback_hardware_readiness",
+        "playback_hardware_readiness_events",
+    ] {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(count, 1, "missing migration table {table}");
+    }
+
+    Ok(())
+}

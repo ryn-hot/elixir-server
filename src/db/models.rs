@@ -464,6 +464,7 @@ pub struct ExternalSubtitle {
     pub format: Option<String>,
     pub is_default: bool,
     pub is_forced: bool,
+    pub is_hearing_impaired: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

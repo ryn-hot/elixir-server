@@ -54,6 +54,7 @@ pub struct SubtitleInfo {
     pub title: Option<String>,
     pub is_default: bool,
     pub is_forced: bool,
+    pub is_hearing_impaired: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -506,6 +507,9 @@ fn build_transcode_ffmpeg_args(
     push_transcode_seek_args(&mut args, params.seek_seconds);
     push_hardware_decode_args(&mut args, playback_plan);
     args.extend(["-i".to_string(), input.to_string()]);
+    if let Some(path) = external_burn_in_input_path(playback_plan) {
+        push_external_burn_in_input_args(&mut args, path, params.seek_seconds);
+    }
 
     if !subtitles.is_empty() {
         args.extend(
@@ -625,12 +629,13 @@ fn build_transcode_ffmpeg_args(
     );
 
     for (idx, sub) in subtitles.iter().enumerate() {
+        let subtitle_input_index = text_subtitle_input_index(playback_plan);
         let playlist = temp_dir.join(format!("sub_{idx}.m3u8"));
         let segment = temp_dir.join(format!("sub_{idx}_%05d.vtt"));
         args.extend(
             [
                 "-map".to_string(),
-                format!("1:{}", sub.stream_index),
+                format!("{subtitle_input_index}:{}", sub.stream_index),
                 "-c:s".to_string(),
                 "webvtt".to_string(),
                 "-f".to_string(),
@@ -682,6 +687,9 @@ fn build_adaptive_transcode_ffmpeg_args(
     push_transcode_seek_args(&mut args, params.seek_seconds);
     push_hardware_decode_args(&mut args, Some(plan));
     args.extend(["-i".to_string(), input.to_string()]);
+    if let Some(path) = external_burn_in_input_path(Some(plan)) {
+        push_external_burn_in_input_args(&mut args, path, params.seek_seconds);
+    }
 
     if !subtitles.is_empty() {
         args.extend(
@@ -762,12 +770,13 @@ fn build_adaptive_transcode_ffmpeg_args(
     );
 
     for (idx, sub) in subtitles.iter().enumerate() {
+        let subtitle_input_index = text_subtitle_input_index(Some(plan));
         let playlist = temp_dir.join(format!("sub_{idx}.m3u8"));
         let segment = temp_dir.join(format!("sub_{idx}_%05d.vtt"));
         args.extend(
             [
                 "-map".to_string(),
-                format!("1:{}", sub.stream_index),
+                format!("{subtitle_input_index}:{}", sub.stream_index),
                 "-c:s".to_string(),
                 "webvtt".to_string(),
                 "-f".to_string(),
@@ -832,16 +841,13 @@ fn adaptive_video_filter_branch(
     let filters = planned_video_filters(output);
     match output.burn_in.as_ref() {
         Some(burn_in) if burn_in.mode == SubtitleBurnInMode::Image => {
+            let subtitle_label = image_subtitle_filter_label(burn_in);
             if filters.is_empty() {
-                format!(
-                    "{source_label}[0:{}]overlay{output_label}",
-                    burn_in.stream_index
-                )
+                format!("{source_label}[{subtitle_label}]overlay{output_label}")
             } else {
                 format!(
-                    "{source_label}{}[vbase{rung_id}];[vbase{rung_id}][0:{}]overlay{output_label}",
+                    "{source_label}{}[vbase{rung_id}];[vbase{rung_id}][{subtitle_label}]overlay{output_label}",
                     filters.join(","),
-                    burn_in.stream_index
                 )
             }
         }
@@ -850,7 +856,7 @@ fn adaptive_video_filter_branch(
             chain.push(format!(
                 "subtitles={}:si={}",
                 ffmpeg_filter_path(input),
-                burn_in.stream_index
+                ass_subtitle_filter_stream_index(burn_in)
             ));
             format!("{source_label}{}{output_label}", chain.join(","))
         }
@@ -1058,16 +1064,13 @@ fn planned_video_filter(input: &str, playback_plan: Option<&PlaybackPlan>) -> Vi
     let selected_video = selected_video_map(playback_plan);
     match output.burn_in.as_ref() {
         Some(burn_in) if burn_in.mode == SubtitleBurnInMode::Image => {
+            let subtitle_label = image_subtitle_filter_label(burn_in);
             let filter_complex = if filters.is_empty() {
-                format!(
-                    "[{selected_video}][0:{}]overlay[vout]",
-                    burn_in.stream_index,
-                )
+                format!("[{selected_video}][{subtitle_label}]overlay[vout]")
             } else {
                 format!(
-                    "[{selected_video}]{}[vbase];[vbase][0:{}]overlay[vout]",
+                    "[{selected_video}]{}[vbase];[vbase][{subtitle_label}]overlay[vout]",
                     filters.join(","),
-                    burn_in.stream_index,
                 )
             };
             VideoFilterArgs {
@@ -1081,7 +1084,7 @@ fn planned_video_filter(input: &str, playback_plan: Option<&PlaybackPlan>) -> Vi
             chain.push(format!(
                 "subtitles={}:si={}",
                 ffmpeg_filter_path(input),
-                burn_in.stream_index
+                ass_subtitle_filter_stream_index(burn_in)
             ));
             VideoFilterArgs {
                 video_map: "[vout]".to_string(),
@@ -1099,6 +1102,51 @@ fn planned_video_filter(input: &str, playback_plan: Option<&PlaybackPlan>) -> Vi
             filter_complex: None,
             vf: None,
         },
+    }
+}
+
+fn ass_subtitle_filter_stream_index(burn_in: &crate::playback::plan::SubtitleBurnInPlan) -> i32 {
+    burn_in.filter_stream_index.unwrap_or(0).max(0)
+}
+
+fn image_subtitle_filter_label(burn_in: &crate::playback::plan::SubtitleBurnInPlan) -> String {
+    if burn_in.external_path.is_some() {
+        "1:0".to_string()
+    } else {
+        format!("0:{}", burn_in.stream_index)
+    }
+}
+
+fn external_burn_in_input_path(playback_plan: Option<&PlaybackPlan>) -> Option<&str> {
+    playback_plan?
+        .video_output
+        .as_ref()?
+        .burn_in
+        .as_ref()?
+        .external_path
+        .as_deref()
+}
+
+fn push_external_burn_in_input_args(args: &mut Vec<String>, path: &str, seek_seconds: f32) {
+    if seek_seconds.abs() >= f32::EPSILON {
+        args.extend(
+            [
+                "-itsoffset".to_string(),
+                format!("-{seek_seconds}"),
+                "-ss".to_string(),
+                format!("{seek_seconds}"),
+            ]
+            .into_iter(),
+        );
+    }
+    args.extend(["-i".to_string(), path.to_string()]);
+}
+
+fn text_subtitle_input_index(playback_plan: Option<&PlaybackPlan>) -> usize {
+    if external_burn_in_input_path(playback_plan).is_some() {
+        2
+    } else {
+        1
     }
 }
 
@@ -1565,6 +1613,9 @@ struct SubtitleStream {
 struct SubtitleDisposition {
     default: Option<i32>,
     forced: Option<i32>,
+    hearing_impaired: Option<i32>,
+    captions: Option<i32>,
+    descriptions: Option<i32>,
 }
 
 async fn detect_text_subtitles(
@@ -1624,16 +1675,48 @@ async fn detect_text_subtitles(
             .and_then(|d| d.forced)
             .unwrap_or(0)
             == 1;
+        let is_hearing_impaired = subtitle_info_hearing_impaired(&stream, title.as_deref());
         candidates.push(SubtitleInfo {
             stream_index,
             language,
             title,
             is_default,
             is_forced,
+            is_hearing_impaired,
         });
     }
 
     candidates
+}
+
+fn subtitle_info_hearing_impaired(stream: &SubtitleStream, title: Option<&str>) -> bool {
+    stream
+        .disposition
+        .as_ref()
+        .map(|d| {
+            d.hearing_impaired.unwrap_or(0) == 1
+                || d.captions.unwrap_or(0) == 1
+                || d.descriptions.unwrap_or(0) == 1
+        })
+        .unwrap_or(false)
+        || subtitle_title_suggests_hearing_impaired(title)
+}
+
+fn subtitle_title_suggests_hearing_impaired(title: Option<&str>) -> bool {
+    let Some(title) = title else {
+        return false;
+    };
+    let lower = title.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("hearingimpaired") || compact.contains("closedcaptions") {
+        return true;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "sdh" | "cc" | "hi"))
 }
 
 fn is_text_subtitle(codec: &str) -> bool {
@@ -1834,6 +1917,46 @@ mod tests {
             !args.iter().any(|arg| arg == value),
             "{value} unexpectedly present in {args:?}"
         );
+    }
+
+    fn video_output_with_subtitle_burn_in(
+        stream_index: i32,
+        codec: &str,
+        mode: SubtitleBurnInMode,
+        scale: Option<VideoScalePlan>,
+    ) -> VideoOutputPlan {
+        VideoOutputPlan {
+            codec: "h264".to_string(),
+            encoder: "libx264".to_string(),
+            preset: "slow".to_string(),
+            profile: Some("high".to_string()),
+            level: Some("4.1".to_string()),
+            crf: None,
+            bitrate_bps: Some(8_000_000),
+            maxrate_bps: Some(8_000_000),
+            bufsize_bps: Some(16_000_000),
+            pixel_format: Some("yuv420p".to_string()),
+            scale,
+            tone_map: None,
+            frame_rate: VideoFrameRatePlan {
+                mode: VideoFrameRateMode::Source,
+                source_fps: Some("23.976".to_string()),
+                target_fps: None,
+            },
+            gop_frames: Some(96),
+            segment_seconds: "4".to_string(),
+            keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+            hls_delivery: Delivery::HlsFmp4,
+            burn_in: Some(SubtitleBurnInPlan {
+                stream_index,
+                filter_stream_index: None,
+                external_path: None,
+                codec: codec.to_string(),
+                mode,
+                reason: "selected_subtitle_requires_video_burn_in".to_string(),
+            }),
+            reasons: vec!["subtitle_requires_burn_in".to_string()],
+        }
     }
 
     #[test]
@@ -2192,6 +2315,7 @@ mod tests {
             title: Some("Dialogue".to_string()),
             is_default: true,
             is_forced: false,
+            is_hearing_impaired: false,
         }];
 
         let args = build_transcode_ffmpeg_args(
@@ -2268,6 +2392,8 @@ mod tests {
             hls_delivery: Delivery::HlsFmp4,
             burn_in: Some(SubtitleBurnInPlan {
                 stream_index: 2,
+                filter_stream_index: None,
+                external_path: None,
                 codec: "hdmv_pgs_subtitle".to_string(),
                 mode: SubtitleBurnInMode::Image,
                 reason: "selected_subtitle_requires_video_burn_in".to_string(),
@@ -2314,6 +2440,218 @@ mod tests {
         assert_arg_pair(&args, "-force_key_frames", "expr:gte(t,n_forced*4)");
         assert!(!args.iter().any(|arg| arg == "-vf"));
         assert!(!args.iter().any(|arg| arg.contains("fps=")));
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_apply_dvd_vobsub_image_subtitle_burn_in() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Copy,
+            StreamAction::BurnIn,
+            None,
+        );
+        plan.selected_subtitle_track = Some(3);
+        plan.video_transcode_reason = Some("subtitle_requires_burn_in".to_string());
+        plan.video_output = Some(video_output_with_subtitle_burn_in(
+            3,
+            "dvd_subtitle",
+            SubtitleBurnInMode::Image,
+            None,
+        ));
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/vobsub-source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-filter_complex", "[0:0][0:3]overlay[vout]");
+        assert_arg_pair(&args, "-map", "[vout]");
+        assert_arg_pair(&args, "-map", "0:1");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("subtitles=") || arg.contains(":si=")),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_apply_external_image_subtitle_burn_in() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 12.5,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Copy,
+            StreamAction::BurnIn,
+            None,
+        );
+        plan.selected_subtitle_track = Some(-100_000);
+        plan.video_transcode_reason = Some("subtitle_requires_burn_in".to_string());
+        let mut output =
+            video_output_with_subtitle_burn_in(0, "idx", SubtitleBurnInMode::Image, None);
+        output.burn_in.as_mut().expect("burn-in plan").external_path =
+            Some("/media/Phase17.External.VobSub.idx".to_string());
+        plan.video_output = Some(output);
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-i", "/media/source.mkv");
+        assert_arg_pair(&args, "-i", "/media/Phase17.External.VobSub.idx");
+        assert_arg_pair(&args, "-itsoffset", "-12.5");
+        assert_arg_pair(&args, "-ss", "12.5");
+        assert_arg_pair(&args, "-filter_complex", "[0:0][1:0]overlay[vout]");
+        assert_arg_pair(&args, "-map", "[vout]");
+        assert_arg_pair(&args, "-map", "0:1");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("[0:-100000]") || arg.contains("[0:0]overlay")),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_do_not_seek_zero_second_external_image_subtitle() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Copy,
+            StreamAction::BurnIn,
+            None,
+        );
+        plan.selected_subtitle_track = Some(-100_000);
+        plan.video_transcode_reason = Some("subtitle_requires_burn_in".to_string());
+        let mut output =
+            video_output_with_subtitle_burn_in(0, "pgs", SubtitleBurnInMode::Image, None);
+        output.burn_in.as_mut().expect("burn-in plan").external_path =
+            Some("/media/Phase17.External.PGS.sup".to_string());
+        plan.video_output = Some(output);
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/source.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(&args, "-copyts", "-start_at_zero");
+        assert_arg_pair(&args, "-i", "/media/source.mkv");
+        assert_arg_pair(&args, "-i", "/media/Phase17.External.PGS.sup");
+        assert_arg_pair(&args, "-filter_complex", "[0:0][1:0]overlay[vout]");
+        assert_arg_pair(&args, "-map", "[vout]");
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "-ss").count(),
+            1,
+            "{args:?}"
+        );
+        assert!(
+            !args.windows(4).any(|pair| {
+                pair[0] == "-itsoffset" && pair[1] == "-0" && pair[2] == "-ss" && pair[3] == "0"
+            }),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn video_transcode_ffmpeg_args_apply_ass_ssa_exact_style_burn_in() {
+        let temp = tempdir().unwrap();
+        let layout =
+            HlsOutputLayout::for_job(temp.path(), PlaybackMode::VideoTranscode, Delivery::HlsFmp4);
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::VideoTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let mut plan = hls_playback_plan(
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            StreamAction::Copy,
+            StreamAction::BurnIn,
+            None,
+        );
+        plan.selected_subtitle_track = Some(4);
+        plan.video_transcode_reason = Some("subtitle_requires_burn_in".to_string());
+        plan.video_output = Some(video_output_with_subtitle_burn_in(
+            4,
+            "ass",
+            SubtitleBurnInMode::AssSsaExactStyle,
+            Some(VideoScalePlan {
+                width: 1280,
+                height: 720,
+                reason: "resolution_exceeds_policy".to_string(),
+            }),
+        ));
+        plan.video_output
+            .as_mut()
+            .and_then(|output| output.burn_in.as_mut())
+            .unwrap()
+            .filter_stream_index = Some(2);
+
+        let args = build_transcode_ffmpeg_args(
+            "/media/Phase 17's source:final.mkv",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            23.976,
+        );
+
+        assert_arg_pair(
+            &args,
+            "-filter_complex",
+            "[0:0]scale=1280:720,subtitles='/media/Phase 17\\'s source\\:final.mkv':si=2[vout]",
+        );
+        assert_arg_pair(&args, "-map", "[vout]");
+        assert_arg_pair(&args, "-map", "0:1");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("overlay") || arg == "-vf"),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -2497,6 +2835,7 @@ mod tests {
             decoder: Some("videotoolbox".to_string()),
             encoder: Some("h264_videotoolbox".to_string()),
             fallback: Some("software".to_string()),
+            ..HardwareAccelerationPlan::default()
         };
         plan.video_output = Some(VideoOutputPlan {
             codec: "h264".to_string(),
@@ -2574,6 +2913,7 @@ mod tests {
             decoder: Some("cuda".to_string()),
             encoder: Some("h264_nvenc".to_string()),
             fallback: Some("software".to_string()),
+            ..HardwareAccelerationPlan::default()
         };
         plan.video_output = Some(VideoOutputPlan {
             codec: "h264".to_string(),
@@ -2661,6 +3001,7 @@ mod tests {
             decoder: Some("cuda".to_string()),
             encoder: Some("h264_nvenc".to_string()),
             fallback: Some("software".to_string()),
+            ..HardwareAccelerationPlan::default()
         };
         plan.adaptive = true;
         plan.video_action = StreamAction::Transcode;
@@ -2741,6 +3082,7 @@ mod tests {
             decoder: Some("d3d11va".to_string()),
             encoder: Some("h264_amf".to_string()),
             fallback: Some("software".to_string()),
+            ..HardwareAccelerationPlan::default()
         };
         plan.video_output = Some(VideoOutputPlan {
             codec: "h264".to_string(),
@@ -2812,6 +3154,7 @@ mod tests {
             decoder: Some("h264_qsv".to_string()),
             encoder: Some("h264_qsv".to_string()),
             fallback: Some("software".to_string()),
+            ..HardwareAccelerationPlan::default()
         };
         plan.video_output = Some(VideoOutputPlan {
             codec: "h264".to_string(),

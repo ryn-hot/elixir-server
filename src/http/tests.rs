@@ -11637,13 +11637,23 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     let media_path = temp.path().join("Artifact.Movie.2024.mkv");
     tokio::fs::write(&media_path, b"source").await?;
     tokio::fs::write(temp.path().join("seg_0_00000.ts"), b"segment").await?;
+    tokio::fs::write(temp.path().join("init_0.mp4"), b"init").await?;
     tokio::fs::write(temp.path().join("secret.ts"), b"secret").await?;
     tokio::fs::write(
-        temp.path().join("stream_0.m3u8"),
-        "#EXTM3U\nseg_0_00000.ts\n",
+        temp.path().join("master.m3u8"),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nstream_0.m3u8?token=evil-master&x-plex-token=evil-plex&keep=master\n",
     )
     .await?;
-    tokio::fs::write(temp.path().join("sub_0.m3u8"), "#EXTM3U\nsub_0_00000.vtt\n").await?;
+    tokio::fs::write(
+        temp.path().join("stream_0.m3u8"),
+        "#EXTM3U\n#EXT-X-MAP:URI=\"init_0.mp4?access_token=evil-init&keep=init\"\n#EXTINF:4.000,\nseg_0_00000.ts?sid=evil-sid&keep=seg\n#EXT-X-ENDLIST\n",
+    )
+    .await?;
+    tokio::fs::write(
+        temp.path().join("sub_0.m3u8"),
+        "#EXTM3U\nsub_0_00000.vtt?token=evil-sub&keep=sub\n",
+    )
+    .await?;
     tokio::fs::write(temp.path().join("sub_0_00000.vtt"), "WEBVTT\n").await?;
 
     #[cfg(unix)]
@@ -11677,7 +11687,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'transcode', 'active', 'lan', 0, 6, ?, '2000-01-01 00:00:00')",
+         VALUES (?, ?, ?, 'transcode', 'active', 'lan', 0, 6, ?, '2099-01-01 00:00:00')",
     )
     .bind(session_id.to_string())
     .bind(user_id.to_string())
@@ -11690,6 +11700,74 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .transcodes
         .insert_test_job(session_id, temp.path().to_path_buf(), 1)
         .await;
+
+    let missing_auth_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/master.m3u8?session={session_token}"
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing_auth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_session_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/sessions/{session_id}/master.m3u8"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing_session_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let other_user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(other_user_id.to_string())
+        .bind("hls-artifact-other-user@example.com")
+        .bind("hashed")
+        .execute(&state.db_pool)
+        .await?;
+    let other_token = state.auth_service.issue_access_token(other_user_id)?.token;
+    let wrong_owner_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/master.m3u8?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {other_token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(wrong_owner_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let master_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/master.m3u8?session={session_token}&token=scoped-auth&ts=cache1"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    let master_status = master_resp.status();
+    let master_bytes = body::to_bytes(master_resp.into_body(), 1_048_576).await?;
+    assert_eq!(
+        master_status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&master_bytes)
+    );
+    let master_playlist = String::from_utf8_lossy(&master_bytes);
+    assert!(master_playlist.contains("stream_0.m3u8?keep=master&session="));
+    assert!(master_playlist.contains("&token=scoped-auth"));
+    assert!(master_playlist.contains("&ts=cache1"));
+    assert!(master_playlist.contains("sub_0.m3u8?"));
+    assert!(master_playlist.contains("session=session-token-for-artifacts"));
+    assert!(!master_playlist.contains("evil-master"));
+    assert!(!master_playlist.contains("x-plex-token"));
 
     let valid_resp = app
         .clone()
@@ -11716,13 +11794,13 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
-    assert_ne!(updated_at.trim(), "2000-01-01 00:00:00");
+    assert_ne!(updated_at.trim(), "2099-01-01 00:00:00");
 
     let playlist_resp = app
         .clone()
         .oneshot(
             Request::get(format!(
-                "/sessions/{session_id}/stream_0.m3u8?session={session_token}"
+                "/sessions/{session_id}/stream_0.m3u8?session={session_token}&token=scoped-auth&ts=cache1"
             ))
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())?,
@@ -11737,7 +11815,45 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         String::from_utf8_lossy(&playlist_bytes)
     );
     let playlist = String::from_utf8_lossy(&playlist_bytes);
-    assert!(playlist.contains("seg_0_00000.ts?session="));
+    assert!(playlist.contains("#EXT-X-MAP:URI=\"init_0.mp4?keep=init&session="));
+    assert!(playlist.contains("seg_0_00000.ts?keep=seg&session="));
+    assert!(playlist.contains("&token=scoped-auth"));
+    assert!(playlist.contains("&ts=cache1"));
+    assert!(!playlist.contains("access_token=evil-init"));
+    assert!(!playlist.contains("sid=evil-sid"));
+
+    let init_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/init_0.mp4?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let init_bytes = body::to_bytes(init_resp.into_body(), 1_048_576).await?;
+    assert_eq!(&init_bytes[..], b"init");
+
+    let subtitle_playlist_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/sub_0.m3u8?session={session_token}&token=scoped-auth&ts=cache1"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(subtitle_playlist_resp.status(), StatusCode::OK);
+    let subtitle_playlist_bytes =
+        body::to_bytes(subtitle_playlist_resp.into_body(), 1_048_576).await?;
+    let subtitle_playlist = String::from_utf8_lossy(&subtitle_playlist_bytes);
+    assert!(subtitle_playlist.contains("sub_0_00000.vtt?keep=sub&session="));
+    assert!(subtitle_playlist.contains("&token=scoped-auth"));
+    assert!(subtitle_playlist.contains("&ts=cache1"));
+    assert!(!subtitle_playlist.contains("evil-sub"));
 
     let subtitle_resp = app
         .clone()
@@ -11759,7 +11875,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     );
     assert!(String::from_utf8_lossy(&subtitle_bytes).contains("WEBVTT"));
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = ?")
         .bind(session_id.to_string())
         .execute(&state.db_pool)
         .await?;
@@ -11777,9 +11893,9 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
-    assert_ne!(poll_updated_at.trim(), "2000-01-01 00:00:00");
+    assert_ne!(poll_updated_at.trim(), "2099-01-01 00:00:00");
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = ?")
         .bind(session_id.to_string())
         .execute(&state.db_pool)
         .await?;
@@ -11797,7 +11913,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
-    assert_ne!(heartbeat_updated_at.trim(), "2000-01-01 00:00:00");
+    assert_ne!(heartbeat_updated_at.trim(), "2099-01-01 00:00:00");
 
     let present_but_unregistered = app
         .clone()
@@ -11838,6 +11954,33 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         assert_eq!(symlink_escape.status(), StatusCode::NOT_FOUND);
     }
 
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+    let expired_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/seg_0_00000.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(expired_resp.status(), StatusCode::UNAUTHORIZED);
+    let expired_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ? LIMIT 1")
+            .bind(session_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+    assert_eq!(expired_state, "ended");
+    assert!(state.transcodes.snapshot(session_id).await.is_none());
+    assert!(
+        !temp.path().exists(),
+        "expired HLS session should remove temp artifacts"
+    );
+
     let direct_session_id = Uuid::new_v4();
     let direct_session_token = "direct-stream-session-token";
     let direct_temp = tempdir()?;
@@ -11857,7 +12000,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 6, ?, '2000-01-01 00:00:00')",
+         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 6, ?, '2099-01-01 00:00:00')",
     )
     .bind(direct_session_id.to_string())
     .bind(user_id.to_string())
@@ -11948,6 +12091,32 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         )
         .await?;
     assert_eq!(old_transcode_name_resp.status(), StatusCode::NOT_FOUND);
+
+    let end_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{direct_session_id}/end"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
+    assert!(state.transcodes.snapshot(direct_session_id).await.is_none());
+    assert!(
+        !direct_temp.path().exists(),
+        "ended direct-stream HLS session should remove temp artifacts"
+    );
+    let ended_segment_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{direct_session_id}/segment_00000.m4s?session={direct_session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(ended_segment_resp.status(), StatusCode::UNAUTHORIZED);
 
     Ok(())
 }
