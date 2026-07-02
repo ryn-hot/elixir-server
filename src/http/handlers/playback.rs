@@ -85,6 +85,8 @@ pub struct PlayRequest {
     pub preferred_file_id: Option<String>,
     pub preferred_episode_id: Option<String>,
     pub network_type: Option<String>,
+    #[serde(alias = "shareId")]
+    pub share_id: Option<String>,
     pub client_capabilities: Option<Value>,
     #[serde(alias = "audioStreamIndex")]
     pub audio_stream_index: Option<i32>,
@@ -118,8 +120,55 @@ pub struct PlayResponse {
     pub episode_selection_reason: Option<String>,
     pub server_id: String,
     pub wan_direct_endpoint: Option<String>,
+    pub stream_token_expires_at: String,
+    pub remote_access: RemoteAccessContract,
+    pub remote_policy: RemotePlaybackPolicySnapshot,
     pub state: String,
     pub logical_position_seconds: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAccessContract {
+    pub lan_direct_endpoint: Option<String>,
+    pub wan_direct_endpoint: Option<String>,
+    pub reverse_proxy_endpoint: Option<String>,
+    pub reverse_proxy_behavior: String,
+    pub https_required: bool,
+    pub secure_connection_policy: String,
+    pub request_transport: String,
+    pub token_ttl_seconds: u64,
+    pub stream_token_expires_at: String,
+    pub session_revocation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePlaybackPolicySnapshot {
+    pub applied: bool,
+    pub scope: String,
+    pub policy_sources: Vec<String>,
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_remote_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_resolution: Option<String>,
+    #[serde(default = "default_remote_policy_true")]
+    pub allow_downloads: bool,
+    #[serde(default = "default_remote_policy_true")]
+    pub allow_direct_play: bool,
+    #[serde(default = "default_remote_policy_true")]
+    pub allow_transcode: bool,
+    #[serde(default = "default_remote_policy_true")]
+    pub allow_hardware_transcode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+fn default_remote_policy_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -344,6 +393,7 @@ struct FileRow {
 
 pub async fn play(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user: CurrentUser,
     Json(body): Json<PlayRequest>,
 ) -> ApiResult<Json<PlayResponse>> {
@@ -502,6 +552,9 @@ pub async fn play(
     }
 
     let network_class = classify_playback_network(body.network_type.as_deref());
+    let share_id = validated_share_id(body.share_id.as_deref())?;
+    let request_transport = playback_request_transport(&headers);
+    enforce_remote_transport_policy(&state.settings, network_class, &request_transport)?;
     let profile = profile_for_network(&state.settings.playback, Some(network_class.as_str()));
     let caps_json = body.client_capabilities.clone();
     let mut caps = caps_json
@@ -577,6 +630,13 @@ pub async fn play(
         network_class,
         hardware_capabilities,
     );
+    let remote_policy = resolve_remote_playback_policy(
+        &state.settings.playback,
+        user.user_id,
+        share_id.as_deref(),
+        network_class,
+    );
+    apply_remote_policy_to_effective_policy(&mut effective_policy, &remote_policy);
     let hardware_host_fingerprint = state.hardware_host_fingerprint.read().await.clone();
     if let Some(host_fingerprint) = hardware_host_fingerprint.as_deref() {
         effective_policy.performance_envelopes =
@@ -623,6 +683,12 @@ pub async fn play(
                 &mut playback_plan,
             );
     }
+    append_remote_policy_plan_reasons(
+        &mut playback_plan,
+        &remote_policy,
+        &request_transport,
+        &state.settings,
+    );
     record_playback_feasibility_for_plan(
         &playback_plan,
         client_kind_label(&client_profile.client_kind),
@@ -654,6 +720,17 @@ pub async fn play(
     ) {
         return Err(error);
     }
+    if let Some(error) = enforce_remote_policy_session_limit(
+        &state,
+        &remote_policy,
+        &playback_plan,
+        client_kind_label(&client_profile.client_kind),
+        network_class.as_str(),
+    )
+    .await?
+    {
+        return Err(error);
+    }
     if let Some(error) = enforce_playback_capacity_before_start(
         &state,
         &user,
@@ -678,6 +755,8 @@ pub async fn play(
     }
     let session_id = Uuid::new_v4();
     let session_token = Uuid::new_v4().to_string();
+    let (stream_token_ttl_seconds, stream_token_expires_at) =
+        stream_token_expiry(&state.settings.playback);
     info!(
         user = %user.user_id,
         item = %body.media_item_id,
@@ -712,13 +791,15 @@ pub async fn play(
         .inc();
 
     let server_id = ensure_server_instance(&state.db_pool, &state.settings, user.user_id).await?;
-    let wan_direct_endpoint: Option<String> = sqlx::query_scalar(
-        "SELECT wan_direct_endpoint FROM server_registry ORDER BY last_seen_at DESC LIMIT 1",
+    let remote_access = remote_access_contract(
+        &state,
+        &server_id.to_string(),
+        stream_token_ttl_seconds,
+        &stream_token_expires_at,
+        &request_transport,
     )
-    .fetch_optional(&state.db_pool)
-    .await
-    .ok()
-    .flatten();
+    .await;
+    let wan_direct_endpoint = remote_access.wan_direct_endpoint.clone();
 
     let stream_url = if playback_plan.mode == PlaybackMode::DirectPlay {
         format!(
@@ -757,11 +838,27 @@ pub async fn play(
     } else {
         None
     };
-    let playback_plan_json =
+    let mut playback_plan_json =
         serde_json::to_value(&playback_plan).map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Some(plan) = playback_plan_json.as_object_mut() {
+        plan.insert(
+            "remote_access".to_string(),
+            serde_json::to_value(&remote_access).map_err(|e| ApiError::internal(e.to_string()))?,
+        );
+        plan.insert(
+            "remote_policy".to_string(),
+            serde_json::to_value(&remote_policy).map_err(|e| ApiError::internal(e.to_string()))?,
+        );
+        plan.insert(
+            "stream_token_expires_at".to_string(),
+            Value::String(stream_token_expires_at.clone()),
+        );
+    }
+    let remote_policy_json =
+        serde_json::to_string(&remote_policy).map_err(|e| ApiError::internal(e.to_string()))?;
     let job_state_json = transcode_state.clone();
 
-    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, playback_plan_json, job_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, token_expires_at, share_id, remote_policy_json, playback_plan_json, job_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(session_id.to_string())
         .bind(user.user_id.to_string())
         .bind(server_id.to_string())
@@ -774,6 +871,9 @@ pub async fn play(
         .bind(caps_json.as_ref().map(|v| v.to_string()))
         .bind(transcode_state.as_ref().map(|s| s.to_string()))
         .bind(session_token.clone())
+        .bind(stream_token_expires_at.clone())
+        .bind(share_id.clone())
+        .bind(Some(remote_policy_json))
         .bind(Some(playback_plan_json.to_string()))
         .bind(job_state_json.as_ref().map(|s| s.to_string()))
         .execute(&state.db_pool)
@@ -800,6 +900,9 @@ pub async fn play(
         episode_selection_reason,
         server_id: server_id.to_string(),
         wan_direct_endpoint,
+        stream_token_expires_at,
+        remote_access,
+        remote_policy,
         state: "active".to_string(),
         logical_position_seconds: start_position_seconds.unwrap_or(0) as f32,
     };
@@ -1396,6 +1499,476 @@ fn effective_playback_policy_from_config(
     derive_effective_playback_policy(client_profile, &server_policy, &network_policy)
 }
 
+#[derive(Debug, Clone)]
+struct PlaybackRequestTransport {
+    secure: bool,
+    policy: String,
+}
+
+fn playback_request_transport(headers: &HeaderMap) -> PlaybackRequestTransport {
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    let forwarded_header = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let forwarded_ssl = headers
+        .get("x-forwarded-ssl")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let forwarded_scheme = headers
+        .get("x-forwarded-scheme")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+
+    let secure = forwarded_proto.as_deref() == Some("https")
+        || forwarded_scheme.as_deref() == Some("https")
+        || forwarded_ssl.as_deref() == Some("on")
+        || forwarded_header
+            .as_deref()
+            .is_some_and(|value| value.contains("proto=https"));
+
+    PlaybackRequestTransport {
+        secure,
+        policy: if secure {
+            "https_or_forwarded_https".to_string()
+        } else {
+            "insecure_or_unreported".to_string()
+        },
+    }
+}
+
+fn enforce_remote_transport_policy(
+    settings: &crate::config::Settings,
+    network_class: NetworkClass,
+    transport: &PlaybackRequestTransport,
+) -> ApiResult<()> {
+    let remote_like = remote_policy_applies(network_class, None);
+    if remote_like
+        && settings.playback.remote_require_https
+        && !settings.playback.remote_allow_insecure
+        && matches!(&settings.environment, RunEnvironment::Production)
+        && !transport.secure
+    {
+        return Err(ApiError::conflict_code(
+            "remote_https_required",
+            "remote playback requires HTTPS",
+            serde_json::json!({
+                "network_class": network_class.as_str(),
+                "secure_connection_policy": "require_https",
+                "retry": {
+                    "allowed": true,
+                    "strategy": "use_https_or_configured_reverse_proxy"
+                }
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn validated_share_id(value: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 128
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+    {
+        return Err(ApiError::bad_request("invalid share_id"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn remote_policy_applies(network_class: NetworkClass, share_id: Option<&str>) -> bool {
+    share_id.is_some() || matches!(network_class, NetworkClass::Wan | NetworkClass::Unknown)
+}
+
+fn resolve_remote_playback_policy(
+    config: &crate::config::PlaybackConfig,
+    user_id: Uuid,
+    share_id: Option<&str>,
+    network_class: NetworkClass,
+) -> RemotePlaybackPolicySnapshot {
+    let applied = remote_policy_applies(network_class, share_id);
+    let mut policy = RemotePlaybackPolicySnapshot {
+        applied,
+        scope: if share_id.is_some() {
+            "share".to_string()
+        } else if applied {
+            "user".to_string()
+        } else {
+            "lan".to_string()
+        },
+        policy_sources: Vec::new(),
+        user_id: user_id.to_string(),
+        share_id: share_id.map(str::to_string),
+        max_remote_bitrate_bps: applied
+            .then_some(config.default_wan_max_bitrate_bps)
+            .flatten(),
+        max_resolution: None,
+        allow_downloads: true,
+        allow_direct_play: true,
+        allow_transcode: true,
+        allow_hardware_transcode: true,
+        max_sessions: None,
+        reasons: Vec::new(),
+    };
+
+    if applied {
+        policy
+            .policy_sources
+            .push("playback.default_wan_max_bitrate_bps".to_string());
+        apply_remote_policy_override(
+            &mut policy,
+            &config.default_remote_policy,
+            "playback.default_remote_policy",
+        );
+        if let Some(user_policy) = config.remote_user_policies.get(&user_id.to_string()) {
+            apply_remote_policy_override(&mut policy, user_policy, "playback.remote_user_policies");
+        }
+        if let Some(share_id) = share_id {
+            if let Some(share_policy) = config.remote_share_policies.get(share_id) {
+                apply_remote_policy_override(
+                    &mut policy,
+                    share_policy,
+                    "playback.remote_share_policies",
+                );
+            }
+        }
+    }
+
+    if policy.applied {
+        policy.reasons.push("remote_policy_applied".to_string());
+        policy
+            .reasons
+            .push(format!("remote_policy_scope_{}", policy.scope));
+        if policy
+            .max_remote_bitrate_bps
+            .filter(|value| *value > 0)
+            .is_some()
+        {
+            policy
+                .reasons
+                .push("remote_policy_max_bitrate_applied".to_string());
+        }
+        if policy.max_resolution.as_deref().is_some() {
+            policy
+                .reasons
+                .push("remote_policy_max_resolution_applied".to_string());
+        }
+        if !policy.allow_downloads {
+            policy
+                .reasons
+                .push("remote_policy_downloads_disabled".to_string());
+        }
+        if !policy.allow_direct_play {
+            policy
+                .reasons
+                .push("remote_policy_direct_play_disabled".to_string());
+        }
+        if !policy.allow_transcode {
+            policy
+                .reasons
+                .push("remote_policy_transcode_disabled".to_string());
+        }
+        if !policy.allow_hardware_transcode {
+            policy
+                .reasons
+                .push("remote_policy_hardware_transcode_disabled".to_string());
+        }
+        if policy.max_sessions.filter(|value| *value > 0).is_some() {
+            policy
+                .reasons
+                .push("remote_policy_session_limit_applied".to_string());
+        }
+    }
+
+    policy
+}
+
+fn apply_remote_policy_override(
+    policy: &mut RemotePlaybackPolicySnapshot,
+    override_policy: &crate::config::PlaybackRemotePolicyOverride,
+    source: &str,
+) {
+    let mut changed = false;
+    if let Some(value) = override_policy
+        .max_remote_bitrate_bps
+        .filter(|value| *value > 0)
+    {
+        policy.max_remote_bitrate_bps =
+            min_positive_i64_local(policy.max_remote_bitrate_bps, Some(value));
+        changed = true;
+    }
+    if let Some(value) = override_policy.max_resolution.as_ref() {
+        let value = value.trim();
+        if !value.is_empty() && !is_unlimited_resolution(value) {
+            policy.max_resolution = match policy.max_resolution.as_deref() {
+                Some(existing) => Some(min_resolution(existing, value)),
+                None => Some(value.to_string()),
+            };
+            changed = true;
+        }
+    }
+    if let Some(value) = override_policy.allow_downloads {
+        policy.allow_downloads = value;
+        changed = true;
+    }
+    if let Some(value) = override_policy.allow_direct_play {
+        policy.allow_direct_play = value;
+        changed = true;
+    }
+    if let Some(value) = override_policy.allow_transcode {
+        policy.allow_transcode = value;
+        changed = true;
+    }
+    if let Some(value) = override_policy.allow_hardware_transcode {
+        policy.allow_hardware_transcode = value;
+        changed = true;
+    }
+    if let Some(value) = override_policy.max_sessions.filter(|value| *value > 0) {
+        policy.max_sessions = policy
+            .max_sessions
+            .map(|existing| existing.min(value))
+            .or(Some(value));
+        changed = true;
+    }
+    if changed {
+        policy.policy_sources.push(source.to_string());
+    }
+}
+
+fn apply_remote_policy_to_effective_policy(
+    effective_policy: &mut EffectivePlaybackPolicy,
+    remote_policy: &RemotePlaybackPolicySnapshot,
+) {
+    if !remote_policy.applied {
+        return;
+    }
+
+    if let Some(value) = remote_policy
+        .max_remote_bitrate_bps
+        .filter(|value| *value > 0)
+    {
+        effective_policy.max_bitrate_bps =
+            min_positive_i64_local(effective_policy.max_bitrate_bps, Some(value));
+        effective_policy.max_remote_bitrate_bps =
+            min_positive_i64_local(effective_policy.max_remote_bitrate_bps, Some(value));
+    }
+    if let Some(value) = remote_policy.max_resolution.as_deref() {
+        effective_policy.max_resolution = match effective_policy.max_resolution.as_deref() {
+            Some(existing) => Some(min_resolution(existing, value)),
+            None => Some(value.to_string()),
+        };
+    }
+    if !remote_policy.allow_downloads || !remote_policy.allow_direct_play {
+        effective_policy.allow_direct_play = false;
+    }
+    if !remote_policy.allow_transcode {
+        effective_policy.allow_audio_transcode = false;
+        effective_policy.allow_video_transcode = false;
+        effective_policy.allow_adaptive_transcode = false;
+    }
+    if !remote_policy.allow_hardware_transcode {
+        effective_policy.hardware_acceleration = "off".to_string();
+        effective_policy.allow_hardware_decode = false;
+        effective_policy.allow_hardware_encode = false;
+    }
+}
+
+fn append_remote_policy_plan_reasons(
+    plan: &mut PlaybackPlan,
+    remote_policy: &RemotePlaybackPolicySnapshot,
+    transport: &PlaybackRequestTransport,
+    settings: &crate::config::Settings,
+) {
+    if !remote_policy.applied {
+        return;
+    }
+    for reason in &remote_policy.reasons {
+        push_plan_reason(plan, reason);
+    }
+    if settings.playback.remote_require_https {
+        push_plan_reason(plan, "remote_transport_https_required_by_policy");
+    }
+    if settings.playback.remote_allow_insecure {
+        push_plan_reason(plan, "remote_transport_insecure_allowed_by_policy");
+    } else if matches!(&settings.environment, RunEnvironment::Development) && !transport.secure {
+        push_plan_reason(plan, "remote_transport_insecure_allowed_in_development");
+    } else if transport.secure {
+        push_plan_reason(plan, "remote_transport_secure");
+    }
+}
+
+fn push_plan_reason(plan: &mut PlaybackPlan, reason: &str) {
+    if !plan.reasons.iter().any(|existing| existing == reason) {
+        plan.reasons.push(reason.to_string());
+    }
+    if let Some(feasibility) = plan.feasibility.as_mut() {
+        if !feasibility
+            .reasons
+            .iter()
+            .any(|existing| existing == reason)
+        {
+            feasibility.reasons.push(reason.to_string());
+        }
+    }
+}
+
+fn min_positive_i64_local(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a.filter(|value| *value > 0), b.filter(|value| *value > 0)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn stream_token_ttl_seconds(config: &crate::config::PlaybackConfig) -> u64 {
+    let requested = config.stream_token_ttl_seconds;
+    if requested == 0 {
+        return config.session_ttl_seconds.max(1);
+    }
+    requested.min(config.session_ttl_seconds).max(1)
+}
+
+fn stream_token_expiry(config: &crate::config::PlaybackConfig) -> (u64, String) {
+    let ttl = stream_token_ttl_seconds(config);
+    let duration =
+        chrono::Duration::from_std(Duration::from_secs(ttl)).unwrap_or(chrono::Duration::MAX);
+    let expires_at = chrono::Utc::now() + duration;
+    (ttl, expires_at.to_rfc3339())
+}
+
+async fn remote_access_contract(
+    state: &AppState,
+    server_id: &str,
+    token_ttl_seconds: u64,
+    token_expires_at: &str,
+    transport: &PlaybackRequestTransport,
+) -> RemoteAccessContract {
+    let endpoints = playback_endpoints(state, server_id).await;
+    RemoteAccessContract {
+        lan_direct_endpoint: endpoints.lan_direct_endpoint,
+        wan_direct_endpoint: endpoints.wan_direct_endpoint,
+        reverse_proxy_endpoint: state
+            .settings
+            .playback
+            .remote_reverse_proxy_endpoint
+            .clone(),
+        reverse_proxy_behavior:
+            "preserve_authorization_header_and_query_tokens; honor_x_forwarded_proto".to_string(),
+        https_required: state.settings.playback.remote_require_https,
+        secure_connection_policy: secure_connection_policy(&state.settings, transport),
+        request_transport: transport.policy.clone(),
+        token_ttl_seconds,
+        stream_token_expires_at: token_expires_at.to_string(),
+        session_revocation:
+            "ending, expiring, or token-expiring a session invalidates direct and HLS routes"
+                .to_string(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct PlaybackEndpoints {
+    lan_direct_endpoint: Option<String>,
+    wan_direct_endpoint: Option<String>,
+}
+
+async fn playback_endpoints(state: &AppState, server_id: &str) -> PlaybackEndpoints {
+    let registry_row = sqlx::query(
+        "SELECT lan_addresses, wan_direct_endpoint
+         FROM server_registry
+         WHERE server_id = ?
+         ORDER BY last_seen_at DESC
+         LIMIT 1",
+    )
+    .bind(server_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(row) = registry_row {
+        let lan_addresses: Option<String> = row.try_get("lan_addresses").ok();
+        let wan_direct_endpoint: Option<String> = row.try_get("wan_direct_endpoint").ok();
+        return PlaybackEndpoints {
+            lan_direct_endpoint: first_lan_endpoint(lan_addresses.as_deref())
+                .or_else(|| Some(configured_lan_endpoint(&state.settings))),
+            wan_direct_endpoint,
+        };
+    }
+
+    let instance_row = sqlx::query(
+        "SELECT lan_addresses, wan_direct_endpoint
+         FROM server_instances
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind(server_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(row) = instance_row {
+        let lan_addresses: Option<String> = row.try_get("lan_addresses").ok();
+        let wan_direct_endpoint: Option<String> = row.try_get("wan_direct_endpoint").ok();
+        return PlaybackEndpoints {
+            lan_direct_endpoint: first_lan_endpoint(lan_addresses.as_deref())
+                .or_else(|| Some(configured_lan_endpoint(&state.settings))),
+            wan_direct_endpoint,
+        };
+    }
+
+    PlaybackEndpoints {
+        lan_direct_endpoint: Some(configured_lan_endpoint(&state.settings)),
+        wan_direct_endpoint: None,
+    }
+}
+
+fn first_lan_endpoint(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .and_then(|values| values.into_iter().find(|value| !value.trim().is_empty()))
+}
+
+fn configured_lan_endpoint(settings: &crate::config::Settings) -> String {
+    let host = if settings.server.host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        settings.server.host.as_str()
+    };
+    format!("{host}:{}", settings.server.port)
+}
+
+fn secure_connection_policy(
+    settings: &crate::config::Settings,
+    transport: &PlaybackRequestTransport,
+) -> String {
+    if settings.playback.remote_allow_insecure {
+        "allow_insecure_remote".to_string()
+    } else if settings.playback.remote_require_https
+        && matches!(&settings.environment, RunEnvironment::Production)
+    {
+        "require_https".to_string()
+    } else if settings.playback.remote_require_https && transport.secure {
+        "https_satisfied".to_string()
+    } else if settings.playback.remote_require_https {
+        "https_required_for_production_development_insecure_allowed".to_string()
+    } else {
+        "https_optional".to_string()
+    }
+}
+
 fn hardware_metric_label(plan: &HardwareAccelerationPlan) -> &'static str {
     match (plan.decoder.is_some(), plan.encoder.is_some()) {
         (true, true) => "hardware_decode_encode",
@@ -1738,6 +2311,104 @@ async fn enforce_playback_capacity_before_start(
     )))
 }
 
+async fn enforce_remote_policy_session_limit(
+    state: &AppState,
+    remote_policy: &RemotePlaybackPolicySnapshot,
+    playback_plan: &PlaybackPlan,
+    client_kind: &str,
+    network_kind: &str,
+) -> ApiResult<Option<ApiError>> {
+    let Some(limit) = remote_policy.max_sessions.filter(|value| *value > 0) else {
+        return Ok(None);
+    };
+    if !remote_policy.applied {
+        return Ok(None);
+    }
+
+    let (resource, observed) = if let Some(share_id) = remote_policy.share_id.as_deref() {
+        let count = active_share_playback_session_count(state, share_id).await?;
+        ("remote_share_sessions", count)
+    } else {
+        let count = active_user_playback_session_count(state, &remote_policy.user_id).await?;
+        ("remote_user_sessions", count)
+    };
+
+    if observed < u64::from(limit) {
+        return Ok(None);
+    }
+
+    let hardware = hardware_metric_label(&playback_plan.hardware_acceleration);
+    PLAYBACK_CAPACITY_REJECTIONS
+        .with_label_values(&[
+            resource,
+            playback_plan.mode.as_str(),
+            playback_plan.delivery.as_str(),
+            client_kind,
+            network_kind,
+            "transcode_capacity_exhausted",
+        ])
+        .inc();
+    record_playback_error_labels(
+        playback_plan.mode.as_str(),
+        playback_plan.delivery.as_str(),
+        client_kind,
+        network_kind,
+        "transcode_capacity_exhausted",
+        hardware,
+    );
+
+    Ok(Some(ApiError::conflict_code(
+        "transcode_capacity_exhausted",
+        format!("remote playback capacity exhausted: {resource}"),
+        serde_json::json!({
+            "capacity": {
+                "resource": resource,
+                "limit": limit,
+                "observed": observed,
+                "requested": 1
+            },
+            "remote_policy": remote_policy,
+            "plan_summary": playback_plan_summary(playback_plan),
+            "retry": {
+                "allowed": true,
+                "strategy": "end_existing_remote_session_then_retry"
+            }
+        }),
+    )))
+}
+
+async fn active_user_playback_session_count(state: &AppState, user_id: &str) -> ApiResult<u64> {
+    let count: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT CAST(COUNT(*) AS TEXT)
+         FROM playback_sessions
+         WHERE state = 'active' AND user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(count
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
+async fn active_share_playback_session_count(state: &AppState, share_id: &str) -> ApiResult<u64> {
+    let count: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT CAST(COUNT(*) AS TEXT)
+         FROM playback_sessions
+         WHERE state = 'active' AND share_id = ?",
+    )
+    .bind(share_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(count
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
 async fn playback_capacity_snapshot(
     state: &AppState,
     user: &CurrentUser,
@@ -2017,6 +2688,18 @@ fn playback_capacity_violation_details(
             "server_recovery_required": true,
             "automatic_client_retry": false
         }
+    })
+}
+
+fn playback_plan_summary(playback_plan: &PlaybackPlan) -> Value {
+    let plan_value = serde_json::to_value(playback_plan).ok();
+    plan_summary_from_plan(plan_value.as_ref(), None).unwrap_or_else(|| {
+        serde_json::json!({
+            "mode": playback_plan.mode.as_str(),
+            "delivery": playback_plan.delivery.as_str(),
+            "playable": playback_plan.playable,
+            "reasons": playback_plan.reasons.clone(),
+        })
     })
 }
 
@@ -2939,6 +3622,7 @@ pub async fn stream_direct(
         session_token,
     )
     .await?;
+    enforce_stream_route_remote_policy(&session_row, StreamRoutePolicyKind::DirectFile)?;
     let session_media_file_id: String = session_row.get("media_file_id");
     if session_media_file_id != id {
         tracing::warn!(
@@ -3032,6 +3716,7 @@ pub async fn stream_subtitle(
         session_token,
     )
     .await?;
+    enforce_stream_route_remote_policy(&session_row, StreamRoutePolicyKind::DirectFile)?;
     let session_media_file_id: String = session_row.get("media_file_id");
     if session_media_file_id != id {
         tracing::warn!(
@@ -3126,6 +3811,7 @@ pub async fn master_playlist(
         session_token,
     )
     .await?;
+    enforce_stream_route_remote_policy(&session_row, StreamRoutePolicyKind::Hls)?;
     touch_playback_session(&state, &id, PlaybackActivityKind::HlsMasterPlaylist).await?;
     let media_file_id: String = session_row.get("media_file_id");
     let transcode_state: Option<String> = session_row.try_get("transcode_state").ok();
@@ -3300,7 +3986,7 @@ pub async fn serve_segment(
         .session
         .as_deref()
         .ok_or_else(|| ApiError::unauthorized("session token required"))?;
-    let _session_row = get_session_with_token(
+    let session_row = get_session_with_token(
         &state,
         &user,
         &session_id.to_string(),
@@ -3308,6 +3994,7 @@ pub async fn serve_segment(
         session_token,
     )
     .await?;
+    enforce_stream_route_remote_policy(&session_row, StreamRoutePolicyKind::Hls)?;
     let artifact = state
         .transcodes
         .artifact_path(session_id, &segment)
@@ -3465,6 +4152,9 @@ pub struct SessionDetailResponse {
     pub decision_reason: Option<String>,
     pub decision_reasons: Vec<String>,
     pub wan_direct_endpoint: Option<String>,
+    pub stream_token_expires_at: Option<String>,
+    pub remote_access: Option<RemoteAccessContract>,
+    pub remote_policy: Option<RemotePlaybackPolicySnapshot>,
     pub playback_plan: Option<serde_json::Value>,
     pub plan_summary: Option<serde_json::Value>,
     pub job_snapshot: Option<serde_json::Value>,
@@ -3578,7 +4268,7 @@ async fn get_session(
     expected_mode: Option<&str>,
     require_active: bool,
 ) -> ApiResult<AnyRow> {
-    let row = sqlx::query("SELECT id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, transcode_state, playback_plan_json, job_state_json, token, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
+    let row = sqlx::query("SELECT id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, transcode_state, playback_plan_json, job_state_json, token, CAST(token_expires_at AS TEXT) as token_expires_at, share_id, remote_policy_json, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
         .bind(session_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -3613,10 +4303,19 @@ async fn get_session(
 }
 
 async fn expire_active_playback_session(state: &AppState, session_id: &str) -> ApiResult<()> {
+    expire_active_playback_session_with_reason(state, session_id, "ttl", "session_expired").await
+}
+
+async fn expire_active_playback_session_with_reason(
+    state: &AppState,
+    session_id: &str,
+    metric_reason: &'static str,
+    stop_reason: &'static str,
+) -> ApiResult<()> {
     if let Ok(id) = Uuid::parse_str(session_id) {
-        state.transcodes.stop(id, "session_expired").await;
+        state.transcodes.stop(id, stop_reason).await;
         PLAYBACK_SESSION_EXPIRATIONS
-            .with_label_values(&["ttl"])
+            .with_label_values(&[metric_reason])
             .inc();
     }
     sqlx::query::<sqlx::Any>(
@@ -3629,6 +4328,20 @@ async fn expire_active_playback_session(state: &AppState, session_id: &str) -> A
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(())
+}
+
+fn playback_stream_token_expired(row: &AnyRow) -> bool {
+    let Ok(expires_at) = row.try_get::<String, _>("token_expires_at") else {
+        return false;
+    };
+    let trimmed = expires_at.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(expires_at) = parse_playback_session_timestamp(trimmed) else {
+        return false;
+    };
+    chrono::Utc::now() > expires_at
 }
 
 fn playback_session_expired(row: &AnyRow, ttl_seconds: u64) -> bool {
@@ -3821,7 +4534,87 @@ async fn get_session_with_token(
             return Err(ApiError::unauthorized("invalid session"));
         }
     }
+    if playback_stream_token_expired(&row) {
+        expire_active_playback_session_with_reason(
+            state,
+            session_id,
+            "stream_token",
+            "stream_token_expired",
+        )
+        .await?;
+        return Err(ApiError::unauthorized("invalid session"));
+    }
     Ok(row)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamRoutePolicyKind {
+    DirectFile,
+    Hls,
+}
+
+fn enforce_stream_route_remote_policy(
+    row: &AnyRow,
+    route_kind: StreamRoutePolicyKind,
+) -> ApiResult<()> {
+    let Some(policy) = remote_policy_snapshot_from_session(row) else {
+        return Ok(());
+    };
+    if !policy.applied {
+        return Ok(());
+    }
+
+    let mode = row
+        .try_get::<String, _>("mode")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match route_kind {
+        StreamRoutePolicyKind::DirectFile => {
+            if !policy.allow_downloads || !policy.allow_direct_play || mode != "direct_play" {
+                return Err(ApiError::unauthorized("invalid session"));
+            }
+        }
+        StreamRoutePolicyKind::Hls => {
+            if !policy.allow_transcode && session_mode_is_transcode(&mode) {
+                return Err(ApiError::unauthorized("invalid session"));
+            }
+            if !policy.allow_hardware_transcode && session_plan_uses_hardware(row) {
+                return Err(ApiError::unauthorized("invalid session"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn remote_policy_snapshot_from_session(row: &AnyRow) -> Option<RemotePlaybackPolicySnapshot> {
+    row.try_get::<String, _>("remote_policy_json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<RemotePlaybackPolicySnapshot>(&raw).ok())
+}
+
+fn session_mode_is_transcode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "transcode"
+            | "audio_transcode"
+            | "subtitle_transcode"
+            | "video_transcode"
+            | "adaptive_transcode"
+    )
+}
+
+fn session_plan_uses_hardware(row: &AnyRow) -> bool {
+    row.try_get::<String, _>("playback_plan_json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("hardware_acceleration")
+                .and_then(|hardware| hardware.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn rewrite_playlist_with_token(
@@ -4583,6 +5376,11 @@ pub async fn session_detail(
     let decision_reason = decision_reason_from_plan(playback_plan.as_ref());
     let decision_reasons = decision_reasons_from_plan(playback_plan.as_ref());
     let ffmpeg_log_tail = ffmpeg_log_tail_from_state(job_state.as_ref(), transcode_state.as_ref());
+    let remote_access = playback_plan
+        .as_ref()
+        .and_then(|plan| plan.get("remote_access").cloned())
+        .and_then(|value| serde_json::from_value::<RemoteAccessContract>(value).ok());
+    let remote_policy = remote_policy_snapshot_from_session(&session);
 
     let logical_position_seconds = session
         .try_get::<f64, _>("logical_position_seconds")
@@ -4615,6 +5413,9 @@ pub async fn session_detail(
         decision_reason,
         decision_reasons,
         wan_direct_endpoint,
+        stream_token_expires_at: session.try_get("token_expires_at").ok(),
+        remote_access,
+        remote_policy,
         playback_plan,
         plan_summary,
         job_snapshot,

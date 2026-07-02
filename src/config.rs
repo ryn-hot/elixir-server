@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -213,6 +213,13 @@ impl Settings {
                 "playback.default_lan_max_bitrate_bps",
                 default_lan_bitrate_bps(),
             )?
+            .set_default(
+                "playback.stream_token_ttl_seconds",
+                default_stream_token_ttl_seconds(),
+            )?
+            .set_default("playback.remote_require_https", default_true())?
+            .set_default("playback.remote_allow_insecure", default_false())?
+            .set_default("playback.remote_reverse_proxy_endpoint", None::<String>)?
             .set_default("playback.allow_direct_play", default_true())?
             .set_default("playback.allow_direct_stream", default_true())?
             .set_default("playback.allow_audio_transcode", default_true())?
@@ -707,6 +714,20 @@ pub struct PlaybackConfig {
     pub default_wan_max_bitrate_bps: Option<i64>,
     #[serde(default = "default_lan_bitrate_bps")]
     pub default_lan_max_bitrate_bps: Option<i64>,
+    #[serde(default = "default_stream_token_ttl_seconds")]
+    pub stream_token_ttl_seconds: u64,
+    #[serde(default = "default_true")]
+    pub remote_require_https: bool,
+    #[serde(default = "default_false")]
+    pub remote_allow_insecure: bool,
+    #[serde(default)]
+    pub remote_reverse_proxy_endpoint: Option<String>,
+    #[serde(default)]
+    pub default_remote_policy: PlaybackRemotePolicyOverride,
+    #[serde(default)]
+    pub remote_user_policies: HashMap<String, PlaybackRemotePolicyOverride>,
+    #[serde(default)]
+    pub remote_share_policies: HashMap<String, PlaybackRemotePolicyOverride>,
     #[serde(default = "default_true")]
     pub allow_direct_play: bool,
     #[serde(default = "default_true")]
@@ -796,6 +817,13 @@ impl Default for PlaybackConfig {
             default_supported_audio_codecs: default_supported_audio_codecs(),
             default_wan_max_bitrate_bps: default_wan_bitrate_bps(),
             default_lan_max_bitrate_bps: default_lan_bitrate_bps(),
+            stream_token_ttl_seconds: default_stream_token_ttl_seconds(),
+            remote_require_https: default_true(),
+            remote_allow_insecure: default_false(),
+            remote_reverse_proxy_endpoint: None,
+            default_remote_policy: PlaybackRemotePolicyOverride::default(),
+            remote_user_policies: HashMap::new(),
+            remote_share_policies: HashMap::new(),
             allow_direct_play: default_true(),
             allow_direct_stream: default_true(),
             allow_audio_transcode: default_true(),
@@ -843,6 +871,17 @@ impl PlaybackConfig {
         self.max_active_video_transcodes
             .or(self.max_simultaneous_video_transcodes)
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct PlaybackRemotePolicyOverride {
+    pub max_remote_bitrate_bps: Option<i64>,
+    pub max_resolution: Option<String>,
+    pub allow_downloads: Option<bool>,
+    pub allow_direct_play: Option<bool>,
+    pub allow_transcode: Option<bool>,
+    pub allow_hardware_transcode: Option<bool>,
+    pub max_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1014,6 +1053,10 @@ fn default_anizip_base_url() -> String {
 
 fn default_session_ttl_seconds() -> u64 {
     60 * 60 * 6 // 6 hours
+}
+
+fn default_stream_token_ttl_seconds() -> u64 {
+    60 * 60 * 6 // Bounded to normal playback session lifetime by the handler.
 }
 
 fn default_cleanup_interval_seconds() -> u64 {

@@ -228,3 +228,33 @@ async fn migrations_create_playback_performance_envelope_table() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn migrations_create_remote_playback_policy_session_columns() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+
+    let database = Database::connect(&config).await?;
+    database.run_migrations().await?;
+
+    let applied_versions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 49")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(applied_versions, 1);
+
+    for column in ["token_expires_at", "share_id", "remote_policy_json"] {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('playback_sessions') WHERE name = ?",
+        )
+        .bind(column)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(count, 1, "missing playback_sessions.{column}");
+    }
+
+    Ok(())
+}

@@ -36,8 +36,8 @@ use crate::{
     artwork::ArtworkService,
     auth::AuthService,
     config::{
-        AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, RunEnvironment, SecretsConfig,
-        ServerConfig, Settings, TelemetryConfig,
+        AuthConfig, ClassifierConfig, DatabaseConfig, LibraryConfig, PlaybackRemotePolicyOverride,
+        RunEnvironment, SecretsConfig, ServerConfig, Settings, TelemetryConfig,
     },
     db::Database,
     db::models::{
@@ -110,8 +110,9 @@ async fn seed_test_media_probe(
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as i64);
+    let probe_version = crate::playback::probe::MEDIA_CAPABILITIES_PROBE_VERSION;
     let normalized = json!({
-        "probe_version": 1,
+        "probe_version": probe_version,
         "ffprobe_version": "test-fixture",
         "probe_status": "ok",
         "probe_error": null,
@@ -178,9 +179,10 @@ async fn seed_test_media_probe(
             (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
              source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
              created_at, updated_at)
-         VALUES (?, 1, 'test-fixture', 'ok', CURRENT_TIMESTAMP, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES (?, ?, 'test-fixture', 'ok', CURRENT_TIMESTAMP, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_file_id)
+    .bind(probe_version)
     .bind(source_mtime_ms)
     .bind(source_size_bytes)
     .bind(normalized.to_string())
@@ -194,6 +196,7 @@ struct PlaybackRouteFixture {
     app: Router,
     state: AppState,
     token: String,
+    user_id: String,
     item_id: String,
     media_file_id: String,
     _dir: TempDir,
@@ -201,6 +204,31 @@ struct PlaybackRouteFixture {
 
 async fn setup_playback_route_fixture(
     settings: Settings,
+    file_name: &str,
+    container: &str,
+    video_codec: &str,
+    audio_codec: &str,
+    width: i32,
+    height: i32,
+    bitrate_bps: i64,
+) -> Result<PlaybackRouteFixture> {
+    setup_playback_route_fixture_with_user(
+        settings,
+        Uuid::new_v4(),
+        file_name,
+        container,
+        video_codec,
+        audio_codec,
+        width,
+        height,
+        bitrate_bps,
+    )
+    .await
+}
+
+async fn setup_playback_route_fixture_with_user(
+    settings: Settings,
+    user_id: Uuid,
     file_name: &str,
     container: &str,
     video_codec: &str,
@@ -255,7 +283,6 @@ async fn setup_playback_route_fixture(
     };
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
-    let user_id = Uuid::new_v4();
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
         .bind(user_id.to_string())
         .bind(format!("phase13-{}@example.com", Uuid::new_v4()))
@@ -291,10 +318,29 @@ async fn setup_playback_route_fixture(
         app,
         state,
         token,
+        user_id: user_id.to_string(),
         item_id,
         media_file_id,
         _dir: dir,
     })
+}
+
+async fn play_fixture_json(fixture: &PlaybackRouteFixture, body: Value) -> Result<Value> {
+    let resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::OK, "body: {}", json);
+    Ok(json)
 }
 
 fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
@@ -11368,6 +11414,672 @@ async fn direct_stream_supports_range() -> Result<()> {
 }
 
 #[tokio::test]
+async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_policy_bypass()
+-> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase22-direct-route-security".to_string();
+    settings.playback.stream_token_ttl_seconds = 60;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase22.Direct.Route.Security.mp4",
+        "mp4",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+
+    let play_body = || {
+        json!({
+            "media_item_id": fixture.item_id,
+            "preferred_file_id": fixture.media_file_id,
+            "network_type": "wan",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "native_mpv",
+                "direct_play_preferred": true,
+                "supported_containers": ["mp4", "mkv"],
+                "supported_video_codecs": ["h264"],
+                "supported_audio_codecs": ["aac"],
+                "quality_mode": "original",
+                "supports_auth_headers_for_media": true
+            }
+        })
+    };
+
+    let play_json = play_fixture_json(&fixture, play_body()).await?;
+    assert_eq!(
+        play_json.get("mode").and_then(Value::as_str),
+        Some("direct_play")
+    );
+    let stream_url = play_json
+        .get("streamUrl")
+        .or_else(|| play_json.get("stream_url"))
+        .and_then(Value::as_str)
+        .expect("stream_url")
+        .to_string();
+    let session_id = play_json
+        .get("sessionId")
+        .or_else(|| play_json.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("session_id")
+        .to_string();
+    let media_file_id = play_json
+        .get("mediaFileId")
+        .or_else(|| play_json.get("media_file_id"))
+        .and_then(Value::as_str)
+        .expect("media_file_id");
+    assert!(
+        play_json
+            .get("decision_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("remote_policy_applied"))),
+        "expected remote policy reason: {play_json}"
+    );
+    assert!(
+        play_json
+            .get("remote_access")
+            .and_then(|value| value.get("stream_token_expires_at"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "remote access contract should expose token expiry: {play_json}"
+    );
+
+    let other_user_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        .bind(other_user_id.to_string())
+        .bind("phase22-direct-other@example.com")
+        .bind("hashed")
+        .execute(&fixture.state.db_pool)
+        .await?;
+    let other_token = fixture
+        .state
+        .auth_service
+        .issue_access_token(other_user_id)?
+        .token;
+
+    let cross_user_range_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(&stream_url)
+                .header("authorization", format!("Bearer {other_token}"))
+                .header("range", "bytes=0-3")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(cross_user_range_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let mismatched_url = stream_url.replacen(media_file_id, &Uuid::new_v4().to_string(), 1);
+    let mismatched_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(&mismatched_url)
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(mismatched_resp.status(), StatusCode::UNAUTHORIZED);
+
+    sqlx::query(
+        "UPDATE playback_sessions SET token_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+    )
+    .bind(&session_id)
+    .execute(&fixture.state.db_pool)
+    .await?;
+    let expired_token_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(&stream_url)
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(expired_token_resp.status(), StatusCode::UNAUTHORIZED);
+    let expired_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ? LIMIT 1")
+            .bind(&session_id)
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(expired_state, "ended");
+
+    let revoked_json = play_fixture_json(&fixture, play_body()).await?;
+    let revoked_stream_url = revoked_json
+        .get("streamUrl")
+        .or_else(|| revoked_json.get("stream_url"))
+        .and_then(Value::as_str)
+        .expect("stream_url");
+    let revoked_session_id = revoked_json
+        .get("sessionId")
+        .or_else(|| revoked_json.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("session_id");
+    let end_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{revoked_session_id}/end"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
+    let revoked_stream_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(revoked_stream_url)
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(revoked_stream_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let share_json = play_fixture_json(&fixture, play_body()).await?;
+    let share_stream_url = share_json
+        .get("streamUrl")
+        .or_else(|| share_json.get("stream_url"))
+        .and_then(Value::as_str)
+        .expect("stream_url");
+    let share_session_id = share_json
+        .get("sessionId")
+        .or_else(|| share_json.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("session_id");
+    let deny_direct_policy = json!({
+        "applied": true,
+        "scope": "share",
+        "policy_sources": ["phase22-test"],
+        "user_id": fixture.user_id,
+        "share_id": "phase22-no-downloads",
+        "allow_downloads": false,
+        "allow_direct_play": false,
+        "allow_transcode": true,
+        "allow_hardware_transcode": true,
+        "reasons": ["remote_policy_downloads_disabled", "remote_policy_direct_play_disabled"]
+    });
+    sqlx::query("UPDATE playback_sessions SET share_id = ?, remote_policy_json = ? WHERE id = ?")
+        .bind("phase22-no-downloads")
+        .bind(deny_direct_policy.to_string())
+        .bind(share_session_id)
+        .execute(&fixture.state.db_pool)
+        .await?;
+    let share_policy_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(share_stream_url)
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(share_policy_resp.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase22_wan_policy_selects_direct_stream_fixed_and_adaptive_modes() -> Result<()> {
+    let remote_user_id = Uuid::new_v4();
+    let mut direct_settings = test_settings_with_db();
+    direct_settings.auth.access_token_secret = "phase22-direct-mode".to_string();
+    direct_settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    direct_settings.playback.remote_user_policies.insert(
+        remote_user_id.to_string(),
+        PlaybackRemotePolicyOverride {
+            max_remote_bitrate_bps: Some(6_000_000),
+            max_resolution: Some("1080p".to_string()),
+            allow_hardware_transcode: Some(false),
+            max_sessions: Some(4),
+            ..PlaybackRemotePolicyOverride::default()
+        },
+    );
+    let direct_fixture = setup_playback_route_fixture_with_user(
+        direct_settings,
+        remote_user_id,
+        "Phase22.Direct.Mode.mp4",
+        "mp4",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let direct_json = play_fixture_json(
+        &direct_fixture,
+        json!({
+            "media_item_id": direct_fixture.item_id,
+            "preferred_file_id": direct_fixture.media_file_id,
+            "network_type": "wan",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "web",
+                "direct_play_preferred": true,
+                "supported_containers": ["mp4"],
+                "supported_video_codecs": ["h264"],
+                "supported_audio_codecs": ["aac"],
+                "supported_hls_segment_types": ["fmp4"],
+                "quality_mode": "fixed",
+                "fixed_bitrate_bps": 8_000_000,
+                "fixed_resolution": "1080p",
+                "supports_auth_headers_for_media": true
+            }
+        }),
+    )
+    .await?;
+    assert_phase22_remote_play_response(
+        &direct_json,
+        "direct_play",
+        "playback.remote_user_policies",
+    );
+    assert!(
+        direct_json
+            .get("decision_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| {
+                reasons.iter().any(|reason| {
+                    reason.as_str() == Some("remote_policy_hardware_transcode_disabled")
+                })
+            }),
+        "hardware transcode policy should be explicit: {direct_json}"
+    );
+
+    let mut direct_stream_settings = test_settings_with_db();
+    direct_stream_settings.auth.access_token_secret = "phase22-direct-stream-mode".to_string();
+    direct_stream_settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    direct_stream_settings
+        .playback
+        .remote_share_policies
+        .insert(
+            "phase22-share-stream".to_string(),
+            PlaybackRemotePolicyOverride {
+                max_remote_bitrate_bps: Some(6_000_000),
+                allow_downloads: Some(false),
+                allow_direct_play: Some(false),
+                ..PlaybackRemotePolicyOverride::default()
+            },
+        );
+    let direct_stream_fixture = setup_playback_route_fixture(
+        direct_stream_settings,
+        "Phase22.Direct.Stream.Mode.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let direct_stream_json = play_fixture_json(
+        &direct_stream_fixture,
+        json!({
+            "media_item_id": direct_stream_fixture.item_id,
+            "preferred_file_id": direct_stream_fixture.media_file_id,
+            "network_type": "wan",
+            "share_id": "phase22-share-stream",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "web",
+                "direct_play_preferred": true,
+                "supported_containers": ["mp4"],
+                "supported_video_codecs": ["h264"],
+                "supported_audio_codecs": ["aac"],
+                "supported_hls_segment_types": ["fmp4"],
+                "quality_mode": "fixed",
+                "fixed_bitrate_bps": 8_000_000,
+                "fixed_resolution": "1080p",
+                "supports_auth_headers_for_media": true
+            }
+        }),
+    )
+    .await?;
+    assert_phase22_remote_play_response(
+        &direct_stream_json,
+        "direct_stream",
+        "playback.remote_share_policies",
+    );
+    assert!(
+        direct_stream_json
+            .get("decision_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("remote_policy_downloads_disabled"))),
+        "share no-downloads policy should be explicit: {direct_stream_json}"
+    );
+
+    let mut fixed_settings = test_settings_with_db();
+    fixed_settings.auth.access_token_secret = "phase22-fixed-mode".to_string();
+    fixed_settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    fixed_settings.playback.default_wan_max_bitrate_bps = Some(3_000_000);
+    fixed_settings.playback.default_remote_policy.max_resolution = Some("720p".to_string());
+    let fixed_fixture = setup_playback_route_fixture(
+        fixed_settings,
+        "Phase22.Fixed.Transcode.Mode.mkv",
+        "mkv",
+        "hevc",
+        "aac",
+        1920,
+        1080,
+        8_000_000,
+    )
+    .await?;
+    let fixed_json = play_fixture_json(
+        &fixed_fixture,
+        json!({
+            "media_item_id": fixed_fixture.item_id,
+            "preferred_file_id": fixed_fixture.media_file_id,
+            "network_type": "wan",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "mobile",
+                "direct_play_preferred": false,
+                "supported_containers": ["mp4"],
+                "supported_video_codecs": ["h264"],
+                "supported_audio_codecs": ["aac"],
+                "supported_hls_segment_types": ["fmp4"],
+                "quality_mode": "fixed",
+                "fixed_bitrate_bps": 3_000_000,
+                "fixed_resolution": "720p",
+                "max_bitrate_bps": 3_000_000,
+                "max_resolution": "720p"
+            }
+        }),
+    )
+    .await?;
+    assert_phase22_remote_play_response(
+        &fixed_json,
+        "video_transcode",
+        "playback.default_wan_max_bitrate_bps",
+    );
+    assert!(
+        fixed_json
+            .get("decision_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("remote_policy_max_resolution_applied"))),
+        "remote max-resolution policy should be explicit: {fixed_json}"
+    );
+
+    let mut adaptive_settings = test_settings_with_db();
+    adaptive_settings.auth.access_token_secret = "phase22-adaptive-mode".to_string();
+    adaptive_settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    adaptive_settings.playback.default_wan_max_bitrate_bps = Some(4_000_000);
+    adaptive_settings.playback.allow_adaptive_transcode = true;
+    adaptive_settings.playback.adaptive_quality_enabled = true;
+    let adaptive_fixture = setup_playback_route_fixture(
+        adaptive_settings,
+        "Phase22.Adaptive.Transcode.Mode.mkv",
+        "mkv",
+        "hevc",
+        "aac",
+        1920,
+        1080,
+        8_000_000,
+    )
+    .await?;
+    let adaptive_json = play_fixture_json(
+        &adaptive_fixture,
+        json!({
+            "media_item_id": adaptive_fixture.item_id,
+            "preferred_file_id": adaptive_fixture.media_file_id,
+            "network_type": "wan",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "web",
+                "direct_play_preferred": false,
+                "supported_containers": ["mp4"],
+                "supported_video_codecs": ["h264"],
+                "supported_audio_codecs": ["aac"],
+                "supported_hls_segment_types": ["fmp4"],
+                "quality_mode": "automatic",
+                "automatic_min_bitrate_bps": 800_000,
+                "automatic_max_bitrate_bps": 4_000_000,
+                "automatic_min_resolution": "360p",
+                "automatic_max_resolution": "1080p",
+                "abr_support_type": "hls.js"
+            }
+        }),
+    )
+    .await?;
+    assert_phase22_remote_play_response(
+        &adaptive_json,
+        "adaptive_transcode",
+        "playback.default_wan_max_bitrate_bps",
+    );
+    assert_eq!(
+        adaptive_json.get("adaptive").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let mut limit_settings = test_settings_with_db();
+    limit_settings.auth.access_token_secret = "phase22-session-limit".to_string();
+    limit_settings.playback.default_remote_policy.max_sessions = Some(1);
+    let limit_fixture = setup_playback_route_fixture(
+        limit_settings,
+        "Phase22.Session.Limit.Mode.mp4",
+        "mp4",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let limit_body = json!({
+        "media_item_id": limit_fixture.item_id,
+        "preferred_file_id": limit_fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "web",
+            "direct_play_preferred": true,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supported_hls_segment_types": ["fmp4"],
+            "quality_mode": "fixed",
+            "fixed_bitrate_bps": 5_000_000,
+            "fixed_resolution": "720p"
+        }
+    });
+    let first_limit_json = play_fixture_json(&limit_fixture, limit_body.clone()).await?;
+    assert_phase22_remote_play_response(
+        &first_limit_json,
+        "direct_play",
+        "playback.default_remote_policy",
+    );
+    let second_limit_resp = limit_fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", limit_fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(limit_body.to_string()))?,
+        )
+        .await?;
+    let second_limit_status = second_limit_resp.status();
+    let second_limit_bytes = body::to_bytes(second_limit_resp.into_body(), 1_048_576).await?;
+    let second_limit_json: Value = serde_json::from_slice(&second_limit_bytes)?;
+    assert_eq!(
+        second_limit_status,
+        StatusCode::CONFLICT,
+        "body: {second_limit_json}"
+    );
+    assert_eq!(
+        second_limit_json.get("code").and_then(Value::as_str),
+        Some("transcode_capacity_exhausted")
+    );
+    assert_eq!(
+        second_limit_json
+            .pointer("/details/capacity/resource")
+            .and_then(Value::as_str),
+        Some("remote_user_sessions")
+    );
+
+    Ok(())
+}
+
+fn assert_phase22_remote_play_response(json: &Value, mode: &str, policy_source: &str) {
+    assert_eq!(
+        json.get("mode").and_then(Value::as_str),
+        Some(mode),
+        "{json}"
+    );
+    let reasons = json
+        .get("decision_reasons")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing decision_reasons: {json}"));
+    for expected in [
+        "remote_policy_applied",
+        "remote_policy_max_bitrate_applied",
+        "remote_transport_https_required_by_policy",
+    ] {
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some(expected)),
+            "missing reason {expected}: {json}"
+        );
+    }
+    let sources = json
+        .get("remote_policy")
+        .and_then(|value| value.get("policy_sources"))
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing policy sources: {json}"));
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.as_str() == Some(policy_source)),
+        "missing policy source {policy_source}: {json}"
+    );
+    assert!(
+        json.get("remote_access")
+            .and_then(|value| value.get("lan_direct_endpoint"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "missing LAN endpoint contract: {json}"
+    );
+    assert!(
+        json.get("stream_token_expires_at")
+            .and_then(Value::as_str)
+            .is_some(),
+        "missing token expiry: {json}"
+    );
+}
+
+#[tokio::test]
+async fn phase22_remote_smoke_requires_tls_and_accepts_reverse_proxy_forwarding() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.environment = RunEnvironment::Production;
+    settings.auth.access_token_secret = "phase22-remote-smoke".to_string();
+    settings.playback.plan_contract_enabled = true;
+    settings.playback.remote_require_https = true;
+    settings.playback.remote_allow_insecure = false;
+    settings.playback.remote_reverse_proxy_endpoint =
+        Some("https://media.example.test".to_string());
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase22.Remote.Proxy.Smoke.mp4",
+        "mp4",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+
+    let play_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "web",
+            "direct_play_preferred": true,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supported_hls_segment_types": ["fmp4"],
+            "quality_mode": "fixed",
+            "fixed_bitrate_bps": 5_000_000,
+            "fixed_resolution": "720p",
+            "supports_auth_headers_for_media": true
+        }
+    });
+
+    let insecure_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let insecure_status = insecure_resp.status();
+    let insecure_bytes = body::to_bytes(insecure_resp.into_body(), 1_048_576).await?;
+    let insecure_json: Value = serde_json::from_slice(&insecure_bytes)?;
+    assert_eq!(
+        insecure_status,
+        StatusCode::CONFLICT,
+        "body: {insecure_json}"
+    );
+    assert_eq!(
+        insecure_json.get("code").and_then(Value::as_str),
+        Some("remote_https_required")
+    );
+
+    let forwarded_tls_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-host", "media.example.test")
+                .body(Body::from(play_body.to_string()))?,
+        )
+        .await?;
+    let forwarded_status = forwarded_tls_resp.status();
+    let forwarded_bytes = body::to_bytes(forwarded_tls_resp.into_body(), 1_048_576).await?;
+    let forwarded_json: Value = serde_json::from_slice(&forwarded_bytes)?;
+    assert_eq!(forwarded_status, StatusCode::OK, "body: {forwarded_json}");
+    assert_eq!(
+        forwarded_json
+            .pointer("/remote_access/reverse_proxy_endpoint")
+            .and_then(Value::as_str),
+        Some("https://media.example.test")
+    );
+    assert_eq!(
+        forwarded_json
+            .pointer("/remote_access/request_transport")
+            .and_then(Value::as_str),
+        Some("https_or_forwarded_https")
+    );
+    assert_eq!(
+        forwarded_json
+            .pointer("/remote_access/secure_connection_policy")
+            .and_then(Value::as_str),
+        Some("require_https")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn phase13_direct_stream_rollout_gate_returns_structured_error() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "phase13-direct-stream-gate-secret".to_string();
@@ -11742,6 +12454,18 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .await?;
     assert_eq!(wrong_owner_resp.status(), StatusCode::UNAUTHORIZED);
 
+    let wrong_owner_segment_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/seg_0_00000.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {other_token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(wrong_owner_segment_resp.status(), StatusCode::UNAUTHORIZED);
+
     let master_resp = app
         .clone()
         .oneshot(
@@ -11788,6 +12512,42 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         String::from_utf8_lossy(&valid_bytes)
     );
     assert_eq!(&valid_bytes[..], b"segment");
+
+    let deny_hls_policy = json!({
+        "applied": true,
+        "scope": "share",
+        "policy_sources": ["phase22-test"],
+        "user_id": user_id.to_string(),
+        "share_id": "phase22-no-transcode",
+        "allow_downloads": true,
+        "allow_direct_play": true,
+        "allow_transcode": false,
+        "allow_hardware_transcode": true,
+        "reasons": ["remote_policy_transcode_disabled"]
+    });
+    sqlx::query("UPDATE playback_sessions SET share_id = ?, remote_policy_json = ? WHERE id = ?")
+        .bind("phase22-no-transcode")
+        .bind(deny_hls_policy.to_string())
+        .bind(session_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+    let denied_share_segment_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/sessions/{session_id}/seg_0_00000.ts?session={session_token}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(denied_share_segment_resp.status(), StatusCode::UNAUTHORIZED);
+    sqlx::query(
+        "UPDATE playback_sessions SET share_id = NULL, remote_policy_json = NULL WHERE id = ?",
+    )
+    .bind(session_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
 
     let updated_at: String =
         sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
