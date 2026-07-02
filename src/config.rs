@@ -249,6 +249,19 @@ impl Settings {
             .set_default("playback.allow_hardware_decode", default_true())?
             .set_default("playback.allow_hardware_encode", default_true())?
             .set_default("playback.hardware_fallback", default_hardware_fallback())?
+            .set_default(
+                "playback.unknown_performance_policy",
+                default_unknown_performance_policy(),
+            )?
+            .set_default(
+                "playback.performance_envelope_artifacts",
+                Vec::<String>::new(),
+            )?
+            .set_default("playback.performance_benchmark_enabled", default_false())?
+            .set_default(
+                "playback.performance_benchmark_timeout_seconds",
+                default_performance_benchmark_timeout_seconds(),
+            )?
             .set_default("playback.force_sdr_output", default_false())?
             .set_default("playback.max_active_sessions", None::<u32>)?
             .set_default("playback.max_active_direct_streams", None::<u32>)?
@@ -288,6 +301,12 @@ impl Settings {
         self.library.artwork_cache_dir = normalize_path(&self.library.artwork_cache_dir, base_dir);
         self.extensions.storage_root = normalize_path(&self.extensions.storage_root, base_dir);
         self.extensions.bundled_dir = normalize_path(&self.extensions.bundled_dir, base_dir);
+        self.playback.performance_envelope_artifacts = self
+            .playback
+            .performance_envelope_artifacts
+            .iter()
+            .map(|path| normalize_path(path, base_dir))
+            .collect();
         if self.metadata.tvdb_base_url.trim().is_empty() {
             self.metadata.tvdb_base_url = self.classifier.tvdb_base_url.clone();
         }
@@ -736,6 +755,14 @@ pub struct PlaybackConfig {
     pub allow_hardware_encode: bool,
     #[serde(default = "default_hardware_fallback")]
     pub hardware_fallback: String,
+    #[serde(default = "default_unknown_performance_policy")]
+    pub unknown_performance_policy: String,
+    #[serde(default)]
+    pub performance_envelope_artifacts: Vec<String>,
+    #[serde(default = "default_false")]
+    pub performance_benchmark_enabled: bool,
+    #[serde(default = "default_performance_benchmark_timeout_seconds")]
+    pub performance_benchmark_timeout_seconds: u64,
     #[serde(default = "default_false")]
     pub force_sdr_output: bool,
     #[serde(default)]
@@ -793,6 +820,10 @@ impl Default for PlaybackConfig {
             allow_hardware_decode: default_true(),
             allow_hardware_encode: default_true(),
             hardware_fallback: default_hardware_fallback(),
+            unknown_performance_policy: default_unknown_performance_policy(),
+            performance_envelope_artifacts: Vec::new(),
+            performance_benchmark_enabled: default_false(),
+            performance_benchmark_timeout_seconds: default_performance_benchmark_timeout_seconds(),
             force_sdr_output: default_false(),
             max_active_sessions: None,
             max_active_direct_streams: None,
@@ -1053,6 +1084,14 @@ fn default_hardware_fallback() -> String {
     "software".to_string()
 }
 
+fn default_unknown_performance_policy() -> String {
+    "deny".to_string()
+}
+
+fn default_performance_benchmark_timeout_seconds() -> u64 {
+    20
+}
+
 fn discover_config_paths() -> ConfigPaths {
     if let Ok(dir) = std::env::var("ELIXIR_CONFIG_DIR") {
         return ConfigPaths::new(expand_tilde_path(Path::new(dir.trim())));
@@ -1210,6 +1249,7 @@ mod tests {
         settings.library.artwork_cache_dir = "data/artwork".to_string();
         settings.extensions.storage_root = "data/extensions".to_string();
         settings.extensions.bundled_dir = "extensions/bundled".to_string();
+        settings.playback.performance_envelope_artifacts = vec!["certifications/local".to_string()];
 
         settings.normalize_paths(base.path())?;
 
@@ -1236,8 +1276,26 @@ mod tests {
             PathBuf::from(&settings.extensions.bundled_dir),
             base.path().join("extensions/bundled")
         );
+        assert_eq!(
+            settings.playback.performance_envelope_artifacts,
+            vec![
+                base.path()
+                    .join("certifications/local")
+                    .to_string_lossy()
+                    .to_string()
+            ]
+        );
 
         Ok(())
+    }
+
+    #[test]
+    fn playback_performance_defaults_are_fail_closed_and_inert() {
+        let playback = PlaybackConfig::default();
+        assert_eq!(playback.unknown_performance_policy, "deny");
+        assert!(!playback.performance_benchmark_enabled);
+        assert!(playback.performance_envelope_artifacts.is_empty());
+        assert_eq!(playback.performance_benchmark_timeout_seconds, 20);
     }
 
     #[test]

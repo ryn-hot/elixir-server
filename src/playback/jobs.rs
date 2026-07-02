@@ -24,8 +24,9 @@ use uuid::Uuid;
 
 use crate::{
     metrics::PLAYBACK_ADAPTIVE_RENDITION_SWITCHES,
-    playback::plan::{
-        Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan, StreamAction,
+    playback::{
+        performance::record_playback_performance_observation,
+        plan::{Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan, StreamAction},
     },
 };
 
@@ -253,6 +254,17 @@ struct PlaybackJob {
     subtitle_delay_seconds: Option<f64>,
     subtitles: Vec<SubtitleInfo>,
     active_rung_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlaybackPerformanceObservation {
+    envelope_id: String,
+    startup_latency_ms: Option<i64>,
+    first_segment_latency_ms: Option<i64>,
+    realtime_factor_millis: Option<i32>,
+    failure_kind: Option<String>,
+    fallback_kind: Option<String>,
+    output_mode: Option<String>,
 }
 
 impl PlaybackJob {
@@ -941,6 +953,7 @@ impl PlaybackJobManager {
         }
         self.transition(&job, PlaybackJobState::PlaylistReady, None, None)
             .await?;
+        let playlist_ready_at = Utc::now();
 
         if let Err(err) = wait_for_first_media_segment_or_process_exit(
             &job,
@@ -959,12 +972,20 @@ impl PlaybackJobManager {
                 .await;
             return Err(err);
         }
-        {
+        let (started_at, first_segment_at) = {
             let mut job = job.lock().await;
             let now = Utc::now();
             job.last_segment_at = Some(now);
             job.last_progress_at = Some(now);
-        }
+            (job.started_at, now)
+        };
+        self.record_successful_performance_observation(
+            playback_plan.as_ref(),
+            started_at,
+            Some(playlist_ready_at),
+            first_segment_at,
+        )
+        .await;
         self.enforce_resource_limits(session_id).await?;
         self.transition(&job, PlaybackJobState::Running, None, None)
             .await?;
@@ -1001,6 +1022,82 @@ impl PlaybackJobManager {
                 }
             }
             time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn record_successful_performance_observation(
+        &self,
+        playback_plan: Option<&PlaybackPlan>,
+        started_at: Option<DateTime<Utc>>,
+        playlist_ready_at: Option<DateTime<Utc>>,
+        first_segment_at: DateTime<Utc>,
+    ) {
+        let Some(playback_plan) = playback_plan else {
+            return;
+        };
+        let Some(envelope_id) = selected_performance_envelope_id(playback_plan) else {
+            return;
+        };
+        let observation = PlaybackPerformanceObservation {
+            envelope_id: envelope_id.to_string(),
+            startup_latency_ms: started_at
+                .as_ref()
+                .zip(playlist_ready_at.as_ref())
+                .and_then(|(start, ready)| elapsed_millis(start, ready)),
+            first_segment_latency_ms: started_at
+                .as_ref()
+                .and_then(|start| elapsed_millis(start, &first_segment_at)),
+            realtime_factor_millis: started_at.as_ref().and_then(|start| {
+                first_segment_realtime_factor_millis(playback_plan, start, &first_segment_at)
+            }),
+            failure_kind: None,
+            fallback_kind: playback_plan_fallback_kind(playback_plan),
+            output_mode: Some(playback_plan.mode.as_str().to_string()),
+        };
+        self.record_performance_observation(observation, true).await;
+    }
+
+    async fn record_failed_performance_observation(
+        &self,
+        observation: Option<PlaybackPerformanceObservation>,
+    ) {
+        let Some(observation) = observation else {
+            return;
+        };
+        self.record_performance_observation(observation, false)
+            .await;
+    }
+
+    async fn record_performance_observation(
+        &self,
+        observation: PlaybackPerformanceObservation,
+        success: bool,
+    ) {
+        match record_playback_performance_observation(
+            &self.db_pool,
+            &observation.envelope_id,
+            success,
+            observation.startup_latency_ms,
+            observation.first_segment_latency_ms,
+            observation.realtime_factor_millis,
+            observation.failure_kind.as_deref(),
+            observation.fallback_kind.as_deref(),
+            observation.output_mode.as_deref(),
+        )
+        .await
+        {
+            Ok(0) => tracing::debug!(
+                envelope_id = %observation.envelope_id,
+                success,
+                "playback performance observation skipped because selected envelope no longer exists"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                envelope_id = %observation.envelope_id,
+                success,
+                error = ?err,
+                "failed to record playback performance observation"
+            ),
         }
     }
 
@@ -1050,6 +1147,10 @@ impl PlaybackJobManager {
             .ok()
             .filter(|tail| !tail.trim().is_empty());
         let error_kind = classify_playback_failure(reason, detail.as_deref(), log_tail.as_deref());
+        let failure_observation = {
+            let job = entry.lock().await;
+            playback_performance_failure_observation(&job, reason, error_kind, Utc::now())
+        };
         if error_kind == "hardware_unavailable" && planned_hardware_api.is_some() {
             if let Some(callback) = self.hardware_failure_callback.as_ref() {
                 callback();
@@ -1068,6 +1169,8 @@ impl PlaybackJobManager {
         if stop_process {
             self.stop_process_and_remove_dir(&entry, true).await;
         }
+        self.record_failed_performance_observation(failure_observation)
+            .await;
         let (session_id, snapshot) = {
             let mut job = entry.lock().await;
             job.state = PlaybackJobState::Failed;
@@ -1274,6 +1377,92 @@ fn job_planned_hardware_api(job: &PlaybackJob) -> Option<String> {
                 .then_some(plan.hardware_acceleration.api)
         })
         .flatten()
+}
+
+fn selected_performance_envelope_id(playback_plan: &PlaybackPlan) -> Option<&str> {
+    playback_plan
+        .feasibility
+        .as_ref()
+        .and_then(|feasibility| feasibility.selected_envelope_id.as_deref())
+}
+
+fn playback_performance_failure_observation(
+    job: &PlaybackJob,
+    reason: &str,
+    error_kind: &str,
+    observed_at: DateTime<Utc>,
+) -> Option<PlaybackPerformanceObservation> {
+    let playback_plan = job.plan.parsed_playback_plan()?;
+    let envelope_id = selected_performance_envelope_id(&playback_plan)?.to_string();
+    let elapsed_since_start = job
+        .started_at
+        .as_ref()
+        .and_then(|started_at| elapsed_millis(started_at, &observed_at));
+    let (startup_latency_ms, first_segment_latency_ms) = if reason.starts_with("startup") {
+        (elapsed_since_start, None)
+    } else if reason.starts_with("first_segment") {
+        (None, elapsed_since_start)
+    } else {
+        (None, None)
+    };
+    Some(PlaybackPerformanceObservation {
+        envelope_id,
+        startup_latency_ms,
+        first_segment_latency_ms,
+        realtime_factor_millis: None,
+        failure_kind: Some(error_kind.to_string()),
+        fallback_kind: playback_plan_fallback_kind(&playback_plan),
+        output_mode: Some(playback_plan.mode.as_str().to_string()),
+    })
+}
+
+fn elapsed_millis(start: &DateTime<Utc>, end: &DateTime<Utc>) -> Option<i64> {
+    let millis = end.signed_duration_since(*start).num_milliseconds();
+    (millis >= 0).then_some(millis)
+}
+
+fn first_segment_realtime_factor_millis(
+    playback_plan: &PlaybackPlan,
+    started_at: &DateTime<Utc>,
+    first_segment_at: &DateTime<Utc>,
+) -> Option<i32> {
+    let elapsed_ms = elapsed_millis(started_at, first_segment_at)?;
+    if elapsed_ms <= 0 {
+        return None;
+    }
+    let segment_seconds = selected_output_segment_seconds(playback_plan)?;
+    let realtime_factor = segment_seconds / (elapsed_ms as f64 / 1000.0);
+    Some(
+        (realtime_factor * 1000.0)
+            .round()
+            .clamp(0.0, i32::MAX as f64) as i32,
+    )
+}
+
+fn selected_output_segment_seconds(playback_plan: &PlaybackPlan) -> Option<f64> {
+    playback_plan
+        .video_output
+        .as_ref()
+        .and_then(|output| output.segment_seconds.parse::<f64>().ok())
+        .or_else(|| {
+            let ladder = playback_plan.adaptive_ladder.as_ref()?;
+            let active = ladder
+                .rungs
+                .iter()
+                .find(|rung| rung.id == ladder.active_rung_id)
+                .or_else(|| ladder.rungs.first())?;
+            active.video.segment_seconds.parse::<f64>().ok()
+        })
+        .filter(|seconds| *seconds > 0.0)
+}
+
+fn playback_plan_fallback_kind(playback_plan: &PlaybackPlan) -> Option<String> {
+    playback_plan
+        .hardware_acceleration
+        .fallback
+        .as_deref()
+        .filter(|fallback| !fallback.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn active_rung_snapshot(
@@ -1712,8 +1901,10 @@ mod tests {
         db::Database,
         playback::plan::{
             AdaptiveAudioStrategy, AdaptiveLadderPlan, AdaptiveRungPlan, CompatibilityReport,
-            HdrAction, PLAYBACK_PLAN_VERSION, SeekBehavior, VideoFrameRateMode, VideoFrameRatePlan,
-            VideoOutputPlan,
+            HdrAction, PLAYBACK_PLAN_VERSION, PlaybackFeasibilityAction,
+            PlaybackFeasibilityDecision, PlaybackPerformanceConfidence,
+            PlaybackPerformanceDecision, PlaybackSupportDecision, SeekBehavior, VideoFrameRateMode,
+            VideoFrameRatePlan, VideoOutputPlan,
         },
     };
     use tempfile::tempdir;
@@ -1920,16 +2111,24 @@ mod tests {
                 id: "0".to_string(),
                 label: "720p 3000k".to_string(),
                 bandwidth_bps: 3_000_000,
+                average_bandwidth_bps: 2_700_000,
                 width: 1280,
                 height: 720,
+                resolution: "1280x720".to_string(),
+                codecs: "avc1.640029,mp4a.40.2".to_string(),
+                frame_rate: Some("24".to_string()),
                 video: test_adaptive_video_output(720, 3_000_000),
             },
             AdaptiveRungPlan {
                 id: "1".to_string(),
                 label: "480p 1200k".to_string(),
                 bandwidth_bps: 1_200_000,
+                average_bandwidth_bps: 1_080_000,
                 width: 854,
                 height: 480,
+                resolution: "854x480".to_string(),
+                codecs: "avc1.640029,mp4a.40.2".to_string(),
+                frame_rate: Some("24".to_string()),
                 video: test_adaptive_video_output(480, 1_200_000),
             },
         ];
@@ -1958,12 +2157,118 @@ mod tests {
                 reasons: vec!["adaptive_ladder_source_aware".to_string()],
             }),
             video_transcode_reason: Some("adaptive_quality_requested".to_string()),
+            workload_class: None,
+            feasibility: None,
             compatibility_report: CompatibilityReport::empty("media-file"),
             reasons: vec!["adaptive_transcode_automatic_quality_requested".to_string()],
             warnings: Vec::new(),
             expected_outputs: Vec::new(),
             playable: true,
         }
+    }
+
+    fn test_feasibility_decision(envelope_id: &str) -> PlaybackFeasibilityDecision {
+        PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::AllowTranscode,
+            reason: "certified_realtime".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::RealtimeSafe,
+            confidence: PlaybackPerformanceConfidence::Certified,
+            selected_envelope_id: Some(envelope_id.to_string()),
+            selected_hardware_api: Some("nvenc".to_string()),
+            selected_envelope_p50_realtime_factor_millis: Some(1_800),
+            selected_envelope_p95_realtime_factor_millis: Some(1_500),
+            selected_envelope_startup_latency_ms: Some(400),
+            selected_envelope_first_segment_latency_ms: Some(900),
+            selected_envelope_failure_count: Some(0),
+            selected_envelope_sample_count: Some(8),
+            realtime_required_millis: 1000,
+            reasons: vec!["certification_artifact".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: Vec::new(),
+            background_probe_queued: false,
+        }
+    }
+
+    fn test_playback_job_with_plan(
+        playback_plan: PlaybackPlan,
+        started_at: DateTime<Utc>,
+    ) -> PlaybackJob {
+        let session_id = Uuid::new_v4();
+        PlaybackJob {
+            plan: PlaybackJobPlan::new(
+                session_id,
+                "media-file",
+                "source.mkv",
+                TranscodeParams {
+                    seek_seconds: 0.0,
+                    mode: PlaybackMode::AdaptiveTranscode,
+                    delivery: Delivery::HlsAdaptiveFmp4,
+                },
+                Some(serde_json::to_value(playback_plan).expect("serialize playback plan")),
+            ),
+            state: PlaybackJobState::Running,
+            temp_dir: PathBuf::from("/tmp/elixir-test"),
+            artifacts: ArtifactRegistry::for_plan(
+                PlaybackMode::AdaptiveTranscode,
+                Delivery::HlsAdaptiveFmp4,
+                0,
+            ),
+            process_id: None,
+            process_group_id: None,
+            child: None,
+            capacity_permits: Vec::new(),
+            started_at: Some(started_at),
+            last_progress_at: Some(started_at),
+            last_segment_at: None,
+            log_path: PathBuf::from("/tmp/elixir-test/ffmpeg.log"),
+            error: None,
+            error_code: None,
+            error_kind: None,
+            log_tail: None,
+            subtitle_delay_seconds: None,
+            subtitles: Vec::new(),
+            active_rung_id: Some("0".to_string()),
+        }
+    }
+
+    #[test]
+    fn phase20_failure_observation_extracts_selected_envelope_and_latency_bucket() {
+        let mut playback_plan = test_adaptive_playback_plan();
+        playback_plan.feasibility = Some(test_feasibility_decision("env-selected"));
+        let started_at = Utc::now();
+        let job = test_playback_job_with_plan(playback_plan, started_at);
+        let observed_at = started_at + chrono::Duration::milliseconds(1_500);
+
+        let first_segment = playback_performance_failure_observation(
+            &job,
+            "first_segment_timeout",
+            "first_segment_timeout",
+            observed_at,
+        )
+        .expect("first segment failure observation");
+        assert_eq!(first_segment.envelope_id, "env-selected");
+        assert_eq!(first_segment.startup_latency_ms, None);
+        assert_eq!(first_segment.first_segment_latency_ms, Some(1_500));
+        assert_eq!(
+            first_segment.failure_kind.as_deref(),
+            Some("first_segment_timeout")
+        );
+        assert_eq!(
+            first_segment.output_mode.as_deref(),
+            Some("adaptive_transcode")
+        );
+
+        let startup = playback_performance_failure_observation(
+            &job,
+            "startup_timeout",
+            "startup_timeout",
+            observed_at,
+        )
+        .expect("startup failure observation");
+        assert_eq!(startup.envelope_id, "env-selected");
+        assert_eq!(startup.startup_latency_ms, Some(1_500));
+        assert_eq!(startup.first_segment_latency_ms, None);
     }
 
     #[tokio::test]
@@ -2344,6 +2649,8 @@ mod tests {
             }),
             adaptive_ladder: None,
             video_transcode_reason: Some("source_bitrate_exceeds_policy".to_string()),
+            workload_class: None,
+            feasibility: None,
             compatibility_report: report,
             reasons: vec!["source_bitrate_exceeds_policy".to_string()],
             warnings: Vec::new(),
@@ -2479,6 +2786,8 @@ mod tests {
             }),
             adaptive_ladder: None,
             video_transcode_reason: Some("source_bitrate_exceeds_policy".to_string()),
+            workload_class: None,
+            feasibility: None,
             compatibility_report: report,
             reasons: vec!["source_bitrate_exceeds_policy".to_string()],
             warnings: Vec::new(),

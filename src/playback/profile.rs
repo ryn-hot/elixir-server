@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::hardware::HardwareCapabilities;
+use super::{hardware::HardwareCapabilities, plan::PlaybackPerformanceEnvelope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +18,21 @@ pub enum QualityMode {
     Original,
     Fixed,
     Automatic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbrSupportType {
+    NativeHls,
+    HlsJs,
+    Mpv,
+    None,
+}
+
+impl AbrSupportType {
+    pub fn supports_adaptive_hls(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +94,30 @@ pub enum NetworkClass {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownPerformancePolicy {
+    Deny,
+    AllowBestEffort,
+}
+
+impl UnknownPerformancePolicy {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "deny" | "fail" | "fail_closed" | "reject" => Self::Deny,
+            "allow_best_effort" | "best_effort" | "allow" => Self::AllowBestEffort,
+            _ => Self::Deny,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::AllowBestEffort => "allow_best_effort",
+        }
+    }
+}
+
 impl NetworkClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -119,7 +158,25 @@ pub struct ClientPlaybackProfile {
     #[serde(default = "default_default_subtitle_policy")]
     pub default_subtitle_policy: DefaultSubtitlePolicy,
     pub quality_mode: QualityMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_min_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_max_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_min_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_max_resolution: Option<String>,
+    #[serde(default = "default_abr_support_type")]
+    pub abr_support_type: AbrSupportType,
     pub app_version: Option<String>,
+}
+
+fn default_abr_support_type() -> AbrSupportType {
+    AbrSupportType::None
 }
 
 fn default_subtitle_rendering() -> SubtitleRendering {
@@ -197,6 +254,13 @@ impl ClientPlaybackProfile {
             forced_subtitle_policy: ForcedSubtitlePolicy::MatchingAudio,
             default_subtitle_policy: DefaultSubtitlePolicy::MediaDefault,
             quality_mode: QualityMode::Original,
+            fixed_bitrate_bps: None,
+            fixed_resolution: None,
+            automatic_min_bitrate_bps: None,
+            automatic_max_bitrate_bps: None,
+            automatic_min_resolution: None,
+            automatic_max_resolution: None,
+            abr_support_type: AbrSupportType::Mpv,
             app_version: None,
         }
     }
@@ -226,6 +290,13 @@ impl ClientPlaybackProfile {
             forced_subtitle_policy: ForcedSubtitlePolicy::MatchingAudio,
             default_subtitle_policy: DefaultSubtitlePolicy::MediaDefault,
             quality_mode: QualityMode::Fixed,
+            fixed_bitrate_bps: Some(8_000_000),
+            fixed_resolution: Some("1080p".to_string()),
+            automatic_min_bitrate_bps: Some(800_000),
+            automatic_max_bitrate_bps: Some(8_000_000),
+            automatic_min_resolution: Some("360p".to_string()),
+            automatic_max_resolution: Some("1080p".to_string()),
+            abr_support_type: AbrSupportType::HlsJs,
             app_version: None,
         }
     }
@@ -254,6 +325,8 @@ pub struct ServerPlaybackPolicy {
     pub hardware_fallback: String,
     pub force_sdr_output: bool,
     pub hardware_capabilities: HardwareCapabilities,
+    pub unknown_performance_policy: UnknownPerformancePolicy,
+    pub performance_envelopes: Vec<PlaybackPerformanceEnvelope>,
 }
 
 impl Default for ServerPlaybackPolicy {
@@ -280,6 +353,8 @@ impl Default for ServerPlaybackPolicy {
             hardware_fallback: "software".to_string(),
             force_sdr_output: false,
             hardware_capabilities: HardwareCapabilities::software_only(),
+            unknown_performance_policy: UnknownPerformancePolicy::Deny,
+            performance_envelopes: Vec::new(),
         }
     }
 }
@@ -304,6 +379,20 @@ pub struct EffectivePlaybackPolicy {
     pub max_bitrate_bps: Option<i64>,
     pub max_remote_bitrate_bps: Option<i64>,
     pub max_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_min_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_max_bitrate_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_min_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_max_resolution: Option<String>,
+    #[serde(default = "default_abr_support_type")]
+    pub abr_support_type: AbrSupportType,
     pub server_upload_cap_bps: Option<i64>,
     pub max_simultaneous_video_transcodes: Option<u32>,
     pub active_video_transcodes: u32,
@@ -319,6 +408,8 @@ pub struct EffectivePlaybackPolicy {
     pub hardware_fallback: String,
     pub force_sdr_output: bool,
     pub hardware_capabilities: HardwareCapabilities,
+    pub unknown_performance_policy: UnknownPerformancePolicy,
+    pub performance_envelopes: Vec<PlaybackPerformanceEnvelope>,
 }
 
 impl Default for EffectivePlaybackPolicy {
@@ -333,6 +424,13 @@ impl Default for EffectivePlaybackPolicy {
             max_bitrate_bps: None,
             max_remote_bitrate_bps: None,
             max_resolution: None,
+            fixed_bitrate_bps: None,
+            fixed_resolution: None,
+            automatic_min_bitrate_bps: None,
+            automatic_max_bitrate_bps: None,
+            automatic_min_resolution: None,
+            automatic_max_resolution: None,
+            abr_support_type: AbrSupportType::None,
             server_upload_cap_bps: None,
             max_simultaneous_video_transcodes: None,
             active_video_transcodes: 0,
@@ -348,6 +446,8 @@ impl Default for EffectivePlaybackPolicy {
             hardware_fallback: "software".to_string(),
             force_sdr_output: false,
             hardware_capabilities: HardwareCapabilities::software_only(),
+            unknown_performance_policy: UnknownPerformancePolicy::Deny,
+            performance_envelopes: Vec::new(),
         }
     }
 }
@@ -371,6 +471,12 @@ pub fn derive_effective_playback_policy(
     if !native_original_on_lan {
         push_positive_i64(&mut bitrate_caps, client.max_bitrate_bps);
         push_positive_i64(&mut bitrate_caps, network.max_bitrate_bps);
+        if client.quality_mode == QualityMode::Fixed {
+            push_positive_i64(&mut bitrate_caps, client.fixed_bitrate_bps);
+        }
+        if client.quality_mode == QualityMode::Automatic {
+            push_positive_i64(&mut bitrate_caps, client.automatic_max_bitrate_bps);
+        }
     }
     if remote_like {
         push_positive_i64(&mut bitrate_caps, server.max_remote_bitrate_bps);
@@ -379,7 +485,7 @@ pub fn derive_effective_playback_policy(
         push_positive_i64(&mut bitrate_caps, network.server_upload_cap_bps);
     }
 
-    let max_resolution = if native_original_on_lan {
+    let mut max_resolution = if native_original_on_lan {
         None
     } else {
         min_resolution_cap(
@@ -400,6 +506,24 @@ pub fn derive_effective_playback_policy(
             .as_deref(),
         )
     };
+    if !native_original_on_lan && client.quality_mode == QualityMode::Fixed {
+        max_resolution = min_resolution_cap(
+            max_resolution.as_deref(),
+            client
+                .fixed_resolution
+                .as_deref()
+                .filter(|value| !is_unlimited_resolution(value)),
+        );
+    }
+    if !native_original_on_lan && client.quality_mode == QualityMode::Automatic {
+        max_resolution = min_resolution_cap(
+            max_resolution.as_deref(),
+            client
+                .automatic_max_resolution
+                .as_deref()
+                .filter(|value| !is_unlimited_resolution(value)),
+        );
+    }
 
     EffectivePlaybackPolicy {
         allow_direct_play: server.allow_direct_play,
@@ -408,6 +532,7 @@ pub fn derive_effective_playback_policy(
         allow_video_transcode: server.allow_video_transcode && hls_capable,
         allow_adaptive_transcode: server.allow_adaptive_transcode
             && hls_capable
+            && client.abr_support_type.supports_adaptive_hls()
             && client.quality_mode == QualityMode::Automatic,
         network_class: network.network_class,
         max_bitrate_bps: bitrate_caps.into_iter().min(),
@@ -416,6 +541,42 @@ pub fn derive_effective_playback_policy(
             network.max_remote_bitrate_bps,
         ),
         max_resolution,
+        fixed_bitrate_bps: (client.quality_mode == QualityMode::Fixed)
+            .then_some(client.fixed_bitrate_bps)
+            .flatten(),
+        fixed_resolution: (client.quality_mode == QualityMode::Fixed)
+            .then_some(
+                client
+                    .fixed_resolution
+                    .clone()
+                    .filter(|value| !is_unlimited_resolution(value)),
+            )
+            .flatten(),
+        automatic_min_bitrate_bps: (client.quality_mode == QualityMode::Automatic)
+            .then_some(client.automatic_min_bitrate_bps)
+            .flatten()
+            .filter(|value| *value > 0),
+        automatic_max_bitrate_bps: (client.quality_mode == QualityMode::Automatic)
+            .then_some(client.automatic_max_bitrate_bps)
+            .flatten()
+            .filter(|value| *value > 0),
+        automatic_min_resolution: (client.quality_mode == QualityMode::Automatic)
+            .then_some(
+                client
+                    .automatic_min_resolution
+                    .clone()
+                    .filter(|value| !is_unlimited_resolution(value)),
+            )
+            .flatten(),
+        automatic_max_resolution: (client.quality_mode == QualityMode::Automatic)
+            .then_some(
+                client
+                    .automatic_max_resolution
+                    .clone()
+                    .filter(|value| !is_unlimited_resolution(value)),
+            )
+            .flatten(),
+        abr_support_type: client.abr_support_type,
         server_upload_cap_bps: min_positive_i64(
             server.server_upload_cap_bps,
             network.server_upload_cap_bps,
@@ -434,6 +595,8 @@ pub fn derive_effective_playback_policy(
         hardware_fallback: server.hardware_fallback.clone(),
         force_sdr_output: server.force_sdr_output,
         hardware_capabilities: server.hardware_capabilities.clone(),
+        unknown_performance_policy: server.unknown_performance_policy,
+        performance_envelopes: server.performance_envelopes.clone(),
     }
 }
 

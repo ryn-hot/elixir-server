@@ -207,6 +207,194 @@ impl Default for HardwareAccelerationPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackSupportDecision {
+    Supported,
+    Unsupported,
+    MixedFallback,
+    SoftwareOnly,
+    Unknown,
+}
+
+impl PlaybackSupportDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::MixedFallback => "mixed_fallback",
+            Self::SoftwareOnly => "software_only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackPerformanceDecision {
+    RealtimeSafe,
+    RealtimeMarginal,
+    NotRealtime,
+    Unknown,
+}
+
+impl PlaybackPerformanceDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RealtimeSafe => "realtime_safe",
+            Self::RealtimeMarginal => "realtime_marginal",
+            Self::NotRealtime => "not_realtime",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackPerformanceConfidence {
+    Certified,
+    LocalBenchmark,
+    LiveObserved,
+    StaticInferred,
+    Unknown,
+}
+
+impl PlaybackPerformanceConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::LocalBenchmark => "local_benchmark",
+            Self::LiveObserved => "live_observed",
+            Self::StaticInferred => "static_inferred",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackFeasibilityAction {
+    AllowDirect,
+    AllowTranscode,
+    AllowWithWarning,
+    DowngradeQuality,
+    SoftwareFallback,
+    Reject,
+}
+
+impl PlaybackFeasibilityAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowDirect => "allow_direct",
+            Self::AllowTranscode => "allow_transcode",
+            Self::AllowWithWarning => "allow_with_warning",
+            Self::DowngradeQuality => "downgrade_quality",
+            Self::SoftwareFallback => "software_fallback",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaybackWorkloadClass {
+    pub schema_version: u32,
+    pub class_id: String,
+    pub source_container: Option<String>,
+    pub source_video_codec: Option<String>,
+    pub source_video_profile: Option<String>,
+    pub source_bit_depth: Option<u8>,
+    pub source_pixel_format: Option<String>,
+    pub source_width: Option<i32>,
+    pub source_height: Option<i32>,
+    pub source_frame_rate: Option<String>,
+    pub source_bitrate_bps: Option<i64>,
+    pub hdr_action: HdrAction,
+    pub subtitle_action: StreamAction,
+    pub audio_action: StreamAction,
+    pub output_codec: Option<String>,
+    pub output_width: Option<i32>,
+    pub output_height: Option<i32>,
+    pub output_pixel_format: Option<String>,
+    pub delivery: Delivery,
+    pub pipeline_signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline_stages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaybackPerformanceEnvelope {
+    pub id: String,
+    pub host_fingerprint: String,
+    pub os_family: String,
+    pub os_version: Option<String>,
+    pub gpu_vendor: Option<String>,
+    pub gpu_model: Option<String>,
+    pub gpu_driver_version: Option<String>,
+    pub hardware_api: Option<String>,
+    pub ffmpeg_path: Option<String>,
+    pub ffmpeg_version: Option<String>,
+    pub ffmpeg_sha256: Option<String>,
+    pub elixir_version: Option<String>,
+    pub workload_class_id: String,
+    pub pipeline_signature: String,
+    pub support_decision: PlaybackSupportDecision,
+    pub performance_decision: PlaybackPerformanceDecision,
+    pub confidence: PlaybackPerformanceConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_realtime_factor_millis: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_realtime_factor_millis: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_segment_latency_ms: Option<i64>,
+    pub failure_count: i64,
+    pub sample_count: i64,
+    pub invalidation_fingerprint: String,
+    pub last_observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaybackFeasibilityDecision {
+    pub action: PlaybackFeasibilityAction,
+    pub reason: String,
+    pub support_decision: PlaybackSupportDecision,
+    pub performance_decision: PlaybackPerformanceDecision,
+    pub confidence: PlaybackPerformanceConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_hardware_api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_p50_realtime_factor_millis: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_p95_realtime_factor_millis: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_startup_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_first_segment_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_failure_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_envelope_sample_count: Option<i64>,
+    pub realtime_required_millis: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_codes: Vec<String>,
+    pub background_probe_queued: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioOutputPlan {
     pub codec: String,
@@ -306,8 +494,16 @@ pub struct AdaptiveRungPlan {
     pub id: String,
     pub label: String,
     pub bandwidth_bps: i64,
+    #[serde(default)]
+    pub average_bandwidth_bps: i64,
     pub width: i32,
     pub height: i32,
+    #[serde(default)]
+    pub resolution: String,
+    #[serde(default)]
+    pub codecs: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<String>,
     pub video: VideoOutputPlan,
 }
 
@@ -344,6 +540,10 @@ pub struct PlaybackPlan {
     pub adaptive_ladder: Option<AdaptiveLadderPlan>,
     #[serde(default)]
     pub video_transcode_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_class: Option<PlaybackWorkloadClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feasibility: Option<PlaybackFeasibilityDecision>,
     pub compatibility_report: CompatibilityReport,
     pub reasons: Vec<String>,
     pub warnings: Vec<String>,

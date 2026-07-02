@@ -13,9 +13,11 @@ use crate::{
         PlaybackJobCapacityLimits, PlaybackJobLimits, PlaybackJobManager,
         hardware::{
             HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
+            collect_host_hardware_inventory, host_hardware_fingerprint,
             load_or_detect_hardware_capabilities, mark_all_hardware_readiness_stale,
         },
         jobs::HardwareFailureCallback,
+        performance::PlaybackPerformanceProbeScheduler,
     },
     runtime::docker::DockerStartupConfig,
     secrets::SecretsManager,
@@ -37,6 +39,8 @@ pub struct AppState {
     pub artwork: Arc<ArtworkService>,
     pub transcodes: Arc<PlaybackJobManager>,
     pub hardware_capabilities: Arc<RwLock<Option<HardwareCapabilities>>>,
+    pub hardware_host_fingerprint: Arc<RwLock<Option<String>>>,
+    pub playback_performance_probes: Arc<PlaybackPerformanceProbeScheduler>,
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
 }
@@ -93,12 +97,18 @@ impl AppState {
             ..PlaybackJobLimits::default()
         };
         let hardware_capabilities = Arc::new(RwLock::new(None));
+        let hardware_host_fingerprint = Arc::new(RwLock::new(None));
+        let playback_performance_probes = Arc::new(PlaybackPerformanceProbeScheduler::new(
+            settings.playback.performance_benchmark_enabled,
+            settings.playback.performance_benchmark_timeout_seconds,
+        ));
         let hardware_refresh_active = Arc::new(AtomicBool::new(false));
         let hardware_acceleration_enabled = settings.playback.hardware_acceleration_enabled;
         let hardware_acceleration = settings.playback.hardware_acceleration.clone();
         let hardware_failure_callback: HardwareFailureCallback = {
             let db_pool = db_pool.clone();
             let hardware_capabilities = hardware_capabilities.clone();
+            let hardware_host_fingerprint = hardware_host_fingerprint.clone();
             let hardware_refresh_active = hardware_refresh_active.clone();
             Arc::new(move || {
                 if !hardware_acceleration_enabled {
@@ -113,10 +123,12 @@ impl AppState {
 
                 let db_pool = db_pool.clone();
                 let hardware_capabilities = hardware_capabilities.clone();
+                let hardware_host_fingerprint = hardware_host_fingerprint.clone();
                 let hardware_refresh_active = hardware_refresh_active.clone();
                 let hardware_acceleration = hardware_acceleration.clone();
                 tokio::spawn(async move {
                     *hardware_capabilities.write().await = None;
+                    *hardware_host_fingerprint.write().await = None;
                     if let Err(err) = mark_all_hardware_readiness_stale(&db_pool).await {
                         tracing::warn!(
                             error = %err,
@@ -128,8 +140,11 @@ impl AppState {
                     };
                     match load_or_detect_hardware_capabilities(&db_pool, &config).await {
                         Ok(capabilities) => {
+                            let inventory = collect_host_hardware_inventory().await;
+                            let host_fingerprint = host_hardware_fingerprint(&inventory);
                             let available_apis = capabilities.available_apis.clone();
                             *hardware_capabilities.write().await = Some(capabilities);
+                            *hardware_host_fingerprint.write().await = Some(host_fingerprint);
                             tracing::info!(
                                 available_apis = ?available_apis,
                                 "playback hardware readiness refreshed after live hardware failure"
@@ -171,6 +186,8 @@ impl AppState {
             artwork: Arc::new(artwork),
             transcodes: playback_jobs,
             hardware_capabilities,
+            hardware_host_fingerprint,
+            playback_performance_probes,
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),
         }

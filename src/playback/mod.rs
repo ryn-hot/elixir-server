@@ -25,6 +25,8 @@ pub mod certification;
 pub mod decision;
 pub mod hardware;
 pub mod jobs;
+pub mod network_emulator;
+pub mod performance;
 pub mod plan;
 pub mod probe;
 pub mod profile;
@@ -473,7 +475,7 @@ fn push_transcode_seek_args(args: &mut Vec<String>, seek_seconds: f32) {
     args.push(format!("{}", seek_seconds));
 }
 
-fn build_transcode_ffmpeg_args(
+pub(crate) fn build_transcode_ffmpeg_args(
     input: &str,
     params: &TranscodeParams,
     playback_plan: Option<&PlaybackPlan>,
@@ -1846,6 +1848,8 @@ mod tests {
             video_output: None,
             adaptive_ladder: None,
             video_transcode_reason: None,
+            workload_class: None,
+            feasibility: None,
             compatibility_report: report,
             reasons: vec!["direct_stream_codecs_copyable_container_changed".to_string()],
             warnings: Vec::new(),
@@ -1896,6 +1900,8 @@ mod tests {
             video_output: None,
             adaptive_ladder: None,
             video_transcode_reason: None,
+            workload_class: None,
+            feasibility: None,
             compatibility_report: report,
             reasons: Vec::new(),
             warnings: Vec::new(),
@@ -2155,16 +2161,24 @@ mod tests {
                     id: "0".to_string(),
                     label: "720p 3000k".to_string(),
                     bandwidth_bps: 3_000_000,
+                    average_bandwidth_bps: 2_700_000,
                     width: 1280,
                     height: 720,
+                    resolution: "1280x720".to_string(),
+                    codecs: "avc1.640029,mp4a.40.2".to_string(),
+                    frame_rate: Some("24".to_string()),
                     video: first_video,
                 },
                 AdaptiveRungPlan {
                     id: "1".to_string(),
                     label: "480p 1200k".to_string(),
                     bandwidth_bps: 1_200_000,
+                    average_bandwidth_bps: 1_080_000,
                     width: 854,
                     height: 480,
+                    resolution: "854x480".to_string(),
+                    codecs: "avc1.640029,mp4a.40.2".to_string(),
+                    frame_rate: Some("24".to_string()),
                     video: second_video,
                 },
             ],
@@ -3012,16 +3026,24 @@ mod tests {
                     id: "0".to_string(),
                     label: "720p 3000k".to_string(),
                     bandwidth_bps: 3_000_000,
+                    average_bandwidth_bps: 2_700_000,
                     width: 1280,
                     height: 720,
+                    resolution: "1280x720".to_string(),
+                    codecs: "avc1.640029,mp4a.40.2".to_string(),
+                    frame_rate: Some("24".to_string()),
                     video: first_video,
                 },
                 AdaptiveRungPlan {
                     id: "1".to_string(),
                     label: "480p 1200k".to_string(),
                     bandwidth_bps: 1_200_000,
+                    average_bandwidth_bps: 1_080_000,
                     width: 854,
                     height: 480,
+                    resolution: "854x480".to_string(),
+                    codecs: "avc1.640029,mp4a.40.2".to_string(),
+                    frame_rate: Some("24".to_string()),
                     video: second_video,
                 },
             ],

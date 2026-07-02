@@ -212,6 +212,55 @@ pub static PLAYBACK_HARDWARE_PROBE_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| 
     IntCounterVec::new(opts, &["api", "operation", "reason"]).expect("counter vec created")
 });
 
+pub static PLAYBACK_FEASIBILITY_DECISIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_feasibility_decision_total",
+        "Playback feasibility admission decisions by decision, reason, mode, and client",
+    );
+    IntCounterVec::new(opts, &["decision", "reason", "mode", "client"])
+        .expect("counter vec created")
+});
+
+pub static PLAYBACK_PERFORMANCE_ENVELOPE_STATUS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_performance_envelope_status",
+        "Loaded playback performance envelope status by workload class, hardware API, support/performance status, and confidence",
+    );
+    IntGaugeVec::new(opts, &["class", "api", "status", "confidence"]).expect("gauge vec created")
+});
+
+pub static PLAYBACK_TRANSCODE_REALTIME_FACTOR: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_playback_transcode_realtime_factor",
+        "Observed or certified transcode realtime factor for admitted playback workloads",
+    );
+    HistogramVec::new(opts, &["class", "api", "pipeline"]).expect("histogram vec created")
+});
+
+pub static PLAYBACK_TRANSCODE_REJECTED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_transcode_rejected_total",
+        "Playback transcode requests rejected by feasibility admission",
+    );
+    IntCounterVec::new(opts, &["reason", "class", "client"]).expect("counter vec created")
+});
+
+pub static PLAYBACK_TRANSCODE_DOWNGRADED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_transcode_downgraded_total",
+        "Playback transcode requests downgraded by feasibility admission",
+    );
+    IntCounterVec::new(opts, &["reason", "class", "client"]).expect("counter vec created")
+});
+
+pub static PLAYBACK_PERFORMANCE_PROBE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_playback_performance_probe_duration_seconds",
+        "Duration of playback performance envelope probes",
+    );
+    HistogramVec::new(opts, &["class", "api", "status"]).expect("histogram vec created")
+});
+
 pub static RECONCILE_RUNS: Lazy<IntCounterVec> = Lazy::new(|| {
     let opts = Opts::new(
         "elixir_reconcile_runs_total",
@@ -283,6 +332,24 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(PLAYBACK_HARDWARE_PROBE_FAILURES.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_FEASIBILITY_DECISIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_PERFORMANCE_ENVELOPE_STATUS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_TRANSCODE_REALTIME_FACTOR.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_TRANSCODE_REJECTED.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_TRANSCODE_DOWNGRADED.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_PERFORMANCE_PROBE_DURATION.clone()))
         .ok();
     REGISTRY.register(Box::new(RECONCILE_RUNS.clone())).ok();
     REGISTRY.register(Box::new(RECONCILE_ACTIONS.clone())).ok();

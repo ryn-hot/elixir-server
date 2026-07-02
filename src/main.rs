@@ -45,7 +45,11 @@ use elixir_server::orchestrator::naming::build_aliases;
 use elixir_server::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
 use elixir_server::orchestrator::reconcile::ReconcileConfig;
 use elixir_server::playback::{
-    hardware::{HardwareDetectionConfig, HardwarePreference, load_or_detect_hardware_capabilities},
+    hardware::{
+        HardwareDetectionConfig, HardwarePreference, collect_host_hardware_inventory,
+        host_hardware_fingerprint, load_or_detect_hardware_capabilities,
+    },
+    performance::seed_playback_performance_envelopes_from_certification_artifacts,
     start_session_cleanup,
 };
 use elixir_server::runtime::health::{
@@ -366,8 +370,43 @@ fn start_playback_hardware_readiness_warmup(state: AppState) {
         };
         match load_or_detect_hardware_capabilities(&state.db_pool, &config).await {
             Ok(capabilities) => {
+                let inventory = collect_host_hardware_inventory().await;
+                let host_fingerprint = host_hardware_fingerprint(&inventory);
                 let available_apis = capabilities.available_apis.clone();
                 *state.hardware_capabilities.write().await = Some(capabilities);
+                *state.hardware_host_fingerprint.write().await = Some(host_fingerprint);
+                let host_fingerprint = state.hardware_host_fingerprint.read().await.clone();
+                if !state
+                    .settings
+                    .playback
+                    .performance_envelope_artifacts
+                    .is_empty()
+                {
+                    match seed_playback_performance_envelopes_from_certification_artifacts(
+                        &state.db_pool,
+                        &state.settings.playback.performance_envelope_artifacts,
+                        host_fingerprint.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            tracing::info!(
+                                artifacts_seen = summary.artifacts_seen,
+                                envelopes_seen = summary.envelopes_seen,
+                                envelopes_upserted = summary.envelopes_upserted,
+                                envelopes_skipped_host_mismatch =
+                                    summary.envelopes_skipped_host_mismatch,
+                                "seeded playback performance envelopes from certification artifacts"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to seed playback performance envelopes from certification artifacts"
+                            );
+                        }
+                    }
+                }
                 tracing::info!(
                     available_apis = ?available_apis,
                     "playback hardware readiness warm-up completed"

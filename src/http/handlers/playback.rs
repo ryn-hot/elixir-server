@@ -28,9 +28,11 @@ use crate::{
     metrics::{
         PLAY_DECISIONS, PLAY_ERRORS, PLAY_LATENCY, PLAYBACK_CAPACITY_LEVELS,
         PLAYBACK_CAPACITY_REJECTIONS, PLAYBACK_DECISIONS, PLAYBACK_ERRORS,
-        PLAYBACK_HLS_PLAYLIST_STARTUP_LATENCY, PLAYBACK_MISSING_SEGMENTS, PLAYBACK_SEGMENT_LATENCY,
-        PLAYBACK_SESSION_EXPIRATIONS, SEGMENT_SERVED, TRANSCODE_DURATION, TRANSCODE_ERRORS,
-        TRANSCODE_STARTS,
+        PLAYBACK_FEASIBILITY_DECISIONS, PLAYBACK_HLS_PLAYLIST_STARTUP_LATENCY,
+        PLAYBACK_MISSING_SEGMENTS, PLAYBACK_PERFORMANCE_ENVELOPE_STATUS, PLAYBACK_SEGMENT_LATENCY,
+        PLAYBACK_SESSION_EXPIRATIONS, PLAYBACK_TRANSCODE_DOWNGRADED,
+        PLAYBACK_TRANSCODE_REALTIME_FACTOR, PLAYBACK_TRANSCODE_REJECTED, SEGMENT_SERVED,
+        TRANSCODE_DURATION, TRANSCODE_ERRORS, TRANSCODE_STARTS,
     },
     network::registry::ensure_server_instance,
     playback::{
@@ -45,16 +47,22 @@ use crate::{
             load_current_hardware_readiness_records,
         },
         jobs::playback_temp_root,
-        plan::{Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan, StreamAction},
+        performance::load_playback_performance_envelopes,
+        plan::{
+            AdaptiveLadderPlan, AdaptiveRungPlan, Delivery, HardwareAccelerationPlan,
+            PlaybackFeasibilityAction, PlaybackMode, PlaybackPerformanceEnvelope, PlaybackPlan,
+            StreamAction,
+        },
         probe::{
             MediaCapabilities, MediaProbeError, SubtitleKind, SubtitleStreamCapabilities,
             canonical_subtitle_codec, ensure_media_file_probe, subtitle_kind,
         },
         profile::{
-            AssComplexitySupport, ClientKind, ClientPlaybackProfile, DefaultSubtitlePolicy,
-            EffectivePlaybackPolicy, ForcedSubtitlePolicy, ImageSubtitleSupport, NetworkClass,
-            NetworkPlaybackPolicy, QualityMode, ServerPlaybackPolicy, SubtitleBurnPolicy,
-            SubtitleRendering, derive_effective_playback_policy,
+            AbrSupportType, AssComplexitySupport, ClientKind, ClientPlaybackProfile,
+            DefaultSubtitlePolicy, EffectivePlaybackPolicy, ForcedSubtitlePolicy,
+            ImageSubtitleSupport, NetworkClass, NetworkPlaybackPolicy, QualityMode,
+            ServerPlaybackPolicy, SubtitleBurnPolicy, SubtitleRendering, UnknownPerformancePolicy,
+            derive_effective_playback_policy,
         },
         range::{
             DirectFileBody, DirectReadMetricLabels, build_direct_file_response, content_type_for,
@@ -294,8 +302,24 @@ pub struct ClientCapabilities {
     pub subtitle_mode: Option<String>,
     pub preferred_subtitle_language: Option<String>,
     pub preferred_subtitle_title: Option<String>,
+    #[serde(alias = "qualityMode")]
     pub quality_mode: Option<String>,
+    #[serde(alias = "fixedBitrateBps")]
+    pub fixed_bitrate_bps: Option<i64>,
+    #[serde(alias = "fixedResolution")]
+    pub fixed_resolution: Option<String>,
+    #[serde(alias = "automaticMinBitrateBps")]
+    pub automatic_min_bitrate_bps: Option<i64>,
+    #[serde(alias = "automaticMaxBitrateBps")]
+    pub automatic_max_bitrate_bps: Option<i64>,
+    #[serde(alias = "automaticMinResolution")]
+    pub automatic_min_resolution: Option<String>,
+    #[serde(alias = "automaticMaxResolution")]
+    pub automatic_max_resolution: Option<String>,
+    #[serde(alias = "abrSupportType")]
+    pub abr_support_type: Option<String>,
     pub app_version: Option<String>,
+    #[serde(alias = "maxBitrateBps")]
     pub max_bitrate_bps: Option<i64>,
 }
 
@@ -553,6 +577,14 @@ pub async fn play(
         network_class,
         hardware_capabilities,
     );
+    let hardware_host_fingerprint = state.hardware_host_fingerprint.read().await.clone();
+    if let Some(host_fingerprint) = hardware_host_fingerprint.as_deref() {
+        effective_policy.performance_envelopes =
+            load_playback_performance_envelopes(&state.db_pool, host_fingerprint)
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?;
+        record_playback_performance_envelopes(&effective_policy.performance_envelopes);
+    }
     effective_policy.active_video_transcodes = active_video_transcode_count(&state).await?;
     let start_position_seconds = validated_start_position_seconds(body.start_position_seconds)?;
     let subtitle_mode = body
@@ -567,7 +599,7 @@ pub async fn play(
         .preferred_subtitle_title
         .clone()
         .or_else(|| caps.preferred_subtitle_title.clone());
-    let playback_plan = plan_playback(
+    let mut playback_plan = plan_playback(
         &selected.id,
         &media_capabilities,
         PlaybackSelection {
@@ -580,6 +612,20 @@ pub async fn play(
         },
         &client_profile,
         &effective_policy,
+    );
+    if let Some(host_fingerprint) = hardware_host_fingerprint.as_deref() {
+        state
+            .playback_performance_probes
+            .queue_missing_workload_probe(
+                state.db_pool.clone(),
+                selected.path.clone(),
+                host_fingerprint.to_string(),
+                &mut playback_plan,
+            );
+    }
+    record_playback_feasibility_for_plan(
+        &playback_plan,
+        client_kind_label(&client_profile.client_kind),
     );
     if !playback_plan.playable {
         let error_code = playback_error_code_for_plan(&playback_plan);
@@ -1076,6 +1122,13 @@ fn default_capabilities(
         preferred_subtitle_language: None,
         preferred_subtitle_title: None,
         quality_mode: Some("fixed".to_string()),
+        fixed_bitrate_bps: max_bitrate,
+        fixed_resolution: Some(profile.max_resolution.clone()),
+        automatic_min_bitrate_bps: Some(800_000),
+        automatic_max_bitrate_bps: max_bitrate,
+        automatic_min_resolution: Some("360p".to_string()),
+        automatic_max_resolution: Some(profile.max_resolution.clone()),
+        abr_support_type: Some("hls_js".to_string()),
         app_version: None,
         max_bitrate_bps: max_bitrate,
     }
@@ -1250,6 +1303,40 @@ fn client_playback_profile_from_caps(caps: &ClientCapabilities) -> ClientPlaybac
     if let Some(value) = caps.quality_mode.as_deref() {
         profile.quality_mode = quality_mode(value);
     }
+    profile.fixed_bitrate_bps = positive_bitrate_cap(caps.fixed_bitrate_bps)
+        .or_else(|| {
+            (profile.quality_mode == QualityMode::Fixed)
+                .then_some(profile.max_bitrate_bps)
+                .flatten()
+        })
+        .or(profile.fixed_bitrate_bps);
+    profile.fixed_resolution = caps
+        .fixed_resolution
+        .clone()
+        .and_then(non_unlimited_resolution)
+        .or_else(|| {
+            (profile.quality_mode == QualityMode::Fixed)
+                .then_some(profile.max_resolution.clone())
+                .flatten()
+        })
+        .or(profile.fixed_resolution);
+    profile.automatic_min_bitrate_bps =
+        positive_bitrate_cap(caps.automatic_min_bitrate_bps).or(profile.automatic_min_bitrate_bps);
+    profile.automatic_max_bitrate_bps =
+        positive_bitrate_cap(caps.automatic_max_bitrate_bps).or(profile.automatic_max_bitrate_bps);
+    profile.automatic_min_resolution = caps
+        .automatic_min_resolution
+        .clone()
+        .and_then(non_unlimited_resolution)
+        .or(profile.automatic_min_resolution);
+    profile.automatic_max_resolution = caps
+        .automatic_max_resolution
+        .clone()
+        .and_then(non_unlimited_resolution)
+        .or(profile.automatic_max_resolution);
+    if let Some(value) = caps.abr_support_type.as_deref() {
+        profile.abr_support_type = abr_support_type(value);
+    }
     profile.app_version = caps.app_version.clone();
     profile
 }
@@ -1289,6 +1376,10 @@ fn effective_playback_policy_from_config(
         hardware_fallback: config.hardware_fallback.clone(),
         force_sdr_output: config.force_sdr_output,
         hardware_capabilities,
+        unknown_performance_policy: UnknownPerformancePolicy::parse(
+            &config.unknown_performance_policy,
+        ),
+        performance_envelopes: Vec::new(),
     };
     let network_policy = NetworkPlaybackPolicy {
         network_class,
@@ -1328,6 +1419,66 @@ fn hardware_metric_label_from_job_state(job_state: &Value) -> String {
         .unwrap_or_else(|| "software".to_string())
 }
 
+fn record_playback_performance_envelopes(envelopes: &[PlaybackPerformanceEnvelope]) {
+    for envelope in envelopes {
+        let api = envelope.hardware_api.as_deref().unwrap_or("software");
+        let status = format!(
+            "{}_{}",
+            envelope.support_decision.as_str(),
+            envelope.performance_decision.as_str()
+        );
+        PLAYBACK_PERFORMANCE_ENVELOPE_STATUS
+            .with_label_values(&[
+                envelope.workload_class_id.as_str(),
+                api,
+                status.as_str(),
+                envelope.confidence.as_str(),
+            ])
+            .set(1);
+        if let Some(realtime_factor) = envelope.p95_realtime_factor_millis {
+            PLAYBACK_TRANSCODE_REALTIME_FACTOR
+                .with_label_values(&[
+                    envelope.workload_class_id.as_str(),
+                    api,
+                    envelope.pipeline_signature.as_str(),
+                ])
+                .observe(f64::from(realtime_factor) / 1000.0);
+        }
+    }
+}
+
+fn record_playback_feasibility_for_plan(playback_plan: &PlaybackPlan, client_kind: &str) {
+    let Some(feasibility) = playback_plan.feasibility.as_ref() else {
+        return;
+    };
+    let workload_class = playback_plan
+        .workload_class
+        .as_ref()
+        .map(|workload| workload.class_id.as_str())
+        .unwrap_or("none");
+    PLAYBACK_FEASIBILITY_DECISIONS
+        .with_label_values(&[
+            feasibility.action.as_str(),
+            feasibility.reason.as_str(),
+            playback_plan.mode.as_str(),
+            client_kind,
+        ])
+        .inc();
+    match feasibility.action {
+        PlaybackFeasibilityAction::Reject => {
+            PLAYBACK_TRANSCODE_REJECTED
+                .with_label_values(&[feasibility.reason.as_str(), workload_class, client_kind])
+                .inc();
+        }
+        PlaybackFeasibilityAction::DowngradeQuality => {
+            PLAYBACK_TRANSCODE_DOWNGRADED
+                .with_label_values(&[feasibility.reason.as_str(), workload_class, client_kind])
+                .inc();
+        }
+        _ => {}
+    }
+}
+
 fn playback_plan_contract_allowed(settings: &crate::config::Settings) -> bool {
     settings.playback.plan_contract_enabled || settings.environment == RunEnvironment::Development
 }
@@ -1349,6 +1500,8 @@ fn playback_error_code_for_plan(playback_plan: &PlaybackPlan) -> &'static str {
         .any(|reason| reason == "transcode_capacity_exhausted")
     {
         "transcode_capacity_exhausted"
+    } else if let Some(error_code) = playback_feasibility_error_code(playback_plan) {
+        error_code
     } else if playback_plan
         .reasons
         .iter()
@@ -1376,6 +1529,41 @@ fn playback_error_code_for_plan(playback_plan: &PlaybackPlan) -> &'static str {
     } else {
         "playback_not_playable"
     }
+}
+
+fn playback_feasibility_error_code(playback_plan: &PlaybackPlan) -> Option<&'static str> {
+    const FEASIBILITY_ERRORS: &[&str] = &[
+        "hardware_decode_unsupported",
+        "hardware_encode_unsupported",
+        "hardware_filter_unsupported",
+        "software_decode_unsupported",
+        "server_cannot_realtime_transcode_source",
+        "server_cannot_realtime_tonemap_source",
+        "server_cannot_realtime_burn_subtitles",
+        "transcode_performance_unknown_policy_denied",
+        "transcode_capacity_exhausted",
+    ];
+    playback_plan
+        .feasibility
+        .as_ref()
+        .and_then(|feasibility| {
+            FEASIBILITY_ERRORS
+                .iter()
+                .copied()
+                .find(|error| feasibility.reason == *error)
+                .or_else(|| {
+                    FEASIBILITY_ERRORS
+                        .iter()
+                        .copied()
+                        .find(|error| feasibility.reasons.iter().any(|reason| reason == *error))
+                })
+        })
+        .or_else(|| {
+            FEASIBILITY_ERRORS
+                .iter()
+                .copied()
+                .find(|error| playback_plan.reasons.iter().any(|reason| reason == *error))
+        })
 }
 
 fn record_playback_error_labels(
@@ -1943,8 +2131,30 @@ fn plan_summary_from_plan(
         "video_transcode_reason": plan.get("video_transcode_reason").cloned().unwrap_or(Value::Null),
         "tone_map": plan.pointer("/video_output/tone_map").cloned().unwrap_or(Value::Null),
         "hardware_acceleration": plan.get("hardware_acceleration").cloned().unwrap_or(Value::Null),
+        "workload_class": plan.get("workload_class").cloned().unwrap_or(Value::Null),
+        "feasibility": plan.get("feasibility").cloned().unwrap_or(Value::Null),
+        "feasibility_remediation": feasibility_remediation_from_value(plan.get("feasibility")),
         "warnings": plan.get("warnings").cloned().unwrap_or(Value::Array(Vec::new())),
     }))
+}
+
+fn feasibility_remediation_from_value(feasibility: Option<&Value>) -> Value {
+    let reason = feasibility
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("playback_not_playable");
+    let remediation_codes = feasibility
+        .and_then(|value| value.get("remediation_codes"))
+        .and_then(Value::as_array)
+        .map(|codes| {
+            codes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    playback_feasibility_remediation(reason, &remediation_codes)
 }
 
 fn job_snapshot_from_state(job_state: Option<&Value>) -> Option<Value> {
@@ -2058,18 +2268,44 @@ fn redact_playback_diagnostics_text(raw: &str) -> String {
 
 fn playback_not_playable_details(playback_plan: &PlaybackPlan) -> Value {
     let plan_value = serde_json::to_value(playback_plan).ok();
+    let remediation = playback_plan
+        .feasibility
+        .as_ref()
+        .map(|feasibility| {
+            playback_feasibility_remediation(
+                feasibility.reason.as_str(),
+                &feasibility.remediation_codes,
+            )
+        })
+        .unwrap_or_else(|| playback_feasibility_remediation("playback_not_playable", &[]));
     serde_json::json!({
         "reason": playback_plan.decision_reason(),
         "reasons": playback_plan.reasons.clone(),
+        "workload_class": playback_plan.workload_class.clone(),
+        "feasibility": playback_plan.feasibility.clone(),
+        "remediation": remediation,
         "plan_summary": plan_summary_from_plan(plan_value.as_ref(), None),
     })
 }
 
 fn playback_capacity_retry_details(playback_plan: &PlaybackPlan) -> Value {
     let plan_value = serde_json::to_value(playback_plan).ok();
+    let remediation = playback_plan
+        .feasibility
+        .as_ref()
+        .map(|feasibility| {
+            playback_feasibility_remediation(
+                feasibility.reason.as_str(),
+                &feasibility.remediation_codes,
+            )
+        })
+        .unwrap_or_else(|| playback_feasibility_remediation("transcode_capacity_exhausted", &[]));
     serde_json::json!({
         "reason": playback_plan.decision_reason(),
         "reasons": playback_plan.reasons.clone(),
+        "workload_class": playback_plan.workload_class.clone(),
+        "feasibility": playback_plan.feasibility.clone(),
+        "remediation": remediation,
         "plan_summary": plan_summary_from_plan(plan_value.as_ref(), None),
         "retry": {
             "allowed": true,
@@ -2080,6 +2316,109 @@ fn playback_capacity_retry_details(playback_plan: &PlaybackPlan) -> Value {
             "server_recovery_required": true,
             "automatic_client_retry": false
         }
+    })
+}
+
+fn playback_feasibility_remediation(reason: &str, remediation_codes: &[String]) -> Value {
+    let (user_message, admin_message, actions): (&str, &str, Vec<&str>) = match reason {
+        "hardware_decode_unsupported" => (
+            "This server cannot hardware-decode this video on the current GPU/driver path.",
+            "Hardware decode is unsupported for the selected source workload. Verify the GPU driver, FFmpeg hardware decoder, and codec/profile capability row.",
+            vec![
+                "update_gpu_driver",
+                "try_original_quality",
+                "allow_software_decode_or_lower_quality",
+            ],
+        ),
+        "hardware_encode_unsupported" => (
+            "This server cannot hardware-encode the requested output on the current GPU/driver path.",
+            "Hardware encode is unsupported for the selected output codec/profile/resolution. Verify FFmpeg encoder support and platform-specific encoder limits.",
+            vec![
+                "update_gpu_driver",
+                "lower_quality",
+                "allow_software_encode",
+            ],
+        ),
+        "hardware_filter_unsupported" => (
+            "This server cannot run the required hardware video filters for this playback.",
+            "The selected scale, tone-map, format conversion, or subtitle path is unsupported on the selected hardware API.",
+            vec![
+                "lower_quality",
+                "disable_subtitle_burn_in",
+                "use_software_filter_path",
+            ],
+        ),
+        "software_decode_unsupported" => (
+            "This server cannot decode this video format.",
+            "The selected source codec is not in the server's supported FFmpeg software decode set, and no hardware decoder was selected for this playback.",
+            vec![
+                "try_original_quality",
+                "use_a_client_that_supports_the_source_codec",
+                "replace_or_remux_media",
+            ],
+        ),
+        "server_cannot_realtime_tonemap_source" => (
+            "This server cannot convert this HDR video to SDR in real time.",
+            "The selected HDR tone-map workload is below the realtime performance envelope for this host.",
+            vec![
+                "try_original_quality",
+                "use_hdr_capable_client",
+                "lower_quality",
+                "upgrade_server_hardware",
+            ],
+        ),
+        "server_cannot_realtime_burn_subtitles" => (
+            "This server cannot burn these subtitles into video in real time.",
+            "Subtitle burn-in is below the realtime envelope for the selected source/output workload.",
+            vec![
+                "disable_subtitle_burn_in",
+                "choose_text_subtitles",
+                "lower_quality",
+            ],
+        ),
+        "server_cannot_realtime_transcode_source" => (
+            "This server cannot convert this video in real time.",
+            "The selected transcode workload is below the realtime performance envelope for this host.",
+            vec![
+                "try_original_quality",
+                "lower_quality",
+                "upgrade_server_hardware",
+            ],
+        ),
+        "transcode_performance_unknown_policy_denied" => (
+            "This server has not verified that it can convert this video in real time.",
+            "Unknown workload performance is configured fail-closed. Seed a certification artifact, allow bounded local probes, or explicitly permit best-effort playback.",
+            vec![
+                "try_original_quality",
+                "lower_quality",
+                "enable_certification_seed_or_probe",
+            ],
+        ),
+        "transcode_capacity_exhausted" => (
+            "This server is already busy converting other videos.",
+            "Playback transcode capacity admission rejected this request before starting FFmpeg.",
+            vec![
+                "retry_later",
+                "try_original_quality",
+                "increase_transcode_capacity",
+            ],
+        ),
+        _ => (
+            "This server cannot play this item with the requested settings.",
+            "Playback planning returned no feasible direct, remux, transcode, fallback, or downgrade path.",
+            vec![
+                "try_original_quality",
+                "lower_quality",
+                "check_server_playback_settings",
+            ],
+        ),
+    };
+    serde_json::json!({
+        "user_message": user_message,
+        "admin_message": admin_message,
+        "reason": reason,
+        "remediation_codes": remediation_codes,
+        "suggested_actions": actions,
     })
 }
 
@@ -2268,6 +2607,19 @@ fn quality_mode(value: &str) -> QualityMode {
         "fixed" => QualityMode::Fixed,
         _ => QualityMode::Original,
     }
+}
+
+fn abr_support_type(value: &str) -> AbrSupportType {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native_hls" | "native" | "avplayer" | "exoplayer" => AbrSupportType::NativeHls,
+        "hls_js" | "hlsjs" | "hls.js" | "web" => AbrSupportType::HlsJs,
+        "mpv" | "libmpv" => AbrSupportType::Mpv,
+        _ => AbrSupportType::None,
+    }
+}
+
+fn non_unlimited_resolution(value: String) -> Option<String> {
+    (!is_unlimited_resolution(&value)).then_some(value)
 }
 
 fn min_resolution(a: &str, b: &str) -> String {
@@ -2870,6 +3222,17 @@ pub async fn master_playlist(
         }
     };
     let mut playlist_body = content;
+    let adaptive_ladder_plan = adaptive_ladder_plan_from_plan_value(playback_plan_json.as_ref());
+    if let Some(ladder) = adaptive_ladder_plan.as_ref() {
+        playlist_body = normalize_adaptive_master_playlist_metadata(&playlist_body, ladder);
+        if let Err(err) = validate_adaptive_master_playlist_metadata(&playlist_body, ladder) {
+            tracing::warn!(
+                session = %session_id,
+                error = %err,
+                "adaptive master playlist metadata failed validation"
+            );
+        }
+    }
     if !handle.subtitles.is_empty() {
         let renditions = build_subtitle_renditions(&handle.subtitles, &handle.temp_dir).await;
         if !renditions.is_empty() {
@@ -3481,6 +3844,150 @@ fn rewrite_playlist_with_token(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn adaptive_ladder_plan_from_plan_value(
+    playback_plan: Option<&Value>,
+) -> Option<AdaptiveLadderPlan> {
+    playback_plan
+        .and_then(|plan| plan.get("adaptive_ladder"))
+        .cloned()
+        .and_then(|ladder| serde_json::from_value::<AdaptiveLadderPlan>(ladder).ok())
+}
+
+fn normalize_adaptive_master_playlist_metadata(
+    content: &str,
+    ladder: &AdaptiveLadderPlan,
+) -> String {
+    let mut rung_index = 0_usize;
+    content
+        .lines()
+        .map(|line| {
+            let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") else {
+                return line.to_string();
+            };
+            let Some(rung) = ladder.rungs.get(rung_index) else {
+                return line.to_string();
+            };
+            rung_index += 1;
+            format!(
+                "#EXT-X-STREAM-INF:{}",
+                normalized_stream_inf_attributes(attrs, rung)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_adaptive_master_playlist_metadata(
+    content: &str,
+    ladder: &AdaptiveLadderPlan,
+) -> Result<(), String> {
+    let stream_lines = content
+        .lines()
+        .filter_map(|line| line.strip_prefix("#EXT-X-STREAM-INF:"))
+        .collect::<Vec<_>>();
+    if stream_lines.len() != ladder.rungs.len() {
+        return Err(format!(
+            "variant_count_mismatch:{}:{}",
+            stream_lines.len(),
+            ladder.rungs.len()
+        ));
+    }
+    for (attrs, rung) in stream_lines.into_iter().zip(&ladder.rungs) {
+        let parsed = parse_hls_attributes(attrs);
+        require_hls_attr(&parsed, "BANDWIDTH", &rung.bandwidth_bps.to_string())?;
+        require_hls_attr(
+            &parsed,
+            "AVERAGE-BANDWIDTH",
+            &rung.average_bandwidth_bps.to_string(),
+        )?;
+        require_hls_attr(&parsed, "RESOLUTION", &rung.resolution)?;
+        require_hls_attr(&parsed, "CODECS", &format!("\"{}\"", rung.codecs))?;
+        if let Some(frame_rate) = rung.frame_rate.as_deref() {
+            require_hls_attr(&parsed, "FRAME-RATE", frame_rate)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalized_stream_inf_attributes(attrs: &str, rung: &AdaptiveRungPlan) -> String {
+    let mut parsed = parse_hls_attributes(attrs);
+    upsert_hls_attr(&mut parsed, "BANDWIDTH", rung.bandwidth_bps.to_string());
+    upsert_hls_attr(
+        &mut parsed,
+        "AVERAGE-BANDWIDTH",
+        rung.average_bandwidth_bps.to_string(),
+    );
+    upsert_hls_attr(&mut parsed, "RESOLUTION", rung.resolution.clone());
+    upsert_hls_attr(&mut parsed, "CODECS", format!("\"{}\"", rung.codecs));
+    if let Some(frame_rate) = rung.frame_rate.as_deref() {
+        upsert_hls_attr(&mut parsed, "FRAME-RATE", frame_rate.to_string());
+    }
+    parsed
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_hls_attributes(attrs: &str) -> Vec<(String, String)> {
+    split_hls_attribute_list(attrs)
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key.to_ascii_uppercase(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn split_hls_attribute_list(attrs: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in attrs.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            ',' if !quoted => {
+                if !current.trim().is_empty() {
+                    parts.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn upsert_hls_attr(attrs: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = attrs
+        .iter_mut()
+        .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+    {
+        *existing = value;
+    } else {
+        attrs.push((key.to_string(), value));
+    }
+}
+
+fn require_hls_attr(attrs: &[(String, String)], key: &str, expected: &str) -> Result<(), String> {
+    match attrs
+        .iter()
+        .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.as_str())
+    {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!("{key}_mismatch:{actual}:{expected}")),
+        None => Err(format!("{key}_missing")),
+    }
 }
 
 fn rewrite_hls_uri_attributes(
@@ -4320,7 +4827,10 @@ pub async fn seek_transcode(
 mod tests {
     use super::*;
     use crate::playback::plan::{
-        CompatibilityReport, HdrAction, PLAYBACK_PLAN_VERSION, SeekBehavior, StreamAction,
+        AdaptiveAudioStrategy, CompatibilityReport, HdrAction, PLAYBACK_PLAN_VERSION,
+        PlaybackFeasibilityAction, PlaybackFeasibilityDecision, PlaybackPerformanceConfidence,
+        PlaybackPerformanceDecision, PlaybackSupportDecision, SeekBehavior, StreamAction,
+        VideoFrameRateMode, VideoFrameRatePlan, VideoOutputPlan,
     };
 
     fn phase13_test_plan(mode: PlaybackMode) -> PlaybackPlan {
@@ -4349,6 +4859,8 @@ mod tests {
             selected_subtitle_track: None,
             hdr_action: HdrAction::None,
             hardware_acceleration: HardwareAccelerationPlan::default(),
+            workload_class: None,
+            feasibility: None,
             audio_output: None,
             video_output: None,
             adaptive_ladder: None,
@@ -4384,6 +4896,226 @@ mod tests {
         let violation = playback_capacity_violation(config, plan, snapshot)
             .unwrap_or_else(|| panic!("expected {resource} capacity violation"));
         assert_eq!(violation.resource, resource);
+    }
+
+    #[test]
+    fn phase20_structured_rejection_uses_feasibility_error_code_and_details() {
+        let mut plan = phase13_test_plan(PlaybackMode::VideoTranscode);
+        plan.playable = false;
+        plan.reasons = vec!["transcode_performance_unknown_policy_denied".to_string()];
+        plan.feasibility = Some(PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: "transcode_performance_unknown_policy_denied".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::Unknown,
+            confidence: PlaybackPerformanceConfidence::Unknown,
+            selected_envelope_id: None,
+            selected_hardware_api: None,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: vec!["transcode_performance_unknown_policy_denied".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: vec!["try_original_quality_or_lower_quality".to_string()],
+            background_probe_queued: false,
+        });
+
+        assert_eq!(
+            playback_error_code_for_plan(&plan),
+            "transcode_performance_unknown_policy_denied"
+        );
+        let details = playback_not_playable_details(&plan);
+        assert_eq!(
+            details.get("reason").and_then(Value::as_str),
+            Some("transcode_performance_unknown_policy_denied")
+        );
+        assert_eq!(
+            details
+                .get("feasibility")
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str),
+            Some("transcode_performance_unknown_policy_denied")
+        );
+        assert_eq!(
+            details
+                .get("plan_summary")
+                .and_then(|value| value.get("feasibility"))
+                .and_then(|value| value.get("action"))
+                .and_then(Value::as_str),
+            Some("reject")
+        );
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("suggested_actions"))
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.first())
+                .and_then(Value::as_str),
+            Some("try_original_quality")
+        );
+        assert_eq!(
+            details
+                .get("plan_summary")
+                .and_then(|value| value.get("feasibility_remediation"))
+                .and_then(|value| value.get("admin_message"))
+                .and_then(Value::as_str),
+            Some(
+                "Unknown workload performance is configured fail-closed. Seed a certification artifact, allow bounded local probes, or explicitly permit best-effort playback."
+            )
+        );
+    }
+
+    #[test]
+    fn phase20_structured_rejection_explains_unsupported_hardware_capability() {
+        let mut plan = phase13_test_plan(PlaybackMode::VideoTranscode);
+        plan.playable = false;
+        plan.reasons = vec!["hardware_decode_unsupported".to_string()];
+        plan.feasibility = Some(PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: "hardware_decode_unsupported".to_string(),
+            support_decision: PlaybackSupportDecision::Unsupported,
+            performance_decision: PlaybackPerformanceDecision::Unknown,
+            confidence: PlaybackPerformanceConfidence::Certified,
+            selected_envelope_id: Some("env-unsupported".to_string()),
+            selected_hardware_api: Some("nvenc".to_string()),
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: Some(2),
+            selected_envelope_sample_count: Some(2),
+            realtime_required_millis: 1000,
+            reasons: vec!["hardware_decode_unsupported".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: vec!["update_driver_or_use_original_quality".to_string()],
+            background_probe_queued: false,
+        });
+
+        assert_eq!(
+            playback_error_code_for_plan(&plan),
+            "hardware_decode_unsupported"
+        );
+        let details = playback_not_playable_details(&plan);
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("suggested_actions"))
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.first())
+                .and_then(Value::as_str),
+            Some("update_gpu_driver")
+        );
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("admin_message"))
+                .and_then(Value::as_str),
+            Some(
+                "Hardware decode is unsupported for the selected source workload. Verify the GPU driver, FFmpeg hardware decoder, and codec/profile capability row."
+            )
+        );
+    }
+
+    #[test]
+    fn phase20_structured_rejection_explains_unsupported_software_decode() {
+        let mut plan = phase13_test_plan(PlaybackMode::VideoTranscode);
+        plan.playable = false;
+        plan.reasons = vec!["software_decode_unsupported".to_string()];
+        plan.feasibility = Some(PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: "software_decode_unsupported".to_string(),
+            support_decision: PlaybackSupportDecision::Unsupported,
+            performance_decision: PlaybackPerformanceDecision::Unknown,
+            confidence: PlaybackPerformanceConfidence::StaticInferred,
+            selected_envelope_id: None,
+            selected_hardware_api: None,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: vec!["software_decode_unsupported".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: vec!["replace_or_remux_media".to_string()],
+            background_probe_queued: false,
+        });
+
+        assert_eq!(
+            playback_error_code_for_plan(&plan),
+            "software_decode_unsupported"
+        );
+        let details = playback_not_playable_details(&plan);
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("user_message"))
+                .and_then(Value::as_str),
+            Some("This server cannot decode this video format.")
+        );
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("suggested_actions"))
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.get(2))
+                .and_then(Value::as_str),
+            Some("replace_or_remux_media")
+        );
+    }
+
+    #[test]
+    fn phase20_structured_rejection_explains_below_realtime_envelope() {
+        let mut plan = phase13_test_plan(PlaybackMode::VideoTranscode);
+        plan.playable = false;
+        plan.reasons = vec!["server_cannot_realtime_tonemap_source".to_string()];
+        plan.feasibility = Some(PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: "server_cannot_realtime_tonemap_source".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::NotRealtime,
+            confidence: PlaybackPerformanceConfidence::Certified,
+            selected_envelope_id: Some("env-not-realtime".to_string()),
+            selected_hardware_api: Some("nvenc".to_string()),
+            selected_envelope_p50_realtime_factor_millis: Some(650),
+            selected_envelope_p95_realtime_factor_millis: Some(500),
+            selected_envelope_startup_latency_ms: Some(2100),
+            selected_envelope_first_segment_latency_ms: Some(3200),
+            selected_envelope_failure_count: Some(1),
+            selected_envelope_sample_count: Some(6),
+            realtime_required_millis: 1000,
+            reasons: vec!["server_cannot_realtime_tonemap_source".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: vec!["use_original_quality_or_lower_quality".to_string()],
+            background_probe_queued: false,
+        });
+
+        assert_eq!(
+            playback_error_code_for_plan(&plan),
+            "server_cannot_realtime_tonemap_source"
+        );
+        let details = playback_not_playable_details(&plan);
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("suggested_actions"))
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.first())
+                .and_then(Value::as_str),
+            Some("try_original_quality")
+        );
+        assert_eq!(
+            details
+                .get("remediation")
+                .and_then(|value| value.get("user_message"))
+                .and_then(Value::as_str),
+            Some("This server cannot convert this HDR video to SDR in real time.")
+        );
     }
 
     #[test]
@@ -4509,6 +5241,104 @@ mod tests {
     }
 
     #[test]
+    fn phase21_adaptive_master_playlist_metadata_is_normalized_and_validated() {
+        let ladder = AdaptiveLadderPlan {
+            rungs: vec![
+                phase21_adaptive_rung("0", 3_128_000, 1280, 720),
+                phase21_adaptive_rung("1", 1_628_000, 854, 480),
+            ],
+            starting_rung_id: "0".to_string(),
+            active_rung_id: "0".to_string(),
+            audio_strategy: AdaptiveAudioStrategy::PerRung,
+            reasons: vec!["phase21_hls_metadata_fixture".to_string()],
+        };
+        let raw = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=1,OLD=YES\nstream_0.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2,CODECS=\"old\"\nstream_1.m3u8\n";
+
+        let normalized = normalize_adaptive_master_playlist_metadata(raw, &ladder);
+
+        validate_adaptive_master_playlist_metadata(&normalized, &ladder)
+            .expect("normalized playlist should pass HLS metadata validation");
+        assert!(normalized.contains("BANDWIDTH=3128000"));
+        assert!(normalized.contains("AVERAGE-BANDWIDTH=2815200"));
+        assert!(normalized.contains("RESOLUTION=1280x720"));
+        assert!(normalized.contains("CODECS=\"avc1.640029,mp4a.40.2\""));
+        assert!(normalized.contains("FRAME-RATE=24"));
+        assert!(normalized.contains("OLD=YES"));
+    }
+
+    #[test]
+    fn phase21_client_capabilities_parse_quality_bounds_and_abr_support() {
+        let caps: ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "client_kind": "web",
+            "qualityMode": "automatic",
+            "abrSupportType": "hls.js",
+            "fixedBitrateBps": 2_000_000,
+            "fixedResolution": "720p",
+            "automaticMinBitrateBps": 800_000,
+            "automaticMaxBitrateBps": 6_000_000,
+            "automaticMinResolution": "360p",
+            "automaticMaxResolution": "1080p",
+            "maxBitrateBps": 8_000_000
+        }))
+        .expect("client capabilities");
+
+        let profile = client_playback_profile_from_caps(&caps);
+
+        assert_eq!(profile.quality_mode, QualityMode::Automatic);
+        assert_eq!(profile.abr_support_type, AbrSupportType::HlsJs);
+        assert_eq!(profile.fixed_bitrate_bps, Some(2_000_000));
+        assert_eq!(profile.fixed_resolution.as_deref(), Some("720p"));
+        assert_eq!(profile.automatic_min_bitrate_bps, Some(800_000));
+        assert_eq!(profile.automatic_max_bitrate_bps, Some(6_000_000));
+        assert_eq!(profile.automatic_min_resolution.as_deref(), Some("360p"));
+        assert_eq!(profile.automatic_max_resolution.as_deref(), Some("1080p"));
+    }
+
+    fn phase21_adaptive_rung(
+        id: &str,
+        bandwidth_bps: i64,
+        width: i32,
+        height: i32,
+    ) -> AdaptiveRungPlan {
+        AdaptiveRungPlan {
+            id: id.to_string(),
+            label: format!("{height}p"),
+            bandwidth_bps,
+            average_bandwidth_bps: bandwidth_bps * 90 / 100,
+            width,
+            height,
+            resolution: format!("{width}x{height}"),
+            codecs: "avc1.640029,mp4a.40.2".to_string(),
+            frame_rate: Some("24".to_string()),
+            video: VideoOutputPlan {
+                codec: "h264".to_string(),
+                encoder: "libx264".to_string(),
+                preset: "veryfast".to_string(),
+                profile: Some("high".to_string()),
+                level: Some("4.1".to_string()),
+                crf: None,
+                bitrate_bps: Some(bandwidth_bps),
+                maxrate_bps: Some(bandwidth_bps),
+                bufsize_bps: Some(bandwidth_bps * 2),
+                pixel_format: Some("yuv420p".to_string()),
+                scale: None,
+                tone_map: None,
+                frame_rate: VideoFrameRatePlan {
+                    mode: VideoFrameRateMode::Source,
+                    source_fps: Some("24".to_string()),
+                    target_fps: None,
+                },
+                gop_frames: Some(96),
+                segment_seconds: "4".to_string(),
+                keyframe_expression: "expr:gte(t,n_forced*4)".to_string(),
+                hls_delivery: Delivery::HlsAdaptiveFmp4,
+                burn_in: None,
+                reasons: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
     fn phase17_hls_subtitle_media_preserves_metadata_and_escapes_attributes() {
         let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nstream_0.m3u8\n";
         let renditions = vec![SubtitleRendition {
@@ -4625,6 +5455,8 @@ mod tests {
             selected_subtitle_track: None,
             hdr_action: HdrAction::Unknown,
             hardware_acceleration: HardwareAccelerationPlan::default(),
+            workload_class: None,
+            feasibility: None,
             audio_output: None,
             video_output: None,
             adaptive_ladder: None,

@@ -3,22 +3,26 @@ use crate::playback::{
     plan::{
         AdaptiveAudioStrategy, AdaptiveLadderPlan, AdaptiveRungPlan, AudioOutputPlan,
         CompatibilityCheck, CompatibilityReport, Delivery, ExpectedOutput,
-        HardwareAccelerationPlan, HdrAction, PLAYBACK_PLAN_VERSION, PlaybackMode, PlaybackPlan,
-        SeekBehavior, StreamAction, SubtitleBurnInMode, SubtitleBurnInPlan, VideoFrameRateMode,
-        VideoFrameRatePlan, VideoOutputPlan, VideoScalePlan, VideoToneMapPlan,
+        HardwareAccelerationPlan, HdrAction, PLAYBACK_PLAN_VERSION, PlaybackFeasibilityAction,
+        PlaybackFeasibilityDecision, PlaybackMode, PlaybackPerformanceConfidence,
+        PlaybackPerformanceDecision, PlaybackPerformanceEnvelope, PlaybackPlan,
+        PlaybackSupportDecision, PlaybackWorkloadClass, SeekBehavior, StreamAction,
+        SubtitleBurnInMode, SubtitleBurnInPlan, VideoFrameRateMode, VideoFrameRatePlan,
+        VideoOutputPlan, VideoScalePlan, VideoToneMapPlan,
     },
     probe::{
         AudioStreamCapabilities, MediaCapabilities, ProbeStatus, SubtitleKind,
-        SubtitleStreamCapabilities, VideoStreamCapabilities,
+        SubtitleStreamCapabilities, VideoStreamCapabilities, canonical_video_codec,
     },
     profile::{
         AssComplexitySupport, ClientKind, ClientPlaybackProfile, DefaultSubtitlePolicy,
         EffectivePlaybackPolicy, ForcedSubtitlePolicy, ImageSubtitleSupport, QualityMode,
-        SubtitleBurnPolicy, SubtitleRendering,
+        SubtitleBurnPolicy, SubtitleRendering, UnknownPerformancePolicy,
     },
 };
 
 const VIDEOTOOLBOX_H264_MIN_OUTPUT_WIDTH: i32 = 640;
+const ADAPTIVE_TRANSCODE_CAPACITY_WEIGHT: u32 = 2;
 const H264_LEVEL_LIMITS: &[H264LevelLimit] = &[
     H264LevelLimit {
         level: 30,
@@ -399,6 +403,9 @@ pub fn plan_playback(
         push_unique(&mut blockers, "subtitle_not_direct_playable");
     }
 
+    let adaptive_delivery = preferred_hls_delivery(client, true);
+    let adaptive_audio_output_candidate =
+        audio.and_then(|audio| planned_audio_output(audio, client, adaptive_delivery));
     let adaptive_ladder_candidate = if adaptive_transcode_can_be_considered(client, policy) {
         match planned_adaptive_ladder(
             media,
@@ -406,7 +413,8 @@ pub fn plan_playback(
             subtitle,
             video_transcode_subtitle_action(subtitle, client),
             hdr_action,
-            preferred_hls_delivery(client, true),
+            adaptive_delivery,
+            adaptive_audio_output_candidate.as_ref(),
             source_bitrate_bps,
             &blockers,
             primary_video_transcode_reason(&blockers).as_deref(),
@@ -430,9 +438,8 @@ pub fn plan_playback(
     }
 
     if let Some(mut adaptive_ladder) = adaptive_ladder_candidate {
-        let video_delivery = preferred_hls_delivery(client, true);
-        let video_audio_output =
-            audio.and_then(|audio| planned_audio_output(audio, client, video_delivery));
+        let video_delivery = adaptive_delivery;
+        let video_audio_output = adaptive_audio_output_candidate;
         let subtitle_action = video_transcode_subtitle_action(subtitle, client);
         let mut video_output = adaptive_ladder.rungs[0].video.clone();
         let (hardware_acceleration, hardware_warnings) =
@@ -444,6 +451,11 @@ pub fn plan_playback(
                     return not_playable_plan(media_file_id, reasons, report);
                 }
             };
+        if !software_decode_supported_for_plan(video, &hardware_acceleration) {
+            let mut reasons = blockers;
+            push_unique(&mut reasons, "software_decode_unsupported");
+            return not_playable_plan(media_file_id, reasons, report);
+        }
         if video_output.encoder != adaptive_ladder.rungs[0].video.encoder {
             for rung in adaptive_ladder.rungs.iter_mut() {
                 rung.video.encoder = video_output.encoder.clone();
@@ -488,14 +500,14 @@ pub fn plan_playback(
         plan.hardware_acceleration = hardware_acceleration;
         plan.warnings = hardware_warnings;
         plan.expected_outputs = hls_expected_outputs_for_plan(&plan);
-        return plan;
+        return apply_runtime_feasibility(plan, media, video, audio, subtitle, policy);
     }
 
     if blockers.is_empty() {
         let mut reasons = vec!["direct_play_all_capabilities_satisfied".to_string()];
         push_hdr_action_reason(&mut reasons, hdr_action);
         push_hdr_detail_reasons(&mut reasons, video, hdr_action);
-        return PlaybackPlan {
+        let plan = PlaybackPlan {
             plan_version: PLAYBACK_PLAN_VERSION,
             mode: PlaybackMode::DirectPlay,
             delivery: Delivery::DirectFile,
@@ -522,12 +534,15 @@ pub fn plan_playback(
             video_output: None,
             adaptive_ladder: None,
             video_transcode_reason: None,
+            workload_class: None,
+            feasibility: None,
             compatibility_report: report,
             reasons,
             warnings: Vec::new(),
             expected_outputs: direct_file_outputs(),
             playable: true,
         };
+        return apply_runtime_feasibility(plan, media, video, audio, subtitle, policy);
     }
 
     let delivery = preferred_hls_delivery(client, false);
@@ -562,7 +577,7 @@ pub fn plan_playback(
             && subtitle.is_none()
             && hls_policy_ok
     }) {
-        return hls_plan(
+        let plan = hls_plan(
             media_file_id,
             PlaybackMode::DirectStream,
             direct_stream_delivery,
@@ -584,6 +599,7 @@ pub fn plan_playback(
             None,
             None,
         );
+        return apply_runtime_feasibility(plan, media, video, audio, subtitle, policy);
     }
 
     let audio_transcode_required = audio
@@ -610,7 +626,7 @@ pub fn plan_playback(
                 push_unique(&mut reasons, reason);
             }
         }
-        return hls_plan(
+        let plan = hls_plan(
             media_file_id,
             PlaybackMode::AudioTranscode,
             delivery,
@@ -628,6 +644,7 @@ pub fn plan_playback(
             None,
             None,
         );
+        return apply_runtime_feasibility(plan, media, video, audio, subtitle, policy);
     }
 
     let subtitle_transcode_required = subtitle
@@ -644,7 +661,7 @@ pub fn plan_playback(
         && subtitle_transcode_required
         && hls_policy_ok
     {
-        return hls_plan(
+        let plan = hls_plan(
             media_file_id,
             PlaybackMode::SubtitleTranscode,
             delivery,
@@ -666,6 +683,7 @@ pub fn plan_playback(
             None,
             None,
         );
+        return apply_runtime_feasibility(plan, media, video, audio, subtitle, policy);
     }
 
     if !policy.allow_video_transcode {
@@ -717,6 +735,11 @@ pub fn plan_playback(
                 return not_playable_plan(media_file_id, reasons, report);
             }
         };
+    if !software_decode_supported_for_plan(video, &hardware_acceleration) {
+        let mut reasons = reasons;
+        push_unique(&mut reasons, "software_decode_unsupported");
+        return not_playable_plan(media_file_id, reasons, report);
+    }
 
     let mut plan = hls_plan(
         media_file_id,
@@ -742,7 +765,7 @@ pub fn plan_playback(
     );
     plan.hardware_acceleration = hardware_acceleration;
     plan.warnings = hardware_warnings;
-    plan
+    apply_runtime_feasibility(plan, media, video, audio, subtitle, policy)
 }
 
 pub fn can_direct_play_container(
@@ -912,6 +935,42 @@ pub fn can_copy_video_to_delivery(video: &VideoStreamCapabilities, delivery: Del
         }
         Delivery::HlsFmp4 | Delivery::HlsAdaptiveFmp4 => matches!(codec, "h264" | "hevc" | "av1"),
     }
+}
+
+fn software_decode_supported_for_plan(
+    video: &VideoStreamCapabilities,
+    hardware_acceleration: &HardwareAccelerationPlan,
+) -> bool {
+    hardware_acceleration.decoder.is_some()
+        || software_video_decode_supported(video.codec.as_deref())
+}
+
+fn software_video_decode_supported(codec: Option<&str>) -> bool {
+    let Some(codec) = codec else {
+        return false;
+    };
+    let codec = canonical_video_codec(codec);
+    matches!(
+        codec.as_str(),
+        "h264"
+            | "hevc"
+            | "av1"
+            | "vp9"
+            | "vp8"
+            | "mpeg2video"
+            | "mpeg4"
+            | "msmpeg4v3"
+            | "vc1"
+            | "prores"
+            | "theora"
+            | "mjpeg"
+            | "jpeg2000"
+            | "h263"
+            | "h263p"
+            | "dnxhd"
+            | "ffv1"
+            | "rawvideo"
+    )
 }
 
 pub fn can_copy_audio_to_delivery(audio: &AudioStreamCapabilities, delivery: Delivery) -> bool {
@@ -1207,6 +1266,8 @@ fn adaptive_transcode_can_be_considered(
 ) -> bool {
     client.quality_mode == QualityMode::Automatic
         && policy.allow_adaptive_transcode
+        && client.abr_support_type.supports_adaptive_hls()
+        && policy.abr_support_type.supports_adaptive_hls()
         && policy.allow_video_transcode
         && !direct_play_original_quality_required(client, policy)
 }
@@ -1226,6 +1287,7 @@ fn planned_adaptive_ladder(
     subtitle_action: StreamAction,
     hdr_action: HdrAction,
     delivery: Delivery,
+    audio_output: Option<&AudioOutputPlan>,
     source_bitrate_bps: i64,
     reasons: &[String],
     primary_reason: Option<&str>,
@@ -1242,8 +1304,21 @@ fn planned_adaptive_ladder(
     let source_bitrate_bps = (source_bitrate_bps > 0)
         .then_some(source_bitrate_bps)
         .ok_or_else(|| "adaptive_ladder_source_bitrate_unknown".to_string())?;
-    let (bitrate_cap_bps, mut ladder_reasons) =
+    let (total_bitrate_cap_bps, mut ladder_reasons) =
         adaptive_bitrate_cap_bps(source_bitrate_bps, policy);
+    let audio_bitrate_bps = audio_output
+        .and_then(|audio| audio.bitrate_bps)
+        .filter(|bitrate| *bitrate > 0)
+        .unwrap_or(0);
+    let max_video_bitrate_bps = total_bitrate_cap_bps.saturating_sub(audio_bitrate_bps);
+    if max_video_bitrate_bps < 250_000 {
+        return Err("adaptive_ladder_bandwidth_cap_too_low".to_string());
+    }
+    let max_height = adaptive_max_height(source_height, policy);
+    let min_height = adaptive_min_height(max_height, policy);
+    let min_total_bitrate_bps = policy
+        .automatic_min_bitrate_bps
+        .filter(|value| *value > 0 && *value <= total_bitrate_cap_bps);
     let frame_rate = planned_frame_rate(video);
     let fps_for_gop = frame_rate
         .target_fps
@@ -1257,18 +1332,28 @@ fn planned_adaptive_ladder(
 
     let mut rungs = Vec::new();
     for (target_height, default_bitrate_bps) in adaptive_default_ladder() {
-        if target_height > source_height {
+        if target_height > max_height {
             continue;
         }
-        let target_bitrate_bps = default_bitrate_bps.min(bitrate_cap_bps);
+        if min_height.is_some_and(|height| target_height < height) {
+            continue;
+        }
+        let target_bitrate_bps = default_bitrate_bps.min(max_video_bitrate_bps);
         if target_bitrate_bps < 250_000 {
             continue;
         }
-        if target_bitrate_bps >= source_bitrate_bps.saturating_mul(95) / 100 {
+        let total_bandwidth_bps = target_bitrate_bps.saturating_add(audio_bitrate_bps);
+        if total_bandwidth_bps > total_bitrate_cap_bps {
+            continue;
+        }
+        if min_total_bitrate_bps.is_some_and(|minimum| total_bandwidth_bps < minimum) {
+            continue;
+        }
+        if total_bandwidth_bps >= source_bitrate_bps.saturating_mul(95) / 100 {
             continue;
         }
         if rungs.last().is_some_and(|previous: &AdaptiveRungPlan| {
-            rungs_too_close(previous.bandwidth_bps, target_bitrate_bps)
+            rungs_too_close(previous.bandwidth_bps, total_bandwidth_bps)
         }) {
             continue;
         }
@@ -1349,12 +1434,18 @@ fn planned_adaptive_ladder(
             burn_in,
             reasons: output_reasons,
         };
+        let codecs = hls_variant_codecs(&video, audio_output);
+        let frame_rate_metadata = hls_variant_frame_rate(&video.frame_rate);
         rungs.push(AdaptiveRungPlan {
             id: rung_id,
             label,
-            bandwidth_bps: target_bitrate_bps,
+            bandwidth_bps: total_bandwidth_bps,
+            average_bandwidth_bps: hls_average_bandwidth_bps(total_bandwidth_bps),
             width: target_width,
             height: output_height,
+            resolution: format!("{}x{}", target_width, output_height),
+            codecs,
+            frame_rate: frame_rate_metadata,
             video,
         });
     }
@@ -1365,6 +1456,12 @@ fn planned_adaptive_ladder(
 
     push_unique(&mut ladder_reasons, "adaptive_ladder_source_aware");
     push_unique(&mut ladder_reasons, "adaptive_audio_strategy_per_rung");
+    if policy.automatic_min_bitrate_bps.is_some() || policy.automatic_min_resolution.is_some() {
+        push_unique(&mut ladder_reasons, "adaptive_ladder_min_quality_applied");
+    }
+    if policy.automatic_max_bitrate_bps.is_some() || policy.automatic_max_resolution.is_some() {
+        push_unique(&mut ladder_reasons, "adaptive_ladder_max_quality_applied");
+    }
     let starting_rung_id = rungs[0].id.clone();
     Ok(AdaptiveLadderPlan {
         rungs,
@@ -1397,6 +1494,10 @@ fn adaptive_bitrate_cap_bps(
         caps.push(value);
         reasons.push("adaptive_client_bitrate_cap_applied".to_string());
     }
+    if let Some(value) = policy.automatic_max_bitrate_bps.filter(|value| *value > 0) {
+        caps.push(value);
+        reasons.push("adaptive_max_bitrate_cap_applied".to_string());
+    }
     if matches!(
         policy.network_class,
         crate::playback::profile::NetworkClass::Wan
@@ -1415,6 +1516,104 @@ fn adaptive_bitrate_cap_bps(
         caps.into_iter().min().unwrap_or(source_bitrate_bps),
         reasons,
     )
+}
+
+fn adaptive_max_height(source_height: i32, policy: &EffectivePlaybackPolicy) -> i32 {
+    [
+        Some(source_height),
+        policy.max_resolution.as_deref().and_then(resolution_height),
+        policy
+            .automatic_max_resolution
+            .as_deref()
+            .and_then(resolution_height),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(source_height)
+}
+
+fn adaptive_min_height(max_height: i32, policy: &EffectivePlaybackPolicy) -> Option<i32> {
+    policy
+        .automatic_min_resolution
+        .as_deref()
+        .and_then(resolution_height)
+        .filter(|height| *height <= max_height)
+}
+
+fn hls_average_bandwidth_bps(bandwidth_bps: i64) -> i64 {
+    bandwidth_bps
+        .saturating_mul(90)
+        .checked_div(100)
+        .unwrap_or(bandwidth_bps)
+}
+
+fn hls_variant_codecs(video: &VideoOutputPlan, audio: Option<&AudioOutputPlan>) -> String {
+    let mut codecs = vec![h264_codec_string(video)];
+    if let Some(audio) = audio.and_then(|audio| hls_audio_codec_string(&audio.codec)) {
+        codecs.push(audio);
+    }
+    codecs.join(",")
+}
+
+fn h264_codec_string(video: &VideoOutputPlan) -> String {
+    format!(
+        "avc1.{}00{}",
+        h264_profile_compatibility_hex(video.profile.as_deref()),
+        h264_level_hex(video.level.as_deref())
+    )
+}
+
+fn h264_profile_compatibility_hex(profile: Option<&str>) -> &'static str {
+    match profile
+        .unwrap_or("high")
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "baseline" | "constrained_baseline" => "42",
+        "main" => "4d",
+        _ => "64",
+    }
+}
+
+fn h264_level_hex(level: Option<&str>) -> String {
+    let raw = level.unwrap_or("4.1").trim();
+    let normalized = raw
+        .split_once('.')
+        .and_then(|(major, minor)| {
+            Some(format!(
+                "{}{}",
+                major.trim().parse::<u8>().ok()?,
+                minor.trim().parse::<u8>().ok()?
+            ))
+        })
+        .or_else(|| raw.parse::<u8>().ok().map(|value| value.to_string()))
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(41);
+    format!("{normalized:02x}")
+}
+
+fn hls_audio_codec_string(codec: &str) -> Option<String> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "aac" => Some("mp4a.40.2".to_string()),
+        "ac3" => Some("ac-3".to_string()),
+        "eac3" => Some("ec-3".to_string()),
+        "opus" => Some("opus".to_string()),
+        "mp3" => Some("mp4a.40.34".to_string()),
+        _ => None,
+    }
+}
+
+fn hls_variant_frame_rate(frame_rate: &VideoFrameRatePlan) -> Option<String> {
+    frame_rate
+        .target_fps
+        .as_deref()
+        .or(frame_rate.source_fps.as_deref())
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .map(format_fps)
 }
 
 fn rungs_too_close(previous_bitrate_bps: i64, next_bitrate_bps: i64) -> bool {
@@ -2165,6 +2364,30 @@ fn not_playable_plan(
         video_output: None,
         adaptive_ladder: None,
         video_transcode_reason: None,
+        workload_class: None,
+        feasibility: Some(PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "playback_not_playable".to_string()),
+            support_decision: PlaybackSupportDecision::Unknown,
+            performance_decision: PlaybackPerformanceDecision::Unknown,
+            confidence: PlaybackPerformanceConfidence::Unknown,
+            selected_envelope_id: None,
+            selected_hardware_api: None,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: reasons.clone(),
+            warnings: Vec::new(),
+            remediation_codes: Vec::new(),
+            background_probe_queued: false,
+        }),
         compatibility_report: report,
         reasons,
         warnings: Vec::new(),
@@ -2230,6 +2453,8 @@ fn hls_plan(
         video_output,
         adaptive_ladder,
         video_transcode_reason,
+        workload_class: None,
+        feasibility: None,
         compatibility_report,
         reasons,
         warnings: Vec::new(),
@@ -2340,13 +2565,12 @@ fn video_transcode_capacity_available(policy: &EffectivePlaybackPolicy) -> bool 
 }
 
 fn adaptive_transcode_capacity_available(policy: &EffectivePlaybackPolicy) -> bool {
-    const ADAPTIVE_TRANSCODE_WEIGHT: u32 = 2;
     policy
         .max_simultaneous_video_transcodes
         .map(|max| {
             policy
                 .active_video_transcodes
-                .saturating_add(ADAPTIVE_TRANSCODE_WEIGHT)
+                .saturating_add(ADAPTIVE_TRANSCODE_CAPACITY_WEIGHT)
                 <= max
         })
         .unwrap_or(true)
@@ -2587,6 +2811,604 @@ fn dolby_vision_profile_direct_playable(video: &VideoStreamCapabilities) -> bool
     matches!(video.dolby_vision_profile, Some(5 | 8) | None)
 }
 
+fn apply_runtime_feasibility(
+    mut plan: PlaybackPlan,
+    media: &MediaCapabilities,
+    video: &VideoStreamCapabilities,
+    audio: Option<&AudioStreamCapabilities>,
+    subtitle: Option<&SubtitleStreamCapabilities>,
+    policy: &EffectivePlaybackPolicy,
+) -> PlaybackPlan {
+    let mut workload = derive_playback_workload_class(media, video, audio, subtitle, &plan);
+    let mut decision = decide_playback_feasibility(&plan, &workload, policy);
+
+    if decision.action == PlaybackFeasibilityAction::Reject
+        && plan.mode == PlaybackMode::AdaptiveTranscode
+        && let Some((rung_id, video_output)) = lower_realtime_safe_adaptive_rung(&plan)
+    {
+        if let Some(ladder) = plan.adaptive_ladder.as_mut() {
+            ladder.starting_rung_id = rung_id.clone();
+            ladder.active_rung_id = rung_id;
+            push_unique(
+                &mut ladder.reasons,
+                "runtime_feasibility_lower_rung_selected",
+            );
+        }
+        plan.video_output = Some(video_output);
+        workload = derive_playback_workload_class(media, video, audio, subtitle, &plan);
+        decision = PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::DowngradeQuality,
+            reason: "downgrade_quality_runtime_feasibility".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::RealtimeMarginal,
+            confidence: PlaybackPerformanceConfidence::StaticInferred,
+            selected_envelope_id: None,
+            selected_hardware_api: plan.hardware_acceleration.api.clone(),
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: vec![
+                "downgrade_quality_runtime_feasibility".to_string(),
+                "lower_rung_expected_realtime_safe".to_string(),
+            ],
+            warnings: vec!["playback_quality_downgraded_for_realtime_feasibility".to_string()],
+            remediation_codes: Vec::new(),
+            background_probe_queued: false,
+        };
+    }
+
+    for warning in &decision.warnings {
+        push_unique(&mut plan.warnings, warning);
+    }
+    for reason in &decision.reasons {
+        push_unique(&mut plan.reasons, reason);
+    }
+    if decision.action == PlaybackFeasibilityAction::SoftwareFallback
+        && plan.hardware_acceleration.enabled
+    {
+        plan.hardware_acceleration.enabled = false;
+        plan.hardware_acceleration.api = None;
+        plan.hardware_acceleration.decoder = None;
+        plan.hardware_acceleration.encoder = None;
+        plan.hardware_acceleration.decode_status = Some("software_fallback".to_string());
+        plan.hardware_acceleration.encode_status = Some("software_fallback".to_string());
+        if let Some(output) = plan.video_output.as_mut() {
+            output.encoder = "libx264".to_string();
+            push_unique(
+                &mut output.reasons,
+                "runtime_feasibility_hardware_to_software_fallback",
+            );
+        }
+    }
+    if decision.action == PlaybackFeasibilityAction::Reject {
+        plan.playable = false;
+    }
+    plan.workload_class = Some(workload);
+    plan.feasibility = Some(decision);
+    plan
+}
+
+fn derive_playback_workload_class(
+    media: &MediaCapabilities,
+    video: &VideoStreamCapabilities,
+    audio: Option<&AudioStreamCapabilities>,
+    subtitle: Option<&SubtitleStreamCapabilities>,
+    plan: &PlaybackPlan,
+) -> PlaybackWorkloadClass {
+    let output = plan.video_output.as_ref().or_else(|| {
+        plan.adaptive_ladder
+            .as_ref()?
+            .rungs
+            .first()
+            .map(|rung| &rung.video)
+    });
+    let output_width = output
+        .and_then(|output| output.scale.as_ref().map(|scale| scale.width))
+        .or(video.width);
+    let output_height = output
+        .and_then(|output| output.scale.as_ref().map(|scale| scale.height))
+        .or(video.height);
+    let output_codec = output.map(|output| output.codec.clone());
+    let output_pixel_format = output.and_then(|output| output.pixel_format.clone());
+    let pipeline_stages = pipeline_stages_for_plan(plan);
+    let pipeline_signature = pipeline_stages.join("+");
+    let mut cost_labels = Vec::new();
+    push_unique(&mut cost_labels, resolution_cost_label(video.height));
+    if video.hdr10 {
+        push_unique(&mut cost_labels, "hdr10");
+    }
+    if video.hdr10_plus {
+        push_unique(&mut cost_labels, "hdr10_plus");
+    }
+    if video.dolby_vision {
+        push_unique(&mut cost_labels, "dolby_vision");
+    }
+    if matches!(plan.hdr_action, HdrAction::ToneMapToSdr) {
+        push_unique(&mut cost_labels, "hdr_tonemap");
+    }
+    if matches!(plan.subtitle_action, StreamAction::BurnIn) {
+        push_unique(&mut cost_labels, subtitle_burn_cost_label(subtitle));
+    }
+    if plan.video_action == StreamAction::Transcode
+        && video.codec.as_deref().is_some_and(|codec| codec == "av1")
+    {
+        push_unique(&mut cost_labels, "av1_source");
+    }
+    if plan.audio_action == StreamAction::Transcode {
+        push_unique(&mut cost_labels, audio_cost_label(audio));
+    }
+    if output_height
+        .zip(video.height)
+        .is_some_and(|(out, src)| out < src)
+    {
+        push_unique(&mut cost_labels, "downscale");
+    }
+
+    let class_id = workload_class_id(
+        plan,
+        video,
+        output_codec.as_deref(),
+        output_height,
+        &cost_labels,
+        &pipeline_signature,
+    );
+
+    PlaybackWorkloadClass {
+        schema_version: 1,
+        class_id,
+        source_container: media.container.canonical.clone(),
+        source_video_codec: video.codec.clone(),
+        source_video_profile: video.profile.clone(),
+        source_bit_depth: video.bit_depth.and_then(i32_to_u8),
+        source_pixel_format: video.pixel_format.clone(),
+        source_width: video.width,
+        source_height: video.height,
+        source_frame_rate: video
+            .frame_rate
+            .map(|frame_rate| format!("{frame_rate:.3}")),
+        source_bitrate_bps: video.bitrate_bps.or(media.overall_bitrate_bps),
+        hdr_action: plan.hdr_action,
+        subtitle_action: plan.subtitle_action,
+        audio_action: plan.audio_action,
+        output_codec,
+        output_width,
+        output_height,
+        output_pixel_format,
+        delivery: plan.delivery,
+        pipeline_signature,
+        pipeline_stages,
+        cost_labels,
+    }
+}
+
+fn decide_playback_feasibility(
+    plan: &PlaybackPlan,
+    workload: &PlaybackWorkloadClass,
+    policy: &EffectivePlaybackPolicy,
+) -> PlaybackFeasibilityDecision {
+    if matches!(
+        plan.mode,
+        PlaybackMode::DirectPlay | PlaybackMode::DirectStream
+    ) {
+        return PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::AllowDirect,
+            reason: "server_transcode_not_required".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::RealtimeSafe,
+            confidence: PlaybackPerformanceConfidence::StaticInferred,
+            selected_envelope_id: None,
+            selected_hardware_api: None,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: vec!["server_transcode_not_required".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: Vec::new(),
+            background_probe_queued: false,
+        };
+    }
+
+    if matches!(
+        plan.mode,
+        PlaybackMode::AudioTranscode | PlaybackMode::SubtitleTranscode
+    ) {
+        return PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::AllowTranscode,
+            reason: "partial_transcode_video_copyable".to_string(),
+            support_decision: PlaybackSupportDecision::Supported,
+            performance_decision: PlaybackPerformanceDecision::RealtimeSafe,
+            confidence: PlaybackPerformanceConfidence::StaticInferred,
+            selected_envelope_id: None,
+            selected_hardware_api: None,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons: vec!["partial_transcode_video_copyable".to_string()],
+            warnings: Vec::new(),
+            remediation_codes: Vec::new(),
+            background_probe_queued: false,
+        };
+    }
+
+    if let Some(envelope) = select_performance_envelope(plan, workload, policy) {
+        return decision_from_envelope(plan, envelope);
+    }
+
+    static_feasibility_decision(plan, workload, policy)
+}
+
+fn decision_from_envelope(
+    plan: &PlaybackPlan,
+    envelope: &PlaybackPerformanceEnvelope,
+) -> PlaybackFeasibilityDecision {
+    let selected_hardware_api = plan.hardware_acceleration.api.clone();
+    let mut reasons = envelope.reasons.clone();
+    let mut warnings = envelope.warnings.clone();
+    let mut remediation_codes = envelope.remediation_codes.clone();
+    let action = match (envelope.support_decision, envelope.performance_decision) {
+        (PlaybackSupportDecision::Unsupported, _) => {
+            if plan
+                .hardware_acceleration
+                .fallback
+                .as_deref()
+                .is_some_and(|fallback| fallback.eq_ignore_ascii_case("software"))
+            {
+                push_unique(&mut reasons, "software_fallback");
+                push_unique(&mut warnings, "hardware_path_unsupported_software_fallback");
+                PlaybackFeasibilityAction::SoftwareFallback
+            } else {
+                push_unique(&mut reasons, "hardware_decode_unsupported");
+                push_unique(
+                    &mut remediation_codes,
+                    "update_driver_or_use_original_quality",
+                );
+                PlaybackFeasibilityAction::Reject
+            }
+        }
+        (_, PlaybackPerformanceDecision::RealtimeSafe) => PlaybackFeasibilityAction::AllowTranscode,
+        (_, PlaybackPerformanceDecision::RealtimeMarginal) => {
+            push_unique(&mut warnings, "transcode_realtime_marginal");
+            PlaybackFeasibilityAction::AllowWithWarning
+        }
+        (_, PlaybackPerformanceDecision::NotRealtime) => {
+            push_unique(&mut reasons, workload_not_realtime_reason(plan));
+            push_unique(
+                &mut remediation_codes,
+                "use_original_quality_or_lower_quality",
+            );
+            PlaybackFeasibilityAction::Reject
+        }
+        (_, PlaybackPerformanceDecision::Unknown) => {
+            push_unique(&mut reasons, "transcode_performance_unknown_policy_denied");
+            push_unique(
+                &mut remediation_codes,
+                "try_original_quality_or_lower_quality",
+            );
+            PlaybackFeasibilityAction::Reject
+        }
+    };
+    let reason = reasons
+        .first()
+        .cloned()
+        .unwrap_or_else(|| action.as_str().to_string());
+    PlaybackFeasibilityDecision {
+        action,
+        reason,
+        support_decision: envelope.support_decision,
+        performance_decision: envelope.performance_decision,
+        confidence: envelope.confidence,
+        selected_envelope_id: Some(envelope.id.clone()),
+        selected_hardware_api,
+        selected_envelope_p50_realtime_factor_millis: envelope.p50_realtime_factor_millis,
+        selected_envelope_p95_realtime_factor_millis: envelope.p95_realtime_factor_millis,
+        selected_envelope_startup_latency_ms: envelope.startup_latency_ms,
+        selected_envelope_first_segment_latency_ms: envelope.first_segment_latency_ms,
+        selected_envelope_failure_count: Some(envelope.failure_count),
+        selected_envelope_sample_count: Some(envelope.sample_count),
+        realtime_required_millis: 1000,
+        reasons,
+        warnings,
+        remediation_codes,
+        background_probe_queued: false,
+    }
+}
+
+fn static_feasibility_decision(
+    plan: &PlaybackPlan,
+    workload: &PlaybackWorkloadClass,
+    policy: &EffectivePlaybackPolicy,
+) -> PlaybackFeasibilityDecision {
+    let selected_hardware_api = plan.hardware_acceleration.api.clone();
+    let mut reasons = Vec::new();
+    let mut warnings = Vec::new();
+    let mut remediation_codes = Vec::new();
+    if static_known_not_realtime(workload) {
+        push_unique(&mut reasons, workload_not_realtime_reason(plan));
+        push_unique(
+            &mut remediation_codes,
+            "use_original_quality_or_lower_quality",
+        );
+        return PlaybackFeasibilityDecision {
+            action: PlaybackFeasibilityAction::Reject,
+            reason: reasons[0].clone(),
+            support_decision: support_decision_for_plan(plan),
+            performance_decision: PlaybackPerformanceDecision::NotRealtime,
+            confidence: PlaybackPerformanceConfidence::StaticInferred,
+            selected_envelope_id: None,
+            selected_hardware_api,
+            selected_envelope_p50_realtime_factor_millis: None,
+            selected_envelope_p95_realtime_factor_millis: None,
+            selected_envelope_startup_latency_ms: None,
+            selected_envelope_first_segment_latency_ms: None,
+            selected_envelope_failure_count: None,
+            selected_envelope_sample_count: None,
+            realtime_required_millis: 1000,
+            reasons,
+            warnings,
+            remediation_codes,
+            background_probe_queued: false,
+        };
+    }
+
+    match policy.unknown_performance_policy {
+        UnknownPerformancePolicy::Deny => {
+            push_unique(&mut reasons, "transcode_performance_unknown_policy_denied");
+            push_unique(
+                &mut remediation_codes,
+                "try_original_quality_or_lower_quality",
+            );
+            PlaybackFeasibilityDecision {
+                action: PlaybackFeasibilityAction::Reject,
+                reason: "transcode_performance_unknown_policy_denied".to_string(),
+                support_decision: support_decision_for_plan(plan),
+                performance_decision: PlaybackPerformanceDecision::Unknown,
+                confidence: PlaybackPerformanceConfidence::Unknown,
+                selected_envelope_id: None,
+                selected_hardware_api,
+                selected_envelope_p50_realtime_factor_millis: None,
+                selected_envelope_p95_realtime_factor_millis: None,
+                selected_envelope_startup_latency_ms: None,
+                selected_envelope_first_segment_latency_ms: None,
+                selected_envelope_failure_count: None,
+                selected_envelope_sample_count: None,
+                realtime_required_millis: 1000,
+                reasons,
+                warnings,
+                remediation_codes,
+                background_probe_queued: false,
+            }
+        }
+        UnknownPerformancePolicy::AllowBestEffort => {
+            push_unique(&mut warnings, "transcode_performance_unknown_best_effort");
+            PlaybackFeasibilityDecision {
+                action: PlaybackFeasibilityAction::AllowWithWarning,
+                reason: "transcode_performance_unknown_best_effort".to_string(),
+                support_decision: support_decision_for_plan(plan),
+                performance_decision: PlaybackPerformanceDecision::Unknown,
+                confidence: PlaybackPerformanceConfidence::Unknown,
+                selected_envelope_id: None,
+                selected_hardware_api,
+                selected_envelope_p50_realtime_factor_millis: None,
+                selected_envelope_p95_realtime_factor_millis: None,
+                selected_envelope_startup_latency_ms: None,
+                selected_envelope_first_segment_latency_ms: None,
+                selected_envelope_failure_count: None,
+                selected_envelope_sample_count: None,
+                realtime_required_millis: 1000,
+                reasons: vec!["transcode_performance_unknown_best_effort".to_string()],
+                warnings,
+                remediation_codes,
+                background_probe_queued: false,
+            }
+        }
+    }
+}
+
+fn select_performance_envelope<'a>(
+    plan: &PlaybackPlan,
+    workload: &PlaybackWorkloadClass,
+    policy: &'a EffectivePlaybackPolicy,
+) -> Option<&'a PlaybackPerformanceEnvelope> {
+    let selected_api = plan.hardware_acceleration.api.as_deref();
+    policy
+        .performance_envelopes
+        .iter()
+        .filter(|envelope| envelope.workload_class_id == workload.class_id)
+        .filter(|envelope| envelope.pipeline_signature == workload.pipeline_signature)
+        .filter(|envelope| {
+            envelope.hardware_api.as_deref().is_none()
+                || envelope.hardware_api.as_deref() == selected_api
+        })
+        .max_by_key(|envelope| confidence_rank(envelope.confidence))
+}
+
+fn confidence_rank(confidence: PlaybackPerformanceConfidence) -> i32 {
+    match confidence {
+        PlaybackPerformanceConfidence::Certified => 4,
+        PlaybackPerformanceConfidence::LocalBenchmark => 3,
+        PlaybackPerformanceConfidence::LiveObserved => 2,
+        PlaybackPerformanceConfidence::StaticInferred => 1,
+        PlaybackPerformanceConfidence::Unknown => 0,
+    }
+}
+
+fn static_known_not_realtime(workload: &PlaybackWorkloadClass) -> bool {
+    workload.cost_labels.iter().any(|label| label == "8k")
+}
+
+fn support_decision_for_plan(plan: &PlaybackPlan) -> PlaybackSupportDecision {
+    if !plan.hardware_acceleration.enabled {
+        PlaybackSupportDecision::SoftwareOnly
+    } else if plan
+        .hardware_acceleration
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("unsupported"))
+    {
+        PlaybackSupportDecision::MixedFallback
+    } else {
+        PlaybackSupportDecision::Supported
+    }
+}
+
+fn workload_not_realtime_reason(plan: &PlaybackPlan) -> &'static str {
+    if matches!(plan.hdr_action, HdrAction::ToneMapToSdr) {
+        "server_cannot_realtime_tonemap_source"
+    } else if plan.subtitle_action == StreamAction::BurnIn {
+        "server_cannot_realtime_burn_subtitles"
+    } else {
+        "server_cannot_realtime_transcode_source"
+    }
+}
+
+fn pipeline_stages_for_plan(plan: &PlaybackPlan) -> Vec<String> {
+    if plan.video_action != StreamAction::Transcode {
+        return vec!["video_copy".to_string()];
+    }
+    let mut stages = Vec::new();
+    if plan.hardware_acceleration.decoder.is_some() {
+        stages.push("hardware_decode".to_string());
+    } else {
+        stages.push("software_decode".to_string());
+    }
+    if plan
+        .video_output
+        .as_ref()
+        .is_some_and(video_filter_graph_requires_software)
+    {
+        stages.push("software_filter".to_string());
+    }
+    if plan.hardware_acceleration.encoder.is_some() {
+        stages.push("hardware_encode".to_string());
+    } else {
+        stages.push("software_encode".to_string());
+    }
+    if plan.audio_action == StreamAction::Transcode {
+        stages.push("audio_transcode".to_string());
+    }
+    if plan.subtitle_action == StreamAction::BurnIn {
+        stages.push("subtitle_burn_in".to_string());
+    }
+    stages
+}
+
+fn lower_realtime_safe_adaptive_rung(plan: &PlaybackPlan) -> Option<(String, VideoOutputPlan)> {
+    let ladder = plan.adaptive_ladder.as_ref()?;
+    ladder
+        .rungs
+        .iter()
+        .find(|rung| rung.height <= 1080)
+        .or_else(|| ladder.rungs.last())
+        .map(|rung| (rung.id.clone(), rung.video.clone()))
+}
+
+fn resolution_cost_label(height: Option<i32>) -> &'static str {
+    match height.unwrap_or_default() {
+        height if height >= 4320 => "8k",
+        height if height >= 2160 => "4k",
+        height if height >= 1440 => "1440p",
+        height if height >= 1080 => "1080p",
+        height if height >= 720 => "720p",
+        _ => "sd",
+    }
+}
+
+fn subtitle_burn_cost_label(subtitle: Option<&SubtitleStreamCapabilities>) -> &'static str {
+    match subtitle.map(|subtitle| &subtitle.kind) {
+        Some(SubtitleKind::Image) => "image_subtitle_burn_in",
+        Some(SubtitleKind::Text) => "text_subtitle_burn_in",
+        _ => "subtitle_burn_in",
+    }
+}
+
+fn audio_cost_label(audio: Option<&AudioStreamCapabilities>) -> &'static str {
+    if audio
+        .and_then(|audio| audio.channels)
+        .is_some_and(|channels| channels > 6)
+    {
+        "high_channel_audio_transcode"
+    } else {
+        "audio_transcode"
+    }
+}
+
+fn workload_class_id(
+    plan: &PlaybackPlan,
+    video: &VideoStreamCapabilities,
+    output_codec: Option<&str>,
+    output_height: Option<i32>,
+    cost_labels: &[String],
+    pipeline_signature: &str,
+) -> String {
+    let codec = video.codec.as_deref().unwrap_or("unknown");
+    let source_resolution = resolution_cost_label(video.height);
+    let output_resolution = resolution_cost_label(output_height);
+    let hdr = match plan.hdr_action {
+        HdrAction::ToneMapToSdr => "hdr_tonemap",
+        HdrAction::DirectDolbyVision => "dolby_vision_direct",
+        HdrAction::DirectHdr10Fallback => "hdr10_fallback",
+        HdrAction::Unsupported => "hdr_unsupported",
+        HdrAction::UnknownFailClosed => "hdr_unknown",
+        HdrAction::Direct => "hdr_direct",
+        HdrAction::None | HdrAction::Unknown => "sdr",
+    };
+    let subtitle = match plan.subtitle_action {
+        StreamAction::BurnIn => "sub_burn",
+        StreamAction::ConvertTextToWebvtt => "sub_webvtt",
+        StreamAction::Passthrough | StreamAction::Copy => "sub_copy",
+        StreamAction::Disabled | StreamAction::Drop => "sub_none",
+        StreamAction::Transcode => "sub_transcode",
+    };
+    let labels = if cost_labels.is_empty() {
+        "baseline".to_string()
+    } else {
+        cost_labels
+            .iter()
+            .map(|label| sanitize_class_token(label))
+            .collect::<Vec<_>>()
+            .join("-")
+    };
+    [
+        sanitize_class_token(plan.mode.as_str()),
+        sanitize_class_token(codec),
+        sanitize_class_token(source_resolution),
+        sanitize_class_token(output_codec.unwrap_or("copy")),
+        sanitize_class_token(output_resolution),
+        sanitize_class_token(hdr),
+        sanitize_class_token(subtitle),
+        sanitize_class_token(pipeline_signature),
+        labels,
+    ]
+    .join(":")
+}
+
+fn sanitize_class_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -2603,8 +3425,8 @@ mod tests {
             plan::StreamAction,
             probe::{SubtitleKind, normalize_ffprobe_metadata},
             profile::{
-                ClientPlaybackProfile, NetworkClass, NetworkPlaybackPolicy, ServerPlaybackPolicy,
-                derive_effective_playback_policy,
+                AbrSupportType, ClientPlaybackProfile, NetworkClass, NetworkPlaybackPolicy,
+                ServerPlaybackPolicy, derive_effective_playback_policy,
             },
         },
     };
@@ -2702,6 +3524,149 @@ mod tests {
                   "avg_frame_rate": "60/1",
                   "bit_rate": "11800000",
                   "level": 40
+                },
+                {
+                  "index": 1,
+                  "codec_type": "audio",
+                  "codec_name": "aac",
+                  "channels": 2,
+                  "channel_layout": "stereo",
+                  "sample_rate": "48000",
+                  "bit_rate": "192000"
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
+    fn av1_4k_capabilities() -> MediaCapabilities {
+        capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "matroska,webm",
+                "bit_rate": "32000000",
+                "duration": "30.000000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "av1",
+                  "profile": "Main",
+                  "pix_fmt": "yuv420p10le",
+                  "width": 3840,
+                  "height": 2160,
+                  "avg_frame_rate": "24000/1001",
+                  "bit_rate": "31800000",
+                  "level": 12
+                },
+                {
+                  "index": 1,
+                  "codec_type": "audio",
+                  "codec_name": "opus",
+                  "channels": 6,
+                  "channel_layout": "5.1",
+                  "sample_rate": "48000",
+                  "bit_rate": "384000"
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
+    fn ffv1_mkv_capabilities() -> MediaCapabilities {
+        capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "matroska,webm",
+                "bit_rate": "16000000",
+                "duration": "30.000000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "ffv1",
+                  "pix_fmt": "yuv420p",
+                  "width": 1920,
+                  "height": 1080,
+                  "avg_frame_rate": "24000/1001",
+                  "bit_rate": "15500000"
+                },
+                {
+                  "index": 1,
+                  "codec_type": "audio",
+                  "codec_name": "flac",
+                  "channels": 2,
+                  "channel_layout": "stereo",
+                  "sample_rate": "48000",
+                  "bit_rate": "500000"
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
+    fn vp9_webm_capabilities() -> MediaCapabilities {
+        capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "matroska,webm",
+                "bit_rate": "9000000",
+                "duration": "30.000000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "vp9",
+                  "profile": "Profile 0",
+                  "pix_fmt": "yuv420p",
+                  "width": 1920,
+                  "height": 1080,
+                  "avg_frame_rate": "30000/1001",
+                  "bit_rate": "8500000"
+                },
+                {
+                  "index": 1,
+                  "codec_type": "audio",
+                  "codec_name": "opus",
+                  "channels": 2,
+                  "channel_layout": "stereo",
+                  "sample_rate": "48000",
+                  "bit_rate": "192000"
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
+    fn unsupported_video_codec_capabilities() -> MediaCapabilities {
+        capabilities(
+            r#"
+            {
+              "format": {
+                "format_name": "matroska,webm",
+                "bit_rate": "9000000",
+                "duration": "30.000000"
+              },
+              "streams": [
+                {
+                  "index": 0,
+                  "codec_type": "video",
+                  "codec_name": "unsupported_vendor_codec",
+                  "pix_fmt": "yuv420p",
+                  "width": 1920,
+                  "height": 1080,
+                  "avg_frame_rate": "24000/1001",
+                  "bit_rate": "8500000"
                 },
                 {
                   "index": 1,
@@ -2832,6 +3797,73 @@ mod tests {
         }
     }
 
+    fn video_transcode_policy() -> EffectivePlaybackPolicy {
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(3_000_000);
+        policy
+    }
+
+    fn envelope_for_plan(
+        plan: &PlaybackPlan,
+        support_decision: PlaybackSupportDecision,
+        performance_decision: PlaybackPerformanceDecision,
+        confidence: PlaybackPerformanceConfidence,
+    ) -> PlaybackPerformanceEnvelope {
+        let workload = plan
+            .workload_class
+            .as_ref()
+            .expect("plan should have a workload class");
+        PlaybackPerformanceEnvelope {
+            id: "phase20-envelope".to_string(),
+            host_fingerprint: "host-fixture".to_string(),
+            os_family: "windows".to_string(),
+            os_version: Some("11".to_string()),
+            gpu_vendor: plan
+                .hardware_acceleration
+                .enabled
+                .then(|| "nvidia".to_string()),
+            gpu_model: plan
+                .hardware_acceleration
+                .enabled
+                .then(|| "fixture gpu".to_string()),
+            gpu_driver_version: plan
+                .hardware_acceleration
+                .enabled
+                .then(|| "fixture driver".to_string()),
+            hardware_api: plan.hardware_acceleration.api.clone(),
+            ffmpeg_path: Some("ffmpeg".to_string()),
+            ffmpeg_version: Some("ffmpeg fixture".to_string()),
+            ffmpeg_sha256: Some("sha256:fixture".to_string()),
+            elixir_version: Some("test".to_string()),
+            workload_class_id: workload.class_id.clone(),
+            pipeline_signature: workload.pipeline_signature.clone(),
+            support_decision,
+            performance_decision,
+            confidence,
+            p50_realtime_factor_millis: Some(1_250),
+            p95_realtime_factor_millis: Some(match performance_decision {
+                PlaybackPerformanceDecision::RealtimeSafe => 1_500,
+                PlaybackPerformanceDecision::RealtimeMarginal => 975,
+                PlaybackPerformanceDecision::NotRealtime => 650,
+                PlaybackPerformanceDecision::Unknown => 0,
+            }),
+            startup_latency_ms: Some(350),
+            first_segment_latency_ms: Some(750),
+            failure_count: 0,
+            sample_count: 8,
+            invalidation_fingerprint: "invalidation-fixture".to_string(),
+            last_observed_at: Some("2026-07-01T00:00:00Z".to_string()),
+            reasons: Vec::new(),
+            warnings: Vec::new(),
+            remediation_codes: Vec::new(),
+        }
+    }
+
     #[test]
     fn planner_goldens_from_probe_fixtures_without_filesystem() {
         let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
@@ -2865,6 +3897,445 @@ mod tests {
         assert_eq!(browser_plan.mode, PlaybackMode::DirectStream);
         assert_eq!(browser_plan.video_action, StreamAction::Copy);
         assert_eq!(browser_plan.audio_action, StreamAction::Copy);
+    }
+
+    #[test]
+    fn phase20_weird_codec_direct_plays_when_client_supports_it() {
+        let media = ffv1_mkv_capabilities();
+        let mut client = ClientPlaybackProfile::native_mpv();
+        client.supported_video_codecs.push("ffv1".to_string());
+
+        let plan = plan_playback(
+            "phase20-ffv1-direct-play",
+            &media,
+            PlaybackSelection::default(),
+            &client,
+            &EffectivePlaybackPolicy::default(),
+        );
+
+        assert!(plan.playable, "{:?}", plan.reasons);
+        assert_eq!(plan.mode, PlaybackMode::DirectPlay);
+        assert_eq!(plan.video_action, StreamAction::Passthrough);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(feasibility.action, PlaybackFeasibilityAction::AllowDirect);
+    }
+
+    #[test]
+    fn phase20_weird_codec_uses_software_decode_when_realtime_envelope_is_safe() {
+        let media = vp9_webm_capabilities();
+        let mut policy = video_transcode_policy();
+        policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
+
+        let dry_run = plan_playback(
+            "phase20-vp9-software-decode-dry-run",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+        assert_eq!(dry_run.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(dry_run.hardware_acceleration.decoder, None);
+        assert!(
+            dry_run
+                .workload_class
+                .as_ref()
+                .expect("workload class")
+                .pipeline_stages
+                .contains(&"software_decode".to_string())
+        );
+
+        policy.unknown_performance_policy = UnknownPerformancePolicy::Deny;
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &dry_run,
+            PlaybackSupportDecision::SoftwareOnly,
+            PlaybackPerformanceDecision::RealtimeSafe,
+            PlaybackPerformanceConfidence::Certified,
+        )];
+        let plan = plan_playback(
+            "phase20-vp9-software-decode",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(plan.playable, "{:?}", plan.reasons);
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::AllowTranscode
+        );
+        assert_eq!(
+            feasibility.support_decision,
+            PlaybackSupportDecision::SoftwareOnly
+        );
+    }
+
+    #[test]
+    fn phase20_weird_codec_rejects_cleanly_when_software_decode_is_unsupported() {
+        let media = unsupported_video_codec_capabilities();
+        let mut policy = video_transcode_policy();
+        policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
+
+        let plan = plan_playback(
+            "phase20-unsupported-codec",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(!plan.playable);
+        assert_eq!(plan.video_action, StreamAction::Disabled);
+        assert!(plan.expected_outputs.is_empty());
+        assert!(
+            plan.reasons
+                .contains(&"software_decode_unsupported".to_string()),
+            "{:?}",
+            plan.reasons
+        );
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(feasibility.action, PlaybackFeasibilityAction::Reject);
+        assert!(
+            feasibility
+                .reasons
+                .contains(&"software_decode_unsupported".to_string()),
+            "{:?}",
+            feasibility.reasons
+        );
+    }
+
+    #[test]
+    fn phase20_direct_play_bypasses_unknown_performance_fail_closed_policy() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let policy = EffectivePlaybackPolicy {
+            unknown_performance_policy: UnknownPerformancePolicy::Deny,
+            ..EffectivePlaybackPolicy::default()
+        };
+
+        let plan = plan_playback(
+            "phase20-direct",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::native_mpv(),
+            &policy,
+        );
+
+        assert!(plan.playable);
+        assert_eq!(plan.mode, PlaybackMode::DirectPlay);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(feasibility.action, PlaybackFeasibilityAction::AllowDirect);
+        assert_eq!(feasibility.reason, "server_transcode_not_required");
+    }
+
+    #[test]
+    fn phase20_unknown_video_transcode_performance_can_fail_closed_before_job_start() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let mut policy = video_transcode_policy();
+        policy.unknown_performance_policy = UnknownPerformancePolicy::Deny;
+
+        let plan = plan_playback(
+            "phase20-unknown-denied",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
+        assert!(!plan.playable);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(feasibility.action, PlaybackFeasibilityAction::Reject);
+        assert_eq!(
+            feasibility.reason,
+            "transcode_performance_unknown_policy_denied"
+        );
+        assert!(
+            plan.reasons
+                .contains(&"transcode_performance_unknown_policy_denied".to_string()),
+            "{:?}",
+            plan.reasons
+        );
+    }
+
+    #[test]
+    fn phase20_realtime_safe_envelope_admits_matching_video_transcode() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let policy = video_transcode_policy();
+        let dry_run = plan_playback(
+            "phase20-envelope-dry-run",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+        assert_eq!(dry_run.mode, PlaybackMode::VideoTranscode);
+
+        let mut policy = policy;
+        policy.unknown_performance_policy = UnknownPerformancePolicy::Deny;
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &dry_run,
+            PlaybackSupportDecision::Supported,
+            PlaybackPerformanceDecision::RealtimeSafe,
+            PlaybackPerformanceConfidence::Certified,
+        )];
+
+        let plan = plan_playback(
+            "phase20-envelope-admitted",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(plan.playable, "{:?}", plan.reasons);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::AllowTranscode
+        );
+        assert_eq!(
+            feasibility.selected_envelope_id.as_deref(),
+            Some("phase20-envelope")
+        );
+        assert_eq!(
+            feasibility.confidence,
+            PlaybackPerformanceConfidence::Certified
+        );
+    }
+
+    #[test]
+    fn phase20_not_realtime_tonemap_envelope_rejects_before_transcode_job() {
+        let media = capabilities(include_str!("fixtures/hevc_hdr_pgs.json"));
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            force_sdr_output: true,
+            max_resolution: Some("1080p".to_string()),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(50_000_000);
+        let selection = PlaybackSelection {
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            start_position_seconds: None,
+            ..PlaybackSelection::default()
+        };
+        let dry_run = plan_playback(
+            "phase20-tonemap-dry-run",
+            &media,
+            selection.clone(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+        assert_eq!(dry_run.mode, PlaybackMode::VideoTranscode);
+        assert!(matches!(dry_run.hdr_action, HdrAction::ToneMapToSdr));
+
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &dry_run,
+            PlaybackSupportDecision::Supported,
+            PlaybackPerformanceDecision::NotRealtime,
+            PlaybackPerformanceConfidence::Certified,
+        )];
+
+        let plan = plan_playback(
+            "phase20-tonemap-rejected",
+            &media,
+            selection,
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(!plan.playable);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(feasibility.action, PlaybackFeasibilityAction::Reject);
+        assert_eq!(feasibility.reason, "server_cannot_realtime_tonemap_source");
+        assert!(
+            plan.reasons
+                .contains(&"server_cannot_realtime_tonemap_source".to_string()),
+            "{:?}",
+            plan.reasons
+        );
+    }
+
+    #[test]
+    fn phase20_unsupported_hardware_envelope_falls_back_to_software_when_allowed() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            hardware_capabilities: nvenc_capabilities(),
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.max_bitrate_bps = Some(3_000_000);
+        let dry_run = plan_playback(
+            "phase20-hardware-fallback-dry-run",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+        assert!(dry_run.hardware_acceleration.enabled);
+        assert_eq!(dry_run.hardware_acceleration.api.as_deref(), Some("nvenc"));
+
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &dry_run,
+            PlaybackSupportDecision::Unsupported,
+            PlaybackPerformanceDecision::Unknown,
+            PlaybackPerformanceConfidence::Certified,
+        )];
+
+        let plan = plan_playback(
+            "phase20-hardware-fallback",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(plan.playable, "{:?}", plan.reasons);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::SoftwareFallback
+        );
+        assert!(!plan.hardware_acceleration.enabled);
+        assert_eq!(
+            plan.video_output
+                .as_ref()
+                .map(|output| output.encoder.as_str()),
+            Some("libx264")
+        );
+        assert!(
+            plan.warnings
+                .contains(&"hardware_path_unsupported_software_fallback".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn phase20_non_av1_gpu_keeps_hardware_h264_encode_with_software_av1_decode_when_safe() {
+        let media = av1_4k_capabilities();
+        let mut policy = video_transcode_policy();
+        policy.hardware_acceleration = "nvenc".to_string();
+        policy.hardware_capabilities = nvenc_capabilities();
+        policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
+
+        let dry_run = plan_playback(
+            "phase20-av1-software-decode-hardware-encode-dry-run",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+        assert_eq!(dry_run.mode, PlaybackMode::VideoTranscode);
+        assert_eq!(
+            dry_run.hardware_acceleration.encoder.as_deref(),
+            Some("h264_nvenc")
+        );
+        assert_eq!(dry_run.hardware_acceleration.decoder, None);
+        let workload = dry_run
+            .workload_class
+            .as_ref()
+            .expect("dry run should classify workload");
+        assert!(workload.cost_labels.contains(&"av1_source".to_string()));
+        assert!(
+            workload
+                .pipeline_stages
+                .contains(&"software_decode".to_string())
+        );
+        assert!(
+            workload
+                .pipeline_stages
+                .contains(&"hardware_encode".to_string())
+        );
+
+        policy.unknown_performance_policy = UnknownPerformancePolicy::Deny;
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &dry_run,
+            PlaybackSupportDecision::MixedFallback,
+            PlaybackPerformanceDecision::RealtimeSafe,
+            PlaybackPerformanceConfidence::Certified,
+        )];
+        let plan = plan_playback(
+            "phase20-av1-software-decode-hardware-encode",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        assert!(plan.playable, "{:?}", plan.reasons);
+        assert_eq!(
+            plan.hardware_acceleration.encoder.as_deref(),
+            Some("h264_nvenc")
+        );
+        assert_eq!(plan.hardware_acceleration.decoder, None);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::AllowTranscode
+        );
+        assert_eq!(
+            feasibility.support_decision,
+            PlaybackSupportDecision::MixedFallback
+        );
+    }
+
+    #[test]
+    fn phase20_static_8k_adaptive_source_downgrades_to_lower_rung_before_job_start() {
+        let mut media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let video = media.video_streams.first_mut().unwrap();
+        video.width = Some(7680);
+        video.height = Some(4320);
+        video.bitrate_bps = Some(60_000_000);
+        media.overall_bitrate_bps = Some(60_000_000);
+        let mut client = ClientPlaybackProfile::browser_like();
+        client.quality_mode = QualityMode::Automatic;
+        client.max_bitrate_bps = Some(60_000_000);
+        let mut policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            allow_adaptive_transcode: true,
+            max_bitrate_bps: Some(60_000_000),
+            abr_support_type: AbrSupportType::HlsJs,
+            ..EffectivePlaybackPolicy::default()
+        };
+        policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
+
+        let plan = plan_playback(
+            "phase20-adaptive-downgrade",
+            &media,
+            PlaybackSelection::default(),
+            &client,
+            &policy,
+        );
+
+        assert_eq!(plan.mode, PlaybackMode::AdaptiveTranscode);
+        assert!(plan.playable, "{:?}", plan.reasons);
+        let feasibility = plan.feasibility.as_ref().expect("feasibility decision");
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::DowngradeQuality
+        );
+        let ladder = plan.adaptive_ladder.as_ref().expect("adaptive ladder");
+        let active = ladder
+            .rungs
+            .iter()
+            .find(|rung| rung.id == ladder.active_rung_id)
+            .expect("active rung");
+        assert!(active.height <= 1080, "{active:?}");
+        assert!(
+            plan.warnings
+                .contains(&"playback_quality_downgraded_for_realtime_feasibility".to_string()),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[test]
@@ -3131,6 +4602,7 @@ mod tests {
             allow_video_transcode: true,
             allow_adaptive_transcode: true,
             max_bitrate_bps: Some(50_000_000),
+            abr_support_type: AbrSupportType::HlsJs,
             ..EffectivePlaybackPolicy::default()
         };
         policy.video_encoder_level = "4.1".to_string();
@@ -4082,6 +5554,7 @@ mod tests {
             allow_video_transcode: true,
             allow_adaptive_transcode: true,
             max_bitrate_bps: Some(50_000_000),
+            abr_support_type: AbrSupportType::HlsJs,
             ..EffectivePlaybackPolicy::default()
         };
 
@@ -4196,6 +5669,186 @@ mod tests {
                 .contains(&"adaptive_transcode_capacity_exhausted".to_string()),
             "{:?}",
             exhausted_plan.reasons
+        );
+    }
+
+    #[test]
+    fn phase21_adaptive_requires_explicit_automatic_quality_and_abr_support() {
+        let hevc_hdr_pgs = capabilities(include_str!("fixtures/hevc_hdr_pgs.json"));
+        let fixed = ClientPlaybackProfile::browser_like();
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            allow_adaptive_transcode: true,
+            max_bitrate_bps: Some(50_000_000),
+            max_resolution: Some("2160p".to_string()),
+            abr_support_type: AbrSupportType::HlsJs,
+            ..EffectivePlaybackPolicy::default()
+        };
+
+        let fixed_plan = plan_playback(
+            "phase21-fixed-not-adaptive",
+            &hevc_hdr_pgs,
+            PlaybackSelection::default(),
+            &fixed,
+            &policy,
+        );
+        assert_ne!(fixed_plan.mode, PlaybackMode::AdaptiveTranscode);
+        assert!(!fixed_plan.adaptive);
+        assert!(
+            !fixed_plan
+                .reasons
+                .contains(&"adaptive_transcode_automatic_quality_requested".to_string()),
+            "{:?}",
+            fixed_plan.reasons
+        );
+
+        let mut no_abr = fixed.clone();
+        no_abr.quality_mode = QualityMode::Automatic;
+        no_abr.abr_support_type = AbrSupportType::None;
+        let no_abr_plan = plan_playback(
+            "phase21-no-abr-not-adaptive",
+            &hevc_hdr_pgs,
+            PlaybackSelection::default(),
+            &no_abr,
+            &policy,
+        );
+        assert_ne!(no_abr_plan.mode, PlaybackMode::AdaptiveTranscode);
+        assert!(!no_abr_plan.adaptive);
+
+        let mut automatic = fixed;
+        automatic.quality_mode = QualityMode::Automatic;
+        automatic.abr_support_type = AbrSupportType::HlsJs;
+        let automatic_plan = plan_playback(
+            "phase21-automatic-adaptive",
+            &hevc_hdr_pgs,
+            PlaybackSelection::default(),
+            &automatic,
+            &policy,
+        );
+        assert_eq!(automatic_plan.mode, PlaybackMode::AdaptiveTranscode);
+        assert!(automatic_plan.adaptive);
+        assert!(
+            automatic_plan
+                .reasons
+                .contains(&"adaptive_transcode_automatic_quality_requested".to_string())
+        );
+    }
+
+    #[test]
+    fn phase21_fixed_lower_quality_selects_bounded_video_transcode() {
+        let media = capabilities(include_str!("fixtures/h264_aac_mkv.json"));
+        let mut fixed = ClientPlaybackProfile::browser_like();
+        fixed.quality_mode = QualityMode::Fixed;
+        fixed.fixed_resolution = Some("720p".to_string());
+        fixed.fixed_bitrate_bps = Some(2_000_000);
+        let server = ServerPlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            max_resolution: Some("2160p".to_string()),
+            max_simultaneous_video_transcodes: Some(2),
+            ..ServerPlaybackPolicy::default()
+        };
+        let network = NetworkPlaybackPolicy {
+            network_class: NetworkClass::Lan,
+            max_bitrate_bps: None,
+            max_remote_bitrate_bps: None,
+            max_resolution: None,
+            server_upload_cap_bps: None,
+        };
+        let policy = derive_effective_playback_policy(&fixed, &server, &network);
+
+        let plan = plan_playback(
+            "phase21-fixed-lower-quality",
+            &media,
+            PlaybackSelection::default(),
+            &fixed,
+            &policy,
+        );
+
+        assert_eq!(
+            plan.mode,
+            PlaybackMode::VideoTranscode,
+            "{:?}",
+            plan.reasons
+        );
+        let output = plan.video_output.as_ref().expect("video output");
+        assert_eq!(output.scale.as_ref().map(|scale| scale.height), Some(720));
+        assert_eq!(output.bitrate_bps, Some(2_000_000));
+        assert_ne!(plan.mode, PlaybackMode::AdaptiveTranscode);
+    }
+
+    #[test]
+    fn phase21_adaptive_ladder_metadata_respects_source_bounds_and_quality_caps() {
+        let media = capabilities(include_str!("fixtures/hevc_hdr_pgs.json"));
+        let mut automatic = ClientPlaybackProfile::browser_like();
+        automatic.quality_mode = QualityMode::Automatic;
+        automatic.abr_support_type = AbrSupportType::HlsJs;
+        automatic.automatic_min_resolution = Some("480p".to_string());
+        automatic.automatic_max_resolution = Some("1080p".to_string());
+        automatic.automatic_min_bitrate_bps = Some(1_000_000);
+        automatic.automatic_max_bitrate_bps = Some(5_000_000);
+        automatic.max_resolution = Some("2160p".to_string());
+        automatic.max_bitrate_bps = Some(50_000_000);
+        let policy = EffectivePlaybackPolicy {
+            allow_direct_stream: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+            allow_adaptive_transcode: true,
+            max_bitrate_bps: Some(50_000_000),
+            max_resolution: Some("2160p".to_string()),
+            automatic_min_resolution: Some("480p".to_string()),
+            automatic_max_resolution: Some("1080p".to_string()),
+            automatic_min_bitrate_bps: Some(1_000_000),
+            automatic_max_bitrate_bps: Some(5_000_000),
+            abr_support_type: AbrSupportType::HlsJs,
+            ..EffectivePlaybackPolicy::default()
+        };
+
+        let plan = plan_playback(
+            "phase21-adaptive-metadata",
+            &media,
+            PlaybackSelection::default(),
+            &automatic,
+            &policy,
+        );
+
+        assert_eq!(
+            plan.mode,
+            PlaybackMode::AdaptiveTranscode,
+            "{:?}",
+            plan.reasons
+        );
+        let source_height = media
+            .primary_video()
+            .and_then(|video| video.height)
+            .unwrap();
+        let ladder = plan.adaptive_ladder.as_ref().expect("adaptive ladder");
+        assert!(ladder.rungs.len() >= 2, "{ladder:?}");
+        assert!(
+            ladder.rungs.iter().all(|rung| rung.height <= source_height
+                && rung.height <= 1080
+                && rung.height >= 480),
+            "{ladder:?}"
+        );
+        assert!(
+            ladder
+                .rungs
+                .iter()
+                .all(|rung| rung.bandwidth_bps <= 5_000_000),
+            "{ladder:?}"
+        );
+        assert!(
+            ladder.rungs.iter().all(|rung| {
+                rung.average_bandwidth_bps > 0
+                    && rung.average_bandwidth_bps <= rung.bandwidth_bps
+                    && rung.resolution == format!("{}x{}", rung.width, rung.height)
+                    && rung.codecs.contains("avc1.")
+                    && rung.frame_rate.is_some()
+            }),
+            "{ladder:?}"
         );
     }
 

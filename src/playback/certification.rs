@@ -22,9 +22,13 @@ use crate::{
             HardwareReadinessSnapshot, detect_hardware_readiness, parse_ffmpeg_components,
             parse_hwaccels,
         },
-        plan::{Delivery, PlaybackMode, PlaybackPlan, StreamAction, VideoFrameRateMode},
+        performance::performance_envelope_from_certification_case,
+        plan::{
+            Delivery, PlaybackMode, PlaybackPerformanceEnvelope, PlaybackPlan,
+            PlaybackWorkloadClass, StreamAction, VideoFrameRateMode,
+        },
         probe::{MediaCapabilities, normalize_ffprobe_metadata},
-        profile::{ClientPlaybackProfile, EffectivePlaybackPolicy},
+        profile::{ClientPlaybackProfile, EffectivePlaybackPolicy, UnknownPerformancePolicy},
     },
 };
 
@@ -140,6 +144,8 @@ pub struct CertificationReport {
     pub hardware_readiness: Option<HardwareReadinessSnapshot>,
     pub cases: CaseSummary,
     pub performance: PerformanceSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub performance_envelopes: Vec<PlaybackPerformanceEnvelope>,
     pub failure_reasons: Vec<String>,
     pub artifact_digest: Option<String>,
 }
@@ -208,7 +214,11 @@ pub struct CaseReport {
     pub decoder: Option<String>,
     pub realtime_factor: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_class: Option<PlaybackWorkloadClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub performance_gate: Option<PerformanceGateReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_envelope: Option<PlaybackPerformanceEnvelope>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub artifacts: Vec<String>,
@@ -326,6 +336,7 @@ pub async fn run_hardware_certification(
             hardware_readiness: Some(hardware_readiness),
             cases: CaseSummary::default(),
             performance: PerformanceSummary::default(),
+            performance_envelopes: Vec::new(),
             failure_reasons: Vec::new(),
             artifact_digest: None,
         },
@@ -413,6 +424,9 @@ impl CertificationRun {
                     .unwrap_or(speed),
             );
         }
+        if let Some(envelope) = case.performance_envelope.as_ref() {
+            self.report.performance_envelopes.push(envelope.clone());
+        }
         self.report.cases.case_reports.push(case);
     }
 
@@ -429,6 +443,10 @@ impl CertificationRun {
             self.report.status = CertificationStatus::Failed;
         }
         self.report.finished_at = Some(Utc::now());
+        write_json(
+            &self.config.artifact_dir.join("performance-envelopes.json"),
+            &self.report.performance_envelopes,
+        )?;
         self.report.artifact_digest = Some(artifact_tree_digest(
             &self.config.artifact_dir,
             &self.report,
@@ -598,7 +616,9 @@ impl CertificationRun {
             encoder: None,
             decoder: None,
             realtime_factor: None,
+            workload_class: None,
             performance_gate: None,
+            performance_envelope: None,
             errors: Vec::new(),
             warnings: Vec::new(),
             artifacts: Vec::new(),
@@ -668,6 +688,7 @@ impl CertificationRun {
 
         report.mode = Some(plan.mode.as_str().to_string());
         report.delivery = Some(plan.delivery.as_str().to_string());
+        report.workload_class = plan.workload_class.clone();
         let hardware_required = case.require_hardware && plan_requires_video_hardware(&plan);
         report.hardware_required = hardware_required;
         report.encoder = plan.hardware_acceleration.encoder.clone();
@@ -698,6 +719,8 @@ impl CertificationRun {
             .context("hardware HLS output failed")?;
         report.realtime_factor = Some(metrics.realtime_factor);
         report.performance_gate = metrics.performance_gate.clone();
+        report.performance_envelope =
+            performance_envelope_from_certification_case(&self.report, report, &plan);
 
         if hardware_required {
             let command = read_json(case_dir.join("ffmpeg-command.json"))?;
@@ -952,7 +975,9 @@ impl CertificationRun {
             encoder: Some("libx264".to_string()),
             decoder: None,
             realtime_factor: None,
+            workload_class: None,
             performance_gate: None,
+            performance_envelope: None,
             errors: Vec::new(),
             warnings: Vec::new(),
             artifacts: Vec::new(),
@@ -1030,6 +1055,7 @@ impl CertificationRun {
         policy.allow_hardware_decode = false;
         policy.allow_hardware_encode = false;
         policy.hardware_capabilities = HardwareCapabilities::software_only();
+        policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
         let plan = plan_playback(
             "hardware-certification-software-fallback",
             &capabilities,
@@ -1048,8 +1074,11 @@ impl CertificationRun {
             .await?;
         report.mode = Some(plan.mode.as_str().to_string());
         report.delivery = Some(plan.delivery.as_str().to_string());
+        report.workload_class = plan.workload_class.clone();
         report.realtime_factor = Some(metrics.realtime_factor);
         report.performance_gate = metrics.performance_gate;
+        report.performance_envelope =
+            performance_envelope_from_certification_case(&self.report, report, &plan);
         Ok(())
     }
 }
@@ -1897,6 +1926,7 @@ fn certification_effective_policy(
     policy.hardware_fallback = "software".to_string();
     policy.force_sdr_output = true;
     policy.hardware_capabilities = hardware_capabilities.clone();
+    policy.unknown_performance_policy = UnknownPerformancePolicy::AllowBestEffort;
     policy
 }
 
@@ -2383,6 +2413,7 @@ ESCAPED="a \"quoted\" value"
             hardware_readiness: None,
             cases: CaseSummary::default(),
             performance: PerformanceSummary::default(),
+            performance_envelopes: Vec::new(),
             failure_reasons: Vec::new(),
             artifact_digest: None,
         };
@@ -2512,6 +2543,8 @@ ESCAPED="a \"quoted\" value"
             video_output: None,
             adaptive_ladder: None,
             video_transcode_reason: None,
+            workload_class: None,
+            feasibility: None,
             compatibility_report: crate::playback::plan::CompatibilityReport::empty("m"),
             reasons: Vec::new(),
             warnings: Vec::new(),
@@ -2881,6 +2914,7 @@ ESCAPED="a \"quoted\" value"
                 hardware_readiness: None,
                 cases: CaseSummary::default(),
                 performance: PerformanceSummary::default(),
+                performance_envelopes: Vec::new(),
                 failure_reasons: Vec::new(),
                 artifact_digest: None,
             },
@@ -2900,7 +2934,9 @@ ESCAPED="a \"quoted\" value"
             encoder: Some("h264_nvenc".to_string()),
             decoder: Some("cuda".to_string()),
             realtime_factor: None,
+            workload_class: None,
             performance_gate: None,
+            performance_envelope: None,
             errors: vec!["ffmpeg failed".to_string()],
             warnings: Vec::new(),
             artifacts: Vec::new(),
