@@ -187,6 +187,22 @@ pub static PLAYBACK_SESSION_EXPIRATIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["reason"]).expect("counter vec created")
 });
 
+pub static PLAYBACK_CLEANUP_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_cleanup_actions_total",
+        "Playback cleanup actions by target, reason, and result",
+    );
+    IntCounterVec::new(opts, &["target", "reason", "result"]).expect("counter vec created")
+});
+
+pub static PLAYBACK_PROCESS_EXITS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_process_exits_total",
+        "Playback FFmpeg process cleanup exits by reason, method, and result",
+    );
+    IntCounterVec::new(opts, &["reason", "method", "result"]).expect("counter vec created")
+});
+
 pub static PLAYBACK_HARDWARE_READINESS_STATUS: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new(
         "elixir_playback_hardware_readiness_status",
@@ -323,6 +339,12 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(PLAYBACK_SESSION_EXPIRATIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_CLEANUP_ACTIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_PROCESS_EXITS.clone()))
         .ok();
     REGISTRY
         .register(Box::new(PLAYBACK_HARDWARE_READINESS_STATUS.clone()))

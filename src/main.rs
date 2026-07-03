@@ -49,7 +49,10 @@ use elixir_server::playback::{
         HardwareDetectionConfig, HardwarePreference, collect_host_hardware_inventory,
         host_hardware_fingerprint, load_or_detect_hardware_capabilities,
     },
-    performance::seed_playback_performance_envelopes_from_certification_artifacts,
+    performance::{
+        collect_playback_host_identity,
+        seed_playback_performance_envelopes_from_certification_artifacts,
+    },
     start_session_cleanup,
 };
 use elixir_server::runtime::health::{
@@ -207,6 +210,9 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("orchestrator runtime health restore failed: {err}");
     }
+    if let Err(err) = state.transcodes.cleanup_orphan_temp_dirs().await {
+        tracing::warn!("playback temp startup cleanup failed: {err}");
+    }
 
     let app = router(state.clone());
     let listener = TcpListener::bind(addr)
@@ -233,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_post_listener_background_tasks(state: AppState, reconcile_config: ReconcileConfig) {
+    start_playback_host_identity_warmup(state.clone());
     start_playback_hardware_readiness_warmup(state.clone());
 
     // Kick off background periodic scan.
@@ -359,6 +366,48 @@ async fn start_post_listener_background_tasks(state: AppState, reconcile_config:
     }
 }
 
+fn start_playback_host_identity_warmup(state: AppState) {
+    tokio::spawn(async move {
+        let identity = collect_playback_host_identity().await;
+        let host_fingerprint = identity.host_fingerprint.clone();
+        *state.playback_host_fingerprint.write().await = Some(host_fingerprint.clone());
+        if !state
+            .settings
+            .playback
+            .performance_envelope_artifacts
+            .is_empty()
+        {
+            match seed_playback_performance_envelopes_from_certification_artifacts(
+                &state.db_pool,
+                &state.settings.playback.performance_envelope_artifacts,
+                Some(&host_fingerprint),
+            )
+            .await
+            {
+                Ok(summary) => {
+                    tracing::info!(
+                        artifacts_seen = summary.artifacts_seen,
+                        envelopes_seen = summary.envelopes_seen,
+                        envelopes_upserted = summary.envelopes_upserted,
+                        envelopes_skipped_host_mismatch = summary.envelopes_skipped_host_mismatch,
+                        "seeded playback performance envelopes from certification artifacts"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to seed playback performance envelopes from certification artifacts"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            host_fingerprint = %host_fingerprint,
+            "playback host identity warm-up completed"
+        );
+    });
+}
+
 fn start_playback_hardware_readiness_warmup(state: AppState) {
     if !state.settings.playback.hardware_acceleration_enabled {
         return;
@@ -375,38 +424,6 @@ fn start_playback_hardware_readiness_warmup(state: AppState) {
                 let available_apis = capabilities.available_apis.clone();
                 *state.hardware_capabilities.write().await = Some(capabilities);
                 *state.hardware_host_fingerprint.write().await = Some(host_fingerprint);
-                let host_fingerprint = state.hardware_host_fingerprint.read().await.clone();
-                if !state
-                    .settings
-                    .playback
-                    .performance_envelope_artifacts
-                    .is_empty()
-                {
-                    match seed_playback_performance_envelopes_from_certification_artifacts(
-                        &state.db_pool,
-                        &state.settings.playback.performance_envelope_artifacts,
-                        host_fingerprint.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(summary) => {
-                            tracing::info!(
-                                artifacts_seen = summary.artifacts_seen,
-                                envelopes_seen = summary.envelopes_seen,
-                                envelopes_upserted = summary.envelopes_upserted,
-                                envelopes_skipped_host_mismatch =
-                                    summary.envelopes_skipped_host_mismatch,
-                                "seeded playback performance envelopes from certification artifacts"
-                            );
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to seed playback performance envelopes from certification artifacts"
-                            );
-                        }
-                    }
-                }
                 tracing::info!(
                     available_apis = ?available_apis,
                     "playback hardware readiness warm-up completed"

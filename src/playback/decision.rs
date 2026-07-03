@@ -15,7 +15,7 @@ use crate::playback::{
         SubtitleStreamCapabilities, VideoStreamCapabilities, canonical_video_codec,
     },
     profile::{
-        AssComplexitySupport, ClientKind, ClientPlaybackProfile, DefaultSubtitlePolicy,
+        AssComplexitySupport, ClientPlaybackProfile, DefaultSubtitlePolicy,
         EffectivePlaybackPolicy, ForcedSubtitlePolicy, ImageSubtitleSupport, QualityMode,
         SubtitleBurnPolicy, SubtitleRendering, UnknownPerformancePolicy,
     },
@@ -1277,7 +1277,7 @@ fn direct_play_original_quality_required(
     policy: &EffectivePlaybackPolicy,
 ) -> bool {
     client.quality_mode == QualityMode::Original
-        || (client.client_kind == ClientKind::NativeMpv && policy.force_direct_play_for_native_mpv)
+        || (client.direct_play_preferred && policy.force_direct_play_for_native_mpv)
 }
 
 fn planned_adaptive_ladder(
@@ -2091,7 +2091,7 @@ fn video_profile_allowed(video: &VideoStreamCapabilities, client: &ClientPlaybac
     let Some(codec) = video.codec.as_deref() else {
         return false;
     };
-    if !codec.eq_ignore_ascii_case("h264") || client.client_kind == ClientKind::NativeMpv {
+    if !codec.eq_ignore_ascii_case("h264") || !client.strict_h264_profile_limits {
         return true;
     }
     let Some(profile) = video.profile.as_deref() else {
@@ -2107,7 +2107,7 @@ fn video_level_allowed(video: &VideoStreamCapabilities, client: &ClientPlaybackP
     let Some(codec) = video.codec.as_deref() else {
         return false;
     };
-    if !codec.eq_ignore_ascii_case("h264") || client.client_kind == ClientKind::NativeMpv {
+    if !codec.eq_ignore_ascii_case("h264") || !client.strict_h264_profile_limits {
         return true;
     }
     video.level.map(|level| level <= 42).unwrap_or(true)
@@ -2120,7 +2120,7 @@ fn video_pixel_format_allowed(
     let Some(codec) = video.codec.as_deref() else {
         return false;
     };
-    if !codec.eq_ignore_ascii_case("h264") || client.client_kind == ClientKind::NativeMpv {
+    if !codec.eq_ignore_ascii_case("h264") || !client.strict_h264_profile_limits {
         return true;
     }
     let Some(pixel_format) = video.pixel_format.as_deref() else {

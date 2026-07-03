@@ -3645,6 +3645,104 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
             .and_then(Value::as_str),
         Some("sqlite")
     );
+    let rollout_gates = json
+        .pointer("/playback/rollout_gates")
+        .and_then(Value::as_array)
+        .expect("settings should expose playback rollout gates");
+    let gate = |flag: &str| {
+        rollout_gates
+            .iter()
+            .find(|gate| gate.get("flag").and_then(Value::as_str) == Some(flag))
+            .unwrap_or_else(|| panic!("missing playback rollout gate {flag}"))
+    };
+    let expected_flags = [
+        "playback.plan_contract_enabled",
+        "playback.hls_direct_stream_enabled",
+        "playback.audio_transcode_enabled",
+        "playback.subtitle_transcode_enabled",
+        "playback.video_transcode_enabled",
+        "playback.transcode_feasibility_enabled",
+        "playback.adaptive_quality_enabled",
+        "playback.hardware_acceleration_enabled",
+        "playback.hdr_tone_mapping_enabled",
+        "playback.public_corpus_required",
+        "playback.client_automation_required",
+    ];
+    assert_eq!(rollout_gates.len(), expected_flags.len());
+    for flag in expected_flags {
+        assert!(gate(flag).get("raw_enabled").is_some());
+    }
+    let plan_contract = gate("playback.plan_contract_enabled");
+    assert_eq!(
+        plan_contract.get("raw_enabled").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        plan_contract
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(true),
+        "plan contract should be enabled by default"
+    );
+    assert_eq!(
+        plan_contract
+            .get("default_enabled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        gate("playback.video_transcode_enabled")
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        gate("playback.transcode_feasibility_enabled")
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        gate("playback.adaptive_quality_enabled")
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        gate("playback.hardware_acceleration_enabled")
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        gate("playback.hdr_tone_mapping_enabled")
+            .get("effective_enabled")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        gate("playback.public_corpus_required")
+            .get("release_evidence_gate")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        gate("playback.client_automation_required")
+            .get("release_evidence_gate")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        gate("playback.client_automation_required")
+            .get("runtime_enforced")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        json.pointer("/playback/planner_policy/allow_video_transcode")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     Ok(())
 }
@@ -10045,6 +10143,258 @@ async fn playback_profile_requires_auth() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn phase25_profile_endpoint_negotiates_effective_profile_and_policy() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase25-profile-endpoint-secret".to_string();
+    settings.playback.default_wan_max_bitrate_bps = Some(6_000_000);
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase25.Profile.Endpoint.mp4",
+        "mp4",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/api/v1/profile/playback?network_type=wan&profile_id=web_safari&profile_version=999&app_version=17.5",
+            )
+            .header("authorization", format!("Bearer {}", fixture.token))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(
+        json.pointer("/profile/profile_id").and_then(Value::as_str),
+        Some("web_safari"),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/profile/profile_version")
+            .and_then(Value::as_u64),
+        Some(5),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/profile/max_bitrate_bps")
+            .and_then(Value::as_i64),
+        Some(6_000_000),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/negotiation/effective_profile_id")
+            .and_then(Value::as_str),
+        Some("web_safari"),
+        "{json}"
+    );
+    assert!(
+        json.pointer("/negotiation/compatibility")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons.iter().any(|reason| {
+                reason.as_str() == Some("requested_profile_version_capped_to_server_catalog")
+            })),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/effective_policy/network_class")
+            .and_then(Value::as_str),
+        Some("wan"),
+        "{json}"
+    );
+    assert_eq!(
+        json.pointer("/effective_policy/max_bitrate_bps")
+            .and_then(Value::as_i64),
+        Some(6_000_000),
+        "{json}"
+    );
+    assert!(
+        json.pointer("/catalog")
+            .and_then(Value::as_array)
+            .is_some_and(|catalog| catalog.iter().any(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some("native_mpv_desktop")
+            }) && catalog.iter().any(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some("game_console_conservative")
+            })),
+        "{json}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase25_profile_fixtures_drive_planner_modes_and_unknown_spoof_is_safe() -> Result<()> {
+    let mut direct_stream_settings = test_settings_with_db();
+    direct_stream_settings.auth.access_token_secret =
+        "phase25-direct-stream-profile-secret".to_string();
+    direct_stream_settings.playback.allow_direct_stream = true;
+    direct_stream_settings.playback.hls_direct_stream_enabled = true;
+    let direct_stream_fixture = setup_playback_route_fixture(
+        direct_stream_settings,
+        "Phase25.Profile.DirectStream.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+
+    let native_body = json!({
+        "media_item_id": direct_stream_fixture.item_id,
+        "preferred_file_id": direct_stream_fixture.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_id": "native_mpv_desktop",
+            "profile_version": 5,
+            "app_version": "0.1.0",
+            "quality_mode": "original"
+        }
+    });
+    let native_json = play_fixture_json(&direct_stream_fixture, native_body).await?;
+    assert_eq!(
+        native_json.get("mode").and_then(Value::as_str),
+        Some("direct_play"),
+        "{native_json}"
+    );
+    assert_eq!(
+        native_json
+            .pointer("/playback_plan/client_profile/profile_id")
+            .and_then(Value::as_str),
+        Some("native_mpv_desktop"),
+        "{native_json}"
+    );
+
+    let spoofed_unknown_body = json!({
+        "media_item_id": direct_stream_fixture.item_id,
+        "preferred_file_id": direct_stream_fixture.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_id": "totally-unknown-player",
+            "profile_version": 5,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv", "mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supported_hls_segment_types": ["fmp4"],
+            "quality_mode": "original"
+        }
+    });
+    let unknown_json = play_fixture_json(&direct_stream_fixture, spoofed_unknown_body).await?;
+    assert_eq!(
+        unknown_json.get("mode").and_then(Value::as_str),
+        Some("direct_stream"),
+        "{unknown_json}"
+    );
+    assert_eq!(
+        unknown_json
+            .pointer("/playback_plan/client_profile/profile_id")
+            .and_then(Value::as_str),
+        Some("web_chromium"),
+        "{unknown_json}"
+    );
+    assert_eq!(
+        unknown_json
+            .pointer("/playback_plan/client_profile/direct_play_preferred")
+            .and_then(Value::as_bool),
+        Some(false),
+        "{unknown_json}"
+    );
+    assert_eq!(
+        unknown_json
+            .pointer("/playback_plan/client_profile/supported_containers/0")
+            .and_then(Value::as_str),
+        Some("mp4"),
+        "{unknown_json}"
+    );
+
+    let mut transcode_settings = test_settings_with_db();
+    transcode_settings.auth.access_token_secret = "phase25-transcode-profile-secret".to_string();
+    transcode_settings.playback.allow_direct_stream = true;
+    transcode_settings.playback.allow_video_transcode = true;
+    transcode_settings.playback.hls_direct_stream_enabled = true;
+    transcode_settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    let transcode_fixture = setup_playback_route_fixture(
+        transcode_settings,
+        "Phase25.Profile.VideoTranscode.mkv",
+        "mkv",
+        "hevc",
+        "aac",
+        1920,
+        1080,
+        8_000_000,
+    )
+    .await?;
+    let native_hevc = play_fixture_json(
+        &transcode_fixture,
+        json!({
+            "media_item_id": transcode_fixture.item_id,
+            "preferred_file_id": transcode_fixture.media_file_id,
+            "network_type": "lan",
+            "client_capabilities": {
+                "profile_id": "native_mpv_desktop",
+                "profile_version": 5,
+                "quality_mode": "original"
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(
+        native_hevc.get("mode").and_then(Value::as_str),
+        Some("direct_play"),
+        "{native_hevc}"
+    );
+    let browser_hevc = play_fixture_json(
+        &transcode_fixture,
+        json!({
+            "media_item_id": transcode_fixture.item_id,
+            "preferred_file_id": transcode_fixture.media_file_id,
+            "network_type": "lan",
+            "client_capabilities": {
+                "profile_id": "web_chromium",
+                "profile_version": 5,
+                "quality_mode": "fixed",
+                "fixed_bitrate_bps": 4_000_000,
+                "fixed_resolution": "720p"
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(
+        browser_hevc.get("mode").and_then(Value::as_str),
+        Some("video_transcode"),
+        "{browser_hevc}"
+    );
+    assert_eq!(
+        browser_hevc
+            .pointer("/playback_plan/client_profile/fixed_resolution")
+            .and_then(Value::as_str),
+        Some("720p"),
+        "{browser_hevc}"
+    );
+    assert_eq!(
+        browser_hevc
+            .pointer("/playback_plan/effective_policy/fixed_bitrate_bps")
+            .and_then(Value::as_i64),
+        Some(4_000_000),
+        "{browser_hevc}"
+    );
+
+    Ok(())
+}
+
 fn hash_password(password: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -12079,6 +12429,798 @@ async fn phase22_remote_smoke_requires_tls_and_accepts_reverse_proxy_forwarding(
     Ok(())
 }
 
+async fn phase23_seed_active_session(
+    pool: &sqlx::AnyPool,
+    user_id: &str,
+    media_file_id: &str,
+    mode: &str,
+    token: &str,
+) -> Result<Uuid> {
+    let session_id = Uuid::new_v4();
+    let session_id_text = session_id.to_string();
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
+         VALUES (?, ?, ?, ?, 'active', 'lan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(&session_id_text)
+    .bind(user_id)
+    .bind(media_file_id)
+    .bind(mode)
+    .bind(token)
+    .execute(pool)
+    .await?;
+    Ok(session_id)
+}
+
+#[tokio::test]
+async fn phase23_simulated_six_hour_direct_play_range_soak_continues_until_end() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase23-direct-soak".to_string();
+    settings.playback.session_ttl_seconds = 6 * 60 * 60 + 300;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase23.Direct.Range.Soak.mkv",
+        "mkv",
+        "hevc",
+        "dts",
+        1920,
+        1080,
+        8_000_000,
+    )
+    .await?;
+    let play_json = play_fixture_json(
+        &fixture,
+        json!({
+            "media_item_id": fixture.item_id,
+            "preferred_file_id": fixture.media_file_id,
+            "network_type": "lan",
+            "client_capabilities": {
+                "profile_version": 2,
+                "client_kind": "native_mpv",
+                "direct_play_preferred": true,
+                "supported_containers": ["mkv"],
+                "supported_video_codecs": ["hevc"],
+                "supported_audio_codecs": ["dts"],
+                "supports_auth_headers_for_media": true,
+                "quality_mode": "original"
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(
+        play_json.get("mode").and_then(Value::as_str),
+        Some("direct_play")
+    );
+    let stream_url = play_json
+        .get("streamUrl")
+        .or_else(|| play_json.get("stream_url"))
+        .and_then(Value::as_str)
+        .context("stream url")?
+        .to_string();
+    let session_id = play_json
+        .get("sessionId")
+        .or_else(|| play_json.get("session_id"))
+        .and_then(Value::as_str)
+        .context("session id")?
+        .to_string();
+
+    for simulated_minute in (0..=360).step_by(15) {
+        let start = (simulated_minute % 7) as u64;
+        let end = start + 2;
+        let resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get(&stream_url)
+                    .header("authorization", format!("Bearer {}", fixture.token))
+                    .header("range", format!("bytes={start}-{end}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "minute {simulated_minute} body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(bytes.len(), 3, "minute {simulated_minute}");
+    }
+
+    let active_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(active_state, "active");
+
+    let end_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/end"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
+
+    let after_end = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(&stream_url)
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("range", "bytes=0-2")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(after_end.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase23_simulated_six_hour_hls_direct_stream_soak_reads_segments_until_end() -> Result<()>
+{
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase23-hls-soak".to_string();
+    settings.playback.session_ttl_seconds = 6 * 60 * 60 + 300;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase23.Hls.Direct.Stream.Soak.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1920,
+        1080,
+        6_000_000,
+    )
+    .await?;
+    let session_id = Uuid::new_v4();
+    let session_token = "phase23-hls-soak-session";
+    let temp = tempdir()?;
+    tokio::fs::write(
+        temp.path().join("master.m3u8"),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\nmedia.m3u8\n",
+    )
+    .await?;
+    tokio::fs::write(
+        temp.path().join("media.m3u8"),
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.000,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n",
+    )
+    .await?;
+    tokio::fs::write(temp.path().join("init.mp4"), b"init").await?;
+    tokio::fs::write(temp.path().join("segment_00000.m4s"), b"segment").await?;
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
+         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(session_id.to_string())
+    .bind(&fixture.user_id)
+    .bind(&fixture.media_file_id)
+    .bind(session_token)
+    .execute(&fixture.state.db_pool)
+    .await?;
+    fixture
+        .state
+        .transcodes
+        .insert_test_job_for_plan(
+            session_id,
+            temp.path().to_path_buf(),
+            PlaybackMode::DirectStream,
+            Delivery::HlsFmp4,
+            0,
+        )
+        .await;
+
+    for simulated_minute in (0..=360).step_by(20) {
+        let segment_resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/sessions/{session_id}/segment_00000.m4s?session={session_token}"
+                ))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+            )
+            .await?;
+        let status = segment_resp.status();
+        let bytes = body::to_bytes(segment_resp.into_body(), 1_048_576).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "minute {simulated_minute} body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(&bytes[..], b"segment");
+
+        let heartbeat_resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/heartbeat"))
+                    .header("authorization", format!("Bearer {}", fixture.token))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(heartbeat_resp.status(), StatusCode::OK);
+        let resume_resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}/resume"))
+                    .header("authorization", format!("Bearer {}", fixture.token))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resume_resp.status(), StatusCode::OK);
+    }
+
+    let end_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/end"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
+    assert!(
+        fixture
+            .state
+            .transcodes
+            .snapshot(session_id)
+            .await
+            .is_none()
+    );
+    assert!(tokio::fs::metadata(temp.path()).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase23_simulated_six_hour_video_transcode_loop_soak_reads_segments_until_end()
+-> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase23-video-soak".to_string();
+    settings.playback.session_ttl_seconds = 6 * 60 * 60 + 300;
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase23.Video.Transcode.Loop.Soak.mkv",
+        "mkv",
+        "hevc",
+        "dts",
+        3840,
+        2160,
+        24_000_000,
+    )
+    .await?;
+    let session_id = Uuid::new_v4();
+    let session_token = "phase23-video-soak-session";
+    let temp = tempdir()?;
+    tokio::fs::write(
+        temp.path().join("master.m3u8"),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\nstream_0.m3u8\n",
+    )
+    .await?;
+    tokio::fs::write(
+        temp.path().join("stream_0.m3u8"),
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:4.000,\nseg_0_00000.m4s\n#EXT-X-ENDLIST\n",
+    )
+    .await?;
+    tokio::fs::write(temp.path().join("seg_0_00000.m4s"), b"transcoded-segment").await?;
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
+         VALUES (?, ?, ?, 'video_transcode', 'active', 'wan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(session_id.to_string())
+    .bind(&fixture.user_id)
+    .bind(&fixture.media_file_id)
+    .bind(session_token)
+    .execute(&fixture.state.db_pool)
+    .await?;
+    fixture
+        .state
+        .transcodes
+        .insert_test_job_for_plan(
+            session_id,
+            temp.path().to_path_buf(),
+            PlaybackMode::VideoTranscode,
+            Delivery::HlsFmp4,
+            0,
+        )
+        .await;
+
+    for simulated_minute in (0..=360).step_by(30) {
+        let playlist_resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/sessions/{session_id}/stream_0.m3u8?session={session_token}"
+                ))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            playlist_resp.status(),
+            StatusCode::OK,
+            "minute {simulated_minute}"
+        );
+        let segment_resp = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/sessions/{session_id}/seg_0_00000.m4s?session={session_token}"
+                ))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+            )
+            .await?;
+        let status = segment_resp.status();
+        let bytes = body::to_bytes(segment_resp.into_body(), 1_048_576).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "minute {simulated_minute} body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(&bytes[..], b"transcoded-segment");
+    }
+
+    let end_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/end"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(end_resp.status(), StatusCode::OK);
+    assert!(
+        fixture
+            .state
+            .transcodes
+            .snapshot(session_id)
+            .await
+            .is_none()
+    );
+    assert!(tokio::fs::metadata(temp.path()).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase23_concurrent_load_rejects_video_over_capacity_before_job_start() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase23-load-matrix".to_string();
+    settings.playback.unknown_performance_policy = "allow_best_effort".to_string();
+    settings.playback.max_active_video_transcodes = Some(4);
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase23.Concurrent.Load.mkv",
+        "mkv",
+        "hevc",
+        "dts",
+        3840,
+        2160,
+        24_000_000,
+    )
+    .await?;
+
+    let direct_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv"],
+            "supported_video_codecs": ["hevc"],
+            "supported_audio_codecs": ["dts"],
+            "supports_auth_headers_for_media": true,
+            "quality_mode": "original"
+        }
+    });
+    let mut tasks = Vec::new();
+    for _ in 0..50 {
+        let app = fixture.app.clone();
+        let token = fixture.token.clone();
+        let request_body = direct_body.clone();
+        tasks.push(tokio::spawn(async move {
+            let resp = app
+                .oneshot(
+                    Request::post("/api/v1/play")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body.to_string()))?,
+                )
+                .await?;
+            let status = resp.status();
+            let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+            let json: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(status, StatusCode::OK, "body: {}", json);
+            Ok::<Value, anyhow::Error>(json)
+        }));
+    }
+    for task in tasks {
+        let json = task.await??;
+        assert_eq!(
+            json.get("mode").and_then(Value::as_str),
+            Some("direct_play")
+        );
+    }
+
+    let mut temp_dirs = Vec::new();
+    for idx in 0..10 {
+        let session_id = phase23_seed_active_session(
+            &fixture.state.db_pool,
+            &fixture.user_id,
+            &fixture.media_file_id,
+            "direct_stream",
+            &format!("phase23-remux-{idx}"),
+        )
+        .await?;
+        let temp = tempdir()?;
+        tokio::fs::write(temp.path().join("master.m3u8"), "#EXTM3U\nmedia.m3u8\n").await?;
+        tokio::fs::write(
+            temp.path().join("media.m3u8"),
+            "#EXTM3U\nsegment_00000.m4s\n",
+        )
+        .await?;
+        tokio::fs::write(temp.path().join("segment_00000.m4s"), b"segment").await?;
+        fixture
+            .state
+            .transcodes
+            .insert_test_job_for_plan(
+                session_id,
+                temp.path().to_path_buf(),
+                PlaybackMode::DirectStream,
+                Delivery::HlsFmp4,
+                0,
+            )
+            .await;
+        temp_dirs.push(temp);
+    }
+    let mixed_modes = [
+        ("audio_transcode", PlaybackMode::AudioTranscode),
+        ("video_transcode", PlaybackMode::VideoTranscode),
+        ("video_transcode", PlaybackMode::VideoTranscode),
+        ("adaptive_transcode", PlaybackMode::AdaptiveTranscode),
+    ];
+    for (idx, (mode, playback_mode)) in mixed_modes.iter().enumerate() {
+        let session_id = phase23_seed_active_session(
+            &fixture.state.db_pool,
+            &fixture.user_id,
+            &fixture.media_file_id,
+            mode,
+            &format!("phase23-mixed-{idx}"),
+        )
+        .await?;
+        let temp = tempdir()?;
+        tokio::fs::write(temp.path().join("master.m3u8"), "#EXTM3U\nstream_0.m3u8\n").await?;
+        tokio::fs::write(
+            temp.path().join("stream_0.m3u8"),
+            "#EXTM3U\nseg_0_00000.m4s\n",
+        )
+        .await?;
+        tokio::fs::write(temp.path().join("seg_0_00000.m4s"), b"segment").await?;
+        fixture
+            .state
+            .transcodes
+            .insert_test_job_for_plan(
+                session_id,
+                temp.path().to_path_buf(),
+                *playback_mode,
+                Delivery::HlsFmp4,
+                0,
+            )
+            .await;
+        temp_dirs.push(temp);
+    }
+
+    let before_count: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    let transcode_body = json!({
+        "media_item_id": fixture.item_id,
+        "preferred_file_id": fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": false,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "supports_auth_headers_for_media": true,
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 4_000_000
+        }
+    });
+
+    let resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(transcode_body.to_string()))?,
+        )
+        .await?;
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", json);
+    assert_eq!(
+        json.get("code").and_then(Value::as_str),
+        Some("transcode_capacity_exhausted")
+    );
+    assert!(
+        json.pointer("/details/reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("transcode_capacity_exhausted"))),
+        "body: {json}"
+    );
+    assert_eq!(
+        json.pointer("/details/retry/strategy")
+            .and_then(Value::as_str),
+        Some("retry_same_request")
+    );
+    let after_count: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&fixture.state.db_pool)
+            .await?;
+    assert_eq!(
+        after_count, before_count,
+        "capacity rejection must not insert another session"
+    );
+    let active_direct_streams: String = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions WHERE state = 'active' AND mode = 'direct_stream'",
+    )
+    .fetch_one(&fixture.state.db_pool)
+    .await?;
+    assert_eq!(active_direct_streams, "10");
+    let active_video_weight: String = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(CASE WHEN mode = 'adaptive_transcode' THEN 2 ELSE 1 END), 0) AS TEXT)
+         FROM playback_sessions
+         WHERE state = 'active' AND mode IN ('video_transcode', 'adaptive_transcode', 'transcode')",
+    )
+    .fetch_one(&fixture.state.db_pool)
+    .await?;
+    assert_eq!(active_video_weight, "4");
+    assert_eq!(fixture.state.transcodes.startup_queue_len(), 0);
+    fixture.state.transcodes.stop_all().await;
+    drop(temp_dirs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase23_capacity_edges_reject_per_user_temp_and_startup_before_session_insert()
+-> Result<()> {
+    let mut per_user_settings = test_settings_with_db();
+    per_user_settings.auth.access_token_secret = "phase23-per-user".to_string();
+    per_user_settings.playback.max_sessions_per_user = Some(1);
+    let per_user = setup_playback_route_fixture(
+        per_user_settings,
+        "Phase23.Per.User.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    phase23_seed_active_session(
+        &per_user.state.db_pool,
+        &per_user.user_id,
+        &per_user.media_file_id,
+        "direct_play",
+        "phase23-existing-user-session",
+    )
+    .await?;
+    let direct_body = json!({
+        "media_item_id": per_user.item_id,
+        "preferred_file_id": per_user.media_file_id,
+        "network_type": "lan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": true,
+            "supported_containers": ["mkv"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "quality_mode": "original"
+        }
+    });
+    let before_per_user: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&per_user.state.db_pool)
+            .await?;
+    let per_user_resp = per_user
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", per_user.token))
+                .header("content-type", "application/json")
+                .body(Body::from(direct_body.to_string()))?,
+        )
+        .await?;
+    let status = per_user_resp.status();
+    let bytes = body::to_bytes(per_user_resp.into_body(), 1_048_576).await?;
+    let json: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", json);
+    assert_eq!(
+        json.pointer("/details/capacity/resource")
+            .and_then(Value::as_str),
+        Some("per_user_sessions")
+    );
+    assert!(
+        crate::metrics::PLAYBACK_CAPACITY_LEVELS
+            .with_label_values(&["active_sessions", "all", "all"])
+            .get()
+            >= 1
+    );
+    let after_per_user: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&per_user.state.db_pool)
+            .await?;
+    assert_eq!(after_per_user, before_per_user);
+
+    let mut temp_settings = test_settings_with_db();
+    temp_settings.auth.access_token_secret = "phase23-temp-limit".to_string();
+    temp_settings.playback.max_temp_dir_bytes = Some(1);
+    let temp_fixture = setup_playback_route_fixture(
+        temp_settings,
+        "Phase23.Temp.Limit.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    let temp_root = crate::playback::jobs::playback_temp_root();
+    let temp_limit_dir = temp_root.join(format!("phase23-temp-limit-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_limit_dir).await?;
+    tokio::fs::write(temp_limit_dir.join("bytes.bin"), b"over-limit").await?;
+    let hls_body = json!({
+        "media_item_id": temp_fixture.item_id,
+        "preferred_file_id": temp_fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": false,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 2_000_000
+        }
+    });
+    let before_temp: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&temp_fixture.state.db_pool)
+            .await?;
+    let temp_resp = temp_fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", temp_fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(hls_body.to_string()))?,
+        )
+        .await?;
+    let temp_status = temp_resp.status();
+    let temp_bytes = body::to_bytes(temp_resp.into_body(), 1_048_576).await?;
+    let temp_json: Value = serde_json::from_slice(&temp_bytes)?;
+    let _ = tokio::fs::remove_dir_all(&temp_limit_dir).await;
+    assert_eq!(temp_status, StatusCode::CONFLICT, "body: {}", temp_json);
+    assert_eq!(
+        temp_json
+            .pointer("/details/capacity/resource")
+            .and_then(Value::as_str),
+        Some("temp_dir_bytes")
+    );
+    assert!(
+        crate::metrics::PLAYBACK_CAPACITY_LEVELS
+            .with_label_values(&["temp_dir_bytes", "all", "all"])
+            .get()
+            >= 1
+    );
+    let after_temp: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&temp_fixture.state.db_pool)
+            .await?;
+    assert_eq!(after_temp, before_temp);
+
+    let mut queue_settings = test_settings_with_db();
+    queue_settings.auth.access_token_secret = "phase23-startup-queue".to_string();
+    queue_settings.playback.max_startup_queue_length = Some(1);
+    let queue_fixture = setup_playback_route_fixture(
+        queue_settings,
+        "Phase23.Startup.Queue.mkv",
+        "mkv",
+        "h264",
+        "aac",
+        1280,
+        720,
+        2_000_000,
+    )
+    .await?;
+    queue_fixture.state.transcodes.set_test_startup_queue_len(1);
+    let queue_body = json!({
+        "media_item_id": queue_fixture.item_id,
+        "preferred_file_id": queue_fixture.media_file_id,
+        "network_type": "wan",
+        "client_capabilities": {
+            "profile_version": 2,
+            "client_kind": "native_mpv",
+            "direct_play_preferred": false,
+            "supported_containers": ["mp4"],
+            "supported_video_codecs": ["h264"],
+            "supported_audio_codecs": ["aac"],
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 2_000_000
+        }
+    });
+    let before_queue: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&queue_fixture.state.db_pool)
+            .await?;
+    let queue_resp = queue_fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/play")
+                .header("authorization", format!("Bearer {}", queue_fixture.token))
+                .header("content-type", "application/json")
+                .body(Body::from(queue_body.to_string()))?,
+        )
+        .await?;
+    queue_fixture.state.transcodes.set_test_startup_queue_len(0);
+    let queue_status = queue_resp.status();
+    let queue_bytes = body::to_bytes(queue_resp.into_body(), 1_048_576).await?;
+    let queue_json: Value = serde_json::from_slice(&queue_bytes)?;
+    assert_eq!(queue_status, StatusCode::CONFLICT, "body: {}", queue_json);
+    assert_eq!(
+        queue_json
+            .pointer("/details/capacity/resource")
+            .and_then(Value::as_str),
+        Some("startup_queue_length")
+    );
+    assert!(
+        crate::metrics::PLAYBACK_CAPACITY_LEVELS
+            .with_label_values(&["startup_queue_length", "all", "all"])
+            .get()
+            >= 1
+    );
+    let after_queue: String =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS TEXT) FROM playback_sessions")
+            .fetch_one(&queue_fixture.state.db_pool)
+            .await?;
+    assert_eq!(after_queue, before_queue);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn phase13_direct_stream_rollout_gate_returns_structured_error() -> Result<()> {
     let mut settings = test_settings_with_db();
@@ -12304,6 +13446,269 @@ async fn phase13_capacity_gate_rejects_before_session_insert_and_records_metric(
         session_count, "0",
         "capacity rejection must not persist a session"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase24_diagnostics_bundle_and_admin_sessions_expose_support_evidence() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.auth.access_token_secret = "phase24-diagnostics-secret".to_string();
+    let fixture = setup_playback_route_fixture(
+        settings,
+        "Phase24.Diagnostics.2026.mkv",
+        "mkv",
+        "hevc",
+        "aac",
+        3840,
+        2160,
+        18_000_000,
+    )
+    .await?;
+
+    let session_id = Uuid::new_v4();
+    let session_id_text = session_id.to_string();
+    let temp = tempdir()?;
+    tokio::fs::write(temp.path().join("master.m3u8"), "#EXTM3U\n").await?;
+    tokio::fs::write(temp.path().join("seg_0_00000.m4s"), b"segment").await?;
+    tokio::fs::write(
+        temp.path().join("ffmpeg.log"),
+        "Authorization: Bearer secret-token\nsegment failed token=secret-token\n",
+    )
+    .await?;
+    let playback_plan = json!({
+        "mode": "video_transcode",
+        "delivery": "hls_fmp4",
+        "media_file_id": fixture.media_file_id,
+        "selected_video_track": 0,
+        "selected_audio_track": 1,
+        "selected_subtitle_track": 2,
+        "video_action": "transcode",
+        "audio_action": "copy",
+        "subtitle_action": "burn_in",
+        "hdr_action": "tone_map_to_sdr",
+        "adaptive": false,
+        "reasons": ["source_bitrate_exceeds_bandwidth_policy"],
+        "hardware_acceleration": {
+            "enabled": true,
+            "api": "nvenc",
+            "decoder": "cuda",
+            "encoder": "h264_nvenc"
+        },
+        "compatibility_report": {
+            "source_bitrate_bps": 18000000,
+            "checks": []
+        },
+        "client_profile": {
+            "client_kind": "web",
+            "quality_mode": "fixed",
+            "max_bitrate_bps": 4000000
+        },
+        "effective_policy": {
+            "network_class": "wan",
+            "max_bitrate_bps": 4000000,
+            "allow_video_transcode": true
+        }
+    });
+    let job_state = json!({
+        "state": "failed",
+        "mode": "video_transcode",
+        "delivery": "hls_fmp4",
+        "logical_start_seconds": 0.0,
+        "temp_dir": temp.path().to_string_lossy(),
+        "artifacts": ["master.m3u8", "seg_0_00000.m4s"],
+        "started_at": "2026-07-02T00:00:00Z",
+        "last_progress_at": "2026-07-02T00:00:02Z",
+        "last_segment_at": "2026-07-02T00:00:02Z",
+        "log_path": temp.path().join("ffmpeg.log").to_string_lossy(),
+        "error": "startup_failed: ffmpeg exited before playlist token=secret-token",
+        "error_code": "startup_failed",
+        "error_kind": "ffmpeg_exit",
+        "log_tail": "Authorization: Bearer secret-token\nfailed token=secret-token",
+        "ffmpeg_command": [
+            "ffmpeg",
+            "-i",
+            "http://127.0.0.1/media.mkv?session=secret-session&token=secret-token",
+            "-f",
+            "hls"
+        ]
+    });
+
+    sqlx::query(
+        "INSERT INTO playback_sessions
+            (id, user_id, media_file_id, mode, state, network_type,
+             logical_position_seconds, duration_seconds, client_capabilities,
+             transcode_state, token, token_expires_at, remote_policy_json,
+             playback_plan_json, job_state_json)
+         VALUES (?, ?, ?, 'video_transcode', 'error', 'wan', 0, 3600, ?, ?, ?, '2099-01-01 00:00:00', ?, ?, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(&fixture.user_id)
+    .bind(&fixture.media_file_id)
+    .bind(json!({"client_kind": "web"}).to_string())
+    .bind(job_state.to_string())
+    .bind("diagnostic-session-token")
+    .bind(json!({"applied": false, "scope": "none"}).to_string())
+    .bind(playback_plan.to_string())
+    .bind(job_state.to_string())
+    .execute(&fixture.state.db_pool)
+    .await?;
+    crate::metrics::init_metrics();
+    crate::metrics::PLAYBACK_ERRORS
+        .with_label_values(&[
+            "video_transcode",
+            "hls_fmp4",
+            "web",
+            "wan",
+            "ffmpeg_startup_failed",
+            "hardware_decode_encode",
+        ])
+        .inc();
+
+    let bundle_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sessions/{session_id}/diagnostics"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let bundle_status = bundle_resp.status();
+    let bundle_bytes = body::to_bytes(bundle_resp.into_body(), 1_048_576).await?;
+    let bundle: Value = serde_json::from_slice(&bundle_bytes)?;
+    assert_eq!(bundle_status, StatusCode::OK, "body: {}", bundle);
+    assert_eq!(
+        bundle.pointer("/session/token").and_then(Value::as_str),
+        Some("[redacted]")
+    );
+    assert_eq!(
+        bundle
+            .pointer("/client_profile/client_kind")
+            .and_then(Value::as_str),
+        Some("web")
+    );
+    assert_eq!(
+        bundle
+            .pointer("/effective_policy/network_class")
+            .and_then(Value::as_str),
+        Some("wan")
+    );
+    assert_eq!(
+        bundle
+            .pointer("/source_probe/probe_status")
+            .and_then(Value::as_str),
+        Some("ok")
+    );
+    assert_eq!(
+        bundle.get("error_taxonomy").and_then(Value::as_str),
+        Some("ffmpeg_startup_failed")
+    );
+    let command = bundle
+        .get("ffmpeg_command")
+        .and_then(Value::as_array)
+        .context("ffmpeg command in diagnostics bundle")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(command.contains("session=[redacted]"));
+    assert!(command.contains("token=[redacted]"));
+    assert!(!command.contains("secret-token"));
+    let stderr_tail = bundle
+        .get("stderr_tail")
+        .and_then(Value::as_str)
+        .context("stderr tail in diagnostics bundle")?;
+    assert!(stderr_tail.contains("[redacted]"));
+    assert!(!stderr_tail.contains("secret-token"));
+    assert!(
+        bundle
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .is_some_and(|artifacts| artifacts
+                .iter()
+                .any(
+                    |artifact| artifact.get("name").and_then(Value::as_str) == Some("master.m3u8")
+                )),
+        "expected artifact listing: {bundle}"
+    );
+    assert!(
+        bundle
+            .get("recent_server_metrics")
+            .and_then(Value::as_array)
+            .is_some_and(|metrics| !metrics.is_empty()),
+        "expected playback metrics snapshot: {bundle}"
+    );
+    assert_eq!(
+        bundle
+            .pointer("/client_player_events/available")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let admin_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/playback/admin/sessions")
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let admin_status = admin_resp.status();
+    let admin_bytes = body::to_bytes(admin_resp.into_body(), 1_048_576).await?;
+    let admin: Value = serde_json::from_slice(&admin_bytes)?;
+    assert_eq!(admin_status, StatusCode::OK, "body: {}", admin);
+    let session = admin
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| {
+            sessions.iter().find(|session| {
+                session.get("id").and_then(Value::as_str) == Some(session_id_text.as_str())
+            })
+        })
+        .context("phase24 admin session row")?;
+    assert_eq!(
+        session
+            .pointer("/selected_tracks/subtitle")
+            .and_then(Value::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        session.pointer("/hardware/api").and_then(Value::as_str),
+        Some("nvenc")
+    );
+    assert_eq!(
+        session
+            .get("bandwidth_estimate_bps")
+            .and_then(Value::as_i64),
+        Some(18_000_000)
+    );
+    assert_eq!(
+        session.get("error_taxonomy").and_then(Value::as_str),
+        Some("ffmpeg_startup_failed")
+    );
+    let expected_stop_url = format!("/api/v1/sessions/{session_id}/end");
+    assert_eq!(
+        session.get("stop_url").and_then(Value::as_str),
+        Some(expected_stop_url.as_str())
+    );
+
+    let stop_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/sessions/{session_id}/end"))
+                .header("authorization", format!("Bearer {}", fixture.token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(stop_resp.status(), StatusCode::OK);
+    let state: String = sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_one(&fixture.state.db_pool)
+        .await?;
+    assert_eq!(state, "ended");
 
     Ok(())
 }

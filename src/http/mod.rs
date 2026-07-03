@@ -425,8 +425,17 @@ pub fn router(state: AppState) -> Router {
             get(handlers::playback::hardware_readiness),
         )
         .route(
+            "/api/v1/playback/readiness",
+            get(handlers::playback::playback_readiness)
+                .post(handlers::playback::playback_readiness_probe),
+        )
+        .route(
             "/api/v1/playback/hardware/warnings",
             get(handlers::playback::hardware_warnings),
+        )
+        .route(
+            "/api/v1/playback/admin/sessions",
+            get(handlers::playback::playback_admin_sessions),
         )
         .route(
             "/stream/direct/:id",
@@ -455,6 +464,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/:id/resume",
             get(handlers::playback::resume_session),
+        )
+        .route(
+            "/api/v1/sessions/:id/diagnostics",
+            get(handlers::playback::session_diagnostics),
         )
         .route(
             "/api/v1/sessions/:id/poll",

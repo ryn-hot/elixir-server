@@ -40,6 +40,7 @@ pub struct AppState {
     pub transcodes: Arc<PlaybackJobManager>,
     pub hardware_capabilities: Arc<RwLock<Option<HardwareCapabilities>>>,
     pub hardware_host_fingerprint: Arc<RwLock<Option<String>>>,
+    pub playback_host_fingerprint: Arc<RwLock<Option<String>>>,
     pub playback_performance_probes: Arc<PlaybackPerformanceProbeScheduler>,
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
@@ -98,6 +99,7 @@ impl AppState {
         };
         let hardware_capabilities = Arc::new(RwLock::new(None));
         let hardware_host_fingerprint = Arc::new(RwLock::new(None));
+        let playback_host_fingerprint = Arc::new(RwLock::new(None));
         let playback_performance_probes = Arc::new(PlaybackPerformanceProbeScheduler::new(
             settings.playback.performance_benchmark_enabled,
             settings.playback.performance_benchmark_timeout_seconds,
@@ -187,6 +189,7 @@ impl AppState {
             transcodes: playback_jobs,
             hardware_capabilities,
             hardware_host_fingerprint,
+            playback_host_fingerprint,
             playback_performance_probes,
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),

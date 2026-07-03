@@ -70,6 +70,11 @@ pub struct TranscodeHandle {
     pub job_state: serde_json::Value,
 }
 
+pub(crate) struct SpawnedFfmpeg {
+    pub child: Child,
+    pub command_line: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
     MasterPlaylist,
@@ -359,7 +364,7 @@ async fn spawn_ffmpeg(
     log_path: &Path,
     temp_dir: &Path,
     subtitles: &[SubtitleInfo],
-) -> Result<Child> {
+) -> Result<SpawnedFfmpeg> {
     let log_file = StdFile::create(log_path).context("creating ffmpeg log file")?;
     let mut command = Command::new("ffmpeg");
 
@@ -377,7 +382,7 @@ async fn spawn_ffmpeg(
             fps,
         )
     };
-    command.args(args);
+    command.args(&args);
 
     command
         .stdin(Stdio::null())
@@ -391,7 +396,14 @@ async fn spawn_ffmpeg(
 
     let child = command.spawn().context("failed to spawn ffmpeg")?;
 
-    Ok(child)
+    let mut command_line = Vec::with_capacity(args.len() + 1);
+    command_line.push("ffmpeg".to_string());
+    command_line.extend(args);
+
+    Ok(SpawnedFfmpeg {
+        child,
+        command_line,
+    })
 }
 
 pub(crate) fn build_direct_stream_ffmpeg_args(

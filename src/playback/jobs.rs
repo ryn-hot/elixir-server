@@ -1,4 +1,5 @@
 use std::{
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -23,7 +24,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    metrics::PLAYBACK_ADAPTIVE_RENDITION_SWITCHES,
+    metrics::{
+        PLAYBACK_ADAPTIVE_RENDITION_SWITCHES, PLAYBACK_CLEANUP_ACTIONS, PLAYBACK_PROCESS_EXITS,
+    },
     playback::{
         performance::record_playback_performance_observation,
         plan::{Delivery, HardwareAccelerationPlan, PlaybackMode, PlaybackPlan, StreamAction},
@@ -218,6 +221,7 @@ pub struct PlaybackJobSnapshot {
     pub error_code: Option<String>,
     pub error_kind: Option<String>,
     pub log_tail: Option<String>,
+    pub ffmpeg_command: Option<Vec<String>>,
     pub playback_plan: Option<Value>,
     pub active_rung: Option<Value>,
 }
@@ -234,6 +238,107 @@ impl PlaybackJobSnapshot {
     }
 }
 
+struct ProcessIsolation {
+    #[cfg(windows)]
+    job_object: Option<WindowsJobObject>,
+}
+
+impl ProcessIsolation {
+    fn none() -> Self {
+        Self {
+            #[cfg(windows)]
+            job_object: None,
+        }
+    }
+
+    fn attach(_child: &Child) -> Self {
+        #[cfg(windows)]
+        let child = _child;
+        Self {
+            #[cfg(windows)]
+            job_object: WindowsJobObject::assign(child)
+                .map_err(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to assign playback FFmpeg process to Windows job object"
+                    );
+                    err
+                })
+                .ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJobObject {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsJobObject {}
+
+#[cfg(windows)]
+impl WindowsJobObject {
+    fn assign(child: &Child) -> Result<Self> {
+        use std::{ffi::c_void, mem, ptr};
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            },
+        };
+
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle == 0 {
+            return Err(std::io::Error::last_os_error()).context("creating Windows job object");
+        }
+
+        let mut info = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set_info = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if set_info == 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(err).context("configuring Windows job object kill-on-close");
+        }
+
+        let process_handle = child
+            .raw_handle()
+            .ok_or_else(|| anyhow!("child process handle unavailable"))?
+            as HANDLE;
+        let assigned = unsafe { AssignProcessToJobObject(handle, process_handle) };
+        if assigned == 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(err).context("assigning FFmpeg process to Windows job object");
+        }
+
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobObject {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
 struct PlaybackJob {
     plan: PlaybackJobPlan,
     state: PlaybackJobState,
@@ -241,6 +346,8 @@ struct PlaybackJob {
     artifacts: ArtifactRegistry,
     process_id: Option<u32>,
     process_group_id: Option<u32>,
+    #[allow(dead_code)]
+    process_isolation: ProcessIsolation,
     child: Option<Child>,
     capacity_permits: Vec<OwnedSemaphorePermit>,
     started_at: Option<DateTime<Utc>>,
@@ -251,6 +358,7 @@ struct PlaybackJob {
     error_code: Option<String>,
     error_kind: Option<String>,
     log_tail: Option<String>,
+    ffmpeg_command: Option<Vec<String>>,
     subtitle_delay_seconds: Option<f64>,
     subtitles: Vec<SubtitleInfo>,
     active_rung_id: Option<String>,
@@ -288,6 +396,7 @@ impl PlaybackJob {
             error_code: self.error_code.clone(),
             error_kind: self.error_kind.clone(),
             log_tail: self.log_tail.clone(),
+            ffmpeg_command: self.ffmpeg_command.clone(),
             playback_plan: self.plan.playback_plan.clone(),
             active_rung: active_rung_snapshot(
                 self.plan.playback_plan.as_ref(),
@@ -424,7 +533,8 @@ impl PlaybackJobManager {
         )
         .await?;
 
-        self.stop_process_and_remove_dir(&entry, true).await;
+        self.stop_process_and_remove_dir(&entry, true, "restart")
+            .await;
 
         let mut restart_plan = {
             let job = entry.lock().await;
@@ -460,7 +570,7 @@ impl PlaybackJobManager {
             )
             .await;
 
-        self.stop_process_and_remove_dir(&entry, true).await;
+        self.stop_process_and_remove_dir(&entry, true, reason).await;
 
         let stopped = {
             let mut job = entry.lock().await;
@@ -660,6 +770,59 @@ impl PlaybackJobManager {
         }
     }
 
+    pub async fn cleanup_orphan_temp_dirs(&self) -> Result<u64> {
+        let root = playback_temp_root();
+        let mut entries = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err).context("reading playback temp root"),
+        };
+        let active_temp_dirs = self.active_temp_dirs().await;
+        let mut removed = 0_u64;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .context("reading playback temp entry")?
+        {
+            let path = entry.path();
+            if active_temp_dirs.iter().any(|active| active == &path) {
+                continue;
+            }
+            if !entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if record_temp_dir_cleanup(&path, "startup_orphan").await {
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+
+    async fn active_temp_dirs(&self) -> Vec<PathBuf> {
+        let entries = self
+            .jobs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        let mut dirs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            dirs.push(entry.lock().await.temp_dir.clone());
+        }
+        dirs
+    }
+
+    #[cfg(test)]
+    pub fn set_test_startup_queue_len(&self, value: usize) {
+        self.startup_queue_len.store(value, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub async fn insert_test_job(
         &self,
@@ -715,6 +878,7 @@ impl PlaybackJobManager {
             artifacts,
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: Vec::new(),
             started_at: Some(Utc::now()),
@@ -725,6 +889,7 @@ impl PlaybackJobManager {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles,
             active_rung_id: None,
@@ -836,6 +1001,7 @@ impl PlaybackJobManager {
             artifacts,
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: Vec::new(),
             started_at: None,
@@ -846,6 +1012,7 @@ impl PlaybackJobManager {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id,
@@ -874,7 +1041,7 @@ impl PlaybackJobManager {
             _ => Vec::new(),
         };
         let layout = HlsOutputLayout::for_job(&temp_dir, plan.params.mode, plan.params.delivery);
-        let child = match spawn_ffmpeg(
+        let spawned = match spawn_ffmpeg(
             &plan.media_path,
             &plan.params,
             playback_plan.as_ref(),
@@ -893,8 +1060,11 @@ impl PlaybackJobManager {
                 return Err(err);
             }
         };
+        let child = spawned.child;
+        let ffmpeg_command = redact_ffmpeg_command(&spawned.command_line);
         let process_id = child.id();
         let process_group_id = process_group_id(process_id);
+        let process_isolation = ProcessIsolation::attach(&child);
         let snapshot = {
             let mut job = job.lock().await;
             job.artifacts =
@@ -903,7 +1073,9 @@ impl PlaybackJobManager {
             job.child = Some(child);
             job.process_id = process_id;
             job.process_group_id = process_group_id;
+            job.process_isolation = process_isolation;
             job.capacity_permits = permits;
+            job.ffmpeg_command = Some(ffmpeg_command);
             job.started_at = Some(Utc::now());
             job.last_progress_at = Some(Utc::now());
             job.snapshot()
@@ -1167,7 +1339,7 @@ impl PlaybackJobManager {
         };
         let redacted_log_tail = log_tail.map(redact_log_tail);
         if stop_process {
-            self.stop_process_and_remove_dir(&entry, true).await;
+            self.stop_process_and_remove_dir(&entry, true, reason).await;
         }
         self.record_failed_performance_observation(failure_observation)
             .await;
@@ -1215,20 +1387,33 @@ impl PlaybackJobManager {
         &self,
         job: &Arc<Mutex<PlaybackJob>>,
         release_permit: bool,
+        reason: &str,
     ) {
-        let (mut child, process_group_id, temp_dir, permits) = {
+        let (mut child, process_group_id, process_isolation, temp_dir, permits) = {
             let mut job = job.lock().await;
             let child = job.child.take();
+            let process_isolation =
+                std::mem::replace(&mut job.process_isolation, ProcessIsolation::none());
             let permits = if release_permit {
                 std::mem::take(&mut job.capacity_permits)
             } else {
                 Vec::new()
             };
-            (child, job.process_group_id, job.temp_dir.clone(), permits)
+            (
+                child,
+                job.process_group_id,
+                process_isolation,
+                job.temp_dir.clone(),
+                permits,
+            )
         };
 
-        kill_child_process_group(&mut child, process_group_id).await;
-        let _ = fs::remove_dir_all(temp_dir).await;
+        let outcome = kill_child_process_group(&mut child, process_group_id).await;
+        drop(process_isolation);
+        PLAYBACK_PROCESS_EXITS
+            .with_label_values(&[reason, outcome.method, outcome.result])
+            .inc();
+        record_temp_dir_cleanup(&temp_dir, reason).await;
         drop(permits);
     }
 
@@ -1242,6 +1427,28 @@ impl PlaybackJobManager {
             .map(|meta| meta.len() > self.limits.max_log_bytes)
             .unwrap_or(false)
         {
+            let retain_bytes = self
+                .limits
+                .log_tail_bytes
+                .min(self.limits.max_log_bytes.max(1));
+            match rotate_bounded_log(&log_path, retain_bytes).await {
+                Ok(true) => PLAYBACK_CLEANUP_ACTIONS
+                    .with_label_values(&["ffmpeg_log", "max_log_size_exceeded", "rotated"])
+                    .inc(),
+                Ok(false) => PLAYBACK_CLEANUP_ACTIONS
+                    .with_label_values(&["ffmpeg_log", "max_log_size_exceeded", "missing"])
+                    .inc(),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %log_path.to_string_lossy(),
+                        error = %err,
+                        "failed to rotate oversized playback FFmpeg log"
+                    );
+                    PLAYBACK_CLEANUP_ACTIONS
+                        .with_label_values(&["ffmpeg_log", "max_log_size_exceeded", "error"])
+                        .inc();
+                }
+            }
             self.fail_job(session_id, "max_log_size_exceeded", None, true)
                 .await;
             return Err(anyhow!("playback job log exceeded max size"));
@@ -1695,7 +1902,15 @@ fn process_group_id(process_id: Option<u32>) -> Option<u32> {
     }
 }
 
-async fn kill_child_process_group(child: &mut Option<Child>, process_group_id: Option<u32>) {
+struct ProcessCleanupOutcome {
+    method: &'static str,
+    result: &'static str,
+}
+
+async fn kill_child_process_group(
+    child: &mut Option<Child>,
+    process_group_id: Option<u32>,
+) -> ProcessCleanupOutcome {
     #[cfg(unix)]
     if let Some(process_group_id) = process_group_id {
         let _ = Command::new("kill")
@@ -1713,11 +1928,43 @@ async fn kill_child_process_group(child: &mut Option<Child>, process_group_id: O
             .stderr(std::process::Stdio::null())
             .status()
             .await;
+        if let Some(child) = child.as_mut() {
+            let result = wait_for_child_exit(child).await;
+            return ProcessCleanupOutcome {
+                method: "process_group",
+                result,
+            };
+        }
+        return ProcessCleanupOutcome {
+            method: "process_group",
+            result: "no_child_handle",
+        };
     }
 
     if let Some(child) = child.as_mut() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        if child.kill().await.is_err() {
+            return ProcessCleanupOutcome {
+                method: "child_kill",
+                result: "kill_error",
+            };
+        }
+        let result = wait_for_child_exit(child).await;
+        return ProcessCleanupOutcome {
+            method: "child_kill",
+            result,
+        };
+    }
+
+    ProcessCleanupOutcome {
+        method: "none",
+        result: "no_child",
+    }
+}
+
+async fn wait_for_child_exit(child: &mut Child) -> &'static str {
+    match child.wait().await {
+        Ok(_) => "exited",
+        Err(_) => "wait_error",
     }
 }
 
@@ -1824,6 +2071,61 @@ async fn read_log_tail(path: &Path, max_bytes: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+async fn rotate_bounded_log(path: &Path, retain_bytes: u64) -> Result<bool> {
+    let mut file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+    };
+    let len = file.metadata().await?.len();
+    let retain_bytes = retain_bytes.max(1).min(len);
+    let mut tail = Vec::with_capacity(retain_bytes as usize);
+    file.seek(std::io::SeekFrom::Start(len - retain_bytes))
+        .await?;
+    file.read_to_end(&mut tail).await?;
+    drop(file);
+
+    let rotated = path.with_extension("log.1");
+    if fs::metadata(&rotated).await.is_ok() {
+        let _ = fs::remove_file(&rotated).await;
+    }
+    fs::rename(path, &rotated)
+        .await
+        .with_context(|| format!("rotating {} to {}", path.display(), rotated.display()))?;
+    fs::write(path, tail)
+        .await
+        .with_context(|| format!("writing bounded log {}", path.display()))?;
+    Ok(true)
+}
+
+async fn record_temp_dir_cleanup(path: &Path, reason: &str) -> bool {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => {
+            PLAYBACK_CLEANUP_ACTIONS
+                .with_label_values(&["temp_dir", reason, "removed"])
+                .inc();
+            true
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            PLAYBACK_CLEANUP_ACTIONS
+                .with_label_values(&["temp_dir", reason, "missing"])
+                .inc();
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.to_string_lossy(),
+                error = %err,
+                "failed to remove playback temp dir"
+            );
+            PLAYBACK_CLEANUP_ACTIONS
+                .with_label_values(&["temp_dir", reason, "error"])
+                .inc();
+            false
+        }
+    }
+}
+
 fn redact_log_tail(raw: String) -> String {
     raw.lines()
         .map(|line| {
@@ -1842,6 +2144,35 @@ fn redact_log_tail(raw: String) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn redact_ffmpeg_command(tokens: &[String]) -> Vec<String> {
+    let mut redact_next = false;
+    tokens
+        .iter()
+        .map(|token| {
+            let lower = token.to_ascii_lowercase();
+            if redact_next {
+                redact_next = false;
+                return "[redacted]".to_string();
+            }
+            if matches!(
+                lower.as_str(),
+                "-headers" | "-http_proxy" | "-headers_file" | "-cookies"
+            ) {
+                redact_next = true;
+                return token.clone();
+            }
+            if lower.contains("authorization:")
+                || lower.contains("bearer ")
+                || lower.contains("cookie:")
+            {
+                "[redacted]".to_string()
+            } else {
+                redact_query_token(token)
+            }
+        })
+        .collect()
 }
 
 fn redact_query_token(token: &str) -> String {
@@ -2216,6 +2547,7 @@ mod tests {
             ),
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: Vec::new(),
             started_at: Some(started_at),
@@ -2226,6 +2558,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: Some("0".to_string()),
@@ -2334,6 +2667,7 @@ mod tests {
             ),
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: Vec::new(),
             started_at: Some(Utc::now()),
@@ -2344,6 +2678,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: None,
@@ -2408,6 +2743,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase23_stop_all_cleans_active_jobs_and_temp_dirs() -> Result<()> {
+        let (manager, database) = test_manager().await?;
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        insert_session(&database.pool, first_session).await?;
+        insert_session(&database.pool, second_session).await?;
+        let first_temp = tempdir()?;
+        let second_temp = tempdir()?;
+        let first_path = first_temp.path().to_path_buf();
+        let second_path = second_temp.path().to_path_buf();
+        fs::write(first_path.join("seg_0_00000.ts"), b"segment").await?;
+        fs::write(second_path.join("seg_0_00000.ts"), b"segment").await?;
+        manager
+            .insert_test_job(first_session, first_path.clone(), 0)
+            .await;
+        manager
+            .insert_test_job(second_session, second_path.clone(), 0)
+            .await;
+
+        manager.stop_all().await;
+
+        assert!(manager.snapshot(first_session).await.is_none());
+        assert!(manager.snapshot(second_session).await.is_none());
+        assert!(fs::metadata(&first_path).await.is_err());
+        assert!(fs::metadata(&second_path).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase23_startup_cleanup_removes_orphans_and_retains_active_temp_dirs() -> Result<()> {
+        let (manager, database) = test_manager().await?;
+        let active_session = Uuid::new_v4();
+        insert_session(&database.pool, active_session).await?;
+        let root = playback_temp_root();
+        fs::create_dir_all(&root).await?;
+        let orphan_dir = root.join(format!("phase23-orphan-{}", Uuid::new_v4()));
+        let active_dir = root.join(format!("phase23-active-{}", Uuid::new_v4()));
+        fs::create_dir_all(&orphan_dir).await?;
+        fs::create_dir_all(&active_dir).await?;
+        fs::write(orphan_dir.join("stale.ts"), b"stale").await?;
+        fs::write(active_dir.join("seg_0_00000.ts"), b"segment").await?;
+        manager
+            .insert_test_job(active_session, active_dir.clone(), 0)
+            .await;
+        let labels = ["temp_dir", "startup_orphan", "removed"];
+        let before = PLAYBACK_CLEANUP_ACTIONS.with_label_values(&labels).get();
+
+        let removed = manager.cleanup_orphan_temp_dirs().await?;
+
+        assert_eq!(removed, 1);
+        assert!(fs::metadata(&orphan_dir).await.is_err());
+        assert!(fs::metadata(&active_dir).await.is_ok());
+        assert_eq!(
+            PLAYBACK_CLEANUP_ACTIONS.with_label_values(&labels).get(),
+            before + 1
+        );
+        manager.stop(active_session, "test_cleanup").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase23_log_rotation_bounds_current_log_and_preserves_tail() -> Result<()> {
+        let temp = tempdir()?;
+        let log_path = temp.path().join("ffmpeg.log");
+        fs::write(&log_path, b"0123456789abcdefghijklmnopqrstuvwxyz").await?;
+
+        let rotated = rotate_bounded_log(&log_path, 8).await?;
+
+        assert!(rotated);
+        assert!(fs::metadata(temp.path().join("ffmpeg.log.1")).await.is_ok());
+        let current = fs::read(&log_path).await?;
+        assert_eq!(&current[..], b"stuvwxyz");
+        assert!(current.len() <= 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase23_repeated_simulated_seek_cycles_remove_previous_temp_dirs() -> Result<()> {
+        let (manager, database) = test_manager().await?;
+        let session_id = Uuid::new_v4();
+        insert_session(&database.pool, session_id).await?;
+        let mut previous_temp: Option<PathBuf> = None;
+        let mut temp_guards = Vec::new();
+
+        for idx in 0..4 {
+            if let Some(old_temp) = previous_temp.take() {
+                let entry = manager
+                    .jobs
+                    .get(&session_id)
+                    .map(|entry| entry.value().clone())
+                    .context("active job before simulated seek")?;
+                manager
+                    .stop_process_and_remove_dir(&entry, true, "seek_restart")
+                    .await;
+                manager.jobs.remove(&session_id);
+                assert!(
+                    fs::metadata(&old_temp).await.is_err(),
+                    "seek cycle {idx} should remove previous temp dir {}",
+                    old_temp.display()
+                );
+            }
+
+            let temp = tempdir()?;
+            let temp_path = temp.path().to_path_buf();
+            fs::write(temp_path.join("seg_0_00000.ts"), b"segment").await?;
+            manager
+                .insert_test_job_for_plan(
+                    session_id,
+                    temp_path.clone(),
+                    PlaybackMode::VideoTranscode,
+                    Delivery::HlsMpegts,
+                    0,
+                )
+                .await;
+            assert!(fs::metadata(&temp_path).await.is_ok());
+            previous_temp = Some(temp_path);
+            temp_guards.push(temp);
+        }
+
+        manager.stop(session_id, "test_end").await;
+        if let Some(temp_path) = previous_temp {
+            assert!(fs::metadata(&temp_path).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn restart_releases_existing_capacity_permit_before_relaunch() -> Result<()> {
         let (manager, database) = test_manager().await?;
         let session_id = Uuid::new_v4();
@@ -2432,6 +2894,7 @@ mod tests {
             artifacts: ArtifactRegistry::for_transcode(0),
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: vec![permit],
             started_at: Some(Utc::now()),
@@ -2442,6 +2905,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: None,
@@ -2482,6 +2946,7 @@ mod tests {
             artifacts: ArtifactRegistry::for_transcode(0),
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: vec![permit],
             started_at: Some(Utc::now()),
@@ -2492,6 +2957,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: None,
@@ -2570,6 +3036,24 @@ mod tests {
         assert!(tail.contains("session=[redacted]"), "{tail}");
         assert!(tail.contains("token=[redacted]"), "{tail}");
         Ok(())
+    }
+
+    #[test]
+    fn phase24_ffmpeg_command_redaction_removes_tokens_and_headers() {
+        let redacted = redact_ffmpeg_command(&[
+            "ffmpeg".to_string(),
+            "-headers".to_string(),
+            "Authorization: Bearer secret-token".to_string(),
+            "-i".to_string(),
+            "http://127.0.0.1/source.mkv?session=secret-session&token=secret-token&keep=1"
+                .to_string(),
+        ]);
+        let rendered = redacted.join(" ");
+        assert!(rendered.contains("session=[redacted]"), "{rendered}");
+        assert!(rendered.contains("token=[redacted]"), "{rendered}");
+        assert!(rendered.contains("-headers [redacted]"), "{rendered}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
+        assert!(!rendered.contains("secret-session"), "{rendered}");
     }
 
     #[test]
@@ -2702,6 +3186,7 @@ mod tests {
             artifacts: ArtifactRegistry::for_transcode(0),
             process_id: None,
             process_group_id: None,
+            process_isolation: ProcessIsolation::none(),
             child: None,
             capacity_permits: Vec::new(),
             started_at: Some(Utc::now()),
@@ -2712,6 +3197,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: None,
@@ -2838,6 +3324,118 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    struct ProcessGroupTestGuard {
+        pid: u32,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl ProcessGroupTestGuard {
+        fn new(pid: u32) -> Self {
+            Self { pid, armed: true }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessGroupTestGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::process::Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{}", self.pid))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn phase23_timeout_failure_kills_process_group_and_removes_temp_dir() -> Result<()> {
+        let (manager, database) = test_manager().await?;
+        let session_id = Uuid::new_v4();
+        insert_session(&database.pool, session_id).await?;
+        let temp = tempdir()?;
+        let temp_path = temp.path().to_path_buf();
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let child = command.spawn()?;
+        let pid = child.id().context("child pid")?;
+        let mut guard = ProcessGroupTestGuard::new(pid);
+        let labels = ["startup_timeout", "process_group", "exited"];
+        let before = PLAYBACK_PROCESS_EXITS.with_label_values(&labels).get();
+
+        let job = PlaybackJob {
+            plan: PlaybackJobPlan::new(
+                session_id,
+                "media-file",
+                "test-media",
+                TranscodeParams {
+                    seek_seconds: 0.0,
+                    mode: PlaybackMode::VideoTranscode,
+                    delivery: Delivery::HlsMpegts,
+                },
+                None,
+            ),
+            state: PlaybackJobState::Running,
+            temp_dir: temp_path.clone(),
+            artifacts: ArtifactRegistry::for_transcode(0),
+            process_id: Some(pid),
+            process_group_id: Some(pid),
+            process_isolation: ProcessIsolation::none(),
+            child: Some(child),
+            capacity_permits: Vec::new(),
+            started_at: Some(Utc::now()),
+            last_progress_at: Some(Utc::now()),
+            last_segment_at: Some(Utc::now()),
+            log_path: temp_path.join("ffmpeg.log"),
+            error: None,
+            error_code: None,
+            error_kind: None,
+            log_tail: None,
+            ffmpeg_command: None,
+            subtitle_delay_seconds: None,
+            subtitles: Vec::new(),
+            active_rung_id: None,
+        };
+        manager.jobs.insert(session_id, Arc::new(Mutex::new(job)));
+
+        manager
+            .fail_job(session_id, "startup_timeout", None, true)
+            .await;
+
+        assert!(fs::metadata(&temp_path).await.is_err());
+        assert_eq!(
+            PLAYBACK_PROCESS_EXITS.with_label_values(&labels).get(),
+            before + 1
+        );
+        let alive = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(!alive, "process {pid} should have been killed");
+        guard.disarm();
+        Ok(())
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn stop_kills_process_group_and_removes_temp_dir() -> Result<()> {
@@ -2857,6 +3455,7 @@ mod tests {
             .process_group(0);
         let child = command.spawn()?;
         let pid = child.id().context("child pid")?;
+        let mut guard = ProcessGroupTestGuard::new(pid);
 
         let job = PlaybackJob {
             plan: PlaybackJobPlan::new(
@@ -2875,6 +3474,7 @@ mod tests {
             artifacts: ArtifactRegistry::for_transcode(0),
             process_id: Some(pid),
             process_group_id: Some(pid),
+            process_isolation: ProcessIsolation::none(),
             child: Some(child),
             capacity_permits: Vec::new(),
             started_at: Some(Utc::now()),
@@ -2885,6 +3485,7 @@ mod tests {
             error_code: None,
             error_kind: None,
             log_tail: None,
+            ffmpeg_command: None,
             subtitle_delay_seconds: None,
             subtitles: Vec::new(),
             active_rung_id: None,
@@ -2904,6 +3505,7 @@ mod tests {
             .map(|status| status.success())
             .unwrap_or(false);
         assert!(!alive, "process {pid} should have been killed");
+        guard.disarm();
         Ok(())
     }
 }

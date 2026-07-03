@@ -21,7 +21,7 @@ use crate::{
         decision::{PlaybackSelection, plan_playback},
         plan::{Delivery, PlaybackMode, StreamAction},
         probe::{MediaCapabilities, normalize_ffprobe_metadata},
-        profile::{ClientPlaybackProfile, EffectivePlaybackPolicy},
+        profile::{ClientPlaybackProfile, EffectivePlaybackPolicy, UnknownPerformancePolicy},
     },
 };
 
@@ -286,6 +286,7 @@ fn playback_corpus_manifest_is_valid_and_covers_required_axes() -> Result<()> {
             "generated_h264_eac3_mkv",
             "generated_hevc10_aac_mkv",
             "generated_av1_opus_mkv",
+            "generated_h264_aac_srt_mkv",
             "generated_h264_aac_ass_mkv",
             "generated_corrupt_truncated_mkv",
         ],
@@ -1614,6 +1615,11 @@ async fn generate_media_case(
             fs::write(&ass_path, ass_fixture())?;
             h264_aac_ass_args(&output, &ass_path, case.source.duration_seconds)
         }
+        "generated_h264_aac_srt_mkv" => {
+            let srt_path = case_dir.join("subtitle.srt");
+            fs::write(&srt_path, srt_fixture())?;
+            h264_aac_srt_args(&output, &srt_path, case.source.duration_seconds)
+        }
         other => bail!("no generator implemented for playback corpus case {other}"),
     };
 
@@ -1833,6 +1839,51 @@ fn h264_aac_ass_args(output: &Path, ass_path: &Path, duration: f64) -> Vec<Strin
     ]
 }
 
+fn h264_aac_srt_args(output: &Path, srt_path: &Path, duration: f64) -> Vec<String> {
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        format!("testsrc2=size=160x90:rate=24:duration={duration}"),
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        format!("sine=frequency=330:sample_rate=48000:duration={duration}"),
+        "-i".to_string(),
+        srt_path.to_string_lossy().to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "1:a:0".to_string(),
+        "-map".to_string(),
+        "2:0".to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "ultrafast".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-profile:v".to_string(),
+        "high".to_string(),
+        "-level:v".to_string(),
+        "4.1".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "96k".to_string(),
+        "-c:s".to_string(),
+        "srt".to_string(),
+        "-metadata:s:s:0".to_string(),
+        "language=eng".to_string(),
+        "-shortest".to_string(),
+        output.to_string_lossy().to_string(),
+    ]
+}
+
 fn ass_fixture() -> &'static str {
     r#"[Script Info]
 ScriptType: v4.00+
@@ -1847,6 +1898,10 @@ Style: Default,Arial,12,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.10,0:00:00.90,Default,,0,0,0,,Playback corpus subtitle
 "#
+}
+
+fn srt_fixture() -> &'static str {
+    "1\n00:00:00,100 --> 00:00:00,900\nPlayback corpus subtitle\n"
 }
 
 fn insert_output_duration_limit(args: &mut Vec<String>, seconds: f64) {
@@ -1988,6 +2043,7 @@ fn corpus_policy() -> EffectivePlaybackPolicy {
         hardware_acceleration: "off".to_string(),
         allow_hardware_decode: false,
         allow_hardware_encode: false,
+        unknown_performance_policy: UnknownPerformancePolicy::AllowBestEffort,
         ..EffectivePlaybackPolicy::default()
     }
 }

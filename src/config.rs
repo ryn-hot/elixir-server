@@ -225,12 +225,17 @@ impl Settings {
             .set_default("playback.allow_audio_transcode", default_true())?
             .set_default("playback.allow_video_transcode", default_true())?
             .set_default("playback.allow_adaptive_transcode", default_false())?
-            .set_default("playback.plan_contract_enabled", default_false())?
+            .set_default("playback.plan_contract_enabled", default_true())?
             .set_default("playback.hls_direct_stream_enabled", default_true())?
             .set_default("playback.audio_transcode_enabled", default_true())?
             .set_default("playback.subtitle_transcode_enabled", default_true())?
+            .set_default("playback.video_transcode_enabled", default_true())?
+            .set_default("playback.transcode_feasibility_enabled", default_true())?
             .set_default("playback.hardware_acceleration_enabled", default_false())?
             .set_default("playback.adaptive_quality_enabled", default_false())?
+            .set_default("playback.hdr_tone_mapping_enabled", default_false())?
+            .set_default("playback.public_corpus_required", default_false())?
+            .set_default("playback.client_automation_required", default_false())?
             .set_default("playback.force_direct_play_for_native_mpv", default_false())?
             .set_default(
                 "playback.video_encoder_preset",
@@ -738,7 +743,7 @@ pub struct PlaybackConfig {
     pub allow_video_transcode: bool,
     #[serde(default = "default_false")]
     pub allow_adaptive_transcode: bool,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub plan_contract_enabled: bool,
     #[serde(default = "default_true")]
     pub hls_direct_stream_enabled: bool,
@@ -746,10 +751,20 @@ pub struct PlaybackConfig {
     pub audio_transcode_enabled: bool,
     #[serde(default = "default_true")]
     pub subtitle_transcode_enabled: bool,
+    #[serde(default = "default_true")]
+    pub video_transcode_enabled: bool,
+    #[serde(default = "default_true")]
+    pub transcode_feasibility_enabled: bool,
     #[serde(default = "default_false")]
     pub hardware_acceleration_enabled: bool,
     #[serde(default = "default_false")]
     pub adaptive_quality_enabled: bool,
+    #[serde(default = "default_false")]
+    pub hdr_tone_mapping_enabled: bool,
+    #[serde(default = "default_false")]
+    pub public_corpus_required: bool,
+    #[serde(default = "default_false")]
+    pub client_automation_required: bool,
     #[serde(default)]
     pub server_upload_cap_bps: Option<i64>,
     #[serde(default)]
@@ -829,12 +844,17 @@ impl Default for PlaybackConfig {
             allow_audio_transcode: default_true(),
             allow_video_transcode: default_true(),
             allow_adaptive_transcode: default_false(),
-            plan_contract_enabled: default_false(),
+            plan_contract_enabled: default_true(),
             hls_direct_stream_enabled: default_true(),
             audio_transcode_enabled: default_true(),
             subtitle_transcode_enabled: default_true(),
+            video_transcode_enabled: default_true(),
+            transcode_feasibility_enabled: default_true(),
             hardware_acceleration_enabled: default_false(),
             adaptive_quality_enabled: default_false(),
+            hdr_tone_mapping_enabled: default_false(),
+            public_corpus_required: default_false(),
+            client_automation_required: default_false(),
             server_upload_cap_bps: None,
             max_simultaneous_video_transcodes: None,
             max_active_video_transcodes: None,
