@@ -34,6 +34,8 @@ pub struct Settings {
     #[serde(default)]
     pub playback: PlaybackConfig,
     #[serde(default)]
+    pub media_interactions: MediaInteractionsConfig,
+    #[serde(default)]
     pub telemetry: TelemetryConfig,
 }
 
@@ -51,6 +53,7 @@ impl Default for Settings {
             metadata: MetadataConfig::default(),
             classifier: ClassifierConfig::default(),
             playback: PlaybackConfig::default(),
+            media_interactions: MediaInteractionsConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
     }
@@ -285,6 +288,7 @@ impl Settings {
             .set_default("playback.max_startup_queue_length", None::<u32>)?
             .set_default("playback.max_temp_dir_bytes", None::<u64>)?
             .set_default("playback.max_ffmpeg_log_bytes", None::<u64>)?
+            .set_default("media_interactions.support_api_enabled", default_false())?
             .set_default("telemetry.log_directives", default_log_directives())?
             .add_source(File::from(config_paths.default_file.clone()).required(false))
             .add_source(File::from(config_paths.local_file.clone()).required(false))
@@ -890,6 +894,20 @@ impl PlaybackConfig {
     pub fn video_transcode_capacity_limit(&self) -> Option<u32> {
         self.max_active_video_transcodes
             .or(self.max_simultaneous_video_transcodes)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaInteractionsConfig {
+    #[serde(default = "default_false")]
+    pub support_api_enabled: bool,
+}
+
+impl Default for MediaInteractionsConfig {
+    fn default() -> Self {
+        Self {
+            support_api_enabled: default_false(),
+        }
     }
 }
 

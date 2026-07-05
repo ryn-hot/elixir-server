@@ -10,6 +10,7 @@ pub mod extensions;
 pub mod http;
 pub mod library;
 pub mod media;
+pub mod media_interactions;
 pub mod metadata;
 pub mod metrics;
 pub mod network;

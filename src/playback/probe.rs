@@ -305,6 +305,20 @@ pub async fn upsert_media_file_probe_success(
     .execute(pool)
     .await?;
 
+    if let Err(err) = crate::media_interactions::ingest_chapter_segments_from_metadata(
+        pool,
+        media_file_id,
+        metadata,
+    )
+    .await
+    {
+        tracing::warn!(
+            media_file_id,
+            error = %err,
+            "failed to ingest chapter media segments after probe success"
+        );
+    }
+
     Ok(capabilities)
 }
 

@@ -12,6 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, any::AnyRow};
@@ -25,14 +26,19 @@ use crate::{
         error::{ApiError, ApiResult},
     },
     media::ffprobe,
+    media_interactions::{
+        MediaSegmentJobListFilters, PlaybackInteractionPreferences, list_media_segment_jobs,
+        load_or_create_playback_preferences,
+    },
     metrics::{
-        PLAY_DECISIONS, PLAY_ERRORS, PLAY_LATENCY, PLAYBACK_CAPACITY_LEVELS,
+        AUTOPLAY_TRANSITIONS, PLAY_DECISIONS, PLAY_ERRORS, PLAY_LATENCY, PLAYBACK_CAPACITY_LEVELS,
         PLAYBACK_CAPACITY_REJECTIONS, PLAYBACK_DECISIONS, PLAYBACK_ERRORS,
         PLAYBACK_FEASIBILITY_DECISIONS, PLAYBACK_HLS_PLAYLIST_STARTUP_LATENCY,
-        PLAYBACK_MISSING_SEGMENTS, PLAYBACK_PERFORMANCE_ENVELOPE_STATUS, PLAYBACK_SEGMENT_LATENCY,
-        PLAYBACK_SESSION_EXPIRATIONS, PLAYBACK_TRANSCODE_DOWNGRADED,
+        PLAYBACK_MISSING_SEGMENTS, PLAYBACK_PERFORMANCE_ENVELOPE_STATUS, PLAYBACK_PROGRESS_UPDATES,
+        PLAYBACK_SEGMENT_LATENCY, PLAYBACK_SESSION_EXPIRATIONS, PLAYBACK_TRANSCODE_DOWNGRADED,
         PLAYBACK_TRANSCODE_REALTIME_FACTOR, PLAYBACK_TRANSCODE_REJECTED, SEGMENT_SERVED,
-        TRANSCODE_DURATION, TRANSCODE_ERRORS, TRANSCODE_STARTS,
+        SEGMENT_SKIP_ACTIONS, TRANSCODE_DURATION, TRANSCODE_ERRORS, TRANSCODE_STARTS,
+        USER_MEDIA_STATE_TRANSITIONS,
     },
     network::registry::ensure_server_instance,
     playback::{
@@ -84,6 +90,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+const AUTOPLAY_SESSION_IDLE_TIMEOUT_SECONDS: i64 = 4 * 60 * 60;
+
 #[derive(Debug, Deserialize)]
 pub struct PlayRequest {
     pub media_item_id: String,
@@ -130,6 +138,91 @@ pub struct PlayResponse {
     pub remote_policy: RemotePlaybackPolicySnapshot,
     pub state: String,
     pub logical_position_seconds: f32,
+    pub playback_state: Option<PlaybackStateContract>,
+    pub segments: Vec<MediaSegmentContract>,
+    pub up_next: Option<Value>,
+    pub playback_preferences: PlaybackInteractionPreferences,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaybackStateContract {
+    pub item_type: String,
+    pub item_id: String,
+    pub resume_seconds: f64,
+    pub duration_seconds: Option<i32>,
+    pub watched: bool,
+    pub watched_at: Option<String>,
+    pub last_played_at: Option<String>,
+    pub state_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaSegmentContract {
+    pub id: String,
+    pub media_file_id: String,
+    pub item_type: String,
+    pub item_id: String,
+    pub segment_type: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub source_label: String,
+    pub confidence: f64,
+    pub locked: bool,
+    pub status: String,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlaybackProgressRequest {
+    #[serde(alias = "positionSeconds")]
+    pub position_seconds: f64,
+    #[serde(alias = "durationSeconds")]
+    pub duration_seconds: Option<f64>,
+    pub paused: Option<bool>,
+    #[serde(alias = "playbackRate")]
+    pub playback_rate: Option<f64>,
+    #[serde(alias = "eventType")]
+    pub event_type: Option<String>,
+    #[serde(alias = "segmentType")]
+    pub segment_type: Option<String>,
+    #[serde(alias = "segmentBehavior")]
+    pub segment_behavior: Option<String>,
+    #[serde(alias = "clientReportedAt")]
+    pub client_reported_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EndSessionRequest {
+    #[serde(alias = "positionSeconds")]
+    pub position_seconds: Option<f64>,
+    #[serde(alias = "durationSeconds")]
+    pub duration_seconds: Option<f64>,
+    #[serde(alias = "eventType")]
+    pub event_type: Option<String>,
+    #[serde(alias = "clientReportedAt")]
+    pub client_reported_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaybackProgressResponse {
+    pub ok: bool,
+    pub playback_state: Option<PlaybackStateContract>,
+    pub active_segment: Option<MediaSegmentContract>,
+    pub up_next: Option<Value>,
+    pub playback_preferences: PlaybackInteractionPreferences,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ManualWatchStateRequest {
+    #[serde(alias = "durationSeconds")]
+    pub duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManualWatchStateResponse {
+    pub ok: bool,
+    pub action: String,
+    pub playback_state: PlaybackStateContract,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +369,75 @@ pub async fn playback_readiness_probe(
             .map_err(|err| ApiError::internal(err.to_string()))?;
     *state.playback_host_fingerprint.write().await = Some(report.host.host_fingerprint.clone());
     Ok(Json(report))
+}
+
+pub async fn get_item_watch_state(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    AxumPath((item_type, item_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<ManualWatchStateResponse>> {
+    let (context, _media_file_id, duration_seconds) =
+        resolve_manual_watch_state_context(&state, &item_type, &item_id).await?;
+    let playback_state = load_user_media_state(&state, user.user_id, &context)
+        .await?
+        .unwrap_or_else(|| default_playback_state_contract(&context, duration_seconds));
+
+    Ok(Json(ManualWatchStateResponse {
+        ok: true,
+        action: "get".to_string(),
+        playback_state,
+    }))
+}
+
+pub async fn mark_item_watched(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    AxumPath((item_type, item_id)): AxumPath<(String, String)>,
+    body: Option<Json<ManualWatchStateRequest>>,
+) -> ApiResult<Json<ManualWatchStateResponse>> {
+    apply_manual_watch_state_action(
+        &state,
+        user.user_id,
+        &item_type,
+        &item_id,
+        ManualWatchStateAction::Watched,
+        body.map(|Json(value)| value).unwrap_or_default(),
+    )
+    .await
+}
+
+pub async fn mark_item_unwatched(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    AxumPath((item_type, item_id)): AxumPath<(String, String)>,
+    body: Option<Json<ManualWatchStateRequest>>,
+) -> ApiResult<Json<ManualWatchStateResponse>> {
+    apply_manual_watch_state_action(
+        &state,
+        user.user_id,
+        &item_type,
+        &item_id,
+        ManualWatchStateAction::Unwatched,
+        body.map(|Json(value)| value).unwrap_or_default(),
+    )
+    .await
+}
+
+pub async fn reset_item_watch_progress(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    AxumPath((item_type, item_id)): AxumPath<(String, String)>,
+    body: Option<Json<ManualWatchStateRequest>>,
+) -> ApiResult<Json<ManualWatchStateResponse>> {
+    apply_manual_watch_state_action(
+        &state,
+        user.user_id,
+        &item_type,
+        &item_id,
+        ManualWatchStateAction::ResetProgress,
+        body.map(|Json(value)| value).unwrap_or_default(),
+    )
+    .await
 }
 
 pub async fn hardware_readiness(
@@ -470,6 +632,15 @@ struct FileRow {
     size_bytes: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct PlaybackItemContext {
+    item_type: String,
+    item_id: String,
+    series_id: Option<String>,
+    season_id: Option<String>,
+    episode_id: Option<String>,
+}
+
 pub async fn play(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -660,6 +831,24 @@ pub async fn play(
     )
     .ok_or_else(|| ApiError::not_found("requested file not found"))?;
 
+    let playback_context = resolve_playback_item_context(
+        &state,
+        &body.media_item_id,
+        item.r#type,
+        scoped_episode_id.as_deref(),
+        &selected.id,
+    )
+    .await?;
+    let persisted_resume_seconds = if body.start_position_seconds.is_none() {
+        if let Some(context) = playback_context.as_ref() {
+            load_resume_seconds(&state, user.user_id, context).await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut media_capabilities =
         ensure_media_file_probe(&state.db_pool, &selected.id, &selected.path)
             .await
@@ -725,7 +914,8 @@ pub async fn play(
         record_playback_performance_envelopes(&effective_policy.performance_envelopes);
     }
     effective_policy.active_video_transcodes = active_video_transcode_count(&state).await?;
-    let start_position_seconds = validated_start_position_seconds(body.start_position_seconds)?;
+    let start_position_seconds =
+        validated_start_position_seconds(body.start_position_seconds.or(persisted_resume_seconds))?;
     let subtitle_mode = body
         .subtitle_mode
         .as_deref()
@@ -908,6 +1098,9 @@ pub async fn play(
     )
     .await;
 
+    let playback_context_json = playback_context
+        .as_ref()
+        .map(|context| playback_context_json(context, &body.media_item_id, &selected.id));
     let transcode_state = if playback_plan.mode.is_hls_producing() {
         Some(serde_json::json!({
             "seek_seconds": start_position_seconds.unwrap_or(0) as f32,
@@ -946,7 +1139,7 @@ pub async fn play(
         serde_json::to_string(&remote_policy).map_err(|e| ApiError::internal(e.to_string()))?;
     let job_state_json = transcode_state.clone();
 
-    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, token_expires_at, share_id, remote_policy_json, playback_plan_json, job_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, token_expires_at, share_id, remote_policy_json, playback_plan_json, job_state_json, selected_item_type, selected_item_id, selected_series_id, selected_season_id, selected_episode_id, playback_context_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(session_id.to_string())
         .bind(user.user_id.to_string())
         .bind(server_id.to_string())
@@ -964,9 +1157,49 @@ pub async fn play(
         .bind(Some(remote_policy_json))
         .bind(Some(playback_plan_json.to_string()))
         .bind(job_state_json.as_ref().map(|s| s.to_string()))
+        .bind(playback_context.as_ref().map(|context| context.item_type.clone()))
+        .bind(playback_context.as_ref().map(|context| context.item_id.clone()))
+        .bind(playback_context.as_ref().and_then(|context| context.series_id.clone()))
+        .bind(playback_context.as_ref().and_then(|context| context.season_id.clone()))
+        .bind(playback_context.as_ref().and_then(|context| context.episode_id.clone()))
+        .bind(playback_context_json)
         .execute(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let playback_state = if let Some(context) = playback_context.as_ref() {
+        Some(
+            apply_playback_progress_update(
+                &state,
+                user.user_id,
+                &session_id.to_string(),
+                &selected.id,
+                context,
+                ProgressProjectionInput {
+                    position_seconds: start_position_seconds.unwrap_or(0) as f64,
+                    duration_seconds: resolved_duration,
+                    paused: false,
+                    event_type: "start",
+                    client_reported_at: None,
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let segments = load_active_media_segments(&state, &selected.id).await?;
+    let playback_preferences = load_or_create_playback_preferences(&state.db_pool, user.user_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let up_next = compute_up_next_metadata(
+        &state,
+        user.user_id,
+        playback_context.as_ref(),
+        resolved_duration,
+        &playback_preferences,
+    )
+    .await?;
 
     latency_timer.stop_and_record();
 
@@ -984,7 +1217,11 @@ pub async fn play(
         decision_reasons: playback_plan.reasons.clone(),
         playback_plan: playback_plan_json,
         media_file_id: selected.id.clone(),
-        selected_episode_id: scoped_episode_id,
+        selected_episode_id: scoped_episode_id.or_else(|| {
+            playback_context
+                .as_ref()
+                .and_then(|context| context.episode_id.clone())
+        }),
         episode_selection_reason,
         server_id: server_id.to_string(),
         wan_direct_endpoint,
@@ -993,6 +1230,10 @@ pub async fn play(
         remote_policy,
         state: "active".to_string(),
         logical_position_seconds: start_position_seconds.unwrap_or(0) as f32,
+        playback_state,
+        segments,
+        up_next,
+        playback_preferences,
     };
 
     Ok(Json(response))
@@ -1050,6 +1291,843 @@ async fn resolve_duration_seconds(
     item_duration
 }
 
+async fn resolve_playback_item_context(
+    state: &AppState,
+    media_item_id: &str,
+    item_type: MediaType,
+    scoped_episode_id: Option<&str>,
+    media_file_id: &str,
+) -> ApiResult<Option<PlaybackItemContext>> {
+    if matches!(item_type, MediaType::Movie) {
+        return Ok(Some(PlaybackItemContext {
+            item_type: "movie".to_string(),
+            item_id: media_item_id.to_string(),
+            series_id: None,
+            season_id: None,
+            episode_id: None,
+        }));
+    }
+
+    if let Some(episode_id) = scoped_episode_id {
+        let row = sqlx::query(
+            "SELECT id, series_id, season_id
+             FROM episodes
+             WHERE id = ? AND series_id = ?
+             LIMIT 1",
+        )
+        .bind(episode_id)
+        .bind(media_item_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+        return Ok(row.map(|row| PlaybackItemContext {
+            item_type: "episode".to_string(),
+            item_id: row.get("id"),
+            series_id: row.try_get("series_id").ok(),
+            season_id: row.try_get("season_id").ok(),
+            episode_id: Some(episode_id.to_string()),
+        }));
+    }
+
+    resolve_context_for_media_file(state, media_file_id).await
+}
+
+async fn resolve_context_for_media_file(
+    state: &AppState,
+    media_file_id: &str,
+) -> ApiResult<Option<PlaybackItemContext>> {
+    if let Some(row) = sqlx::query(
+        "SELECT movie_id
+         FROM movie_files
+         WHERE media_file_id = ?
+         LIMIT 1",
+    )
+    .bind(media_file_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    {
+        return Ok(Some(PlaybackItemContext {
+            item_type: "movie".to_string(),
+            item_id: row.get("movie_id"),
+            series_id: None,
+            season_id: None,
+            episode_id: None,
+        }));
+    }
+
+    let row = sqlx::query(
+        "SELECT e.id, e.series_id, e.season_id
+         FROM episode_files ef
+         JOIN episodes e ON e.id = ef.episode_id
+         WHERE ef.media_file_id = ?
+         LIMIT 1",
+    )
+    .bind(media_file_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(row.map(|row| {
+        let episode_id: String = row.get("id");
+        PlaybackItemContext {
+            item_type: "episode".to_string(),
+            item_id: episode_id.clone(),
+            series_id: row.try_get("series_id").ok(),
+            season_id: row.try_get("season_id").ok(),
+            episode_id: Some(episode_id),
+        }
+    }))
+}
+
+async fn load_session_item_context(
+    state: &AppState,
+    session_id: &str,
+    media_file_id: &str,
+) -> ApiResult<Option<PlaybackItemContext>> {
+    let row = sqlx::query(
+        "SELECT selected_item_type, selected_item_id, selected_series_id,
+                selected_season_id, selected_episode_id
+         FROM playback_sessions
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if let Some(row) = row {
+        let item_type = row
+            .try_get::<String, _>("selected_item_type")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let item_id = row
+            .try_get::<String, _>("selected_item_id")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+
+        if let (Some(item_type), Some(item_id)) = (item_type, item_id) {
+            return Ok(Some(PlaybackItemContext {
+                item_type,
+                item_id,
+                series_id: row.try_get("selected_series_id").ok(),
+                season_id: row.try_get("selected_season_id").ok(),
+                episode_id: row.try_get("selected_episode_id").ok(),
+            }));
+        }
+    }
+
+    resolve_context_for_media_file(state, media_file_id).await
+}
+
+fn playback_context_json(
+    context: &PlaybackItemContext,
+    requested_item_id: &str,
+    media_file_id: &str,
+) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "requested_item_id": requested_item_id,
+        "media_file_id": media_file_id,
+        "item_type": context.item_type,
+        "item_id": context.item_id,
+        "series_id": context.series_id,
+        "season_id": context.season_id,
+        "episode_id": context.episode_id,
+    })
+    .to_string()
+}
+
+async fn load_user_media_state(
+    state: &AppState,
+    user_id: Uuid,
+    context: &PlaybackItemContext,
+) -> ApiResult<Option<PlaybackStateContract>> {
+    let row = sqlx::query(
+        "SELECT resume_seconds, duration_seconds,
+                CASE WHEN watched THEN 1 ELSE 0 END as watched,
+                CAST(watched_at AS TEXT) as watched_at,
+                CAST(last_played_at AS TEXT) as last_played_at,
+                state_source
+         FROM user_media_state
+         WHERE user_id = ? AND item_type = ? AND item_id = ?
+         LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .bind(&context.item_type)
+    .bind(&context.item_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(row.map(|row| playback_state_contract_from_row(context, &row)))
+}
+
+fn playback_state_contract_from_row(
+    context: &PlaybackItemContext,
+    row: &AnyRow,
+) -> PlaybackStateContract {
+    PlaybackStateContract {
+        item_type: context.item_type.clone(),
+        item_id: context.item_id.clone(),
+        resume_seconds: row.try_get::<f64, _>("resume_seconds").unwrap_or(0.0),
+        duration_seconds: row
+            .try_get::<i64, _>("duration_seconds")
+            .ok()
+            .map(|value| value as i32),
+        watched: row_bool(row, "watched"),
+        watched_at: row.try_get("watched_at").ok(),
+        last_played_at: row.try_get("last_played_at").ok(),
+        state_source: row.try_get("state_source").ok(),
+    }
+}
+
+fn default_playback_state_contract(
+    context: &PlaybackItemContext,
+    duration_seconds: Option<i32>,
+) -> PlaybackStateContract {
+    PlaybackStateContract {
+        item_type: context.item_type.clone(),
+        item_id: context.item_id.clone(),
+        resume_seconds: 0.0,
+        duration_seconds,
+        watched: false,
+        watched_at: None,
+        last_played_at: None,
+        state_source: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManualWatchStateAction {
+    Watched,
+    Unwatched,
+    ResetProgress,
+}
+
+impl ManualWatchStateAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            ManualWatchStateAction::Watched => "watched",
+            ManualWatchStateAction::Unwatched => "unwatched",
+            ManualWatchStateAction::ResetProgress => "reset_progress",
+        }
+    }
+}
+
+async fn apply_manual_watch_state_action(
+    state: &AppState,
+    user_id: Uuid,
+    item_type: &str,
+    item_id: &str,
+    action: ManualWatchStateAction,
+    request: ManualWatchStateRequest,
+) -> ApiResult<Json<ManualWatchStateResponse>> {
+    let (context, media_file_id, catalog_duration_seconds) =
+        resolve_manual_watch_state_context(state, item_type, item_id).await?;
+    let request_duration_seconds = validated_progress_duration(request.duration_seconds)?;
+    let previous_state = load_user_media_state(state, user_id, &context).await?;
+    let previous_watched = previous_state
+        .as_ref()
+        .map(|state| state.watched)
+        .unwrap_or(false);
+    let watched = match action {
+        ManualWatchStateAction::Watched => true,
+        ManualWatchStateAction::Unwatched => false,
+        ManualWatchStateAction::ResetProgress => previous_watched,
+    };
+    let transition = media_state_transition(previous_state.as_ref(), 0.0, watched);
+    let watched_i64 = if watched { 1_i64 } else { 0_i64 };
+    let watched_at = watched.then(|| {
+        previous_state
+            .as_ref()
+            .and_then(|state| state.watched_at.clone())
+            .unwrap_or_else(|| Utc::now().to_rfc3339())
+    });
+    let insert_play_count = if watched { 1_i64 } else { 0_i64 };
+    let duration_seconds = request_duration_seconds
+        .or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.duration_seconds)
+        })
+        .or(catalog_duration_seconds);
+
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO user_media_state (
+             user_id, item_type, item_id, media_file_id, series_id, season_id,
+             resume_seconds, duration_seconds, watched, watched_at, play_count,
+             last_played_at, last_session_id, state_source, updated_at, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ? != 0, ?, ?, CURRENT_TIMESTAMP, NULL, 'manual',
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
+             media_file_id = COALESCE(excluded.media_file_id, user_media_state.media_file_id),
+             series_id = COALESCE(excluded.series_id, user_media_state.series_id),
+             season_id = COALESCE(excluded.season_id, user_media_state.season_id),
+             resume_seconds = 0,
+             duration_seconds = COALESCE(excluded.duration_seconds, user_media_state.duration_seconds),
+             watched = excluded.watched,
+             watched_at = CASE
+                 WHEN excluded.watched THEN COALESCE(user_media_state.watched_at, excluded.watched_at, CURRENT_TIMESTAMP)
+                 ELSE NULL
+             END,
+             play_count = CASE
+                 WHEN NOT user_media_state.watched AND excluded.watched THEN user_media_state.play_count + 1
+                 ELSE user_media_state.play_count
+             END,
+             last_played_at = CURRENT_TIMESTAMP,
+             last_session_id = NULL,
+             state_source = 'manual',
+             updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(user_id.to_string())
+    .bind(&context.item_type)
+    .bind(&context.item_id)
+    .bind(media_file_id)
+    .bind(&context.series_id)
+    .bind(&context.season_id)
+    .bind(duration_seconds)
+    .bind(watched_i64)
+    .bind(watched_at)
+    .bind(insert_play_count)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    record_user_media_state_transition(&context.item_type, transition, "manual");
+
+    let playback_state = load_user_media_state(state, user_id, &context)
+        .await?
+        .ok_or_else(|| ApiError::internal("failed to persist manual playback state"))?;
+
+    Ok(Json(ManualWatchStateResponse {
+        ok: true,
+        action: action.as_str().to_string(),
+        playback_state,
+    }))
+}
+
+async fn resolve_manual_watch_state_context(
+    state: &AppState,
+    item_type: &str,
+    item_id: &str,
+) -> ApiResult<(PlaybackItemContext, Option<String>, Option<i32>)> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err(ApiError::bad_request("item_id is required"));
+    }
+    match item_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "movie" => {
+            let row = sqlx::query(
+                "SELECT
+                     m.id,
+                     m.runtime_seconds,
+                     (
+                         SELECT mf.id
+                         FROM movie_files mlf
+                         JOIN media_files mf ON mf.id = mlf.media_file_id
+                         WHERE mlf.movie_id = m.id AND mf.scan_state = 'ok'
+                         ORDER BY mf.id ASC
+                         LIMIT 1
+                     ) AS media_file_id
+                 FROM movies m
+                 WHERE m.id = ?
+                 LIMIT 1",
+            )
+            .bind(item_id)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found("movie not found"))?;
+            Ok((
+                PlaybackItemContext {
+                    item_type: "movie".to_string(),
+                    item_id: row.get("id"),
+                    series_id: None,
+                    season_id: None,
+                    episode_id: None,
+                },
+                row.try_get("media_file_id").ok(),
+                row.try_get::<i64, _>("runtime_seconds")
+                    .ok()
+                    .map(|value| value as i32),
+            ))
+        }
+        "episode" => {
+            let row = sqlx::query(
+                "SELECT
+                     e.id,
+                     e.series_id,
+                     e.season_id,
+                     e.runtime_seconds,
+                     (
+                         SELECT mf.id
+                         FROM episode_files ef
+                         JOIN media_files mf ON mf.id = ef.media_file_id
+                         WHERE ef.episode_id = e.id AND mf.scan_state = 'ok'
+                         ORDER BY mf.id ASC
+                         LIMIT 1
+                     ) AS media_file_id
+                 FROM episodes e
+                 WHERE e.id = ?
+                 LIMIT 1",
+            )
+            .bind(item_id)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found("episode not found"))?;
+            let episode_id: String = row.get("id");
+            Ok((
+                PlaybackItemContext {
+                    item_type: "episode".to_string(),
+                    item_id: episode_id.clone(),
+                    series_id: row.try_get("series_id").ok(),
+                    season_id: row.try_get("season_id").ok(),
+                    episode_id: Some(episode_id),
+                },
+                row.try_get("media_file_id").ok(),
+                row.try_get::<i64, _>("runtime_seconds")
+                    .ok()
+                    .map(|value| value as i32),
+            ))
+        }
+        _ => Err(ApiError::bad_request(
+            "watch state item_type must be movie or episode",
+        )),
+    }
+}
+
+fn row_bool(row: &AnyRow, column: &str) -> bool {
+    row.try_get::<bool, _>(column)
+        .or_else(|_| row.try_get::<i64, _>(column).map(|value| value != 0))
+        .or_else(|_| row.try_get::<i32, _>(column).map(|value| value != 0))
+        .unwrap_or(false)
+}
+
+fn record_playback_progress_update(event_type: &str, result: &str) {
+    PLAYBACK_PROGRESS_UPDATES
+        .with_label_values(&[event_type, result])
+        .inc();
+}
+
+fn record_user_media_state_transition(item_type: &str, transition: &str, source: &str) {
+    USER_MEDIA_STATE_TRANSITIONS
+        .with_label_values(&[item_type, transition, source])
+        .inc();
+}
+
+fn record_segment_skip_action(
+    event_type: &str,
+    segment_type: Option<&str>,
+    behavior: Option<&str>,
+    result: &str,
+) {
+    if event_type != "segment_skip" {
+        return;
+    }
+    let segment_type = normalize_metric_label(segment_type, "unknown");
+    let behavior = normalize_metric_label(behavior, "unknown");
+    SEGMENT_SKIP_ACTIONS
+        .with_label_values(&[&segment_type, &behavior, result])
+        .inc();
+}
+
+fn normalize_metric_label(value: Option<&str>, fallback: &str) -> String {
+    let normalized = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    if normalized.is_empty() {
+        fallback.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn media_state_transition(
+    previous_state: Option<&PlaybackStateContract>,
+    resume_seconds: f64,
+    watched: bool,
+) -> &'static str {
+    let Some(previous_state) = previous_state else {
+        return "created";
+    };
+    if !previous_state.watched && watched {
+        return "watched";
+    }
+    if previous_state.watched && !watched {
+        return "unwatched";
+    }
+    if !watched && previous_state.resume_seconds >= 30.0 && resume_seconds < 30.0 {
+        return "progress_reset";
+    }
+    if !watched && (previous_state.resume_seconds - resume_seconds).abs() >= 1.0 {
+        return "resume_updated";
+    }
+    "touched"
+}
+
+async fn load_resume_seconds(
+    state: &AppState,
+    user_id: Uuid,
+    context: &PlaybackItemContext,
+) -> ApiResult<Option<f64>> {
+    Ok(load_user_media_state(state, user_id, context)
+        .await?
+        .filter(|state| !state.watched && state.resume_seconds >= 30.0)
+        .map(|state| state.resume_seconds))
+}
+
+async fn apply_playback_progress_update(
+    state: &AppState,
+    user_id: Uuid,
+    session_id: &str,
+    media_file_id: &str,
+    context: &PlaybackItemContext,
+    input: ProgressProjectionInput<'_>,
+) -> ApiResult<PlaybackStateContract> {
+    update_session_progress(
+        state,
+        session_id,
+        input.position_seconds,
+        input.duration_seconds,
+    )
+    .await?;
+
+    let previous_state = load_user_media_state(state, user_id, context).await?;
+    let previous_watched = previous_state
+        .as_ref()
+        .map(|state| state.watched)
+        .unwrap_or(false);
+    let (resume_seconds, watched) = project_watch_state(
+        &context.item_type,
+        input.position_seconds,
+        input.duration_seconds,
+    );
+    let transition = media_state_transition(previous_state.as_ref(), resume_seconds, watched);
+    let watched_i64 = if watched { 1_i64 } else { 0_i64 };
+    let watched_at = watched.then(|| chrono::Utc::now().to_rfc3339());
+    let play_count = if watched { 1_i64 } else { 0_i64 };
+
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO user_media_state (
+             user_id, item_type, item_id, media_file_id, series_id, season_id,
+             resume_seconds, duration_seconds, watched, watched_at, play_count,
+             last_played_at, last_session_id, state_source, updated_at, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? != 0, ?, ?, CURRENT_TIMESTAMP, ?, 'playback',
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
+             media_file_id = excluded.media_file_id,
+             series_id = COALESCE(excluded.series_id, user_media_state.series_id),
+             season_id = COALESCE(excluded.season_id, user_media_state.season_id),
+             resume_seconds = excluded.resume_seconds,
+             duration_seconds = COALESCE(excluded.duration_seconds, user_media_state.duration_seconds),
+             watched = excluded.watched,
+             watched_at = CASE
+                 WHEN excluded.watched THEN COALESCE(user_media_state.watched_at, excluded.watched_at, CURRENT_TIMESTAMP)
+                 ELSE NULL
+             END,
+             play_count = CASE
+                 WHEN NOT user_media_state.watched AND excluded.watched THEN user_media_state.play_count + 1
+                 ELSE user_media_state.play_count
+             END,
+             last_played_at = CURRENT_TIMESTAMP,
+             last_session_id = excluded.last_session_id,
+             state_source = 'playback',
+             updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(user_id.to_string())
+    .bind(&context.item_type)
+    .bind(&context.item_id)
+    .bind(media_file_id)
+    .bind(&context.series_id)
+    .bind(&context.season_id)
+    .bind(resume_seconds)
+    .bind(input.duration_seconds)
+    .bind(watched_i64)
+    .bind(watched_at)
+    .bind(play_count)
+    .bind(session_id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if should_record_progress_event(input.event_type) {
+        insert_progress_event(state, user_id, session_id, media_file_id, context, input).await?;
+    }
+    record_autoplay_watch_progress(state, user_id, session_id, context, input).await?;
+    if !previous_watched && watched {
+        insert_progress_event(
+            state,
+            user_id,
+            session_id,
+            media_file_id,
+            context,
+            ProgressProjectionInput {
+                event_type: "watched_transition",
+                ..input
+            },
+        )
+        .await?;
+    }
+    record_playback_progress_update(input.event_type, "ok");
+    record_user_media_state_transition(&context.item_type, transition, "playback");
+
+    load_user_media_state(state, user_id, context)
+        .await?
+        .ok_or_else(|| ApiError::internal("failed to persist playback state"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressProjectionInput<'a> {
+    position_seconds: f64,
+    duration_seconds: Option<i32>,
+    paused: bool,
+    event_type: &'a str,
+    client_reported_at: Option<&'a str>,
+}
+
+async fn update_session_progress(
+    state: &AppState,
+    session_id: &str,
+    position_seconds: f64,
+    duration_seconds: Option<i32>,
+) -> ApiResult<()> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE playback_sessions
+         SET logical_position_seconds = ?,
+             duration_seconds = COALESCE(?, duration_seconds),
+             last_progress_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(position_seconds)
+    .bind(duration_seconds)
+    .bind(session_id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
+}
+
+async fn insert_progress_event(
+    state: &AppState,
+    user_id: Uuid,
+    session_id: &str,
+    media_file_id: &str,
+    context: &PlaybackItemContext,
+    input: ProgressProjectionInput<'_>,
+) -> ApiResult<()> {
+    sqlx::query::<sqlx::Any>(
+        "INSERT INTO playback_progress_events (
+             id, session_id, user_id, item_type, item_id, media_file_id,
+             event_type, position_seconds, duration_seconds, paused, client_reported_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ? != 0, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_id)
+    .bind(user_id.to_string())
+    .bind(&context.item_type)
+    .bind(&context.item_id)
+    .bind(media_file_id)
+    .bind(input.event_type)
+    .bind(input.position_seconds)
+    .bind(input.duration_seconds)
+    .bind(if input.paused { 1_i64 } else { 0_i64 })
+    .bind(input.client_reported_at)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
+}
+
+fn project_watch_state(
+    item_type: &str,
+    position_seconds: f64,
+    duration_seconds: Option<i32>,
+) -> (f64, bool) {
+    let duration = duration_seconds
+        .filter(|duration| *duration > 0)
+        .map(|duration| duration as f64);
+    let bounded_position = duration
+        .map(|duration| position_seconds.min(duration).max(0.0))
+        .unwrap_or_else(|| position_seconds.max(0.0));
+    let watched = duration
+        .map(|duration| {
+            bounded_position >= duration * 0.9
+                || duration - bounded_position <= watched_remaining_threshold_seconds(item_type)
+        })
+        .unwrap_or(false);
+
+    if watched {
+        (0.0, true)
+    } else if bounded_position >= 30.0 {
+        (bounded_position, false)
+    } else {
+        (0.0, false)
+    }
+}
+
+fn watched_remaining_threshold_seconds(item_type: &str) -> f64 {
+    if item_type.eq_ignore_ascii_case("movie") {
+        600.0
+    } else {
+        180.0
+    }
+}
+
+fn should_record_progress_event(event_type: &str) -> bool {
+    !event_type.eq_ignore_ascii_case("progress")
+}
+
+fn validated_progress_position(value: f64) -> ApiResult<f64> {
+    if !value.is_finite() || value < 0.0 || value > i32::MAX as f64 {
+        return Err(ApiError::bad_request("invalid position_seconds"));
+    }
+    Ok(value)
+}
+
+fn validated_progress_duration(value: Option<f64>) -> ApiResult<Option<i32>> {
+    match value {
+        Some(seconds) if !seconds.is_finite() || seconds < 0.0 => {
+            Err(ApiError::bad_request("invalid duration_seconds"))
+        }
+        Some(seconds) if seconds > i32::MAX as f64 => {
+            Err(ApiError::bad_request("invalid duration_seconds"))
+        }
+        Some(seconds) if seconds >= 1.0 => Ok(Some(seconds.round() as i32)),
+        Some(_) | None => Ok(None),
+    }
+}
+
+fn validated_playback_rate(value: Option<f64>) -> ApiResult<()> {
+    if let Some(rate) = value {
+        if !rate.is_finite() || rate <= 0.0 || rate > 8.0 {
+            return Err(ApiError::bad_request("invalid playback_rate"));
+        }
+    }
+    Ok(())
+}
+
+fn validated_progress_event_type<'a>(
+    value: Option<&'a str>,
+    default: &'a str,
+) -> ApiResult<&'a str> {
+    let event_type = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default);
+    match event_type {
+        "start" | "progress" | "pause" | "resume" | "seek" | "segment_skip" | "ended"
+        | "stopped" | "correction" | "autoplay_next" | "play_next" | "autoplay_cancelled"
+        | "error" => Ok(event_type),
+        _ => Err(ApiError::bad_request("invalid event_type")),
+    }
+}
+
+fn validated_client_reported_at(value: Option<&str>) -> ApiResult<Option<&str>> {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        if value.len() > 64 {
+            return Err(ApiError::bad_request("invalid client_reported_at"));
+        }
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn load_active_media_segments(
+    state: &AppState,
+    media_file_id: &str,
+) -> ApiResult<Vec<MediaSegmentContract>> {
+    let rows = sqlx::query(
+        "SELECT id, media_file_id, item_type, item_id, segment_type,
+                start_seconds, end_seconds, source_label, confidence,
+                CASE WHEN locked THEN 1 ELSE 0 END as locked, status, metadata_json
+         FROM media_segments
+         WHERE media_file_id = ? AND status = 'active'
+         ORDER BY start_seconds ASC, end_seconds ASC
+         LIMIT 50",
+    )
+    .bind(media_file_id)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(rows
+        .iter()
+        .map(media_segment_contract_from_row)
+        .collect::<Vec<_>>())
+}
+
+async fn load_active_segment_at_position(
+    state: &AppState,
+    media_file_id: &str,
+    position_seconds: f64,
+) -> ApiResult<Option<MediaSegmentContract>> {
+    let row = sqlx::query(
+        "SELECT id, media_file_id, item_type, item_id, segment_type,
+                start_seconds, end_seconds, source_label, confidence,
+                CASE WHEN locked THEN 1 ELSE 0 END as locked, status, metadata_json
+         FROM media_segments
+         WHERE media_file_id = ?
+           AND status = 'active'
+           AND start_seconds <= ?
+           AND end_seconds > ?
+         ORDER BY start_seconds ASC, end_seconds ASC
+         LIMIT 1",
+    )
+    .bind(media_file_id)
+    .bind(position_seconds)
+    .bind(position_seconds)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(row.as_ref().map(media_segment_contract_from_row))
+}
+
+fn media_segment_contract_from_row(row: &AnyRow) -> MediaSegmentContract {
+    MediaSegmentContract {
+        id: row.get("id"),
+        media_file_id: row.get("media_file_id"),
+        item_type: row.get("item_type"),
+        item_id: row.get("item_id"),
+        segment_type: row.get("segment_type"),
+        start_seconds: row.try_get::<f64, _>("start_seconds").unwrap_or(0.0),
+        end_seconds: row.try_get::<f64, _>("end_seconds").unwrap_or(0.0),
+        source_label: row.get("source_label"),
+        confidence: row.try_get::<f64, _>("confidence").unwrap_or(0.0),
+        locked: row_bool(row, "locked"),
+        status: row.get("status"),
+        metadata: row
+            .try_get::<String, _>("metadata_json")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok()),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EpisodePlaybackChoice {
     episode_id: String,
@@ -1065,14 +2143,41 @@ struct EpisodePlaybackCandidate {
     position_seconds: f64,
     duration_seconds: Option<f64>,
     last_played_at: Option<String>,
+    watched: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UpNextCandidate {
+    episode_id: String,
+    series_id: String,
+    season_id: Option<String>,
+    title: Option<String>,
+    season_number: i32,
+    episode_number: i32,
+    absolute_episode_number: Option<i32>,
+    media_file_id: String,
+    watched: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AutoplaySessionState {
+    id: String,
+    consecutive_count: i32,
+    elapsed_autoplay_seconds: i64,
+    last_progress_session_id: Option<String>,
+    last_progress_position_seconds: Option<f64>,
+    last_episode_id: Option<String>,
 }
 
 impl EpisodePlaybackCandidate {
     fn completed(&self) -> bool {
+        if self.watched {
+            return true;
+        }
         let Some(duration) = self.duration_seconds.filter(|duration| *duration > 0.0) else {
             return false;
         };
-        self.position_seconds >= duration * 0.9 || duration - self.position_seconds <= 120.0
+        self.position_seconds >= duration * 0.9 || duration - self.position_seconds <= 180.0
     }
 
     fn resumable(&self) -> bool {
@@ -1099,16 +2204,18 @@ async fn select_series_episode_for_playback(
              e.season_number,
              e.episode_number,
              e.absolute_episode_number,
-             CAST(COALESCE(MAX(ps.logical_position_seconds), 0) AS REAL) AS position_seconds,
-             CAST(MAX(COALESCE(ps.duration_seconds, e.runtime_seconds, 0)) AS REAL) AS duration_seconds,
-             MAX(CAST(ps.updated_at AS TEXT)) AS last_played_at
+             CAST(COALESCE(ums.resume_seconds, 0) AS REAL) AS position_seconds,
+             CAST(COALESCE(ums.duration_seconds, e.runtime_seconds, 0) AS REAL) AS duration_seconds,
+             CAST(ums.last_played_at AS TEXT) AS last_played_at,
+             CASE WHEN ums.watched THEN 1 ELSE 0 END AS watched
          FROM episodes e
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
-         LEFT JOIN playback_sessions ps
-           ON ps.media_file_id = mf.id AND ps.user_id = ?
+         LEFT JOIN user_media_state ums
+           ON ums.user_id = ? AND ums.item_type = 'episode' AND ums.item_id = e.id
          WHERE e.series_id = ? AND mf.scan_state = 'ok'
-         GROUP BY e.id, e.season_number, e.episode_number, e.absolute_episode_number
+         GROUP BY e.id, e.season_number, e.episode_number, e.absolute_episode_number,
+                  ums.resume_seconds, ums.duration_seconds, ums.last_played_at, ums.watched
          ORDER BY e.season_number ASC,
                   COALESCE(e.absolute_episode_number, e.episode_number) ASC,
                   e.episode_number ASC",
@@ -1135,6 +2242,7 @@ async fn select_series_episode_for_playback(
                 .ok()
                 .filter(|value| *value > 0.0),
             last_played_at: row.try_get::<String, _>("last_played_at").ok(),
+            watched: row_bool(&row, "watched"),
         });
     }
 
@@ -1163,6 +2271,418 @@ async fn select_series_episode_for_playback(
             episode_id: candidate.id.clone(),
             reason: "first_available_episode".to_string(),
         }))
+}
+
+async fn compute_up_next_metadata(
+    state: &AppState,
+    user_id: Uuid,
+    context: Option<&PlaybackItemContext>,
+    duration_seconds: Option<i32>,
+    preferences: &PlaybackInteractionPreferences,
+) -> ApiResult<Option<Value>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    if context.item_type != "episode" {
+        return Ok(None);
+    }
+    let Some(series_id) = context.series_id.as_deref() else {
+        return Ok(None);
+    };
+
+    let rows = sqlx::query(
+        "SELECT
+             e.id,
+             e.series_id,
+             e.season_id,
+             e.title,
+             e.season_number,
+             e.episode_number,
+             e.absolute_episode_number,
+             MIN(mf.id) AS media_file_id,
+             CASE WHEN ums.watched THEN 1 ELSE 0 END AS watched
+         FROM episodes e
+         JOIN episode_files ef ON ef.episode_id = e.id
+         JOIN media_files mf ON mf.id = ef.media_file_id
+         LEFT JOIN user_media_state ums
+           ON ums.user_id = ? AND ums.item_type = 'episode' AND ums.item_id = e.id
+         WHERE e.series_id = ? AND mf.scan_state = 'ok'
+         GROUP BY e.id, e.series_id, e.season_id, e.title, e.season_number,
+                  e.episode_number, e.absolute_episode_number, ums.watched
+         ORDER BY e.season_number ASC,
+                  COALESCE(e.absolute_episode_number, e.episode_number) ASC,
+                  e.episode_number ASC",
+    )
+    .bind(user_id.to_string())
+    .bind(series_id)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        candidates.push(UpNextCandidate {
+            episode_id: row.get("id"),
+            series_id: row.get("series_id"),
+            season_id: row.try_get("season_id").ok(),
+            title: row.try_get("title").ok(),
+            season_number: row.get::<i64, _>("season_number") as i32,
+            episode_number: row.get::<i64, _>("episode_number") as i32,
+            absolute_episode_number: row
+                .try_get::<i64, _>("absolute_episode_number")
+                .ok()
+                .map(|value| value as i32),
+            media_file_id: row.get("media_file_id"),
+            watched: row_bool(&row, "watched"),
+        });
+    }
+
+    let Some(current_index) = candidates
+        .iter()
+        .position(|candidate| candidate.episode_id == context.item_id)
+    else {
+        return Ok(None);
+    };
+
+    let remaining = &candidates[current_index + 1..];
+    let (next, reason) = remaining
+        .iter()
+        .find(|candidate| !candidate.watched)
+        .map(|candidate| (candidate, "next_unwatched_episode"))
+        .or_else(|| {
+            remaining
+                .first()
+                .map(|candidate| (candidate, "next_available_episode"))
+        })
+        .map_or((None, "end_of_series"), |(candidate, reason)| {
+            (Some(candidate), reason)
+        });
+
+    let start_after_seconds = duration_seconds
+        .filter(|duration| *duration > 0)
+        .map(|duration| (duration - 30).max(0))
+        .unwrap_or(0);
+    let autoplay = compute_autoplay_policy_metadata(state, user_id, series_id, preferences).await?;
+    let autoplay_allowed = autoplay
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(Some(if let Some(candidate) = next {
+        serde_json::json!({
+            "available": true,
+            "episode_id": candidate.episode_id,
+            "media_item_id": candidate.series_id,
+            "series_id": candidate.series_id,
+            "season_id": candidate.season_id,
+            "media_file_id": candidate.media_file_id,
+            "title": candidate.title,
+            "season_number": candidate.season_number,
+            "episode_number": candidate.episode_number,
+            "absolute_episode_number": candidate.absolute_episode_number,
+            "start_after_seconds": start_after_seconds,
+            "countdown_seconds": preferences.autoplay_countdown_seconds,
+            "autoplay_allowed": autoplay_allowed,
+            "autoplay": autoplay,
+            "reason": reason,
+        })
+    } else {
+        serde_json::json!({
+            "available": false,
+            "media_item_id": series_id,
+            "series_id": series_id,
+            "autoplay_allowed": false,
+            "autoplay": autoplay,
+            "reason": reason,
+        })
+    }))
+}
+
+async fn compute_autoplay_policy_metadata(
+    state: &AppState,
+    user_id: Uuid,
+    series_id: &str,
+    preferences: &PlaybackInteractionPreferences,
+) -> ApiResult<Value> {
+    let session = load_active_autoplay_session(state, user_id, series_id).await?;
+    let consecutive_count = session
+        .as_ref()
+        .map(|session| session.consecutive_count)
+        .unwrap_or(0)
+        .max(0);
+    let elapsed_autoplay_seconds = session
+        .as_ref()
+        .map(|session| session.elapsed_autoplay_seconds)
+        .unwrap_or(0)
+        .max(0);
+    let max_consecutive = preferences.autoplay_max_consecutive.max(0);
+    let max_elapsed_minutes = preferences.autoplay_max_elapsed_minutes.max(0);
+    let max_elapsed_seconds = i64::from(max_elapsed_minutes) * 60;
+    let mut block_reason = Value::Null;
+    let allowed = if !preferences.autoplay_enabled {
+        block_reason = Value::String("disabled".to_string());
+        false
+    } else if max_consecutive <= 0 {
+        block_reason = Value::String("max_consecutive_zero".to_string());
+        false
+    } else if consecutive_count >= max_consecutive {
+        block_reason = Value::String("max_consecutive_reached".to_string());
+        false
+    } else if max_elapsed_minutes <= 0 {
+        block_reason = Value::String("max_elapsed_zero".to_string());
+        false
+    } else if elapsed_autoplay_seconds >= max_elapsed_seconds {
+        block_reason = Value::String("max_elapsed_reached".to_string());
+        false
+    } else {
+        true
+    };
+    let session_id = session.as_ref().map(|session| session.id.clone());
+    let last_episode_id = session
+        .as_ref()
+        .and_then(|session| session.last_episode_id.clone());
+
+    Ok(serde_json::json!({
+        "enabled": preferences.autoplay_enabled,
+        "allowed": allowed,
+        "block_reason": block_reason,
+        "consecutive_count": consecutive_count,
+        "max_consecutive": max_consecutive,
+        "elapsed_autoplay_seconds": elapsed_autoplay_seconds,
+        "elapsed_autoplay_minutes": elapsed_autoplay_seconds / 60,
+        "max_elapsed_minutes": max_elapsed_minutes,
+        "remaining_elapsed_seconds": (max_elapsed_seconds - elapsed_autoplay_seconds).max(0),
+        "countdown_seconds": preferences.autoplay_countdown_seconds,
+        "idle_timeout_seconds": AUTOPLAY_SESSION_IDLE_TIMEOUT_SECONDS,
+        "session_id": session_id,
+        "last_episode_id": last_episode_id,
+    }))
+}
+
+async fn record_autoplay_interaction(
+    state: &AppState,
+    user_id: Uuid,
+    context: &PlaybackItemContext,
+    event_type: &str,
+) -> ApiResult<()> {
+    if context.item_type != "episode" {
+        return Ok(());
+    }
+    let Some(series_id) = context.series_id.as_deref() else {
+        return Ok(());
+    };
+    match event_type {
+        "autoplay_next" => {
+            record_autoplay_transition(state, user_id, series_id, &context.item_id).await
+        }
+        "play_next" => {
+            cancel_active_autoplay_sessions(state, user_id, series_id, "play_next").await
+        }
+        "autoplay_cancelled" => {
+            cancel_active_autoplay_sessions(state, user_id, series_id, "autoplay_cancelled").await
+        }
+        "ended" | "stopped" | "error" => {
+            cancel_active_autoplay_sessions(state, user_id, series_id, "session_end").await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn record_autoplay_watch_progress(
+    state: &AppState,
+    user_id: Uuid,
+    session_id: &str,
+    context: &PlaybackItemContext,
+    input: ProgressProjectionInput<'_>,
+) -> ApiResult<()> {
+    if context.item_type != "episode" {
+        return Ok(());
+    }
+    let Some(series_id) = context.series_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(session) = load_active_autoplay_session(state, user_id, series_id).await? else {
+        return Ok(());
+    };
+
+    let bounded_position = input.position_seconds.max(0.0);
+    let baseline = if session.last_progress_session_id.as_deref() == Some(session_id) {
+        session
+            .last_progress_position_seconds
+            .unwrap_or(bounded_position)
+            .max(0.0)
+    } else {
+        0.0
+    };
+    let mut delta_seconds = if autoplay_progress_event_counts_elapsed(input.event_type) {
+        (bounded_position - baseline).max(0.0)
+    } else {
+        0.0
+    };
+    delta_seconds = delta_seconds.min(120.0);
+
+    sqlx::query::<sqlx::Any>(
+        "UPDATE user_autoplay_sessions
+         SET elapsed_autoplay_seconds = elapsed_autoplay_seconds + ?,
+             last_progress_session_id = ?,
+             last_progress_position_seconds = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND canceled = 0",
+    )
+    .bind(delta_seconds.round() as i64)
+    .bind(session_id)
+    .bind(bounded_position)
+    .bind(session.id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(())
+}
+
+fn autoplay_progress_event_counts_elapsed(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "progress" | "pause" | "resume" | "ended" | "stopped" | "error"
+    )
+}
+
+async fn record_autoplay_transition(
+    state: &AppState,
+    user_id: Uuid,
+    series_id: &str,
+    last_episode_id: &str,
+) -> ApiResult<()> {
+    if let Some(session) = load_active_autoplay_session(state, user_id, series_id).await? {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE user_autoplay_sessions
+             SET last_episode_id = ?,
+                 consecutive_count = consecutive_count + 1,
+                 last_progress_session_id = NULL,
+                 last_progress_position_seconds = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(last_episode_id)
+        .bind(session.id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        record_autoplay_transition_metric("ok", "autoplay_next_advanced");
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO user_autoplay_sessions (
+                 id, user_id, series_id, started_at, last_episode_id,
+                 consecutive_count, elapsed_autoplay_seconds, canceled, updated_at
+             )
+             VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 1, 0, 0, CURRENT_TIMESTAMP)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id.to_string())
+        .bind(series_id)
+        .bind(last_episode_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        record_autoplay_transition_metric("ok", "autoplay_next_created");
+    }
+    Ok(())
+}
+
+async fn cancel_active_autoplay_sessions(
+    state: &AppState,
+    user_id: Uuid,
+    series_id: &str,
+    reason: &str,
+) -> ApiResult<()> {
+    let result = sqlx::query::<sqlx::Any>(
+        "UPDATE user_autoplay_sessions
+         SET canceled = 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = ? AND series_id = ? AND canceled = 0",
+    )
+    .bind(user_id.to_string())
+    .bind(series_id)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    if result.rows_affected() > 0 {
+        record_autoplay_transition_metric("ok", reason);
+    }
+    Ok(())
+}
+
+fn record_autoplay_transition_metric(result: &str, reason: &str) {
+    AUTOPLAY_TRANSITIONS
+        .with_label_values(&[result, reason])
+        .inc();
+}
+
+async fn load_active_autoplay_session(
+    state: &AppState,
+    user_id: Uuid,
+    series_id: &str,
+) -> ApiResult<Option<AutoplaySessionState>> {
+    let row = sqlx::query(
+        "SELECT
+             id,
+             consecutive_count,
+             elapsed_autoplay_seconds,
+             last_progress_session_id,
+             CAST(last_progress_position_seconds AS REAL) AS last_progress_position_seconds,
+             last_episode_id,
+             CAST(updated_at AS TEXT) AS updated_at
+         FROM user_autoplay_sessions
+         WHERE user_id = ? AND series_id = ? AND canceled = 0
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .bind(series_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let updated_at = row
+        .try_get::<String, _>("updated_at")
+        .ok()
+        .and_then(|value| parse_db_timestamp_utc(&value));
+    if updated_at.is_some_and(|updated_at| {
+        Utc::now().signed_duration_since(updated_at).num_seconds()
+            > AUTOPLAY_SESSION_IDLE_TIMEOUT_SECONDS
+    }) {
+        cancel_active_autoplay_sessions(state, user_id, series_id, "idle_timeout").await?;
+        return Ok(None);
+    }
+
+    Ok(Some(AutoplaySessionState {
+        id: row.get("id"),
+        consecutive_count: row
+            .try_get::<i64, _>("consecutive_count")
+            .unwrap_or(0)
+            .clamp(0, i32::MAX as i64) as i32,
+        elapsed_autoplay_seconds: row
+            .try_get::<i64, _>("elapsed_autoplay_seconds")
+            .unwrap_or(0)
+            .max(0),
+        last_progress_session_id: row.try_get("last_progress_session_id").ok(),
+        last_progress_position_seconds: row.try_get("last_progress_position_seconds").ok(),
+        last_episode_id: row.try_get("last_episode_id").ok(),
+    }))
+}
+
+fn parse_db_timestamp_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|value| value.and_utc())
+        })
 }
 
 fn select_file<'a>(
@@ -3596,10 +5116,133 @@ async fn playback_diagnostics_bundle_from_row(
             "available": false,
             "events": []
         }),
+        media_interactions: media_interactions_diagnostics_for_session(
+            state,
+            session,
+            &session_id,
+            &media_file_id,
+        )
+        .await?,
         playback_plan,
         plan_summary,
         job_snapshot,
         error_taxonomy,
+    })
+}
+
+async fn media_interactions_diagnostics_for_session(
+    state: &AppState,
+    session: &AnyRow,
+    session_id: &str,
+    media_file_id: &str,
+) -> ApiResult<Value> {
+    let user_id = session
+        .try_get::<String, _>("user_id")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok());
+    let context = load_session_item_context(state, session_id, media_file_id).await?;
+    let playback_state = match (user_id, context.as_ref()) {
+        (Some(user_id), Some(context)) => load_user_media_state(state, user_id, context).await?,
+        _ => None,
+    };
+    let active_segments = load_active_media_segments(state, media_file_id).await?;
+    let recent_jobs = recent_media_segment_jobs_for_diagnostics(
+        state,
+        media_file_id,
+        context
+            .as_ref()
+            .and_then(|context| context.season_id.as_deref()),
+    )
+    .await?;
+    let active_segment_count = active_segments.len();
+    let recent_segment_job_count = recent_jobs.len();
+
+    Ok(serde_json::json!({
+        "context": context.as_ref().map(playback_item_context_for_diagnostics),
+        "playback_state": playback_state,
+        "active_segments": active_segments,
+        "active_segment_count": active_segment_count,
+        "recent_segment_jobs": recent_jobs,
+        "recent_segment_job_count": recent_segment_job_count,
+    }))
+}
+
+async fn recent_media_segment_jobs_for_diagnostics(
+    state: &AppState,
+    media_file_id: &str,
+    season_id: Option<&str>,
+) -> ApiResult<Vec<Value>> {
+    let mut jobs = list_media_segment_jobs(
+        &state.db_pool,
+        MediaSegmentJobListFilters {
+            scope_type: Some("media_file".to_string()),
+            scope_id: Some(media_file_id.to_string()),
+            limit: Some(10),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if let Some(season_id) = season_id {
+        jobs.extend(
+            list_media_segment_jobs(
+                &state.db_pool,
+                MediaSegmentJobListFilters {
+                    scope_type: Some("season".to_string()),
+                    scope_id: Some(season_id.to_string()),
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?,
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut summaries = Vec::new();
+    for job in jobs {
+        if !seen.insert(job.id.clone()) {
+            continue;
+        }
+        let error_reason = job
+            .error
+            .as_ref()
+            .and_then(|error| error.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        summaries.push(serde_json::json!({
+            "id": job.id,
+            "job_type": job.job_type,
+            "scope_type": job.scope_type,
+            "scope_id": job.scope_id,
+            "provider_kind": job.provider_kind,
+            "status": job.status,
+            "priority": job.priority,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "next_attempt_at": job.next_attempt_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "locked": job.locked_by.is_some(),
+            "error_reason": error_reason,
+        }));
+        if summaries.len() >= 20 {
+            break;
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn playback_item_context_for_diagnostics(context: &PlaybackItemContext) -> Value {
+    serde_json::json!({
+        "item_type": &context.item_type,
+        "item_id": &context.item_id,
+        "series_id": &context.series_id,
+        "season_id": &context.season_id,
+        "episode_id": &context.episode_id,
     })
 }
 
@@ -5139,6 +6782,7 @@ pub struct PlaybackDiagnosticsBundle {
     pub artifacts: Vec<PlaybackDiagnosticArtifact>,
     pub recent_server_metrics: Vec<String>,
     pub client_player_events: Value,
+    pub media_interactions: Value,
     pub job_snapshot: Option<Value>,
     pub error_taxonomy: Option<String>,
 }
@@ -6526,6 +8170,82 @@ pub async fn playback_admin_sessions(
     }))
 }
 
+pub async fn progress_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    user: CurrentUser,
+    Json(body): Json<PlaybackProgressRequest>,
+) -> ApiResult<Json<PlaybackProgressResponse>> {
+    let session = get_session(&state, &user, &id, None, true).await?;
+    let position_seconds = validated_progress_position(body.position_seconds)?;
+    let duration_seconds = validated_progress_duration(body.duration_seconds)?.or_else(|| {
+        session
+            .try_get::<i64, _>("duration_seconds")
+            .ok()
+            .map(|value| value as i32)
+    });
+    validated_playback_rate(body.playback_rate)?;
+    let event_type = validated_progress_event_type(body.event_type.as_deref(), "progress")?;
+    let client_reported_at = validated_client_reported_at(body.client_reported_at.as_deref())?;
+    let media_file_id: String = session.get("media_file_id");
+    let context = load_session_item_context(&state, &id, &media_file_id).await?;
+
+    let playback_state = if let Some(context) = context.as_ref() {
+        Some(
+            apply_playback_progress_update(
+                &state,
+                user.user_id,
+                &id,
+                &media_file_id,
+                context,
+                ProgressProjectionInput {
+                    position_seconds,
+                    duration_seconds,
+                    paused: body.paused.unwrap_or(false),
+                    event_type,
+                    client_reported_at,
+                },
+            )
+            .await?,
+        )
+    } else {
+        update_session_progress(&state, &id, position_seconds, duration_seconds).await?;
+        record_playback_progress_update(event_type, "ok");
+        None
+    };
+    record_segment_skip_action(
+        event_type,
+        body.segment_type.as_deref(),
+        body.segment_behavior.as_deref(),
+        "ok",
+    );
+    if let Some(context) = context.as_ref() {
+        record_autoplay_interaction(&state, user.user_id, context, event_type).await?;
+    }
+
+    let active_segment =
+        load_active_segment_at_position(&state, &media_file_id, position_seconds).await?;
+    let playback_preferences = load_or_create_playback_preferences(&state.db_pool, user.user_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let up_next = compute_up_next_metadata(
+        &state,
+        user.user_id,
+        context.as_ref(),
+        duration_seconds,
+        &playback_preferences,
+    )
+    .await?;
+
+    Ok(Json(PlaybackProgressResponse {
+        ok: true,
+        playback_state,
+        active_segment,
+        up_next,
+        playback_preferences,
+    }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionPollResponse {
     pub id: String,
@@ -6635,11 +8355,59 @@ pub async fn end_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     user: CurrentUser,
+    body: Option<Json<EndSessionRequest>>,
 ) -> ApiResult<Json<Value>> {
     let session_id =
         Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("invalid session id"))?;
     // Validate ownership.
-    let _ = get_session(&state, &user, &id, None, false).await?;
+    let session = get_session(&state, &user, &id, None, false).await?;
+    let media_file_id: String = session.get("media_file_id");
+    let mut playback_state = None;
+    let context = load_session_item_context(&state, &id, &media_file_id).await?;
+    let mut event_type = "ended".to_string();
+
+    if let Some(Json(body)) = body {
+        event_type =
+            validated_progress_event_type(body.event_type.as_deref(), "ended")?.to_string();
+        if let Some(position_seconds) = body.position_seconds {
+            let position_seconds = validated_progress_position(position_seconds)?;
+            let duration_seconds =
+                validated_progress_duration(body.duration_seconds)?.or_else(|| {
+                    session
+                        .try_get::<i64, _>("duration_seconds")
+                        .ok()
+                        .map(|value| value as i32)
+                });
+            let client_reported_at =
+                validated_client_reported_at(body.client_reported_at.as_deref())?;
+
+            if let Some(context) = context.as_ref() {
+                playback_state = Some(
+                    apply_playback_progress_update(
+                        &state,
+                        user.user_id,
+                        &id,
+                        &media_file_id,
+                        context,
+                        ProgressProjectionInput {
+                            position_seconds,
+                            duration_seconds,
+                            paused: true,
+                            event_type: &event_type,
+                            client_reported_at,
+                        },
+                    )
+                    .await?,
+                );
+            } else {
+                update_session_progress(&state, &id, position_seconds, duration_seconds).await?;
+                record_playback_progress_update(&event_type, "ok");
+            }
+        }
+    }
+    if let Some(context) = context.as_ref() {
+        record_autoplay_interaction(&state, user.user_id, context, &event_type).await?;
+    }
 
     state.transcodes.stop_and_remove(session_id).await;
     sqlx::query::<sqlx::Any>(
@@ -6651,7 +8419,10 @@ pub async fn end_session(
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     info!(session = %id, "session ended and cleaned up");
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "playback_state": playback_state,
+    })))
 }
 
 pub async fn seek_transcode(

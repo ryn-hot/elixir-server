@@ -404,6 +404,85 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/library/scan", post(handlers::library::scan))
         .route("/api/v1/artwork/:id", get(handlers::artwork::get_artwork))
         .route(
+            "/api/v1/items/:item_type/:item_id/segments",
+            get(handlers::media_interactions::list_item_segments),
+        )
+        .route(
+            "/api/v1/items/:item_type/:item_id/watch-state",
+            get(handlers::playback::get_item_watch_state),
+        )
+        .route(
+            "/api/v1/items/:item_type/:item_id/watch-state/watched",
+            post(handlers::playback::mark_item_watched),
+        )
+        .route(
+            "/api/v1/items/:item_type/:item_id/watch-state/unwatched",
+            post(handlers::playback::mark_item_unwatched),
+        )
+        .route(
+            "/api/v1/items/:item_type/:item_id/watch-state/reset",
+            post(handlers::playback::reset_item_watch_progress),
+        )
+        .route(
+            "/api/v1/items/:item_type/:item_id/media-segment-jobs/analyze",
+            post(handlers::media_interactions::analyze_item),
+        )
+        .route(
+            "/api/v1/media-interaction-libraries",
+            get(handlers::media_interactions::list_library_settings),
+        )
+        .route(
+            "/api/v1/media-interaction-libraries/:source_config_id",
+            get(handlers::media_interactions::get_library_settings)
+                .put(handlers::media_interactions::update_library_settings),
+        )
+        .route(
+            "/api/v1/media-files/:id/media-segments",
+            get(handlers::media_interactions::list_file_segments),
+        )
+        .route(
+            "/api/v1/media-files/:id/media-segments/refresh-chapters",
+            post(handlers::media_interactions::refresh_file_chapter_segments),
+        )
+        .route(
+            "/api/v1/media-files/:id/media-segments/refresh-builtins",
+            post(handlers::media_interactions::refresh_file_builtin_provider_segments),
+        )
+        .route(
+            "/api/v1/media-segments/candidates",
+            get(handlers::media_interactions::list_segment_candidate_review)
+                .post(handlers::media_interactions::create_segment_candidate),
+        )
+        .route(
+            "/api/v1/media-segments/:id/disable",
+            post(handlers::media_interactions::disable_segment),
+        )
+        .route(
+            "/api/v1/media-segment-jobs",
+            get(handlers::media_interactions::list_jobs)
+                .post(handlers::media_interactions::enqueue_job),
+        )
+        .route(
+            "/api/v1/media-segment-jobs/run-worker",
+            post(handlers::media_interactions::run_worker),
+        )
+        .route(
+            "/api/v1/media-segment-providers/certifications",
+            get(handlers::media_interactions::list_provider_certifications),
+        )
+        .route(
+            "/api/v1/media-segment-providers/:id/certify",
+            post(handlers::media_interactions::certify_provider),
+        )
+        .route(
+            "/api/v1/media-segment-jobs/:id/cancel",
+            post(handlers::media_interactions::cancel_job),
+        )
+        .route(
+            "/api/v1/media-segment-jobs/:id/retry",
+            post(handlers::media_interactions::retry_job),
+        )
+        .route(
             "/api/v1/library/review/queue",
             get(handlers::review::list_queue),
         )
@@ -476,6 +555,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/:id/heartbeat",
             post(handlers::playback::heartbeat_session),
+        )
+        .route(
+            "/api/v1/sessions/:id/progress",
+            post(handlers::playback::progress_session),
         )
         .route(
             "/api/v1/sessions/:id/end",
@@ -589,11 +672,22 @@ pub fn router(state: AppState) -> Router {
                 .patch(handlers::discovery::patch_find_media_preferences),
         )
         .route("/api/v1/profile/playback", get(handlers::profile::profile))
+        .route(
+            "/api/v1/profile/playback-interactions",
+            get(handlers::profile::playback_interactions)
+                .put(handlers::profile::update_playback_interactions),
+        )
         .with_state(state)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::OPTIONS,
+                ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
         )
 }

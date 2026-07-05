@@ -9,6 +9,7 @@ pub mod download_broker;
 pub mod extensions;
 pub mod health;
 pub mod library;
+pub mod media_interactions;
 pub mod network_protection;
 pub mod playback;
 pub mod profile;

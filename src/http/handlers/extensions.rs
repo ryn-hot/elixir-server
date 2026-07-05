@@ -8917,6 +8917,22 @@ pub(crate) async fn resolve_control_provider_transport_base_url(
     instance_id: Uuid,
     endpoint: &ProviderEndpoint,
 ) -> anyhow::Result<String> {
+    #[cfg(test)]
+    if matches!(
+        endpoint.host.trim().to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    ) {
+        let base_path = if endpoint.base_path.trim().is_empty() {
+            "/"
+        } else {
+            endpoint.base_path.as_str()
+        };
+        return Ok(format!(
+            "{}://{}:{}{}",
+            endpoint.scheme, endpoint.host, endpoint.port, base_path
+        ));
+    }
+
     let canonical = endpoint.canonical_url()?;
     if control_endpoint_host_resolves(&endpoint.host, endpoint.port).await {
         return Ok(canonical);

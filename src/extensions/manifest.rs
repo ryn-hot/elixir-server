@@ -88,6 +88,7 @@ impl ExtensionManifest {
                 validate_scope_media_for_capability(&provide.capability, scope)?;
             }
             validate_scope_actions_for_capability(&provide.capability, provide.scope.as_ref())?;
+            validate_segment_provider_contract(self, provide)?;
             validate_debrid_provider_contract(self, provide)?;
         }
 
@@ -527,6 +528,8 @@ pub struct ManifestProviderScope {
     #[serde(default)]
     pub media_types: Vec<String>,
     #[serde(default)]
+    pub segment_types: Vec<String>,
+    #[serde(default)]
     pub actions: Vec<String>,
     #[serde(default)]
     pub requires_account: bool,
@@ -549,14 +552,23 @@ impl ManifestProviderScope {
                 );
             }
         }
+        for segment_type in &self.segment_types {
+            ensure_non_empty(segment_type, "provides.scope.segment_types")?;
+            if !allowed_segment_type(segment_type) {
+                bail!(
+                    "unsupported provides.scope.segment_types value '{}'; expected intro|recap|preview|credits|outro|custom",
+                    segment_type
+                );
+            }
+        }
         for action in &self.actions {
             ensure_non_empty(action, "provides.scope.actions")?;
             if !matches!(
                 action.trim().to_ascii_lowercase().as_str(),
-                "search" | "add" | "monitor" | "resolve"
+                "search" | "add" | "monitor" | "resolve" | "lookup"
             ) {
                 bail!(
-                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor|resolve",
+                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor|resolve|lookup",
                     action
                 );
             }
@@ -2079,6 +2091,13 @@ fn canonical_media_type(value: &str) -> Option<&'static str> {
     }
 }
 
+fn allowed_segment_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "intro" | "recap" | "preview" | "credits" | "outro" | "custom"
+    )
+}
+
 fn infer_scope_actions_for_capability(capability: &str) -> Vec<&'static str> {
     match capability.trim().to_ascii_lowercase().as_str() {
         "media.manager.movies" | "media.manager.tv" | "media.manager.anime" => {
@@ -2086,6 +2105,7 @@ fn infer_scope_actions_for_capability(capability: &str) -> Vec<&'static str> {
         }
         value if value.starts_with("media.search.") => vec!["search"],
         "acquisition.stream_candidate_provider" => vec!["search"],
+        "media.segment_provider" => vec!["lookup"],
         _ => Vec::new(),
     }
 }
@@ -2101,6 +2121,7 @@ fn infer_scope_media_for_capability(capability: &str) -> Option<Vec<&'static str
         "acquisition.candidate_provider" | "acquisition.stream_candidate_provider" => {
             Some(vec!["movies", "tv", "anime"])
         }
+        "media.segment_provider" => Some(vec!["movies", "tv", "anime"]),
         _ => None,
     }
 }
@@ -2144,6 +2165,71 @@ fn validate_scope_actions_for_capability(
             "source capability '{}' requires provides.scope.actions to include 'search'",
             capability
         );
+    }
+    if capability == "media.segment_provider" && !actions.iter().any(|value| value == "lookup") {
+        bail!(
+            "segment provider capability '{}' requires provides.scope.actions to include 'lookup'",
+            capability
+        );
+    }
+    Ok(())
+}
+
+fn validate_segment_provider_contract(
+    manifest: &ExtensionManifest,
+    provide: &ManifestProvide,
+) -> Result<()> {
+    if !provide
+        .capability
+        .trim()
+        .eq_ignore_ascii_case("media.segment_provider")
+    {
+        return Ok(());
+    }
+    let implementation = provide
+        .implementation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("media.segment_provider providers must declare provides.implementation")
+        })?;
+    if implementation.contains(char::is_whitespace) {
+        bail!(
+            "media.segment_provider provides.implementation must be a stable id without whitespace"
+        );
+    }
+    let scope = provide.scope.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("media.segment_provider providers must declare provides.scope")
+    })?;
+    if scope.media_types.is_empty() {
+        bail!("media.segment_provider providers must declare provides.scope.media_types");
+    }
+    if scope.segment_types.is_empty() {
+        bail!("media.segment_provider providers must declare provides.scope.segment_types");
+    }
+    let actions = scope
+        .actions
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !actions.iter().any(|value| value == "lookup") {
+        bail!("media.segment_provider providers must declare provides.scope.actions with 'lookup'");
+    }
+    if scope.download_broker.is_some() || scope.broker.is_some() {
+        bail!("media.segment_provider providers must not declare download broker scope");
+    }
+    if !manifest.requires.downloads.is_empty() {
+        bail!("media.segment_provider modules must not declare download requirements");
+    }
+    if provide.endpoint.is_none() && manifest.networking.is_none() {
+        bail!(
+            "media.segment_provider providers must declare an endpoint or module networking service port"
+        );
+    }
+    if provide.healthcheck.is_none() {
+        bail!("media.segment_provider providers must declare a healthcheck for readiness");
     }
     Ok(())
 }
@@ -2562,6 +2648,113 @@ runtime:
         assert!(
             err.to_string()
                 .contains("requires provides.scope.actions to include 'search'")
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_media_segment_provider_scope() {
+        let yaml = r#"
+id: elixir.segment_providers.community_markers
+version: 1.0.0
+kind: module
+name: Community Markers
+provides:
+  - capability: media.segment_provider
+    slot: default
+    cardinality: many
+    implementation: community_markers
+    scope:
+      media_types: ["movie", "tv", "anime"]
+      segment_types: ["intro", "recap", "credits", "outro"]
+      actions: ["lookup"]
+    endpoint:
+      type: http
+      base_url: http://127.0.0.1:8080
+    healthcheck:
+      type: http
+      path: /health
+runtime:
+  type: container
+  image: example/community-markers:1
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("segment provider manifest should parse");
+        let provide = &parsed.manifest.provides[0];
+        assert_eq!(provide.capability, "media.segment_provider");
+        let scope = provide.scope.as_ref().expect("scope");
+        assert_eq!(scope.actions, vec!["lookup"]);
+        assert_eq!(
+            scope.segment_types,
+            vec!["intro", "recap", "credits", "outro"]
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_media_segment_provider_without_segment_types() {
+        let yaml = r#"
+id: elixir.segment_providers.bad_markers
+version: 1.0.0
+kind: module
+name: Bad Markers
+provides:
+  - capability: media.segment_provider
+    slot: default
+    cardinality: many
+    implementation: bad_markers
+    scope:
+      media_types: ["movie"]
+      actions: ["lookup"]
+    endpoint:
+      type: http
+      base_url: http://127.0.0.1:8080
+    healthcheck:
+      type: http
+      path: /health
+runtime:
+  type: container
+  image: example/bad-markers:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("providers must declare provides.scope.segment_types")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_media_segment_provider_with_download_broker_scope() {
+        let yaml = r#"
+id: elixir.segment_providers.bad_broker
+version: 1.0.0
+kind: module
+name: Bad Broker Markers
+provides:
+  - capability: media.segment_provider
+    slot: default
+    cardinality: many
+    implementation: bad_broker
+    scope:
+      media_types: ["movie"]
+      segment_types: ["intro"]
+      actions: ["lookup"]
+      download_broker:
+        enabled: true
+        provider_kind: debrid
+        logical_id: acquisition.debrid.default
+    endpoint:
+      type: http
+      base_url: http://127.0.0.1:8080
+    healthcheck:
+      type: http
+      path: /health
+runtime:
+  type: container
+  image: example/bad-broker:1
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "media.segment_provider providers must not declare download broker scope"
+            )
         );
     }
 

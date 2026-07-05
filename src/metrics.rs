@@ -301,6 +301,79 @@ pub static OWNER_RELEASE_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["action", "owner_type", "status"]).expect("counter vec created")
 });
 
+pub static MEDIA_SEGMENT_JOBS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_media_segment_jobs_total",
+        "Count of media segment job lifecycle transitions",
+    );
+    IntCounterVec::new(opts, &["provider_kind", "job_type", "status"]).expect("counter vec created")
+});
+
+pub static MEDIA_SEGMENT_JOB_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_media_segment_job_duration_seconds",
+        "Duration of completed media segment jobs",
+    );
+    HistogramVec::new(opts, &["provider_kind", "job_type", "status"])
+        .expect("histogram vec created")
+});
+
+pub static MEDIA_SEGMENT_JOB_BACKLOG: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_media_segment_job_backlog",
+        "Current media segment jobs by backlog status",
+    );
+    IntGaugeVec::new(opts, &["status"]).expect("gauge vec created")
+});
+
+pub static PLAYBACK_PROGRESS_UPDATES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_playback_progress_updates_total",
+        "Count of media interaction progress updates",
+    );
+    IntCounterVec::new(opts, &["event_type", "result"]).expect("counter vec created")
+});
+
+pub static USER_MEDIA_STATE_TRANSITIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_user_media_state_transitions_total",
+        "Count of user media state transitions",
+    );
+    IntCounterVec::new(opts, &["item_type", "transition", "source"]).expect("counter vec created")
+});
+
+pub static MEDIA_SEGMENTS_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_media_segments_active_total",
+        "Current active media segments by type and source",
+    );
+    IntGaugeVec::new(opts, &["segment_type", "source_label"]).expect("gauge vec created")
+});
+
+pub static MEDIA_SEGMENT_CANDIDATES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_media_segment_candidates_total",
+        "Count of media segment candidate validation outcomes",
+    );
+    IntCounterVec::new(opts, &["provider_kind", "validation_state"]).expect("counter vec created")
+});
+
+pub static SEGMENT_SKIP_ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_segment_skip_actions_total",
+        "Count of segment skip actions reported by clients",
+    );
+    IntCounterVec::new(opts, &["segment_type", "behavior", "result"]).expect("counter vec created")
+});
+
+pub static AUTOPLAY_TRANSITIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_autoplay_transitions_total",
+        "Count of Up Next autoplay state transitions",
+    );
+    IntCounterVec::new(opts, &["result", "reason"]).expect("counter vec created")
+});
+
 pub fn init_metrics() {
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
@@ -377,6 +450,31 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(RECONCILE_ACTIONS.clone())).ok();
     REGISTRY
         .register(Box::new(OWNER_RELEASE_EVENTS.clone()))
+        .ok();
+    REGISTRY.register(Box::new(MEDIA_SEGMENT_JOBS.clone())).ok();
+    REGISTRY
+        .register(Box::new(MEDIA_SEGMENT_JOB_DURATION.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(MEDIA_SEGMENT_JOB_BACKLOG.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(PLAYBACK_PROGRESS_UPDATES.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(USER_MEDIA_STATE_TRANSITIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(MEDIA_SEGMENTS_ACTIVE.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(MEDIA_SEGMENT_CANDIDATES.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(SEGMENT_SKIP_ACTIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(AUTOPLAY_TRANSITIONS.clone()))
         .ok();
 }
 

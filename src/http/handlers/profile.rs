@@ -7,11 +7,15 @@ use serde::Serialize;
 use crate::{
     http::{
         auth::CurrentUser,
-        error::ApiResult,
+        error::{ApiError, ApiResult},
         handlers::playback::{
             effective_playback_policy_from_config, merge_client_profile_with_server_profile,
             profile_for_network,
         },
+    },
+    media_interactions::{
+        PlaybackInteractionPreferences, PlaybackInteractionPreferencesPatch,
+        load_or_create_playback_preferences, update_playback_preferences,
     },
     playback::{
         hardware::HardwareCapabilities,
@@ -52,6 +56,11 @@ pub struct ProfileResponse {
     effective_policy: EffectivePlaybackPolicy,
     negotiation: PlaybackProfileNegotiation,
     catalog: Vec<PlaybackProfileCatalogEntry>,
+}
+
+#[derive(Serialize)]
+pub struct PlaybackInteractionPreferencesResponse {
+    preferences: PlaybackInteractionPreferences,
 }
 
 pub async fn profile(
@@ -106,4 +115,38 @@ pub async fn profile(
         negotiation: negotiated.negotiation,
         catalog: playback_profile_catalog(),
     }))
+}
+
+pub async fn playback_interactions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> ApiResult<Json<PlaybackInteractionPreferencesResponse>> {
+    let preferences = load_or_create_playback_preferences(&state.db_pool, user.user_id)
+        .await
+        .map_err(map_preferences_error)?;
+    Ok(Json(PlaybackInteractionPreferencesResponse { preferences }))
+}
+
+pub async fn update_playback_interactions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(body): Json<PlaybackInteractionPreferencesPatch>,
+) -> ApiResult<Json<PlaybackInteractionPreferencesResponse>> {
+    let preferences = update_playback_preferences(&state.db_pool, user.user_id, body)
+        .await
+        .map_err(map_preferences_error)?;
+    Ok(Json(PlaybackInteractionPreferencesResponse { preferences }))
+}
+
+fn map_preferences_error(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("invalid")
+        || message.contains("must")
+        || message.contains("between")
+        || message.contains("required")
+    {
+        ApiError::bad_request(message)
+    } else {
+        ApiError::internal(message)
+    }
 }

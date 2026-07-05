@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Row, any::AnyRow};
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -57,7 +57,24 @@ pub struct LibraryItemResponse {
     pub poster_url: Option<String>,
     pub banner_url: Option<String>,
     pub backdrop_url: Option<String>,
+    pub progress: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_state: Option<LibraryItemPlaybackStateResponse>,
     pub lifecycle: LibraryItemCardLifecycleResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryItemPlaybackStateResponse {
+    pub item_type: String,
+    pub item_id: String,
+    pub series_id: Option<String>,
+    pub season_id: Option<String>,
+    pub resume_seconds: f64,
+    pub duration_seconds: Option<i32>,
+    pub watched: bool,
+    pub watched_at: Option<String>,
+    pub last_played_at: Option<String>,
+    pub state_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -96,6 +113,8 @@ pub async fn list_items(
             _ => series_ids.push(id),
         }
     }
+    let mut continuing_series_ids = series_ids.clone();
+    continuing_series_ids.extend(anime_ids.iter().cloned());
 
     let movie_posters = load_primary_artwork(
         &state.db_pool,
@@ -169,6 +188,17 @@ pub async fn list_items(
         &["anilist", "tvdb", "cinemeta"],
     )
     .await?;
+    let playback_states = if let Some(user_id) = optional_user_id_from_headers(&state, &headers) {
+        load_library_item_playback_states(
+            &state.db_pool,
+            user_id,
+            &movie_ids,
+            &continuing_series_ids,
+        )
+        .await?
+    } else {
+        HashMap::new()
+    };
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
@@ -181,6 +211,11 @@ pub async fn list_items(
             .and_then(|s| serde_json::from_str(&s).ok());
         let (description, genres) =
             extract_metadata_fields(metadata.as_ref(), &preferred_languages);
+        let playback_state = playback_states.get(&id).cloned();
+        let progress = playback_state
+            .as_ref()
+            .map(library_item_playback_progress)
+            .unwrap_or(0.0);
         items.push(LibraryItemResponse {
             id: id.clone(),
             title: row.get::<String, _>("title"),
@@ -210,6 +245,8 @@ pub async fn list_items(
                 "anime" => anime_backdrops.get(&id).cloned(),
                 _ => series_backdrops.get(&id).cloned(),
             },
+            progress,
+            playback_state,
             lifecycle,
         });
     }
@@ -669,7 +706,19 @@ pub struct EpisodeResponse {
     pub has_file: bool,
     pub lifecycle: EpisodeLifecycleResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_state: Option<EpisodePlaybackStateResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub acquisition: Option<EpisodeAcquisitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EpisodePlaybackStateResponse {
+    pub resume_seconds: f64,
+    pub duration_seconds: Option<i32>,
+    pub watched: bool,
+    pub watched_at: Option<String>,
+    pub last_played_at: Option<String>,
+    pub state_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -859,6 +908,11 @@ pub async fn list_episodes(
     .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
 
     let episode_ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
+    let playback_states = if let Some(user_id) = optional_user_id_from_headers(&state, &headers) {
+        load_episode_playback_states(&state.db_pool, user_id, &episode_ids).await?
+    } else {
+        HashMap::new()
+    };
     let acquisition_projections =
         list_library_episode_acquisition_projections(&state.db_pool, &episode_ids)
             .await
@@ -945,6 +999,7 @@ pub async fn list_episodes(
                 blocked_in_elixir,
                 acquisition_projections.get(&id),
             ));
+            let playback_state = playback_states.get(&id).cloned();
 
             EpisodeResponse {
                 id,
@@ -962,12 +1017,203 @@ pub async fn list_episodes(
                     can_block_in_elixir: has_file,
                     can_restore: blocked_in_elixir,
                 },
+                playback_state,
                 acquisition,
             }
         })
         .collect();
 
     Ok(Json(episodes))
+}
+
+async fn load_library_item_playback_states(
+    pool: &sqlx::AnyPool,
+    user_id: Uuid,
+    movie_ids: &[String],
+    series_ids: &[String],
+) -> ApiResult<HashMap<String, LibraryItemPlaybackStateResponse>> {
+    let mut states = HashMap::new();
+
+    if !movie_ids.is_empty() {
+        let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT item_id AS library_item_id, item_type, item_id,
+                    series_id, season_id, resume_seconds, duration_seconds,
+                    CASE WHEN watched THEN 1 ELSE 0 END AS watched,
+                    CAST(watched_at AS TEXT) AS watched_at,
+                    CAST(last_played_at AS TEXT) AS last_played_at,
+                    state_source
+             FROM user_media_state
+             WHERE user_id = ",
+        );
+        query.push_bind(user_id.to_string());
+        query.push(" AND item_type = 'movie' AND item_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for movie_id in movie_ids {
+                separated.push_bind(movie_id.as_str());
+            }
+            separated.push_unseparated(")");
+        }
+        query.push(" ORDER BY last_played_at DESC, updated_at DESC");
+
+        let rows = query
+            .build()
+            .fetch_all(pool)
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        for row in rows {
+            let state = library_item_playback_state_from_row(&row);
+            if library_item_playback_progress(&state) > 0.0 {
+                let library_item_id: String = row.get("library_item_id");
+                states.insert(library_item_id, state);
+            }
+        }
+    }
+
+    if !series_ids.is_empty() {
+        let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT series_id AS library_item_id, item_type, item_id,
+                    series_id, season_id, resume_seconds, duration_seconds,
+                    CASE WHEN watched THEN 1 ELSE 0 END AS watched,
+                    CAST(watched_at AS TEXT) AS watched_at,
+                    CAST(last_played_at AS TEXT) AS last_played_at,
+                    state_source
+             FROM user_media_state
+             WHERE user_id = ",
+        );
+        query.push_bind(user_id.to_string());
+        query.push(" AND item_type = 'episode' AND series_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for series_id in series_ids {
+                separated.push_bind(series_id.as_str());
+            }
+            separated.push_unseparated(")");
+        }
+        query.push(" ORDER BY last_played_at DESC, updated_at DESC");
+
+        let rows = query
+            .build()
+            .fetch_all(pool)
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        for row in rows {
+            let library_item_id: Option<String> = row.try_get("library_item_id").ok();
+            let Some(library_item_id) = library_item_id.filter(|id| !id.trim().is_empty()) else {
+                continue;
+            };
+            if states.contains_key(&library_item_id) {
+                continue;
+            }
+            let state = library_item_playback_state_from_row(&row);
+            if library_item_playback_progress(&state) > 0.0 {
+                states.insert(library_item_id, state);
+            }
+        }
+    }
+
+    Ok(states)
+}
+
+fn library_item_playback_state_from_row(row: &AnyRow) -> LibraryItemPlaybackStateResponse {
+    LibraryItemPlaybackStateResponse {
+        item_type: row.get("item_type"),
+        item_id: row.get("item_id"),
+        series_id: row.try_get("series_id").ok(),
+        season_id: row.try_get("season_id").ok(),
+        resume_seconds: row.try_get::<f64, _>("resume_seconds").unwrap_or(0.0),
+        duration_seconds: row
+            .try_get::<i64, _>("duration_seconds")
+            .ok()
+            .map(|value| value as i32),
+        watched: row
+            .try_get::<bool, _>("watched")
+            .or_else(|_| row.try_get::<i64, _>("watched").map(|value| value != 0))
+            .unwrap_or(false),
+        watched_at: row.try_get("watched_at").ok(),
+        last_played_at: row.try_get("last_played_at").ok(),
+        state_source: row.try_get("state_source").ok(),
+    }
+}
+
+fn library_item_playback_progress(state: &LibraryItemPlaybackStateResponse) -> f64 {
+    if state.watched || state.resume_seconds <= 0.0 {
+        return 0.0;
+    }
+    let Some(duration_seconds) = state.duration_seconds else {
+        return 0.0;
+    };
+    if duration_seconds <= 0 {
+        return 0.0;
+    }
+    (state.resume_seconds / duration_seconds as f64).clamp(0.0, 0.98)
+}
+
+fn optional_user_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<Uuid> {
+    let raw = headers.get("authorization")?.to_str().ok()?;
+    let token = raw.strip_prefix("Bearer ")?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    state
+        .auth_service
+        .verify_access_token(token)
+        .ok()
+        .map(|(user_id, _session_id)| user_id)
+}
+
+async fn load_episode_playback_states(
+    pool: &sqlx::AnyPool,
+    user_id: Uuid,
+    episode_ids: &[String],
+) -> ApiResult<HashMap<String, EpisodePlaybackStateResponse>> {
+    if episode_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+        "SELECT item_id, resume_seconds, duration_seconds,
+                CASE WHEN watched THEN 1 ELSE 0 END AS watched,
+                CAST(watched_at AS TEXT) AS watched_at,
+                CAST(last_played_at AS TEXT) AS last_played_at,
+                state_source
+         FROM user_media_state
+         WHERE user_id = ",
+    );
+    query.push_bind(user_id.to_string());
+    query.push(" AND item_type = 'episode' AND item_id IN (");
+    let mut separated = query.separated(", ");
+    for episode_id in episode_ids {
+        separated.push_bind(episode_id);
+    }
+    separated.push_unseparated(")");
+
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let mut states = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let episode_id: String = row.get("item_id");
+        states.insert(
+            episode_id,
+            EpisodePlaybackStateResponse {
+                resume_seconds: row.try_get::<f64, _>("resume_seconds").unwrap_or(0.0),
+                duration_seconds: row
+                    .try_get::<i64, _>("duration_seconds")
+                    .ok()
+                    .map(|value| value as i32),
+                watched: row
+                    .try_get::<bool, _>("watched")
+                    .or_else(|_| row.try_get::<i64, _>("watched").map(|value| value != 0))
+                    .unwrap_or(false),
+                watched_at: row.try_get("watched_at").ok(),
+                last_played_at: row.try_get("last_played_at").ok(),
+                state_source: row.try_get("state_source").ok(),
+            },
+        );
+    }
+    Ok(states)
 }
 
 fn episode_acquisition_response(

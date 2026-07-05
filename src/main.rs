@@ -38,6 +38,7 @@ use elixir_server::http::handlers::extensions::{
 use elixir_server::http::router;
 use elixir_server::library::LinkerService;
 use elixir_server::library::start_periodic_scan;
+use elixir_server::media_interactions::start_media_segment_job_worker_loop_until_shutdown;
 use elixir_server::metadata::MetadataService;
 use elixir_server::network::{start_mdns, wan::start_wan_tasks};
 use elixir_server::orchestrator::executor::ExecutorAction;
@@ -66,6 +67,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 fn load_env() {
@@ -221,13 +223,21 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Elixir server listening on http://{}", addr);
 
+    let background_shutdown = CancellationToken::new();
     tokio::spawn(start_post_listener_background_tasks(
         state.clone(),
         reconcile_config,
+        background_shutdown.clone(),
     ));
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown({
+            let background_shutdown = background_shutdown.clone();
+            async move {
+                shutdown_signal().await;
+                background_shutdown.cancel();
+            }
+        })
         .await
         .context("server error")?;
 
@@ -238,7 +248,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_post_listener_background_tasks(state: AppState, reconcile_config: ReconcileConfig) {
+async fn start_post_listener_background_tasks(
+    state: AppState,
+    reconcile_config: ReconcileConfig,
+    shutdown: CancellationToken,
+) {
     start_playback_host_identity_warmup(state.clone());
     start_playback_hardware_readiness_warmup(state.clone());
 
@@ -293,6 +307,16 @@ async fn start_post_listener_background_tasks(state: AppState, reconcile_config:
     tokio::spawn(async move {
         acquisition::stream_materializer::start_http_stream_materializer_loop(
             http_stream_materializer_state,
+        )
+        .await;
+    });
+
+    let media_segment_worker_state = state.clone();
+    let media_segment_worker_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        start_media_segment_job_worker_loop_until_shutdown(
+            media_segment_worker_state,
+            media_segment_worker_shutdown,
         )
         .await;
     });
