@@ -35,7 +35,8 @@ use crate::{
         imports::{AcquisitionImportRunState, list_import_runs_by_release},
         language_policy::{
             AcquisitionLanguagePreference, load_saved_language_preference,
-            quality_profile_with_language_preference, save_language_preference,
+            quality_profile_with_anime_audio_preference, quality_profile_with_language_preference,
+            save_language_preference,
         },
         load_intent_recovery_views,
         release_resolution::anime::{
@@ -1374,6 +1375,7 @@ pub async fn find_media_scoped_add(
         source_suite_id: Some("default".to_string()),
         release_delay_seconds: None,
         quality_profile: None,
+        anime_audio_preference: payload.anime_audio_preference.clone(),
         metadata_refresh_after: Some(now),
         candidate_search_after: Some(now),
         target: Some(target),
@@ -1401,6 +1403,11 @@ pub async fn find_media_scoped_add(
     let route_policy = intent.route_policy.unwrap_or_default();
     intent.route_policy = Some(route_policy);
     if let Some(scope) = intent.scope.as_mut() {
+        add_scoped_add_anime_audio_preference(
+            scope,
+            payload.media_type,
+            payload.anime_audio_preference.as_ref(),
+        );
         add_scoped_add_effective_route_policy(scope, intent.route_policy);
     }
     scope_json = intent.scope.clone().unwrap_or(scope_json);
@@ -2328,6 +2335,25 @@ fn add_scoped_add_effective_route_policy(
     }
 }
 
+fn add_scoped_add_anime_audio_preference(
+    scope: &mut Value,
+    media_type: MediaType,
+    preference: Option<&crate::acquisition::language_policy::AnimeAudioPreference>,
+) {
+    let Some(preference) = preference else {
+        return;
+    };
+    if !preference.active_for_media_type(media_type) {
+        return;
+    }
+    if let Some(map) = scope.as_object_mut() {
+        map.insert(
+            "animeAudioPreference".to_string(),
+            json!(preference.normalized()),
+        );
+    }
+}
+
 fn scoped_add_intent_target(
     selection: &ScopedAddSelection,
     _targets: &[FindMediaScopedPreviewTarget],
@@ -2452,6 +2478,11 @@ async fn apply_find_media_source_provider_config_defaults(
 ) -> AnyResult<()> {
     let Some(source_provider_id) = request.source_provider_id else {
         let language_preference = load_saved_language_preference(store).await?;
+        request.quality_profile = quality_profile_with_anime_audio_preference(
+            request.quality_profile.take(),
+            request.media_type,
+            request.anime_audio_preference.as_ref(),
+        );
         request.quality_profile = quality_profile_with_language_preference(
             request.quality_profile.take(),
             request.media_type,
@@ -2493,6 +2524,11 @@ async fn apply_find_media_source_provider_config_defaults(
             request.quality_profile = find_media_source_quality_profile_from_config(config);
         }
     }
+    request.quality_profile = quality_profile_with_anime_audio_preference(
+        request.quality_profile.take(),
+        request.media_type,
+        request.anime_audio_preference.as_ref(),
+    );
     let language_preference = load_saved_language_preference(store).await?;
     request.quality_profile = quality_profile_with_language_preference(
         request.quality_profile.take(),

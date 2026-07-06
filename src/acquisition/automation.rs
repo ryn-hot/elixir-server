@@ -6759,7 +6759,13 @@ fn preferences_from_subscription(
     let profile = subscription.quality_profile.as_ref();
     let media_type = subscription.media_type;
     let language_preference = language_preference_from_quality_profile(profile, media_type);
-    let mut required_languages = json_string_array(profile, &["requiredLanguages", "languages"]);
+    let mut required_languages = json_string_array(
+        profile,
+        &["providerLanguageHints", "provider_language_hints"],
+    );
+    if required_languages.is_empty() {
+        required_languages = json_string_array(profile, &["requiredLanguages", "languages"]);
+    }
     if required_languages.is_empty() {
         required_languages = language_preference.provider_language_hints(media_type);
     }

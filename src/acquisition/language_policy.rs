@@ -81,6 +81,104 @@ pub struct AcquisitionLanguagePreference {
     pub unknown_language: UnknownLanguagePolicy,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeAudioPreferenceMode {
+    Any,
+    PreferDub,
+    RequireDubReview,
+}
+
+impl Default for AnimeAudioPreferenceMode {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl AnimeAudioPreferenceMode {
+    pub fn active(self) -> bool {
+        !matches!(self, Self::Any)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeAudioPreference {
+    #[serde(default)]
+    pub mode: AnimeAudioPreferenceMode,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+impl Default for AnimeAudioPreference {
+    fn default() -> Self {
+        Self {
+            mode: AnimeAudioPreferenceMode::Any,
+            language: None,
+        }
+    }
+}
+
+impl AnimeAudioPreference {
+    pub fn normalized(&self) -> Self {
+        if !self.mode.active() {
+            return Self::default();
+        }
+        Self {
+            mode: self.mode,
+            language: Some(
+                self.language
+                    .as_deref()
+                    .and_then(normalize_language_value)
+                    .unwrap_or_else(|| "en".to_string()),
+            ),
+        }
+    }
+
+    pub fn active_for_media_type(&self, media_type: MediaType) -> bool {
+        media_type == MediaType::Anime && self.normalized().mode.active()
+    }
+
+    pub fn provider_language_hints(&self, media_type: MediaType) -> Vec<String> {
+        if !self.active_for_media_type(media_type) {
+            return Vec::new();
+        }
+        self.normalized().language.into_iter().collect()
+    }
+
+    pub fn to_language_preference(
+        &self,
+        media_type: MediaType,
+    ) -> Option<AcquisitionLanguagePreference> {
+        if !self.active_for_media_type(media_type) {
+            return None;
+        }
+        let normalized = self.normalized();
+        let mut preference = AcquisitionLanguagePreference {
+            mode: match normalized.mode {
+                AnimeAudioPreferenceMode::Any => LanguagePreferenceMode::Off,
+                AnimeAudioPreferenceMode::PreferDub => LanguagePreferenceMode::Prefer,
+                AnimeAudioPreferenceMode::RequireDubReview => LanguagePreferenceMode::RequireReview,
+            },
+            anime: LanguagePreferenceMediaRule {
+                profiles: vec![
+                    "en_audio".to_string(),
+                    "dual_audio".to_string(),
+                    "dubbed".to_string(),
+                ],
+                ..LanguagePreferenceMediaRule::default()
+            },
+            unknown_language: UnknownLanguagePolicy::AllowLowerPriority,
+            ..AcquisitionLanguagePreference::default()
+        };
+        if normalized.mode == AnimeAudioPreferenceMode::RequireDubReview {
+            preference.anime.audio = normalized.language.into_iter().collect();
+            preference.unknown_language = UnknownLanguagePolicy::RequireReview;
+        }
+        Some(preference.normalized())
+    }
+}
+
 impl Default for AcquisitionLanguagePreference {
     fn default() -> Self {
         Self {
@@ -288,6 +386,14 @@ pub fn quality_profile_with_language_preference(
     let mut object = profile
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
+    if let Some(existing) = object
+        .get("languagePreference")
+        .or_else(|| object.get("language_preference"))
+        .and_then(|value| language_preference_from_json(Some(value)))
+    {
+        object.insert("languagePreference".to_string(), json!(existing));
+        return Some(JsonValue::Object(object));
+    }
     let normalized = preference.clone().normalized();
     object.insert("languagePreference".to_string(), json!(normalized));
 
@@ -306,6 +412,42 @@ pub fn quality_profile_with_language_preference(
             object.insert("requiredLanguages".to_string(), json!(hints));
         }
     }
+    Some(JsonValue::Object(object))
+}
+
+pub fn quality_profile_with_anime_audio_preference(
+    profile: Option<JsonValue>,
+    media_type: MediaType,
+    preference: Option<&AnimeAudioPreference>,
+) -> Option<JsonValue> {
+    let Some(preference) = preference else {
+        return profile;
+    };
+    if !preference.active_for_media_type(media_type) {
+        return profile;
+    }
+    let normalized = preference.normalized();
+    let Some(language_preference) = normalized.to_language_preference(media_type) else {
+        return profile;
+    };
+    let mut object = profile
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert("animeAudioPreference".to_string(), json!(normalized));
+    object.insert("languagePreference".to_string(), json!(language_preference));
+
+    let provider_hints = preference.provider_language_hints(media_type);
+    if !provider_hints.is_empty() {
+        object.insert("providerLanguageHints".to_string(), json!(provider_hints));
+    }
+
+    if normalized.mode == AnimeAudioPreferenceMode::RequireDubReview {
+        let required = preference.provider_language_hints(media_type);
+        if !required.is_empty() {
+            object.insert("requiredAudioLanguages".to_string(), json!(required));
+        }
+    }
+
     Some(JsonValue::Object(object))
 }
 
@@ -764,5 +906,77 @@ mod tests {
 
         assert_eq!(assessment.state, LanguagePreferenceAssessmentState::Match);
         assert!(assessment.score_delta > 0.0);
+    }
+
+    #[test]
+    fn lp3_anime_audio_preference_builds_request_scoped_dub_profile() {
+        let preference = AnimeAudioPreference {
+            mode: AnimeAudioPreferenceMode::PreferDub,
+            language: None,
+        };
+
+        let profile =
+            quality_profile_with_anime_audio_preference(None, MediaType::Anime, Some(&preference))
+                .expect("quality profile");
+
+        assert_eq!(
+            profile.pointer("/animeAudioPreference/mode"),
+            Some(&json!("prefer_dub"))
+        );
+        assert_eq!(
+            profile.pointer("/animeAudioPreference/language"),
+            Some(&json!("en"))
+        );
+        assert_eq!(
+            profile.pointer("/languagePreference/mode"),
+            Some(&json!("prefer"))
+        );
+        assert_eq!(
+            profile.pointer("/providerLanguageHints"),
+            Some(&json!(["en"]))
+        );
+        assert!(profile.pointer("/requiredLanguages").is_none());
+        assert!(profile.pointer("/requiredAudioLanguages").is_none());
+
+        let saved = AcquisitionLanguagePreference {
+            mode: LanguagePreferenceMode::Prefer,
+            anime: LanguagePreferenceMediaRule {
+                profiles: vec!["ja_audio_en_subs".to_string()],
+                ..LanguagePreferenceMediaRule::default()
+            },
+            ..AcquisitionLanguagePreference::default()
+        };
+        let merged = quality_profile_with_language_preference(
+            Some(profile.clone()),
+            MediaType::Anime,
+            &saved,
+        )
+        .expect("merged profile");
+        assert_eq!(
+            merged.pointer("/languagePreference/anime/profiles"),
+            Some(&json!(["dual_audio", "dubbed", "en_audio"]))
+        );
+    }
+
+    #[test]
+    fn lp3_anime_audio_preference_ignores_non_anime_requests() {
+        let preference = AnimeAudioPreference {
+            mode: AnimeAudioPreferenceMode::PreferDub,
+            language: Some("English".to_string()),
+        };
+
+        let profile = quality_profile_with_anime_audio_preference(
+            Some(json!({ "allowedQualities": ["1080p"] })),
+            MediaType::Series,
+            Some(&preference),
+        )
+        .expect("quality profile");
+
+        assert_eq!(
+            profile.pointer("/allowedQualities"),
+            Some(&json!(["1080p"]))
+        );
+        assert!(profile.pointer("/animeAudioPreference").is_none());
+        assert!(profile.pointer("/languagePreference").is_none());
     }
 }

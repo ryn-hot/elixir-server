@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    acquisition::language_policy::AnimeAudioPreference,
     acquisition::subscriptions::{
         AcquisitionRequestMode, AcquisitionRequestScope, AcquisitionRoutePolicy,
     },
@@ -374,6 +375,8 @@ pub struct FindMediaScopedAddRequest {
     pub result: ScopedAddMediaIdentity,
     pub scope: ScopedAddSelection,
     #[serde(default)]
+    pub anime_audio_preference: Option<AnimeAudioPreference>,
+    #[serde(default)]
     pub route_policy: Option<AcquisitionRoutePolicy>,
 }
 
@@ -655,6 +658,7 @@ mod tests {
                 target_keys: vec!["s1e7".to_string()],
                 ..empty_selection(ScopedAddSelectionType::Episode)
             },
+            anime_audio_preference: None,
             route_policy: Some(AcquisitionRoutePolicy::DebridOnly),
         };
 

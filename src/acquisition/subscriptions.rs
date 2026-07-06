@@ -13,6 +13,7 @@ use crate::{
         record_acquisition_audit_event,
     },
     acquisition::episode_state::sync_library_episode_acquisition_state_for_target,
+    acquisition::language_policy::AnimeAudioPreference,
     db::models::MediaType,
     download_broker::DEBRID_DEFAULT_LOGICAL_ID,
     extensions::ExternalIds,
@@ -606,6 +607,8 @@ pub struct CreateAcquisitionIntent {
     pub release_delay_seconds: Option<i64>,
     #[serde(default)]
     pub quality_profile: Option<JsonValue>,
+    #[serde(default)]
+    pub anime_audio_preference: Option<AnimeAudioPreference>,
     #[serde(default)]
     pub metadata_refresh_after: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -3847,6 +3850,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: Some(now - ChronoDuration::minutes(1)),
                 candidate_search_after: Some(now),
                 target: Some(AcquisitionIntentTarget {
@@ -4001,6 +4005,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: None,
@@ -4061,6 +4066,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: Some(900),
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {
@@ -4106,6 +4112,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {
@@ -4154,6 +4161,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {
@@ -4190,6 +4198,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {
@@ -4241,6 +4250,7 @@ mod tests {
             source_suite_id: None,
             release_delay_seconds: None,
             quality_profile: None,
+            anime_audio_preference: None,
             metadata_refresh_after: None,
             candidate_search_after: None,
             target: Some(AcquisitionIntentTarget {
@@ -4321,6 +4331,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {
@@ -4356,6 +4367,7 @@ mod tests {
             source_suite_id: None,
             release_delay_seconds: None,
             quality_profile: None,
+            anime_audio_preference: None,
             metadata_refresh_after: None,
             candidate_search_after: None,
             target: Some(AcquisitionIntentTarget {
@@ -4438,6 +4450,7 @@ mod tests {
                 source_suite_id: None,
                 release_delay_seconds: None,
                 quality_profile: None,
+                anime_audio_preference: None,
                 metadata_refresh_after: None,
                 candidate_search_after: None,
                 target: Some(AcquisitionIntentTarget {

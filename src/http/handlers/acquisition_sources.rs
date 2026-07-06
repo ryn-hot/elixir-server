@@ -2473,6 +2473,9 @@ fn release_candidate_language_evidence(
     if let Some(language) = candidate.language.as_deref() {
         add_language_evidence_text(&mut evidence, language);
     }
+    for file in &candidate.files {
+        add_language_evidence_text(&mut evidence, &file.path);
+    }
     if let Some(raw) = candidate.raw.as_ref() {
         add_language_evidence_from_paths(
             &mut evidence,
@@ -2480,17 +2483,29 @@ fn release_candidate_language_evidence(
             &[
                 &["language"][..],
                 &["languages"][..],
+                &["languageProfile"][..],
+                &["languageProfiles"][..],
                 &["audioLanguage"][..],
                 &["audioLanguages"][..],
                 &["mediaEvidence", "language"][..],
+                &["mediaEvidence", "languageProfile"][..],
+                &["mediaEvidence", "languageProfiles"][..],
                 &["mediaEvidence", "audioLanguage"][..],
                 &["mediaEvidence", "audioLanguages"][..],
+                &["mediaEvidence", "languageVariant", "kind"][..],
+                &["mediaEvidence", "languageVariant", "profiles"][..],
                 &["parsedHints", "language"][..],
                 &["parsedHints", "languages"][..],
+                &["parsedHints", "languageProfile"][..],
+                &["parsedHints", "languageProfiles"][..],
                 &["raw", "language"][..],
                 &["raw", "languages"][..],
+                &["raw", "languageProfile"][..],
+                &["raw", "languageProfiles"][..],
                 &["raw", "audioLanguage"][..],
                 &["raw", "audioLanguages"][..],
+                &["raw", "languageVariant", "kind"][..],
+                &["raw", "languageVariant", "profiles"][..],
             ],
         );
         add_subtitle_evidence_from_paths(
@@ -2516,16 +2531,26 @@ fn stream_candidate_language_evidence(candidate: &Value) -> CandidateLanguageEvi
     for pointer in [
         "/title",
         "/language",
+        "/languageProfile",
+        "/languageProfiles",
         "/audioLanguage",
         "/audioLanguages",
         "/mediaEvidence/language",
+        "/mediaEvidence/languageProfile",
+        "/mediaEvidence/languageProfiles",
         "/mediaEvidence/audioLanguage",
         "/mediaEvidence/audioLanguages",
+        "/mediaEvidence/languageVariant/kind",
+        "/mediaEvidence/languageVariant/profiles",
         "/sourceModule/languageTags",
         "/raw/language",
         "/raw/languages",
+        "/raw/languageProfile",
+        "/raw/languageProfiles",
         "/raw/audioLanguage",
         "/raw/audioLanguages",
+        "/raw/languageVariant/kind",
+        "/raw/languageVariant/profiles",
     ] {
         if let Some(value) = candidate.pointer(pointer) {
             add_language_evidence_value(&mut evidence, value);
@@ -5625,6 +5650,46 @@ mod tests {
     }
 
     #[test]
+    fn lp3_release_language_preference_uses_candidate_file_paths_for_dub_evidence() -> Result<()> {
+        let mut request = suite_search_request(None);
+        request.media_type = "anime".to_string();
+        request.preferences.language_preference = Some(test_language_preference(
+            crate::db::models::MediaType::Anime,
+            json!({
+                "mode": "prefer",
+                "anime": { "profiles": ["en_audio", "dual_audio", "dubbed"] },
+                "unknownLanguage": "allow_lower_priority"
+            }),
+        ));
+        let (mut candidates, warnings) = normalize_upstream_candidates(vec![json!({
+            "title": "Example Anime S01E02 1080p-GROUP",
+            "source": "magnet:?xt=urn:btih:4444444444444444444444444444444444444444",
+            "sourceKind": "magnet",
+            "infoHash": "4444444444444444444444444444444444444444",
+            "score": 10.0,
+            "files": [{
+                "path": "Example Anime/Example Anime - S01E02 [English Dub].mkv",
+                "sizeBytes": 4096,
+                "selectable": true
+            }]
+        })]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        apply_release_candidate_language_preference(&request, &mut candidates);
+
+        assert_eq!(
+            candidates[0]
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/serverEvidence/languagePreference/state"))
+                .and_then(Value::as_str),
+            Some("match")
+        );
+        assert!(candidates[0].score.unwrap() > 10.0);
+        Ok(())
+    }
+
+    #[test]
     fn lp3_stream_language_preference_scores_without_filtering_unknown_candidates() {
         let mut request = stream_search_request(None);
         request.preferences.language_preference = Some(test_language_preference(
@@ -5689,6 +5754,36 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn lp3_stream_language_preference_uses_media_evidence_profiles() {
+        let mut request = stream_search_request(None);
+        request.preferences.language_preference = Some(test_language_preference(
+            crate::db::models::MediaType::Anime,
+            json!({
+                "mode": "prefer",
+                "anime": { "profiles": ["en_audio", "dual_audio", "dubbed"] },
+                "unknownLanguage": "allow_lower_priority"
+            }),
+        ));
+        let mut candidate = stream_candidate("profile-stream", "S01E02");
+        candidate
+            .pointer_mut("/mediaEvidence")
+            .and_then(Value::as_object_mut)
+            .expect("media evidence object")
+            .insert("languageProfiles".to_string(), json!(["en_audio"]));
+
+        let candidates = apply_stream_candidate_language_preference(&request, vec![candidate]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0]
+                .pointer("/raw/serverEvidence/languagePreference/state")
+                .and_then(Value::as_str),
+            Some("match")
+        );
+        assert!(candidates[0].get("score").and_then(Value::as_f64).unwrap() > 82.0);
     }
 
     #[tokio::test]

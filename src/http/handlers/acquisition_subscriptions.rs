@@ -11,7 +11,8 @@ use uuid::Uuid;
 use crate::{
     acquisition::{
         language_policy::{
-            load_saved_language_preference, quality_profile_with_language_preference,
+            load_saved_language_preference, quality_profile_with_anime_audio_preference,
+            quality_profile_with_language_preference,
         },
         release_resolution::fingerprint::candidate_release_fingerprint,
         route_attempts::{RouteAttemptRecord, RouteAttemptStatus, attach_route_attempt_ledger},
@@ -288,6 +289,11 @@ async fn apply_source_provider_config_defaults(
         let language_preference = load_saved_language_preference(store)
             .await
             .map_err(ApiError::from)?;
+        request.quality_profile = quality_profile_with_anime_audio_preference(
+            request.quality_profile.take(),
+            request.media_type,
+            request.anime_audio_preference.as_ref(),
+        );
         request.quality_profile = quality_profile_with_language_preference(
             request.quality_profile.take(),
             request.media_type,
@@ -339,6 +345,11 @@ async fn apply_source_provider_config_defaults(
             request.quality_profile = source_quality_profile_from_config(config);
         }
     }
+    request.quality_profile = quality_profile_with_anime_audio_preference(
+        request.quality_profile.take(),
+        request.media_type,
+        request.anime_audio_preference.as_ref(),
+    );
     let language_preference = load_saved_language_preference(store)
         .await
         .map_err(ApiError::from)?;
