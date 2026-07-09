@@ -23,9 +23,11 @@ pub mod manifest;
 pub mod nuvio_registry;
 pub mod package;
 pub mod permissions;
+pub mod prism_policy;
 pub mod registry;
 pub mod required_secrets;
 pub mod source_artifacts;
+pub mod source_network_safety;
 pub mod store;
 pub mod updater;
 

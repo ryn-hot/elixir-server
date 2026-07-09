@@ -39,7 +39,7 @@ use crate::extensions::managed_paths::{
 };
 use crate::extensions::manifest::{
     ExtensionManifest, ManifestNetworking, ManifestRuntime, ManifestRuntimeEgress,
-    ManifestRuntimeEnv,
+    ManifestRuntimeEnv, ManifestRuntimeSecurity,
 };
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
@@ -62,8 +62,9 @@ use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::runtime::model::{
     CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerRuntimeMount, ContainerRuntimeState,
-    ContainerSpec, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
-    apply_container_spec_fingerprint,
+    ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
+    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, EnvVar, PortMapping,
+    VolumeMount, VolumeMountSourceKind, apply_container_spec_fingerprint,
 };
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
@@ -142,6 +143,7 @@ pub struct Executor<'a> {
     drivers: &'a DriverRegistry,
     runtime: &'a dyn RuntimeManager,
     runtime_paths: RuntimePaths,
+    runtime_deployment_id: String,
     secrets: &'a SecretsManager,
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
@@ -237,6 +239,7 @@ impl<'a> Executor<'a> {
             probe,
             drivers,
             runtime,
+            runtime_deployment_id: runtime_paths.deployment_id(),
             runtime_paths,
             secrets,
             wireguard_gateway_image: "qmcgaw/gluetun:v3.39.0".to_string(),
@@ -636,14 +639,22 @@ impl<'a> Executor<'a> {
         }
 
         let mut labels = HashMap::new();
-        labels.insert("elixir.instance_id".to_string(), instance_id.to_string());
+        labels.insert(
+            ELIXIR_INSTANCE_ID_LABEL.to_string(),
+            instance_id.to_string(),
+        );
         labels.insert("elixir.instance_name".to_string(), instance_name);
-        labels.insert("elixir.extension_id".to_string(), extension_id.clone());
+        labels.insert(ELIXIR_EXTENSION_ID_LABEL.to_string(), extension_id.clone());
         labels.insert(
             "elixir.extension_version".to_string(),
             desired_version.clone(),
         );
-        labels.insert("elixir.managed".to_string(), "true".to_string());
+        labels.insert(ELIXIR_MANAGED_LABEL.to_string(), "true".to_string());
+        labels.insert(
+            ELIXIR_DEPLOYMENT_ID_LABEL.to_string(),
+            self.runtime_deployment_id.clone(),
+        );
+        stamp_runtime_security_labels(&mut labels, &runtime.security);
 
         let env = resolve_runtime_env(&self.store, self.secrets, instance_id, runtime.env).await?;
 
@@ -655,6 +666,7 @@ impl<'a> Executor<'a> {
         )?;
         let volumes = prepared_volumes.volumes.clone();
         let runtime_volumes = prepared_volumes.volumes.clone();
+        validate_runtime_security_mounts(&runtime.security, &runtime_volumes, &self.runtime_paths)?;
         if is_nzbget_extension_id(&extension_id) {
             prepare_nzbget_runtime_dirs(&runtime_volumes).await?;
         }
@@ -682,7 +694,9 @@ impl<'a> Executor<'a> {
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: runtime.security.drop_capabilities.clone(),
             sysctls: HashMap::new(),
+            security: container_security_options(&runtime.security),
         };
 
         let resolved_egress = self
@@ -5409,6 +5423,158 @@ async fn resolve_runtime_env(
     Ok(resolved)
 }
 
+fn stamp_runtime_security_labels(
+    labels: &mut HashMap<String, String>,
+    security: &ManifestRuntimeSecurity,
+) {
+    let hardened = security.run_as_non_root
+        || security.user.is_some()
+        || security.read_only_rootfs
+        || security.no_new_privileges
+        || !security.drop_capabilities.is_empty()
+        || !security.tmpfs.is_empty()
+        || security.memory_limit_mb.is_some()
+        || security.pids_limit.is_some()
+        || security.cpu_quota.is_some()
+        || security.seccomp_profile.is_some()
+        || security.apparmor_profile.is_some()
+        || security.prohibit_docker_socket
+        || security.prohibit_host_media_mounts;
+    labels.insert(
+        "elixir.runtime.security.profile".to_string(),
+        if hardened { "hardened" } else { "default" }.to_string(),
+    );
+    labels.insert(
+        "elixir.runtime.security.non_root".to_string(),
+        (security.run_as_non_root || security.user.is_some()).to_string(),
+    );
+    labels.insert(
+        "elixir.runtime.security.read_only_rootfs".to_string(),
+        security.read_only_rootfs.to_string(),
+    );
+    labels.insert(
+        "elixir.runtime.security.no_new_privileges".to_string(),
+        security.no_new_privileges.to_string(),
+    );
+    if !security.drop_capabilities.is_empty() {
+        labels.insert(
+            "elixir.runtime.security.cap_drop".to_string(),
+            security.drop_capabilities.join(","),
+        );
+    }
+    if !security.tmpfs.is_empty() {
+        labels.insert(
+            "elixir.runtime.security.tmpfs_count".to_string(),
+            security.tmpfs.len().to_string(),
+        );
+    }
+    if let Some(memory_limit_mb) = security.memory_limit_mb {
+        labels.insert(
+            "elixir.runtime.security.memory_limit_mb".to_string(),
+            memory_limit_mb.to_string(),
+        );
+    }
+    if let Some(pids_limit) = security.pids_limit {
+        labels.insert(
+            "elixir.runtime.security.pids_limit".to_string(),
+            pids_limit.to_string(),
+        );
+    }
+    if let Some(cpu_quota) = security.cpu_quota.as_deref() {
+        labels.insert(
+            "elixir.runtime.security.cpu_quota".to_string(),
+            cpu_quota.to_string(),
+        );
+    }
+    if let Some(seccomp_profile) = security.seccomp_profile.as_deref() {
+        labels.insert(
+            "elixir.runtime.security.seccomp_profile".to_string(),
+            seccomp_profile.to_string(),
+        );
+    }
+    if let Some(apparmor_profile) = security.apparmor_profile.as_deref() {
+        labels.insert(
+            "elixir.runtime.security.apparmor_profile".to_string(),
+            apparmor_profile.to_string(),
+        );
+    }
+}
+
+fn container_security_options(security: &ManifestRuntimeSecurity) -> ContainerSecurityOptions {
+    ContainerSecurityOptions {
+        user: security.user.clone().or_else(|| {
+            if security.run_as_non_root {
+                Some("1000:1000".to_string())
+            } else {
+                None
+            }
+        }),
+        read_only_rootfs: security.read_only_rootfs,
+        no_new_privileges: security.no_new_privileges,
+        tmpfs: security
+            .tmpfs
+            .iter()
+            .map(|tmpfs| ContainerTmpfsMount {
+                path: tmpfs.path.clone(),
+                size_mb: tmpfs.size_mb,
+            })
+            .collect(),
+        memory_limit_mb: security.memory_limit_mb,
+        pids_limit: security.pids_limit,
+        cpu_quota: security.cpu_quota.clone(),
+        seccomp_profile: security.seccomp_profile.clone(),
+        apparmor_profile: security.apparmor_profile.clone(),
+    }
+}
+
+fn validate_runtime_security_mounts(
+    security: &ManifestRuntimeSecurity,
+    volumes: &[VolumeMount],
+    paths: &RuntimePaths,
+) -> Result<()> {
+    for volume in volumes {
+        if security.prohibit_docker_socket && volume_mount_targets_docker_socket(volume) {
+            bail!(
+                "runtime.security.prohibit_docker_socket blocks mount '{}:{}'",
+                volume.host_path,
+                volume.container_path
+            );
+        }
+        if security.prohibit_host_media_mounts
+            && volume_mount_targets_media_or_downloads(volume, paths)
+        {
+            bail!(
+                "runtime.security.prohibit_host_media_mounts blocks mount '{}:{}'",
+                volume.host_path,
+                volume.container_path
+            );
+        }
+    }
+    Ok(())
+}
+
+fn volume_mount_targets_docker_socket(volume: &VolumeMount) -> bool {
+    volume.host_path == "/var/run/docker.sock"
+        || volume.container_path == "/var/run/docker.sock"
+        || volume.host_path.ends_with("/docker.sock")
+        || volume.container_path.ends_with("/docker.sock")
+}
+
+fn volume_mount_targets_media_or_downloads(volume: &VolumeMount, paths: &RuntimePaths) -> bool {
+    if volume.source_kind != VolumeMountSourceKind::Bind {
+        return false;
+    }
+    path_is_or_contains(&volume.host_path, &paths.media_root)
+        || path_is_or_contains(&volume.host_path, &paths.downloads_root)
+        || volume.container_path == DOWNLOADS_ROOT
+}
+
+fn path_is_or_contains(path: &str, root: &str) -> bool {
+    let path = Path::new(path);
+    let root = Path::new(root);
+    path == root || path.starts_with(root)
+}
+
 pub(crate) fn resolve_runtime_volume_mounts(
     extension_id: &str,
     instance_id: Uuid,
@@ -6383,6 +6549,7 @@ mod tests {
                 })
                 .collect(),
             published_ports: Vec::new(),
+            security: Default::default(),
         }
     }
 
@@ -7412,6 +7579,7 @@ mod tests {
                 from_secret: Some("instance:api_key".to_string()),
             }],
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -7433,6 +7601,165 @@ mod tests {
             .map(|env| env.value.clone());
         assert_eq!(env_value.as_deref(), Some("super-secret"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_security_policy_maps_to_container_spec() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.secure", runtime_env_manifest("ext.secure")).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.secure".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data")
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([3u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        let runtime_spec = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/runtime:latest".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: Vec::new(),
+            egress: None,
+            security: ManifestRuntimeSecurity {
+                run_as_non_root: true,
+                user: None,
+                read_only_rootfs: true,
+                no_new_privileges: true,
+                drop_capabilities: vec!["ALL".to_string()],
+                tmpfs: vec![crate::extensions::manifest::ManifestRuntimeTmpfs {
+                    path: "/tmp".to_string(),
+                    size_mb: Some(64),
+                }],
+                memory_limit_mb: Some(512),
+                pids_limit: Some(128),
+                cpu_quota: Some("1.0".to_string()),
+                seccomp_profile: Some("default".to_string()),
+                apparmor_profile: Some("prism-default".to_string()),
+                prohibit_docker_socket: true,
+                prohibit_host_media_mounts: true,
+            },
+        };
+
+        executor
+            .ensure_runtime_running(
+                instance_id,
+                "ext.secure".to_string(),
+                "default".to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await?;
+
+        let spec = runtime.last_spec().expect("container spec captured");
+        assert_eq!(spec.security.user.as_deref(), Some("1000:1000"));
+        assert!(spec.security.read_only_rootfs);
+        assert!(spec.security.no_new_privileges);
+        assert_eq!(spec.cap_drop, vec!["ALL".to_string()]);
+        assert_eq!(spec.security.tmpfs.len(), 1);
+        assert_eq!(spec.security.tmpfs[0].path, "/tmp");
+        assert_eq!(spec.security.tmpfs[0].size_mb, Some(64));
+        assert_eq!(spec.security.memory_limit_mb, Some(512));
+        assert_eq!(spec.security.pids_limit, Some(128));
+        assert_eq!(spec.security.cpu_quota.as_deref(), Some("1.0"));
+        assert_eq!(spec.security.seccomp_profile.as_deref(), Some("default"));
+        assert_eq!(
+            spec.security.apparmor_profile.as_deref(),
+            Some("prism-default")
+        );
+        assert_eq!(
+            spec.labels
+                .get("elixir.runtime.security.profile")
+                .map(String::as_str),
+            Some("hardened")
+        );
+        assert_eq!(
+            spec.labels
+                .get("elixir.runtime.security.cap_drop")
+                .map(String::as_str),
+            Some("ALL")
+        );
+        assert_eq!(
+            spec.labels
+                .get("elixir.runtime.security.apparmor_profile")
+                .map(String::as_str),
+            Some("prism-default")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_security_policy_rejects_docker_socket_and_media_mounts() {
+        let paths = RuntimePaths {
+            data_root: "/tmp/elixir/data".to_string(),
+            extensions_root: "/tmp/elixir/data/extensions".to_string(),
+            downloads_root: "/tmp/elixir/downloads".to_string(),
+            media_root: "/tmp/elixir/media".to_string(),
+        };
+        let security = ManifestRuntimeSecurity {
+            prohibit_docker_socket: true,
+            prohibit_host_media_mounts: true,
+            ..Default::default()
+        };
+
+        let docker_socket = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: "/var/run/docker.sock".to_string(),
+            container_path: "/var/run/docker.sock".to_string(),
+            read_only: false,
+        };
+        assert!(validate_runtime_security_mounts(&security, &[docker_socket], &paths).is_err());
+
+        let media_mount = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: "/tmp/elixir/media/tv".to_string(),
+            container_path: "/tv".to_string(),
+            read_only: true,
+        };
+        assert!(validate_runtime_security_mounts(&security, &[media_mount], &paths).is_err());
+
+        let source_artifact_mount = VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: "/tmp/elixir/data/extensions/source-artifacts/nuvio".to_string(),
+            container_path: "/app/source-modules".to_string(),
+            read_only: true,
+        };
+        assert!(
+            validate_runtime_security_mounts(&security, &[source_artifact_mount], &paths).is_ok()
+        );
     }
 
     #[tokio::test]
@@ -7501,6 +7828,7 @@ mod tests {
                 from_secret: Some("instance:api_key".to_string()),
             }],
             egress: None,
+            security: Default::default(),
         };
 
         let err = executor
@@ -7574,6 +7902,7 @@ mod tests {
                 from_secret: Some("instance:api_key".to_string()),
             }],
             egress: None,
+            security: Default::default(),
         };
 
         let err = executor
@@ -7635,6 +7964,7 @@ mod tests {
                 .as_ref(),
             temp_dir.path().to_string_lossy().as_ref(),
         );
+        let expected_deployment_id = runtime_paths.deployment_id();
         let executor = Executor::new(
             &database.pool,
             &probe,
@@ -7662,6 +7992,7 @@ mod tests {
                 wireguard_config_secret: Some("instance:wg_config".to_string()),
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
 
         executor
@@ -7679,6 +8010,19 @@ mod tests {
         assert_eq!(specs.len(), 2, "expected gateway + app container specs");
         let gateway = &specs[0];
         let app = &specs[1];
+        assert_eq!(
+            gateway
+                .labels
+                .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                .map(String::as_str),
+            Some(expected_deployment_id.as_str())
+        );
+        assert_eq!(
+            app.labels
+                .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                .map(String::as_str),
+            Some(expected_deployment_id.as_str())
+        );
         assert_eq!(gateway.image, "example/wireguard-gateway:1");
         assert!(gateway.aliases.iter().any(|alias| alias == "svc-test"));
         assert!(
@@ -7782,6 +8126,7 @@ mod tests {
                 wireguard_config_secret: Some("instance:wg_config".to_string()),
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
 
         executor
@@ -7864,6 +8209,7 @@ mod tests {
                 wireguard_config_secret: Some("instance:wg_config".to_string()),
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
 
         let err = executor
@@ -7953,6 +8299,7 @@ mod tests {
             volumes: Vec::new(),
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8061,6 +8408,7 @@ mod tests {
             volumes: vec!["{downloads}:/downloads".to_string()],
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8184,6 +8532,7 @@ mod tests {
             volumes: vec!["{downloads}:/downloads".to_string()],
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8286,6 +8635,7 @@ mod tests {
             volumes: vec!["{downloads}:/downloads".to_string()],
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8417,6 +8767,7 @@ mod tests {
             volumes: vec!["{downloads}:/downloads".to_string()],
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8565,6 +8916,7 @@ mod tests {
             volumes: vec!["{downloads}:/downloads".to_string()],
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         let err = executor
@@ -8665,6 +9017,7 @@ mod tests {
                 wireguard_config_secret: None,
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
 
         executor
@@ -8770,6 +9123,7 @@ mod tests {
             volumes: Vec::new(),
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -8900,6 +9254,7 @@ mod tests {
                 },
             ],
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -9000,6 +9355,7 @@ mod tests {
             volumes: Vec::new(),
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         executor
@@ -10182,6 +10538,7 @@ mod tests {
             volumes: Vec::new(),
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         let probe = StubProbe::default();
@@ -10272,6 +10629,7 @@ mod tests {
             volumes: Vec::new(),
             env: Vec::new(),
             egress: None,
+            security: Default::default(),
         };
 
         let probe = StubProbe::default();
@@ -10624,7 +10982,9 @@ PersistentKeepalive = 25
                 ],
                 cap_add: Vec::new(),
                 devices: Vec::new(),
+                cap_drop: Vec::new(),
                 sysctls: HashMap::new(),
+                security: Default::default(),
             };
             runtime.ensure_container(&target_spec).await?;
 
@@ -10664,6 +11024,7 @@ PersistentKeepalive = 25
                     wireguard_config_secret: Some("instance:wg_config".to_string()),
                     wireguard_gateway_image: None,
                 }),
+                security: Default::default(),
             };
 
             executor
@@ -11236,7 +11597,9 @@ PersistentKeepalive = 25
                 ],
                 cap_add: Vec::new(),
                 devices: Vec::new(),
+                cap_drop: Vec::new(),
                 sysctls: HashMap::new(),
+                security: Default::default(),
             };
 
             runtime.ensure_container(&spec).await?;
@@ -11605,7 +11968,9 @@ PersistentKeepalive = 25
                 command: Vec::new(),
                 cap_add: Vec::new(),
                 devices: Vec::new(),
+                cap_drop: Vec::new(),
                 sysctls: HashMap::new(),
+                security: Default::default(),
             }
         }
 
@@ -11632,7 +11997,9 @@ PersistentKeepalive = 25
                 ],
                 cap_add: Vec::new(),
                 devices: Vec::new(),
+                cap_drop: Vec::new(),
                 sysctls: HashMap::new(),
+                security: Default::default(),
             }
         }
 
@@ -11655,7 +12022,9 @@ PersistentKeepalive = 25
                 ],
                 cap_add: Vec::new(),
                 devices: Vec::new(),
+                cap_drop: Vec::new(),
                 sysctls: HashMap::new(),
+                security: Default::default(),
             }
         }
 
@@ -11774,7 +12143,9 @@ PersistentKeepalive = 25
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         }
     }
 

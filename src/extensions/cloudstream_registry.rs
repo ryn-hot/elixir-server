@@ -2,18 +2,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use reqwest::header::{ETAG, HeaderMap, LAST_MODIFIED};
+use reqwest::header::{ETAG, HeaderMap, LAST_MODIFIED, LOCATION};
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::extensions::source_network_safety::{
+    validate_public_source_ip, validate_source_url_dns,
+};
 use crate::extensions::store::{
     ExtensionStore, NewExtensionSourceModule, NewExtensionSourceModuleVersion,
     NewExtensionSourceRegistry, NewExtensionSourceReplacementRecommendation,
@@ -336,7 +338,7 @@ impl CloudStreamRegistryClient {
     pub fn new(config: CloudStreamRegistryFetchConfig) -> Result<Self> {
         let client = Client::builder()
             .timeout(config.timeout)
-            .redirect(Policy::limited(config.max_redirects))
+            .redirect(Policy::none())
             .build()
             .context("building CloudStream registry client")?;
         Ok(Self { client, config })
@@ -424,16 +426,46 @@ impl CloudStreamRegistryClient {
 
     async fn fetch_text(&self, url: &str) -> Result<FetchedText> {
         let normalized = normalize_http_url(url, None, &self.config)?;
-        let mut response = self
-            .client
-            .get(&normalized)
-            .send()
-            .await
-            .with_context(|| format!("fetching CloudStream registry document {normalized}"))?;
+        let mut next_url = Url::parse(&normalized).context("parsing normalized CloudStream URL")?;
+        let mut redirects = 0usize;
+        let mut response = loop {
+            validate_safe_http_url(&next_url, self.config.allow_private_hosts)?;
+            validate_source_url_dns(
+                &next_url,
+                self.config.allow_private_hosts,
+                "CloudStream registry",
+            )
+            .await?;
+            let response = self
+                .client
+                .get(next_url.clone())
+                .send()
+                .await
+                .with_context(|| format!("fetching CloudStream registry document {next_url}"))?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                bail!("CloudStream registry redirect response missing Location header");
+            };
+            redirects += 1;
+            if redirects > self.config.max_redirects {
+                bail!("too many CloudStream registry redirects");
+            }
+            next_url = checked_cloudstream_registry_redirect_target(
+                &next_url,
+                location,
+                self.config.allow_private_hosts,
+            )?;
+        };
         if !response.status().is_success() {
             bail!(
                 "CloudStream registry document {} returned {}",
-                normalized,
+                response.url(),
                 response.status()
             );
         }
@@ -474,6 +506,19 @@ impl CloudStreamRegistryClient {
             last_modified,
         })
     }
+}
+
+fn checked_cloudstream_registry_redirect_target(
+    current_url: &Url,
+    location: &str,
+    allow_private_hosts: bool,
+) -> Result<Url> {
+    let redirected = current_url.join(location).with_context(|| {
+        format!("parsing CloudStream registry redirect location for {current_url}")
+    })?;
+    validate_safe_http_url(&redirected, allow_private_hosts)
+        .context("blocked unsafe CloudStream registry redirect target")?;
+    Ok(redirected)
 }
 
 pub fn parse_repo_json(
@@ -1513,30 +1558,8 @@ fn validate_safe_http_url(url: &Url, allow_private_hosts: bool) -> Result<()> {
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
         bail!("private or local host '{host}' is not allowed");
     }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ip) => {
-                if ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                    || ip.octets()[0] == 0
-                {
-                    bail!("private or local IP address '{ip}' is not allowed");
-                }
-            }
-            IpAddr::V6(ip) => {
-                if ip.is_loopback()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    || ip.is_unspecified()
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-                {
-                    bail!("private or local IP address '{ip}' is not allowed");
-                }
-            }
-        }
+    if let Ok(ip) = lower.parse() {
+        validate_public_source_ip(ip, "CloudStream registry")?;
     }
     Ok(())
 }
@@ -1773,6 +1796,33 @@ mod tests {
             max_plugin_lists: 4,
             ..CloudStreamRegistryFetchConfig::default()
         }
+    }
+
+    #[test]
+    fn cloudstream_registry_redirect_target_allows_public_relative_redirects() -> Result<()> {
+        let current = Url::parse("https://repo.example.test/cloudstream/repo.json")?;
+        let redirected =
+            checked_cloudstream_registry_redirect_target(&current, "../plugins.json", false)?;
+        assert_eq!(
+            redirected.as_str(),
+            "https://repo.example.test/plugins.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cloudstream_registry_redirect_target_rejects_private_destinations() {
+        let current = Url::parse("https://repo.example.test/cloudstream/repo.json").unwrap();
+        let err = checked_cloudstream_registry_redirect_target(
+            &current,
+            "http://172.16.0.10/plugins.json",
+            false,
+        )
+        .expect_err("private registry redirect should be rejected");
+        assert!(
+            err.to_string()
+                .contains("blocked unsafe CloudStream registry redirect target")
+        );
     }
 
     #[test]

@@ -1052,7 +1052,9 @@ mod docker_tests {
             ],
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
 
         let _handle = runtime.ensure_container(&spec).await?;

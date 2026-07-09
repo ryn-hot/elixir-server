@@ -38,6 +38,10 @@ impl RuntimePaths {
             media_root,
         }
     }
+
+    pub fn deployment_id(&self) -> String {
+        deployment_id_for_storage_root(&self.extensions_root)
+    }
 }
 
 fn absolutize_path(raw: &str) -> PathBuf {
@@ -49,6 +53,13 @@ fn absolutize_path(raw: &str) -> PathBuf {
         Ok(cwd) => cwd.join(path),
         Err(_) => path,
     }
+}
+
+pub fn deployment_id_for_storage_root(storage_root: &str) -> String {
+    let storage_path = absolutize_path(storage_root);
+    let canonical = storage_path.to_string_lossy();
+    let hash = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+    format!("storage-{}", &hash[..16])
 }
 
 #[async_trait]

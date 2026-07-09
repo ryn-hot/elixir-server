@@ -561,6 +561,7 @@ pub struct NewExtensionSourceModuleCertification {
     pub certification_id: Uuid,
     pub source_module_id: Uuid,
     pub source_module_version_id: Option<Uuid>,
+    pub artifact_sha256: Option<String>,
     pub instance_id: Uuid,
     pub adapter: String,
     pub status: String,
@@ -581,6 +582,7 @@ pub struct ExtensionSourceModuleCertification {
     pub certification_id: Uuid,
     pub source_module_id: Uuid,
     pub source_module_version_id: Option<Uuid>,
+    pub artifact_sha256: Option<String>,
     pub instance_id: Uuid,
     pub adapter: String,
     pub status: String,
@@ -3538,11 +3540,231 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn delete_source_registry(&self, registry_id: Uuid) -> Result<u64> {
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_certification_jobs
+             WHERE registry_id = ?
+                OR source_module_id IN (
+                    SELECT source_module_id
+                    FROM extension_source_modules
+                    WHERE registry_id = ?
+                )",
+        )
+        .bind(registry_id.to_string())
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_replacement_recommendations
+             WHERE replacement_registry_id = ?
+                OR source_module_id IN (
+                    SELECT source_module_id
+                    FROM extension_source_modules
+                    WHERE registry_id = ?
+                )
+                OR replacement_source_module_id IN (
+                    SELECT source_module_id
+                    FROM extension_source_modules
+                    WHERE registry_id = ?
+                )",
+        )
+        .bind(registry_id.to_string())
+        .bind(registry_id.to_string())
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_quarantines
+             WHERE source_module_id IN (
+                SELECT source_module_id
+                FROM extension_source_modules
+                WHERE registry_id = ?
+             )",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_certifications
+             WHERE source_module_id IN (
+                SELECT source_module_id
+                FROM extension_source_modules
+                WHERE registry_id = ?
+             )",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_health_events
+             WHERE source_module_id IN (
+                SELECT source_module_id
+                FROM extension_source_modules
+                WHERE registry_id = ?
+             )",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_versions
+             WHERE source_module_id IN (
+                SELECT source_module_id
+                FROM extension_source_modules
+                WHERE registry_id = ?
+             )",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_modules
+             WHERE registry_id = ?",
+        )
+        .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?;
         let affected = sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_registries
              WHERE registry_id = ?",
         )
         .bind(registry_id.to_string())
+        .execute(self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    pub async fn delete_orphan_source_modules_for_instance(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<u64> {
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_certification_jobs
+             WHERE instance_id = ?
+               AND (
+                    registry_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM extension_source_registries registry
+                        WHERE registry.registry_id = extension_source_certification_jobs.registry_id
+                    )
+                    OR source_module_id IN (
+                        SELECT module.source_module_id
+                        FROM extension_source_modules module
+                        WHERE module.instance_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM extension_source_registries registry
+                              WHERE registry.registry_id = module.registry_id
+                          )
+                    )
+               )",
+        )
+        .bind(instance_id.to_string())
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_replacement_recommendations
+             WHERE source_module_id IN (
+                    SELECT module.source_module_id
+                    FROM extension_source_modules module
+                    WHERE module.instance_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM extension_source_registries registry
+                          WHERE registry.registry_id = module.registry_id
+                      )
+             )
+                OR replacement_source_module_id IN (
+                    SELECT module.source_module_id
+                    FROM extension_source_modules module
+                    WHERE module.instance_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM extension_source_registries registry
+                          WHERE registry.registry_id = module.registry_id
+                      )
+             )",
+        )
+        .bind(instance_id.to_string())
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_quarantines
+             WHERE source_module_id IN (
+                SELECT module.source_module_id
+                FROM extension_source_modules module
+                WHERE module.instance_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM extension_source_registries registry
+                      WHERE registry.registry_id = module.registry_id
+                  )
+             )",
+        )
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_certifications
+             WHERE source_module_id IN (
+                SELECT module.source_module_id
+                FROM extension_source_modules module
+                WHERE module.instance_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM extension_source_registries registry
+                      WHERE registry.registry_id = module.registry_id
+                  )
+             )",
+        )
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_health_events
+             WHERE source_module_id IN (
+                SELECT module.source_module_id
+                FROM extension_source_modules module
+                WHERE module.instance_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM extension_source_registries registry
+                      WHERE registry.registry_id = module.registry_id
+                  )
+             )",
+        )
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_module_versions
+             WHERE source_module_id IN (
+                SELECT module.source_module_id
+                FROM extension_source_modules module
+                WHERE module.instance_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM extension_source_registries registry
+                      WHERE registry.registry_id = module.registry_id
+                  )
+             )",
+        )
+        .bind(instance_id.to_string())
+        .execute(self.pool)
+        .await?;
+        let affected = sqlx::query::<sqlx::Any>(
+            "DELETE FROM extension_source_modules
+             WHERE instance_id = ?
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM extension_source_registries registry
+                   WHERE registry.registry_id = extension_source_modules.registry_id
+               )",
+        )
+        .bind(instance_id.to_string())
         .execute(self.pool)
         .await?
         .rows_affected();
@@ -4136,6 +4358,7 @@ impl<'a> ExtensionStore<'a> {
                 certification_id,
                 source_module_id,
                 source_module_version_id,
+                artifact_sha256,
                 instance_id,
                 adapter,
                 status,
@@ -4149,9 +4372,10 @@ impl<'a> ExtensionStore<'a> {
                 policy_version,
                 certified_at,
                 expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(source_module_id, source_module_version_id, instance_id, adapter) DO UPDATE SET
                 certification_id = excluded.certification_id,
+                artifact_sha256 = excluded.artifact_sha256,
                 status = excluded.status,
                 failure_class = excluded.failure_class,
                 summary = excluded.summary,
@@ -4168,6 +4392,7 @@ impl<'a> ExtensionStore<'a> {
         .bind(data.certification_id.to_string())
         .bind(data.source_module_id.to_string())
         .bind(data.source_module_version_id.map(|id| id.to_string()))
+        .bind(data.artifact_sha256.as_deref().map(str::trim))
         .bind(data.instance_id.to_string())
         .bind(data.adapter.trim())
         .bind(data.status.trim())
@@ -4195,6 +4420,7 @@ impl<'a> ExtensionStore<'a> {
                 certification_id,
                 source_module_id,
                 CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                CAST(artifact_sha256 AS TEXT) AS artifact_sha256,
                 instance_id,
                 adapter,
                 status,
@@ -4238,6 +4464,7 @@ impl<'a> ExtensionStore<'a> {
                 certification_id,
                 source_module_id,
                 CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                CAST(artifact_sha256 AS TEXT) AS artifact_sha256,
                 instance_id,
                 adapter,
                 status,
@@ -4276,6 +4503,7 @@ impl<'a> ExtensionStore<'a> {
                 certification_id,
                 source_module_id,
                 CAST(source_module_version_id AS TEXT) AS source_module_version_id,
+                CAST(artifact_sha256 AS TEXT) AS artifact_sha256,
                 instance_id,
                 adapter,
                 status,
@@ -5248,6 +5476,7 @@ fn map_source_module_certification(row: &AnyRow) -> Result<ExtensionSourceModule
             row_get_opt_string(row, "source_module_version_id")?,
             "extension_source_module_certifications.source_module_version_id",
         )?,
+        artifact_sha256: row_get_opt_string(row, "artifact_sha256")?,
         instance_id: parse_uuid(
             &instance_id_raw,
             "extension_source_module_certifications.instance_id",
@@ -6432,6 +6661,7 @@ mod tests {
                 certification_id: Uuid::new_v4(),
                 source_module_id,
                 source_module_version_id: Some(version_id),
+                artifact_sha256: Some("sha256".to_string()),
                 instance_id,
                 adapter: "nuvio_js_v1".to_string(),
                 status: "certified".to_string(),
@@ -6610,8 +6840,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_registry_delete_cascades_modules_versions_and_certification_jobs() -> Result<()>
-    {
+    async fn source_registry_delete_explicitly_removes_modules_versions_and_certification_jobs()
+    -> Result<()> {
         let (database, instance_id) = test_store().await?;
         let store = ExtensionStore::new(&database.pool);
         let registry_id = Uuid::new_v4();
@@ -6696,11 +6926,141 @@ mod tests {
             })
             .await?;
 
+        sqlx::query("PRAGMA foreign_keys = OFF;")
+            .execute(&database.pool)
+            .await?;
+
         let deleted = store.delete_source_registry(registry_id).await?;
         assert_eq!(deleted, 1);
         assert!(
             store
                 .list_source_modules(None, Some(registry_id))
+                .await?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_source_module_versions(source_module_id)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_source_certification_jobs_for_registry(registry_id, 10)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_orphan_repair_removes_modules_left_after_registry_delete() -> Result<()> {
+        let (database, instance_id) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let registry_id = Uuid::new_v4();
+        store
+            .upsert_source_registry(&NewExtensionSourceRegistry {
+                registry_id,
+                instance_id,
+                registry_key: "prism.orphan.fixture".to_string(),
+                registry_type: "nuvio_manifest_json".to_string(),
+                trust_class: "maintainer_known".to_string(),
+                display_name: "Orphan Fixture".to_string(),
+                url: Some("https://example.test/manifest.json".to_string()),
+                enabled: true,
+                auto_refresh: true,
+                trusted_for_executable_updates: true,
+                etag: None,
+                last_modified: None,
+                metadata_json: None,
+            })
+            .await?;
+        let source_module_id = Uuid::new_v4();
+        store
+            .upsert_source_module(&NewExtensionSourceModule {
+                source_module_id,
+                instance_id,
+                registry_id,
+                module_key: "nuvio:orphan:fixture".to_string(),
+                display_name: "Orphan Fixture".to_string(),
+                ecosystem: "nuvio".to_string(),
+                plugin_package: Some("orphan_fixture".to_string()),
+                active_version: Some("1.0.0".to_string()),
+                rollback_version: None,
+                media_types_json: Some(json!(["movie"])),
+                language_tags_json: Some(json!(["en"])),
+                region_tags_json: None,
+                source_domains_json: Some(json!(["example.test"])),
+                account_required: false,
+                unsupported: false,
+                unsupported_reason: None,
+                enabled: true,
+                installed: true,
+                pinned_version: None,
+                health_state: "available".to_string(),
+                replacement_recommendation_key: None,
+                last_error: None,
+                metadata_json: None,
+            })
+            .await?;
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: Uuid::new_v4(),
+                source_module_id,
+                version: "1.0.0".to_string(),
+                artifact_url: Some("https://example.test/orphan.js".to_string()),
+                artifact_sha256: Some("sha256".to_string()),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "passed".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: Some(Utc::now()),
+                activated_at: Some(Utc::now()),
+                metadata_json: None,
+            })
+            .await?;
+        store
+            .create_source_certification_job(&NewExtensionSourceCertificationJob {
+                job_id: Uuid::new_v4(),
+                instance_id,
+                registry_id: Some(registry_id),
+                source_module_id: Some(source_module_id),
+                requested_by: "test".to_string(),
+                reason: "repository_added".to_string(),
+                status: "queued".to_string(),
+                priority: 100,
+                attempts: 0,
+                max_attempts: 2,
+                language_eligibility: None,
+                marketplace_state: Some("certifying".to_string()),
+                summary: Some("queued".to_string()),
+                last_error: None,
+            })
+            .await?;
+
+        sqlx::query("PRAGMA foreign_keys = OFF;")
+            .execute(&database.pool)
+            .await?;
+        sqlx::query("DELETE FROM extension_source_registries WHERE registry_id = ?")
+            .bind(registry_id.to_string())
+            .execute(&database.pool)
+            .await?;
+        assert_eq!(
+            store
+                .list_source_modules(Some(instance_id), Some(registry_id))
+                .await?
+                .len(),
+            1
+        );
+
+        let repaired = store
+            .delete_orphan_source_modules_for_instance(instance_id)
+            .await?;
+        assert_eq!(repaired, 1);
+        assert!(
+            store
+                .list_source_modules(Some(instance_id), Some(registry_id))
                 .await?
                 .is_empty()
         );

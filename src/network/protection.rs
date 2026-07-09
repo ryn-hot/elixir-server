@@ -877,8 +877,10 @@ impl GatewayRuntimeCompiler for GluetunWireguardGatewayRuntime {
             labels,
             command: Vec::new(),
             cap_add: vec!["NET_ADMIN".to_string()],
+            cap_drop: Vec::new(),
             devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
             sysctls,
+            security: Default::default(),
         };
 
         let mut protected_app_spec = input.app_spec.clone();
@@ -1005,8 +1007,10 @@ impl GatewayRuntimeCompiler for GluetunOpenvpnGatewayRuntime {
             labels,
             command: Vec::new(),
             cap_add: vec!["NET_ADMIN".to_string()],
+            cap_drop: Vec::new(),
             devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
 
         let mut protected_app_spec = input.app_spec.clone();
@@ -1138,8 +1142,10 @@ impl GatewayRuntimeCompiler for CloudflareWarpGatewayRuntime {
                 "MKNOD".to_string(),
                 "AUDIT_WRITE".to_string(),
             ],
+            cap_drop: Vec::new(),
             devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
             sysctls,
+            security: Default::default(),
         };
 
         let mut protected_app_spec = input.app_spec.clone();
@@ -8518,8 +8524,10 @@ AllowedIPs = 0.0.0.0/0, ::/0
             labels: HashMap::new(),
             command: Vec::new(),
             cap_add: Vec::new(),
+            cap_drop: Vec::new(),
             devices: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         }
     }
 

@@ -697,8 +697,10 @@ impl DockerProtectedStreamMaterializer {
             labels: labels.clone(),
             command,
             cap_add: Vec::new(),
+            cap_drop: Vec::new(),
             devices: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
         apply_container_spec_fingerprint(&mut app_spec);
 
@@ -1911,6 +1913,22 @@ async fn materialize_direct_file_job(
         let Some(chunk) = chunk else {
             break;
         };
+        if downloaded == 0
+            && let Some(reason) = direct_file_dangerous_sample_reason(&chunk)
+        {
+            drop(file);
+            cleanup_partial(&partial_path, &config.paths.staging_root).await;
+            fail_stream_job(
+                pool,
+                pending,
+                &runtime,
+                "source_returned_non_media_response",
+                &reason,
+                Some(&partial_path),
+            )
+            .await?;
+            return Ok(DirectFileMaterializationOutcome::Failed);
+        }
         if job_cancelled(pool, pending.job.release_job_id).await? {
             drop(file);
             cleanup_partial(&partial_path, &config.paths.staging_root).await;
@@ -2310,6 +2328,32 @@ async fn materialize_direct_file_job_via_protected_egress(
             return Ok(DirectFileMaterializationOutcome::Failed);
         }
     };
+
+    if let Some(reason) = direct_file_dangerous_metadata_reason(
+        &protected_result.final_url,
+        protected_result.content_type.as_deref(),
+        protected_result.content_disposition.as_deref(),
+    ) {
+        cleanup_partial(&partial_path, &config.paths.staging_root).await;
+        let runtime = merge_runtime_object(
+            runtime,
+            json!({
+                "finalUrl": runtime_safe_stream_url(&protected_result.final_url),
+                "contentType": protected_result.content_type,
+                "contentDisposition": protected_result.content_disposition,
+            }),
+        );
+        fail_stream_job(
+            pool,
+            pending,
+            &runtime,
+            "source_returned_non_media_response",
+            &reason,
+            Some(&partial_path),
+        )
+        .await?;
+        return Ok(DirectFileMaterializationOutcome::Failed);
+    }
 
     if job_cancelled(pool, pending.job.release_job_id).await? {
         cleanup_partial(&partial_path, &config.paths.staging_root).await;
@@ -4779,6 +4823,13 @@ fn stable_source_module_invocation_id(value: &str) -> String {
 }
 
 fn direct_file_non_media_response_reason(response: &DirectFileHttpResponse) -> Option<String> {
+    if let Some(reason) = direct_file_dangerous_metadata_reason(
+        &response.final_url,
+        response.content_type.as_deref(),
+        response.content_disposition.as_deref(),
+    ) {
+        return Some(reason);
+    }
     let content_type = response
         .content_type
         .as_deref()
@@ -4790,6 +4841,37 @@ fn direct_file_non_media_response_reason(response: &DirectFileHttpResponse) -> O
     } else {
         None
     }
+}
+
+fn direct_file_dangerous_metadata_reason(
+    final_url: &str,
+    content_type: Option<&str>,
+    content_disposition: Option<&str>,
+) -> Option<String> {
+    if content_type
+        .map(normalize_content_type)
+        .as_deref()
+        .is_some_and(direct_file_content_type_is_dangerous_file)
+        || Url::parse(final_url)
+            .ok()
+            .is_some_and(|url| url_path_has_dangerous_file_extension(url.path()))
+        || filename_from_content_disposition(content_disposition)
+            .as_deref()
+            .is_some_and(path_has_dangerous_file_extension)
+    {
+        return Some(
+            "Direct HTTP stream URL returned an executable or archive instead of a playable media file."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn direct_file_dangerous_sample_reason(sample: &[u8]) -> Option<String> {
+    sample_looks_like_dangerous_file(sample).then(|| {
+        "Direct HTTP stream URL returned executable or archive bytes instead of playable media."
+            .to_string()
+    })
 }
 
 fn normalize_content_type(value: &str) -> String {
@@ -4815,6 +4897,52 @@ fn direct_file_content_type_is_non_media(content_type: &str) -> bool {
         )
         || content_type.ends_with("+json")
         || content_type.ends_with("+xml")
+}
+
+fn direct_file_content_type_is_dangerous_file(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "application/x-msdownload"
+            | "application/vnd.microsoft.portable-executable"
+            | "application/x-dosexec"
+            | "application/x-executable"
+            | "application/x-sh"
+            | "application/java-archive"
+            | "application/zip"
+            | "application/x-zip-compressed"
+            | "application/vnd.rar"
+            | "application/x-rar-compressed"
+            | "application/x-7z-compressed"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-tar"
+            | "application/x-bzip2"
+    )
+}
+
+fn url_path_has_dangerous_file_extension(path: &str) -> bool {
+    path_has_dangerous_file_extension(path)
+}
+
+fn path_has_dangerous_file_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".exe", ".dll", ".msi", ".bat", ".cmd", ".ps1", ".sh", ".jar", ".zip", ".rar", ".7z",
+        ".gz", ".tar", ".tgz", ".bz2",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
+fn sample_looks_like_dangerous_file(sample: &[u8]) -> bool {
+    sample.starts_with(b"MZ")
+        || sample.starts_with(b"PK\x03\x04")
+        || sample.starts_with(b"PK\x05\x06")
+        || sample.starts_with(b"PK\x07\x08")
+        || sample.starts_with(b"Rar!\x1a\x07")
+        || sample.starts_with(b"7z\xbc\xaf\x27\x1c")
+        || sample.starts_with(&[0x1f, 0x8b])
+        || sample.get(257..262).is_some_and(|magic| magic == b"ustar")
 }
 
 async fn mark_stream_release_targets_failed(
@@ -7134,6 +7262,67 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Direct HTTP stream URL returned text/html")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ess6_direct_file_materializer_rejects_executable_bytes_before_write() -> Result<()> {
+        let database = setup_db().await?;
+        let temp = TempDir::new()?;
+        let candidate = direct_file_candidate();
+        let (release_id, _) = seed_direct_file_release(&database.pool, candidate).await?;
+        let downloader = FakeDirectFileClient {
+            chunks: vec![b"MZ\x90\x00not-media".to_vec()],
+            content_length: Some(12),
+            content_type: Some("application/octet-stream".to_string()),
+            content_disposition: Some("attachment; filename=\"Fixture S01E02.mp4\"".to_string()),
+            observed_headers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            observed_referer: Arc::new(tokio::sync::Mutex::new(None)),
+            block_on_second_chunk: None,
+        };
+        let probe = fake_probe(verified_probe_evidence());
+        let config = HttpStreamMaterializerConfig {
+            paths: MaterializerPaths::from_downloads_root(temp.path().join("downloads")),
+            batch_limit: 10,
+        };
+
+        let stats = process_http_stream_materializer_once_with_services(
+            &database.pool,
+            &config,
+            &downloader,
+            &FakeStreamRemuxer::default(),
+            &probe,
+            &FakeLateResolver::default(),
+        )
+        .await?;
+
+        assert_eq!(stats.failed, 1);
+        assert!(!probe.called.load(Ordering::SeqCst));
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .expect("failed stream release");
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        assert!(
+            release
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("executable or archive bytes"),
+            "{:?}",
+            release.state_reason
+        );
+        let runtime = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("streamRuntime"))
+            .expect("runtime evidence");
+        assert_eq!(
+            runtime.get("failureClass").and_then(Value::as_str),
+            Some("source_returned_non_media_response")
+        );
+        if let Some(partial_path) = runtime.get("partialPath").and_then(Value::as_str) {
+            assert!(!Path::new(partial_path).exists());
+        }
         Ok(())
     }
 

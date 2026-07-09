@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -712,15 +711,9 @@ fn docker_runtime_subsystem_state(
 pub fn detect_docker_desktop_filesharing_warning() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var_os("HOME")?;
-        let path = PathBuf::from(home)
-            .join("Library")
-            .join("Group Containers")
-            .join("group.com.docker")
-            .join("settings.json");
-        let raw = std::fs::read_to_string(path).ok()?;
-        let json = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-        docker_desktop_filesharing_warning_from_settings(&json)
+        // Docker Desktop owns this file and can leave reads blocked on macOS.
+        // This warning is advisory, so startup must not wait on it.
+        None
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -729,6 +722,7 @@ pub fn detect_docker_desktop_filesharing_warning() -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn docker_desktop_filesharing_warning_from_settings(json: &serde_json::Value) -> Option<String> {
     let use_grpc_fuse = json.get("useGrpcfuse").and_then(serde_json::Value::as_bool);
     let use_virtiofs = json

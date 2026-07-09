@@ -3338,6 +3338,7 @@ mod tests {
                             volumes: Vec::new(),
                             env: Vec::new(),
                             egress: None,
+                            security: Default::default(),
                         },
                         networking: None,
                         aliases: Vec::new(),

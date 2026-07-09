@@ -40,7 +40,9 @@ use crate::runtime::health::{
     DockerRuntimeSupervisor, PersistedDockerRuntimeHealthState,
     detect_docker_desktop_filesharing_warning, runtime_health_poll_interval,
 };
-use crate::runtime::model::{ContainerPublishedPort, VolumeMount, VolumeMountSourceKind};
+use crate::runtime::model::{
+    ContainerPublishedPort, ContainerRuntimeState, VolumeMount, VolumeMountSourceKind,
+};
 use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeResult, ProbeRunner};
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
@@ -190,6 +192,7 @@ pub struct OrchestratorService {
     secrets: std::sync::Arc<SecretsManager>,
     probe: std::sync::Arc<NetworkProbe>,
     runtime: std::sync::Arc<DockerRuntimeManager>,
+    runtime_deployment_id: String,
     runtime_health: std::sync::Arc<DockerRuntimeSupervisor>,
     runtime_reset_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     startup_runtime_recovery_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -212,6 +215,7 @@ impl OrchestratorService {
         secrets: std::sync::Arc<SecretsManager>,
     ) -> Self {
         let runtime_paths = RuntimePaths::from_roots(&storage_root, &media_root);
+        let runtime_deployment_id = runtime_paths.deployment_id();
         let probe = std::sync::Arc::new(NetworkProbe::new(
             ProbeConfig::with_storage_and_bundled_dirs(&storage_root, &bundled_dir),
         ));
@@ -233,6 +237,7 @@ impl OrchestratorService {
             secrets,
             probe,
             runtime,
+            runtime_deployment_id,
             runtime_health,
             runtime_reset_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             startup_runtime_recovery_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -906,6 +911,19 @@ impl OrchestratorService {
     ) -> Result<()> {
         self.ensure_runtime_ready().await?;
 
+        self.remove_instance_runtime(instance.instance_id).await?;
+        self.ensure_instance_runtime_running(extension_id, instance, manifest)
+            .await
+    }
+
+    pub async fn ensure_instance_runtime_running(
+        &self,
+        extension_id: &str,
+        instance: &ExtensionInstance,
+        manifest: &ExtensionManifest,
+    ) -> Result<()> {
+        self.ensure_runtime_ready().await?;
+
         let runtime = manifest
             .runtime
             .clone()
@@ -918,8 +936,6 @@ impl OrchestratorService {
             tokio::time::sleep(delay).await;
         }
         self.runtime_health.note_restart_started();
-
-        self.remove_instance_runtime(instance.instance_id).await?;
 
         let (aliases, _) = build_aliases(
             extension_id,
@@ -1473,6 +1489,16 @@ impl OrchestratorService {
         Ok(())
     }
 
+    async fn active_instance_id_strings(&self) -> Result<HashSet<String>> {
+        let store = ExtensionStore::new(&self.pool);
+        Ok(store
+            .list_instances(None)
+            .await?
+            .into_iter()
+            .map(|instance| instance.instance_id.to_string())
+            .collect())
+    }
+
     pub async fn recover_orphaned_runtime_state_after_docker_ready(&self) -> Result<bool> {
         if self
             .startup_runtime_recovery_complete
@@ -1504,17 +1530,11 @@ impl OrchestratorService {
             return Ok(false);
         }
 
-        let store = ExtensionStore::new(&self.pool);
-        let active_instance_ids: HashSet<String> = store
-            .list_instances(None)
-            .await?
-            .into_iter()
-            .map(|instance| instance.instance_id.to_string())
-            .collect();
+        let active_instance_ids = self.active_instance_id_strings().await?;
 
         match self
             .runtime
-            .prune_orphaned_managed_containers(&active_instance_ids)
+            .prune_orphaned_managed_containers(&active_instance_ids, &self.runtime_deployment_id)
             .await
         {
             Ok(removed_containers) => {
@@ -1790,7 +1810,12 @@ impl OrchestratorService {
             }
         }
 
-        match self.runtime.stop_and_remove_managed_containers().await {
+        let active_instance_ids = self.active_instance_id_strings().await?;
+        match self
+            .runtime
+            .stop_and_remove_managed_containers(&active_instance_ids, &self.runtime_deployment_id)
+            .await
+        {
             Ok(removed) => removed_containers = removed,
             Err(err) => {
                 if let Some(kind) = classify_docker_runtime_failure(&err) {
@@ -1804,7 +1829,14 @@ impl OrchestratorService {
                             Ok(status) => {
                                 docker_restarted = true;
                                 self.record_docker_runtime_ready(status);
-                                match self.runtime.stop_and_remove_managed_containers().await {
+                                match self
+                                    .runtime
+                                    .stop_and_remove_managed_containers(
+                                        &active_instance_ids,
+                                        &self.runtime_deployment_id,
+                                    )
+                                    .await
+                                {
                                     Ok(removed) => removed_containers = removed,
                                     Err(retry_err) => {
                                         if let Some(retry_kind) =
@@ -1984,6 +2016,15 @@ impl OrchestratorService {
 
     pub fn docker_runtime_snapshot(&self) -> DockerRuntimeHealthSnapshot {
         self.runtime_health.snapshot()
+    }
+
+    pub async fn describe_instance_runtime_state(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<ContainerRuntimeState>> {
+        self.runtime
+            .describe_container_runtime_state(&container_name(instance_id))
+            .await
     }
 
     pub fn record_docker_runtime_failure(

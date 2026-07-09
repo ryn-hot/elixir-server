@@ -178,6 +178,7 @@ impl ExtensionManifest {
             if let Some(egress) = runtime.egress.as_ref() {
                 egress.validate()?;
             }
+            runtime.security.validate()?;
         }
 
         for action in &self.actions {
@@ -661,6 +662,116 @@ pub struct ManifestRuntime {
     pub env: Vec<ManifestRuntimeEnv>,
     #[serde(default)]
     pub egress: Option<ManifestRuntimeEgress>,
+    #[serde(default)]
+    pub security: ManifestRuntimeSecurity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManifestRuntimeSecurity {
+    #[serde(default)]
+    pub run_as_non_root: bool,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub no_new_privileges: bool,
+    #[serde(default)]
+    pub drop_capabilities: Vec<String>,
+    #[serde(default)]
+    pub tmpfs: Vec<ManifestRuntimeTmpfs>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub pids_limit: Option<u64>,
+    #[serde(default)]
+    pub cpu_quota: Option<String>,
+    #[serde(default)]
+    pub seccomp_profile: Option<String>,
+    #[serde(default)]
+    pub apparmor_profile: Option<String>,
+    #[serde(default)]
+    pub prohibit_docker_socket: bool,
+    #[serde(default)]
+    pub prohibit_host_media_mounts: bool,
+}
+
+impl ManifestRuntimeSecurity {
+    fn validate(&self) -> Result<()> {
+        if let Some(user) = self.user.as_deref() {
+            ensure_non_empty(user, "runtime.security.user")?;
+            if user.trim() == "0" || user.trim().eq_ignore_ascii_case("root") {
+                bail!("runtime.security.user must not be root");
+            }
+        }
+        for capability in &self.drop_capabilities {
+            ensure_non_empty(capability, "runtime.security.drop_capabilities")?;
+        }
+        for tmpfs in &self.tmpfs {
+            tmpfs.validate()?;
+        }
+        if let Some(memory_limit_mb) = self.memory_limit_mb
+            && memory_limit_mb == 0
+        {
+            bail!("runtime.security.memory_limit_mb must be greater than zero");
+        }
+        if let Some(pids_limit) = self.pids_limit
+            && pids_limit == 0
+        {
+            bail!("runtime.security.pids_limit must be greater than zero");
+        }
+        if let Some(cpu_quota) = self.cpu_quota.as_deref() {
+            ensure_non_empty(cpu_quota, "runtime.security.cpu_quota")?;
+            let parsed = cpu_quota
+                .trim()
+                .parse::<f64>()
+                .context("runtime.security.cpu_quota must be a positive number")?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                bail!("runtime.security.cpu_quota must be a positive number");
+            }
+        }
+        if let Some(seccomp_profile) = self.seccomp_profile.as_deref() {
+            validate_security_profile_name(seccomp_profile, "runtime.security.seccomp_profile")?;
+        }
+        if let Some(apparmor_profile) = self.apparmor_profile.as_deref() {
+            validate_security_profile_name(apparmor_profile, "runtime.security.apparmor_profile")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_security_profile_name(value: &str, field: &str) -> Result<()> {
+    ensure_non_empty(value, field)?;
+    let value = value.trim();
+    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+        bail!("{field} must be a single-line profile name");
+    }
+    if value.contains('/') || value.contains('\\') || value.contains(':') {
+        bail!("{field} must be a Docker security profile name, not a path or raw option");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManifestRuntimeTmpfs {
+    pub path: String,
+    #[serde(default)]
+    pub size_mb: Option<u64>,
+}
+
+impl ManifestRuntimeTmpfs {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty(&self.path, "runtime.security.tmpfs.path")?;
+        if !self.path.starts_with('/') {
+            bail!("runtime.security.tmpfs.path must be absolute");
+        }
+        if let Some(size_mb) = self.size_mb
+            && size_mb == 0
+        {
+            bail!("runtime.security.tmpfs.size_mb must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2985,6 +3096,55 @@ control_surface:
 "#;
         let err = parse_manifest_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("instance_secret or global_secret"));
+    }
+
+    #[test]
+    fn manifest_validates_runtime_security_profile_names() {
+        let yaml = r#"
+id: elixir.modules.community.secure
+version: 1.0.0
+kind: module
+name: Community Secure
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: community-secure
+runtime:
+  type: container
+  image: example/community-secure:1
+  security:
+    seccomp_profile: default
+    apparmor_profile: prism-default
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        assert_eq!(
+            parsed
+                .manifest
+                .runtime
+                .expect("runtime")
+                .security
+                .apparmor_profile
+                .as_deref(),
+            Some("prism-default")
+        );
+
+        let yaml = r#"
+id: elixir.modules.community.secure
+version: 1.0.0
+kind: module
+name: Community Secure
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: community-secure
+runtime:
+  type: container
+  image: example/community-secure:1
+  security:
+    seccomp_profile: /etc/docker/seccomp.json
+"#;
+        let err = parse_manifest_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("runtime.security.seccomp_profile"));
     }
 
     #[test]

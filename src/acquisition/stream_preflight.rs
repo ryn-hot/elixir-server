@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
     Client, StatusCode, Url,
-    header::{HeaderMap, HeaderName, HeaderValue, RANGE, REFERER, USER_AGENT},
+    header::{HeaderMap, HeaderName, HeaderValue, LOCATION, RANGE, REFERER, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ const DEFAULT_PREFLIGHT_TIMEOUT_SECONDS: u64 = 12;
 const DEFAULT_SAMPLE_BYTES: usize = 128 * 1024;
 const DEFAULT_MANIFEST_BYTES: usize = 512 * 1024;
 const DEFAULT_SEGMENT_SAMPLE_BYTES: usize = 64 * 1024;
+const MAX_PREFLIGHT_REDIRECTS: usize = 5;
 const PREFLIGHT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Elixir-Prism-Certifier/1";
 
@@ -168,7 +169,7 @@ pub async fn preflight_stream_candidate_with_config(
 
     let client = match Client::builder()
         .timeout(config.timeout)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -379,12 +380,32 @@ async fn bounded_get(
     if !headers.contains_key(USER_AGENT) {
         headers.insert(USER_AGENT, HeaderValue::from_static(PREFLIGHT_USER_AGENT));
     }
-    let mut response = client
-        .get(url.clone())
-        .headers(headers)
-        .send()
-        .await
-        .with_context(|| format!("requesting {url}"))?;
+    let mut next_url = url.clone();
+    let mut redirects = 0usize;
+    let mut response = loop {
+        validate_safe_http_url(next_url.as_str()).context("preflight URL is unsafe")?;
+        let response = client
+            .get(next_url.clone())
+            .headers(headers.clone())
+            .send()
+            .await
+            .with_context(|| format!("requesting {next_url}"))?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        let Some(location) = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Err(anyhow!("redirect response missing Location header"));
+        };
+        redirects += 1;
+        if redirects > MAX_PREFLIGHT_REDIRECTS {
+            return Err(anyhow!("too many preflight redirects"));
+        }
+        next_url = checked_preflight_redirect_target(&next_url, location)?;
+    };
     let status = response.status();
     if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
         return Err(anyhow!("HTTP status {status}"));
@@ -416,6 +437,15 @@ async fn bounded_get(
         content_length,
         body,
     })
+}
+
+fn checked_preflight_redirect_target(current_url: &Url, location: &str) -> Result<Url> {
+    let redirected = current_url
+        .join(location)
+        .with_context(|| format!("parsing preflight redirect location for {current_url}"))?;
+    validate_safe_http_url(redirected.as_str())
+        .context("blocked unsafe preflight redirect target")?;
+    Ok(redirected)
 }
 
 fn preflight_headers(candidate: &Value) -> Result<HeaderMap> {
@@ -456,7 +486,11 @@ fn stream_candidate_string(candidate: &Value, pointer: &str) -> Option<String> {
 
 fn classify_network_error(err: &anyhow::Error) -> &'static str {
     let message = err.to_string().to_ascii_lowercase();
-    if message.contains("dns")
+    if message.contains("blocked unsafe preflight redirect target")
+        || message.contains("private, local, link-local")
+        || message.contains("local or internal hostnames")
+        || message.contains("single-label hostnames")
+        || message.contains("dns")
         || message.contains("tls")
         || message.contains("timeout")
         || message.contains("timed out")
@@ -501,6 +535,17 @@ fn classify_non_media_response(
         return Some((
             FAILURE_ACCOUNT_REQUIRED,
             "source returned an account or login-gated page instead of anonymous media".to_string(),
+        ));
+    }
+    if normalized_type
+        .as_deref()
+        .is_some_and(content_type_is_dangerous_file)
+        || url_path_has_dangerous_file_extension(url.path())
+        || sample_looks_like_dangerous_file(sample)
+    {
+        return Some((
+            FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE,
+            "candidate URL returned an executable or archive instead of playable media".to_string(),
         ));
     }
     if normalized_type
@@ -576,6 +621,37 @@ fn content_type_is_media_like(content_type: &str) -> bool {
         )
 }
 
+fn content_type_is_dangerous_file(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "application/x-msdownload"
+            | "application/vnd.microsoft.portable-executable"
+            | "application/x-dosexec"
+            | "application/x-executable"
+            | "application/x-sh"
+            | "application/java-archive"
+            | "application/zip"
+            | "application/x-zip-compressed"
+            | "application/vnd.rar"
+            | "application/x-rar-compressed"
+            | "application/x-7z-compressed"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-tar"
+            | "application/x-bzip2"
+    )
+}
+
+fn url_path_has_dangerous_file_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".exe", ".dll", ".msi", ".bat", ".cmd", ".ps1", ".sh", ".jar", ".zip", ".rar", ".7z",
+        ".gz", ".tar", ".tgz", ".bz2",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
 fn sample_looks_like_non_media_document(sample: &[u8]) -> bool {
     let text = String::from_utf8_lossy(sample);
     let trimmed = text.trim_start().to_ascii_lowercase();
@@ -585,6 +661,17 @@ fn sample_looks_like_non_media_document(sample: &[u8]) -> bool {
         || trimmed.starts_with('{')
         || trimmed.starts_with('[')
         || trimmed.contains("<title>")
+}
+
+fn sample_looks_like_dangerous_file(sample: &[u8]) -> bool {
+    sample.starts_with(b"MZ")
+        || sample.starts_with(b"PK\x03\x04")
+        || sample.starts_with(b"PK\x05\x06")
+        || sample.starts_with(b"PK\x07\x08")
+        || sample.starts_with(b"Rar!\x1a\x07")
+        || sample.starts_with(b"7z\xbc\xaf\x27\x1c")
+        || sample.starts_with(&[0x1f, 0x8b])
+        || sample.get(257..262).is_some_and(|magic| magic == b"ustar")
 }
 
 fn looks_like_login_or_account_page(host: &str, lower: &str) -> bool {
@@ -694,9 +781,52 @@ mod tests {
     }
 
     #[test]
+    fn preflight_classifier_rejects_executable_and_archive_payloads() {
+        let media_named_executable = Url::parse("https://cdn.example.test/video.mkv").unwrap();
+        let result = classify_non_media_response(
+            &media_named_executable,
+            Some("application/octet-stream"),
+            b"MZ\x90\x00malicious",
+        )
+        .expect("classified executable");
+        assert_eq!(result.0, FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE);
+        assert!(result.1.contains("executable or archive"));
+
+        let archive_url = Url::parse("https://cdn.example.test/video.zip").unwrap();
+        let result = classify_non_media_response(
+            &archive_url,
+            Some("application/zip"),
+            b"PK\x03\x04archive",
+        )
+        .expect("classified archive");
+        assert_eq!(result.0, FAILURE_SOURCE_RETURNED_NON_MEDIA_RESPONSE);
+    }
+
+    #[test]
     fn preflight_hls_drm_detector_rejects_license_manifest() {
         let manifest =
             "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT=\"com.apple.streamingkeydelivery\"\n";
         assert!(hls_manifest_has_drm(manifest));
+    }
+
+    #[test]
+    fn preflight_redirect_target_allows_public_relative_redirects() {
+        let current = Url::parse("https://cdn.example.test/media/master.m3u8").unwrap();
+        let redirected = checked_preflight_redirect_target(&current, "../segments/001.ts")
+            .expect("relative public redirect");
+        assert_eq!(
+            redirected.as_str(),
+            "https://cdn.example.test/segments/001.ts"
+        );
+    }
+
+    #[test]
+    fn preflight_redirect_target_rejects_private_destinations_before_fetch() {
+        let current = Url::parse("https://cdn.example.test/media/master.m3u8").unwrap();
+        let err = checked_preflight_redirect_target(&current, "http://127.0.0.1/private.m3u8")
+            .expect_err("private redirect should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("blocked unsafe preflight redirect target"));
+        assert_eq!(classify_network_error(&err), FAILURE_NETWORK_BLOCKED);
     }
 }

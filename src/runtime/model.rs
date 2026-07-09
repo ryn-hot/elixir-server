@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 pub const CONTAINER_SPEC_HASH_LABEL: &str = "elixir.spec_hash";
+pub const ELIXIR_DEPLOYMENT_ID_LABEL: &str = "elixir.deployment_id";
+pub const ELIXIR_EXTENSION_ID_LABEL: &str = "elixir.extension_id";
+pub const ELIXIR_INSTANCE_ID_LABEL: &str = "elixir.instance_id";
+pub const ELIXIR_MANAGED_LABEL: &str = "elixir.managed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerSpec {
@@ -26,9 +30,42 @@ pub struct ContainerSpec {
     #[serde(default)]
     pub cap_add: Vec<String>,
     #[serde(default)]
+    pub cap_drop: Vec<String>,
+    #[serde(default)]
     pub devices: Vec<String>,
     #[serde(default)]
     pub sysctls: HashMap<String, String>,
+    #[serde(default)]
+    pub security: ContainerSecurityOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerSecurityOptions {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub no_new_privileges: bool,
+    #[serde(default)]
+    pub tmpfs: Vec<ContainerTmpfsMount>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub pids_limit: Option<u64>,
+    #[serde(default)]
+    pub cpu_quota: Option<String>,
+    #[serde(default)]
+    pub seccomp_profile: Option<String>,
+    #[serde(default)]
+    pub apparmor_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerTmpfsMount {
+    pub path: String,
+    #[serde(default)]
+    pub size_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +142,39 @@ pub struct ContainerRuntimeState {
     pub mounts: Vec<ContainerRuntimeMount>,
     #[serde(default)]
     pub published_ports: Vec<ContainerPublishedPort>,
+    #[serde(default)]
+    pub security: ContainerRuntimeSecurityState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRuntimeSecurityState {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub no_new_privileges: bool,
+    #[serde(default)]
+    pub cap_drop: Vec<String>,
+    #[serde(default)]
+    pub tmpfs: Vec<ContainerRuntimeTmpfsMount>,
+    #[serde(default)]
+    pub memory_limit_bytes: Option<i64>,
+    #[serde(default)]
+    pub pids_limit: Option<i64>,
+    #[serde(default)]
+    pub nano_cpus: Option<i64>,
+    #[serde(default)]
+    pub seccomp_profile: Option<String>,
+    #[serde(default)]
+    pub apparmor_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRuntimeTmpfsMount {
+    pub path: String,
+    #[serde(default)]
+    pub options: Option<String>,
 }
 
 pub fn apply_container_spec_fingerprint(spec: &mut ContainerSpec) {
@@ -151,6 +221,8 @@ pub fn container_spec_fingerprint(spec: &ContainerSpec) -> String {
     aliases.sort();
     let mut cap_add = spec.cap_add.clone();
     cap_add.sort();
+    let mut cap_drop = spec.cap_drop.clone();
+    cap_drop.sort();
     let mut devices = spec.devices.clone();
     devices.sort();
     let sysctls = spec
@@ -171,8 +243,10 @@ pub fn container_spec_fingerprint(spec: &ContainerSpec) -> String {
         "labels": labels,
         "command": &spec.command,
         "cap_add": cap_add,
+        "cap_drop": cap_drop,
         "devices": devices,
         "sysctls": sysctls,
+        "security": &spec.security,
     });
     blake3::hash(canonical.to_string().as_bytes())
         .to_hex()

@@ -13,11 +13,13 @@ use uuid::Uuid;
 use crate::runtime::RuntimeManager;
 use crate::runtime::model::{
     CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerPublishedPort, ContainerRuntimeMount,
-    ContainerRuntimeState, ContainerSpec, ContainerState, PortMapping, VolumeMount,
-    VolumeMountSourceKind,
+    ContainerRuntimeSecurityState, ContainerRuntimeState, ContainerRuntimeTmpfsMount,
+    ContainerSpec, ContainerState, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
+    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, PortMapping,
+    VolumeMount, VolumeMountSourceKind,
 };
 
-const REQUIRED_LABELS: [&str; 2] = ["elixir.instance_id", "elixir.extension_id"];
+const REQUIRED_LABELS: [&str; 2] = [ELIXIR_INSTANCE_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL];
 const DOCKER_PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DockerRuntimeManager {
@@ -640,6 +642,96 @@ impl DockerRuntimeManager {
         published
     }
 
+    fn extract_runtime_security(value: &Value) -> ContainerRuntimeSecurityState {
+        let user = value
+            .pointer("/Config/User")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let read_only_rootfs = value
+            .pointer("/HostConfig/ReadonlyRootfs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let security_opts = value
+            .pointer("/HostConfig/SecurityOpt")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let no_new_privileges = security_opts
+            .iter()
+            .any(|value| value == "no-new-privileges" || value == "no-new-privileges:true");
+        let seccomp_profile = Self::security_opt_value(&security_opts, "seccomp");
+        let apparmor_profile = Self::security_opt_value(&security_opts, "apparmor");
+        let mut cap_drop = value
+            .pointer("/HostConfig/CapDrop")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        cap_drop.sort();
+        let mut tmpfs = value
+            .pointer("/HostConfig/Tmpfs")
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|(path, options)| ContainerRuntimeTmpfsMount {
+                        path: path.clone(),
+                        options: options.as_str().map(str::to_string),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        tmpfs.sort_by(|left, right| left.path.cmp(&right.path));
+        let memory_limit_bytes = value
+            .pointer("/HostConfig/Memory")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0);
+        let pids_limit = value
+            .pointer("/HostConfig/PidsLimit")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0);
+        let nano_cpus = value
+            .pointer("/HostConfig/NanoCpus")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0);
+
+        ContainerRuntimeSecurityState {
+            user,
+            read_only_rootfs,
+            no_new_privileges,
+            cap_drop,
+            tmpfs,
+            memory_limit_bytes,
+            pids_limit,
+            nano_cpus,
+            seccomp_profile,
+            apparmor_profile,
+        }
+    }
+
+    fn security_opt_value(options: &[String], key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
+        options
+            .iter()
+            .find_map(|value| value.strip_prefix(&prefix))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
     fn extract_runtime_state(value: &Value) -> ContainerRuntimeState {
         let name = value
             .get("Name")
@@ -670,6 +762,7 @@ impl DockerRuntimeManager {
             labels: Self::extract_labels(value),
             mounts,
             published_ports: Self::extract_published_ports(value),
+            security: Self::extract_runtime_security(value),
         }
     }
 
@@ -779,7 +872,7 @@ impl DockerRuntimeManager {
             "ps".to_string(),
             "-a".to_string(),
             "--filter".to_string(),
-            "label=elixir.managed=true".to_string(),
+            Self::managed_container_filter(),
             "--format".to_string(),
             "{{.Names}}".to_string(),
         ];
@@ -819,12 +912,27 @@ impl DockerRuntimeManager {
         Ok(Some(Self::extract_runtime_state(&inspect)))
     }
 
-    pub async fn stop_and_remove_managed_containers(&self) -> Result<Vec<String>> {
+    pub async fn stop_and_remove_managed_containers(
+        &self,
+        active_instance_ids: &HashSet<String>,
+        deployment_id: &str,
+    ) -> Result<Vec<String>> {
         let mut names = self.list_managed_container_names().await?;
         names.sort();
 
         let mut removed = Vec::new();
         for name in names {
+            let inspect = self.inspect_container(&name).await?;
+            let labels = Self::extract_labels(&inspect);
+            if !Self::should_reset_managed_container(&labels, active_instance_ids, deployment_id) {
+                tracing::info!(
+                    "docker runtime: skipping managed container '{}' during reset because it is outside deployment scope '{}'",
+                    name,
+                    deployment_id
+                );
+                continue;
+            }
+
             let handle = ContainerHandle {
                 id: name.clone(),
                 name: name.clone(),
@@ -995,12 +1103,104 @@ impl DockerRuntimeManager {
         bail!("docker runtime restart is not implemented for this platform")
     }
 
+    fn has_matching_deployment_label(
+        labels: &HashMap<String, String>,
+        deployment_id: &str,
+    ) -> bool {
+        labels
+            .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+            .is_some_and(|value| value == deployment_id)
+    }
+
+    fn has_active_legacy_instance_label(
+        labels: &HashMap<String, String>,
+        active_instance_ids: &HashSet<String>,
+    ) -> bool {
+        !labels.contains_key(ELIXIR_DEPLOYMENT_ID_LABEL)
+            && labels
+                .get(ELIXIR_INSTANCE_ID_LABEL)
+                .is_some_and(|value| active_instance_ids.contains(value))
+    }
+
+    fn managed_container_filter() -> String {
+        format!("label={ELIXIR_MANAGED_LABEL}=true")
+    }
+
+    fn should_prune_orphaned_managed_container(
+        labels: &HashMap<String, String>,
+        active_instance_ids: &HashSet<String>,
+        deployment_id: &str,
+    ) -> bool {
+        if labels
+            .get(ELIXIR_INSTANCE_ID_LABEL)
+            .is_some_and(|value| active_instance_ids.contains(value))
+        {
+            return false;
+        }
+        Self::has_matching_deployment_label(labels, deployment_id)
+    }
+
+    fn should_reset_managed_container(
+        labels: &HashMap<String, String>,
+        active_instance_ids: &HashSet<String>,
+        deployment_id: &str,
+    ) -> bool {
+        Self::has_matching_deployment_label(labels, deployment_id)
+            || Self::has_active_legacy_instance_label(labels, active_instance_ids)
+    }
+
+    fn should_remove_conflicting_managed_container(
+        labels: &HashMap<String, String>,
+        spec: &ContainerSpec,
+    ) -> bool {
+        if labels.get(ELIXIR_INSTANCE_ID_LABEL) == spec.labels.get(ELIXIR_INSTANCE_ID_LABEL) {
+            return false;
+        }
+
+        let Some(deployment_id) = spec.labels.get(ELIXIR_DEPLOYMENT_ID_LABEL) else {
+            return true;
+        };
+        Self::has_matching_deployment_label(labels, deployment_id)
+    }
+
+    fn ensure_existing_container_is_mutable_by_spec(
+        name: &str,
+        labels: &HashMap<String, String>,
+        spec: &ContainerSpec,
+    ) -> Result<()> {
+        if labels.get(ELIXIR_INSTANCE_ID_LABEL) == spec.labels.get(ELIXIR_INSTANCE_ID_LABEL) {
+            return Ok(());
+        }
+
+        let Some(expected_deployment_id) = spec.labels.get(ELIXIR_DEPLOYMENT_ID_LABEL) else {
+            return Ok(());
+        };
+
+        match labels.get(ELIXIR_DEPLOYMENT_ID_LABEL) {
+            Some(actual_deployment_id) if actual_deployment_id == expected_deployment_id => Ok(()),
+            Some(actual_deployment_id) => bail!(
+                "container '{}' belongs to Elixir deployment '{}' but current deployment is '{}'; refusing to mutate it",
+                name,
+                actual_deployment_id,
+                expected_deployment_id
+            ),
+            None => bail!(
+                "container '{}' is Elixir-managed but has no deployment label and does not match instance id '{}'; refusing to mutate it",
+                name,
+                spec.labels
+                    .get(ELIXIR_INSTANCE_ID_LABEL)
+                    .map(String::as_str)
+                    .unwrap_or("<missing>")
+            ),
+        }
+    }
+
     async fn remove_conflicting_managed_containers(&self, spec: &ContainerSpec) -> Result<usize> {
         if spec.network_mode.is_some() || spec.aliases.is_empty() {
             return Ok(0);
         }
 
-        let Some(expected_instance_id) = spec.labels.get("elixir.instance_id") else {
+        let Some(expected_instance_id) = spec.labels.get(ELIXIR_INSTANCE_ID_LABEL) else {
             return Ok(0);
         };
 
@@ -1016,7 +1216,14 @@ impl DockerRuntimeManager {
             }
 
             let labels = Self::extract_labels(&inspect);
-            if labels.get("elixir.instance_id") == Some(expected_instance_id) {
+            if labels.get(ELIXIR_INSTANCE_ID_LABEL) == Some(expected_instance_id) {
+                continue;
+            }
+            if !Self::should_remove_conflicting_managed_container(&labels, spec) {
+                tracing::warn!(
+                    "docker runtime: leaving conflicting managed container '{}' in place because it is outside the current deployment scope",
+                    name
+                );
                 continue;
             }
 
@@ -1039,18 +1246,27 @@ impl DockerRuntimeManager {
     pub async fn prune_orphaned_managed_containers(
         &self,
         active_instance_ids: &HashSet<String>,
+        deployment_id: &str,
     ) -> Result<Vec<String>> {
         let mut removed = Vec::new();
         for name in self.list_managed_container_names().await? {
             let inspect = self.inspect_container(&name).await?;
             let labels = Self::extract_labels(&inspect);
-            let instance_id = labels.get("elixir.instance_id");
-            if instance_id.is_some_and(|value| active_instance_ids.contains(value)) {
+            if !Self::should_prune_orphaned_managed_container(
+                &labels,
+                active_instance_ids,
+                deployment_id,
+            ) {
+                tracing::info!(
+                    "docker runtime: leaving managed container '{}' in place during orphan cleanup because it is active, foreign, or legacy-unscoped",
+                    name
+                );
                 continue;
             }
+            let instance_id = labels.get(ELIXIR_INSTANCE_ID_LABEL);
 
             tracing::warn!(
-                "docker runtime: removing orphaned managed container '{}' with missing/stale instance id {:?}",
+                "docker runtime: removing deployment-scoped orphaned managed container '{}' with missing/stale instance id {:?}",
                 name,
                 instance_id
             );
@@ -1094,9 +1310,9 @@ impl DockerRuntimeManager {
             args.push(format!("{}={}", key, value));
         }
 
-        if !spec.labels.contains_key("elixir.managed") {
+        if !spec.labels.contains_key(ELIXIR_MANAGED_LABEL) {
             args.push("--label".to_string());
-            args.push("elixir.managed=true".to_string());
+            args.push(format!("{ELIXIR_MANAGED_LABEL}=true"));
         }
 
         for env in &spec.env {
@@ -1104,8 +1320,55 @@ impl DockerRuntimeManager {
             args.push(format!("{}={}", env.name, env.value));
         }
 
+        if let Some(user) = spec
+            .security
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--user".to_string());
+            args.push(user.to_string());
+        }
+
+        if spec.security.read_only_rootfs {
+            args.push("--read-only".to_string());
+        }
+
+        if spec.security.no_new_privileges {
+            args.push("--security-opt".to_string());
+            args.push("no-new-privileges".to_string());
+        }
+
+        if let Some(seccomp_profile) = spec
+            .security
+            .seccomp_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--security-opt".to_string());
+            args.push(format!("seccomp={seccomp_profile}"));
+        }
+
+        if let Some(apparmor_profile) = spec
+            .security
+            .apparmor_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--security-opt".to_string());
+            args.push(format!("apparmor={apparmor_profile}"));
+        }
+
         for capability in &spec.cap_add {
             args.push("--cap-add".to_string());
+            args.push(capability.clone());
+        }
+
+        for capability in &spec.cap_drop {
+            args.push("--cap-drop".to_string());
             args.push(capability.clone());
         }
 
@@ -1122,6 +1385,32 @@ impl DockerRuntimeManager {
         for volume in &spec.volumes {
             args.push("-v".to_string());
             args.push(format_volume(volume));
+        }
+
+        for tmpfs in &spec.security.tmpfs {
+            args.push("--tmpfs".to_string());
+            args.push(format_tmpfs(tmpfs));
+        }
+
+        if let Some(memory_limit_mb) = spec.security.memory_limit_mb {
+            args.push("--memory".to_string());
+            args.push(format!("{memory_limit_mb}m"));
+        }
+
+        if let Some(pids_limit) = spec.security.pids_limit {
+            args.push("--pids-limit".to_string());
+            args.push(pids_limit.to_string());
+        }
+
+        if let Some(cpu_quota) = spec
+            .security
+            .cpu_quota
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--cpus".to_string());
+            args.push(cpu_quota.to_string());
         }
 
         for port in &spec.ports {
@@ -1280,6 +1569,8 @@ impl RuntimeManager for DockerRuntimeManager {
 
         if let Some(_) = self.find_container_id(&spec.name).await? {
             let inspect = self.inspect_container(&spec.name).await?;
+            let labels = Self::extract_labels(&inspect);
+            Self::ensure_existing_container_is_mutable_by_spec(&spec.name, &labels, spec)?;
             if let Err(err) = self.ensure_container_attached(spec, &inspect).await {
                 let state = Self::extract_state(&inspect)?;
                 tracing::warn!(
@@ -1770,6 +2061,14 @@ fn format_volume(volume: &VolumeMount) -> String {
     }
 }
 
+fn format_tmpfs(tmpfs: &ContainerTmpfsMount) -> String {
+    let path = tmpfs.path.trim();
+    match tmpfs.size_mb {
+        Some(size_mb) => format!("{path}:size={size_mb}m"),
+        None => path.to_string(),
+    }
+}
+
 fn format_port(port: &PortMapping) -> Option<String> {
     let host = port.host_port?;
     let container = port.container_port;
@@ -1784,6 +2083,7 @@ fn format_port(port: &PortMapping) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::model::ContainerSecurityOptions;
     use serde_json::json;
 
     #[test]
@@ -1885,14 +2185,24 @@ mod tests {
     fn runtime_state_extracts_mounts_network_mode_labels_and_published_ports() {
         let inspect = json!({
             "Name": "/elx-qbittorrent",
+            "HostConfig": {
+                "NetworkMode": "container:elx-qbittorrent-vpn",
+                "ReadonlyRootfs": true,
+                "SecurityOpt": ["no-new-privileges", "seccomp=/etc/elixir/seccomp/prism.json", "apparmor=prism-default"],
+                "CapDrop": ["ALL"],
+                "Tmpfs": {
+                    "/tmp": "size=64m"
+                },
+                "Memory": 536870912,
+                "PidsLimit": 128,
+                "NanoCpus": 1000000000
+            },
             "Config": {
+                "User": "1000:1000",
                 "Labels": {
                     "elixir.instance_id": "abc",
                     "elixir.extension_id": "elixir.modules.qbittorrent"
                 }
-            },
-            "HostConfig": {
-                "NetworkMode": "container:elx-qbittorrent-vpn"
             },
             "Mounts": [
                 {
@@ -1948,14 +2258,179 @@ mod tests {
                 host_ip: Some("127.0.0.1".to_string()),
             }]
         );
+        assert_eq!(state.security.user.as_deref(), Some("1000:1000"));
+        assert!(state.security.read_only_rootfs);
+        assert!(state.security.no_new_privileges);
+        assert_eq!(state.security.cap_drop, vec!["ALL".to_string()]);
+        assert_eq!(state.security.tmpfs.len(), 1);
+        assert_eq!(state.security.tmpfs[0].path, "/tmp");
+        assert_eq!(state.security.tmpfs[0].options.as_deref(), Some("size=64m"));
+        assert_eq!(state.security.memory_limit_bytes, Some(536870912));
+        assert_eq!(state.security.pids_limit, Some(128));
+        assert_eq!(state.security.nano_cpus, Some(1000000000));
+        assert_eq!(
+            state.security.seccomp_profile.as_deref(),
+            Some("/etc/elixir/seccomp/prism.json")
+        );
+        assert_eq!(
+            state.security.apparmor_profile.as_deref(),
+            Some("prism-default")
+        );
     }
 
     #[test]
     fn required_labels_enforced() {
         let mut labels = HashMap::new();
-        labels.insert("elixir.instance_id".to_string(), "id".to_string());
-        labels.insert("elixir.extension_id".to_string(), "ext".to_string());
+        labels.insert(ELIXIR_INSTANCE_ID_LABEL.to_string(), "id".to_string());
+        labels.insert(ELIXIR_EXTENSION_ID_LABEL.to_string(), "ext".to_string());
         assert!(DockerRuntimeManager::ensure_required_labels(&labels).is_ok());
+    }
+
+    #[test]
+    fn managed_container_filter_uses_docker_label_filter_syntax() {
+        assert_eq!(
+            DockerRuntimeManager::managed_container_filter(),
+            "label=elixir.managed=true"
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_only_prunes_current_deployment_containers() {
+        let active = HashSet::from(["active".to_string()]);
+        let current_orphan = labels_for("orphan", Some("current"));
+        let current_active = labels_for("active", Some("current"));
+        let foreign_orphan = labels_for("orphan", Some("foreign"));
+        let legacy_orphan = labels_for("orphan", None);
+
+        assert!(
+            DockerRuntimeManager::should_prune_orphaned_managed_container(
+                &current_orphan,
+                &active,
+                "current"
+            )
+        );
+        assert!(
+            !DockerRuntimeManager::should_prune_orphaned_managed_container(
+                &current_active,
+                &active,
+                "current"
+            )
+        );
+        assert!(
+            !DockerRuntimeManager::should_prune_orphaned_managed_container(
+                &foreign_orphan,
+                &active,
+                "current"
+            )
+        );
+        assert!(
+            !DockerRuntimeManager::should_prune_orphaned_managed_container(
+                &legacy_orphan,
+                &active,
+                "current"
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_reset_keeps_foreign_and_unknown_legacy_containers() {
+        let active = HashSet::from(["active".to_string()]);
+        let current_orphan = labels_for("orphan", Some("current"));
+        let legacy_active = labels_for("active", None);
+        let legacy_orphan = labels_for("orphan", None);
+        let foreign_active = labels_for("active", Some("foreign"));
+
+        assert!(DockerRuntimeManager::should_reset_managed_container(
+            &current_orphan,
+            &active,
+            "current"
+        ));
+        assert!(DockerRuntimeManager::should_reset_managed_container(
+            &legacy_active,
+            &active,
+            "current"
+        ));
+        assert!(!DockerRuntimeManager::should_reset_managed_container(
+            &legacy_orphan,
+            &active,
+            "current"
+        ));
+        assert!(!DockerRuntimeManager::should_reset_managed_container(
+            &foreign_active,
+            &active,
+            "current"
+        ));
+    }
+
+    #[test]
+    fn alias_conflict_cleanup_only_removes_current_deployment_conflicts() {
+        let spec = scoped_spec("desired-instance", "current");
+        let same_instance = labels_for("desired-instance", Some("foreign"));
+        let current_conflict = labels_for("other-instance", Some("current"));
+        let foreign_conflict = labels_for("other-instance", Some("foreign"));
+        let legacy_conflict = labels_for("other-instance", None);
+
+        assert!(
+            !DockerRuntimeManager::should_remove_conflicting_managed_container(
+                &same_instance,
+                &spec
+            )
+        );
+        assert!(
+            DockerRuntimeManager::should_remove_conflicting_managed_container(
+                &current_conflict,
+                &spec
+            )
+        );
+        assert!(
+            !DockerRuntimeManager::should_remove_conflicting_managed_container(
+                &foreign_conflict,
+                &spec
+            )
+        );
+        assert!(
+            !DockerRuntimeManager::should_remove_conflicting_managed_container(
+                &legacy_conflict,
+                &spec
+            )
+        );
+    }
+
+    #[test]
+    fn exact_name_foreign_container_refuses_mutation() {
+        let spec = scoped_spec("desired-instance", "current");
+        let foreign = labels_for("other-instance", Some("foreign"));
+        let legacy = labels_for("other-instance", None);
+        let same_instance_legacy = labels_for("desired-instance", None);
+
+        let foreign_err = DockerRuntimeManager::ensure_existing_container_is_mutable_by_spec(
+            "elx-abc123",
+            &foreign,
+            &spec,
+        )
+        .expect_err("foreign deployment should be rejected");
+        assert!(
+            foreign_err.to_string().contains("refusing to mutate it"),
+            "unexpected error: {foreign_err}"
+        );
+
+        let legacy_err = DockerRuntimeManager::ensure_existing_container_is_mutable_by_spec(
+            "elx-abc123",
+            &legacy,
+            &spec,
+        )
+        .expect_err("unknown legacy container should be rejected");
+        assert!(
+            legacy_err.to_string().contains("has no deployment label"),
+            "unexpected error: {legacy_err}"
+        );
+
+        DockerRuntimeManager::ensure_existing_container_is_mutable_by_spec(
+            "elx-abc123",
+            &same_instance_legacy,
+            &spec,
+        )
+        .expect("legacy container with the same instance id is owned by this spec");
     }
 
     #[test]
@@ -1974,6 +2449,46 @@ mod tests {
             classify_docker_runtime_failure(&err),
             Some(DockerRuntimeFailureKind::DaemonUnavailable)
         );
+    }
+
+    fn labels_for(instance_id: &str, deployment_id: Option<&str>) -> HashMap<String, String> {
+        let mut labels = HashMap::new();
+        labels.insert(ELIXIR_MANAGED_LABEL.to_string(), "true".to_string());
+        labels.insert(
+            ELIXIR_INSTANCE_ID_LABEL.to_string(),
+            instance_id.to_string(),
+        );
+        labels.insert(
+            ELIXIR_EXTENSION_ID_LABEL.to_string(),
+            "elixir.test".to_string(),
+        );
+        if let Some(deployment_id) = deployment_id {
+            labels.insert(
+                ELIXIR_DEPLOYMENT_ID_LABEL.to_string(),
+                deployment_id.to_string(),
+            );
+        }
+        labels
+    }
+
+    fn scoped_spec(instance_id: &str, deployment_id: &str) -> ContainerSpec {
+        ContainerSpec {
+            name: "elx-abc123".to_string(),
+            image: "example/test:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: vec!["svc-test".to_string()],
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: labels_for(instance_id, Some(deployment_id)),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            devices: Vec::new(),
+            sysctls: HashMap::new(),
+            security: ContainerSecurityOptions::default(),
+        }
     }
 
     #[tokio::test]
@@ -2056,7 +2571,9 @@ mod tests {
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
         let inspect = json!({
             "NetworkSettings": {
@@ -2085,7 +2602,9 @@ mod tests {
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
         let inspect = json!({
             "NetworkSettings": {
@@ -2114,7 +2633,9 @@ mod tests {
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
         crate::runtime::model::apply_container_spec_fingerprint(&mut spec);
         let desired = spec
@@ -2151,7 +2672,9 @@ mod tests {
             command: Vec::new(),
             cap_add: Vec::new(),
             devices: Vec::new(),
+            cap_drop: Vec::new(),
             sysctls: HashMap::new(),
+            security: Default::default(),
         };
         crate::runtime::model::apply_container_spec_fingerprint(&mut spec);
         let inspect = json!({ "Config": { "Labels": {} } });
@@ -2159,6 +2682,43 @@ mod tests {
         assert_eq!(
             DockerRuntimeManager::container_spec_hash_mismatch(&spec, &inspect),
             None
+        );
+    }
+
+    #[test]
+    fn security_options_change_spec_fingerprint() {
+        let mut baseline = ContainerSpec {
+            name: "elx-new".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: Vec::new(),
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            cap_drop: Vec::new(),
+            sysctls: HashMap::new(),
+            security: Default::default(),
+        };
+        let mut hardened = baseline.clone();
+        hardened.cap_drop = vec!["ALL".to_string()];
+        hardened.security.read_only_rootfs = true;
+        hardened.security.no_new_privileges = true;
+        hardened.security.tmpfs.push(ContainerTmpfsMount {
+            path: "/tmp".to_string(),
+            size_mb: Some(64),
+        });
+        hardened.security.apparmor_profile = Some("prism-default".to_string());
+        crate::runtime::model::apply_container_spec_fingerprint(&mut baseline);
+        crate::runtime::model::apply_container_spec_fingerprint(&mut hardened);
+
+        assert_ne!(
+            baseline.labels.get(CONTAINER_SPEC_HASH_LABEL),
+            hardened.labels.get(CONTAINER_SPEC_HASH_LABEL)
         );
     }
 

@@ -1,23 +1,26 @@
 use std::fmt::Write as _;
 use std::io::ErrorKind;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use reqwest::{Client, Url, redirect::Policy};
+use reqwest::{Client, Url, header::LOCATION, redirect::Policy};
 use serde_json::{Map as JsonMap, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::extensions::source_network_safety::{
+    validate_public_source_ip, validate_source_url_dns,
+};
 use crate::extensions::store::{
     ExtensionSourceModule, ExtensionSourceModuleVersion, ExtensionStore,
     NewExtensionSourceHealthEvent, NewExtensionSourceModuleVersion,
 };
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_ARTIFACT_REDIRECTS: usize = 5;
 const MAX_JS_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_JAR_ARTIFACT_BYTES: usize = 80 * 1024 * 1024;
 const NUVIO_CONTAINER_ROOT: &str = "/app/source-modules";
@@ -376,14 +379,36 @@ fn merge_object(metadata: &mut JsonMap<String, Value>, key: &str, update: Value)
 async fn fetch_artifact(url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
     let client = Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(Policy::limited(5))
+        .redirect(Policy::none())
         .build()
         .context("building source artifact HTTP client")?;
-    let response = client
-        .get(url.clone())
-        .send()
-        .await
-        .with_context(|| format!("fetching source artifact {url}"))?
+    let mut next_url = url.clone();
+    let mut redirects = 0usize;
+    let response = loop {
+        normalize_safe_artifact_url(next_url.as_str()).context("source artifact URL is unsafe")?;
+        validate_source_url_dns(&next_url, false, "source artifact").await?;
+        let response = client
+            .get(next_url.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetching source artifact {next_url}"))?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        let Some(location) = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            bail!("source artifact redirect response missing Location header");
+        };
+        redirects += 1;
+        if redirects > MAX_ARTIFACT_REDIRECTS {
+            bail!("too many source artifact redirects");
+        }
+        next_url = checked_artifact_redirect_target(&next_url, location)?;
+    };
+    let response = response
         .error_for_status()
         .with_context(|| format!("source artifact {url} returned an error status"))?;
     if let Some(length) = response.content_length() {
@@ -411,6 +436,14 @@ async fn fetch_artifact(url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+fn checked_artifact_redirect_target(current_url: &Url, location: &str) -> Result<Url> {
+    let redirected = current_url
+        .join(location)
+        .with_context(|| format!("parsing source artifact redirect location for {current_url}"))?;
+    normalize_safe_artifact_url(redirected.as_str())
+        .context("blocked unsafe source artifact redirect target")
+}
+
 fn normalize_safe_artifact_url(input: &str) -> Result<Url> {
     let url = Url::parse(input.trim()).context("parsing source artifact URL")?;
     match url.scheme() {
@@ -434,30 +467,8 @@ fn normalize_safe_artifact_url(input: &str) -> Result<Url> {
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
         bail!("private or local source artifact host '{host}' is not allowed");
     }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ip) => {
-                if ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                    || ip.octets()[0] == 0
-                {
-                    bail!("private or local source artifact IP address '{ip}' is not allowed");
-                }
-            }
-            IpAddr::V6(ip) => {
-                if ip.is_loopback()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    || ip.is_unspecified()
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-                {
-                    bail!("private or local source artifact IP address '{ip}' is not allowed");
-                }
-            }
-        }
+    if let Ok(ip) = lower.parse() {
+        validate_public_source_ip(ip, "source artifact")?;
     }
     Ok(url)
 }
@@ -623,6 +634,26 @@ mod tests {
         let err = normalize_safe_artifact_url("http://127.0.0.1/provider.js")
             .expect_err("private URL should be rejected");
         assert!(err.to_string().contains("private") || err.to_string().contains("local"));
+    }
+
+    #[test]
+    fn artifact_redirect_target_allows_public_relative_redirects() -> Result<()> {
+        let current = Url::parse("https://raw.example.test/providers/allwish.js")?;
+        let redirected = checked_artifact_redirect_target(&current, "../dist/allwish.js")?;
+        assert_eq!(
+            redirected.as_str(),
+            "https://raw.example.test/dist/allwish.js"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_redirect_target_rejects_private_destinations() {
+        let current = Url::parse("https://raw.example.test/providers/allwish.js").unwrap();
+        let err = checked_artifact_redirect_target(&current, "http://192.168.1.10/allwish.js")
+            .expect_err("private artifact redirect should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("blocked unsafe source artifact redirect target"));
     }
 
     #[test]

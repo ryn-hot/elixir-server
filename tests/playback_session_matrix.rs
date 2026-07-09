@@ -86,6 +86,7 @@ fn test_settings_with_db(_root: &Path) -> Settings {
         metadata: elixir_server::config::MetadataConfig::default(),
         classifier: ClassifierConfig::default(),
         playback: elixir_server::config::PlaybackConfig::default(),
+        media_interactions: elixir_server::config::MediaInteractionsConfig::default(),
         network: elixir_server::config::NetworkConfig::default(),
     }
 }

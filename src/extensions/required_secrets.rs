@@ -226,6 +226,7 @@ mod tests {
                 wireguard_config_secret: Some("instance:wg_config".to_string()),
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
         let required = required_secrets_from_runtime(&runtime).expect("required secrets");
         let keys: Vec<_> = required.into_iter().map(|item| item.key).collect();
@@ -249,6 +250,7 @@ mod tests {
                 wireguard_config_secret: Some("instance:wg_config".to_string()),
                 wireguard_gateway_image: None,
             }),
+            security: Default::default(),
         };
         let required = required_secrets_from_runtime(&runtime).expect("required secrets");
         assert!(

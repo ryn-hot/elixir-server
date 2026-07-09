@@ -37,6 +37,7 @@ use crate::{
         cloudstream_registry::CLOUDSTREAM_COMPAT_EXTENSION_ID,
         manifest::ExtensionManifest,
         nuvio_registry::is_prism_extension_id,
+        prism_policy::prism_certification_policy_version,
         store::{
             ExtensionSourceModule, ExtensionSourceModuleCertification,
             ExtensionSourceModuleVersion, ExtensionSourceRegistry, ExtensionStore,
@@ -2969,6 +2970,9 @@ fn validate_safe_stream_ip(ip: IpAddr) -> Result<()> {
                 || value.is_multicast()
         }
         IpAddr::V6(value) => {
+            if let Some(mapped_ipv4) = value.to_ipv4_mapped() {
+                return validate_safe_stream_ip(IpAddr::V4(mapped_ipv4));
+            }
             value.is_loopback()
                 || value.is_unspecified()
                 || value.is_multicast()
@@ -4109,7 +4113,9 @@ async fn nuvio_source_module_invocation_descriptor(
                 .unwrap_or("nuvio_js_v1")
         ),
     );
-    let certification_eligible = certification.is_some_and(nuvio_certification_allows_acquisition);
+    let certification_eligible = certification.is_some_and(|certification| {
+        nuvio_certification_allows_acquisition(certification, active_version.as_ref())
+    });
     let health_eligible = nuvio_module_health_allows_acquisition(module);
     let acquisition_enabled =
         registry.enabled && module.enabled && certification_eligible && health_eligible;
@@ -4147,6 +4153,20 @@ async fn nuvio_source_module_invocation_descriptor(
             "certificationStatus".to_string(),
             json!(certification.status.as_str()),
         );
+        descriptor.insert(
+            "certificationCurrent".to_string(),
+            json!(nuvio_certification_allows_acquisition(
+                certification,
+                active_version.as_ref()
+            )),
+        );
+        descriptor.insert(
+            "certificationPolicyVersion".to_string(),
+            json!(certification.policy_version.as_str()),
+        );
+        if let Some(value) = certification.artifact_sha256.as_deref() {
+            descriptor.insert("certificationArtifactSha256".to_string(), json!(value));
+        }
         if let Some(value) = certification.failure_class.as_deref() {
             descriptor.insert("certificationFailureClass".to_string(), json!(value));
         }
@@ -4237,6 +4257,7 @@ async fn nuvio_source_module_invocation_descriptor(
 
 fn nuvio_certification_allows_acquisition(
     certification: &ExtensionSourceModuleCertification,
+    active_version: Option<&ExtensionSourceModuleVersion>,
 ) -> bool {
     if !matches!(
         certification.status.as_str(),
@@ -4244,9 +4265,18 @@ fn nuvio_certification_allows_acquisition(
     ) {
         return false;
     }
+    let Some(active_version) = active_version else {
+        return false;
+    };
     certification
         .expires_at
         .is_none_or(|expires_at| expires_at > Utc::now())
+        && certification.policy_version == prism_certification_policy_version()
+        && certification.source_module_version_id == Some(active_version.version_id)
+        && certification
+            .artifact_sha256
+            .as_deref()
+            .is_some_and(|hash| Some(hash) == active_version.artifact_sha256.as_deref())
 }
 
 fn nuvio_module_health_allows_acquisition(module: &ExtensionSourceModule) -> bool {
@@ -4964,6 +4994,10 @@ mod tests {
                 certification_id: Uuid::new_v4(),
                 source_module_id,
                 source_module_version_id: Some(version_id),
+                artifact_sha256: Some(
+                    "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
                 instance_id,
                 adapter: "nuvio_js_v1".to_string(),
                 status: "certified".to_string(),
@@ -4977,7 +5011,7 @@ mod tests {
                 probe_targets_json: json!([]),
                 candidate_evidence_json: json!([]),
                 runtime_version: Some("1.1.1".to_string()),
-                policy_version: "test-policy".to_string(),
+                policy_version: "stale-test-policy".to_string(),
                 certified_at: Some(Utc::now()),
                 expires_at: Some(Utc::now() + chrono::Duration::days(7)),
             })
@@ -4997,6 +5031,69 @@ mod tests {
             .expect("certified moviesdrive module");
         assert_eq!(
             moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationCurrent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationStatus")
+                .and_then(Value::as_str),
+            Some("certified")
+        );
+
+        store
+            .upsert_source_module_certification(&NewExtensionSourceModuleCertification {
+                certification_id: Uuid::new_v4(),
+                source_module_id,
+                source_module_version_id: Some(version_id),
+                artifact_sha256: Some(
+                    "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+                instance_id,
+                adapter: "nuvio_js_v1".to_string(),
+                status: "certified".to_string(),
+                failure_class: None,
+                summary: Some("movie and tv probes passed under current policy".to_string()),
+                media_type_results_json: json!({
+                    "movie": { "status": "certified", "candidateCount": 1, "materializableCount": 1 },
+                    "tv": { "status": "certified", "candidateCount": 1, "materializableCount": 1 }
+                }),
+                materialization_results_json: json!({}),
+                probe_targets_json: json!([]),
+                candidate_evidence_json: json!([]),
+                runtime_version: Some("1.1.1".to_string()),
+                policy_version: prism_certification_policy_version(),
+                certified_at: Some(Utc::now()),
+                expires_at: Some(Utc::now() + chrono::Duration::days(7)),
+            })
+            .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let config = candidate_provider_invocation_config_for_store(&store, &extension, &instance)
+            .await?
+            .expect("provider config");
+        let moviesdrive = config
+            .pointer("/sourceModules")
+            .and_then(Value::as_array)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module.get("id").and_then(Value::as_str) == Some("moviesdrive"))
+            })
+            .expect("current certified moviesdrive module");
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationCurrent")
+                .and_then(Value::as_bool),
             Some(true)
         );
         assert_eq!(
@@ -5004,6 +5101,138 @@ mod tests {
                 .get("certificationStatus")
                 .and_then(Value::as_str),
             Some("certified")
+        );
+
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: Uuid::new_v4(),
+                source_module_id,
+                version: "1.1.1".to_string(),
+                artifact_url: Some(
+                    "https://raw.githubusercontent.com/example/repo/main/providers/moviesdrive.js"
+                        .to_string(),
+                ),
+                artifact_sha256: Some(
+                    "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        .to_string(),
+                ),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "unknown".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: None,
+                activated_at: None,
+                metadata_json: Some(json!({
+                    "artifact": {
+                        "kind": "javascript",
+                        "containerPath": "/app/source-modules/sha256/cc/hash/moviesdrive.js",
+                        "sha256": "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    },
+                    "nuvio": {
+                        "scriptPath": "/app/source-modules/sha256/cc/hash/moviesdrive.js",
+                        "artifactSha256": "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    }
+                })),
+            })
+            .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let config = candidate_provider_invocation_config_for_store(&store, &extension, &instance)
+            .await?
+            .expect("provider config");
+        let moviesdrive = config
+            .pointer("/sourceModules")
+            .and_then(Value::as_array)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module.get("id").and_then(Value::as_str) == Some("moviesdrive"))
+            })
+            .expect("hash-updated moviesdrive module");
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationCurrent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive.get("artifactSha256").and_then(Value::as_str),
+            Some("sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+
+        let replacement_version_id = Uuid::new_v4();
+        store
+            .upsert_source_module_version(&NewExtensionSourceModuleVersion {
+                version_id: replacement_version_id,
+                source_module_id,
+                version: "1.1.2".to_string(),
+                artifact_url: Some(
+                    "https://raw.githubusercontent.com/example/repo/main/providers/moviesdrive.js"
+                        .to_string(),
+                ),
+                artifact_sha256: Some(
+                    "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                ),
+                signature: None,
+                install_state: "active".to_string(),
+                smoke_status: "unknown".to_string(),
+                smoke_error: None,
+                rollback_of_version_id: None,
+                installed_at: None,
+                activated_at: None,
+                metadata_json: Some(json!({
+                    "artifact": {
+                        "kind": "javascript",
+                        "containerPath": "/app/source-modules/sha256/bb/hash/moviesdrive.js",
+                        "sha256": "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    },
+                    "nuvio": {
+                        "scriptPath": "/app/source-modules/sha256/bb/hash/moviesdrive.js",
+                        "artifactSha256": "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                })),
+            })
+            .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE extension_source_modules
+             SET active_version = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = ?",
+        )
+        .bind("1.1.2")
+        .bind(source_module_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let config = candidate_provider_invocation_config_for_store(&store, &extension, &instance)
+            .await?
+            .expect("provider config");
+        let moviesdrive = config
+            .pointer("/sourceModules")
+            .and_then(Value::as_array)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module.get("id").and_then(Value::as_str) == Some("moviesdrive"))
+            })
+            .expect("version-updated moviesdrive module");
+        assert_eq!(
+            moviesdrive.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive
+                .get("certificationCurrent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            moviesdrive.get("artifactSha256").and_then(Value::as_str),
+            Some("sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
 
         store
@@ -6397,6 +6626,24 @@ mod tests {
         *candidate
             .pointer_mut("/delivery/url")
             .expect("delivery url") = json!("http://127.0.0.1/master.m3u8");
+
+        let (candidates, warnings) = validate_upstream_stream_candidates(vec![candidate]);
+
+        assert!(candidates.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("delivery.url is unsafe")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn ess3_stream_validation_rejects_ipv4_mapped_private_delivery_urls() {
+        let mut candidate = stream_candidate("unsafe-ipv4-mapped-url", "S01E01");
+        *candidate
+            .pointer_mut("/delivery/url")
+            .expect("delivery url") = json!("http://[::ffff:127.0.0.1]/master.m3u8");
 
         let (candidates, warnings) = validate_upstream_stream_candidates(vec![candidate]);
 

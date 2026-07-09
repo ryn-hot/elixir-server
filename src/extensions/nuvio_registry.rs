@@ -2,22 +2,25 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use reqwest::header::{ETAG, LAST_MODIFIED, USER_AGENT};
+use reqwest::header::{ETAG, LAST_MODIFIED, LOCATION, USER_AGENT};
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::extensions::source_artifacts::install_source_module_artifact;
+use crate::extensions::source_network_safety::{
+    validate_public_source_ip, validate_source_url_dns,
+};
 use crate::extensions::store::{
-    ExtensionStore, NewExtensionSourceModule, NewExtensionSourceModuleVersion,
-    NewExtensionSourceRegistry, NewExtensionSourceReplacementRecommendation,
+    ExtensionSourceRegistry, ExtensionStore, NewExtensionSourceModule,
+    NewExtensionSourceModuleVersion, NewExtensionSourceRegistry,
+    NewExtensionSourceReplacementRecommendation,
 };
 
 pub const PRISM_EXTENSION_ID: &str = "elixir.sources.prism";
@@ -25,6 +28,7 @@ pub const LEGACY_NUVIO_COMPAT_EXTENSION_ID: &str = "elixir.sources.nuvio_compat"
 pub const PRISM_RECOMMENDED_SOURCE_PACK_ID: &str = "elixir.sourcepacks.prism.recommended";
 pub const PRISM_RECOMMENDED_REGISTRY_KEY: &str = "prism.recommended";
 pub const PRISM_RECOMMENDED_SOURCE_PACK_PATH: &str = "source-packs/prism-recommended.json";
+const PRISM_SOURCE_REGISTRY_TOMBSTONES_CONFIG_KEY: &str = "sourceRegistryTombstones";
 
 pub fn is_prism_extension_id(extension_id: &str) -> bool {
     matches!(
@@ -371,7 +375,7 @@ impl NuvioRegistryClient {
     pub fn new(config: NuvioRegistryFetchConfig) -> Result<Self> {
         let client = Client::builder()
             .timeout(config.timeout)
-            .redirect(Policy::limited(config.max_redirects))
+            .redirect(Policy::none())
             .build()
             .context("building Nuvio registry HTTP client")?;
         Ok(Self { client, config })
@@ -448,23 +452,7 @@ impl NuvioRegistryClient {
         .context("building GitHub provider directory URL")?;
         url.query_pairs_mut().append_pair("ref", &context.reference);
         validate_safe_http_url(&url, self.config.allow_private_hosts)?;
-        let response = self
-            .client
-            .get(url.clone())
-            .header(USER_AGENT, GITHUB_PROVIDER_DISCOVERY_USER_AGENT)
-            .send()
-            .await
-            .with_context(|| format!("fetching GitHub provider directory {url}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
-        }
-        let response = response
-            .error_for_status()
-            .with_context(|| format!("GitHub provider directory {url} returned an error status"))?;
-        let entries = response
-            .json::<Vec<GitHubContentEntry>>()
-            .await
-            .with_context(|| format!("parsing GitHub provider directory {url}"))?;
+        let entries = self.fetch_github_provider_directory_url(url).await?;
         Ok(entries
             .into_iter()
             .filter(|entry| {
@@ -476,14 +464,114 @@ impl NuvioRegistryClient {
             .collect())
     }
 
+    async fn fetch_github_provider_directory_url(
+        &self,
+        url: Url,
+    ) -> Result<Vec<GitHubContentEntry>> {
+        let mut next_url = url;
+        let mut redirects = 0usize;
+        let response = loop {
+            validate_safe_http_url(&next_url, self.config.allow_private_hosts)?;
+            validate_source_url_dns(
+                &next_url,
+                self.config.allow_private_hosts,
+                "GitHub provider directory",
+            )
+            .await?;
+            let response = self
+                .client
+                .get(next_url.clone())
+                .header(USER_AGENT, GITHUB_PROVIDER_DISCOVERY_USER_AGENT)
+                .send()
+                .await
+                .with_context(|| format!("fetching GitHub provider directory {next_url}"))?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                bail!("GitHub provider directory redirect response missing Location header");
+            };
+            redirects += 1;
+            if redirects > self.config.max_redirects {
+                bail!("too many GitHub provider directory redirects");
+            }
+            next_url = checked_nuvio_registry_redirect_target(
+                &next_url,
+                location,
+                self.config.allow_private_hosts,
+            )?;
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let final_url = response.url().to_string();
+        validate_safe_http_url(response.url(), self.config.allow_private_hosts)?;
+        let response = response.error_for_status().with_context(|| {
+            format!("GitHub provider directory {final_url} returned an error status")
+        })?;
+        if let Some(length) = response.content_length() {
+            if length > self.config.max_response_bytes as u64 {
+                bail!(
+                    "GitHub provider directory {} is too large: {} bytes exceeds {} bytes",
+                    final_url,
+                    length,
+                    self.config.max_response_bytes
+                );
+            }
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("reading GitHub provider directory {final_url}"))?;
+        if bytes.len() > self.config.max_response_bytes {
+            bail!(
+                "GitHub provider directory {} exceeded {} bytes",
+                final_url,
+                self.config.max_response_bytes
+            );
+        }
+        serde_json::from_slice::<Vec<GitHubContentEntry>>(&bytes)
+            .with_context(|| format!("parsing GitHub provider directory {final_url}"))
+    }
+
     async fn fetch_text(&self, url: &str, base_url: Option<&str>) -> Result<FetchedText> {
         let normalized = normalize_http_url(url, base_url, &self.config)?;
-        let response = self
-            .client
-            .get(&normalized)
-            .send()
-            .await
-            .with_context(|| format!("fetching Nuvio registry document {normalized}"))?;
+        let mut next_url = Url::parse(&normalized).context("parsing normalized Nuvio URL")?;
+        let mut redirects = 0usize;
+        let response = loop {
+            validate_safe_http_url(&next_url, self.config.allow_private_hosts)?;
+            validate_source_url_dns(&next_url, self.config.allow_private_hosts, "Nuvio registry")
+                .await?;
+            let response = self
+                .client
+                .get(next_url.clone())
+                .send()
+                .await
+                .with_context(|| format!("fetching Nuvio registry document {next_url}"))?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                bail!("Nuvio registry redirect response missing Location header");
+            };
+            redirects += 1;
+            if redirects > self.config.max_redirects {
+                bail!("too many Nuvio registry redirects");
+            }
+            next_url = checked_nuvio_registry_redirect_target(
+                &next_url,
+                location,
+                self.config.allow_private_hosts,
+            )?;
+        };
         let final_url = response.url().to_string();
         validate_safe_http_url(response.url(), self.config.allow_private_hosts)?;
         let headers = response.headers().clone();
@@ -529,6 +617,19 @@ impl NuvioRegistryClient {
                 .map(str::to_string),
         })
     }
+}
+
+fn checked_nuvio_registry_redirect_target(
+    current_url: &Url,
+    location: &str,
+    allow_private_hosts: bool,
+) -> Result<Url> {
+    let redirected = current_url
+        .join(location)
+        .with_context(|| format!("parsing Nuvio registry redirect location for {current_url}"))?;
+    validate_safe_http_url(&redirected, allow_private_hosts)
+        .context("blocked unsafe Nuvio registry redirect target")?;
+    Ok(redirected)
 }
 
 pub fn parse_nuvio_manifest_json(
@@ -700,11 +801,158 @@ pub fn parse_prism_source_pack_manifest(
     Ok(pack)
 }
 
+pub async fn record_prism_source_registry_tombstone(
+    store: &ExtensionStore<'_>,
+    registry: &ExtensionSourceRegistry,
+    reason: &str,
+) -> Result<()> {
+    let registry_key = registry.registry_key.trim();
+    if registry_key.is_empty() {
+        return Ok(());
+    }
+    update_prism_source_registry_tombstones(store, registry.instance_id, |tombstones| {
+        tombstones.insert(
+            registry_key.to_string(),
+            json!({
+                "registryId": registry.registry_id,
+                "registryKey": registry.registry_key,
+                "registryType": registry.registry_type,
+                "trustClass": registry.trust_class,
+                "displayName": registry.display_name,
+                "url": registry.url,
+                "reason": reason,
+                "removedAt": Utc::now(),
+            }),
+        );
+    })
+    .await
+}
+
+async fn clear_prism_source_registry_tombstones(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    registry_keys: &[String],
+) -> Result<()> {
+    if registry_keys.is_empty() {
+        return Ok(());
+    }
+    update_prism_source_registry_tombstones(store, instance_id, |tombstones| {
+        for registry_key in registry_keys {
+            tombstones.remove(registry_key);
+        }
+    })
+    .await
+}
+
+async fn update_prism_source_registry_tombstones(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    update: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<()> {
+    let instance = store
+        .get_instance(instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Prism instance {instance_id} was not found"))?;
+    let mut config = instance
+        .config_json
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut tombstones = config
+        .get(PRISM_SOURCE_REGISTRY_TOMBSTONES_CONFIG_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    update(&mut tombstones);
+    if tombstones.is_empty() {
+        config.remove(PRISM_SOURCE_REGISTRY_TOMBSTONES_CONFIG_KEY);
+    } else {
+        config.insert(
+            PRISM_SOURCE_REGISTRY_TOMBSTONES_CONFIG_KEY.to_string(),
+            Value::Object(tombstones),
+        );
+    }
+    let config_value = Value::Object(config);
+    store
+        .update_instance_config(instance_id, Some(&config_value))
+        .await
+}
+
+async fn prism_source_registry_tombstone_keys(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+) -> Result<HashSet<String>> {
+    Ok(store
+        .get_instance(instance_id)
+        .await?
+        .and_then(|instance| instance.config_json)
+        .and_then(|config| {
+            config
+                .get(PRISM_SOURCE_REGISTRY_TOMBSTONES_CONFIG_KEY)
+                .and_then(Value::as_object)
+                .map(|tombstones| tombstones.keys().cloned().collect::<HashSet<_>>())
+        })
+        .unwrap_or_default())
+}
+
+fn prism_source_pack_registry_keys(pack: &PrismSourcePackManifest) -> Vec<String> {
+    let mut keys = vec![
+        pack.registry_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(PRISM_RECOMMENDED_REGISTRY_KEY)
+            .to_string(),
+    ];
+    keys.extend(
+        pack.maintainer_known_repositories
+            .iter()
+            .map(|repository| repository.registry_key.trim())
+            .filter(|registry_key| !registry_key.is_empty())
+            .map(str::to_string),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 pub async fn seed_prism_recommended_source_pack_for_instance(
     store: &ExtensionStore<'_>,
     instance_id: Uuid,
     installed_package_dir: Option<&Path>,
     storage_root: Option<&str>,
+) -> Result<NuvioRegistryPersistSummary> {
+    seed_prism_recommended_source_pack_for_instance_inner(
+        store,
+        instance_id,
+        installed_package_dir,
+        storage_root,
+        false,
+    )
+    .await
+}
+
+pub async fn restore_prism_recommended_source_pack_for_instance(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    installed_package_dir: Option<&Path>,
+    storage_root: Option<&str>,
+) -> Result<NuvioRegistryPersistSummary> {
+    seed_prism_recommended_source_pack_for_instance_inner(
+        store,
+        instance_id,
+        installed_package_dir,
+        storage_root,
+        true,
+    )
+    .await
+}
+
+async fn seed_prism_recommended_source_pack_for_instance_inner(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    installed_package_dir: Option<&Path>,
+    storage_root: Option<&str>,
+    restore_tombstoned: bool,
 ) -> Result<NuvioRegistryPersistSummary> {
     let manifest_text = read_prism_recommended_source_pack_manifest(installed_package_dir)?;
     let config = NuvioRegistryFetchConfig::default();
@@ -720,12 +968,27 @@ pub async fn seed_prism_recommended_source_pack_for_instance(
             PRISM_RECOMMENDED_SOURCE_PACK_ID
         );
     }
+    let registry_keys = prism_source_pack_registry_keys(&pack);
+    if restore_tombstoned {
+        clear_prism_source_registry_tombstones(store, instance_id, &registry_keys).await?;
+    }
+    let tombstones = prism_source_registry_tombstone_keys(store, instance_id).await?;
+    let registry_key = pack
+        .registry_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(PRISM_RECOMMENDED_REGISTRY_KEY);
+    if tombstones.contains(registry_key) {
+        return Ok(NuvioRegistryPersistSummary::default());
+    }
     let summary = persist_prism_source_pack_manifest(
         store,
         instance_id,
         &pack,
         "bundled://elixir/prism/recommended",
         &config,
+        &tombstones,
     )
     .await?;
     let policy = prism_source_pack_policy(store, instance_id).await?;
@@ -767,6 +1030,10 @@ pub async fn migrate_prism_recommended_source_pack_for_installed_instances(
         let existing_recommended = registries
             .iter()
             .find(|registry| registry.registry_key == PRISM_RECOMMENDED_REGISTRY_KEY);
+        if existing_recommended.is_none() && !registries.is_empty() {
+            summary.skipped_existing_instances += 1;
+            continue;
+        }
         if existing_recommended
             .and_then(prism_registry_source_pack_version)
             .is_some_and(|version| version == desired_pack.version.as_str())
@@ -788,6 +1055,10 @@ pub async fn migrate_prism_recommended_source_pack_for_installed_instances(
                 instance.instance_id
             )
         })?;
+        if seed.registries == 0 && seed.modules == 0 && seed.versions == 0 {
+            summary.skipped_existing_instances += 1;
+            continue;
+        }
         summary.migrated_instances += 1;
         summary.registries += seed.registries;
         summary.modules += seed.modules;
@@ -805,6 +1076,7 @@ pub async fn persist_prism_source_pack_manifest(
     pack: &PrismSourcePackManifest,
     source_url: &str,
     config: &NuvioRegistryFetchConfig,
+    tombstoned_registry_keys: &HashSet<String>,
 ) -> Result<NuvioRegistryPersistSummary> {
     if pack.schema_version != 1 {
         bail!(
@@ -861,9 +1133,15 @@ pub async fn persist_prism_source_pack_manifest(
         .record_source_registry_fetch(registry_id, "success", None, None, None)
         .await?;
 
-    let known_registry_count =
-        persist_prism_source_pack_repositories(store, instance_id, pack, source_url, config)
-            .await?;
+    let known_registry_count = persist_prism_source_pack_repositories(
+        store,
+        instance_id,
+        pack,
+        source_url,
+        config,
+        tombstoned_registry_keys,
+    )
+    .await?;
     let mut warnings = Vec::new();
     let mut modules = Vec::with_capacity(pack.modules.len());
     for (index, raw_module) in pack.modules.iter().enumerate() {
@@ -1340,10 +1618,14 @@ async fn persist_prism_source_pack_repositories(
     pack: &PrismSourcePackManifest,
     source_url: &str,
     config: &NuvioRegistryFetchConfig,
+    tombstoned_registry_keys: &HashSet<String>,
 ) -> Result<usize> {
     let mut count = 0usize;
     for repository in &pack.maintainer_known_repositories {
         let registry_key = repository.registry_key.trim().to_string();
+        if tombstoned_registry_keys.contains(&registry_key) {
+            continue;
+        }
         let registry_id = deterministic_uuid(&format!(
             "elixir:prism:source-pack-known-registry:{instance_id}:{registry_key}"
         ));
@@ -1969,30 +2251,8 @@ fn validate_safe_http_url(url: &Url, allow_private_hosts: bool) -> Result<()> {
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
         bail!("private or local host '{host}' is not allowed");
     }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ip) => {
-                if ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                    || ip.octets()[0] == 0
-                {
-                    bail!("private or local IP address '{ip}' is not allowed");
-                }
-            }
-            IpAddr::V6(ip) => {
-                if ip.is_loopback()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    || ip.is_unspecified()
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-                {
-                    bail!("private or local IP address '{ip}' is not allowed");
-                }
-            }
-        }
+    if let Ok(ip) = lower.parse() {
+        validate_public_source_ip(ip, "Nuvio registry")?;
     }
     Ok(())
 }
@@ -2156,6 +2416,37 @@ fn ensure_non_empty(value: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[test]
+    fn nuvio_registry_redirect_target_allows_public_relative_redirects() -> Result<()> {
+        let current = Url::parse("https://raw.example.test/repos/manifest.json")?;
+        let redirected =
+            checked_nuvio_registry_redirect_target(&current, "../next/manifest.json", false)?;
+        assert_eq!(
+            redirected.as_str(),
+            "https://raw.example.test/next/manifest.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nuvio_registry_redirect_target_rejects_private_destinations() {
+        let current = Url::parse("https://raw.example.test/repos/manifest.json").unwrap();
+        let err = checked_nuvio_registry_redirect_target(
+            &current,
+            "http://10.0.0.5/manifest.json",
+            false,
+        )
+        .expect_err("private registry redirect should be rejected");
+        assert!(
+            err.to_string()
+                .contains("blocked unsafe Nuvio registry redirect target")
+        );
+    }
 
     #[test]
     fn parses_nuvio_manifest_and_resolves_relative_artifacts() -> Result<()> {
@@ -2272,6 +2563,87 @@ mod tests {
         assert_eq!(context.repository, "phisher-nuvio-providers");
         assert_eq!(context.reference, "main");
         assert_eq!(context.root_path, "");
+    }
+
+    #[tokio::test]
+    async fn nuvio_github_provider_directory_follows_checked_redirects() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await?;
+                let mut buffer = vec![0u8; 2048];
+                let read = socket.read(&mut buffer).await?;
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                if request.starts_with("GET /start ") {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await?;
+                } else {
+                    let body =
+                        r#"[{"name":"allwish.js","path":"providers/allwish.js","type":"file"}]"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let client = NuvioRegistryClient::new(NuvioRegistryFetchConfig {
+            allow_private_hosts: true,
+            max_response_bytes: 4096,
+            ..NuvioRegistryFetchConfig::default()
+        })?;
+        let entries = client
+            .fetch_github_provider_directory_url(Url::parse(&format!(
+                "http://127.0.0.1:{port}/start"
+            ))?)
+            .await?;
+
+        server.await??;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "allwish.js");
+        assert_eq!(entries[0].path, "providers/allwish.js");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nuvio_github_provider_directory_rejects_oversized_response() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = vec![0u8; 1024];
+            let _ = socket.read(&mut buffer).await?;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n[]",
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let client = NuvioRegistryClient::new(NuvioRegistryFetchConfig {
+            allow_private_hosts: true,
+            max_response_bytes: 16,
+            ..NuvioRegistryFetchConfig::default()
+        })?;
+        let err = client
+            .fetch_github_provider_directory_url(Url::parse(&format!(
+                "http://127.0.0.1:{port}/oversized"
+            ))?)
+            .await
+            .expect_err("oversized GitHub directory response should fail");
+
+        server.await??;
+        assert!(err.to_string().contains("too large"));
+        Ok(())
     }
 
     #[test]
