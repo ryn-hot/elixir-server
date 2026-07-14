@@ -16,7 +16,7 @@ use crate::runtime::model::{
     ContainerRuntimeSecurityState, ContainerRuntimeState, ContainerRuntimeTmpfsMount,
     ContainerSpec, ContainerState, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
     ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, PortMapping,
-    VolumeMount, VolumeMountSourceKind,
+    PrivateFileVolumeSpec, VolumeMount, VolumeMountSourceKind,
 };
 
 const REQUIRED_LABELS: [&str; 2] = [ELIXIR_INSTANCE_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL];
@@ -166,6 +166,95 @@ impl DockerRuntimeManager {
             .run_capture_with_timeout(args, Some(timeout_duration))
             .await?
             .stdout)
+    }
+
+    async fn inspect_named_volume(&self, name: &str) -> Result<Option<Value>> {
+        let output = Command::new(&self.docker_bin)
+            .args(["volume", "inspect", name])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("inspecting Docker volume {name}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.to_ascii_lowercase().contains("no such volume") {
+                return Ok(None);
+            }
+            bail!(
+                "docker volume inspect failed (status {:?}): {}",
+                output.status.code(),
+                stderr.trim()
+            );
+        }
+        let payload: Value = serde_json::from_slice(&output.stdout)
+            .context("Docker volume inspect returned invalid JSON")?;
+        let values = payload
+            .as_array()
+            .filter(|values| values.len() == 1)
+            .context("Docker volume inspect returned an unexpected result")?;
+        Ok(values.first().cloned())
+    }
+
+    fn private_volume_labels(value: &Value) -> HashMap<String, String> {
+        value
+            .get("Labels")
+            .and_then(Value::as_object)
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn private_volume_labels_match(
+        value: &Value,
+        required_labels: &HashMap<String, String>,
+    ) -> bool {
+        let labels = Self::private_volume_labels(value);
+        required_labels
+            .iter()
+            .all(|(key, expected)| labels.get(key) == Some(expected))
+    }
+
+    fn validate_private_file_volume_spec(spec: &PrivateFileVolumeSpec) -> Result<()> {
+        fn safe_name(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+        }
+
+        if !safe_name(&spec.name)
+            || !safe_name(&spec.file_name)
+            || spec.image.trim().is_empty()
+            || spec.image.len() > 512
+            || spec.source_path.trim().is_empty()
+            || !Path::new(&spec.source_path).is_absolute()
+            || spec.owner_uid == 0
+            || spec.owner_gid == 0
+            || spec.labels.is_empty()
+            || spec.labels.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 128
+                    || value.is_empty()
+                    || value.len() > 256
+                    || key.contains(['\r', '\n', '='])
+                    || value.contains(['\r', '\n'])
+            })
+        {
+            bail!("private file volume specification is invalid");
+        }
+        let metadata = std::fs::symlink_metadata(&spec.source_path)
+            .context("reading private volume source metadata")?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("private file volume source must be a regular non-symbolic file");
+        }
+        Ok(())
     }
 
     pub async fn server_version(&self) -> Result<String> {
@@ -1622,6 +1711,132 @@ impl RuntimeManager for DockerRuntimeManager {
         self.create_container(spec).await
     }
 
+    async fn create_private_file_volume(&self, spec: &PrivateFileVolumeSpec) -> Result<()> {
+        Self::validate_private_file_volume_spec(spec)?;
+        if self.inspect_named_volume(&spec.name).await?.is_some() {
+            bail!("private file volume '{}' already exists", spec.name);
+        }
+
+        let mut create_args = vec!["volume".to_string(), "create".to_string()];
+        let mut labels = spec.labels.iter().collect::<Vec<_>>();
+        labels.sort_by(|left, right| left.0.cmp(right.0));
+        for (key, value) in labels {
+            create_args.push("--label".to_string());
+            create_args.push(format!("{key}={value}"));
+        }
+        create_args.push(spec.name.clone());
+        let created = self.run_stdout(&create_args).await?;
+        if created.trim() != spec.name {
+            bail!("Docker created an unexpected private volume identity");
+        }
+        let Some(created_volume) = self.inspect_named_volume(&spec.name).await? else {
+            bail!("private file volume disappeared after creation");
+        };
+        if !Self::private_volume_labels_match(&created_volume, &spec.labels) {
+            bail!("private file volume ownership labels do not match");
+        }
+
+        let source_mount = format!("{}:/run/elixir-seed/input:ro", spec.source_path);
+        let volume_mount = format!("{}:/run/elixir-seed/output", spec.name);
+        let seed_script = concat!(
+            "set -eu; ",
+            "destination=\"/run/elixir-seed/output/$1\"; ",
+            "test ! -e \"$destination\"; ",
+            "umask 077; ",
+            "cp --no-preserve=mode,ownership,timestamps /run/elixir-seed/input \"$destination.tmp\"; ",
+            "chmod 0600 \"$destination.tmp\"; ",
+            "mv \"$destination.tmp\" \"$destination\"; ",
+            "sync -f \"$destination\"; ",
+            "chmod 0700 /run/elixir-seed/output; ",
+            "chown \"$2:$3\" \"$destination\" /run/elixir-seed/output"
+        );
+        let seed_args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--pull".to_string(),
+            "never".to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "--read-only".to_string(),
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
+            "--cap-add".to_string(),
+            "CHOWN".to_string(),
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
+            "--pids-limit".to_string(),
+            "32".to_string(),
+            "--memory".to_string(),
+            "64m".to_string(),
+            "--user".to_string(),
+            "0:0".to_string(),
+            "--tmpfs".to_string(),
+            "/tmp:size=16m".to_string(),
+            "--label".to_string(),
+            format!("{ELIXIR_MANAGED_LABEL}=true"),
+            "--label".to_string(),
+            "elixir.runtime.role=private_file_volume_seed".to_string(),
+            "-v".to_string(),
+            source_mount,
+            "-v".to_string(),
+            volume_mount,
+            "--entrypoint".to_string(),
+            "/bin/sh".to_string(),
+            spec.image.clone(),
+            "-c".to_string(),
+            seed_script.to_string(),
+            "--".to_string(),
+            spec.file_name.clone(),
+            spec.owner_uid.to_string(),
+            spec.owner_gid.to_string(),
+        ];
+        if let Err(seed_error) = self.run_capture(&seed_args).await {
+            let cleanup = self
+                .remove_private_file_volume(&spec.name, &spec.labels)
+                .await;
+            return match cleanup {
+                Ok(()) => Err(seed_error.context("seeding private file volume")),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "seeding private file volume failed: {seed_error}; cleanup failed: {cleanup_error}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    async fn private_file_volume_owned(
+        &self,
+        name: &str,
+        required_labels: &HashMap<String, String>,
+    ) -> Result<bool> {
+        let Some(volume) = self.inspect_named_volume(name).await? else {
+            return Ok(false);
+        };
+        if !Self::private_volume_labels_match(&volume, required_labels) {
+            bail!("private file volume ownership labels do not match");
+        }
+        Ok(true)
+    }
+
+    async fn remove_private_file_volume(
+        &self,
+        name: &str,
+        required_labels: &HashMap<String, String>,
+    ) -> Result<()> {
+        if !self
+            .private_file_volume_owned(name, required_labels)
+            .await?
+        {
+            return Ok(());
+        }
+        self.run_capture(&["volume".to_string(), "rm".to_string(), name.to_string()])
+            .await?;
+        if self.inspect_named_volume(name).await?.is_some() {
+            bail!("private file volume still exists after removal");
+        }
+        Ok(())
+    }
+
     async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
         if let Some(id) = self.find_container_id(name).await? {
             return Ok(Some(ContainerHandle {
@@ -1639,7 +1854,7 @@ impl RuntimeManager for DockerRuntimeManager {
     }
 
     async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
-        let args = vec!["stop".to_string(), handle.name.clone()];
+        let args = vec!["stop".to_string(), handle.id.clone()];
         self.run_capture(&args).await?;
         Ok(())
     }
@@ -1662,7 +1877,7 @@ impl RuntimeManager for DockerRuntimeManager {
     }
 
     async fn remove_container(&self, handle: &ContainerHandle) -> Result<()> {
-        let args = vec!["rm".to_string(), "-f".to_string(), handle.name.clone()];
+        let args = vec!["rm".to_string(), "-f".to_string(), handle.id.clone()];
         self.run_capture(&args).await?;
         Ok(())
     }
@@ -2088,6 +2303,7 @@ mod tests {
     use super::*;
     use crate::runtime::model::ContainerSecurityOptions;
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
 
     #[test]
     fn port_mapping_formats() {
@@ -2147,6 +2363,163 @@ mod tests {
             read_only: false,
         };
         assert!(DockerRuntimeManager::mount_matches(&desired, &actual));
+    }
+
+    #[test]
+    fn private_file_volume_requires_safe_owned_input() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let source = temporary.path().join("control.json");
+        std::fs::write(&source, b"private-volume-test").expect("test input");
+        let spec = PrivateFileVolumeSpec {
+            name: "elixir_live_private_test".to_string(),
+            image: "elixir-live-egress-worker:test".to_string(),
+            source_path: source.to_string_lossy().into_owned(),
+            file_name: "control.json".to_string(),
+            owner_uid: 65_532,
+            owner_gid: 65_532,
+            labels: HashMap::from([("elixir.managed".to_string(), "true".to_string())]),
+        };
+        DockerRuntimeManager::validate_private_file_volume_spec(&spec)
+            .expect("valid private volume specification");
+
+        for invalid in [
+            PrivateFileVolumeSpec {
+                name: "../unsafe".to_string(),
+                ..spec.clone()
+            },
+            PrivateFileVolumeSpec {
+                file_name: "nested/control.json".to_string(),
+                ..spec.clone()
+            },
+            PrivateFileVolumeSpec {
+                owner_uid: 0,
+                ..spec.clone()
+            },
+        ] {
+            assert!(DockerRuntimeManager::validate_private_file_volume_spec(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn private_file_volume_labels_require_the_complete_binding_tuple() {
+        let volume = json!({
+            "Labels": {
+                "elixir.managed": "true",
+                "elixir.live.egress.binding_id": "binding-a"
+            }
+        });
+        let required = HashMap::from([
+            ("elixir.managed".to_string(), "true".to_string()),
+            (
+                "elixir.live.egress.binding_id".to_string(),
+                "binding-a".to_string(),
+            ),
+        ]);
+        assert!(DockerRuntimeManager::private_volume_labels_match(
+            &volume, &required
+        ));
+        let foreign = HashMap::from([(
+            "elixir.live.egress.binding_id".to_string(),
+            "binding-b".to_string(),
+        )]);
+        assert!(!DockerRuntimeManager::private_volume_labels_match(
+            &volume, &foreign
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "live Docker private-volume test; set ELIXIR_LIVE_EGRESS_DOCKER_TESTS=1 to run"]
+    async fn n11_private_file_volume_is_portable_when_configured() -> Result<()> {
+        if std::env::var("ELIXIR_LIVE_EGRESS_DOCKER_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping Live private-volume test: ELIXIR_LIVE_EGRESS_DOCKER_TESTS=1 is not set"
+            );
+            return Ok(());
+        }
+        let image = std::env::var("ELIXIR_LIVE_EGRESS_WORKER_IMAGE")
+            .context("ELIXIR_LIVE_EGRESS_WORKER_IMAGE is required")?;
+        let runtime = DockerRuntimeManager::new(None);
+        runtime.server_version().await?;
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("control.json");
+        let body = b"elixir-live-private-volume-certification";
+        std::fs::write(&source, body)?;
+        let volume_name = format!("elixir_live_private_test_{}", Uuid::new_v4().simple());
+        let mut labels = HashMap::from([
+            (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
+            (
+                "elixir.live.egress.binding_id".to_string(),
+                Uuid::new_v4().to_string(),
+            ),
+        ]);
+        if let Ok(run_id) = std::env::var("ELIXIR_LIVE_EGRESS_TEST_RUN_ID") {
+            if !run_id.is_empty()
+                && run_id.len() <= 64
+                && run_id.chars().all(|character| character.is_ascii_digit())
+            {
+                labels.insert("elixir.live.egress.test_run_id".to_string(), run_id);
+            }
+        }
+        let spec = PrivateFileVolumeSpec {
+            name: volume_name.clone(),
+            image: image.clone(),
+            source_path: source.to_string_lossy().into_owned(),
+            file_name: "control.json".to_string(),
+            owner_uid: 65_532,
+            owner_gid: 65_532,
+            labels: labels.clone(),
+        };
+        runtime.create_private_file_volume(&spec).await?;
+        assert!(
+            runtime
+                .private_file_volume_owned(&volume_name, &labels)
+                .await?
+        );
+
+        let expected_hash = format!("{:x}", Sha256::digest(body));
+        let check = runtime
+            .run_capture(&[
+                "run".to_string(),
+                "--rm".to_string(),
+                "--pull".to_string(),
+                "never".to_string(),
+                "--network".to_string(),
+                "none".to_string(),
+                "--read-only".to_string(),
+                "--cap-drop".to_string(),
+                "ALL".to_string(),
+                "--security-opt".to_string(),
+                "no-new-privileges".to_string(),
+                "--user".to_string(),
+                "65532:65532".to_string(),
+                "-v".to_string(),
+                format!("{volume_name}:/run/elixir-live-egress:ro"),
+                "--entrypoint".to_string(),
+                "/bin/sh".to_string(),
+                image,
+                "-c".to_string(),
+                concat!(
+                    "set -eu; ",
+                    "test \"$(stat -c '%u:%g:%a' /run/elixir-live-egress)\" = '65532:65532:700'; ",
+                    "test \"$(stat -c '%u:%g:%a' /run/elixir-live-egress/control.json)\" = '65532:65532:600'; ",
+                    "test \"$(sha256sum /run/elixir-live-egress/control.json | cut -d ' ' -f 1)\" = \"$1\""
+                )
+                .to_string(),
+                "--".to_string(),
+                expected_hash,
+            ])
+            .await;
+        let cleanup = runtime
+            .remove_private_file_volume(&volume_name, &labels)
+            .await;
+        check?;
+        cleanup?;
+        assert!(
+            !runtime
+                .private_file_volume_owned(&volume_name, &labels)
+                .await?
+        );
+        Ok(())
     }
 
     #[test]

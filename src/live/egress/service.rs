@@ -33,8 +33,8 @@ use crate::{
         RuntimeManager,
         model::{
             ContainerHandle, ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount,
-            ELIXIR_MANAGED_LABEL, EnvVar, PortMapping, VolumeMount, VolumeMountSourceKind,
-            apply_container_spec_fingerprint,
+            ELIXIR_MANAGED_LABEL, EnvVar, PortMapping, PrivateFileVolumeSpec, VolumeMount,
+            VolumeMountSourceKind, apply_container_spec_fingerprint,
         },
     },
 };
@@ -52,12 +52,16 @@ use super::{
 
 const ROLE_LABEL: &str = "elixir.live.egress.role";
 const SESSION_LABEL: &str = "elixir.live.session_id";
+const BINDING_LABEL: &str = "elixir.live.egress.binding_id";
 const POLICY_LABEL: &str = "elixir.live.egress.policy_id";
 const POLICY_KIND_LABEL: &str = "elixir.live.egress.policy_kind";
 const RUNTIME_KIND_LABEL: &str = "elixir.live.egress.runtime_kind";
 const PORTS_LABEL: &str = "elixir.live.egress.exposed_ports";
 const FENCE_LABEL: &str = "elixir.live.control_fencing_token";
 const WORKER_SECRET_PATH: &str = "/run/elixir-live-egress/control.json";
+const WORKER_SECRET_ROOT: &str = "/run/elixir-live-egress";
+const WORKER_UID: u32 = 65_532;
+const WORKER_GID: u32 = 65_532;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveEgressError {
@@ -127,9 +131,9 @@ struct ActiveBinding {
     control_fencing_token: i64,
     policy_id: String,
     policy_revision: i64,
+    gateway_role: &'static str,
     gateway_name: String,
     worker_name: String,
-    secret_dir: PathBuf,
     fetcher: Arc<UpstreamFetcher>,
     _permit: OwnedSemaphorePermit,
 }
@@ -158,6 +162,7 @@ impl std::fmt::Debug for ActiveBinding {
             .field("control_fencing_token", &self.control_fencing_token)
             .field("policy_id", &self.policy_id)
             .field("policy_revision", &self.policy_revision)
+            .field("gateway_role", &self.gateway_role)
             .field("gateway_name", &self.gateway_name)
             .field("worker_name", &self.worker_name)
             .finish_non_exhaustive()
@@ -556,6 +561,13 @@ impl LiveEgressService {
             .await?;
         let secret_dir = self.control_root.join(binding_id.to_string());
         let secret_path = secret_dir.join("control.json");
+        let control_volume_name = control_volume_name(binding_id);
+        let control_volume_labels = control_volume_labels(
+            session.id,
+            binding_id,
+            session.control_fencing_token,
+            policy_id,
+        );
         let worker_name = worker_name(session.id);
         let gateway_name = format!("{worker_name}-vpn");
         let result = async {
@@ -577,17 +589,31 @@ impl LiveEgressService {
                 },
             )
             .map_err(|_| LiveEgressError::InvalidPolicy)?;
-            let container_user = write_control_secret(&secret_dir, &secret_path, &secret)?;
+            write_control_secret(&secret_dir, &secret_path, &secret)?;
+            self.runtime
+                .create_private_file_volume(&PrivateFileVolumeSpec {
+                    name: control_volume_name.clone(),
+                    image: self.config.worker_image.clone(),
+                    source_path: secret_path.to_string_lossy().into_owned(),
+                    file_name: "control.json".to_string(),
+                    owner_uid: WORKER_UID,
+                    owner_gid: WORKER_GID,
+                    labels: control_volume_labels.clone(),
+                })
+                .await
+                .map_err(|_| LiveEgressError::Runtime)?;
+            remove_secret_dir(&secret_dir).await?;
             let topology = self.compile_topology(
                 session,
+                binding_id,
                 &profile,
                 &worker_name,
-                &secret_path,
-                container_user,
+                &control_volume_name,
             )?;
             let (gateway, worker, fetcher, readiness_json) = self
                 .start_and_verify(
                     session,
+                    binding_id,
                     &profile,
                     topology.gateway_spec,
                     topology.protected_app_spec,
@@ -602,9 +628,9 @@ impl LiveEgressService {
                 control_fencing_token: session.control_fencing_token,
                 policy_id: policy_id.to_string(),
                 policy_revision: policy.revision,
+                gateway_role: gateway_role(profile.kind),
                 gateway_name: gateway.name,
                 worker_name: worker.name,
-                secret_dir: secret_dir.clone(),
                 fetcher,
                 _permit: permit,
             })
@@ -613,7 +639,17 @@ impl LiveEgressService {
         match result {
             Ok(binding) => Ok(Some(binding)),
             Err(error) => {
-                let runtime_cleanup = self.cleanup_runtime(&worker_name, &gateway_name).await;
+                let runtime_cleanup = self
+                    .cleanup_runtime(
+                        session.id,
+                        &binding_id.to_string(),
+                        session.control_fencing_token,
+                        policy_id,
+                        &worker_name,
+                        &gateway_name,
+                        gateway_role(profile.kind),
+                    )
+                    .await;
                 let secret_cleanup = remove_secret_dir(&secret_dir).await;
                 if runtime_cleanup.is_err() || secret_cleanup.is_err() {
                     crate::live::metrics::CLEANUP
@@ -644,24 +680,25 @@ impl LiveEgressService {
     fn compile_topology(
         &self,
         session: &SessionRecord,
+        binding_id: Uuid,
         profile: &LiveEgressProfileConfig,
         worker_name: &str,
-        secret_path: &Path,
-        container_user: String,
+        control_volume_name: &str,
     ) -> Result<crate::network::gateway::CompiledGatewayTopology, LiveEgressError> {
         compile_live_topology(
             &self.config,
             session,
+            binding_id,
             profile,
             worker_name,
-            secret_path,
-            container_user,
+            control_volume_name,
         )
     }
 
     async fn start_and_verify(
         &self,
         session: &SessionRecord,
+        binding_id: Uuid,
         profile: &LiveEgressProfileConfig,
         gateway_spec: Option<ContainerSpec>,
         worker_spec: ContainerSpec,
@@ -716,6 +753,7 @@ impl LiveEgressService {
             .ok_or(LiveEgressError::Runtime)?;
         verify_runtime_state(
             session,
+            binding_id,
             profile,
             &worker_state,
             &gateway_state,
@@ -911,7 +949,8 @@ impl LiveEgressService {
             return Err(LiveEgressError::StaleFence);
         }
         let row = sqlx::query(
-            "SELECT id, gateway_container_name, worker_container_name, control_fencing_token
+            "SELECT id, policy_id, mode, gateway_container_name, worker_container_name,
+                    control_fencing_token
              FROM live_egress_bindings WHERE session_id = $1",
         )
         .bind(session_id.to_string())
@@ -921,10 +960,22 @@ impl LiveEgressService {
             if let Some(binding) = self.bindings.get(&session_id) {
                 let worker_name = binding.worker_name.clone();
                 let gateway_name = binding.gateway_name.clone();
-                let secret_dir = binding.secret_dir.clone();
+                let binding_id = binding.binding_id.to_string();
+                let binding_fence = binding.control_fencing_token;
+                let policy_id = binding.policy_id.clone();
+                let gateway_role = binding.gateway_role;
                 drop(binding);
-                self.cleanup_runtime(&worker_name, &gateway_name).await?;
-                remove_secret_dir(&secret_dir).await?;
+                self.cleanup_runtime(
+                    session_id,
+                    &binding_id,
+                    binding_fence,
+                    &policy_id,
+                    &worker_name,
+                    &gateway_name,
+                    gateway_role,
+                )
+                .await?;
+                remove_secret_dir(&self.control_root.join(&binding_id)).await?;
             }
             self.bindings.remove(&session_id);
             self.fallbacks.remove(&session_id);
@@ -935,6 +986,17 @@ impl LiveEgressService {
             return Err(LiveEgressError::StaleFence);
         }
         let binding_id: String = row.try_get("id")?;
+        let policy_id = row
+            .try_get::<Option<String>, _>("policy_id")?
+            .ok_or(LiveEgressError::Cleanup)?;
+        let mode: String = row.try_get("mode")?;
+        let expected_gateway_role = gateway_role_from_mode(&mode).ok_or_else(|| {
+            tracing::error!(
+                binding_id,
+                "Live egress binding has an invalid persisted mode"
+            );
+            LiveEgressError::Cleanup
+        })?;
         let gateway_name: String = row.try_get("gateway_container_name")?;
         let worker_name: String = row.try_get("worker_container_name")?;
         sqlx::query(
@@ -946,13 +1008,17 @@ impl LiveEgressService {
         .bind(control_fencing_token)
         .execute(&self.pool)
         .await?;
-        let secret_dir = self
-            .bindings
-            .get(&session_id)
-            .map(|binding| binding.secret_dir.clone())
-            .unwrap_or_else(|| self.control_root.join(&binding_id));
+        let secret_dir = self.control_root.join(&binding_id);
         if self
-            .cleanup_runtime(&worker_name, &gateway_name)
+            .cleanup_runtime(
+                session_id,
+                &binding_id,
+                binding_fence,
+                &policy_id,
+                &worker_name,
+                &gateway_name,
+                expected_gateway_role,
+            )
             .await
             .is_err()
             || remove_secret_dir(&secret_dir).await.is_err()
@@ -992,22 +1058,115 @@ impl LiveEgressService {
 
     async fn cleanup_runtime(
         &self,
+        session_id: Uuid,
+        binding_id: &str,
+        control_fencing_token: i64,
+        policy_id: &str,
         worker_name: &str,
         gateway_name: &str,
+        expected_gateway_role: &str,
     ) -> Result<(), LiveEgressError> {
-        let mut cleanup_failed = false;
-        for name in [worker_name, gateway_name] {
+        if binding_id.is_empty()
+            || control_fencing_token < 1
+            || policy_id.is_empty()
+            || !is_gateway_role(expected_gateway_role)
+        {
+            return Err(LiveEgressError::Cleanup);
+        }
+        let binding_uuid = binding_id
+            .parse::<Uuid>()
+            .map_err(|_| LiveEgressError::Cleanup)?;
+        let private_volume_name = control_volume_name(binding_uuid);
+        let private_volume_labels =
+            control_volume_labels(session_id, binding_uuid, control_fencing_token, policy_id);
+        let private_volume_present = self
+            .runtime
+            .private_file_volume_owned(&private_volume_name, &private_volume_labels)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    volume = private_volume_name,
+                    error = %error,
+                    "refusing cleanup without exact Live egress control-volume ownership"
+                );
+                LiveEgressError::Cleanup
+            })?;
+        let expected = [
+            (worker_name, "worker"),
+            (gateway_name, expected_gateway_role),
+        ];
+        let mut handles = Vec::with_capacity(expected.len());
+        let mut ownership_failed = false;
+        for (name, role) in expected {
             let handle = match self.runtime.get_container_handle(name).await {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::error!(container = name, error = %error, "Live egress container lookup failed");
-                    cleanup_failed = true;
+                    ownership_failed = true;
                     continue;
                 }
             };
             let Some(handle) = handle else {
                 continue;
             };
+            let state = match self.runtime.describe_container_runtime_state(name).await {
+                Ok(Some(state)) => state,
+                Ok(None) => {
+                    tracing::error!(
+                        container = name,
+                        "Live egress container ownership state is unavailable"
+                    );
+                    ownership_failed = true;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(container = name, error = %error, "Live egress container ownership inspection failed");
+                    ownership_failed = true;
+                    continue;
+                }
+            };
+            if !runtime_owned_by_binding(
+                &state,
+                name,
+                role,
+                session_id,
+                binding_id,
+                control_fencing_token,
+                policy_id,
+            ) {
+                tracing::error!(
+                    container = name,
+                    "refusing to clean a container without exact Live egress binding ownership"
+                );
+                ownership_failed = true;
+                continue;
+            }
+            handles.push(handle);
+        }
+        if ownership_failed {
+            return Err(LiveEgressError::Cleanup);
+        }
+
+        let mut cleanup_failed = false;
+        for handle in handles {
+            let name = handle.name.as_str();
+            match self.runtime.get_container_handle(name).await {
+                Ok(Some(current)) if current.id == handle.id => {}
+                Ok(None) => continue,
+                Ok(Some(_)) => {
+                    tracing::error!(
+                        container = name,
+                        "Live egress container identity changed before cleanup"
+                    );
+                    cleanup_failed = true;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(container = name, error = %error, "Live egress container identity recheck failed");
+                    cleanup_failed = true;
+                    continue;
+                }
+            }
             if let Err(error) = self.runtime.stop_container(&handle).await {
                 tracing::warn!(container = name, error = %error, "Live egress container stop failed; forcing removal");
             }
@@ -1030,10 +1189,22 @@ impl LiveEgressService {
             }
         }
         if cleanup_failed {
-            Err(LiveEgressError::Cleanup)
-        } else {
-            Ok(())
+            return Err(LiveEgressError::Cleanup);
         }
+        if private_volume_present {
+            self.runtime
+                .remove_private_file_volume(&private_volume_name, &private_volume_labels)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        volume = private_volume_name,
+                        error = %error,
+                        "Live egress control-volume cleanup failed"
+                    );
+                    LiveEgressError::Cleanup
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -1048,12 +1219,56 @@ fn worker_name(session_id: Uuid) -> String {
     format!("elixir-live-egress-{}", session_id.simple())
 }
 
+fn control_volume_name(binding_id: Uuid) -> String {
+    format!("elixir_live_egress_secret_{}", binding_id.simple())
+}
+
+fn control_volume_labels(
+    session_id: Uuid,
+    binding_id: Uuid,
+    control_fencing_token: i64,
+    policy_id: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
+        (ROLE_LABEL.to_string(), "control_secret".to_string()),
+        (SESSION_LABEL.to_string(), session_id.to_string()),
+        (BINDING_LABEL.to_string(), binding_id.to_string()),
+        (POLICY_LABEL.to_string(), policy_id.to_string()),
+        (FENCE_LABEL.to_string(), control_fencing_token.to_string()),
+    ])
+}
+
 fn profile_kind(kind: LiveEgressProfileKind) -> &'static str {
     match kind {
         LiveEgressProfileKind::Warp => "warp",
         LiveEgressProfileKind::Wireguard => "wireguard",
         LiveEgressProfileKind::Openvpn => "openvpn",
     }
+}
+
+fn gateway_role(kind: LiveEgressProfileKind) -> &'static str {
+    match kind {
+        LiveEgressProfileKind::Warp => "warp_gateway",
+        LiveEgressProfileKind::Wireguard => "wireguard_gateway",
+        LiveEgressProfileKind::Openvpn => "openvpn_gateway",
+    }
+}
+
+fn gateway_role_from_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        "warp" => Some("warp_gateway"),
+        "wireguard" => Some("wireguard_gateway"),
+        "openvpn" => Some("openvpn_gateway"),
+        _ => None,
+    }
+}
+
+fn is_gateway_role(role: &str) -> bool {
+    matches!(
+        role,
+        "warp_gateway" | "wireguard_gateway" | "openvpn_gateway"
+    )
 }
 
 fn egress_error_label(error: &LiveEgressError) -> &'static str {
@@ -1114,15 +1329,16 @@ fn gateway_runtime(profile: &LiveEgressProfileConfig) -> Result<GatewayRuntime, 
 fn compile_live_topology(
     config: &LiveEgressConfig,
     session: &SessionRecord,
+    binding_id: Uuid,
     profile: &LiveEgressProfileConfig,
     worker_name: &str,
-    secret_path: &Path,
-    container_user: String,
+    control_volume_name: &str,
 ) -> Result<crate::network::gateway::CompiledGatewayTopology, LiveEgressError> {
     let mut labels = HashMap::new();
     labels.insert(ELIXIR_MANAGED_LABEL.to_string(), "true".to_string());
     labels.insert(ROLE_LABEL.to_string(), "worker".to_string());
     labels.insert(SESSION_LABEL.to_string(), session.id.to_string());
+    labels.insert(BINDING_LABEL.to_string(), binding_id.to_string());
     labels.insert(POLICY_LABEL.to_string(), profile.id.clone());
     labels.insert(
         FENCE_LABEL.to_string(),
@@ -1145,9 +1361,9 @@ fn compile_live_topology(
             },
         ],
         volumes: vec![VolumeMount {
-            source_kind: VolumeMountSourceKind::Bind,
-            host_path: secret_path.to_string_lossy().to_string(),
-            container_path: WORKER_SECRET_PATH.to_string(),
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: control_volume_name.to_string(),
+            container_path: WORKER_SECRET_ROOT.to_string(),
             read_only: true,
         }],
         ports: vec![PortMapping {
@@ -1163,7 +1379,7 @@ fn compile_live_topology(
         devices: Vec::new(),
         sysctls: HashMap::new(),
         security: ContainerSecurityOptions {
-            user: Some(container_user),
+            user: Some(format!("{WORKER_UID}:{WORKER_GID}")),
             read_only_rootfs: true,
             no_new_privileges: true,
             tmpfs: vec![ContainerTmpfsMount {
@@ -1210,6 +1426,7 @@ fn compile_live_topology(
 
 fn verify_runtime_state(
     session: &SessionRecord,
+    binding_id: Uuid,
     profile: &LiveEgressProfileConfig,
     worker: &crate::runtime::model::ContainerRuntimeState,
     gateway: &crate::runtime::model::ContainerRuntimeState,
@@ -1218,9 +1435,26 @@ fn verify_runtime_state(
     control_port: u16,
 ) -> Result<(), LiveEgressError> {
     let expected_network = format!("container:{gateway_name}");
-    let labels_match = worker.labels.get(SESSION_LABEL) == Some(&session.id.to_string())
-        && worker.labels.get(POLICY_LABEL) == Some(&profile.id)
-        && worker.labels.get(FENCE_LABEL) == Some(&session.control_fencing_token.to_string());
+    let binding_id = binding_id.to_string();
+    let expected_worker_name = worker_name(session.id);
+    let worker_labels_match = runtime_owned_by_binding(
+        worker,
+        &expected_worker_name,
+        "worker",
+        session.id,
+        &binding_id,
+        session.control_fencing_token,
+        &profile.id,
+    );
+    let gateway_labels_match = runtime_owned_by_binding(
+        gateway,
+        gateway_name,
+        gateway_role(profile.kind),
+        session.id,
+        &binding_id,
+        session.control_fencing_token,
+        &profile.id,
+    );
     let security = &worker.security;
     let expected_memory = expected_security
         .memory_limit_mb
@@ -1239,14 +1473,45 @@ fn verify_runtime_state(
             && port.protocol == "tcp"
             && port.host_ip.as_deref() == Some("127.0.0.1")
     });
+    let expected_control_volume =
+        control_volume_name(binding_id.parse().map_err(|_| LiveEgressError::Runtime)?);
+    let control_volume_match = worker.mounts.iter().any(|mount| {
+        mount.mount_type == "volume"
+            && mount.name.as_deref() == Some(expected_control_volume.as_str())
+            && mount.destination == WORKER_SECRET_ROOT
+            && mount.read_only
+    });
     if worker.network_mode.as_deref() != Some(expected_network.as_str())
-        || !labels_match
+        || !worker_labels_match
+        || !gateway_labels_match
         || !security_match
+        || !control_volume_match
         || !port_match
     {
         return Err(LiveEgressError::Runtime);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_owned_by_binding(
+    state: &crate::runtime::model::ContainerRuntimeState,
+    expected_name: &str,
+    expected_role: &str,
+    session_id: Uuid,
+    binding_id: &str,
+    control_fencing_token: i64,
+    policy_id: &str,
+) -> bool {
+    let session_id = session_id.to_string();
+    let control_fencing_token = control_fencing_token.to_string();
+    state.name == expected_name
+        && state.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) == Some("true")
+        && state.labels.get(ROLE_LABEL).map(String::as_str) == Some(expected_role)
+        && state.labels.get(SESSION_LABEL).map(String::as_str) == Some(session_id.as_str())
+        && state.labels.get(BINDING_LABEL).map(String::as_str) == Some(binding_id)
+        && state.labels.get(POLICY_LABEL).map(String::as_str) == Some(policy_id)
+        && state.labels.get(FENCE_LABEL).map(String::as_str) == Some(control_fencing_token.as_str())
 }
 
 async fn wait_running(
@@ -1327,7 +1592,7 @@ fn write_control_secret(
     directory: &Path,
     path: &Path,
     secret: &ControlSecretDocument,
-) -> Result<String, LiveEgressError> {
+) -> Result<(), LiveEgressError> {
     let mut directory_builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -1354,7 +1619,7 @@ fn write_control_secret(
     std::fs::File::open(directory)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| LiveEgressError::Runtime)?;
-    container_identity(path)
+    container_identity(path).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -1406,16 +1671,32 @@ mod tests {
     #[derive(Default)]
     struct CleanupRuntime {
         containers: std::sync::Mutex<HashMap<String, ContainerHandle>>,
+        states: std::sync::Mutex<HashMap<String, crate::runtime::model::ContainerRuntimeState>>,
+        private_volumes: std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
+        stop_calls: std::sync::Mutex<Vec<String>>,
+        remove_calls: std::sync::Mutex<Vec<String>>,
+        volume_remove_calls: std::sync::Mutex<Vec<String>>,
         remove_fails: StdAtomicBool,
     }
 
     impl CleanupRuntime {
-        fn insert(&self, name: &str) {
+        fn insert(&self, name: &str, labels: HashMap<String, String>) {
             self.containers.lock().expect("container lock").insert(
                 name.to_string(),
                 ContainerHandle {
                     id: format!("id-{name}"),
                     name: name.to_string(),
+                },
+            );
+            self.states.lock().expect("state lock").insert(
+                name.to_string(),
+                crate::runtime::model::ContainerRuntimeState {
+                    name: name.to_string(),
+                    network_mode: None,
+                    labels,
+                    mounts: Vec::new(),
+                    published_ports: Vec::new(),
+                    security: Default::default(),
                 },
             );
         }
@@ -1436,7 +1717,70 @@ mod tests {
                 .lock()
                 .expect("container lock")
                 .insert(handle.name.clone(), handle.clone());
+            self.states.lock().expect("state lock").insert(
+                handle.name.clone(),
+                crate::runtime::model::ContainerRuntimeState {
+                    name: handle.name.clone(),
+                    network_mode: spec.network_mode.clone(),
+                    labels: spec.labels.clone(),
+                    mounts: Vec::new(),
+                    published_ports: Vec::new(),
+                    security: Default::default(),
+                },
+            );
             Ok(handle)
+        }
+
+        async fn create_private_file_volume(
+            &self,
+            spec: &PrivateFileVolumeSpec,
+        ) -> anyhow::Result<()> {
+            let mut volumes = self.private_volumes.lock().expect("private volume lock");
+            if volumes.contains_key(&spec.name) {
+                anyhow::bail!("private volume already exists");
+            }
+            volumes.insert(spec.name.clone(), spec.labels.clone());
+            Ok(())
+        }
+
+        async fn private_file_volume_owned(
+            &self,
+            name: &str,
+            required_labels: &HashMap<String, String>,
+        ) -> anyhow::Result<bool> {
+            let volumes = self.private_volumes.lock().expect("private volume lock");
+            let Some(labels) = volumes.get(name) else {
+                return Ok(false);
+            };
+            if required_labels
+                .iter()
+                .any(|(key, value)| labels.get(key) != Some(value))
+            {
+                anyhow::bail!("private volume ownership mismatch");
+            }
+            Ok(true)
+        }
+
+        async fn remove_private_file_volume(
+            &self,
+            name: &str,
+            required_labels: &HashMap<String, String>,
+        ) -> anyhow::Result<()> {
+            if !self
+                .private_file_volume_owned(name, required_labels)
+                .await?
+            {
+                return Ok(());
+            }
+            self.volume_remove_calls
+                .lock()
+                .expect("private volume remove call lock")
+                .push(name.to_string());
+            self.private_volumes
+                .lock()
+                .expect("private volume lock")
+                .remove(name);
+            Ok(())
         }
 
         async fn get_container_handle(
@@ -1455,7 +1799,11 @@ mod tests {
             Ok(())
         }
 
-        async fn stop_container(&self, _handle: &ContainerHandle) -> anyhow::Result<()> {
+        async fn stop_container(&self, handle: &ContainerHandle) -> anyhow::Result<()> {
+            self.stop_calls
+                .lock()
+                .expect("stop call lock")
+                .push(handle.name.clone());
             Ok(())
         }
 
@@ -1468,6 +1816,7 @@ mod tests {
                 .lock()
                 .expect("container lock")
                 .remove(&handle.name);
+            self.states.lock().expect("state lock").remove(&handle.name);
             let renamed = ContainerHandle {
                 id: handle.id.clone(),
                 name: new_name.to_string(),
@@ -1480,6 +1829,10 @@ mod tests {
         }
 
         async fn remove_container(&self, handle: &ContainerHandle) -> anyhow::Result<()> {
+            self.remove_calls
+                .lock()
+                .expect("remove call lock")
+                .push(handle.name.clone());
             if self.remove_fails.load(StdOrdering::Acquire) {
                 anyhow::bail!("injected container removal failure");
             }
@@ -1487,6 +1840,7 @@ mod tests {
                 .lock()
                 .expect("container lock")
                 .remove(&handle.name);
+            self.states.lock().expect("state lock").remove(&handle.name);
             Ok(())
         }
 
@@ -1509,6 +1863,18 @@ mod tests {
                 running: true,
                 health: Some("healthy".to_string()),
             })
+        }
+
+        async fn describe_container_runtime_state(
+            &self,
+            container_name: &str,
+        ) -> anyhow::Result<Option<crate::runtime::model::ContainerRuntimeState>> {
+            Ok(self
+                .states
+                .lock()
+                .expect("state lock")
+                .get(container_name)
+                .cloned())
         }
 
         async fn read_container_file(
@@ -1546,13 +1912,55 @@ mod tests {
         }
     }
 
+    fn cleanup_labels(
+        session_id: Uuid,
+        binding_id: &str,
+        control_fencing_token: i64,
+        policy_id: &str,
+        role: &str,
+    ) -> HashMap<String, String> {
+        HashMap::from([
+            (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
+            (ROLE_LABEL.to_string(), role.to_string()),
+            (SESSION_LABEL.to_string(), session_id.to_string()),
+            (BINDING_LABEL.to_string(), binding_id.to_string()),
+            (POLICY_LABEL.to_string(), policy_id.to_string()),
+            (FENCE_LABEL.to_string(), control_fencing_token.to_string()),
+        ])
+    }
+
     #[tokio::test]
     async fn n11_cleanup_runtime_requires_verified_container_absence() {
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
         let runtime = Arc::new(CleanupRuntime::default());
-        runtime.insert("worker");
-        runtime.insert("gateway");
+        let session_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4().to_string();
+        let binding_uuid = binding_id.parse::<Uuid>().expect("binding UUID");
+        let policy_id = "protected-policy";
+        let fence = 7;
+        runtime
+            .private_volumes
+            .lock()
+            .expect("private volume lock")
+            .insert(
+                control_volume_name(binding_uuid),
+                control_volume_labels(session_id, binding_uuid, fence, policy_id),
+            );
+        runtime.insert(
+            "worker",
+            cleanup_labels(session_id, &binding_id, fence, policy_id, "worker"),
+        );
+        runtime.insert(
+            "gateway",
+            cleanup_labels(
+                session_id,
+                &binding_id,
+                fence,
+                policy_id,
+                "wireguard_gateway",
+            ),
+        );
         runtime.remove_fails.store(true, StdOrdering::Release);
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = LiveEgressConfig {
@@ -1569,12 +1977,41 @@ mod tests {
         let service =
             LiveEgressService::new(pool, runtime.clone(), config, audit).expect("egress service");
 
-        assert!(service.cleanup_runtime("worker", "gateway").await.is_err());
+        assert!(
+            service
+                .cleanup_runtime(
+                    session_id,
+                    &binding_id,
+                    fence,
+                    policy_id,
+                    "worker",
+                    "gateway",
+                    "wireguard_gateway",
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(runtime.containers.lock().expect("container lock").len(), 2);
+        assert_eq!(
+            runtime
+                .private_volumes
+                .lock()
+                .expect("private volume lock")
+                .len(),
+            1
+        );
 
         runtime.remove_fails.store(false, StdOrdering::Release);
         service
-            .cleanup_runtime("worker", "gateway")
+            .cleanup_runtime(
+                session_id,
+                &binding_id,
+                fence,
+                policy_id,
+                "worker",
+                "gateway",
+                "wireguard_gateway",
+            )
             .await
             .expect("verified cleanup");
         assert!(
@@ -1582,6 +2019,173 @@ mod tests {
                 .containers
                 .lock()
                 .expect("container lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .private_volumes
+                .lock()
+                .expect("private volume lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn n11_cleanup_runtime_never_mutates_a_foreign_name_collision() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
+        let runtime = Arc::new(CleanupRuntime::default());
+        let session_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4().to_string();
+        let policy_id = "protected-policy";
+        let fence = 11;
+        runtime.insert(
+            "worker",
+            cleanup_labels(
+                session_id,
+                &Uuid::new_v4().to_string(),
+                fence,
+                policy_id,
+                "worker",
+            ),
+        );
+        runtime.insert(
+            "gateway",
+            cleanup_labels(
+                session_id,
+                &binding_id,
+                fence,
+                policy_id,
+                "wireguard_gateway",
+            ),
+        );
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = LiveEgressConfig {
+            control_root: temporary
+                .path()
+                .join("control")
+                .to_string_lossy()
+                .into_owned(),
+            ..LiveEgressConfig::default()
+        };
+        let audit = Arc::new(LiveAuditChain::new(
+            crate::live::admin::LiveAuditKey::new("n11-ownership", [23_u8; 32]).expect("audit key"),
+        ));
+        let service =
+            LiveEgressService::new(pool, runtime.clone(), config, audit).expect("egress service");
+
+        assert!(
+            service
+                .cleanup_runtime(
+                    session_id,
+                    &binding_id,
+                    fence,
+                    policy_id,
+                    "worker",
+                    "gateway",
+                    "wireguard_gateway",
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.containers.lock().expect("container lock").len(), 2);
+        assert!(
+            runtime
+                .stop_calls
+                .lock()
+                .expect("stop call lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .remove_calls
+                .lock()
+                .expect("remove call lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn n11_cleanup_runtime_never_mutates_with_a_foreign_control_volume() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
+        let runtime = Arc::new(CleanupRuntime::default());
+        let session_id = Uuid::new_v4();
+        let binding_uuid = Uuid::new_v4();
+        let binding_id = binding_uuid.to_string();
+        let policy_id = "protected-policy";
+        let fence = 13;
+        runtime.insert(
+            "worker",
+            cleanup_labels(session_id, &binding_id, fence, policy_id, "worker"),
+        );
+        runtime.insert(
+            "gateway",
+            cleanup_labels(
+                session_id,
+                &binding_id,
+                fence,
+                policy_id,
+                "wireguard_gateway",
+            ),
+        );
+        runtime
+            .private_volumes
+            .lock()
+            .expect("private volume lock")
+            .insert(
+                control_volume_name(binding_uuid),
+                control_volume_labels(session_id, Uuid::new_v4(), fence, policy_id),
+            );
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = LiveEgressConfig {
+            control_root: temporary
+                .path()
+                .join("control")
+                .to_string_lossy()
+                .into_owned(),
+            ..LiveEgressConfig::default()
+        };
+        let audit = Arc::new(LiveAuditChain::new(
+            crate::live::admin::LiveAuditKey::new("n11-volume-ownership", [29_u8; 32])
+                .expect("audit key"),
+        ));
+        let service =
+            LiveEgressService::new(pool, runtime.clone(), config, audit).expect("egress service");
+
+        assert!(
+            service
+                .cleanup_runtime(
+                    session_id,
+                    &binding_id,
+                    fence,
+                    policy_id,
+                    "worker",
+                    "gateway",
+                    "wireguard_gateway",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .stop_calls
+                .lock()
+                .expect("stop call lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .remove_calls
+                .lock()
+                .expect("remove call lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .volume_remove_calls
+                .lock()
+                .expect("private volume remove call lock")
                 .is_empty()
         );
     }
@@ -1675,14 +2279,15 @@ mod tests {
             ..LiveEgressProfileConfig::default()
         };
         let worker = worker_name(session.id);
-        let secret = Path::new("/run/elixir/live/control.json");
+        let binding_id = Uuid::new_v4();
+        let secret_volume = control_volume_name(binding_id);
         let topology = compile_live_topology(
             &config,
             &session,
+            binding_id,
             &profile,
             &worker,
-            secret,
-            "65532:65532".to_string(),
+            &secret_volume,
         )
         .expect("compile isolated Live topology");
 
@@ -1690,6 +2295,7 @@ mod tests {
         let app = topology.protected_app_spec;
         let expected_namespace = format!("container:{}", gateway.name);
         let expected_session_id = session.id.to_string();
+        let expected_binding_id = binding_id.to_string();
         assert_eq!(gateway.name, format!("{worker}-vpn"));
         assert_eq!(app.name, worker);
         assert_eq!(
@@ -1698,6 +2304,12 @@ mod tests {
         );
         assert!(app.ports.is_empty());
         assert!(app.aliases.is_empty());
+        assert!(app.volumes.iter().any(|volume| {
+            volume.source_kind == VolumeMountSourceKind::NamedVolume
+                && volume.host_path == secret_volume
+                && volume.container_path == WORKER_SECRET_ROOT
+                && volume.read_only
+        }));
         assert_eq!(gateway.ports.len(), 1);
         assert_eq!(gateway.ports[0].container_port, 18_080);
         assert_eq!(gateway.ports[0].host_port, Some(0));
@@ -1710,7 +2322,7 @@ mod tests {
         );
         assert_eq!(app.image, "elixir-live-egress-worker:test");
         assert_eq!(app.volumes.len(), 1);
-        assert_eq!(app.volumes[0].container_path, WORKER_SECRET_PATH);
+        assert_eq!(app.volumes[0].container_path, WORKER_SECRET_ROOT);
         assert!(app.volumes[0].read_only);
         assert_eq!(app.security.user.as_deref(), Some("65532:65532"));
         assert!(app.security.read_only_rootfs);
@@ -1727,6 +2339,14 @@ mod tests {
         assert_eq!(
             app.labels.get(SESSION_LABEL).map(String::as_str),
             Some(expected_session_id.as_str())
+        );
+        assert_eq!(
+            app.labels.get(BINDING_LABEL).map(String::as_str),
+            Some(expected_binding_id.as_str())
+        );
+        assert_eq!(
+            gateway.labels.get(BINDING_LABEL).map(String::as_str),
+            Some(expected_binding_id.as_str())
         );
         for spec in [&gateway, &app] {
             assert!(

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::runtime::model::{
-    ContainerHandle, ContainerRuntimeState, ContainerSpec, ContainerState,
+    ContainerHandle, ContainerRuntimeState, ContainerSpec, ContainerState, PrivateFileVolumeSpec,
 };
 
 pub mod docker;
@@ -66,6 +66,26 @@ pub fn deployment_id_for_storage_root(storage_root: &str) -> String {
 pub trait RuntimeManager: Send + Sync {
     async fn ensure_network(&self, name: &str) -> anyhow::Result<()>;
     async fn ensure_container(&self, spec: &ContainerSpec) -> anyhow::Result<ContainerHandle>;
+    async fn create_private_file_volume(
+        &self,
+        _spec: &PrivateFileVolumeSpec,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("runtime does not support private file volumes")
+    }
+    async fn private_file_volume_owned(
+        &self,
+        _name: &str,
+        _required_labels: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("runtime does not support private file volumes")
+    }
+    async fn remove_private_file_volume(
+        &self,
+        _name: &str,
+        _required_labels: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("runtime does not support private file volumes")
+    }
     async fn get_container_handle(&self, name: &str) -> anyhow::Result<Option<ContainerHandle>>;
     async fn start_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
     async fn stop_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;

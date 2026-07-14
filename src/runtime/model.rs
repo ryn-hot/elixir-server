@@ -84,6 +84,17 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PrivateFileVolumeSpec {
+    pub name: String,
+    pub image: String,
+    pub source_path: String,
+    pub file_name: String,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub labels: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeMountSourceKind {
