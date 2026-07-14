@@ -99,6 +99,8 @@ pub enum LiveRemuxError {
     ResourceKindMismatch,
     #[error("Live remux byte range is invalid")]
     RangeRejected,
+    #[error("Live remux cleanup is incomplete")]
+    CleanupIncomplete,
 }
 
 impl From<LiveRelayError> for LiveRemuxError {
@@ -292,6 +294,14 @@ impl RemuxJob {
         self.completed.store(true, Ordering::Release);
         self.completion.notify_waiters();
     }
+
+    fn ensure_cleanup_complete(&self) -> Result<(), LiveRemuxError> {
+        if self.cleanup_succeeded.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(LiveRemuxError::CleanupIncomplete)
+        }
+    }
 }
 
 impl LiveRemuxService {
@@ -471,7 +481,7 @@ impl LiveRemuxService {
                 return Err(LiveRemuxError::StaleControlFence);
             }
         }
-        self.cancel_session(session.id).await;
+        self.cancel_session(session.id).await?;
         if self.sessions.contains_key(&session.id) {
             return Err(LiveRemuxError::Unavailable);
         }
@@ -873,7 +883,7 @@ impl LiveRemuxService {
         Ok(())
     }
 
-    pub async fn end_session(&self, session_id: Uuid) {
+    pub async fn end_session(&self, session_id: Uuid) -> Result<(), LiveRemuxError> {
         let job = self
             .sessions
             .get(&session_id)
@@ -886,11 +896,13 @@ impl LiveRemuxService {
             ))
             .await;
             self.finish_job_cleanup(&job).await;
+            job.ensure_cleanup_complete()?;
         }
+        Ok(())
     }
 
-    async fn cancel_session(&self, session_id: Uuid) {
-        self.end_session(session_id).await;
+    async fn cancel_session(&self, session_id: Uuid) -> Result<(), LiveRemuxError> {
+        self.end_session(session_id).await
     }
 
     pub async fn cancel_all(&self) {
@@ -909,6 +921,12 @@ impl LiveRemuxService {
             ))
             .await;
             self.finish_job_cleanup(&job).await;
+            if !job.cleanup_succeeded.load(Ordering::Acquire) {
+                tracing::error!(
+                    session_id = %job.session_id,
+                    "Live remux cleanup remained incomplete during cancellation"
+                );
+            }
         }
     }
 
@@ -941,7 +959,13 @@ impl LiveRemuxService {
             .collect::<Vec<_>>();
         for job in jobs {
             if self.validate_job_authority(&job).await.is_err() {
-                self.end_session(job.session_id).await;
+                if let Err(error) = self.end_session(job.session_id).await {
+                    tracing::error!(
+                        session_id = %job.session_id,
+                        error = %error,
+                        "Live remux stale-job cleanup failed"
+                    );
+                }
             }
         }
     }
@@ -1873,8 +1897,13 @@ mod unit_tests {
 
         job.mark_completed();
         assert_eq!(job.diagnostic_state(&session), Some("failed"));
+        assert_eq!(
+            job.ensure_cleanup_complete(),
+            Err(LiveRemuxError::CleanupIncomplete)
+        );
         job.cleanup_succeeded.store(true, Ordering::Release);
         assert_eq!(job.diagnostic_state(&session), Some("completed"));
+        assert_eq!(job.ensure_cleanup_complete(), Ok(()));
 
         session.control_fencing_token = 2;
         assert_eq!(job.diagnostic_state(&session), None);

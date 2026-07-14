@@ -609,7 +609,7 @@ pub async fn terminate_session(
             )
             .await
             .map_err(map_session_admin_error)?;
-        end_delivery_runtime(&state, session_id).await;
+        super::sessions::end_delivery_runtime(&state, session_id, fence).await?;
         Ok(admin_response(StatusCode::OK, mutation, request_id))
     }
     .await;
@@ -1362,26 +1362,6 @@ async fn key_admin_service(state: &AppState) -> Result<LiveKeyAdminService, Live
         state.live.admin_audit().ok_or_else(service_unavailable)?,
         state.secrets.clone(),
     ))
-}
-
-async fn end_delivery_runtime(state: &AppState, session_id: Uuid) {
-    if let Some(relay) = state.live.relay_service() {
-        relay.end_session(session_id);
-    }
-    if let Some(remux) = state.live.remux_service() {
-        remux.end_session(session_id).await;
-    }
-    if let (Some(egress), Some(fence)) = (
-        state.live.egress_service(),
-        state.live.control_fencing_token().await,
-    ) && let Err(error) = egress.end_session(session_id, fence).await
-    {
-        tracing::error!(
-            session_id = %session_id,
-            error = %error,
-            "Live administrative egress cleanup failed"
-        );
-    }
 }
 
 fn service_unavailable() -> LiveHttpRejection {

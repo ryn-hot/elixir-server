@@ -690,7 +690,7 @@ pub async fn heartbeat(
             }
         };
         if request.player_state == PlayerState::Ended {
-            end_delivery_runtime(&state, session.id).await;
+            end_delivery_runtime(&state, session.id, fence).await?;
         }
         let detail = detail_from_stored(&state, &updated, &stored, now).await?;
         Ok(no_store(Json(detail).into_response()))
@@ -1043,7 +1043,7 @@ pub async fn end(
             )
             .await
             .map_err(map_repository_error)?;
-        end_delivery_runtime(&state, session.id).await;
+        end_delivery_runtime(&state, session.id, fence).await?;
         refresh_live_gauges(&state).await;
         crate::live::metrics::CLEANUP
             .with_label_values(&["session", "completed"])
@@ -1577,7 +1577,7 @@ async fn exhaust_recovery(
         )
         .await
         .map_err(map_repository_error)?;
-    end_delivery_runtime(state, session.id).await;
+    end_delivery_runtime(state, session.id, session.control_fencing_token).await?;
     Err(recovery_exhausted())
 }
 
@@ -1589,7 +1589,7 @@ async fn replace_delivery_runtime(
     fence: i64,
     now: DateTime<Utc>,
 ) -> Result<(), LiveHttpRejection> {
-    end_delivery_runtime(state, session.id).await;
+    end_delivery_runtime(state, session.id, fence).await?;
     if let Err(rejection) = admit_delivery_runtime(state, session, actor).await {
         let termination = repository
             .terminate(
@@ -1611,9 +1611,10 @@ async fn replace_delivery_runtime(
                 now,
             )
             .await;
-        end_delivery_runtime(state, session.id).await;
+        let cleanup = end_delivery_runtime(state, session.id, fence).await;
         refresh_live_gauges(state).await;
         termination.map_err(map_repository_error)?;
+        cleanup?;
         return Err(rejection);
     }
     refresh_live_gauges(state).await;
@@ -1665,23 +1666,42 @@ async fn admit_delivery_runtime(
     }
 }
 
-async fn end_delivery_runtime(state: &AppState, session_id: Uuid) {
+pub(super) async fn end_delivery_runtime(
+    state: &AppState,
+    session_id: Uuid,
+    control_fencing_token: i64,
+) -> Result<(), LiveHttpRejection> {
+    let mut cleanup_failed = false;
     if let Some(relay) = state.live.relay_service() {
         relay.end_session(session_id);
     }
     if let Some(remux) = state.live.remux_service() {
-        remux.end_session(session_id).await;
+        if let Err(error) = remux.end_session(session_id).await {
+            cleanup_failed = true;
+            tracing::error!(
+                session_id = %session_id,
+                error = %error,
+                "Live remux session cleanup failed"
+            );
+        }
     }
-    if let (Some(egress), Some(fence)) = (
-        state.live.egress_service(),
-        state.live.control_fencing_token().await,
-    ) && let Err(error) = egress.end_session(session_id, fence).await
-    {
-        tracing::error!(
-            session_id = %session_id,
-            error = %error,
-            "Live egress session cleanup failed"
-        );
+    if let Some(egress) = state.live.egress_service() {
+        if let Err(error) = egress.end_session(session_id, control_fencing_token).await {
+            cleanup_failed = true;
+            tracing::error!(
+                session_id = %session_id,
+                error = %error,
+                "Live egress session cleanup failed"
+            );
+        }
+    }
+    if cleanup_failed {
+        crate::live::metrics::CLEANUP
+            .with_label_values(&["session", "failed"])
+            .inc();
+        Err(cleanup_incomplete())
+    } else {
+        Ok(())
     }
 }
 
@@ -1841,8 +1861,9 @@ async fn ensure_delivery_ready(
                 now,
             )
             .await;
-        end_delivery_runtime(state, session.id).await;
+        let cleanup = end_delivery_runtime(state, session.id, session.control_fencing_token).await;
         refresh_live_gauges(state).await;
+        cleanup?;
         return Err(rejection);
     }
     for _ in 0..6 {
@@ -2872,6 +2893,15 @@ fn control_unavailable() -> LiveHttpRejection {
         StatusCode::SERVICE_UNAVAILABLE,
         "LIVE_CONTROL_LEASE_UNAVAILABLE",
         "The Live control service is unavailable.",
+        true,
+    )
+}
+
+fn cleanup_incomplete() -> LiveHttpRejection {
+    LiveHttpRejection::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "LIVE_CLEANUP_INCOMPLETE",
+        "The Live session ended, but delivery cleanup is incomplete.",
         true,
     )
 }

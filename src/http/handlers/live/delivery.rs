@@ -491,7 +491,7 @@ pub(super) fn map_remux_error(error: LiveRemuxError) -> LiveHttpRejection {
             "Live remux storage capacity is unavailable.",
             true,
         ),
-        LiveRemuxError::Unavailable => LiveHttpRejection::new(
+        LiveRemuxError::Unavailable | LiveRemuxError::CleanupIncomplete => LiveHttpRejection::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "LIVE_REMUX_UNAVAILABLE",
             "The Live remux service is unavailable.",

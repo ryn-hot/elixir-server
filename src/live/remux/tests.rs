@@ -401,7 +401,7 @@ async fn real_copy_remux_mode(protocol: SessionProtocol, mode: RemuxFixtureMode)
                     Utc::now(),
                 )
                 .await?;
-            remux.end_session(restarted.id).await;
+            remux.end_session(restarted.id).await?;
             assert_eq!(remux.available_capacity(), 1);
             assert!(
                 tokio::fs::read_dir(&remux_root)
@@ -491,7 +491,7 @@ async fn real_copy_remux_mode(protocol: SessionProtocol, mode: RemuxFixtureMode)
             Utc::now(),
         )
         .await?;
-    remux.end_session(bound.id).await;
+    remux.end_session(bound.id).await?;
     let snapshot = remux.snapshot().await;
     assert_eq!(snapshot.active_jobs, 0);
     assert_eq!(snapshot.available_capacity, 1);
