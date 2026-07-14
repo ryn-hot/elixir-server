@@ -862,7 +862,7 @@ pub async fn create_subscription(
             candidate_search_after,
             status,
             active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'active', 1)",
     )
     .bind(subscription_id.to_string())
     .bind(data.media_type.as_str())
@@ -959,23 +959,23 @@ pub async fn update_subscription(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_subscriptions
-         SET monitor_policy = ?,
-             request_mode = ?,
-             idempotency_key = ?,
-             request_scope = ?,
-             scope_json = ?,
-             metadata_policy = ?,
-             completion_policy = ?,
-             route_policy = ?,
-             source_provider_id = ?,
-             release_delay_seconds = ?,
-             quality_profile_json = ?,
-             metadata_refresh_after = ?,
-             candidate_search_after = ?,
-             status = ?,
-             active = ?,
+         SET monitor_policy = $1,
+             request_mode = $2,
+             idempotency_key = $3,
+             request_scope = $4,
+             scope_json = $5,
+             metadata_policy = $6,
+             completion_policy = $7,
+             route_policy = $8,
+             source_provider_id = $9,
+             release_delay_seconds = $10,
+             quality_profile_json = $11,
+             metadata_refresh_after = $12,
+             candidate_search_after = $13,
+             status = $14,
+             active = $15,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $16",
     )
     .bind(monitor_policy.as_str())
     .bind(request_mode.as_str())
@@ -996,7 +996,7 @@ pub async fn update_subscription(
     .bind(db_datetime_string(metadata_refresh_after))
     .bind(db_datetime_string(candidate_search_after))
     .bind(status.as_str())
-    .bind(active)
+    .bind(if active { 1_i64 } else { 0_i64 })
     .bind(subscription_id.to_string())
     .execute(pool)
     .await
@@ -1013,9 +1013,9 @@ pub async fn update_subscription_external_ids(
     let external_ids_json = external_ids_json(Some(external_ids))?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_subscriptions
-         SET external_ids_json = ?,
+         SET external_ids_json = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $2",
     )
     .bind(external_ids_json.as_deref())
     .bind(subscription_id.to_string())
@@ -1044,10 +1044,10 @@ pub async fn stop_subscription_tracking(
     let target_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
          SET state = 'excluded',
-             state_reason = ?,
+             state_reason = $1,
              next_search_after = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $2
            AND state IN ('pending', 'searching', 'blocked', 'submitted')",
     )
     .bind(reason)
@@ -1059,13 +1059,13 @@ pub async fn stop_subscription_tracking(
     let coverage_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_coverage
          SET state = 'rejected',
-             reason = ?,
+             reason = $1,
              verified_by = 'user_cancelled',
              updated_at = CURRENT_TIMESTAMP
          WHERE release_id IN (
              SELECT release_id
              FROM acquisition_releases
-             WHERE subscription_id = ?
+             WHERE subscription_id = $2
          )
            AND state NOT IN ('imported', 'rejected')",
     )
@@ -1078,14 +1078,14 @@ pub async fn stop_subscription_tracking(
     let job_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
          SET state = 'cancelled',
-             state_reason = ?,
+             state_reason = $1,
              active = 0,
              completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
              updated_at = CURRENT_TIMESTAMP
          WHERE release_id IN (
              SELECT release_id
              FROM acquisition_releases
-             WHERE subscription_id = ?
+             WHERE subscription_id = $2
          )
            AND state NOT IN ('completed', 'cancelled')",
     )
@@ -1098,9 +1098,9 @@ pub async fn stop_subscription_tracking(
     let release_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
          SET state = 'cancelled',
-             state_reason = ?,
+             state_reason = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $2
            AND state NOT IN ('completed', 'cancelled')",
     )
     .bind(reason)
@@ -1116,7 +1116,7 @@ pub async fn stop_subscription_tracking(
              candidate_search_after = CURRENT_TIMESTAMP,
              metadata_refresh_after = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .execute(pool)
@@ -1173,10 +1173,10 @@ pub async fn list_subscriptions(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM acquisition_subscriptions
-             WHERE active = ?
+             WHERE active = $1
              ORDER BY created_at DESC",
         )
-        .bind(active)
+        .bind(if active { 1_i64 } else { 0_i64 })
         .fetch_all(pool)
         .await?
     } else {
@@ -1251,7 +1251,7 @@ pub async fn get_subscription(
             CAST(created_at AS TEXT) AS created_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM acquisition_subscriptions
-         WHERE subscription_id = ?
+         WHERE subscription_id = $1
          LIMIT 1",
     )
     .bind(subscription_id.to_string())
@@ -1312,14 +1312,14 @@ async fn find_subscription_by_request_identity(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM acquisition_subscriptions
-             WHERE media_type = ?
-               AND normalized_title = ?
-               AND year = ?
-               AND request_mode = ?
-               AND request_scope = ?
-               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE(?, '')
-               AND route_policy = ?
-               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE(?, '')
+             WHERE media_type = $1
+               AND normalized_title = $2
+               AND year = $3
+               AND request_mode = $4
+               AND request_scope = $5
+               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE($6, '')
+               AND route_policy = $7
+               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE($8, '')
                AND active = 1
              ORDER BY created_at ASC
              LIMIT 25",
@@ -1364,14 +1364,14 @@ async fn find_subscription_by_request_identity(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM acquisition_subscriptions
-             WHERE media_type = ?
-               AND normalized_title = ?
+             WHERE media_type = $1
+               AND normalized_title = $2
                AND year IS NULL
-               AND request_mode = ?
-               AND request_scope = ?
-               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE(?, '')
-               AND route_policy = ?
-               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE(?, '')
+               AND request_mode = $3
+               AND request_scope = $4
+               AND COALESCE(CAST(scope_json AS TEXT), '') = COALESCE($5, '')
+               AND route_policy = $6
+               AND COALESCE(CAST(source_provider_id AS TEXT), '') = COALESCE($7, '')
                AND active = 1
              ORDER BY created_at ASC
              LIMIT 25",
@@ -1449,7 +1449,7 @@ async fn find_active_subscription_by_idempotency_key(
             CAST(created_at AS TEXT) AS created_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM acquisition_subscriptions
-         WHERE idempotency_key = ?
+         WHERE idempotency_key = $1
            AND active = 1
          ORDER BY created_at ASC
          LIMIT 1",
@@ -1566,7 +1566,7 @@ pub async fn list_subscription_targets(
             CAST(created_at AS TEXT) AS created_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM acquisition_targets
-         WHERE subscription_id = ?
+         WHERE subscription_id = $1
          ORDER BY season_number, episode_number, absolute_episode_number, target_key",
     )
     .bind(subscription_id.to_string())
@@ -1602,18 +1602,18 @@ pub async fn update_target_state(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
-         SET state = ?,
-             state_reason = ?,
-             selected_provider_id = ?,
-             selected_route_logical_id = ?,
-             selected_candidate_json = ?,
-             download_id = ?,
-             import_event_id = ?,
-             search_attempts = ?,
-             last_search_at = ?,
-             next_search_after = ?,
+         SET state = $1,
+             state_reason = $2,
+             selected_provider_id = $3,
+             selected_route_logical_id = $4,
+             selected_candidate_json = $5,
+             download_id = $6,
+             import_event_id = $7,
+             search_attempts = $8,
+             last_search_at = $9,
+             next_search_after = $10,
              updated_at = CURRENT_TIMESTAMP
-         WHERE target_id = ?",
+         WHERE target_id = $11",
     )
     .bind(update.state.as_str())
     .bind(update.state_reason.or(existing.state_reason))
@@ -1665,15 +1665,15 @@ pub async fn reset_target_for_candidate_retry(
 ) -> Result<Option<AcquisitionTarget>> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              selected_provider_id = NULL,
              selected_route_logical_id = NULL,
              selected_candidate_json = NULL,
              download_id = NULL,
-             next_search_after = ?,
+             next_search_after = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE target_id = ?",
+         WHERE target_id = $4",
     )
     .bind(AcquisitionTargetState::Pending.as_str())
     .bind(state_reason)
@@ -1695,7 +1695,7 @@ pub async fn clear_target_next_search_after(pool: &AnyPool, target_id: Uuid) -> 
         "UPDATE acquisition_targets
          SET next_search_after = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE target_id = ?",
+         WHERE target_id = $1",
     )
     .bind(target_id.to_string())
     .execute(pool)
@@ -1725,14 +1725,14 @@ pub async fn retry_acquisition_request(
         "UPDATE acquisition_subscriptions
          SET status = 'active',
              active = 1,
-             metadata_refresh_after = ?,
-             candidate_search_after = ?,
+             metadata_refresh_after = $1,
+             candidate_search_after = $2,
              last_metadata_refresh_at = CASE
                  WHEN request_mode = 'one_shot' AND metadata_policy = 'initial_only' THEN NULL
                  ELSE last_metadata_refresh_at
              END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $3",
     )
     .bind(db_datetime_string(now))
     .bind(db_datetime_string(now))
@@ -1796,7 +1796,7 @@ pub async fn complete_terminal_acquisition_request_if_ready(
             SUM(CASE WHEN t.state = 'excluded' THEN 1 ELSE 0 END) AS excluded_count
          FROM acquisition_subscriptions s
          JOIN acquisition_targets t ON t.subscription_id = s.subscription_id
-         WHERE s.subscription_id = ?
+         WHERE s.subscription_id = $1
            AND s.active = 1
            AND s.status = 'active'
            AND s.completion_policy = 'terminal_selected_targets'
@@ -1838,7 +1838,7 @@ pub async fn complete_terminal_acquisition_requests(
          HAVING COUNT(t.target_id) > 0
             AND SUM(CASE WHEN t.state NOT IN ('imported', 'excluded') THEN 1 ELSE 0 END) = 0
          ORDER BY s.updated_at ASC
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(limit.max(1))
     .fetch_all(pool)
@@ -1867,7 +1867,7 @@ async fn mark_terminal_acquisition_request_completed(
          SET status = 'completed',
              active = 0,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $1
            AND active = 1
            AND status = 'active'
            AND completion_policy = 'terminal_selected_targets'",
@@ -1979,7 +1979,7 @@ pub async fn list_due_metadata_subscriptions(
                     AND last_metadata_refresh_at IS NULL
                 )
            )
-           AND metadata_refresh_after <= ?
+           AND metadata_refresh_after <= $1
            AND (
                 tracking_started_at IS NOT NULL
                 OR last_metadata_refresh_at IS NULL
@@ -1990,7 +1990,7 @@ pub async fn list_due_metadata_subscriptions(
                 )
            )
          ORDER BY metadata_refresh_after ASC
-         LIMIT ?",
+         LIMIT $2",
     )
     .bind(db_datetime_string(now))
     .bind(limit.max(1))
@@ -2034,10 +2034,10 @@ pub async fn list_due_candidate_targets(
          WHERE s.active = 1
            AND s.status = 'active'
            AND t.state IN ('pending', 'searching', 'blocked')
-           AND COALESCE(t.next_search_after, s.candidate_search_after) <= ?
-           AND (t.air_time IS NULL OR t.air_time <= ?)
+           AND COALESCE(t.next_search_after, s.candidate_search_after) <= $1
+           AND (t.air_time IS NULL OR t.air_time <= $2)
          ORDER BY COALESCE(t.next_search_after, s.candidate_search_after) ASC
-         LIMIT ?",
+         LIMIT $3",
     )
     .bind(db_datetime_string(now))
     .bind(db_datetime_string(now))
@@ -2055,9 +2055,9 @@ pub async fn record_metadata_refresh(
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_subscriptions
          SET last_metadata_refresh_at = CURRENT_TIMESTAMP,
-             metadata_refresh_after = ?,
+             metadata_refresh_after = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $2",
     )
     .bind(db_datetime_string(next_after))
     .bind(subscription_id.to_string())
@@ -2075,9 +2075,9 @@ pub async fn start_subscription_tracking_if_initial_download_complete(
     let incomplete_due_targets: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM acquisition_targets
-         WHERE subscription_id = ?
+         WHERE subscription_id = $1
            AND state IN ('pending', 'searching', 'blocked', 'submitted')
-           AND (air_time IS NULL OR air_time <= ?)",
+           AND (air_time IS NULL OR air_time <= $2)",
     )
     .bind(subscription_id.to_string())
     .bind(db_datetime_string(now))
@@ -2091,10 +2091,10 @@ pub async fn start_subscription_tracking_if_initial_download_complete(
 
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_subscriptions
-         SET tracking_started_at = ?,
-             metadata_refresh_after = ?,
+         SET tracking_started_at = $1,
+             metadata_refresh_after = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $3
            AND tracking_started_at IS NULL",
     )
     .bind(db_datetime_string(now))
@@ -2116,10 +2116,10 @@ pub async fn record_candidate_search(
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
          SET last_search_at = CURRENT_TIMESTAMP,
-             next_search_after = ?,
+             next_search_after = $1,
              search_attempts = search_attempts + 1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE target_id = ?",
+         WHERE target_id = $2",
     )
     .bind(db_datetime_string(next_after))
     .bind(target_id.to_string())
@@ -2163,10 +2163,10 @@ pub async fn list_submitted_debrid_targets(
          WHERE s.active = 1
            AND s.status = 'active'
            AND t.state = 'submitted'
-           AND t.selected_route_logical_id = ?
+           AND t.selected_route_logical_id = $1
            AND t.download_id IS NOT NULL
          ORDER BY t.updated_at ASC
-         LIMIT ?",
+         LIMIT $2",
     )
     .bind(DEBRID_DEFAULT_LOGICAL_ID)
     .bind(limit.max(1))
@@ -2207,19 +2207,19 @@ async fn upsert_subscription_target(
     if let Some(existing) = existing {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_targets
-             SET media_type = ?,
-                 title = ?,
-                 season_number = ?,
-                 episode_number = ?,
-                 absolute_episode_number = ?,
-                 air_date = ?,
-                 air_time = ?,
-                 metadata_json = ?,
-                 state = ?,
-                 state_reason = ?,
-                 next_search_after = ?,
+             SET media_type = $1,
+                 title = $2,
+                 season_number = $3,
+                 episode_number = $4,
+                 absolute_episode_number = $5,
+                 air_date = $6,
+                 air_time = $7,
+                 metadata_json = $8,
+                 state = $9,
+                 state_reason = $10,
+                 next_search_after = $11,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE target_id = ?",
+             WHERE target_id = $12",
         )
         .bind(media_type.as_str())
         .bind(title)
@@ -2258,7 +2258,7 @@ async fn upsert_subscription_target(
                 metadata_json,
                 state,
                 next_search_after
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(target_id.to_string())
         .bind(subscription.subscription_id.to_string())
@@ -2331,7 +2331,7 @@ pub async fn get_target(pool: &AnyPool, target_id: Uuid) -> Result<Option<Acquis
             CAST(created_at AS TEXT) AS created_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM acquisition_targets
-         WHERE target_id = ?
+         WHERE target_id = $1
          LIMIT 1",
     )
     .bind(target_id.to_string())
@@ -2371,7 +2371,7 @@ async fn get_target_by_key(
             CAST(created_at AS TEXT) AS created_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM acquisition_targets
-         WHERE subscription_id = ? AND target_key = ?
+         WHERE subscription_id = $1 AND target_key = $2
          LIMIT 1",
     )
     .bind(subscription_id.to_string())
@@ -4422,7 +4422,7 @@ mod tests {
                 manager_item_id,
                 manager_label,
                 source
-            ) VALUES (?, 'series', 'Arr Show', 'arrshow', 2026, ?, 'sonarr-1', 'Sonarr', 'find_media_add')",
+            ) VALUES ($1, 'series', 'Arr Show', 'arrshow', 2026, $2, 'sonarr-1', 'Sonarr', 'find_media_add')",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(manager_provider_id.to_string())
@@ -4467,7 +4467,7 @@ mod tests {
 
         let rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM managed_ingest_intents
-             WHERE manager_provider_id = ? AND manager_item_id = 'sonarr-1' AND active = 1",
+             WHERE manager_provider_id = $1 AND manager_item_id = 'sonarr-1' AND active = 1",
         )
         .bind(manager_provider_id.to_string())
         .fetch_one(&database.pool)
@@ -4532,7 +4532,7 @@ mod tests {
                 selected_route_logical_id,
                 download_id,
                 state
-            ) VALUES (?, ?, 'test.source', 'default', 'series', 'Stale Show',
+            ) VALUES ($1, $2, 'test.source', 'default', 'series', 'Stale Show',
                 'Stale.Show.S01E01', 'magnet:?xt=urn:btih:test', 'magnet',
                 'fingerprint-stale-show', 'single', 'tv_sonarr_style', 'test',
                 'high', 'acquisition.debrid.default', 'debrid-job', 'submitted')",
@@ -4549,7 +4549,7 @@ mod tests {
                 download_id,
                 state,
                 active
-            ) VALUES (?, ?, 'acquisition.debrid.default', 'debrid-job', 'submitted', 1)",
+            ) VALUES ($1, $2, 'acquisition.debrid.default', 'debrid-job', 'submitted', 1)",
         )
         .bind(release_job_id.to_string())
         .bind(release_id.to_string())
@@ -4563,7 +4563,7 @@ mod tests {
                 coverage_kind,
                 confidence,
                 state
-            ) VALUES (?, ?, ?, 'single_episode', 'high', 'submitted')",
+            ) VALUES ($1, $2, $3, 'single_episode', 'high', 'submitted')",
         )
         .bind(coverage_id.to_string())
         .bind(release_id.to_string())
@@ -4601,13 +4601,13 @@ mod tests {
             .expect("target");
         assert_eq!(target.state, AcquisitionTargetState::Excluded);
         let release_state: String =
-            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = $1")
                 .bind(release_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
         assert_eq!(release_state, "cancelled");
         let job_state: String = sqlx::query_scalar(
-            "SELECT state FROM acquisition_release_jobs WHERE release_job_id = ?",
+            "SELECT state FROM acquisition_release_jobs WHERE release_job_id = $1",
         )
         .bind(release_job_id.to_string())
         .fetch_one(&database.pool)

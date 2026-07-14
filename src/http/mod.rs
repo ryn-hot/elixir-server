@@ -352,6 +352,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/signup", post(handlers::auth::signup))
+        .route("/api/v1/auth/refresh", post(handlers::auth::refresh))
+        .route("/api/v1/auth/logout", post(handlers::auth::logout))
+        .route("/api/v1/auth/session", get(handlers::auth::session))
+        .route("/api/v1/profiles", get(handlers::auth::profiles))
+        .route(
+            "/api/v1/profiles/:id/select",
+            post(handlers::auth::select_profile),
+        )
         .route(
             "/api/v1/auth/reset/start",
             post(handlers::auth::start_password_reset),
@@ -677,6 +685,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::profile::playback_interactions)
                 .put(handlers::profile::update_playback_interactions),
         )
+        .merge(crate::live::router())
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -686,9 +695,14 @@ pub fn router(state: AppState) -> Router {
                     Method::POST,
                     Method::PUT,
                     Method::PATCH,
+                    Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    header::HeaderName::from_static("x-elixir-csrf"),
+                ]),
         )
 }
 

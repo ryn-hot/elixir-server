@@ -2415,7 +2415,7 @@ mod tests {
             })
             .await?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_runs SET created_at = datetime('now', '-10 minutes') WHERE run_id = ?",
+            "UPDATE orchestrator_runs SET created_at = datetime('now', '-10 minutes') WHERE run_id = $1",
         )
         .bind(stale_run_id.to_string())
         .execute(&database.pool)

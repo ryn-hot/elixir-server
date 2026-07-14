@@ -93,6 +93,7 @@ fn test_settings_with_db() -> Settings {
         classifier: ClassifierConfig::default(),
         playback: crate::config::PlaybackConfig::default(),
         media_interactions: MediaInteractionsConfig::default(),
+        live: crate::live::config::LiveConfig::default(),
         network: crate::config::NetworkConfig::default(),
     }
 }
@@ -175,7 +176,7 @@ async fn seed_test_media_probe(
         "attachments_present": false
     });
 
-    sqlx::query("DELETE FROM media_file_probes WHERE media_file_id = ?")
+    sqlx::query("DELETE FROM media_file_probes WHERE media_file_id = $1")
         .bind(media_file_id)
         .execute(pool)
         .await?;
@@ -184,7 +185,7 @@ async fn seed_test_media_probe(
             (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
              source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
              created_at, updated_at)
-         VALUES (?, ?, 'test-fixture', 'ok', CURRENT_TIMESTAMP, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, 'test-fixture', 'ok', CURRENT_TIMESTAMP, $3, $4, $5, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_file_id)
     .bind(probe_version)
@@ -288,7 +289,7 @@ async fn setup_playback_route_fixture_with_user(
     };
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind(format!("phase13-{}@example.com", Uuid::new_v4()))
         .bind("hashed")
@@ -297,12 +298,12 @@ async fn setup_playback_route_fixture_with_user(
     let token = state.auth_service.issue_access_token(user_id)?.token;
 
     let item_id: String =
-        sqlx::query_scalar("SELECT id FROM movies WHERE title = ? AND year = 2026 LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM movies WHERE title = $1 AND year = 2026 LIMIT 1")
             .bind(&title)
             .fetch_one(&state.db_pool)
             .await?;
     let media_file_id: String =
-        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = $1 LIMIT 1")
             .bind(file_path.to_string_lossy().to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -2011,7 +2012,7 @@ async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()>
             title,
             normalized_title,
             source_provider_id
-         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+         ) VALUES ($1, 'movie', 'Example Movie', 'example movie', $2)",
     )
     .bind(subscription_id.to_string())
     .bind(source_provider_id.to_string())
@@ -2042,7 +2043,7 @@ async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()>
             remote_release_id,
             state,
             selected_candidate_json
-         ) VALUES (?, ?, ?, ?, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', ?, 'magnet', ?, ?, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', ?, ?, 'rd-release-1', 'downloaded', ?)",
+         ) VALUES ($1, $2, $3, $4, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', $5, 'magnet', $6, $7, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', $8, $9, 'rd-release-1', 'downloaded', $10)",
     )
     .bind(release_id.to_string())
     .bind(subscription_id.to_string())
@@ -2089,7 +2090,7 @@ async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()>
             selected_file_ids_json,
             skipped_file_ids_json,
             release_id
-         ) VALUES (?, ?, ?, 'default', ?, 'magnet', 'movies', 'Example Movie', 'rd-torrent-1', 'rd-download-1', 'completed', ?, '[]', 1.0, 1024, 1024, 0, 'real_debrid', 'rd-release-1', 'downloaded', ?, 'all', '[]', '[]', ?)",
+         ) VALUES ($1, $2, $3, 'default', $4, 'magnet', 'movies', 'Example Movie', 'rd-torrent-1', 'rd-download-1', 'completed', $5, '[]', 1.0, 1024, 1024, 0, 'real_debrid', 'rd-release-1', 'downloaded', $6, 'all', '[]', '[]', $7)",
     )
     .bind(job_id.to_string())
     .bind(provider_id.to_string())
@@ -2132,14 +2133,14 @@ async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()>
     );
 
     let job_count = sqlx::query_scalar::<sqlx::Any, i64>(
-        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = ?",
+        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = $1",
     )
     .bind(job_id.to_string())
     .fetch_one(&state.db_pool)
     .await?;
     assert_eq!(job_count, 1);
     let release_candidate = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT selected_candidate_json FROM acquisition_releases WHERE release_id = ?",
+        "SELECT selected_candidate_json FROM acquisition_releases WHERE release_id = $1",
     )
     .bind(release_id.to_string())
     .fetch_one(&state.db_pool)
@@ -2149,7 +2150,7 @@ async fn debrid_disable_preserves_history_and_materialized_files() -> Result<()>
         "release provenance should remain queryable after disable"
     );
     let source_ref = sqlx::query_scalar::<sqlx::Any, Option<String>>(
-        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = ?",
+        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = $1",
     )
     .bind(release_id.to_string())
     .fetch_one(&state.db_pool)
@@ -2232,7 +2233,7 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
             title,
             normalized_title,
             source_provider_id
-         ) VALUES (?, 'episode', 'Example Show', 'example show', ?)",
+         ) VALUES ($1, 'episode', 'Example Show', 'example show', $2)",
     )
     .bind(subscription_id.to_string())
     .bind(source_provider_id.to_string())
@@ -2263,7 +2264,7 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
             remote_release_id,
             state,
             selected_candidate_json
-         ) VALUES (?, ?, ?, ?, 'default', 'episode', 'Example Show', 'Example.Show.S01E01.1080p', ?, 'magnet', ?, ?, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', ?, ?, 'rd-release-2', 'downloaded', ?)",
+         ) VALUES ($1, $2, $3, $4, 'default', 'episode', 'Example Show', 'Example.Show.S01E01.1080p', $5, 'magnet', $6, $7, 'single', 'tv', 'test', 'high', 100.0, 'acquisition.debrid.default', $8, $9, 'rd-release-2', 'downloaded', $10)",
     )
     .bind(release_id.to_string())
     .bind(subscription_id.to_string())
@@ -2310,7 +2311,7 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
             selected_file_ids_json,
             skipped_file_ids_json,
             release_id
-         ) VALUES (?, ?, ?, 'default', ?, 'magnet', 'tv', 'Example Show S01E01', 'rd-torrent-2', 'rd-download-2', 'completed', ?, '[]', 1.0, 2048, 2048, 0, 'real_debrid', 'rd-release-2', 'downloaded', ?, 'all', '[]', '[]', ?)",
+         ) VALUES ($1, $2, $3, 'default', $4, 'magnet', 'tv', 'Example Show S01E01', 'rd-torrent-2', 'rd-download-2', 'completed', $5, '[]', 1.0, 2048, 2048, 0, 'real_debrid', 'rd-release-2', 'downloaded', $6, 'all', '[]', '[]', $7)",
     )
     .bind(job_id.to_string())
     .bind(provider_id.to_string())
@@ -2361,14 +2362,14 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
     assert!(store.get_provider(nzb_provider_id).await?.is_some());
 
     let job_count = sqlx::query_scalar::<sqlx::Any, i64>(
-        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = ?",
+        "SELECT COUNT(*) FROM debrid_download_jobs WHERE job_id = $1",
     )
     .bind(job_id.to_string())
     .fetch_one(&state.db_pool)
     .await?;
     assert_eq!(job_count, 1);
     let release_source = sqlx::query_scalar::<sqlx::Any, Option<String>>(
-        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = ?",
+        "SELECT source_provider_id FROM acquisition_releases WHERE release_id = $1",
     )
     .bind(release_id.to_string())
     .fetch_one(&state.db_pool)
@@ -2378,7 +2379,7 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
         Some(source_provider_id.to_string().as_str())
     );
     let release_selected = sqlx::query_scalar::<sqlx::Any, Option<String>>(
-        "SELECT selected_provider_id FROM acquisition_releases WHERE release_id = ?",
+        "SELECT selected_provider_id FROM acquisition_releases WHERE release_id = $1",
     )
     .bind(release_id.to_string())
     .fetch_one(&state.db_pool)
@@ -3588,7 +3589,7 @@ async fn find_media_scope_test_app(
     let source_provider_id = seed_acquisition_candidate_provider(&store, extension_id).await?;
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind(email)
         .bind("hashed")
@@ -3760,6 +3761,64 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         Some(true)
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn s10_disabled_live_settings_are_explicit_and_live_routes_are_absent() -> Result<()> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    state.live.initialize().await?;
+    let app = router(state);
+    let settings_response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/settings").body(Body::empty())?)
+        .await?;
+    assert_eq!(settings_response.status(), StatusCode::OK);
+    let settings_json: Value =
+        serde_json::from_slice(&body::to_bytes(settings_response.into_body(), 1_048_576).await?)?;
+    assert_eq!(
+        settings_json.pointer("/live/raw_enabled"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        settings_json.pointer("/live/effective_enabled"),
+        Some(&json!(false))
+    );
+    assert_eq!(settings_json.pointer("/live/ready"), Some(&json!(false)));
+    assert_eq!(
+        settings_json.pointer("/live/disabled_reason"),
+        Some(&json!("live_disabled"))
+    );
+    let features = settings_json
+        .pointer("/live/features")
+        .and_then(Value::as_array)
+        .expect("Live feature status list");
+    assert_eq!(features.len(), 12);
+    assert!(features.iter().all(|feature| {
+        feature["raw_enabled"] == false && feature["effective_enabled"] == false
+    }));
+
+    let live_response = app
+        .oneshot(Request::get("/api/v1/live/catalogs").body(Body::empty())?)
+        .await?;
+    assert_eq!(live_response.status(), StatusCode::NOT_FOUND);
     Ok(())
 }
 
@@ -4897,7 +4956,7 @@ async fn osr2_acquisition_request_endpoints_are_idempotent_cancelable_and_retrya
         .await?;
     assert_eq!(cancel_response.status(), StatusCode::OK);
     let cancelled_active: i64 = sqlx::query_scalar(
-        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = $1",
     )
     .bind(&subscription_id)
     .fetch_one(&db_pool)
@@ -4936,7 +4995,7 @@ async fn osr2_acquisition_request_endpoints_are_idempotent_cancelable_and_retrya
     sqlx::query(
         "UPDATE acquisition_subscriptions
          SET status = 'completed', active = 0
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(&subscription_id)
     .execute(&db_pool)
@@ -5095,7 +5154,7 @@ async fn mmr4_selected_episode_retry_uses_explicit_targets_and_idempotency() -> 
     );
     let active_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM acquisition_subscriptions
-         WHERE idempotency_key = ? AND active = 1",
+         WHERE idempotency_key = $1 AND active = 1",
     )
     .bind("mmr4-selected-s01e01-s01e03")
     .fetch_one(&db_pool)
@@ -5105,7 +5164,7 @@ async fn mmr4_selected_episode_retry_uses_explicit_targets_and_idempotency() -> 
     sqlx::query(
         "UPDATE acquisition_subscriptions
          SET status = 'completed', active = 0
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(&subscription_id)
     .execute(&db_pool)
@@ -5282,7 +5341,7 @@ async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_co
     sqlx::query(
         "UPDATE acquisition_targets
          SET state = 'imported', state_reason = 'Imported into library.'
-         WHERE target_id = ?",
+         WHERE target_id = $1",
     )
     .bind(imported_target_id)
     .execute(&db_pool)
@@ -5290,7 +5349,7 @@ async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_co
     sqlx::query(
         "UPDATE acquisition_targets
          SET state = 'excluded', state_reason = 'No matching acquisition candidates were returned.'
-         WHERE target_id = ?",
+         WHERE target_id = $1",
     )
     .bind(no_results_target_id)
     .execute(&db_pool)
@@ -5298,7 +5357,7 @@ async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_co
     sqlx::query(
         "UPDATE acquisition_subscriptions
          SET status = 'completed', active = 0, updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id)
     .execute(&db_pool)
@@ -5376,7 +5435,7 @@ async fn mmr5_acquisition_history_links_show_and_summarizes_terminal_one_shot_co
     let active_after_read: i64 = sqlx::query_scalar(
         "SELECT CAST(active AS INTEGER)
          FROM acquisition_subscriptions
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id)
     .fetch_one(&db_pool)
@@ -7037,7 +7096,7 @@ async fn login_returns_access_token() -> Result<()> {
     let password = "correct horse battery staple";
     let password_hash = hash_password(password);
 
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
         .bind(email)
         .bind(password_hash)
@@ -7080,8 +7139,710 @@ async fn login_returns_access_token() -> Result<()> {
 }
 
 #[tokio::test]
+async fn auth_session_refresh_reuse_logout_and_bootstrap_flow() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.database.url = format!(
+        "sqlite:file:http-auth-sessions-{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    );
+    settings.auth.access_token_secret =
+        "http-auth-access-secret-00000000000000000000000000".to_string();
+    settings.auth.refresh_token_secret =
+        Some("http-auth-refresh-secret-0000000000000000000000000".to_string());
+    settings.auth.csrf_secret =
+        Some("http-auth-csrf-secret-000000000000000000000000000".to_string());
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let user_id = Uuid::new_v4();
+    let email = "session-flow@example.test";
+    let password = "correct horse battery staple";
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(user_id.to_string())
+        .bind(email)
+        .bind(hash_password(password))
+        .execute(&db_pool)
+        .await?;
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .header("user-agent", "elixir-auth-flow-test/1")
+                .body(Body::from(
+                    json!({
+                        "email": email,
+                        "password": password,
+                        "remember_device": true,
+                        "device_name": "Test Desktop",
+                        "device_type": "desktop",
+                        "client_name": "elixir-test",
+                        "client_version": "1.0.0"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(login_response.status(), StatusCode::OK);
+    assert_eq!(
+        login_response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
+    let login: Value =
+        serde_json::from_slice(&body::to_bytes(login_response.into_body(), 1_048_576).await?)?;
+    let access = login["access_token"]
+        .as_str()
+        .expect("login access token")
+        .to_string();
+    let refresh = login["refresh_token"]
+        .as_str()
+        .expect("login refresh token")
+        .to_string();
+    let csrf = login["csrf_token"]
+        .as_str()
+        .expect("login CSRF token")
+        .to_string();
+    let session_id = login["session_id"]
+        .as_str()
+        .expect("login session id")
+        .to_string();
+    assert!(refresh.starts_with("elx_refresh_v1_"));
+    assert!(csrf.starts_with("elx_csrf_v1_"));
+    let stored: (String, String, String) = sqlx::query_as(
+        "SELECT rt.token_hash, s.device_name, s.client_name
+         FROM refresh_tokens AS rt
+         JOIN account_sessions AS s ON s.id = rt.session_id
+         WHERE s.id = $1",
+    )
+    .bind(&session_id)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_ne!(stored.0, refresh);
+    assert_eq!(stored.1, "Test Desktop");
+    assert_eq!(stored.2, "elixir-test");
+
+    let bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/auth/session")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+    assert_eq!(
+        bootstrap
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
+    assert_eq!(
+        bootstrap
+            .headers()
+            .get("pragma")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let bootstrap_json: Value =
+        serde_json::from_slice(&body::to_bytes(bootstrap.into_body(), 1_048_576).await?)?;
+    assert_eq!(bootstrap_json["user_id"], user_id.to_string());
+    assert_eq!(bootstrap_json["session_id"], session_id);
+    assert_eq!(bootstrap_json["role"], "owner");
+    assert_eq!(bootstrap_json["csrf_token"], csrf);
+    assert!(bootstrap_json.get("access_token").is_none());
+    assert!(bootstrap_json.get("refresh_token").is_none());
+
+    let query_bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/auth/session?access_token={access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(query_bootstrap.status(), StatusCode::FORBIDDEN);
+    let cookie_bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/auth/session")
+                .header("cookie", format!("elixir_ui_token={access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(cookie_bootstrap.status(), StatusCode::FORBIDDEN);
+
+    let refreshed = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"refresh_token": refresh}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    assert_eq!(
+        refreshed
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
+    let refreshed_json: Value =
+        serde_json::from_slice(&body::to_bytes(refreshed.into_body(), 1_048_576).await?)?;
+    let rotated_access = refreshed_json["access_token"]
+        .as_str()
+        .expect("rotated access token")
+        .to_string();
+    let rotated_refresh = refreshed_json["refresh_token"]
+        .as_str()
+        .expect("rotated refresh token")
+        .to_string();
+    assert_ne!(rotated_refresh, refresh);
+    assert_ne!(refreshed_json["csrf_token"], csrf);
+
+    let reused = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"refresh_token": refresh}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+    let reused_body = body::to_bytes(reused.into_body(), 1_048_576).await?;
+    let reused_body = String::from_utf8(reused_body.to_vec())?;
+    assert!(!reused_body.contains(&refresh));
+    assert!(!reused_body.contains(&rotated_refresh));
+    let revoked_bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/auth/session")
+                .header("authorization", format!("Bearer {rotated_access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(revoked_bootstrap.status(), StatusCode::UNAUTHORIZED);
+
+    let second_login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email": email, "password": password}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(second_login.status(), StatusCode::OK);
+    let second_login_json: Value =
+        serde_json::from_slice(&body::to_bytes(second_login.into_body(), 1_048_576).await?)?;
+    let second_access = second_login_json["access_token"]
+        .as_str()
+        .expect("second access token");
+    let second_refresh = second_login_json["refresh_token"]
+        .as_str()
+        .expect("second refresh token");
+    let second_session = second_login_json["session_id"]
+        .as_str()
+        .expect("second session id");
+    let query_logout = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/auth/logout?access_token={second_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(query_logout.status(), StatusCode::FORBIDDEN);
+    let still_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM account_sessions WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(second_session)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(still_active, 1);
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/logout")
+                .header("authorization", format!("Bearer {second_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(logout.status(), StatusCode::OK);
+    let revoked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM account_sessions WHERE id = $1 AND revoked_at IS NOT NULL",
+    )
+    .bind(second_session)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(revoked, 1);
+    let refresh_after_logout = app
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"refresh_token": second_refresh}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(refresh_after_logout.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a14_profile_list_select_pin_and_revocation_preserve_legacy_routes() -> Result<()> {
+    let mut settings = test_settings_with_db();
+    settings.database.url = "sqlite::memory:?cache=shared".to_string();
+    settings.database.max_connections = 1;
+    settings.auth.access_token_secret =
+        "a14-access-secret-000000000000000000000000000000".to_string();
+    settings.auth.refresh_token_secret =
+        Some("a14-refresh-secret-00000000000000000000000000000".to_string());
+    settings.auth.csrf_secret = Some("a14-csrf-secret-0000000000000000000000000000000".to_string());
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let mut revocations = auth_service.authorization_revocation_notifier().subscribe();
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let user_id = Uuid::new_v4();
+    let email = "a14-owner@example.test";
+    let password = "correct horse battery staple";
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(user_id.to_string())
+        .bind(email)
+        .bind(hash_password(password))
+        .execute(&db_pool)
+        .await?;
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email": email, "password": password}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(login_response.status(), StatusCode::OK);
+    let login: Value =
+        serde_json::from_slice(&body::to_bytes(login_response.into_body(), 1_048_576).await?)?;
+    let access = login["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+    let refresh = login["refresh_token"]
+        .as_str()
+        .expect("refresh token")
+        .to_string();
+    let home_id = login["home_id"].as_str().expect("home id").to_string();
+    let owner_profile_id = login["profile_id"]
+        .as_str()
+        .expect("owner profile id")
+        .to_string();
+    let session_id = login["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let initial_csrf = login["csrf_token"].as_str().expect("CSRF token");
+
+    let managed_profile_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO profiles (
+            id, home_id, user_id, profile_type, display_name, avatar_color,
+            pin_hash, is_default
+         ) VALUES ($1, $2, NULL, 'managed', 'Kids', '#44AA88', $3, FALSE)",
+    )
+    .bind(managed_profile_id.to_string())
+    .bind(&home_id)
+    .bind(hash_password("1234"))
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO profile_authorization_revisions (profile_id, home_id, revision)
+         VALUES ($1, $2, 1)",
+    )
+    .bind(managed_profile_id.to_string())
+    .bind(&home_id)
+    .execute(&db_pool)
+    .await?;
+
+    let profiles_response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/profiles")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(profiles_response.status(), StatusCode::OK);
+    let profiles: Value =
+        serde_json::from_slice(&body::to_bytes(profiles_response.into_body(), 1_048_576).await?)?;
+    let profiles = profiles["profiles"].as_array().expect("profile list");
+    assert_eq!(profiles.len(), 2);
+    let managed = profiles
+        .iter()
+        .find(|profile| profile["id"] == managed_profile_id.to_string())
+        .expect("managed profile summary");
+    assert_eq!(managed["profile_type"], "managed");
+    assert_eq!(managed["role"], "viewer");
+    assert_eq!(managed["has_pin"], true);
+    assert!(managed.get("pin_hash").is_none());
+    let query_profiles = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/profiles?access_token={access}")).body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(query_profiles.status(), StatusCode::FORBIDDEN);
+
+    let wrong_pin = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/profiles/{managed_profile_id}/select"))
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"pin": "9999"}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(wrong_pin.status(), StatusCode::FORBIDDEN);
+    assert!(matches!(
+        revocations.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let unchanged_profile: String =
+        sqlx::query_scalar("SELECT active_profile_id FROM account_sessions WHERE id = $1")
+            .bind(&session_id)
+            .fetch_one(&db_pool)
+            .await?;
+    assert_eq!(unchanged_profile, owner_profile_id);
+
+    let selected_response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/profiles/{managed_profile_id}/select"))
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"pin": "1234"}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(selected_response.status(), StatusCode::OK);
+    assert_eq!(
+        selected_response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
+    let selected: Value =
+        serde_json::from_slice(&body::to_bytes(selected_response.into_body(), 1_048_576).await?)?;
+    assert_eq!(
+        selected["active_profile_id"],
+        managed_profile_id.to_string()
+    );
+    assert_eq!(selected["role"], "viewer");
+    assert_eq!(selected["profile"]["profile_type"], "managed");
+    assert_ne!(selected["csrf_token"], initial_csrf);
+    let capabilities = selected["capabilities"]
+        .as_array()
+        .expect("selected capabilities");
+    assert!(capabilities.contains(&json!("live_browse")));
+    assert!(capabilities.contains(&json!("live_play")));
+    assert!(!capabilities.contains(&json!("live_manage")));
+    assert!(!capabilities.contains(&json!("extensions_manage")));
+    let event_id = revocations.try_recv()?;
+    let event: (String, String, String, String) = sqlx::query_as(
+        "SELECT event_type, subject_type, subject_id, payload_json
+         FROM authorization_revocation_outbox WHERE id = $1",
+    )
+    .bind(event_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(event.0, "profile_switched");
+    assert_eq!(event.1, "account_session");
+    assert_eq!(event.2, session_id);
+    let event_payload: Value = serde_json::from_str(&event.3)?;
+    assert_eq!(event_payload["previous_profile_id"], owner_profile_id);
+    assert_eq!(
+        event_payload["selected_profile_id"],
+        managed_profile_id.to_string()
+    );
+
+    let bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/auth/session")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+    let bootstrap: Value =
+        serde_json::from_slice(&body::to_bytes(bootstrap.into_body(), 1_048_576).await?)?;
+    assert_eq!(
+        bootstrap["active_profile_id"],
+        managed_profile_id.to_string()
+    );
+    assert_eq!(bootstrap["role"], "viewer");
+
+    let legacy_profile = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/profile/playback")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(legacy_profile.status(), StatusCode::OK);
+
+    let refreshed = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"refresh_token": refresh}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let refreshed: Value =
+        serde_json::from_slice(&body::to_bytes(refreshed.into_body(), 1_048_576).await?)?;
+    assert_eq!(refreshed["profile_id"], managed_profile_id.to_string());
+    assert_eq!(refreshed["role"], "viewer");
+    let rotated_access = refreshed["access_token"]
+        .as_str()
+        .expect("rotated access token");
+
+    let selected_owner = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/profiles/{owner_profile_id}/select"))
+                .header("authorization", format!("Bearer {rotated_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(selected_owner.status(), StatusCode::OK);
+    let selected_owner: Value =
+        serde_json::from_slice(&body::to_bytes(selected_owner.into_body(), 1_048_576).await?)?;
+    assert_eq!(selected_owner["active_profile_id"], owner_profile_id);
+    assert_eq!(selected_owner["role"], "owner");
+    let _ = revocations.try_recv()?;
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM authorization_revocation_outbox
+         WHERE event_type = 'profile_switched' AND account_session_id = $1",
+    )
+    .bind(&session_id)
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(event_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a15_production_qt_client_and_axum_server_complete_auth_lifecycle() -> Result<()> {
+    let client_binary = std::env::var("ELIXIR_A15_CLIENT_TEST_BINARY")
+        .context("ELIXIR_A15_CLIENT_TEST_BINARY must name the Qt integration test executable")?;
+    anyhow::ensure!(
+        std::path::Path::new(&client_binary).is_file(),
+        "Qt integration test executable does not exist: {client_binary}"
+    );
+
+    let mut settings = test_settings_with_db();
+    settings.database.url = format!(
+        "sqlite:file:a15-auth-live-{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    );
+    settings.database.max_connections = 4;
+    settings.auth.access_token_secret =
+        "a15-access-secret-000000000000000000000000000000".to_string();
+    settings.auth.refresh_token_secret =
+        Some("a15-refresh-secret-00000000000000000000000000000".to_string());
+    settings.auth.csrf_secret = Some("a15-csrf-secret-0000000000000000000000000000000".to_string());
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+
+    let user_id = Uuid::new_v4();
+    let email = "a15-owner@example.test";
+    let password = "correct horse battery staple";
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(user_id.to_string())
+        .bind(email)
+        .bind(hash_password(password))
+        .execute(&db_pool)
+        .await?;
+    let owner = crate::auth::home_profiles::HomeProfileRepository::new(&db_pool)
+        .ensure_owner_home(user_id)
+        .await?;
+    let managed_profile_id = Uuid::new_v4();
+    let managed_pin = "2468";
+    sqlx::query(
+        "INSERT INTO profiles (
+            id, home_id, user_id, profile_type, display_name, avatar_color,
+            pin_hash, is_default
+         ) VALUES ($1, $2, NULL, 'managed', 'A15 Kids', '#44AA88', $3, FALSE)",
+    )
+    .bind(managed_profile_id.to_string())
+    .bind(owner.home.id.to_string())
+    .bind(hash_password(managed_pin))
+    .execute(&db_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO profile_authorization_revisions (profile_id, home_id, revision)
+         VALUES ($1, $2, 1)",
+    )
+    .bind(managed_profile_id.to_string())
+    .bind(owner.home.id.to_string())
+    .execute(&db_pool)
+    .await?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut command = tokio::process::Command::new(&client_binary);
+    command
+        .kill_on_drop(true)
+        .env("ELIXIR_A15_SERVER_URL", format!("http://{address}"))
+        .env("ELIXIR_A15_EMAIL", email)
+        .env("ELIXIR_A15_PASSWORD", password)
+        .env("ELIXIR_A15_OWNER_PROFILE_ID", owner.profile.id.to_string())
+        .env(
+            "ELIXIR_A15_MANAGED_PROFILE_ID",
+            managed_profile_id.to_string(),
+        )
+        .env("ELIXIR_A15_MANAGED_PIN", managed_pin);
+    let client_result = tokio::time::timeout(Duration::from_secs(60), command.output()).await;
+
+    let _ = shutdown_tx.send(());
+    let server_result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .context("A15 Axum server did not shut down")??;
+    server_result.context("A15 Axum server failed")?;
+
+    let client_output = client_result
+        .context("A15 Qt integration test exceeded 60 seconds")?
+        .context("failed to launch A15 Qt integration test")?;
+    anyhow::ensure!(
+        client_output.status.success(),
+        "A15 Qt integration test failed (status {}):\nstdout:\n{}\nstderr:\n{}",
+        client_output.status,
+        String::from_utf8_lossy(&client_output.stdout),
+        String::from_utf8_lossy(&client_output.stderr)
+    );
+
+    let session: (String, Option<String>) = sqlx::query_as(
+        "SELECT active_profile_id, CAST(revoked_at AS TEXT)
+         FROM account_sessions
+         WHERE user_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(session.0, owner.profile.id.to_string());
+    assert!(
+        session.1.is_some(),
+        "logout must revoke the account session"
+    );
+
+    let profile_switch_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM authorization_revocation_outbox
+         WHERE event_type = 'profile_switched'",
+    )
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(profile_switch_events, 2);
+    let logout_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM authorization_revocation_outbox
+         WHERE event_type = 'account_session_revoked'
+           AND reason_code = 'user_logout'",
+    )
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(logout_events, 1);
+    let refresh_state: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) AS token_count,
+                SUM(CASE WHEN used_at IS NOT NULL THEN 1 ELSE 0 END) AS used_count,
+                SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END) AS revoked_count
+         FROM refresh_tokens
+         WHERE session_id IN (SELECT id FROM account_sessions WHERE user_id = $1)",
+    )
+    .bind(user_id.to_string())
+    .fetch_one(&db_pool)
+    .await?;
+    assert_eq!(refresh_state, (3, 2, 3));
+    Ok(())
+}
+
+#[tokio::test]
 async fn signup_and_password_reset_flow() -> Result<()> {
     let mut settings = test_settings_with_db();
+    settings.database.url = format!(
+        "sqlite:file:http-signup-reset-{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    );
     settings.auth.access_token_secret = "signup-secret-key".to_string();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -7101,6 +7862,23 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         secrets,
     ));
 
+    let rejected_signup = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "email": "newuser@example.com",
+                        "password": "strongpassword",
+                        "device_name": "x".repeat(129)
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(rejected_signup.status(), StatusCode::BAD_REQUEST);
+
     // Signup
     let signup_body = serde_json::json!({
         "email": "newuser@example.com",
@@ -7115,6 +7893,13 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         )
         .await?;
     let signup_status = signup_resp.status();
+    assert_eq!(
+        signup_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
     let signup_bytes = body::to_bytes(signup_resp.into_body(), 1_048_576).await?;
     let signup_json: Value = serde_json::from_slice(&signup_bytes)?;
     assert_eq!(
@@ -7124,6 +7909,11 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         signup_json
     );
     assert!(signup_json.get("accessToken").is_some() || signup_json.get("access_token").is_some());
+    let signup_refresh_token = signup_json
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .expect("signup refresh token")
+        .to_string();
 
     // Duplicate signup should fail
     let dup_resp = app
@@ -7149,9 +7939,15 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         )
         .await?;
     let reset_status = reset_start_resp.status();
+    assert_eq!(
+        reset_start_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store, private")
+    );
     let reset_bytes = body::to_bytes(reset_start_resp.into_body(), 1_048_576).await?;
     let reset_json: Value = serde_json::from_slice(&reset_bytes)?;
-    eprintln!("reset_start_status={} body={}", reset_status, reset_json);
     assert_eq!(reset_status, StatusCode::OK);
     let token = reset_json
         .get("token")
@@ -7182,6 +7978,17 @@ async fn signup_and_password_reset_flow() -> Result<()> {
         "reset complete body: {}",
         complete_json
     );
+    let revoked_refresh = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"refresh_token": signup_refresh_token}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(revoked_refresh.status(), StatusCode::UNAUTHORIZED);
 
     // Login with new password should succeed
     let login_body = serde_json::json!({
@@ -7241,7 +8048,7 @@ async fn settings_and_registry_require_auth_and_show_wan() -> Result<()> {
 
     // Seed user
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("wan@example.com")
         .bind("hashed")
@@ -7495,7 +8302,7 @@ async fn discovery_manager_preferences_round_trip() -> Result<()> {
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-prefs@example.com")
         .bind("hashed")
@@ -7831,7 +8638,7 @@ async fn discovery_find_media_filters_providers_by_scope() -> Result<()> {
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media@example.com")
         .bind("hashed")
@@ -8260,7 +9067,7 @@ async fn find_media_scope_preview_tvdb_is_read_only_and_deterministic() -> Resul
         seed_acquisition_candidate_provider(&store, "elixir.sources.scope_preview").await?;
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("scope-preview@example.com")
         .bind("hashed")
@@ -8275,7 +9082,7 @@ async fn find_media_scope_preview_tvdb_is_read_only_and_deterministic() -> Resul
     });
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, created_at, updated_at)
-         VALUES (?1, 'series', ?2, 'Fixture Series', 2003, NULL, NULL, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, 'series', $2, 'Fixture Series', 2003, NULL, NULL, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_item_id.to_string())
     .bind(json!({ "tvdbSeries": "321" }).to_string())
@@ -8366,7 +9173,7 @@ async fn find_media_scope_preview_tvdb_is_read_only_and_deterministic() -> Resul
     assert_eq!(after_targets, before_targets);
 
     let persisted_metadata: String =
-        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = ?1")
+        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = $1")
             .bind(media_item_id.to_string())
             .fetch_one(&db_pool)
             .await?;
@@ -8405,7 +9212,7 @@ async fn find_media_scope_preview_reports_missing_metadata_credentials() -> Resu
         seed_acquisition_candidate_provider(&store, "elixir.sources.scope_preview_missing").await?;
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("scope-preview-missing@example.com")
         .bind("hashed")
@@ -8532,7 +9339,7 @@ async fn find_media_scoped_add_season_creates_only_selected_targets_and_is_idemp
     );
 
     let target_rows = sqlx::query(
-        "SELECT target_key, state FROM acquisition_targets WHERE subscription_id = ? ORDER BY target_key",
+        "SELECT target_key, state FROM acquisition_targets WHERE subscription_id = $1 ORDER BY target_key",
     )
     .bind(&subscription_id)
     .fetch_all(&state.db_pool)
@@ -8546,7 +9353,7 @@ async fn find_media_scoped_add_season_creates_only_selected_targets_and_is_idemp
             .fetch_one(&state.db_pool)
             .await?;
     let episode_slots = sqlx::query(
-        "SELECT season_number, episode_number FROM episodes WHERE series_id = ? ORDER BY season_number, episode_number",
+        "SELECT season_number, episode_number FROM episodes WHERE series_id = $1 ORDER BY season_number, episode_number",
     )
     .bind(series_id)
     .fetch_all(&state.db_pool)
@@ -8578,7 +9385,7 @@ async fn find_media_scoped_add_selected_targets_preserves_rich_existing_metadata
     });
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
-         VALUES (?, 'series', ?, 'Fixture Series', 2003, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, 'series', $2, 'Fixture Series', 2003, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_item_id.to_string())
     .bind(json!({ "tvdbSeries": "321" }).to_string())
@@ -8587,7 +9394,7 @@ async fn find_media_scoped_add_selected_targets_preserves_rich_existing_metadata
     .await?;
     sqlx::query(
         "INSERT INTO series (id, title, year, library_type, external_tvdb_series, metadata_json, created_at, updated_at)
-         VALUES (?, 'Fixture Series', 2003, 'series', '321', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, 'Fixture Series', 2003, 'series', '321', $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_item_id.to_string())
     .bind(rich_metadata.to_string())
@@ -8626,7 +9433,7 @@ async fn find_media_scoped_add_selected_targets_preserves_rich_existing_metadata
     assert_eq!(payload["targetCount"], json!(2));
 
     let persisted_metadata: String =
-        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT CAST(metadata_json AS TEXT) FROM media_items WHERE id = $1")
             .bind(media_item_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -8639,13 +9446,13 @@ async fn find_media_scoped_add_selected_targets_preserves_rich_existing_metadata
     .await?;
     assert_eq!(target_keys, vec!["S01E01", "S01E02"]);
     let episode_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = $1")
             .bind(media_item_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
     assert_eq!(episode_count, 2);
     let unselected_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM episodes WHERE series_id = ? AND season_number = 2",
+        "SELECT COUNT(*) FROM episodes WHERE series_id = $1 AND season_number = 2",
     )
     .bind(media_item_id.to_string())
     .fetch_one(&state.db_pool)
@@ -8704,7 +9511,7 @@ async fn find_media_scoped_add_episode_singleton_queues_one_target() -> Result<(
         .as_str()
         .context("subscription id")?;
     let target_key: String = sqlx::query_scalar(
-        "SELECT target_key FROM acquisition_targets WHERE subscription_id = ? LIMIT 1",
+        "SELECT target_key FROM acquisition_targets WHERE subscription_id = $1 LIMIT 1",
     )
     .bind(subscription_id)
     .fetch_one(&state.db_pool)
@@ -8803,7 +9610,7 @@ async fn find_media_preferences_clear_stale_manager_provider_ids() -> Result<()>
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-stale-pref@example.com")
         .bind("hashed")
@@ -8953,7 +9760,7 @@ async fn find_media_acquisition_lists_active_intents() -> Result<()> {
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-acquisition@example.com")
         .bind("hashed")
@@ -9129,7 +9936,7 @@ async fn find_media_search_without_providers_returns_ok() -> Result<()> {
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-no-providers@example.com")
         .bind("hashed")
@@ -9195,7 +10002,7 @@ async fn find_media_add_returns_missing_manager_conflict() -> Result<()> {
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-add@example.com")
         .bind("hashed")
@@ -9257,7 +10064,7 @@ async fn find_media_add_returns_manager_selection_required_conflict() -> Result<
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-add-selection@example.com")
         .bind("hashed")
@@ -9432,7 +10239,7 @@ async fn find_media_add_returns_missing_required_secrets_conflict() -> Result<()
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-add-missing-secrets@example.com")
         .bind("hashed")
@@ -9560,7 +10367,7 @@ async fn find_media_add_movie_uses_prefixed_manager_lookup_terms() -> Result<()>
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-add-movie@example.com")
         .bind("hashed")
@@ -9705,7 +10512,7 @@ async fn find_media_add_clears_show_and_episode_tombstones_for_readded_show() ->
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-add-readd@example.com")
         .bind("hashed")
@@ -9873,7 +10680,7 @@ async fn find_media_targets_manager_resolution_precedence() -> Result<()> {
     let store = ExtensionStore::new(&db_pool);
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("find-media-targets@example.com")
         .bind("hashed")
@@ -10126,7 +10933,7 @@ async fn playback_profile_requires_auth() -> Result<()> {
 
     // Seed user
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("profile@example.com")
         .bind("hashed")
@@ -10570,7 +11377,7 @@ async fn library_items_include_managed_card_lifecycle() -> Result<()> {
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_imdb, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("Managed Show")
@@ -10581,7 +11388,7 @@ async fn library_items_include_managed_card_lifecycle() -> Result<()> {
     .await?;
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(series_id.to_string())
     .bind("series")
@@ -10700,7 +11507,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         (user_one_id, "continue-one@example.com"),
         (user_two_id, "continue-two@example.com"),
     ] {
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
             .bind(user_id.to_string())
             .bind(email)
             .bind("hashed")
@@ -10721,26 +11528,26 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
     let episode_id_text = episode_id.to_string();
     sqlx::query(
         "INSERT INTO movies (id, title, year, runtime_seconds, metadata_json)
-         VALUES (?, 'Continue Movie', 2026, 2400, NULL)",
+         VALUES ($1, 'Continue Movie', 2026, 2400, NULL)",
     )
     .bind(movie_id.to_string())
     .execute(&db_pool)
     .await?;
     sqlx::query(
         "INSERT INTO movies (id, title, year, runtime_seconds, metadata_json)
-         VALUES (?, 'Watched Movie', 2026, 3600, NULL)",
+         VALUES ($1, 'Watched Movie', 2026, 3600, NULL)",
     )
     .bind(watched_movie_id.to_string())
     .execute(&db_pool)
     .await?;
-    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES ($1, $2, $3, $4)")
         .bind(series_id.to_string())
         .bind("Continue Show")
         .bind(2026)
         .bind("series")
         .execute(&db_pool)
         .await?;
-    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, $3)")
         .bind(season_id.to_string())
         .bind(series_id.to_string())
         .bind("Season 1")
@@ -10750,7 +11557,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         "INSERT INTO episodes (
             id, series_id, season_id, season_number, episode_number, title,
             runtime_seconds, has_file
-         ) VALUES (?, ?, ?, 1, 1, 'Pilot', 1500, 1)",
+         ) VALUES ($1, $2, $3, 1, 1, 'Pilot', 1500, 1)",
     )
     .bind(episode_id.to_string())
     .bind(series_id.to_string())
@@ -10762,7 +11569,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, resume_seconds, duration_seconds,
             watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'movie', ?, 600, 2400, 0, NULL, 0,
+         ) VALUES ($1, 'movie', $2, 600, 2400, 0, NULL, 0,
              '2026-07-04 10:00:00', 'playback')",
     )
     .bind(user_one_id.to_string())
@@ -10773,7 +11580,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, resume_seconds, duration_seconds,
             watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'movie', ?, 0, 3600, 1, '2026-07-04 09:00:00', 1,
+         ) VALUES ($1, 'movie', $2, 0, 3600, 1, '2026-07-04 09:00:00', 1,
              '2026-07-04 09:00:00', 'manual')",
     )
     .bind(user_one_id.to_string())
@@ -10784,7 +11591,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, series_id, season_id, resume_seconds,
             duration_seconds, watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'episode', ?, ?, ?, 300, 1500, 0, NULL, 0,
+         ) VALUES ($1, 'episode', $2, $3, $4, 300, 1500, 0, NULL, 0,
              '2026-07-04 11:00:00', 'playback')",
     )
     .bind(user_one_id.to_string())
@@ -10797,7 +11604,7 @@ async fn library_items_project_continue_watching_from_user_media_state() -> Resu
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, resume_seconds, duration_seconds,
             watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'movie', ?, 0, 2400, 1, '2026-07-04 12:00:00', 1,
+         ) VALUES ($1, 'movie', $2, 0, 2400, 1, '2026-07-04 12:00:00', 1,
              '2026-07-04 12:00:00', 'manual')",
     )
     .bind(user_two_id.to_string())
@@ -10961,7 +11768,7 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("review@example.com")
         .bind("hashed")
@@ -10996,14 +11803,14 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let media_file_id: String =
-        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = $1 LIMIT 1")
             .bind(media_path.to_string_lossy().to_string())
             .fetch_one(&state.db_pool)
             .await?;
 
     let review_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO review_queue (id, media_file_id, status, confidence, hint_json, candidates_json) VALUES (?, ?, 'pending', ?, ?, ?)",
+        "INSERT INTO review_queue (id, media_file_id, status, confidence, hint_json, candidates_json) VALUES ($1, $2, 'pending', $3, $4, $5)",
     )
     .bind(&review_id)
     .bind(&media_file_id)
@@ -11035,10 +11842,11 @@ async fn review_queue_apply_updates_movie_and_override() -> Result<()> {
         .await?;
     assert_eq!(imdb_id.as_deref(), Some("tt1234567"));
 
-    let status: String = sqlx::query_scalar("SELECT status FROM review_queue WHERE id = ? LIMIT 1")
-        .bind(&review_id)
-        .fetch_one(&state.db_pool)
-        .await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM review_queue WHERE id = $1 LIMIT 1")
+            .bind(&review_id)
+            .fetch_one(&state.db_pool)
+            .await?;
     assert_eq!(status, "applied");
 
     let override_key: String = sqlx::query_scalar(
@@ -11146,7 +11954,7 @@ async fn media_segment_candidate_routes_activate_and_disable_segments() -> Resul
     let manual_candidate_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM media_segment_candidates
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
            AND (provider_kind = 'manual' OR identity_strength = 'manual')",
     )
     .bind(&fixture.media_file_id)
@@ -11457,7 +12265,7 @@ async fn false_positive_detector_segment_disable_is_support_only_and_removes_ski
     let (candidate_state, candidate_reason): (String, Option<String>) = sqlx::query_as(
         "SELECT validation_state, validation_reason
          FROM media_segment_candidates
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
            AND provider_kind = 'local_visual_recurring'
          LIMIT 1",
     )
@@ -12116,7 +12924,7 @@ async fn play_endpoint_does_not_call_segment_providers() -> Result<()> {
         2_000_000,
     )
     .await?;
-    sqlx::query("UPDATE movies SET external_imdb = 'tt7650001' WHERE id = ?")
+    sqlx::query("UPDATE movies SET external_imdb = 'tt7650001' WHERE id = $1")
         .bind(&fixture.item_id)
         .execute(&fixture.state.db_pool)
         .await?;
@@ -12387,7 +13195,7 @@ async fn media_interaction_library_settings_update_provider_policy() -> Result<(
     sqlx::query(
         "INSERT INTO server_instances
             (id, user_id, device_name, lan_addresses)
-         VALUES (?, ?, 'MIDM Test Server', '[]')",
+         VALUES ($1, $2, 'MIDM Test Server', '[]')",
     )
     .bind(&server_id)
     .bind(&fixture.user_id)
@@ -12396,13 +13204,13 @@ async fn media_interaction_library_settings_update_provider_policy() -> Result<(
     sqlx::query(
         "INSERT INTO source_configs
             (id, server_id, extension_id, config_json, enabled)
-         VALUES (?, ?, 'elixir.local_folder', '{}', 1)",
+         VALUES ($1, $2, 'elixir.local_folder', '{}', 1)",
     )
     .bind(&source_config_id)
     .bind(&server_id)
     .execute(&fixture.state.db_pool)
     .await?;
-    sqlx::query("UPDATE media_files SET source_config_id = ? WHERE id = ?")
+    sqlx::query("UPDATE media_files SET source_config_id = $1 WHERE id = $2")
         .bind(&source_config_id)
         .bind(&fixture.media_file_id)
         .execute(&fixture.state.db_pool)
@@ -12475,7 +13283,7 @@ async fn media_interaction_library_settings_update_provider_policy() -> Result<(
     let stored_enabled = sqlx::query_scalar::<_, i64>(
         "SELECT CASE WHEN enabled THEN 1 ELSE 0 END
          FROM media_interaction_library_provider_settings
-         WHERE source_config_id = ?
+         WHERE source_config_id = $1
            AND provider_kind = 'theintrodb'",
     )
     .bind(&source_config_id)
@@ -12538,7 +13346,7 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     run_full_scan(&state.db_pool, vec![candidate], false).await?;
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("play-user@example.com")
         .bind("hashed")
@@ -12550,7 +13358,7 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
             .fetch_one(&state.db_pool)
             .await?;
     let media_file_id: String =
-        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = $1 LIMIT 1")
             .bind(file_path.to_string_lossy().to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -12644,11 +13452,12 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
         .get("session_id")
         .and_then(Value::as_str)
         .context("play response should include session_id")?;
-    let persisted_plan: Option<String> =
-        sqlx::query_scalar("SELECT playback_plan_json FROM playback_sessions WHERE id = ? LIMIT 1")
-            .bind(session_id)
-            .fetch_one(&state.db_pool)
-            .await?;
+    let persisted_plan: Option<String> = sqlx::query_scalar(
+        "SELECT playback_plan_json FROM playback_sessions WHERE id = $1 LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db_pool)
+    .await?;
     let persisted_plan: Value = serde_json::from_str(
         persisted_plan
             .as_deref()
@@ -12753,7 +13562,7 @@ async fn play_endpoint_returns_stream_url() -> Result<()> {
     );
 
     let persisted_resume: f64 = sqlx::query_scalar(
-        "SELECT resume_seconds FROM user_media_state WHERE user_id = ? AND item_type = 'movie' AND item_id = ?",
+        "SELECT resume_seconds FROM user_media_state WHERE user_id = $1 AND item_type = 'movie' AND item_id = $2",
     )
     .bind(user_id.to_string())
     .bind(item_id.clone())
@@ -12828,7 +13637,7 @@ async fn progress_writes_are_bounded_under_concurrent_playback() -> Result<()> {
     .await?;
 
     let second_user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(second_user_id.to_string())
         .bind("concurrent-progress-second@example.com")
         .bind("hashed")
@@ -12936,7 +13745,7 @@ async fn progress_writes_are_bounded_under_concurrent_playback() -> Result<()> {
         "SELECT COUNT(*)
          FROM user_media_state
          WHERE item_type = 'movie'
-           AND item_id = ?",
+           AND item_id = $1",
     )
     .bind(&fixture.item_id)
     .fetch_one(&fixture.state.db_pool)
@@ -12952,9 +13761,9 @@ async fn progress_writes_are_bounded_under_concurrent_playback() -> Result<()> {
                     CASE WHEN watched THEN 1 ELSE 0 END,
                     last_session_id
              FROM user_media_state
-             WHERE user_id = ?
+             WHERE user_id = $1
                AND item_type = 'movie'
-               AND item_id = ?",
+               AND item_id = $2",
         )
         .bind(&fixture.user_id)
         .bind(&fixture.item_id)
@@ -12980,9 +13789,9 @@ async fn progress_writes_are_bounded_under_concurrent_playback() -> Result<()> {
                     CASE WHEN watched THEN 1 ELSE 0 END,
                     last_session_id
              FROM user_media_state
-             WHERE user_id = ?
+             WHERE user_id = $1
                AND item_type = 'movie'
-               AND item_id = ?",
+               AND item_id = $2",
         )
         .bind(second_user_id.to_string())
         .bind(&fixture.item_id)
@@ -13104,9 +13913,9 @@ async fn progress_load_coalesces_many_heartbeats_without_audit_growth() -> Resul
     let state_row_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM user_media_state
-         WHERE user_id = ?
+         WHERE user_id = $1
            AND item_type = 'movie'
-           AND item_id = ?",
+           AND item_id = $2",
     )
     .bind(&fixture.user_id)
     .bind(&fixture.item_id)
@@ -13120,9 +13929,9 @@ async fn progress_load_coalesces_many_heartbeats_without_audit_growth() -> Resul
     let (resume_seconds, last_session_id): (f64, Option<String>) = sqlx::query_as(
         "SELECT resume_seconds, last_session_id
          FROM user_media_state
-         WHERE user_id = ?
+         WHERE user_id = $1
            AND item_type = 'movie'
-           AND item_id = ?",
+           AND item_id = $2",
     )
     .bind(&fixture.user_id)
     .bind(&fixture.item_id)
@@ -13255,7 +14064,7 @@ async fn manual_watch_state_routes_mark_unwatch_and_reset_progress() -> Result<(
     let play_count: i64 = sqlx::query_scalar(
         "SELECT play_count
          FROM user_media_state
-         WHERE user_id = ? AND item_type = 'movie' AND item_id = ?",
+         WHERE user_id = $1 AND item_type = 'movie' AND item_id = $2",
     )
     .bind(&fixture.user_id)
     .bind(&fixture.item_id)
@@ -13294,7 +14103,7 @@ async fn manual_watch_state_routes_mark_unwatch_and_reset_progress() -> Result<(
          SET resume_seconds = 88,
              state_source = 'playback',
              updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = ? AND item_type = 'movie' AND item_id = ?",
+         WHERE user_id = $1 AND item_type = 'movie' AND item_id = $2",
     )
     .bind(&fixture.user_id)
     .bind(&fixture.item_id)
@@ -13369,7 +14178,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     tokio::fs::write(&s2e11_path, b"s02e11").await?;
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("play-series-user@example.com")
         .bind("hashed")
@@ -13382,7 +14191,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
              skip_credits_behavior, skip_outro_behavior, autoplay_enabled,
              autoplay_countdown_seconds, autoplay_max_consecutive,
              segment_provider_settings_json)
-         VALUES (?, 'prompt', 'prompt', 'prompt', 'prompt', 'prompt', 1, 10, 1, '{}')",
+         VALUES ($1, 'prompt', 'prompt', 'prompt', 'prompt', 'prompt', 1, 10, 1, '{}')",
     )
     .bind(user_id.to_string())
     .execute(&state.db_pool)
@@ -13406,25 +14215,25 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
 
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, 'series', '{}', 'Playback Scope', 2024)",
+         VALUES ($1, 'series', '{}', 'Playback Scope', 2024)",
     )
     .bind(series_id.to_string())
     .execute(&state.db_pool)
     .await?;
     sqlx::query(
         "INSERT INTO series (id, title, year, library_type, metadata_json)
-         VALUES (?, 'Playback Scope', 2024, 'series', NULL)",
+         VALUES ($1, 'Playback Scope', 2024, 'series', NULL)",
     )
     .bind(series_id.to_string())
     .execute(&state.db_pool)
     .await?;
-    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, $3)")
         .bind(season_one_id.to_string())
         .bind(series_id.to_string())
         .bind("Season 1")
         .execute(&state.db_pool)
         .await?;
-    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 2, ?)")
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 2, $3)")
         .bind(season_two_id.to_string())
         .bind(series_id.to_string())
         .bind("Season 2")
@@ -13433,7 +14242,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO episodes
             (id, series_id, season_id, season_number, episode_number, title, has_file)
-         VALUES (?, ?, ?, 1, 1, 'Episode One', 1)",
+         VALUES ($1, $2, $3, 1, 1, 'Episode One', 1)",
     )
     .bind(episode_one_id.to_string())
     .bind(series_id.to_string())
@@ -13443,7 +14252,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO episodes
             (id, series_id, season_id, season_number, episode_number, title, has_file)
-         VALUES (?, ?, ?, 2, 10, 'Later Episode', 1)",
+         VALUES ($1, $2, $3, 2, 10, 'Later Episode', 1)",
     )
     .bind(episode_later_id.to_string())
     .bind(series_id.to_string())
@@ -13453,7 +14262,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO episodes
             (id, series_id, season_id, season_number, episode_number, title, has_file)
-         VALUES (?, ?, ?, 2, 11, 'Final Episode', 1)",
+         VALUES ($1, $2, $3, 2, 11, 'Final Episode', 1)",
     )
     .bind(episode_final_id.to_string())
     .bind(series_id.to_string())
@@ -13463,7 +14272,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO media_files
             (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+         VALUES ($1, $2, $3, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
     )
     .bind(file_one_id.to_string())
     .bind(series_id.to_string())
@@ -13473,7 +14282,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO media_files
             (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 3840, 2160, 18000000, 'ok')",
+         VALUES ($1, $2, $3, 6, 'mkv', 'h264', 'aac', 3840, 2160, 18000000, 'ok')",
     )
     .bind(file_later_id.to_string())
     .bind(series_id.to_string())
@@ -13483,24 +14292,24 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     sqlx::query(
         "INSERT INTO media_files
             (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+         VALUES ($1, $2, $3, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
     )
     .bind(file_final_id.to_string())
     .bind(series_id.to_string())
     .bind(s2e11_path.to_string_lossy().to_string())
     .execute(&state.db_pool)
     .await?;
-    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
         .bind(episode_one_id.to_string())
         .bind(file_one_id.to_string())
         .execute(&state.db_pool)
         .await?;
-    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
         .bind(episode_later_id.to_string())
         .bind(file_later_id.to_string())
         .execute(&state.db_pool)
         .await?;
-    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+    sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
         .bind(episode_final_id.to_string())
         .bind(file_final_id.to_string())
         .execute(&state.db_pool)
@@ -13672,7 +14481,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
             (user_id, item_type, item_id, media_file_id, series_id, season_id,
              resume_seconds, duration_seconds, watched, watched_at, play_count,
              last_played_at, state_source)
-         VALUES (?, 'episode', ?, ?, ?, ?, 0, 1000, 1, CURRENT_TIMESTAMP, 1,
+         VALUES ($1, 'episode', $2, $3, $4, $5, 0, 1000, 1, CURRENT_TIMESTAMP, 1,
                  CURRENT_TIMESTAMP, 'playback')
          ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
              resume_seconds = 0,
@@ -13720,7 +14529,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
             (user_id, item_type, item_id, media_file_id, series_id, season_id,
              resume_seconds, duration_seconds, watched, play_count, last_played_at,
              state_source)
-         VALUES (?, 'episode', ?, ?, ?, ?, 45, 1000, 0, 0, CURRENT_TIMESTAMP,
+         VALUES ($1, 'episode', $2, $3, $4, $5, 45, 1000, 0, 0, CURRENT_TIMESTAMP,
                  'playback')
          ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
              resume_seconds = 45,
@@ -13812,7 +14621,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     let durable_count: i64 = sqlx::query_scalar(
         "SELECT consecutive_count
          FROM user_autoplay_sessions
-         WHERE user_id = ? AND series_id = ? AND canceled = 0
+         WHERE user_id = $1 AND series_id = $2 AND canceled = FALSE
          ORDER BY updated_at DESC
          LIMIT 1",
     )
@@ -13914,7 +14723,7 @@ async fn play_endpoint_scopes_series_episode_preferred_id() -> Result<()> {
     let cancelled_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM user_autoplay_sessions
-         WHERE user_id = ? AND series_id = ? AND canceled = 0",
+         WHERE user_id = $1 AND series_id = $2 AND canceled = FALSE",
     )
     .bind(user_id.to_string())
     .bind(series_id.to_string())
@@ -14058,7 +14867,7 @@ async fn direct_stream_supports_range() -> Result<()> {
 
     // Create a user and session via /play.
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("range-user@example.com")
         .bind("hashed")
@@ -14071,7 +14880,7 @@ async fn direct_stream_supports_range() -> Result<()> {
         .fetch_one(&state.db_pool)
         .await?;
     let selected_file_id: String =
-        sqlx::query_scalar("SELECT id FROM media_files WHERE path = ? LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM media_files WHERE path = $1 LIMIT 1")
             .bind(file_path.to_string_lossy().to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -14093,7 +14902,7 @@ async fn direct_stream_supports_range() -> Result<()> {
     sqlx::query(
         "INSERT INTO media_files
             (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-         VALUES (?, ?, ?, 10, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+         VALUES ($1, $2, $3, 10, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
     )
     .bind(other_file_id.to_string())
     .bind(&media_item_id)
@@ -14157,7 +14966,7 @@ async fn direct_stream_supports_range() -> Result<()> {
         .await?;
     assert_eq!(tampered_resp.status(), StatusCode::UNAUTHORIZED);
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = $1")
         .bind(session_id)
         .execute(&state.db_pool)
         .await?;
@@ -14380,13 +15189,13 @@ async fn direct_stream_supports_range() -> Result<()> {
     assert!(head_invalid_range_body.is_empty());
 
     let updated_at: String =
-        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = $1")
             .bind(session_id)
             .fetch_one(&state.db_pool)
             .await?;
     assert_ne!(updated_at.trim(), "2000-01-01 00:00:00");
 
-    sqlx::query("UPDATE playback_sessions SET mode = 'transcode' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET mode = 'transcode' WHERE id = $1")
         .bind(session_id)
         .execute(&state.db_pool)
         .await?;
@@ -14480,7 +15289,7 @@ async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_polic
     );
 
     let other_user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(other_user_id.to_string())
         .bind("phase22-direct-other@example.com")
         .bind("hashed")
@@ -14517,7 +15326,7 @@ async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_polic
     assert_eq!(mismatched_resp.status(), StatusCode::UNAUTHORIZED);
 
     sqlx::query(
-        "UPDATE playback_sessions SET token_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        "UPDATE playback_sessions SET token_expires_at = '2000-01-01T00:00:00Z' WHERE id = $1",
     )
     .bind(&session_id)
     .execute(&fixture.state.db_pool)
@@ -14533,7 +15342,7 @@ async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_polic
         .await?;
     assert_eq!(expired_token_resp.status(), StatusCode::UNAUTHORIZED);
     let expired_state: String =
-        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ? LIMIT 1")
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = $1 LIMIT 1")
             .bind(&session_id)
             .fetch_one(&fixture.state.db_pool)
             .await?;
@@ -14594,12 +15403,14 @@ async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_polic
         "allow_hardware_transcode": true,
         "reasons": ["remote_policy_downloads_disabled", "remote_policy_direct_play_disabled"]
     });
-    sqlx::query("UPDATE playback_sessions SET share_id = ?, remote_policy_json = ? WHERE id = ?")
-        .bind("phase22-no-downloads")
-        .bind(deny_direct_policy.to_string())
-        .bind(share_session_id)
-        .execute(&fixture.state.db_pool)
-        .await?;
+    sqlx::query(
+        "UPDATE playback_sessions SET share_id = $1, remote_policy_json = $2 WHERE id = $3",
+    )
+    .bind("phase22-no-downloads")
+    .bind(deny_direct_policy.to_string())
+    .bind(share_session_id)
+    .execute(&fixture.state.db_pool)
+    .await?;
     let share_policy_resp = fixture
         .app
         .clone()
@@ -15081,7 +15892,7 @@ async fn phase23_seed_active_session(
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, ?, 'active', 'lan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, $3, $4, 'active', 'lan', 0, 21600, $5, CURRENT_TIMESTAMP)",
     )
     .bind(&session_id_text)
     .bind(user_id)
@@ -15170,7 +15981,7 @@ async fn phase23_simulated_six_hour_direct_play_range_soak_continues_until_end()
     }
 
     let active_state: String =
-        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = $1")
             .bind(&session_id)
             .fetch_one(&fixture.state.db_pool)
             .await?;
@@ -15236,7 +16047,7 @@ async fn phase23_simulated_six_hour_hls_direct_stream_soak_reads_segments_until_
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, $3, 'direct_stream', 'active', 'lan', 0, 21600, $4, CURRENT_TIMESTAMP)",
     )
     .bind(session_id.to_string())
     .bind(&fixture.user_id)
@@ -15356,7 +16167,7 @@ async fn phase23_simulated_six_hour_video_transcode_loop_soak_reads_segments_unt
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'video_transcode', 'active', 'wan', 0, 21600, ?, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, $3, 'video_transcode', 'active', 'wan', 0, 21600, $4, CURRENT_TIMESTAMP)",
     )
     .bind(session_id.to_string())
     .bind(&fixture.user_id)
@@ -16180,7 +16991,7 @@ async fn phase24_diagnostics_bundle_and_admin_sessions_expose_support_evidence()
              logical_position_seconds, duration_seconds, client_capabilities,
              transcode_state, token, token_expires_at, remote_policy_json,
              playback_plan_json, job_state_json)
-         VALUES (?, ?, ?, 'video_transcode', 'error', 'wan', 0, 3600, ?, ?, ?, '2099-01-01 00:00:00', ?, ?, ?)",
+         VALUES ($1, $2, $3, 'video_transcode', 'error', 'wan', 0, 3600, $4, $5, $6, '2099-01-01 00:00:00', $7, $8, $9)",
     )
     .bind(session_id.to_string())
     .bind(&fixture.user_id)
@@ -16344,7 +17155,7 @@ async fn phase24_diagnostics_bundle_and_admin_sessions_expose_support_evidence()
         )
         .await?;
     assert_eq!(stop_resp.status(), StatusCode::OK);
-    let state: String = sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+    let state: String = sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = $1")
         .bind(session_id.to_string())
         .fetch_one(&fixture.state.db_pool)
         .await?;
@@ -16376,8 +17187,8 @@ async fn midm_diagnostics_bundle_redacts_segment_job_error_details() -> Result<(
              logical_position_seconds, duration_seconds, client_capabilities,
              transcode_state, token, token_expires_at, remote_policy_json,
              playback_plan_json, job_state_json, selected_item_type, selected_item_id)
-         VALUES (?, ?, ?, 'direct', 'playing', 'lan', 120, 1800, ?, '{}',
-                 ?, '2099-01-01 00:00:00', ?, '{}', '{}', 'movie', ?)",
+         VALUES ($1, $2, $3, 'direct', 'playing', 'lan', 120, 1800, $4, '{}',
+                 $5, '2099-01-01 00:00:00', $6, '{}', '{}', 'movie', $7)",
     )
     .bind(session_id.to_string())
     .bind(&fixture.user_id)
@@ -16393,8 +17204,8 @@ async fn midm_diagnostics_bundle_redacts_segment_job_error_details() -> Result<(
         "INSERT INTO media_segment_jobs
             (id, job_type, scope_type, scope_id, provider_kind, status,
              priority, attempts, max_attempts, started_at, finished_at, error_json)
-         VALUES (?, 'provider_refresh', 'media_file', ?, 'theintrodb', 'failed',
-                 10, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)",
+         VALUES ($1, 'provider_refresh', 'media_file', $2, 'theintrodb', 'failed',
+                 10, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $3)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&fixture.media_file_id)
@@ -16486,7 +17297,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("hls-artifact-user@example.com")
         .bind("hashed")
@@ -16534,7 +17345,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
 
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, 'movie', '{}', 'Artifact Movie', 2024)",
+         VALUES ($1, 'movie', '{}', 'Artifact Movie', 2024)",
     )
     .bind(media_item_id.to_string())
     .execute(&state.db_pool)
@@ -16542,7 +17353,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     sqlx::query(
         "INSERT INTO media_files
             (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-         VALUES (?, ?, ?, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
+         VALUES ($1, $2, $3, 6, 'mkv', 'h264', 'aac', 1280, 720, 2000000, 'ok')",
     )
     .bind(media_file_id.to_string())
     .bind(media_item_id.to_string())
@@ -16552,7 +17363,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'transcode', 'active', 'lan', 0, 6, ?, '2099-01-01 00:00:00')",
+         VALUES ($1, $2, $3, 'transcode', 'active', 'lan', 0, 6, $4, '2099-01-01 00:00:00')",
     )
     .bind(session_id.to_string())
     .bind(user_id.to_string())
@@ -16588,7 +17399,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     assert_eq!(missing_session_resp.status(), StatusCode::UNAUTHORIZED);
 
     let other_user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(other_user_id.to_string())
         .bind("hls-artifact-other-user@example.com")
         .bind("hashed")
@@ -16678,12 +17489,14 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         "allow_hardware_transcode": true,
         "reasons": ["remote_policy_transcode_disabled"]
     });
-    sqlx::query("UPDATE playback_sessions SET share_id = ?, remote_policy_json = ? WHERE id = ?")
-        .bind("phase22-no-transcode")
-        .bind(deny_hls_policy.to_string())
-        .bind(session_id.to_string())
-        .execute(&state.db_pool)
-        .await?;
+    sqlx::query(
+        "UPDATE playback_sessions SET share_id = $1, remote_policy_json = $2 WHERE id = $3",
+    )
+    .bind("phase22-no-transcode")
+    .bind(deny_hls_policy.to_string())
+    .bind(session_id.to_string())
+    .execute(&state.db_pool)
+    .await?;
     let denied_share_segment_resp = app
         .clone()
         .oneshot(
@@ -16696,14 +17509,14 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .await?;
     assert_eq!(denied_share_segment_resp.status(), StatusCode::UNAUTHORIZED);
     sqlx::query(
-        "UPDATE playback_sessions SET share_id = NULL, remote_policy_json = NULL WHERE id = ?",
+        "UPDATE playback_sessions SET share_id = NULL, remote_policy_json = NULL WHERE id = $1",
     )
     .bind(session_id.to_string())
     .execute(&state.db_pool)
     .await?;
 
     let updated_at: String =
-        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = $1")
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -16788,7 +17601,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     );
     assert!(String::from_utf8_lossy(&subtitle_bytes).contains("WEBVTT"));
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = $1")
         .bind(session_id.to_string())
         .execute(&state.db_pool)
         .await?;
@@ -16802,13 +17615,13 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .await?;
     assert_eq!(poll_resp.status(), StatusCode::OK);
     let poll_updated_at: String =
-        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = $1")
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
     assert_ne!(poll_updated_at.trim(), "2099-01-01 00:00:00");
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = $1")
         .bind(session_id.to_string())
         .execute(&state.db_pool)
         .await?;
@@ -16822,7 +17635,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .await?;
     assert_eq!(heartbeat_resp.status(), StatusCode::OK);
     let heartbeat_updated_at: String =
-        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = ?")
+        sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM playback_sessions WHERE id = $1")
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -16867,7 +17680,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         assert_eq!(symlink_escape.status(), StatusCode::NOT_FOUND);
     }
 
-    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+    sqlx::query("UPDATE playback_sessions SET updated_at = '2000-01-01 00:00:00' WHERE id = $1")
         .bind(session_id.to_string())
         .execute(&state.db_pool)
         .await?;
@@ -16883,7 +17696,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
         .await?;
     assert_eq!(expired_resp.status(), StatusCode::UNAUTHORIZED);
     let expired_state: String =
-        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ? LIMIT 1")
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = $1 LIMIT 1")
             .bind(session_id.to_string())
             .fetch_one(&state.db_pool)
             .await?;
@@ -16913,7 +17726,7 @@ async fn hls_segment_serving_requires_registered_artifact_and_containment() -> R
     sqlx::query(
         "INSERT INTO playback_sessions
             (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token, updated_at)
-         VALUES (?, ?, ?, 'direct_stream', 'active', 'lan', 0, 6, ?, '2099-01-01 00:00:00')",
+         VALUES ($1, $2, $3, 'direct_stream', 'active', 'lan', 0, 6, $4, '2099-01-01 00:00:00')",
     )
     .bind(direct_session_id.to_string())
     .bind(user_id.to_string())
@@ -17070,7 +17883,7 @@ async fn direct_play_range_integration_when_media_present() -> Result<()> {
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("direct-live-user@example.com")
         .bind("hashed")
@@ -17268,7 +18081,7 @@ async fn hls_integration_transcodes_when_media_present() -> Result<()> {
     let app = router(state.clone());
 
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id.to_string())
         .bind("hls-user@example.com")
         .bind("hashed")
@@ -18995,7 +19808,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
             title,
             normalized_title,
             source_provider_id
-         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+         ) VALUES ($1, 'movie', 'Example Movie', 'example movie', $2)",
     )
     .bind(subscription_id.to_string())
     .bind(recovered_provider_id.to_string())
@@ -19019,7 +19832,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
             resolver_version,
             confidence,
             selected_provider_id
-         ) VALUES (?, ?, ?, ?, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', ?, 'magnet', ?, 'single', 'tv', 'test', 'high', ?)",
+         ) VALUES ($1, $2, $3, $4, 'default', 'movie', 'Example Movie', 'Example.Movie.2024.1080p', $5, 'magnet', $6, 'single', 'tv', 'test', 'high', $7)",
     )
     .bind(release_id.to_string())
     .bind(subscription_id.to_string())
@@ -19037,7 +19850,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
             route_logical_id,
             provider_id,
             state
-         ) VALUES (?, ?, 'acquisition.debrid.default', ?, 'queued')",
+         ) VALUES ($1, $2, 'acquisition.debrid.default', $3, 'queued')",
     )
     .bind(release_job_id.to_string())
     .bind(release_id.to_string())
@@ -19092,7 +19905,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
     let subscription_source_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT CASE WHEN source_provider_id IS NULL THEN 1 ELSE 0 END
          FROM acquisition_subscriptions
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .fetch_one(&db_pool)
@@ -19101,7 +19914,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
     let release_provider_refs_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT CASE WHEN source_provider_id IS NULL AND selected_provider_id IS NULL THEN 1 ELSE 0 END
          FROM acquisition_releases
-         WHERE release_id = ?",
+         WHERE release_id = $1",
     )
     .bind(release_id.to_string())
     .fetch_one(&db_pool)
@@ -19110,7 +19923,7 @@ async fn torrentio_candidate_provider_marketplace_lifecycle_matrix() -> Result<(
     let release_job_provider_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT CASE WHEN provider_id IS NULL THEN 1 ELSE 0 END
          FROM acquisition_release_jobs
-         WHERE release_job_id = ?",
+         WHERE release_job_id = $1",
     )
     .bind(release_job_id.to_string())
     .fetch_one(&db_pool)
@@ -20827,7 +21640,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_imdb, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("Noble House")
@@ -20838,7 +21651,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     .await?;
     sqlx::query(
         "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
-         VALUES (?, ?, 1, ?, NULL)",
+         VALUES ($1, $2, 1, $3, NULL)",
     )
     .bind(season_id.to_string())
     .bind(series_id.to_string())
@@ -20848,7 +21661,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     sqlx::query(
         "INSERT INTO episodes (
             id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
-         ) VALUES (?, ?, ?, 1, 1, ?, 1, NULL)",
+         ) VALUES ($1, $2, $3, 1, 1, $4, 1, NULL)",
     )
     .bind(episode_id.to_string())
     .bind(series_id.to_string())
@@ -20858,7 +21671,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     .await?;
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(series_id.to_string())
     .bind("series")
@@ -20870,7 +21683,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     sqlx::query(
         "INSERT INTO media_files (
             id, media_item_id, path, scan_state
-         ) VALUES (?, ?, ?, 'ok')",
+         ) VALUES ($1, $2, $3, 'ok')",
     )
     .bind(media_file_id.to_string())
     .bind(series_id.to_string())
@@ -20879,7 +21692,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     .await?;
     sqlx::query(
         "INSERT INTO episode_files (episode_id, media_file_id)
-         VALUES (?, ?)",
+         VALUES ($1, $2)",
     )
     .bind(episode_id.to_string())
     .bind(media_file_id.to_string())
@@ -20888,7 +21701,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     sqlx::query(
         "INSERT INTO external_subtitles (
             id, media_file_id, path, language
-         ) VALUES (?, ?, ?, ?)",
+         ) VALUES ($1, $2, $3, $4)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(media_file_id.to_string())
@@ -20930,14 +21743,14 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
         "expected subtitle file to be removed"
     );
 
-    let (series_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM series WHERE id = ?")
+    let (series_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM series WHERE id = $1")
         .bind(series_id.to_string())
         .fetch_one(&db_pool)
         .await?;
     assert_eq!(series_count, 0);
 
     let (media_item_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM media_items WHERE id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM media_items WHERE id = $1")
             .bind(series_id.to_string())
             .fetch_one(&db_pool)
             .await?;
@@ -21013,7 +21826,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
 
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+         VALUES ($1, 'movie', $2, 'Fixture Movie', 2026)",
     )
     .bind(movie_id.to_string())
     .bind(serde_json::to_string(&json!({ "tmdb": "999001" }))?)
@@ -21021,7 +21834,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
     .await?;
     sqlx::query(
         "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
-         VALUES (?, 'Fixture Movie', 2026, '999001', NULL)",
+         VALUES ($1, 'Fixture Movie', 2026, '999001', NULL)",
     )
     .bind(movie_id.to_string())
     .execute(&db_pool)
@@ -21030,7 +21843,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
         "INSERT INTO acquisition_subscriptions (
             subscription_id, media_type, title, normalized_title, year,
             monitor_policy, route_policy, status, active
-         ) VALUES (?, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
+         ) VALUES ($1, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
             'all_missing', 'debrid_first', 'active', 1)",
     )
     .bind(subscription_id.to_string())
@@ -21039,7 +21852,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
     sqlx::query(
         "INSERT INTO acquisition_targets (
             target_id, subscription_id, target_key, media_type, title, state
-         ) VALUES (?, ?, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
+         ) VALUES ($1, $2, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
     )
     .bind(target_id.to_string())
     .bind(subscription_id.to_string())
@@ -21089,7 +21902,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
     let subscription_row = sqlx::query(
         "SELECT status, CAST(active AS INTEGER) AS active
          FROM acquisition_subscriptions
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .fetch_one(&db_pool)
@@ -21100,7 +21913,7 @@ async fn library_delete_acquisition_owned_item_stops_subscription() -> Result<()
     assert_eq!(active, 0);
 
     let target_state: String =
-        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = $1")
             .bind(target_id.to_string())
             .fetch_one(&db_pool)
             .await?;
@@ -21148,7 +21961,7 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
 
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+         VALUES ($1, 'movie', $2, 'Fixture Movie', 2026)",
     )
     .bind(movie_id.to_string())
     .bind(serde_json::to_string(&json!({ "tmdb": "999002" }))?)
@@ -21156,7 +21969,7 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
     .await?;
     sqlx::query(
         "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
-         VALUES (?, 'Fixture Movie', 2026, '999002', NULL)",
+         VALUES ($1, 'Fixture Movie', 2026, '999002', NULL)",
     )
     .bind(movie_id.to_string())
     .execute(&db_pool)
@@ -21164,7 +21977,7 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
     sqlx::query(
         "INSERT INTO media_files (
             id, media_item_id, path, scan_state
-         ) VALUES (?, ?, ?, 'ok')",
+         ) VALUES ($1, $2, $3, 'ok')",
     )
     .bind(media_file_id.to_string())
     .bind(movie_id.to_string())
@@ -21175,7 +21988,7 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
         "INSERT INTO acquisition_subscriptions (
             subscription_id, media_type, title, normalized_title, year,
             monitor_policy, route_policy, status, active
-         ) VALUES (?, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
+         ) VALUES ($1, 'movie', 'Fixture Movie', 'fixturemovie', 2026,
             'all_missing', 'debrid_first', 'active', 1)",
     )
     .bind(subscription_id.to_string())
@@ -21184,7 +21997,7 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
     sqlx::query(
         "INSERT INTO acquisition_targets (
             target_id, subscription_id, target_key, media_type, title, state
-         ) VALUES (?, ?, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
+         ) VALUES ($1, $2, 'movie:fixturemovie:2026', 'movie', 'Fixture Movie', 'pending')",
     )
     .bind(target_id.to_string())
     .bind(subscription_id.to_string())
@@ -21235,26 +22048,27 @@ async fn library_release_owner_only_keeps_local_library_rows() -> Result<()> {
         media_path.exists(),
         "release_owner_only must not delete local files"
     );
-    let media_item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ?")
-        .bind(movie_id.to_string())
-        .fetch_one(&db_pool)
-        .await?;
+    let media_item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = $1")
+            .bind(movie_id.to_string())
+            .fetch_one(&db_pool)
+            .await?;
     assert_eq!(media_item_count, 1);
-    let movie_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies WHERE id = ?")
+    let movie_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies WHERE id = $1")
         .bind(movie_id.to_string())
         .fetch_one(&db_pool)
         .await?;
     assert_eq!(movie_count, 1);
 
     let subscription_active: i64 = sqlx::query_scalar(
-        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .fetch_one(&db_pool)
     .await?;
     assert_eq!(subscription_active, 0);
     let target_state: String =
-        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = $1")
             .bind(target_id.to_string())
             .fetch_one(&db_pool)
             .await?;
@@ -21326,7 +22140,7 @@ async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> R
     for (movie_id, tmdb_id) in [(orphan_movie_id, "999003"), (stale_movie_id, "999004")] {
         sqlx::query(
             "INSERT INTO media_items (id, type, external_ids, title, year)
-             VALUES (?, 'movie', ?, 'Fixture Movie', 2026)",
+             VALUES ($1, 'movie', $2, 'Fixture Movie', 2026)",
         )
         .bind(movie_id.to_string())
         .bind(serde_json::to_string(&json!({ "tmdb": tmdb_id }))?)
@@ -21334,7 +22148,7 @@ async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> R
         .await?;
         sqlx::query(
             "INSERT INTO movies (id, title, year, external_tmdb, metadata_json)
-             VALUES (?, 'Fixture Movie', 2026, ?, NULL)",
+             VALUES ($1, 'Fixture Movie', 2026, $2, NULL)",
         )
         .bind(movie_id.to_string())
         .bind(tmdb_id)
@@ -21399,7 +22213,7 @@ async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> R
         })
         .await?;
 
-    sqlx::query("DELETE FROM providers WHERE provider_id = ?")
+    sqlx::query("DELETE FROM providers WHERE provider_id = $1")
         .bind(provider_id.to_string())
         .execute(&db_pool)
         .await?;
@@ -21431,7 +22245,7 @@ async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> R
     );
 
     let orphan_owner_type: String = sqlx::query_scalar(
-        "SELECT owner_type FROM media_ownerships WHERE media_item_id = ? AND active = 1",
+        "SELECT owner_type FROM media_ownerships WHERE media_item_id = $1 AND active = 1",
     )
     .bind(orphan_movie_id.to_string())
     .fetch_one(&db_pool)
@@ -21439,7 +22253,7 @@ async fn library_owner_release_reconcile_repairs_missing_and_stale_owners() -> R
     assert_eq!(orphan_owner_type, "external");
 
     let stale_release_capability: String = sqlx::query_scalar(
-        "SELECT release_capability FROM media_ownerships WHERE ownership_id = ?",
+        "SELECT release_capability FROM media_ownerships WHERE ownership_id = $1",
     )
     .bind(stale_ownership_id.to_string())
     .fetch_one(&db_pool)
@@ -21507,7 +22321,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_tvdb_series, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("Blocked Show")
@@ -21518,7 +22332,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     .await?;
     sqlx::query(
         "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
-         VALUES (?, ?, 1, ?, NULL)",
+         VALUES ($1, $2, 1, $3, NULL)",
     )
     .bind(season_id.to_string())
     .bind(series_id.to_string())
@@ -21528,7 +22342,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     sqlx::query(
         "INSERT INTO episodes (
             id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
-         ) VALUES (?, ?, ?, 1, 2, ?, 1, NULL)",
+         ) VALUES ($1, $2, $3, 1, 2, $4, 1, NULL)",
     )
     .bind(episode_id.to_string())
     .bind(series_id.to_string())
@@ -21538,7 +22352,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     .await?;
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(series_id.to_string())
     .bind("series")
@@ -21553,7 +22367,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
         "INSERT INTO acquisition_subscriptions (
             subscription_id, media_type, title, normalized_title, year,
             monitor_policy, route_policy, status, active
-         ) VALUES (?, 'series', 'Blocked Show', 'blockedshow', 2024,
+         ) VALUES ($1, 'series', 'Blocked Show', 'blockedshow', 2024,
             'all_missing', 'debrid_first', 'active', 1)",
     )
     .bind(subscription_id.to_string())
@@ -21563,7 +22377,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
         "INSERT INTO acquisition_targets (
             target_id, subscription_id, target_key, media_type, title,
             season_number, episode_number, state
-         ) VALUES (?, ?, 'S01E02', 'series', 'Blocked Show', 1, 2, 'pending')",
+         ) VALUES ($1, $2, 'S01E02', 'series', 'Blocked Show', 1, 2, 'pending')",
     )
     .bind(target_id.to_string())
     .bind(subscription_id.to_string())
@@ -21580,7 +22394,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     sqlx::query(
         "INSERT INTO media_files (
             id, media_item_id, path, scan_state
-         ) VALUES (?, ?, ?, 'ok')",
+         ) VALUES ($1, $2, $3, 'ok')",
     )
     .bind(media_file_id.to_string())
     .bind(series_id.to_string())
@@ -21589,7 +22403,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     .await?;
     sqlx::query(
         "INSERT INTO episode_files (episode_id, media_file_id)
-         VALUES (?, ?)",
+         VALUES ($1, $2)",
     )
     .bind(episode_id.to_string())
     .bind(media_file_id.to_string())
@@ -21598,7 +22412,7 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     sqlx::query(
         "INSERT INTO external_subtitles (
             id, media_file_id, path, language
-         ) VALUES (?, ?, ?, ?)",
+         ) VALUES ($1, $2, $3, $4)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(media_file_id.to_string())
@@ -21640,14 +22454,14 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     );
 
     let (episode_has_file,): (i64,) =
-        sqlx::query_as("SELECT CAST(has_file AS INTEGER) FROM episodes WHERE id = ?")
+        sqlx::query_as("SELECT CAST(has_file AS INTEGER) FROM episodes WHERE id = $1")
             .bind(episode_id.to_string())
             .fetch_one(&db_pool)
             .await?;
     assert_eq!(episode_has_file, 0);
 
     let (media_file_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE id = $1")
             .bind(media_file_id.to_string())
             .fetch_one(&db_pool)
             .await?;
@@ -21660,14 +22474,14 @@ async fn library_delete_episode_can_block_locally_and_keep_series_scaffold() -> 
     assert_eq!(tombstones[0].action, "block_episode");
 
     let target_state: String =
-        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = ?")
+        sqlx::query_scalar("SELECT state FROM acquisition_targets WHERE target_id = $1")
             .bind(target_id.to_string())
             .fetch_one(&db_pool)
             .await?;
     assert_eq!(target_state, "excluded");
 
     let subscription_active: i64 = sqlx::query_scalar(
-        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = ?",
+        "SELECT CAST(active AS INTEGER) FROM acquisition_subscriptions WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .fetch_one(&db_pool)
@@ -21743,7 +22557,7 @@ async fn mmr2_library_episode_api_exposes_compact_acquisition_recovery_states() 
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_tvdb_series, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("MMR Show")
@@ -21754,7 +22568,7 @@ async fn mmr2_library_episode_api_exposes_compact_acquisition_recovery_states() 
     .await?;
     sqlx::query(
         "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
-         VALUES (?, ?, 1, ?, NULL)",
+         VALUES ($1, $2, 1, $3, NULL)",
     )
     .bind(season_id.to_string())
     .bind(series_id.to_string())
@@ -21768,7 +22582,7 @@ async fn mmr2_library_episode_api_exposes_compact_acquisition_recovery_states() 
         sqlx::query(
             "INSERT INTO episodes (
                 id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
-             ) VALUES (?, ?, ?, 1, ?, ?, ?, NULL)",
+             ) VALUES ($1, $2, $3, 1, $4, $5, $6, NULL)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -21841,7 +22655,7 @@ async fn mmr2_library_episode_api_exposes_compact_acquisition_recovery_states() 
                 candidate_count,
                 selected_release_title,
                 last_attempt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -21992,7 +22806,7 @@ async fn library_episode_api_projects_authenticated_playback_state_per_user() ->
         (user_one_id, "episode-progress-one@example.com"),
         (user_two_id, "episode-progress-two@example.com"),
     ] {
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
             .bind(user_id.to_string())
             .bind(email)
             .bind("hashed")
@@ -22008,14 +22822,14 @@ async fn library_episode_api_projects_authenticated_playback_state_per_user() ->
     let episode_two_id = Uuid::new_v4();
     let episode_one_id_text = episode_one_id.to_string();
     let episode_two_id_text = episode_two_id.to_string();
-    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES ($1, $2, $3, $4)")
         .bind(series_id.to_string())
         .bind("Playback State Show")
         .bind(2026)
         .bind("series")
         .execute(&db_pool)
         .await?;
-    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, $3)")
         .bind(season_id.to_string())
         .bind(series_id.to_string())
         .bind("Season 1")
@@ -22029,7 +22843,7 @@ async fn library_episode_api_projects_authenticated_playback_state_per_user() ->
             "INSERT INTO episodes (
                 id, series_id, season_id, season_number, episode_number, title,
                 runtime_seconds, has_file, metadata_json
-             ) VALUES (?, ?, ?, 1, ?, ?, ?, 1, NULL)",
+             ) VALUES ($1, $2, $3, 1, $4, $5, $6, 1, NULL)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -22045,7 +22859,7 @@ async fn library_episode_api_projects_authenticated_playback_state_per_user() ->
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, series_id, season_id, resume_seconds,
             duration_seconds, watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'episode', ?, ?, ?, 321.4, 1800, 0, NULL, 0, CURRENT_TIMESTAMP, 'playback')",
+         ) VALUES ($1, 'episode', $2, $3, $4, 321.4, 1800, 0, NULL, 0, CURRENT_TIMESTAMP, 'playback')",
     )
     .bind(user_one_id.to_string())
     .bind(episode_one_id.to_string())
@@ -22057,7 +22871,7 @@ async fn library_episode_api_projects_authenticated_playback_state_per_user() ->
         "INSERT INTO user_media_state (
             user_id, item_type, item_id, series_id, season_id, resume_seconds,
             duration_seconds, watched, watched_at, play_count, last_played_at, state_source
-         ) VALUES (?, 'episode', ?, ?, ?, 0, 1800, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP, 'manual')",
+         ) VALUES ($1, 'episode', $2, $3, $4, 0, 1800, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP, 'manual')",
     )
     .bind(user_two_id.to_string())
     .bind(episode_one_id.to_string())
@@ -22216,14 +23030,14 @@ async fn mmr2_library_episode_api_exposes_post_processing_and_failed_recovery_st
     let series_id = Uuid::new_v4();
     let season_id = Uuid::new_v4();
     let episode_ids = [Uuid::new_v4(), Uuid::new_v4()];
-    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO series (id, title, year, library_type) VALUES ($1, $2, $3, $4)")
         .bind(series_id.to_string())
         .bind("MMR State Show")
         .bind(2026)
         .bind("series")
         .execute(&db_pool)
         .await?;
-    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, ?)")
+    sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, $3)")
         .bind(season_id.to_string())
         .bind(series_id.to_string())
         .bind("Season 1")
@@ -22234,7 +23048,7 @@ async fn mmr2_library_episode_api_exposes_post_processing_and_failed_recovery_st
         sqlx::query(
             "INSERT INTO episodes (
                 id, series_id, season_id, season_number, episode_number, title, has_file
-             ) VALUES (?, ?, ?, 1, ?, ?, 0)",
+             ) VALUES ($1, $2, $3, 1, $4, $5, 0)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -22256,7 +23070,7 @@ async fn mmr2_library_episode_api_exposes_post_processing_and_failed_recovery_st
         sqlx::query(
             "INSERT INTO library_episode_acquisition_state (
                 episode_id, media_item_id, season_id, target_key, state, reason_code, last_attempt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -22343,7 +23157,7 @@ async fn library_restore_blocked_episodes_clears_episode_tombstones() -> Result<
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_tvdb_series, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("Blocked Show")
@@ -22354,7 +23168,7 @@ async fn library_restore_blocked_episodes_clears_episode_tombstones() -> Result<
     .await?;
     sqlx::query(
         "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
-         VALUES (?, ?, 1, ?, NULL)",
+         VALUES ($1, $2, 1, $3, NULL)",
     )
     .bind(season_id.to_string())
     .bind(series_id.to_string())
@@ -22365,7 +23179,7 @@ async fn library_restore_blocked_episodes_clears_episode_tombstones() -> Result<
         sqlx::query(
             "INSERT INTO episodes (
                 id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
-             ) VALUES (?, ?, ?, 1, ?, ?, 0, NULL)",
+             ) VALUES ($1, $2, $3, 1, $4, $5, 0, NULL)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -22377,7 +23191,7 @@ async fn library_restore_blocked_episodes_clears_episode_tombstones() -> Result<
     }
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(series_id.to_string())
     .bind("series")
@@ -22472,7 +23286,7 @@ async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
     sqlx::query(
         "INSERT INTO series (
             id, title, year, library_type, external_tvdb_series, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, NULL)",
     )
     .bind(series_id.to_string())
     .bind("Blocked Show")
@@ -22483,7 +23297,7 @@ async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
     .await?;
     sqlx::query(
         "INSERT INTO seasons (id, series_id, season_number, title, metadata_json)
-         VALUES (?, ?, 1, ?, NULL)",
+         VALUES ($1, $2, 1, $3, NULL)",
     )
     .bind(season_id.to_string())
     .bind(series_id.to_string())
@@ -22493,7 +23307,7 @@ async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
     sqlx::query(
         "INSERT INTO episodes (
             id, series_id, season_id, season_number, episode_number, title, has_file, metadata_json
-         ) VALUES (?, ?, ?, 1, 2, ?, 0, NULL)",
+         ) VALUES ($1, $2, $3, 1, 2, $4, 0, NULL)",
     )
     .bind(episode_id.to_string())
     .bind(series_id.to_string())
@@ -22503,7 +23317,7 @@ async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
     .await?;
     sqlx::query(
         "INSERT INTO media_items (id, type, external_ids, title, year)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(series_id.to_string())
     .bind("series")
@@ -25028,7 +25842,7 @@ async fn extensions_uninstall_source_preserves_acquisition_history() -> Result<(
             title,
             normalized_title,
             source_provider_id
-         ) VALUES (?, 'movie', 'Example Movie', 'example movie', ?)",
+         ) VALUES ($1, 'movie', 'Example Movie', 'example movie', $2)",
     )
     .bind(subscription_id.to_string())
     .bind(provider_id.to_string())
@@ -25051,7 +25865,7 @@ async fn extensions_uninstall_source_preserves_acquisition_history() -> Result<(
     let source_provider_cleared = sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT CASE WHEN source_provider_id IS NULL THEN 1 ELSE 0 END
          FROM acquisition_subscriptions
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .fetch_one(&db_pool)
@@ -25119,7 +25933,7 @@ async fn extensions_clear_runs_deletes_pending_entries() -> Result<()> {
         })
         .await?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE orchestrator_runs SET created_at = '2000-01-01 00:00:00' WHERE run_id = ?",
+        "UPDATE orchestrator_runs SET created_at = '2000-01-01 00:00:00' WHERE run_id = $1",
     )
     .bind(stale_running_id.to_string())
     .execute(&db_pool)

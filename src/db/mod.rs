@@ -1,4 +1,5 @@
 pub mod models;
+mod postgres_migrations;
 
 use std::{path::Path, time::Duration};
 
@@ -39,6 +40,14 @@ impl DatabaseDriver {
     }
 }
 
+pub(crate) fn numbered_bind_list(first: usize, count: usize) -> String {
+    assert!(first > 0, "SQL bind parameters are one-indexed");
+    (first..first + count)
+        .map(|position| format!("${position}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub driver: DatabaseDriver,
@@ -75,10 +84,11 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
-        MIGRATOR
-            .run(&self.pool)
-            .await
-            .context("database migrations failed")?;
+        match self.driver {
+            DatabaseDriver::Postgres => postgres_migrations::migrator()?.run(&self.pool).await,
+            DatabaseDriver::Sqlite => MIGRATOR.run(&self.pool).await,
+        }
+        .context("database migrations failed")?;
         backfill_media_interaction_state(&self.pool).await?;
         Ok(())
     }

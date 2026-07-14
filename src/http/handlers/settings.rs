@@ -4,6 +4,7 @@ use serde::Serialize;
 use crate::{
     config::{RunEnvironment, Settings},
     http::error::ApiResult,
+    live::service::LiveServiceSnapshot,
     state::AppState,
 };
 
@@ -16,6 +17,7 @@ pub struct SettingsResponse {
     database: DatabaseSettings,
     telemetry: TelemetrySettings,
     playback: PlaybackSettings,
+    live: LiveServiceSnapshot,
 }
 
 #[derive(Serialize)]
@@ -115,6 +117,7 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
             log_directives: settings.telemetry.log_directives.clone(),
         },
         playback: playback_settings(settings),
+        live: app_state.live.snapshot().await,
     }))
 }
 

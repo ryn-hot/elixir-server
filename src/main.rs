@@ -147,7 +147,6 @@ async fn main() -> anyhow::Result<()> {
         artwork,
         secrets,
     );
-
     if let Err(err) = bootstrap_core_extensions(&state).await {
         tracing::warn!("core extension bootstrap failed: {err}");
     }
@@ -220,17 +219,41 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {}", addr))?;
+    let live_status = state
+        .live
+        .initialize()
+        .await
+        .context("failed to initialize Live service")?;
+    tracing::info!(
+        raw_enabled = live_status.raw_enabled,
+        effective_enabled = live_status.effective_enabled,
+        ready = live_status.ready,
+        lifecycle = ?live_status.lifecycle,
+        lease_generation = live_status.lease_generation,
+        disabled_reason = live_status.disabled_reason,
+        "Live service initialized"
+    );
 
     tracing::info!("Elixir server listening on http://{}", addr);
 
     let background_shutdown = CancellationToken::new();
+    let live_lease_task = tokio::spawn(
+        state
+            .live
+            .clone()
+            .run_lease_heartbeat(background_shutdown.clone()),
+    );
+    let live_session_task = tokio::spawn(state.live.clone().run_session_lifecycle(
+        state.auth_service.authorization_revocation_notifier(),
+        background_shutdown.clone(),
+    ));
     tokio::spawn(start_post_listener_background_tasks(
         state.clone(),
         reconcile_config,
         background_shutdown.clone(),
     ));
 
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown({
             let background_shutdown = background_shutdown.clone();
             async move {
@@ -238,8 +261,27 @@ async fn main() -> anyhow::Result<()> {
                 background_shutdown.cancel();
             }
         })
-        .await
-        .context("server error")?;
+        .await;
+    background_shutdown.cancel();
+    match tokio::time::timeout(std::time::Duration::from_secs(10), live_lease_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "Live control lease task failed during shutdown");
+        }
+        Err(_) => {
+            tracing::error!("Live control lease shutdown exceeded its deadline");
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), live_session_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "Live session lifecycle task failed during shutdown");
+        }
+        Err(_) => {
+            tracing::error!("Live session lifecycle shutdown exceeded its deadline");
+        }
+    }
+    serve_result.context("server error")?;
 
     // Clean up any lingering transcodes/temp files on shutdown.
     state.transcodes.stop_all().await;

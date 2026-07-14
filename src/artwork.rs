@@ -95,7 +95,7 @@ impl ArtworkService {
                 continue;
             };
             let existing = sqlx::query_scalar::<sqlx::Any, String>(
-                "SELECT id FROM artwork_refs WHERE owner_type = ? AND owner_id = ? AND kind = ? AND url = ? LIMIT 1",
+                "SELECT id FROM artwork_refs WHERE owner_type = $1 AND owner_id = $2 AND kind = $3 AND url = $4 LIMIT 1",
             )
             .bind(owner_type)
             .bind(owner_id.to_string())
@@ -111,7 +111,7 @@ impl ArtworkService {
 
             let id = if let Some(id_str) = existing {
                 sqlx::query::<sqlx::Any>(
-                    "UPDATE artwork_refs SET language = COALESCE(?, language), width = COALESCE(?, width), height = COALESCE(?, height), provider = COALESCE(?, provider), score = COALESCE(?, score), metadata_json = COALESCE(?, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    "UPDATE artwork_refs SET language = COALESCE($1, language), width = COALESCE($2, width), height = COALESCE($3, height), provider = COALESCE($4, provider), score = COALESCE($5, score), metadata_json = COALESCE($6, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
                 )
                 .bind(candidate.language.as_deref())
                 .bind(candidate.width)
@@ -126,7 +126,7 @@ impl ArtworkService {
             } else {
                 let id = Uuid::new_v4();
                 sqlx::query::<sqlx::Any>(
-                    "INSERT INTO artwork_refs (id, owner_type, owner_id, kind, url, language, width, height, provider, score, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    "INSERT INTO artwork_refs (id, owner_type, owner_id, kind, url, language, width, height, provider, score, metadata_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
                 )
                 .bind(id.to_string())
                 .bind(owner_type)
@@ -188,7 +188,7 @@ impl ArtworkService {
         url: &str,
     ) -> Result<Option<String>> {
         let existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT local_path FROM artwork_cache WHERE artwork_id = ? LIMIT 1",
+            "SELECT local_path FROM artwork_cache WHERE artwork_id = $1 LIMIT 1",
         )
         .bind(artwork_id.to_string())
         .fetch_optional(pool)
@@ -217,7 +217,7 @@ impl ArtworkService {
         artwork: &StoredArtwork,
     ) -> Result<Option<String>> {
         let existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT local_path FROM artwork_cache WHERE artwork_id = ? LIMIT 1",
+            "SELECT local_path FROM artwork_cache WHERE artwork_id = $1 LIMIT 1",
         )
         .bind(artwork.id.to_string())
         .fetch_optional(pool)
@@ -250,7 +250,7 @@ impl ArtworkService {
         file.write_all(&bytes).await?;
 
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO artwork_cache (id, artwork_id, local_path, cached_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO artwork_cache (id, artwork_id, local_path, cached_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(artwork.id.to_string())

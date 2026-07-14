@@ -2077,7 +2077,10 @@ fn format_port(port: &PortMapping) -> Option<String> {
         .as_deref()
         .map(|p| format!("/{p}"))
         .unwrap_or_default();
-    Some(format!("{}:{}{}", host, container, proto))
+    match port.host_ip.as_deref() {
+        Some(host_ip) => Some(format!("{host_ip}:{host}:{container}{proto}")),
+        None => Some(format!("{host}:{container}{proto}")),
+    }
 }
 
 #[cfg(test)]
@@ -2091,9 +2094,19 @@ mod tests {
         let mapping = PortMapping {
             container_port: 8080,
             host_port: Some(0),
+            host_ip: None,
             protocol: Some("tcp".to_string()),
         };
         assert_eq!(format_port(&mapping).as_deref(), Some("0:8080/tcp"));
+
+        let loopback = PortMapping {
+            host_ip: Some("127.0.0.1".to_string()),
+            ..mapping
+        };
+        assert_eq!(
+            format_port(&loopback).as_deref(),
+            Some("127.0.0.1:0:8080/tcp")
+        );
     }
 
     #[test]

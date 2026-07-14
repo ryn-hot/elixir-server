@@ -2041,6 +2041,10 @@ impl OrchestratorService {
         &self.runtime_health
     }
 
+    pub(crate) fn runtime_manager(&self) -> std::sync::Arc<dyn RuntimeManager> {
+        self.runtime.clone()
+    }
+
     async fn ensure_runtime_ready(&self) -> Result<()> {
         match self
             .runtime
@@ -3242,7 +3246,7 @@ mod tests {
         );
 
         let lock_rows = sqlx::query_scalar::<sqlx::Any, i64>(
-            "SELECT COUNT(*) FROM orchestrator_locks WHERE lock_name = ?",
+            "SELECT COUNT(*) FROM orchestrator_locks WHERE lock_name = $1",
         )
         .bind(APPLY_LOCK_NAME)
         .fetch_one(&database.pool)
@@ -3318,7 +3322,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_instances
              SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
-             WHERE instance_id = ?",
+             WHERE instance_id = $1",
         )
         .bind(stale_instance.to_string())
         .execute(&database.pool)
@@ -3347,7 +3351,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_instances
              SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
-             WHERE instance_id = ?",
+             WHERE instance_id = $1",
         )
         .bind(keep_instance.to_string())
         .execute(&database.pool)

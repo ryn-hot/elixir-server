@@ -659,7 +659,7 @@ pub async fn upsert_hardware_readiness_record(
             last_checked_at,
             created_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
         ON CONFLICT(host_fingerprint, accelerator_id) DO UPDATE SET
             id = excluded.id,
             api = excluded.api,
@@ -750,7 +750,7 @@ pub async fn load_current_hardware_readiness_records(
             created_at,
             updated_at
         FROM playback_hardware_readiness
-        WHERE host_fingerprint = ? AND stale = 0
+        WHERE host_fingerprint = $1 AND stale = 0
         ORDER BY api, accelerator_id",
     )
     .bind(host_fingerprint)
@@ -769,8 +769,8 @@ pub async fn mark_hardware_readiness_stale_except(
 ) -> Result<u64> {
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE playback_hardware_readiness
-         SET stale = 1, updated_at = ?
-         WHERE host_fingerprint <> ? AND stale = 0",
+         SET stale = 1, updated_at = $1
+         WHERE host_fingerprint <> $2 AND stale = 0",
     )
     .bind(Utc::now().to_rfc3339())
     .bind(active_host_fingerprint)
@@ -783,7 +783,7 @@ pub async fn mark_hardware_readiness_stale_except(
 pub async fn mark_all_hardware_readiness_stale(pool: &AnyPool) -> Result<u64> {
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE playback_hardware_readiness
-         SET stale = 1, updated_at = ?
+         SET stale = 1, updated_at = $1
          WHERE stale = 0",
     )
     .bind(Utc::now().to_rfc3339())
@@ -811,7 +811,7 @@ pub async fn append_hardware_readiness_event(
             message_code,
             details_json,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&id)
     .bind(readiness_id)

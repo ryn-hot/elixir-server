@@ -648,7 +648,7 @@ pub async fn play(
     Json(body): Json<PlayRequest>,
 ) -> ApiResult<Json<PlayResponse>> {
     let latency_timer = PLAY_LATENCY.with_label_values(&["pending"]).start_timer();
-    let movie = sqlx::query("SELECT runtime_seconds FROM movies WHERE id = ? LIMIT 1")
+    let movie = sqlx::query("SELECT runtime_seconds FROM movies WHERE id = $1 LIMIT 1")
         .bind(&body.media_item_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -663,7 +663,7 @@ pub async fn play(
                 .map(|v| v as i32),
         }
     } else {
-        let series = sqlx::query("SELECT library_type FROM series WHERE id = ? LIMIT 1")
+        let series = sqlx::query("SELECT library_type FROM series WHERE id = $1 LIMIT 1")
             .bind(&body.media_item_id)
             .fetch_optional(&state.db_pool)
             .await
@@ -701,7 +701,7 @@ pub async fn play(
         None
     } else if let Some(episode_id) = requested_episode_id {
         let episode = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM episodes WHERE id = ? AND series_id = ? LIMIT 1",
+            "SELECT id FROM episodes WHERE id = $1 AND series_id = $2 LIMIT 1",
         )
         .bind(episode_id)
         .bind(&body.media_item_id)
@@ -711,7 +711,7 @@ pub async fn play(
         Some(episode.ok_or_else(|| ApiError::not_found("episode not found for item"))?)
     } else if let Some(file_or_legacy_episode_id) = requested_file_id {
         sqlx::query_scalar::<_, String>(
-            "SELECT id FROM episodes WHERE id = ? AND series_id = ? LIMIT 1",
+            "SELECT id FROM episodes WHERE id = $1 AND series_id = $2 LIMIT 1",
         )
         .bind(file_or_legacy_episode_id)
         .bind(&body.media_item_id)
@@ -751,7 +751,7 @@ pub async fn play(
     let rows = match item.r#type {
         MediaType::Movie => {
             sqlx::query(
-                "SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = ? AND mf.scan_state = 'ok'",
+                "SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = $1 AND mf.scan_state = 'ok'",
             )
             .bind(&body.media_item_id)
             .fetch_all(&state.db_pool)
@@ -759,7 +759,7 @@ pub async fn play(
         }
         _ if scoped_episode_id.is_some() => {
             sqlx::query(
-                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = ? AND e.id = ? AND mf.scan_state = 'ok'",
+                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = $1 AND e.id = $2 AND mf.scan_state = 'ok'",
             )
             .bind(&body.media_item_id)
             .bind(scoped_episode_id.as_deref().unwrap_or_default())
@@ -768,7 +768,7 @@ pub async fn play(
         }
         _ => {
             sqlx::query(
-                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = ? AND mf.scan_state = 'ok'",
+                "SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, COALESCE(mf.width, 0) as width, COALESCE(mf.height, 0) as height, COALESCE(mf.bitrate_bps, 0) as bitrate_bps, mf.size_bytes FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = $1 AND mf.scan_state = 'ok'",
             )
             .bind(&body.media_item_id)
             .fetch_all(&state.db_pool)
@@ -1139,7 +1139,7 @@ pub async fn play(
         serde_json::to_string(&remote_policy).map_err(|e| ApiError::internal(e.to_string()))?;
     let job_state_json = transcode_state.clone();
 
-    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, token_expires_at, share_id, remote_policy_json, playback_plan_json, job_state_json, selected_item_type, selected_item_id, selected_series_id, selected_season_id, selected_episode_id, playback_context_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query::<sqlx::Any>("INSERT INTO playback_sessions (id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, token, token_expires_at, share_id, remote_policy_json, playback_plan_json, job_state_json, selected_item_type, selected_item_id, selected_series_id, selected_season_id, selected_episode_id, playback_context_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)")
         .bind(session_id.to_string())
         .bind(user.user_id.to_string())
         .bind(server_id.to_string())
@@ -1271,7 +1271,7 @@ async fn resolve_duration_seconds(
     if should_replace {
         if matches!(item_type, MediaType::Movie) {
             let _ = sqlx::query::<sqlx::Any>(
-                "UPDATE movies SET runtime_seconds = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE movies SET runtime_seconds = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             )
             .bind(actual)
             .bind(media_item_id)
@@ -1279,7 +1279,7 @@ async fn resolve_duration_seconds(
             .await;
         }
         let _ = sqlx::query::<sqlx::Any>(
-            "UPDATE media_items SET runtime_seconds = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE media_items SET runtime_seconds = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(actual)
         .bind(media_item_id)
@@ -1312,7 +1312,7 @@ async fn resolve_playback_item_context(
         let row = sqlx::query(
             "SELECT id, series_id, season_id
              FROM episodes
-             WHERE id = ? AND series_id = ?
+             WHERE id = $1 AND series_id = $2
              LIMIT 1",
         )
         .bind(episode_id)
@@ -1340,7 +1340,7 @@ async fn resolve_context_for_media_file(
     if let Some(row) = sqlx::query(
         "SELECT movie_id
          FROM movie_files
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -1361,7 +1361,7 @@ async fn resolve_context_for_media_file(
         "SELECT e.id, e.series_id, e.season_id
          FROM episode_files ef
          JOIN episodes e ON e.id = ef.episode_id
-         WHERE ef.media_file_id = ?
+         WHERE ef.media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -1390,7 +1390,7 @@ async fn load_session_item_context(
         "SELECT selected_item_type, selected_item_id, selected_series_id,
                 selected_season_id, selected_episode_id
          FROM playback_sessions
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(session_id)
@@ -1452,7 +1452,7 @@ async fn load_user_media_state(
                 CAST(last_played_at AS TEXT) as last_played_at,
                 state_source
          FROM user_media_state
-         WHERE user_id = ? AND item_type = ? AND item_id = ?
+         WHERE user_id = $1 AND item_type = $2 AND item_id = $3
          LIMIT 1",
     )
     .bind(user_id.to_string())
@@ -1561,7 +1561,7 @@ async fn apply_manual_watch_state_action(
              resume_seconds, duration_seconds, watched, watched_at, play_count,
              last_played_at, last_session_id, state_source, updated_at, created_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ? != 0, ?, ?, CURRENT_TIMESTAMP, NULL, 'manual',
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8 != 0, $9, $10, CURRENT_TIMESTAMP, NULL, 'manual',
                  CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
              media_file_id = COALESCE(excluded.media_file_id, user_media_state.media_file_id),
@@ -1639,7 +1639,7 @@ async fn resolve_manual_watch_state_context(
                          LIMIT 1
                      ) AS media_file_id
                  FROM movies m
-                 WHERE m.id = ?
+                 WHERE m.id = $1
                  LIMIT 1",
             )
             .bind(item_id)
@@ -1677,7 +1677,7 @@ async fn resolve_manual_watch_state_context(
                          LIMIT 1
                      ) AS media_file_id
                  FROM episodes e
-                 WHERE e.id = ?
+                 WHERE e.id = $1
                  LIMIT 1",
             )
             .bind(item_id)
@@ -1834,7 +1834,7 @@ async fn apply_playback_progress_update(
              resume_seconds, duration_seconds, watched, watched_at, play_count,
              last_played_at, last_session_id, state_source, updated_at, created_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? != 0, ?, ?, CURRENT_TIMESTAMP, ?, 'playback',
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9 != 0, $10, $11, CURRENT_TIMESTAMP, $12, 'playback',
                  CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(user_id, item_type, item_id) DO UPDATE SET
              media_file_id = excluded.media_file_id,
@@ -1915,11 +1915,11 @@ async fn update_session_progress(
 ) -> ApiResult<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE playback_sessions
-         SET logical_position_seconds = ?,
-             duration_seconds = COALESCE(?, duration_seconds),
+         SET logical_position_seconds = $1,
+             duration_seconds = COALESCE($2, duration_seconds),
              last_progress_at = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $3",
     )
     .bind(position_seconds)
     .bind(duration_seconds)
@@ -1943,7 +1943,7 @@ async fn insert_progress_event(
              id, session_id, user_id, item_type, item_id, media_file_id,
              event_type, position_seconds, duration_seconds, paused, client_reported_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ? != 0, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10 != 0, $11)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(session_id)
@@ -2066,7 +2066,7 @@ async fn load_active_media_segments(
                 start_seconds, end_seconds, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END as locked, status, metadata_json
          FROM media_segments
-         WHERE media_file_id = ? AND status = 'active'
+         WHERE media_file_id = $1 AND status = 'active'
          ORDER BY start_seconds ASC, end_seconds ASC
          LIMIT 50",
     )
@@ -2091,10 +2091,10 @@ async fn load_active_segment_at_position(
                 start_seconds, end_seconds, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END as locked, status, metadata_json
          FROM media_segments
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
            AND status = 'active'
-           AND start_seconds <= ?
-           AND end_seconds > ?
+           AND start_seconds <= $2
+           AND end_seconds > $3
          ORDER BY start_seconds ASC, end_seconds ASC
          LIMIT 1",
     )
@@ -2212,8 +2212,8 @@ async fn select_series_episode_for_playback(
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
          LEFT JOIN user_media_state ums
-           ON ums.user_id = ? AND ums.item_type = 'episode' AND ums.item_id = e.id
-         WHERE e.series_id = ? AND mf.scan_state = 'ok'
+           ON ums.user_id = $1 AND ums.item_type = 'episode' AND ums.item_id = e.id
+         WHERE e.series_id = $2 AND mf.scan_state = 'ok'
          GROUP BY e.id, e.season_number, e.episode_number, e.absolute_episode_number,
                   ums.resume_seconds, ums.duration_seconds, ums.last_played_at, ums.watched
          ORDER BY e.season_number ASC,
@@ -2305,8 +2305,8 @@ async fn compute_up_next_metadata(
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
          LEFT JOIN user_media_state ums
-           ON ums.user_id = ? AND ums.item_type = 'episode' AND ums.item_id = e.id
-         WHERE e.series_id = ? AND mf.scan_state = 'ok'
+           ON ums.user_id = $1 AND ums.item_type = 'episode' AND ums.item_id = e.id
+         WHERE e.series_id = $2 AND mf.scan_state = 'ok'
          GROUP BY e.id, e.series_id, e.season_id, e.title, e.season_number,
                   e.episode_number, e.absolute_episode_number, ums.watched
          ORDER BY e.season_number ASC,
@@ -2523,11 +2523,11 @@ async fn record_autoplay_watch_progress(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE user_autoplay_sessions
-         SET elapsed_autoplay_seconds = elapsed_autoplay_seconds + ?,
-             last_progress_session_id = ?,
-             last_progress_position_seconds = ?,
+         SET elapsed_autoplay_seconds = elapsed_autoplay_seconds + $1,
+             last_progress_session_id = $2,
+             last_progress_position_seconds = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND canceled = 0",
+         WHERE id = $4 AND canceled = FALSE",
     )
     .bind(delta_seconds.round() as i64)
     .bind(session_id)
@@ -2556,12 +2556,12 @@ async fn record_autoplay_transition(
     if let Some(session) = load_active_autoplay_session(state, user_id, series_id).await? {
         sqlx::query::<sqlx::Any>(
             "UPDATE user_autoplay_sessions
-             SET last_episode_id = ?,
+             SET last_episode_id = $1,
                  consecutive_count = consecutive_count + 1,
                  last_progress_session_id = NULL,
                  last_progress_position_seconds = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $2",
         )
         .bind(last_episode_id)
         .bind(session.id)
@@ -2575,7 +2575,7 @@ async fn record_autoplay_transition(
                  id, user_id, series_id, started_at, last_episode_id,
                  consecutive_count, elapsed_autoplay_seconds, canceled, updated_at
              )
-             VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 1, 0, 0, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4, 1, 0, FALSE, CURRENT_TIMESTAMP)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(user_id.to_string())
@@ -2597,9 +2597,9 @@ async fn cancel_active_autoplay_sessions(
 ) -> ApiResult<()> {
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE user_autoplay_sessions
-         SET canceled = 1,
+         SET canceled = TRUE,
              updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = ? AND series_id = ? AND canceled = 0",
+         WHERE user_id = $1 AND series_id = $2 AND canceled = FALSE",
     )
     .bind(user_id.to_string())
     .bind(series_id)
@@ -2633,7 +2633,7 @@ async fn load_active_autoplay_session(
              last_episode_id,
              CAST(updated_at AS TEXT) AS updated_at
          FROM user_autoplay_sessions
-         WHERE user_id = ? AND series_id = ? AND canceled = 0
+         WHERE user_id = $1 AND series_id = $2 AND canceled = FALSE
          ORDER BY updated_at DESC
          LIMIT 1",
     )
@@ -3732,7 +3732,7 @@ async fn playback_endpoints(state: &AppState, server_id: &str) -> PlaybackEndpoi
     let registry_row = sqlx::query(
         "SELECT lan_addresses, wan_direct_endpoint
          FROM server_registry
-         WHERE server_id = ?
+         WHERE server_id = $1
          ORDER BY last_seen_at DESC
          LIMIT 1",
     )
@@ -3755,7 +3755,7 @@ async fn playback_endpoints(state: &AppState, server_id: &str) -> PlaybackEndpoi
     let instance_row = sqlx::query(
         "SELECT lan_addresses, wan_direct_endpoint
          FROM server_instances
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(server_id)
@@ -4292,7 +4292,7 @@ async fn active_user_playback_session_count(state: &AppState, user_id: &str) -> 
     let count: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT CAST(COUNT(*) AS TEXT)
          FROM playback_sessions
-         WHERE state = 'active' AND user_id = ?",
+         WHERE state = 'active' AND user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.db_pool)
@@ -4308,7 +4308,7 @@ async fn active_share_playback_session_count(state: &AppState, share_id: &str) -
     let count: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT CAST(COUNT(*) AS TEXT)
          FROM playback_sessions
-         WHERE state = 'active' AND share_id = ?",
+         WHERE state = 'active' AND share_id = $1",
     )
     .bind(share_id)
     .fetch_optional(&state.db_pool)
@@ -5296,7 +5296,7 @@ async fn source_probe_for_diagnostics(
 ) -> ApiResult<Option<Value>> {
     let probe_row = sqlx::query::<sqlx::Any>(
         "SELECT probe_status, CAST(probed_at AS TEXT) as probed_at, normalized_json, error
-         FROM media_file_probes WHERE media_file_id = ? LIMIT 1",
+         FROM media_file_probes WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(&state.db_pool)
@@ -5319,7 +5319,7 @@ async fn source_probe_for_diagnostics(
 
     let media_row = sqlx::query::<sqlx::Any>(
         "SELECT path, container, video_codec, audio_codec, width, height, bitrate_bps, size_bytes, scan_state
-         FROM media_files WHERE id = ? LIMIT 1",
+         FROM media_files WHERE id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(&state.db_pool)
@@ -6067,11 +6067,11 @@ async fn attach_external_subtitles(
 ) -> ApiResult<()> {
     let rows = sqlx::query(
         "SELECT id, path, language, title, format,
-                CAST(is_default AS INTEGER) AS is_default,
-                CAST(is_forced AS INTEGER) AS is_forced,
-                CAST(is_hearing_impaired AS INTEGER) AS is_hearing_impaired
+                CAST(CASE WHEN is_default THEN 1 ELSE 0 END AS BIGINT) AS is_default,
+                CAST(CASE WHEN is_forced THEN 1 ELSE 0 END AS BIGINT) AS is_forced,
+                CAST(CASE WHEN is_hearing_impaired THEN 1 ELSE 0 END AS BIGINT) AS is_hearing_impaired
          FROM external_subtitles
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          ORDER BY path, id",
     )
     .bind(media_file_id)
@@ -6236,7 +6236,7 @@ pub async fn stream_direct(
     }
 
     let file_row = sqlx::query(
-        "SELECT path, container FROM media_files WHERE id = ? AND scan_state = 'ok' LIMIT 1",
+        "SELECT path, container FROM media_files WHERE id = $1 AND scan_state = 'ok' LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&state.db_pool)
@@ -6333,7 +6333,7 @@ pub async fn stream_subtitle(
         "SELECT es.path, es.format, mf.path AS media_path
          FROM external_subtitles es
          JOIN media_files mf ON mf.id = es.media_file_id
-         WHERE es.id = ? AND es.media_file_id = ? AND mf.scan_state = 'ok'
+         WHERE es.id = $1 AND es.media_file_id = $2 AND mf.scan_state = 'ok'
          LIMIT 1",
     )
     .bind(&subtitle_id)
@@ -6421,7 +6421,7 @@ pub async fn master_playlist(
         .and_then(|v| v.get("seek_seconds").and_then(Value::as_f64))
         .unwrap_or(0.0) as f32;
 
-    let file_row = sqlx::query::<sqlx::Any>("SELECT path FROM media_files WHERE id = ? LIMIT 1")
+    let file_row = sqlx::query::<sqlx::Any>("SELECT path FROM media_files WHERE id = $1 LIMIT 1")
         .bind(&media_file_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -6551,7 +6551,7 @@ pub async fn master_playlist(
     );
 
     let _ = sqlx::query::<sqlx::Any>(
-        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP, state = 'active', logical_position_seconds = ? WHERE id = ?",
+        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP, state = 'active', logical_position_seconds = $1 WHERE id = $2",
     )
     .bind(seek_seconds)
     .bind(&id)
@@ -6890,7 +6890,7 @@ async fn touch_playback_session(
     activity: PlaybackActivityKind,
 ) -> ApiResult<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(session_id)
     .execute(&state.db_pool)
@@ -6930,7 +6930,7 @@ async fn get_session(
     expected_mode: Option<&str>,
     require_active: bool,
 ) -> ApiResult<AnyRow> {
-    let row = sqlx::query("SELECT id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, playback_plan_json, job_state_json, token, CAST(token_expires_at AS TEXT) as token_expires_at, share_id, remote_policy_json, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = ? LIMIT 1")
+    let row = sqlx::query("SELECT id, user_id, server_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, client_capabilities, transcode_state, playback_plan_json, job_state_json, token, CAST(token_expires_at AS TEXT) as token_expires_at, share_id, remote_policy_json, CAST(updated_at AS TEXT) as updated_at FROM playback_sessions WHERE id = $1 LIMIT 1")
         .bind(session_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -6983,7 +6983,7 @@ async fn expire_active_playback_session_with_reason(
     sqlx::query::<sqlx::Any>(
         "UPDATE playback_sessions
          SET state = 'ended', updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND state = 'active'",
+         WHERE id = $1 AND state = 'active'",
     )
     .bind(session_id)
     .execute(&state.db_pool)
@@ -8013,9 +8013,9 @@ async fn mark_session_error(
         "UPDATE playback_sessions
          SET state = 'error',
              updated_at = CURRENT_TIMESTAMP,
-             transcode_state = COALESCE(?, transcode_state),
-             job_state_json = COALESCE(?, job_state_json)
-         WHERE id = ?",
+             transcode_state = COALESCE($1, transcode_state),
+             job_state_json = COALESCE($2, job_state_json)
+         WHERE id = $3",
     )
     .bind(transcode_state.clone())
     .bind(transcode_state)
@@ -8150,7 +8150,7 @@ pub async fn playback_admin_sessions(
                 CAST(token_expires_at AS TEXT) as token_expires_at,
                 share_id, remote_policy_json, CAST(updated_at AS TEXT) as updated_at
          FROM playback_sessions
-         WHERE user_id = ? AND state IN ('active', 'error')
+         WHERE user_id = $1 AND state IN ('active', 'error')
          ORDER BY updated_at DESC
          LIMIT 100",
     )
@@ -8411,7 +8411,7 @@ pub async fn end_session(
 
     state.transcodes.stop_and_remove(session_id).await;
     sqlx::query::<sqlx::Any>(
-        "UPDATE playback_sessions SET state = 'ended', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE playback_sessions SET state = 'ended', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(&id)
     .execute(&state.db_pool)
@@ -8438,7 +8438,7 @@ pub async fn seek_transcode(
     let media_file_id: String = session_row.get("media_file_id");
 
     let media_path: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT path FROM media_files WHERE id = ? LIMIT 1",
+        "SELECT path FROM media_files WHERE id = $1 LIMIT 1",
     )
     .bind(&media_file_id)
     .fetch_optional(&state.db_pool)
@@ -8481,7 +8481,7 @@ pub async fn seek_transcode(
         .with_label_values(&["restart", "unknown", "unknown", hardware_label.as_str()])
         .inc();
 
-    sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET logical_position_seconds = ?, state = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query::<sqlx::Any>("UPDATE playback_sessions SET logical_position_seconds = $1, state = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $2")
         .bind(body.position_seconds)
         .bind(&id)
         .execute(&state.db_pool)

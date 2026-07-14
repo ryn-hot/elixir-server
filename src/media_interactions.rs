@@ -617,7 +617,7 @@ pub async fn submit_segment_candidate(
             (id, media_file_id, item_type, item_id, segment_type, start_seconds, end_seconds,
              provider_kind, provider_id, provider_version, confidence, validation_state,
              validation_reason, identity_strength, source_payload_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(id) DO UPDATE SET
              media_file_id = excluded.media_file_id,
              item_type = excluded.item_type,
@@ -752,7 +752,7 @@ pub async fn refresh_chapter_segments_from_probe(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT raw_json, normalized_json
          FROM media_file_probes
-         WHERE media_file_id = ? AND probe_status = 'ok'
+         WHERE media_file_id = $1 AND probe_status = 'ok'
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -1256,11 +1256,11 @@ pub async fn list_media_segment_jobs(
                 CAST(finished_at AS TEXT) AS finished_at,
                 error_json
          FROM media_segment_jobs
-         WHERE (? IS NULL OR status = ?)
-           AND (? IS NULL OR provider_kind = ?)
-           AND (? IS NULL OR job_type = ?)
-           AND (? IS NULL OR scope_type = ?)
-           AND (? IS NULL OR scope_id = ?)
+         WHERE ($1 IS NULL OR status = $2)
+           AND ($3 IS NULL OR provider_kind = $4)
+           AND ($5 IS NULL OR job_type = $6)
+           AND ($7 IS NULL OR scope_type = $8)
+           AND ($9 IS NULL OR scope_id = $10)
          ORDER BY
            CASE status
              WHEN 'running' THEN 0
@@ -1271,7 +1271,7 @@ pub async fn list_media_segment_jobs(
            END,
            priority ASC,
            created_at DESC
-         LIMIT ?",
+         LIMIT $11",
     )
     .bind(status.as_deref())
     .bind(status.as_deref())
@@ -1326,11 +1326,11 @@ pub async fn list_media_segment_provider_certifications(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_provider_certifications
-         WHERE (? IS NULL OR provider_id = ?)
-           AND (? IS NULL OR provider_kind = ?)
-           AND (? IS NULL OR status = ?)
+         WHERE ($1 IS NULL OR provider_id = $2)
+           AND ($3 IS NULL OR provider_kind = $4)
+           AND ($5 IS NULL OR status = $6)
          ORDER BY updated_at DESC
-         LIMIT ?",
+         LIMIT $7",
     )
     .bind(provider_id.as_deref())
     .bind(provider_id.as_deref())
@@ -1502,9 +1502,9 @@ pub async fn retry_media_segment_job(
              locked_by = NULL,
              started_at = NULL,
              finished_at = NULL,
-             error_json = ?,
+             error_json = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $2",
     )
     .bind(payload.to_string())
     .bind(&job_id)
@@ -1578,7 +1578,7 @@ async fn load_media_segment_item_analysis_targets(
     let item_id = normalize_required_text(item_id, "item_id")?;
 
     if requested_type == "movie" {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies WHERE id = ?")
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies WHERE id = $1")
             .bind(&item_id)
             .fetch_one(pool)
             .await
@@ -1590,7 +1590,7 @@ async fn load_media_segment_item_analysis_targets(
             "SELECT DISTINCT mf.id AS media_file_id
              FROM media_files mf
              JOIN movie_files mfv ON mfv.media_file_id = mf.id
-             WHERE mfv.movie_id = ?
+             WHERE mfv.movie_id = $1
                AND mf.scan_state = 'ok'
              ORDER BY mf.id",
         )
@@ -1609,7 +1609,7 @@ async fn load_media_segment_item_analysis_targets(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT library_type
          FROM series
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(&item_id)
@@ -1637,7 +1637,7 @@ async fn load_media_segment_item_analysis_targets(
          FROM episodes e
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
-         WHERE e.series_id = ?
+         WHERE e.series_id = $1
            AND mf.scan_state = 'ok'
          GROUP BY e.id, e.season_number, e.absolute_episode_number, e.episode_number
          ORDER BY e.season_number ASC,
@@ -1663,7 +1663,7 @@ async fn load_media_segment_item_analysis_targets(
          FROM episodes e
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
-         WHERE e.series_id = ?
+         WHERE e.series_id = $1
            AND e.season_id IS NOT NULL
            AND mf.scan_state = 'ok'
          GROUP BY e.season_id
@@ -1930,8 +1930,8 @@ async fn clear_media_segment_provider_cache(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "DELETE FROM media_segment_provider_cache
-         WHERE media_file_id = ?
-           AND provider_kind = ?",
+         WHERE media_file_id = $1
+           AND provider_kind = $2",
     )
     .bind(media_file_id)
     .bind(provider_kind)
@@ -1986,12 +1986,12 @@ pub async fn claim_next_media_segment_job(
             "UPDATE media_segment_jobs
              SET status = 'running',
                  attempts = attempts + 1,
-                 locked_by = ?,
+                 locked_by = $1,
                  started_at = CURRENT_TIMESTAMP,
                  finished_at = NULL,
                  error_json = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?
+             WHERE id = $2
                AND status = 'queued'
                AND attempts < max_attempts
                AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)",
@@ -2420,15 +2420,15 @@ async fn recover_stale_running_media_segment_jobs(
         });
         let result = sqlx::query::<sqlx::Any>(
             "UPDATE media_segment_jobs
-             SET status = ?,
+             SET status = $1,
                  locked_by = NULL,
-                 next_attempt_at = ?,
-                 finished_at = ?,
-                 error_json = ?,
+                 next_attempt_at = $2,
+                 finished_at = $3,
+                 error_json = $4,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?
+             WHERE id = $5
                AND status = 'running'
-               AND started_at = ?",
+               AND started_at = $6",
         )
         .bind(status)
         .bind(next_attempt_at.as_deref())
@@ -2814,24 +2814,24 @@ async fn due_marketplace_segment_provider_media_files(
              WHERE NOT EXISTS (
                    SELECT 1 FROM media_interaction_library_provider_settings lps
                    WHERE lps.source_config_id = mf.source_config_id
-                     AND lps.provider_kind = ?
-                     AND lps.enabled = 0
+                     AND lps.provider_kind = $1
+                     AND lps.enabled = FALSE
                )
                AND NOT EXISTS (
                    SELECT 1 FROM media_segment_provider_cache c
                    WHERE c.media_file_id = mf.id
-                     AND c.provider_kind = ?
+                     AND c.provider_kind = $2
                      AND (c.expires_at IS NULL OR c.expires_at > CURRENT_TIMESTAMP)
                )
                AND NOT EXISTS (
                    SELECT 1 FROM media_segment_jobs j
                    WHERE j.scope_type = 'media_file'
                      AND j.scope_id = mf.id
-                     AND j.provider_kind = ?
+                     AND j.provider_kind = $3
                      AND j.status IN ('queued', 'running')
                )
              ORDER BY mf.id
-             LIMIT ?",
+             LIMIT $4",
         )
         .bind(provider_kind)
         .bind(provider_kind)
@@ -2857,7 +2857,7 @@ async fn due_marketplace_segment_provider_media_files(
          JOIN series s ON s.id = e.series_id
          WHERE COALESCE(e.absolute_episode_number, e.episode_number) > 0
            AND (
-               ? = 1
+               $1 = 1
                OR (
                    (s.external_anilist IS NOT NULL AND TRIM(s.external_anilist) <> '')
                    OR EXISTS (
@@ -2877,24 +2877,24 @@ async fn due_marketplace_segment_provider_media_files(
            AND NOT EXISTS (
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
-                 AND lps.provider_kind = ?
-                 AND lps.enabled = 0
+                 AND lps.provider_kind = $2
+                 AND lps.enabled = FALSE
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_segment_provider_cache c
                WHERE c.media_file_id = mf.id
-                 AND c.provider_kind = ?
+                 AND c.provider_kind = $3
                  AND (c.expires_at IS NULL OR c.expires_at > CURRENT_TIMESTAMP)
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_segment_jobs j
                WHERE j.scope_type = 'media_file'
                  AND j.scope_id = mf.id
-                 AND j.provider_kind = ?
+                 AND j.provider_kind = $4
                  AND j.status IN ('queued', 'running')
            )
          ORDER BY mf.id
-         LIMIT ?",
+         LIMIT $5",
     )
     .bind(include_all_episodes)
     .bind(provider_kind)
@@ -2934,7 +2934,7 @@ async fn due_theintrodb_media_files(pool: &AnyPool, batch_limit: usize) -> Resul
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'theintrodb'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_segment_provider_cache c
@@ -2950,7 +2950,7 @@ async fn due_theintrodb_media_files(pool: &AnyPool, batch_limit: usize) -> Resul
                  AND j.status IN ('queued', 'running')
            )
          ORDER BY mf.id
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -2983,7 +2983,7 @@ async fn due_theintrodb_media_files(pool: &AnyPool, batch_limit: usize) -> Resul
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'theintrodb'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_segment_provider_cache c
@@ -2999,7 +2999,7 @@ async fn due_theintrodb_media_files(pool: &AnyPool, batch_limit: usize) -> Resul
                  AND j.status IN ('queued', 'running')
            )
          ORDER BY mf.id
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(remaining as i64)
     .fetch_all(pool)
@@ -3041,7 +3041,7 @@ async fn due_aniskip_media_files(pool: &AnyPool, batch_limit: usize) -> Result<V
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'aniskip'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_segment_provider_cache c
@@ -3057,7 +3057,7 @@ async fn due_aniskip_media_files(pool: &AnyPool, batch_limit: usize) -> Result<V
                  AND j.status IN ('queued', 'running')
            )
          ORDER BY mf.id
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -3117,7 +3117,7 @@ async fn due_local_audio_fingerprint_media_files(
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'local_audio_recurring'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND NOT EXISTS (
                SELECT 1 FROM media_file_fingerprints fp
@@ -3137,7 +3137,7 @@ async fn due_local_audio_fingerprint_media_files(
                   COALESCE(e.absolute_episode_number, e.episode_number) ASC,
                   e.episode_number ASC,
                   mf.id ASC
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -3347,7 +3347,7 @@ async fn load_local_audio_fingerprint_media_file(
          FROM media_files mf
          JOIN media_items mi ON mi.id = mf.media_item_id
          LEFT JOIN media_file_fingerprints fp ON fp.media_file_id = mf.id
-         WHERE mf.id = ?
+         WHERE mf.id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -3724,7 +3724,7 @@ async fn upsert_media_file_audio_fingerprint(
         "INSERT INTO media_file_fingerprints
             (media_file_id, duration_seconds, file_size_bytes, container, video_codec,
              audio_codec, audio_fingerprint_json, fingerprint_version, computed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
          ON CONFLICT(media_file_id) DO UPDATE SET
              duration_seconds = excluded.duration_seconds,
              file_size_bytes = excluded.file_size_bytes,
@@ -3808,7 +3808,7 @@ async fn due_local_visual_frame_hash_media_files(
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'local_visual_recurring'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND (
                EXISTS (
@@ -3835,7 +3835,7 @@ async fn due_local_visual_frame_hash_media_files(
                  AND j.status IN ('queued', 'running', 'succeeded', 'skipped', 'failed')
            )
          ORDER BY mf.id ASC
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -4044,7 +4044,7 @@ async fn load_local_visual_frame_hash_media_file(
          FROM media_files mf
          JOIN media_items mi ON mi.id = mf.media_item_id
          LEFT JOIN media_file_fingerprints fp ON fp.media_file_id = mf.id
-         WHERE mf.id = ?
+         WHERE mf.id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -4346,7 +4346,7 @@ async fn wait_for_media_segment_job_cancelled_or_pending(
         let status = sqlx::query_scalar::<_, String>(
             "SELECT status
              FROM media_segment_jobs
-             WHERE id = ?
+             WHERE id = $1
              LIMIT 1",
         )
         .bind(cancellation.job_id)
@@ -4486,7 +4486,7 @@ async fn upsert_media_file_visual_frame_hash(
         "INSERT INTO media_file_fingerprints
             (media_file_id, duration_seconds, file_size_bytes, container, video_codec,
              audio_codec, video_frame_hash_json, fingerprint_version, computed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
          ON CONFLICT(media_file_id) DO UPDATE SET
              duration_seconds = excluded.duration_seconds,
              file_size_bytes = excluded.file_size_bytes,
@@ -4615,7 +4615,7 @@ async fn due_local_audio_detector_seasons(
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'local_audio_recurring'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND fp.audio_fingerprint_json IS NOT NULL
            AND TRIM(fp.audio_fingerprint_json) <> ''
@@ -4630,7 +4630,7 @@ async fn due_local_audio_detector_seasons(
          HAVING COUNT(DISTINCT mf.id) >= 2
          ORDER BY MIN(e.season_number) ASC,
                   MIN(COALESCE(e.absolute_episode_number, e.episode_number)) ASC
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -4767,13 +4767,13 @@ async fn load_season_audio_fingerprints(
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
          LEFT JOIN media_file_fingerprints fp ON fp.media_file_id = mf.id
-         WHERE e.season_id = ?
+         WHERE e.season_id = $1
            AND mf.scan_state = 'ok'
            AND NOT EXISTS (
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'local_audio_recurring'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
          ORDER BY e.season_number ASC,
                   COALESCE(e.absolute_episode_number, e.episode_number) ASC,
@@ -4982,7 +4982,7 @@ async fn count_active_local_audio_segments_for_season(
          JOIN media_segment_candidates c ON c.id = ms.canonical_candidate_id
          JOIN episode_files ef ON ef.media_file_id = ms.media_file_id
          JOIN episodes e ON e.id = ef.episode_id
-         WHERE e.season_id = ?
+         WHERE e.season_id = $1
            AND ms.status = 'active'
            AND c.provider_kind = 'local_audio_recurring'",
     )
@@ -5039,7 +5039,7 @@ async fn due_local_visual_detector_media_files(
                SELECT 1 FROM media_interaction_library_provider_settings lps
                WHERE lps.source_config_id = mf.source_config_id
                  AND lps.provider_kind = 'local_visual_recurring'
-                 AND lps.enabled = 0
+                 AND lps.enabled = FALSE
            )
            AND fp.video_frame_hash_json IS NOT NULL
            AND TRIM(fp.video_frame_hash_json) <> ''
@@ -5062,7 +5062,7 @@ async fn due_local_visual_detector_media_files(
                  AND j.status IN ('queued', 'running', 'succeeded')
            )
          ORDER BY fp.computed_at ASC, mf.id ASC
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(batch_limit as i64)
     .fetch_all(pool)
@@ -5216,7 +5216,7 @@ async fn load_video_frame_hash_payload(
     let raw = sqlx::query_scalar::<_, String>(
         "SELECT video_frame_hash_json
          FROM media_file_fingerprints
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
            AND video_frame_hash_json IS NOT NULL
            AND TRIM(video_frame_hash_json) <> ''
          LIMIT 1",
@@ -5659,9 +5659,9 @@ async fn count_active_local_visual_segments_for_file(
         "SELECT COUNT(*)
          FROM media_segments ms
          JOIN media_segment_candidates c ON c.id = ms.canonical_candidate_id
-         WHERE ms.media_file_id = ?
+         WHERE ms.media_file_id = $1
            AND ms.status = 'active'
-           AND c.provider_kind = ?",
+           AND c.provider_kind = $2",
     )
     .bind(media_file_id)
     .bind(PROVIDER_LOCAL_VISUAL_RECURRING)
@@ -5679,7 +5679,7 @@ pub async fn list_active_segments_for_file(
                 canonical_candidate_id, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END AS locked, status, metadata_json
          FROM media_segments
-         WHERE media_file_id = ? AND status = 'active'
+         WHERE media_file_id = $1 AND status = 'active'
          ORDER BY start_seconds ASC, end_seconds ASC",
     )
     .bind(media_file_id)
@@ -5702,7 +5702,7 @@ pub async fn list_active_segments_for_item(
                 canonical_candidate_id, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END AS locked, status, metadata_json
          FROM media_segments
-         WHERE item_type = ? AND item_id = ? AND status = 'active'
+         WHERE item_type = $1 AND item_id = $2 AND status = 'active'
          ORDER BY media_file_id ASC, start_seconds ASC, end_seconds ASC",
     )
     .bind(&context.item_type)
@@ -5725,7 +5725,7 @@ pub async fn list_segment_candidates_for_file(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_candidates
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          ORDER BY created_at DESC, start_seconds ASC
          LIMIT 200",
     )
@@ -5751,7 +5751,7 @@ pub async fn list_segment_candidates_for_item(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_candidates
-         WHERE item_type = ? AND item_id = ?
+         WHERE item_type = $1 AND item_id = $2
          ORDER BY created_at DESC, media_file_id ASC, start_seconds ASC
          LIMIT 200",
     )
@@ -5813,14 +5813,14 @@ pub async fn list_segment_candidate_review_queue(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_candidates
-         WHERE (? IS NULL OR media_file_id = ?)
-           AND (? IS NULL OR item_type = ?)
-           AND (? IS NULL OR item_id = ?)
-           AND (? IS NULL OR segment_type = ?)
-           AND (? IS NULL OR provider_kind = ?)
-           AND (? IS NULL OR validation_state = ?)
-           AND (? IS NULL OR validation_reason = ?)
-           AND (? = 0 OR validation_reason = 'confidence_below_threshold')
+         WHERE ($1 IS NULL OR media_file_id = $2)
+           AND ($3 IS NULL OR item_type = $4)
+           AND ($5 IS NULL OR item_id = $6)
+           AND ($7 IS NULL OR segment_type = $8)
+           AND ($9 IS NULL OR provider_kind = $10)
+           AND ($11 IS NULL OR validation_state = $12)
+           AND ($13 IS NULL OR validation_reason = $14)
+           AND ($15 = 0 OR validation_reason = 'confidence_below_threshold')
          ORDER BY
            CASE validation_state
              WHEN 'rejected' THEN 0
@@ -5832,7 +5832,7 @@ pub async fn list_segment_candidate_review_queue(
            created_at DESC,
            confidence ASC,
            start_seconds ASC
-         LIMIT ?",
+         LIMIT $16",
     )
     .bind(media_file_id.as_deref())
     .bind(media_file_id.as_deref())
@@ -5874,9 +5874,9 @@ pub async fn disable_active_segment(
     sqlx::query::<sqlx::Any>(
         "UPDATE media_segments
          SET status = 'disabled',
-             metadata_json = ?,
+             metadata_json = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $2",
     )
     .bind(
         json!({
@@ -5894,9 +5894,9 @@ pub async fn disable_active_segment(
         sqlx::query::<sqlx::Any>(
             "UPDATE media_segment_candidates
              SET validation_state = 'rejected',
-                 validation_reason = ?,
+                 validation_reason = $1,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $2",
         )
         .bind(disable_reason)
         .bind(candidate_id)
@@ -7448,7 +7448,7 @@ async fn upsert_media_segment_provider_certification(
              summary, media_type_results_json, segment_type_results_json, probe_targets_json,
              response_evidence_json, runtime_version, policy_version, certified_at, expires_at,
              created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(provider_id, policy_version) DO UPDATE SET
              certification_id = excluded.certification_id,
              instance_id = excluded.instance_id,
@@ -7505,8 +7505,8 @@ async fn latest_media_segment_provider_certification(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_provider_certifications
-         WHERE provider_id = ?
-           AND policy_version = ?
+         WHERE provider_id = $1
+           AND policy_version = $2
          LIMIT 1",
     )
     .bind(provider_id.to_string())
@@ -7574,8 +7574,8 @@ async fn load_provider_cache(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT status, response_json, error_json
          FROM media_segment_provider_cache
-         WHERE provider_kind = ?
-           AND provider_cache_key = ?
+         WHERE provider_kind = $1
+           AND provider_cache_key = $2
            AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
          LIMIT 1",
     )
@@ -7621,7 +7621,7 @@ async fn upsert_provider_cache(
         "INSERT INTO media_segment_provider_cache
             (id, media_file_id, item_type, item_id, provider_kind, provider_cache_key,
              status, response_json, error_json, fetched_at, expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, $10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(provider_kind, provider_cache_key) DO UPDATE SET
              media_file_id = excluded.media_file_id,
              item_type = excluded.item_type,
@@ -7661,7 +7661,7 @@ async fn acquire_provider_rate_limit(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT CAST(window_started_at AS TEXT) AS window_started_at, requests_in_window
          FROM media_segment_provider_rate_limits
-         WHERE provider_kind = ?
+         WHERE provider_kind = $1
          LIMIT 1",
     )
     .bind(provider_kind)
@@ -7681,9 +7681,9 @@ async fn acquire_provider_rate_limit(
                 "UPDATE media_segment_provider_rate_limits
                  SET requests_in_window = requests_in_window + 1,
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE provider_kind = ?
-                   AND window_started_at = ?
-                   AND requests_in_window < ?",
+                 WHERE provider_kind = $1
+                   AND window_started_at = $2
+                   AND requests_in_window < $3",
             )
             .bind(provider_kind)
             .bind(&window_started_at)
@@ -7698,7 +7698,7 @@ async fn acquire_provider_rate_limit(
     sqlx::query::<sqlx::Any>(
         "INSERT INTO media_segment_provider_rate_limits
             (provider_kind, window_started_at, requests_in_window, updated_at)
-         VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, 1, CURRENT_TIMESTAMP)
          ON CONFLICT(provider_kind) DO UPDATE SET
              window_started_at = excluded.window_started_at,
              requests_in_window = 1,
@@ -7728,7 +7728,7 @@ async fn enqueue_media_segment_job(
             (id, job_type, scope_type, scope_id, provider_kind, status, priority, attempts,
              max_attempts, next_attempt_at, locked_by, started_at, finished_at, error_json,
              created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'queued', ?, 0, ?, CURRENT_TIMESTAMP, NULL, NULL, NULL, NULL,
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6, 0, $7, CURRENT_TIMESTAMP, NULL, NULL, NULL, NULL,
                  CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          ON CONFLICT(id) DO UPDATE SET
              job_type = excluded.job_type,
@@ -7801,7 +7801,7 @@ async fn load_media_segment_job(
                 CAST(finished_at AS TEXT) AS finished_at,
                 error_json
          FROM media_segment_jobs
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(job_id)
@@ -7821,16 +7821,16 @@ async fn finish_media_segment_job(
     ensure_terminal_job_status(status)?;
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE media_segment_jobs
-         SET status = ?,
+         SET status = $1,
              locked_by = NULL,
              next_attempt_at = NULL,
              finished_at = CURRENT_TIMESTAMP,
-             error_json = ?,
+             error_json = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?
+         WHERE id = $3
            AND (
-               (? = 'cancelled' AND status <> 'succeeded')
-               OR (? <> 'cancelled' AND status <> 'cancelled')
+               ($4 = 'cancelled' AND status <> 'succeeded')
+               OR ($5 <> 'cancelled' AND status <> 'cancelled')
            )",
     )
     .bind(status)
@@ -7878,13 +7878,13 @@ async fn retry_or_fail_media_segment_job(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE media_segment_jobs
-         SET status = ?,
+         SET status = $1,
              locked_by = NULL,
-             next_attempt_at = ?,
-             finished_at = ?,
-             error_json = ?,
+             next_attempt_at = $2,
+             finished_at = $3,
+             error_json = $4,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $5",
     )
     .bind(status)
     .bind(next_attempt_at.as_deref())
@@ -8176,7 +8176,7 @@ async fn load_provider_media_context(
         "SELECT m.id AS movie_id, m.external_imdb, m.external_tmdb
          FROM movie_files mf
          JOIN movies m ON m.id = mf.movie_id
-         WHERE mf.media_file_id = ?
+         WHERE mf.media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -8218,7 +8218,7 @@ async fn load_provider_media_context(
          FROM episode_files ef
          JOIN episodes e ON e.id = ef.episode_id
          JOIN series s ON s.id = e.series_id
-         WHERE ef.media_file_id = ?
+         WHERE ef.media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -8281,7 +8281,7 @@ async fn load_movie_external_id(
     for provider in providers {
         if let Some(value) = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT external_id FROM movie_external_ids
-             WHERE movie_id = ? AND provider = ?
+             WHERE movie_id = $1 AND provider = $2
              ORDER BY COALESCE(confidence, 0) DESC, created_at DESC
              LIMIT 1",
         )
@@ -8306,7 +8306,7 @@ async fn load_series_external_id(
     for provider in providers {
         if let Some(value) = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT external_id FROM series_external_ids
-             WHERE series_id = ? AND provider = ?
+             WHERE series_id = $1 AND provider = $2
              ORDER BY COALESCE(confidence, 0) DESC, created_at DESC
              LIMIT 1",
         )
@@ -8331,7 +8331,7 @@ async fn load_episode_external_id(
     for provider in providers {
         if let Some(value) = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT external_id FROM episode_external_ids
-             WHERE episode_id = ? AND provider = ?
+             WHERE episode_id = $1 AND provider = $2
              ORDER BY COALESCE(confidence, 0) DESC, created_at DESC
              LIMIT 1",
         )
@@ -8534,7 +8534,7 @@ pub async fn load_media_interaction_library_settings(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT id, extension_id, CASE WHEN enabled THEN 1 ELSE 0 END AS source_enabled
          FROM source_configs
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(&source_config_id)
@@ -8577,7 +8577,7 @@ pub async fn update_media_interaction_library_settings(
             sqlx::query::<sqlx::Any>(
                 "INSERT INTO media_interaction_library_provider_settings
                     (source_config_id, provider_kind, enabled, settings_json, created_at, updated_at)
-                 VALUES (?, ?, ? != 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 VALUES ($1, $2, $3 != 0, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                  ON CONFLICT(source_config_id, provider_kind) DO UPDATE SET
                     enabled = excluded.enabled,
                     settings_json = excluded.settings_json,
@@ -8619,7 +8619,7 @@ async fn media_interaction_library_settings_record_from_source_row(
 }
 
 async fn ensure_source_config_exists(pool: &AnyPool, source_config_id: &str) -> Result<()> {
-    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_configs WHERE id = ?")
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_configs WHERE id = $1")
         .bind(source_config_id)
         .fetch_one(pool)
         .await
@@ -8641,7 +8641,7 @@ async fn load_library_provider_settings_map(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_interaction_library_provider_settings
-         WHERE source_config_id = ?
+         WHERE source_config_id = $1
          ORDER BY provider_kind ASC",
     )
     .bind(source_config_id)
@@ -8688,8 +8688,8 @@ async fn load_library_provider_setting(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT CASE WHEN enabled THEN 1 ELSE 0 END AS enabled, settings_json
          FROM media_interaction_library_provider_settings
-         WHERE source_config_id = ?
-           AND provider_kind = ?
+         WHERE source_config_id = $1
+           AND provider_kind = $2
          LIMIT 1",
     )
     .bind(source_config_id)
@@ -8761,7 +8761,7 @@ async fn provider_settings_for_first_enabled_season_file(
          FROM episodes e
          JOIN episode_files ef ON ef.episode_id = e.id
          JOIN media_files mf ON mf.id = ef.media_file_id
-         WHERE e.season_id = ?
+         WHERE e.season_id = $1
            AND mf.scan_state = 'ok'
          ORDER BY mf.id ASC",
     )
@@ -8809,7 +8809,7 @@ async fn load_media_file_source_config_id(
     let row = sqlx::query::<sqlx::Any>(
         "SELECT source_config_id
          FROM media_files
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -8836,7 +8836,7 @@ pub async fn load_or_create_playback_preferences(
              autoplay_countdown_seconds, autoplay_max_consecutive,
              autoplay_max_elapsed_minutes, segment_provider_settings_json,
              created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ? != 0, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7 != 0, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(user_id.to_string())
     .bind(&defaults.skip_intro_behavior)
@@ -8901,18 +8901,18 @@ pub async fn update_playback_preferences(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE user_playback_preferences
-         SET skip_intro_behavior = ?,
-             skip_recap_behavior = ?,
-             skip_preview_behavior = ?,
-             skip_credits_behavior = ?,
-             skip_outro_behavior = ?,
-             autoplay_enabled = ? != 0,
-             autoplay_countdown_seconds = ?,
-             autoplay_max_consecutive = ?,
-             autoplay_max_elapsed_minutes = ?,
-             segment_provider_settings_json = ?,
+         SET skip_intro_behavior = $1,
+             skip_recap_behavior = $2,
+             skip_preview_behavior = $3,
+             skip_credits_behavior = $4,
+             skip_outro_behavior = $5,
+             autoplay_enabled = $6 != 0,
+             autoplay_countdown_seconds = $7,
+             autoplay_max_consecutive = $8,
+             autoplay_max_elapsed_minutes = $9,
+             segment_provider_settings_json = $10,
              updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = ?",
+         WHERE user_id = $11",
     )
     .bind(&preferences.skip_intro_behavior)
     .bind(&preferences.skip_recap_behavior)
@@ -9002,7 +9002,7 @@ async fn normalize_candidate_input(
 }
 
 async fn ensure_media_file_exists(pool: &AnyPool, media_file_id: &str) -> Result<()> {
-    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_files WHERE id = ?")
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_files WHERE id = $1")
         .bind(media_file_id)
         .fetch_one(pool)
         .await
@@ -9014,7 +9014,7 @@ async fn ensure_media_file_exists(pool: &AnyPool, media_file_id: &str) -> Result
 }
 
 async fn ensure_season_exists(pool: &AnyPool, season_id: &str) -> Result<()> {
-    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM seasons WHERE id = ?")
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM seasons WHERE id = $1")
         .bind(season_id)
         .fetch_one(pool)
         .await
@@ -9044,7 +9044,7 @@ async fn ensure_segment_item_exists(pool: &AnyPool, context: &SegmentItemContext
         "episode" => ("episodes", "id"),
         _ => bail!("item_type must be movie or episode"),
     };
-    let query = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?");
+    let query = format!("SELECT COUNT(*) FROM {table} WHERE {column} = $1");
     let exists = sqlx::query_scalar::<_, i64>(&query)
         .bind(&context.item_id)
         .fetch_one(pool)
@@ -9063,7 +9063,7 @@ async fn resolve_item_context_for_file(
     if let Some(row) = sqlx::query::<sqlx::Any>(
         "SELECT movie_id
          FROM movie_files
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9080,7 +9080,7 @@ async fn resolve_item_context_for_file(
     if let Some(row) = sqlx::query::<sqlx::Any>(
         "SELECT episode_id
          FROM episode_files
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9098,7 +9098,7 @@ async fn resolve_item_context_for_file(
         "SELECT mi.id, mi.type
          FROM media_files mf
          JOIN media_items mi ON mi.id = mf.media_item_id
-         WHERE mf.id = ?
+         WHERE mf.id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9119,7 +9119,7 @@ async fn load_media_duration_seconds(pool: &AnyPool, media_file_id: &str) -> Res
     if let Some(row) = sqlx::query::<sqlx::Any>(
         "SELECT duration_seconds
          FROM media_file_fingerprints
-         WHERE media_file_id = ?
+         WHERE media_file_id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9135,7 +9135,7 @@ async fn load_media_duration_seconds(pool: &AnyPool, media_file_id: &str) -> Res
     if let Some(row) = sqlx::query::<sqlx::Any>(
         "SELECT normalized_json
          FROM media_file_probes
-         WHERE media_file_id = ? AND normalized_json IS NOT NULL
+         WHERE media_file_id = $1 AND normalized_json IS NOT NULL
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9156,7 +9156,7 @@ async fn load_media_duration_seconds(pool: &AnyPool, media_file_id: &str) -> Res
         "SELECT mi.runtime_seconds
          FROM media_files mf
          JOIN media_items mi ON mi.id = mf.media_item_id
-         WHERE mf.id = ?
+         WHERE mf.id = $1
          LIMIT 1",
     )
     .bind(media_file_id)
@@ -9251,8 +9251,8 @@ async fn recalculate_active_segments(
     let locked_rows = sqlx::query::<sqlx::Any>(
         "SELECT start_seconds, end_seconds
          FROM media_segments
-         WHERE media_file_id = ?
-           AND segment_type = ?
+         WHERE media_file_id = $1
+           AND segment_type = $2
            AND status = 'active'
            AND locked = TRUE",
     )
@@ -9274,8 +9274,8 @@ async fn recalculate_active_segments(
                 provider_kind, provider_id, provider_version, confidence, identity_strength,
                 source_payload_json
          FROM media_segment_candidates
-         WHERE media_file_id = ?
-           AND segment_type = ?
+         WHERE media_file_id = $1
+           AND segment_type = $2
            AND validation_state = 'accepted'
          ORDER BY start_seconds ASC, end_seconds ASC
          LIMIT 200",
@@ -9293,8 +9293,8 @@ async fn recalculate_active_segments(
     sqlx::query::<sqlx::Any>(
         "UPDATE media_segments
          SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
-         WHERE media_file_id = ?
-           AND segment_type = ?
+         WHERE media_file_id = $1
+           AND segment_type = $2
            AND status = 'active'
            AND (locked = FALSE OR locked IS NULL)",
     )
@@ -9358,7 +9358,7 @@ async fn upsert_active_segment_for_candidate(
     let existing_id = sqlx::query::<sqlx::Any>(
         "SELECT id
          FROM media_segments
-         WHERE canonical_candidate_id = ?
+         WHERE canonical_candidate_id = $1
          LIMIT 1",
     )
     .bind(&candidate.id)
@@ -9374,19 +9374,19 @@ async fn upsert_active_segment_for_candidate(
     if let Some(segment_id) = existing_id {
         sqlx::query::<sqlx::Any>(
             "UPDATE media_segments
-             SET media_file_id = ?,
-                 item_type = ?,
-                 item_id = ?,
-                 segment_type = ?,
-                 start_seconds = ?,
-                 end_seconds = ?,
-                 source_label = ?,
-                 confidence = ?,
-                 locked = ? != 0,
+             SET media_file_id = $1,
+                 item_type = $2,
+                 item_id = $3,
+                 segment_type = $4,
+                 start_seconds = $5,
+                 end_seconds = $6,
+                 source_label = $7,
+                 confidence = $8,
+                 locked = $9 != 0,
                  status = 'active',
-                 metadata_json = ?,
+                 metadata_json = $10,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $11",
         )
         .bind(&candidate.media_file_id)
         .bind(&candidate.item_type)
@@ -9408,7 +9408,7 @@ async fn upsert_active_segment_for_candidate(
                 (id, media_file_id, item_type, item_id, segment_type, start_seconds, end_seconds,
                  canonical_candidate_id, source_label, confidence, locked, status, metadata_json,
                  created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? != 0, 'active', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 != 0, 'active', $12, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&candidate.media_file_id)
@@ -9441,7 +9441,7 @@ async fn load_segment_candidate(
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
          FROM media_segment_candidates
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(candidate_id)
@@ -9461,7 +9461,7 @@ async fn load_active_segment_for_candidate(
                 canonical_candidate_id, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END AS locked, status, metadata_json
          FROM media_segments
-         WHERE canonical_candidate_id = ? AND status = 'active'
+         WHERE canonical_candidate_id = $1 AND status = 'active'
          LIMIT 1",
     )
     .bind(candidate_id)
@@ -9481,7 +9481,7 @@ async fn load_active_segment(
                 canonical_candidate_id, source_label, confidence,
                 CASE WHEN locked THEN 1 ELSE 0 END AS locked, status, metadata_json
          FROM media_segments
-         WHERE id = ? AND status = 'active'
+         WHERE id = $1 AND status = 'active'
          LIMIT 1",
     )
     .bind(segment_id)
@@ -9845,7 +9845,7 @@ async fn load_playback_preferences(
                 autoplay_max_elapsed_minutes,
                 segment_provider_settings_json
          FROM user_playback_preferences
-         WHERE user_id = ?
+         WHERE user_id = $1
          LIMIT 1",
     )
     .bind(user_id.to_string())
@@ -10936,25 +10936,25 @@ mod tests {
         let media_item_id = Uuid::new_v4().to_string();
         let media_file_id = Uuid::new_v4().to_string();
         let movie_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES (?, 'movie', 'Segment Movie', ?, '{}')")
+        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES ($1, 'movie', 'Segment Movie', $2, '{}')")
             .bind(&media_item_id)
             .bind(duration_seconds.round() as i64)
             .execute(pool)
             .await?;
-        sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES (?, ?, ?, 1024, 'ok')")
+        sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES ($1, $2, $3, 1024, 'ok')")
             .bind(&media_file_id)
             .bind(&media_item_id)
             .bind(format!("/media/{media_file_id}.mkv"))
             .execute(pool)
             .await?;
         sqlx::query(
-            "INSERT INTO movies (id, title, runtime_seconds) VALUES (?, 'Segment Movie', ?)",
+            "INSERT INTO movies (id, title, runtime_seconds) VALUES ($1, 'Segment Movie', $2)",
         )
         .bind(&movie_id)
         .bind(duration_seconds.round() as i64)
         .execute(pool)
         .await?;
-        sqlx::query("INSERT INTO movie_files (movie_id, media_file_id) VALUES (?, ?)")
+        sqlx::query("INSERT INTO movie_files (movie_id, media_file_id) VALUES ($1, $2)")
             .bind(&movie_id)
             .bind(&media_file_id)
             .execute(pool)
@@ -10964,7 +10964,7 @@ mod tests {
                 (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
                  source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
                  created_at, updated_at)
-             VALUES (?, 2, 'test', 'ok', CURRENT_TIMESTAMP, 1, 1024, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, 2, 'test', 'ok', CURRENT_TIMESTAMP, 1, 1024, $2, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(&media_file_id)
         .bind(json!({"duration_seconds": duration_seconds}).to_string())
@@ -10983,7 +10983,7 @@ mod tests {
             "INSERT INTO media_file_fingerprints
                 (media_file_id, duration_seconds, file_size_bytes, video_frame_hash_json,
                  fingerprint_version, computed_at)
-             VALUES (?, ?, 1024, ?, 'test-visual-v1', CURRENT_TIMESTAMP)
+             VALUES ($1, $2, 1024, $3, 'test-visual-v1', CURRENT_TIMESTAMP)
              ON CONFLICT(media_file_id) DO UPDATE SET
                  duration_seconds = excluded.duration_seconds,
                  file_size_bytes = excluded.file_size_bytes,
@@ -11008,27 +11008,27 @@ mod tests {
         let series_id = Uuid::new_v4().to_string();
         let season_id = Uuid::new_v4().to_string();
         let episode_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES (?, 'tv', 'Segment Anime', ?, '{}')")
+        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES ($1, 'tv', 'Segment Anime', $2, '{}')")
             .bind(&media_item_id)
             .bind(duration_seconds.round() as i64)
             .execute(pool)
             .await?;
-        sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES (?, ?, ?, 1024, 'ok')")
+        sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES ($1, $2, $3, 1024, 'ok')")
             .bind(&media_file_id)
             .bind(&media_item_id)
             .bind(format!("/media/{media_file_id}.mkv"))
             .execute(pool)
             .await?;
-        sqlx::query("INSERT INTO series (id, title, library_type, external_anilist) VALUES (?, 'Segment Anime', 'anime', '21')")
+        sqlx::query("INSERT INTO series (id, title, library_type, external_anilist) VALUES ($1, 'Segment Anime', 'anime', '21')")
             .bind(&series_id)
             .execute(pool)
             .await?;
-        sqlx::query("INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source) VALUES (?, ?, 'mal', '1535', 1.0, 'test')")
+        sqlx::query("INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source) VALUES ($1, $2, 'mal', '1535', 1.0, 'test')")
             .bind(Uuid::new_v4().to_string())
             .bind(&series_id)
             .execute(pool)
             .await?;
-        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, 'Season 1')")
+        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, 'Season 1')")
             .bind(&season_id)
             .bind(&series_id)
             .execute(pool)
@@ -11037,7 +11037,7 @@ mod tests {
             "INSERT INTO episodes
                 (id, series_id, season_id, season_number, episode_number,
                  absolute_episode_number, title, runtime_seconds, has_file)
-             VALUES (?, ?, ?, 1, 1, 1, 'Episode 1', ?, 1)",
+             VALUES ($1, $2, $3, 1, 1, 1, 'Episode 1', $4, 1)",
         )
         .bind(&episode_id)
         .bind(&series_id)
@@ -11045,7 +11045,7 @@ mod tests {
         .bind(duration_seconds.round() as i64)
         .execute(pool)
         .await?;
-        sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+        sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
             .bind(&episode_id)
             .bind(&media_file_id)
             .execute(pool)
@@ -11055,7 +11055,7 @@ mod tests {
                 (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
                  source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
                  created_at, updated_at)
-             VALUES (?, 2, 'test', 'ok', CURRENT_TIMESTAMP, 1, 1024, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, 2, 'test', 'ok', CURRENT_TIMESTAMP, 1, 1024, $2, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(&media_file_id)
         .bind(json!({"duration_seconds": duration_seconds}).to_string())
@@ -11071,17 +11071,17 @@ mod tests {
         let media_item_id = Uuid::new_v4().to_string();
         let series_id = Uuid::new_v4().to_string();
         let season_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES (?, 'tv', 'Audio Detector Series', 1500, '{}')")
+        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES ($1, 'tv', 'Audio Detector Series', 1500, '{}')")
             .bind(&media_item_id)
             .execute(pool)
             .await?;
         sqlx::query(
-            "INSERT INTO series (id, title, library_type) VALUES (?, 'Audio Detector Series', 'series')",
+            "INSERT INTO series (id, title, library_type) VALUES ($1, 'Audio Detector Series', 'series')",
         )
         .bind(&series_id)
         .execute(pool)
         .await?;
-        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, 'Season 1')")
+        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, 'Season 1')")
             .bind(&season_id)
             .bind(&series_id)
             .execute(pool)
@@ -11096,7 +11096,7 @@ mod tests {
                 "INSERT INTO episodes
                     (id, series_id, season_id, season_number, episode_number,
                      absolute_episode_number, title, runtime_seconds, has_file)
-                 VALUES (?, ?, ?, 1, ?, ?, ?, 1500, 1)",
+                 VALUES ($1, $2, $3, 1, $4, $5, $6, 1500, 1)",
             )
             .bind(&episode_id)
             .bind(&series_id)
@@ -11106,13 +11106,13 @@ mod tests {
             .bind(format!("Episode {episode_number}"))
             .execute(pool)
             .await?;
-            sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES (?, ?, ?, 1024, 'ok')")
+            sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES ($1, $2, $3, 1024, 'ok')")
                 .bind(&media_file_id)
                 .bind(&media_item_id)
                 .bind(format!("/media/{media_file_id}.mkv"))
                 .execute(pool)
                 .await?;
-            sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+            sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
                 .bind(&episode_id)
                 .bind(&media_file_id)
                 .execute(pool)
@@ -11121,7 +11121,7 @@ mod tests {
                 "INSERT INTO media_file_fingerprints
                     (media_file_id, duration_seconds, file_size_bytes, audio_fingerprint_json,
                      fingerprint_version, computed_at)
-                 VALUES (?, 1500, 1024, ?, 'test-audio-v1', CURRENT_TIMESTAMP)",
+                 VALUES ($1, 1500, 1024, $2, 'test-audio-v1', CURRENT_TIMESTAMP)",
             )
             .bind(&media_file_id)
             .bind(fingerprint.to_string())
@@ -11140,17 +11140,17 @@ mod tests {
         let media_item_id = Uuid::new_v4().to_string();
         let series_id = Uuid::new_v4().to_string();
         let season_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES (?, 'tv', 'Unfingerprinted Series', 1500, '{}')")
+        sqlx::query("INSERT INTO media_items (id, type, title, runtime_seconds, external_ids) VALUES ($1, 'tv', 'Unfingerprinted Series', 1500, '{}')")
             .bind(&media_item_id)
             .execute(pool)
             .await?;
         sqlx::query(
-            "INSERT INTO series (id, title, library_type) VALUES (?, 'Unfingerprinted Series', 'series')",
+            "INSERT INTO series (id, title, library_type) VALUES ($1, 'Unfingerprinted Series', 'series')",
         )
         .bind(&series_id)
         .execute(pool)
         .await?;
-        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, 1, 'Season 1')")
+        sqlx::query("INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, 1, 'Season 1')")
             .bind(&season_id)
             .bind(&series_id)
             .execute(pool)
@@ -11165,7 +11165,7 @@ mod tests {
                 "INSERT INTO episodes
                     (id, series_id, season_id, season_number, episode_number,
                      absolute_episode_number, title, runtime_seconds, has_file)
-                 VALUES (?, ?, ?, 1, ?, ?, ?, 1500, 1)",
+                 VALUES ($1, $2, $3, 1, $4, $5, $6, 1500, 1)",
             )
             .bind(&episode_id)
             .bind(&series_id)
@@ -11175,13 +11175,13 @@ mod tests {
             .bind(format!("Episode {episode_number}"))
             .execute(pool)
             .await?;
-            sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES (?, ?, ?, 1024, 'ok')")
+            sqlx::query("INSERT INTO media_files (id, media_item_id, path, size_bytes, scan_state) VALUES ($1, $2, $3, 1024, 'ok')")
                 .bind(&media_file_id)
                 .bind(&media_item_id)
                 .bind(format!("/missing/{media_file_id}.mkv"))
                 .execute(pool)
                 .await?;
-            sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?)")
+            sqlx::query("INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2)")
                 .bind(&episode_id)
                 .bind(&media_file_id)
                 .execute(pool)
@@ -11504,7 +11504,7 @@ mod tests {
         );
 
         let superseded_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM media_segments WHERE media_file_id = ? AND status = 'superseded'",
+            "SELECT COUNT(*) FROM media_segments WHERE media_file_id = $1 AND status = 'superseded'",
         )
         .bind(&media_file_id)
         .fetch_one(&pool)
@@ -11556,7 +11556,7 @@ mod tests {
     async fn theintrodb_refresh_uses_strong_imdb_identity_and_activates_segments() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt1234567' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt1234567' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -11615,7 +11615,7 @@ mod tests {
     async fn theintrodb_refresh_accepts_live_named_segment_shape() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, series_id, _) = seed_anime_episode_file(&pool, 3600.0).await?;
-        sqlx::query("UPDATE series SET external_imdb = 'tt0903747' WHERE id = ?")
+        sqlx::query("UPDATE series SET external_imdb = 'tt0903747' WHERE id = $1")
             .bind(&series_id)
             .execute(&pool)
             .await?;
@@ -11816,7 +11816,7 @@ mod tests {
     async fn theintrodb_refresh_rejects_duration_mismatch_without_activation() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt2223334' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt2223334' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -11880,7 +11880,7 @@ mod tests {
     async fn theintrodb_refresh_outage_caches_error_without_activation() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt3334445' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt3334445' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -11938,7 +11938,7 @@ mod tests {
     async fn disabled_theintrodb_provider_does_not_call_network_or_activate() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt4445556' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt4445556' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -12016,7 +12016,7 @@ mod tests {
     async fn provider_refresh_job_claims_runs_and_finishes() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt7654321' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt7654321' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -12070,13 +12070,13 @@ mod tests {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
         sqlx::query(
-            "UPDATE movies SET external_imdb = 'tt2468135', external_tmdb = '12345' WHERE id = ?",
+            "UPDATE movies SET external_imdb = 'tt2468135', external_tmdb = '12345' WHERE id = $1",
         )
         .bind(&movie_id)
         .execute(&pool)
         .await?;
         let user_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
             .bind(&user_id)
             .bind(format!("midm-{user_id}@example.test"))
             .bind("hash")
@@ -12086,7 +12086,7 @@ mod tests {
             "INSERT INTO user_media_state
                 (user_id, item_type, item_id, media_file_id, resume_seconds,
                  duration_seconds, watched, play_count, last_played_at, state_source)
-             VALUES (?, 'movie', ?, ?, 744.0, 1800, 0, 3, CURRENT_TIMESTAMP, 'test')",
+             VALUES ($1, 'movie', $2, $3, 744.0, 1800, 0, 3, CURRENT_TIMESTAMP, 'test')",
         )
         .bind(&user_id)
         .bind(&movie_id)
@@ -12235,7 +12235,7 @@ mod tests {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
         sqlx::query(
-            "UPDATE movies SET external_imdb = 'tt9753124', external_tmdb = '97531' WHERE id = ?",
+            "UPDATE movies SET external_imdb = 'tt9753124', external_tmdb = '97531' WHERE id = $1",
         )
         .bind(&movie_id)
         .execute(&pool)
@@ -12283,7 +12283,7 @@ mod tests {
             },
         )
         .await?;
-        sqlx::query("UPDATE media_segment_jobs SET max_attempts = 1 WHERE id = ?")
+        sqlx::query("UPDATE media_segment_jobs SET max_attempts = 1 WHERE id = $1")
             .bind(&queued.id)
             .execute(&pool)
             .await?;
@@ -12330,7 +12330,7 @@ mod tests {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
         sqlx::query(
-            "UPDATE movies SET external_imdb = 'tt8642135', external_tmdb = '86421' WHERE id = ?",
+            "UPDATE movies SET external_imdb = 'tt8642135', external_tmdb = '86421' WHERE id = $1",
         )
         .bind(&movie_id)
         .execute(&pool)
@@ -12464,7 +12464,7 @@ mod tests {
         assert_eq!(summary.jobs_queued, 1);
         let queued_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM media_segment_jobs
-             WHERE scope_id = ?
+             WHERE scope_id = $1
                AND job_type = 'provider_refresh'
                AND provider_kind = 'community_markers'
                AND status = 'queued'",
@@ -12765,9 +12765,9 @@ mod tests {
 
         sqlx::query(
             "UPDATE media_segment_jobs
-             SET started_at = ?,
-                 updated_at = ?
-             WHERE id = ?",
+             SET started_at = $1,
+                 updated_at = $2
+             WHERE id = $3",
         )
         .bind(timestamp_after_seconds(
             -MEDIA_SEGMENT_STALE_RUNNING_JOB_SECONDS - 60,
@@ -12818,9 +12818,9 @@ mod tests {
         sqlx::query(
             "UPDATE media_segment_jobs
              SET attempts = max_attempts,
-                 started_at = ?,
-                 updated_at = ?
-             WHERE id = ?",
+                 started_at = $1,
+                 updated_at = $2
+             WHERE id = $3",
         )
         .bind(timestamp_after_seconds(
             -MEDIA_SEGMENT_STALE_RUNNING_JOB_SECONDS - 60,
@@ -12888,9 +12888,9 @@ mod tests {
 
         sqlx::query(
             "UPDATE media_segment_jobs
-             SET started_at = ?,
-                 updated_at = ?
-             WHERE id = ?",
+             SET started_at = $1,
+                 updated_at = $2
+             WHERE id = $3",
         )
         .bind(timestamp_after_seconds(
             -MEDIA_SEGMENT_STALE_RUNNING_JOB_SECONDS - 60,
@@ -12927,7 +12927,7 @@ mod tests {
         sqlx::query(
             "UPDATE media_segment_jobs
              SET next_attempt_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $1",
         )
         .bind(&claimed.id)
         .execute(&pool)
@@ -13307,7 +13307,7 @@ mod tests {
              WHERE job_type = 'video_frame_hash'
                AND scope_type = 'media_file'
                AND provider_kind = 'local_visual_recurring'
-               AND scope_id = ?
+               AND scope_id = $1
                AND status = 'queued'",
         )
         .bind(&media_file_id)
@@ -14251,10 +14251,10 @@ mod tests {
             .filter(|duration| *duration > 0);
         sqlx::query(
             "UPDATE episodes
-                 SET episode_number = ?, absolute_episode_number = ?,
-                     title = ?, runtime_seconds = COALESCE(?, runtime_seconds)
+                 SET episode_number = $1, absolute_episode_number = $2,
+                     title = $3, runtime_seconds = COALESCE($4, runtime_seconds)
                  WHERE id IN (
-                     SELECT episode_id FROM episode_files WHERE media_file_id = ?
+                     SELECT episode_id FROM episode_files WHERE media_file_id = $5
                  )",
         )
         .bind(episode_number)
@@ -14277,8 +14277,8 @@ mod tests {
             .len() as i64;
         sqlx::query(
             "UPDATE media_files
-             SET path = ?, size_bytes = ?, scan_state = 'ok', updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             SET path = $1, size_bytes = $2, scan_state = 'ok', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $3",
         )
         .bind(path.to_string_lossy().to_string())
         .bind(size_bytes)
@@ -14696,7 +14696,7 @@ mod tests {
              WHERE job_type = 'local_detector'
                AND scope_type = 'media_file'
                AND provider_kind = 'local_visual_recurring'
-               AND scope_id = ?
+               AND scope_id = $1
                AND status = 'queued'",
         )
         .bind(&media_file_id)
@@ -14729,7 +14729,7 @@ mod tests {
     async fn worker_iteration_runtime_budget_prevents_new_job_claims() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt1357913' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt1357913' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;
@@ -14752,7 +14752,7 @@ mod tests {
         let queued = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)
              FROM media_segment_jobs
-             WHERE scope_id = ?
+             WHERE scope_id = $1
                AND provider_kind = 'theintrodb'
                AND status = 'queued'",
         )
@@ -14832,7 +14832,7 @@ mod tests {
             "SELECT COUNT(*)
              FROM media_segment_jobs
              WHERE scope_type = 'season'
-               AND scope_id = ?
+               AND scope_id = $1
                AND provider_kind = 'local_audio_recurring'
                AND status = 'queued'",
         )
@@ -14845,7 +14845,7 @@ mod tests {
             "SELECT COUNT(*)
              FROM media_segment_jobs
              WHERE scope_type = 'media_file'
-               AND scope_id = ?
+               AND scope_id = $1
                AND provider_kind = 'local_visual_recurring'
                AND status = 'queued'",
         )
@@ -14870,7 +14870,7 @@ mod tests {
     async fn worker_iteration_enqueues_due_provider_job_and_respects_fresh_cache() -> Result<()> {
         let pool = test_pool().await?;
         let (media_file_id, movie_id) = seed_movie_file(&pool, 1800.0).await?;
-        sqlx::query("UPDATE movies SET external_imdb = 'tt2468101' WHERE id = ?")
+        sqlx::query("UPDATE movies SET external_imdb = 'tt2468101' WHERE id = $1")
             .bind(&movie_id)
             .execute(&pool)
             .await?;

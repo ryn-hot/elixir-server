@@ -799,7 +799,7 @@ async fn list_active_subscription_download_jobs(
             r.owner_id
          FROM acquisition_release_jobs j
          JOIN acquisition_releases r ON r.release_id = j.release_id
-         WHERE r.subscription_id = ?
+         WHERE r.subscription_id = $1
            AND j.active = 1
            AND j.download_id IS NOT NULL
            AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",

@@ -5200,8 +5200,8 @@ mod tests {
             .await?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET active_version = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             SET active_version = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE source_module_id = $2",
         )
         .bind("1.1.2")
         .bind(source_module_id.to_string())

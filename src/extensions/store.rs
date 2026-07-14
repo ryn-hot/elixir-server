@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{AnyPool, QueryBuilder, Row, TypeInfo, Value, ValueRef, any::AnyRow};
+use sqlx::{AnyPool, Row, TypeInfo, Value, ValueRef, any::AnyRow};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -12,7 +12,14 @@ use crate::db::models::{
     OrchestratorRunStatus, Provider, ProviderHealthState, ProviderReadiness,
     ProviderReadinessPhase, RuntimeLog, Secret, SecretScope, SlotCardinality,
 };
-use crate::extensions::ExternalIds;
+use crate::extensions::{
+    ExternalIds,
+    manifest::{
+        ExtensionManifest, LIVE_CATALOG_PROVIDER_CAPABILITY,
+        LIVE_CATALOG_PROVIDER_CONTRACT_VERSION, ManifestEndpoint, ManifestHealthcheck,
+        ManifestProviderScope,
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct NewExtension {
@@ -55,6 +62,36 @@ pub struct ProviderDetails {
     pub provider: Provider,
     pub extension_id: String,
     pub trust_level: ExtensionTrustLevel,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadyLiveCatalogProvider {
+    pub provider: Provider,
+    pub extension_id: String,
+    pub extension_version: String,
+    pub extension_installed_at: DateTime<Utc>,
+    pub instance_updated_at: DateTime<Utc>,
+    pub readiness_updated_at: DateTime<Utc>,
+    pub trust_level: ExtensionTrustLevel,
+    pub contract_version: u32,
+    pub permissions: Vec<String>,
+    pub instance_config: Option<serde_json::Value>,
+    pub declared_scope: ManifestProviderScope,
+    pub declared_endpoint: ManifestEndpoint,
+    pub healthcheck: ManifestHealthcheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRevocationTarget {
+    pub provider_id: Uuid,
+    pub instance_id: Uuid,
+    pub extension_id: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderAvailabilityChange {
+    pub unavailable_providers: Vec<ProviderRevocationTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -721,7 +758,7 @@ impl<'a> ExtensionStore<'a> {
         let manifest_json =
             serde_json::to_string(&data.manifest_json).context("serializing manifest json")?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO extensions (extension_id, name, version, kind, publisher_name, signing_key_id, trust_level, manifest_json, package_hash, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(extension_id) DO UPDATE SET name = excluded.name, version = excluded.version, kind = excluded.kind, publisher_name = excluded.publisher_name, signing_key_id = excluded.signing_key_id, trust_level = excluded.trust_level, manifest_json = excluded.manifest_json, package_hash = excluded.package_hash, enabled = excluded.enabled",
+            "INSERT INTO extensions (extension_id, name, version, kind, publisher_name, signing_key_id, trust_level, manifest_json, package_hash, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \n             ON CONFLICT(extension_id) DO UPDATE SET name = excluded.name, version = excluded.version, kind = excluded.kind, publisher_name = excluded.publisher_name, signing_key_id = excluded.signing_key_id, trust_level = excluded.trust_level, manifest_json = excluded.manifest_json, package_hash = excluded.package_hash, enabled = excluded.enabled",
         )
         .bind(&data.extension_id)
         .bind(&data.name)
@@ -740,7 +777,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn list_extensions(&self) -> Result<Vec<Extension>> {
         let rows = sqlx::query(
-            "SELECT extension_id, name, version, kind, CAST(publisher_name AS TEXT) as publisher_name, CAST(signing_key_id AS TEXT) as signing_key_id, trust_level, manifest_json, CAST(package_hash AS TEXT) as package_hash, CAST(installed_at AS TEXT) as installed_at, CAST(enabled AS INTEGER) as enabled FROM extensions ORDER BY installed_at DESC",
+            "SELECT extension_id, name, version, kind, CAST(publisher_name AS TEXT) as publisher_name, CAST(signing_key_id AS TEXT) as signing_key_id, trust_level, manifest_json, CAST(package_hash AS TEXT) as package_hash, CAST(installed_at AS TEXT) as installed_at, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled FROM extensions ORDER BY installed_at DESC",
         )
         .fetch_all(self.pool)
         .await?;
@@ -753,7 +790,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_extension(&self, extension_id: &str) -> Result<Option<Extension>> {
         let row = sqlx::query(
-            "SELECT extension_id, name, version, kind, CAST(publisher_name AS TEXT) as publisher_name, CAST(signing_key_id AS TEXT) as signing_key_id, trust_level, manifest_json, CAST(package_hash AS TEXT) as package_hash, CAST(installed_at AS TEXT) as installed_at, CAST(enabled AS INTEGER) as enabled FROM extensions WHERE extension_id = ? LIMIT 1",
+            "SELECT extension_id, name, version, kind, CAST(publisher_name AS TEXT) as publisher_name, CAST(signing_key_id AS TEXT) as signing_key_id, trust_level, manifest_json, CAST(package_hash AS TEXT) as package_hash, CAST(installed_at AS TEXT) as installed_at, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled FROM extensions WHERE extension_id = $1 LIMIT 1",
         )
         .bind(extension_id)
         .fetch_optional(self.pool)
@@ -761,17 +798,42 @@ impl<'a> ExtensionStore<'a> {
         row.map(|row| map_extension(&row)).transpose()
     }
 
-    pub async fn set_extension_enabled(&self, extension_id: &str, enabled: bool) -> Result<()> {
-        sqlx::query::<sqlx::Any>("UPDATE extensions SET enabled = ? WHERE extension_id = ?")
+    pub async fn set_extension_enabled(
+        &self,
+        extension_id: &str,
+        enabled: bool,
+    ) -> Result<ProviderAvailabilityChange> {
+        let mut transaction = self.pool.begin().await?;
+        let unavailable_providers = if enabled {
+            Vec::new()
+        } else {
+            let rows = sqlx::query::<sqlx::Any>(
+                "SELECT p.provider_id, p.instance_id, i.extension_id, p.capability \
+                 FROM providers p \
+                 JOIN extension_instances i ON i.instance_id = p.instance_id \
+                 JOIN extensions e ON e.extension_id = i.extension_id \
+                 WHERE e.extension_id = $1 AND e.enabled = TRUE",
+            )
+            .bind(extension_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            rows.iter()
+                .map(map_provider_revocation_target)
+                .collect::<Result<Vec<_>>>()?
+        };
+        sqlx::query::<sqlx::Any>("UPDATE extensions SET enabled = $1 WHERE extension_id = $2")
             .bind(enabled)
             .bind(extension_id)
-            .execute(self.pool)
+            .execute(&mut *transaction)
             .await?;
-        Ok(())
+        transaction.commit().await?;
+        Ok(ProviderAvailabilityChange {
+            unavailable_providers,
+        })
     }
 
     pub async fn delete_extension(&self, extension_id: &str) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM extensions WHERE extension_id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM extensions WHERE extension_id = $1")
             .bind(extension_id)
             .execute(self.pool)
             .await?;
@@ -781,7 +843,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_instance(&self, data: &NewExtensionInstance) -> Result<()> {
         let config_json = json_to_string(data.config_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO extension_instances (instance_id, extension_id, instance_name, config_json, enabled) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO extension_instances (instance_id, extension_id, instance_name, config_json, enabled) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(data.instance_id.to_string())
         .bind(&data.extension_id)
@@ -799,14 +861,14 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<Vec<ExtensionInstance>> {
         let rows = if let Some(extension_id) = extension_id {
             sqlx::query(
-            "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(enabled AS INTEGER) as enabled FROM extension_instances WHERE extension_id = ? ORDER BY created_at DESC",
+            "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled FROM extension_instances WHERE extension_id = $1 ORDER BY created_at DESC",
             )
             .bind(extension_id)
             .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(enabled AS INTEGER) as enabled FROM extension_instances ORDER BY created_at DESC",
+                "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled FROM extension_instances ORDER BY created_at DESC",
             )
             .fetch_all(self.pool)
             .await?
@@ -820,7 +882,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_instance(&self, instance_id: Uuid) -> Result<Option<ExtensionInstance>> {
         let row = sqlx::query(
-            "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(enabled AS INTEGER) as enabled FROM extension_instances WHERE instance_id = ? LIMIT 1",
+            "SELECT instance_id, extension_id, instance_name, CAST(config_json AS TEXT) as config_json, CAST(runtime_version AS TEXT) as runtime_version, CAST(rollback_version AS TEXT) as rollback_version, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled FROM extension_instances WHERE instance_id = $1 LIMIT 1",
         )
         .bind(instance_id.to_string())
         .fetch_optional(self.pool)
@@ -830,7 +892,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn rename_instance(&self, instance_id: Uuid, instance_name: &str) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances SET instance_name = ?, updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?",
+            "UPDATE extension_instances SET instance_name = $1, updated_at = CURRENT_TIMESTAMP WHERE instance_id = $2",
         )
         .bind(instance_name)
         .bind(instance_id.to_string())
@@ -846,7 +908,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         let config_json = json_to_string(config_json)?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances SET config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?",
+            "UPDATE extension_instances SET config_json = $1, updated_at = CURRENT_TIMESTAMP WHERE instance_id = $2",
         )
         .bind(config_json)
         .bind(instance_id.to_string())
@@ -855,15 +917,39 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
-    pub async fn set_instance_enabled(&self, instance_id: Uuid, enabled: bool) -> Result<()> {
+    pub async fn set_instance_enabled(
+        &self,
+        instance_id: Uuid,
+        enabled: bool,
+    ) -> Result<ProviderAvailabilityChange> {
+        let mut transaction = self.pool.begin().await?;
+        let unavailable_providers = if enabled {
+            Vec::new()
+        } else {
+            let rows = sqlx::query::<sqlx::Any>(
+                "SELECT p.provider_id, p.instance_id, i.extension_id, p.capability \
+                 FROM providers p \
+                 JOIN extension_instances i ON i.instance_id = p.instance_id \
+                 WHERE i.instance_id = $1 AND i.enabled = TRUE",
+            )
+            .bind(instance_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+            rows.iter()
+                .map(map_provider_revocation_target)
+                .collect::<Result<Vec<_>>>()?
+        };
         sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?",
+            "UPDATE extension_instances SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE instance_id = $2",
         )
         .bind(enabled)
         .bind(instance_id.to_string())
-        .execute(self.pool)
+        .execute(&mut *transaction)
         .await?;
-        Ok(())
+        transaction.commit().await?;
+        Ok(ProviderAvailabilityChange {
+            unavailable_providers,
+        })
     }
 
     pub async fn update_instance_runtime_version(
@@ -873,7 +959,7 @@ impl<'a> ExtensionStore<'a> {
         rollback_version: Option<&str>,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances SET runtime_version = ?, rollback_version = ?, updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?",
+            "UPDATE extension_instances SET runtime_version = $1, rollback_version = $2, updated_at = CURRENT_TIMESTAMP WHERE instance_id = $3",
         )
         .bind(runtime_version)
         .bind(rollback_version)
@@ -884,7 +970,7 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn delete_instance(&self, instance_id: Uuid) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM extension_instances WHERE instance_id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM extension_instances WHERE instance_id = $1")
             .bind(instance_id.to_string())
             .execute(self.pool)
             .await?;
@@ -900,9 +986,9 @@ impl<'a> ExtensionStore<'a> {
         let stale_str = stale_before.format("%Y-%m-%d %H:%M:%S").to_string();
         let result = sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_instances
-             WHERE extension_id = ?
-               AND instance_name LIKE ?
-               AND updated_at < ?
+             WHERE extension_id = $1
+               AND instance_name LIKE $2
+               AND updated_at < $3
                AND COALESCE(NULLIF(TRIM(CAST(config_json AS TEXT)), 'null'), '') = ''
                AND runtime_version IS NULL
                AND rollback_version IS NULL
@@ -923,7 +1009,7 @@ impl<'a> ExtensionStore<'a> {
                    JOIN providers AS primary_provider
                      ON primary_provider.instance_id = primary_instance.instance_id
                    WHERE primary_instance.extension_id = extension_instances.extension_id
-                     AND primary_instance.instance_name = ?
+                     AND primary_instance.instance_name = $4
                )",
         )
         .bind(extension_id)
@@ -942,7 +1028,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         match scope_id {
             Some(scope_id) => {
-                sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE scope = ? AND scope_id = ?")
+                sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE scope = $1 AND scope_id = $2")
                     .bind(scope.as_str())
                     .bind(scope_id.to_string())
                     .execute(self.pool)
@@ -950,7 +1036,7 @@ impl<'a> ExtensionStore<'a> {
             }
             None => {
                 sqlx::query::<sqlx::Any>(
-                    "DELETE FROM secrets WHERE scope = ? AND scope_id IS NULL",
+                    "DELETE FROM secrets WHERE scope = $1 AND scope_id IS NULL",
                 )
                 .bind(scope.as_str())
                 .execute(self.pool)
@@ -980,7 +1066,7 @@ impl<'a> ExtensionStore<'a> {
         let scope_json = json_to_string(data.scope_json.as_ref())?;
         let endpoint_json = json_to_string(data.endpoint_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO providers (provider_id, instance_id, capability, slot_id, cardinality, implementation, scope_json, endpoint_json, health_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(instance_id, capability, slot_id) DO UPDATE SET cardinality = excluded.cardinality, implementation = excluded.implementation, scope_json = excluded.scope_json, endpoint_json = excluded.endpoint_json, health_state = excluded.health_state, updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO providers (provider_id, instance_id, capability, slot_id, cardinality, implementation, scope_json, endpoint_json, health_state) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \n             ON CONFLICT(instance_id, capability, slot_id) DO UPDATE SET cardinality = excluded.cardinality, implementation = excluded.implementation, scope_json = excluded.scope_json, endpoint_json = excluded.endpoint_json, health_state = excluded.health_state, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(data.provider_id.to_string())
         .bind(data.instance_id.to_string())
@@ -994,7 +1080,7 @@ impl<'a> ExtensionStore<'a> {
         .execute(self.pool)
         .await?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO provider_readiness (provider_id, readiness_phase) VALUES (?, ?) \
+            "INSERT INTO provider_readiness (provider_id, readiness_phase) VALUES ($1, $2) \
              ON CONFLICT(provider_id) DO NOTHING",
         )
         .bind(data.provider_id.to_string())
@@ -1007,7 +1093,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn list_providers(&self, instance_id: Option<Uuid>) -> Result<Vec<Provider>> {
         let rows = if let Some(instance_id) = instance_id {
             sqlx::query(
-                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE instance_id = ? ORDER BY created_at DESC",
+                "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE instance_id = $1 ORDER BY created_at DESC",
             )
             .bind(instance_id.to_string())
             .fetch_all(self.pool)
@@ -1028,7 +1114,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_provider(&self, provider_id: Uuid) -> Result<Option<Provider>> {
         let row = sqlx::query(
-            "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE provider_id = ? LIMIT 1",
+            "SELECT provider_id, instance_id, capability, slot_id, cardinality, CAST(implementation AS TEXT) as implementation, CAST(scope_json AS TEXT) as scope_json, CAST(endpoint_json AS TEXT) as endpoint_json, health_state, CAST(last_healthcheck_at AS TEXT) as last_healthcheck_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM providers WHERE provider_id = $1 LIMIT 1",
         )
         .bind(provider_id.to_string())
         .fetch_optional(self.pool)
@@ -1049,13 +1135,109 @@ impl<'a> ExtensionStore<'a> {
         Ok(items)
     }
 
+    pub async fn list_ready_live_catalog_providers(&self) -> Result<Vec<ReadyLiveCatalogProvider>> {
+        let rows = sqlx::query::<sqlx::Any>(
+            "SELECT p.provider_id, p.instance_id, p.capability, p.slot_id, p.cardinality, \
+                    CAST(p.implementation AS TEXT) as implementation, \
+                    CAST(p.scope_json AS TEXT) as scope_json, \
+                    CAST(p.endpoint_json AS TEXT) as endpoint_json, \
+                    p.health_state, \
+                    CAST(p.last_healthcheck_at AS TEXT) as last_healthcheck_at, \
+                    CAST(p.created_at AS TEXT) as created_at, \
+                    CAST(p.updated_at AS TEXT) as updated_at, \
+                    i.extension_id, CAST(i.config_json AS TEXT) as instance_config_json, \
+                    CAST(i.updated_at AS TEXT) as instance_updated_at, \
+                    e.version as extension_version, e.trust_level, \
+                    CAST(e.installed_at AS TEXT) as extension_installed_at, \
+                    CAST(pr.updated_at AS TEXT) as readiness_updated_at, \
+                    CAST(e.manifest_json AS TEXT) as manifest_json \
+             FROM providers p \
+             JOIN provider_readiness pr ON pr.provider_id = p.provider_id \
+             JOIN extension_instances i ON i.instance_id = p.instance_id \
+             JOIN extensions e ON e.extension_id = i.extension_id \
+             WHERE p.capability = $1 \
+               AND e.enabled = TRUE \
+               AND i.enabled = TRUE \
+               AND e.trust_level <> $2 \
+               AND p.health_state = $3 \
+               AND pr.readiness_phase = $4 \
+             ORDER BY e.extension_id ASC, p.slot_id ASC, p.provider_id ASC",
+        )
+        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
+        .bind(ExtensionTrustLevel::Untrusted.as_str())
+        .bind(ProviderHealthState::Healthy.as_str())
+        .bind(ProviderReadinessPhase::DriverReady.as_str())
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut providers = Vec::with_capacity(rows.len());
+        for row in rows {
+            match map_ready_live_catalog_provider(&row) {
+                Ok(provider) => providers.push(provider),
+                Err(error) => {
+                    let provider_id = row_get_opt_string(&row, "provider_id")?
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::warn!(
+                        provider_id = %provider_id,
+                        error = %error,
+                        "excluding invalid live catalog provider from runtime discovery"
+                    );
+                }
+            }
+        }
+        Ok(providers)
+    }
+
+    pub async fn get_ready_live_catalog_provider(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<Option<ReadyLiveCatalogProvider>> {
+        let row = sqlx::query::<sqlx::Any>(
+            "SELECT p.provider_id, p.instance_id, p.capability, p.slot_id, p.cardinality, \
+                    CAST(p.implementation AS TEXT) as implementation, \
+                    CAST(p.scope_json AS TEXT) as scope_json, \
+                    CAST(p.endpoint_json AS TEXT) as endpoint_json, \
+                    p.health_state, \
+                    CAST(p.last_healthcheck_at AS TEXT) as last_healthcheck_at, \
+                    CAST(p.created_at AS TEXT) as created_at, \
+                    CAST(p.updated_at AS TEXT) as updated_at, \
+                    i.extension_id, CAST(i.config_json AS TEXT) as instance_config_json, \
+                    CAST(i.updated_at AS TEXT) as instance_updated_at, \
+                    e.version as extension_version, e.trust_level, \
+                    CAST(e.installed_at AS TEXT) as extension_installed_at, \
+                    CAST(pr.updated_at AS TEXT) as readiness_updated_at, \
+                    CAST(e.manifest_json AS TEXT) as manifest_json \
+             FROM providers p \
+             JOIN provider_readiness pr ON pr.provider_id = p.provider_id \
+             JOIN extension_instances i ON i.instance_id = p.instance_id \
+             JOIN extensions e ON e.extension_id = i.extension_id \
+             WHERE p.capability = $1 \
+               AND e.enabled = TRUE \
+               AND i.enabled = TRUE \
+               AND e.trust_level <> $2 \
+               AND p.health_state = $3 \
+               AND pr.readiness_phase = $4 \
+               AND p.provider_id = $5 \
+             LIMIT 1",
+        )
+        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
+        .bind(ExtensionTrustLevel::Untrusted.as_str())
+        .bind(ProviderHealthState::Healthy.as_str())
+        .bind(ProviderReadinessPhase::DriverReady.as_str())
+        .bind(provider_id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        row.map(|row| map_ready_live_catalog_provider(&row))
+            .transpose()
+    }
+
     pub async fn update_provider_health(
         &self,
         provider_id: Uuid,
         health_state: ProviderHealthState,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE providers SET health_state = ?, last_healthcheck_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE provider_id = ?",
+            "UPDATE providers SET health_state = $1, last_healthcheck_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE provider_id = $2",
         )
         .bind(health_state.as_str())
         .bind(provider_id.to_string())
@@ -1069,7 +1251,7 @@ impl<'a> ExtensionStore<'a> {
         provider_id: Uuid,
     ) -> Result<Option<ProviderReadiness>> {
         let row = sqlx::query(
-            "SELECT provider_id, readiness_phase, CAST(readiness_detail AS TEXT) as readiness_detail, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM provider_readiness WHERE provider_id = ? LIMIT 1",
+            "SELECT provider_id, readiness_phase, CAST(readiness_detail AS TEXT) as readiness_detail, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(created_at AS TEXT) as created_at, CAST(updated_at AS TEXT) as updated_at FROM provider_readiness WHERE provider_id = $1 LIMIT 1",
         )
         .bind(provider_id.to_string())
         .fetch_optional(self.pool)
@@ -1097,7 +1279,7 @@ impl<'a> ExtensionStore<'a> {
         readiness_detail: Option<&str>,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO provider_readiness (provider_id, readiness_phase, readiness_detail, last_checked_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) \
+            "INSERT INTO provider_readiness (provider_id, readiness_phase, readiness_detail, last_checked_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
              ON CONFLICT(provider_id) DO UPDATE SET readiness_phase = excluded.readiness_phase, readiness_detail = excluded.readiness_detail, last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(provider_id.to_string())
@@ -1108,18 +1290,37 @@ impl<'a> ExtensionStore<'a> {
         Ok(())
     }
 
-    pub async fn delete_provider(&self, provider_id: Uuid) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM providers WHERE provider_id = ?")
+    pub async fn delete_provider(&self, provider_id: Uuid) -> Result<ProviderAvailabilityChange> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query::<sqlx::Any>(
+            "SELECT p.provider_id, p.instance_id, i.extension_id, p.capability \
+             FROM providers p \
+             JOIN extension_instances i ON i.instance_id = p.instance_id \
+             WHERE p.provider_id = $1 LIMIT 1",
+        )
+        .bind(provider_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let unavailable_providers = row
+            .as_ref()
+            .map(map_provider_revocation_target)
+            .transpose()?
+            .into_iter()
+            .collect();
+        sqlx::query::<sqlx::Any>("DELETE FROM providers WHERE provider_id = $1")
             .bind(provider_id.to_string())
-            .execute(self.pool)
+            .execute(&mut *transaction)
             .await?;
-        Ok(())
+        transaction.commit().await?;
+        Ok(ProviderAvailabilityChange {
+            unavailable_providers,
+        })
     }
 
     pub async fn upsert_binding(&self, data: &NewBinding) -> Result<()> {
         let binding_params = json_to_string(data.binding_params_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO bindings (binding_id, consumer_provider_id, requires_capability, requires_slot_id, target_provider_id, binding_params_json, status) VALUES (?, ?, ?, ?, ?, ?, ?) \n             ON CONFLICT(consumer_provider_id, requires_capability, requires_slot_id, target_provider_id) DO UPDATE SET binding_params_json = excluded.binding_params_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO bindings (binding_id, consumer_provider_id, requires_capability, requires_slot_id, target_provider_id, binding_params_json, status) VALUES ($1, $2, $3, $4, $5, $6, $7) \n             ON CONFLICT(consumer_provider_id, requires_capability, requires_slot_id, target_provider_id) DO UPDATE SET binding_params_json = excluded.binding_params_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(data.binding_id.to_string())
         .bind(data.consumer_provider_id.to_string())
@@ -1153,7 +1354,7 @@ impl<'a> ExtensionStore<'a> {
         last_error: Option<&str>,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE bindings SET status = ?, last_error = ?, last_applied_at = CASE WHEN ? = 'applied' THEN CURRENT_TIMESTAMP ELSE last_applied_at END, updated_at = CURRENT_TIMESTAMP WHERE binding_id = ?",
+            "UPDATE bindings SET status = $1, last_error = $2, last_applied_at = CASE WHEN $3 = 'applied' THEN CURRENT_TIMESTAMP ELSE last_applied_at END, updated_at = CURRENT_TIMESTAMP WHERE binding_id = $4",
         )
         .bind(status.as_str())
         .bind(last_error)
@@ -1167,7 +1368,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_desired_blueprint(&self, data: &NewDesiredBlueprint) -> Result<()> {
         let params_json = json_to_string(data.params_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, applied) VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, applied) VALUES ($1, $2, $3, $4, FALSE)",
         )
         .bind(data.desired_id.to_string())
         .bind(&data.blueprint_extension_id)
@@ -1182,7 +1383,7 @@ impl<'a> ExtensionStore<'a> {
         let params_json = json_to_string(data.params_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
             "INSERT INTO desired_blueprints (desired_id, blueprint_extension_id, blueprint_version, params_json, applied)
-             VALUES (?, ?, ?, ?, 0)
+             VALUES ($1, $2, $3, $4, FALSE)
              ON CONFLICT(desired_id) DO UPDATE SET
                 blueprint_extension_id = excluded.blueprint_extension_id,
                 blueprint_version = excluded.blueprint_version,
@@ -1203,14 +1404,14 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<Vec<DesiredBlueprint>> {
         let rows = if let Some(applied) = applied {
             sqlx::query(
-                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints WHERE applied = ? ORDER BY created_at DESC",
+                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(CASE WHEN applied THEN 1 ELSE 0 END AS BIGINT) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints WHERE applied = $1 ORDER BY created_at DESC",
             )
             .bind(applied)
             .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(applied AS INTEGER) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints ORDER BY created_at DESC",
+                "SELECT desired_id, blueprint_extension_id, blueprint_version, CAST(params_json AS TEXT) as params_json, CAST(CASE WHEN applied THEN 1 ELSE 0 END AS BIGINT) as applied, CAST(created_at AS TEXT) as created_at, CAST(applied_at AS TEXT) as applied_at FROM desired_blueprints ORDER BY created_at DESC",
             )
             .fetch_all(self.pool)
             .await?
@@ -1224,7 +1425,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn mark_desired_applied(&self, desired_id: Uuid, applied: bool) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE desired_blueprints SET applied = ?, applied_at = CURRENT_TIMESTAMP WHERE desired_id = ?",
+            "UPDATE desired_blueprints SET applied = $1, applied_at = CURRENT_TIMESTAMP WHERE desired_id = $2",
         )
         .bind(applied)
         .bind(desired_id.to_string())
@@ -1235,7 +1436,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn delete_desired_blueprints(&self, applied: Option<bool>) -> Result<u64> {
         let result = if let Some(applied) = applied {
-            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE applied = ?")
+            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE applied = $1")
                 .bind(applied)
                 .execute(self.pool)
                 .await?
@@ -1249,7 +1450,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn delete_desired_blueprint(&self, desired_id: Uuid) -> Result<u64> {
         let result =
-            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE desired_id = ?")
+            sqlx::query::<sqlx::Any>("DELETE FROM desired_blueprints WHERE desired_id = $1")
                 .bind(desired_id.to_string())
                 .execute(self.pool)
                 .await?;
@@ -1261,7 +1462,7 @@ impl<'a> ExtensionStore<'a> {
         blueprint_extension_id: &str,
     ) -> Result<u64> {
         let result = sqlx::query::<sqlx::Any>(
-            "DELETE FROM desired_blueprints WHERE blueprint_extension_id = ?",
+            "DELETE FROM desired_blueprints WHERE blueprint_extension_id = $1",
         )
         .bind(blueprint_extension_id)
         .execute(self.pool)
@@ -1286,7 +1487,7 @@ impl<'a> ExtensionStore<'a> {
                 "INSERT INTO managed_ingest_intents (
                     intent_id, media_type, title, normalized_title, year, external_ids_json,
                     manager_provider_id, manager_item_id, manager_label, source, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1)
                  ON CONFLICT(manager_provider_id, manager_item_id) DO UPDATE SET
                     media_type = excluded.media_type,
                     title = excluded.title,
@@ -1313,7 +1514,7 @@ impl<'a> ExtensionStore<'a> {
 
             let intent_id_raw: String = sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT intent_id FROM managed_ingest_intents
-                 WHERE manager_provider_id = ? AND manager_item_id = ?
+                 WHERE manager_provider_id = $1 AND manager_item_id = $2
                  LIMIT 1",
             )
             .bind(data.manager_provider_id.to_string())
@@ -1326,11 +1527,11 @@ impl<'a> ExtensionStore<'a> {
         let existing_intent_id = if let Some(year) = data.year {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT intent_id FROM managed_ingest_intents
-                 WHERE manager_provider_id = ?
+                 WHERE manager_provider_id = $1
                    AND manager_item_id IS NULL
-                   AND media_type = ?
-                   AND normalized_title = ?
-                   AND year = ?
+                   AND media_type = $2
+                   AND normalized_title = $3
+                   AND year = $4
                  LIMIT 1",
             )
             .bind(data.manager_provider_id.to_string())
@@ -1342,10 +1543,10 @@ impl<'a> ExtensionStore<'a> {
         } else {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT intent_id FROM managed_ingest_intents
-                 WHERE manager_provider_id = ?
+                 WHERE manager_provider_id = $1
                    AND manager_item_id IS NULL
-                   AND media_type = ?
-                   AND normalized_title = ?
+                   AND media_type = $2
+                   AND normalized_title = $3
                    AND year IS NULL
                  LIMIT 1",
             )
@@ -1360,15 +1561,15 @@ impl<'a> ExtensionStore<'a> {
             if external_ids_json.is_some() {
                 sqlx::query::<sqlx::Any>(
                     "UPDATE managed_ingest_intents
-                     SET title = ?,
-                         normalized_title = ?,
-                         year = ?,
-                         external_ids_json = ?,
-                         manager_label = ?,
-                         source = ?,
+                     SET title = $1,
+                         normalized_title = $2,
+                         year = $3,
+                         external_ids_json = $4,
+                         manager_label = $5,
+                         source = $6,
                          active = 1,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE intent_id = ?",
+                     WHERE intent_id = $7",
                 )
                 .bind(&data.title)
                 .bind(&data.normalized_title)
@@ -1382,14 +1583,14 @@ impl<'a> ExtensionStore<'a> {
             } else {
                 sqlx::query::<sqlx::Any>(
                     "UPDATE managed_ingest_intents
-                     SET title = ?,
-                         normalized_title = ?,
-                         year = ?,
-                         manager_label = ?,
-                         source = ?,
+                     SET title = $1,
+                         normalized_title = $2,
+                         year = $3,
+                         manager_label = $4,
+                         source = $5,
                          active = 1,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE intent_id = ?",
+                     WHERE intent_id = $6",
                 )
                 .bind(&data.title)
                 .bind(&data.normalized_title)
@@ -1408,7 +1609,7 @@ impl<'a> ExtensionStore<'a> {
             "INSERT INTO managed_ingest_intents (
                 intent_id, media_type, title, normalized_title, year, external_ids_json,
                 manager_provider_id, manager_item_id, manager_label, source, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, 1)",
         )
         .bind(intent_id.to_string())
         .bind(data.media_type.as_str())
@@ -1459,7 +1660,7 @@ impl<'a> ExtensionStore<'a> {
             "UPDATE managed_ingest_intents
              SET last_matched_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE intent_id = ?",
+             WHERE intent_id = $1",
         )
         .bind(intent_id.to_string())
         .execute(self.pool)
@@ -1499,7 +1700,7 @@ impl<'a> ExtensionStore<'a> {
                 raw_manager_payload_json,
                 status,
                 imported_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
             ON CONFLICT(event_key) DO UPDATE SET
                 intent_id = excluded.intent_id,
                 media_type = excluded.media_type,
@@ -1600,7 +1801,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM managed_import_events
-             WHERE event_key = ?
+             WHERE event_key = $1
              LIMIT 1",
         )
         .bind(event_key)
@@ -1617,11 +1818,11 @@ impl<'a> ExtensionStore<'a> {
         sqlx::query::<sqlx::Any>(
             "UPDATE managed_import_events
              SET status = 'linked',
-                 linked_media_item_id = ?,
+                 linked_media_item_id = $1,
                  last_error = NULL,
                  processed_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE event_id = ?",
+             WHERE event_id = $2",
         )
         .bind(linked_media_item_id.to_string())
         .bind(event_id.to_string())
@@ -1638,10 +1839,10 @@ impl<'a> ExtensionStore<'a> {
         sqlx::query::<sqlx::Any>(
             "UPDATE managed_import_events
              SET status = 'failed',
-                 last_error = ?,
+                 last_error = $1,
                  processed_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE event_id = ?",
+             WHERE event_id = $2",
         )
         .bind(error)
         .bind(event_id.to_string())
@@ -1655,7 +1856,7 @@ impl<'a> ExtensionStore<'a> {
             "UPDATE managed_ingest_intents
              SET active = 0,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE intent_id = ?",
+             WHERE intent_id = $1",
         )
         .bind(intent_id.to_string())
         .execute(self.pool)
@@ -1688,7 +1889,7 @@ impl<'a> ExtensionStore<'a> {
                 manager_label,
                 manager_implementation,
                 intent_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT(media_item_id) DO UPDATE SET
                 media_type = excluded.media_type,
                 title = excluded.title,
@@ -1740,7 +1941,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM managed_library_provenance
-             WHERE media_item_id = ?
+             WHERE media_item_id = $1
              LIMIT 1",
         )
         .bind(media_item_id.to_string())
@@ -1771,7 +1972,7 @@ impl<'a> ExtensionStore<'a> {
                 release_policy,
                 metadata_json,
                 active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT(ownership_id) DO UPDATE SET
                 media_item_id = excluded.media_item_id,
                 owner_type = excluded.owner_type,
@@ -1808,7 +2009,7 @@ impl<'a> ExtensionStore<'a> {
         .bind(&data.release_capability)
         .bind(&data.release_policy)
         .bind(metadata_json.as_deref())
-        .bind(data.active)
+        .bind(if data.active { 1_i64 } else { 0_i64 })
         .execute(self.pool)
         .await?;
         Ok(())
@@ -1825,7 +2026,7 @@ impl<'a> ExtensionStore<'a> {
         let has_owner = sqlx::query_scalar::<sqlx::Any, i64>(
             "SELECT COUNT(*)
              FROM media_ownerships
-             WHERE media_item_id = ?
+             WHERE media_item_id = $1
                AND owner_role = 'primary'
                AND active = 1",
         )
@@ -1933,7 +2134,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM media_ownerships
-             WHERE media_item_id = ?
+             WHERE media_item_id = $1
                AND active = 1
              ORDER BY CASE owner_role WHEN 'primary' THEN 0 ELSE 1 END, created_at ASC",
         )
@@ -2017,7 +2218,7 @@ impl<'a> ExtensionStore<'a> {
                 status_reason,
                 request_json,
                 response_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(data.release_event_id.to_string())
         .bind(data.media_item_id.map(|value| value.to_string()))
@@ -2049,11 +2250,11 @@ impl<'a> ExtensionStore<'a> {
         let response_json = json_to_string(response)?;
         sqlx::query::<sqlx::Any>(
             "UPDATE media_owner_release_events
-             SET status = ?,
-                 status_reason = ?,
-                 response_json = COALESCE(?, response_json),
+             SET status = $1,
+                 status_reason = $2,
+                 response_json = COALESCE($3, response_json),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE release_event_id = ?",
+             WHERE release_event_id = $4",
         )
         .bind(status)
         .bind(status_reason)
@@ -2085,7 +2286,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM media_owner_release_events
-             WHERE media_item_id = ?
+             WHERE media_item_id = $1
              ORDER BY created_at DESC",
         )
         .bind(media_item_id.to_string())
@@ -2118,7 +2319,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(updated_at AS TEXT) AS updated_at
              FROM media_owner_release_events
              ORDER BY created_at DESC
-             LIMIT ?",
+             LIMIT $1",
         )
         .bind(limit)
         .fetch_all(self.pool)
@@ -2151,9 +2352,9 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM media_owner_release_events
-             WHERE media_item_id = ?
-               AND ownership_id = ?
-               AND requested_action = ?
+             WHERE media_item_id = $1
+               AND ownership_id = $2
+               AND requested_action = $3
              ORDER BY created_at DESC
              LIMIT 1",
         )
@@ -2218,7 +2419,7 @@ impl<'a> ExtensionStore<'a> {
                  SET release_capability = 'none',
                      release_policy = 'unsupported',
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE ownership_id = ?
+                 WHERE ownership_id = $1
                    AND active = 1",
             )
             .bind(owner.ownership_id.to_string())
@@ -2377,7 +2578,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(ei.extension_id AS TEXT) AS extension_id
              FROM providers p
              LEFT JOIN extension_instances ei ON ei.instance_id = p.instance_id
-             WHERE p.provider_id = ?
+             WHERE p.provider_id = $1
              LIMIT 1",
         )
         .bind(provider_id.to_string())
@@ -2412,7 +2613,7 @@ impl<'a> ExtensionStore<'a> {
              LEFT JOIN episodes e ON e.id = ail.episode_id
              WHERE ail.state = 'imported'
                AND r.subscription_id IS NOT NULL
-               AND COALESCE(mf.media_item_id, ail.movie_id, e.series_id) = ?
+               AND COALESCE(mf.media_item_id, ail.movie_id, e.series_id) = $1
              ORDER BY ail.updated_at DESC
              LIMIT 1",
         )
@@ -2448,7 +2649,7 @@ impl<'a> ExtensionStore<'a> {
                 year,
                 CAST(external_ids AS TEXT) AS external_ids
              FROM media_items
-             WHERE id = ?
+             WHERE id = $1
              LIMIT 1",
         )
         .bind(media_item_id.to_string())
@@ -2491,8 +2692,8 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_media_tombstones
                  WHERE active = 1
-                   AND manager_provider_id = ?
-                   AND manager_item_id = ?
+                   AND manager_provider_id = $1
+                   AND manager_item_id = $2
                  LIMIT 1",
             )
             .bind(provider_id.to_string())
@@ -2503,9 +2704,9 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_media_tombstones
                  WHERE active = 1
-                   AND media_type = ?
-                   AND normalized_title = ?
-                   AND year = ?
+                   AND media_type = $1
+                   AND normalized_title = $2
+                   AND year = $3
                  LIMIT 1",
             )
             .bind(data.media_type.as_str())
@@ -2517,8 +2718,8 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_media_tombstones
                  WHERE active = 1
-                   AND media_type = ?
-                   AND normalized_title = ?
+                   AND media_type = $1
+                   AND normalized_title = $2
                    AND year IS NULL
                  LIMIT 1",
             )
@@ -2531,20 +2732,20 @@ impl<'a> ExtensionStore<'a> {
         if let Some(existing_tombstone_id) = existing_tombstone_id {
             sqlx::query::<sqlx::Any>(
                 "UPDATE managed_media_tombstones
-                 SET media_type = ?,
-                     title = ?,
-                     normalized_title = ?,
-                     year = ?,
-                     external_ids_json = COALESCE(?, external_ids_json),
-                     manager_provider_id = ?,
-                     manager_item_id = ?,
-                     manager_label = ?,
-                     manager_implementation = ?,
-                     action = ?,
+                 SET media_type = $1,
+                     title = $2,
+                     normalized_title = $3,
+                     year = $4,
+                     external_ids_json = COALESCE($5, external_ids_json),
+                     manager_provider_id = $6,
+                     manager_item_id = $7,
+                     manager_label = $8,
+                     manager_implementation = $9,
+                     action = $10,
                      active = 1,
                      cleared_at = NULL,
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE tombstone_id = ?",
+                 WHERE tombstone_id = $11",
             )
             .bind(data.media_type.as_str())
             .bind(&data.title)
@@ -2580,7 +2781,7 @@ impl<'a> ExtensionStore<'a> {
                 manager_implementation,
                 action,
                 active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1)",
         )
         .bind(tombstone_id.to_string())
         .bind(data.media_type.as_str())
@@ -2635,7 +2836,7 @@ impl<'a> ExtensionStore<'a> {
              SET active = 0,
                  cleared_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE tombstone_id = ?",
+             WHERE tombstone_id = $1",
         )
         .bind(tombstone_id.to_string())
         .execute(self.pool)
@@ -2662,10 +2863,10 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_episode_tombstones
                  WHERE active = 1
-                   AND manager_provider_id = ?
-                   AND manager_item_id = ?
-                   AND season_number = ?
-                   AND episode_number = ?
+                   AND manager_provider_id = $1
+                   AND manager_item_id = $2
+                   AND season_number = $3
+                   AND episode_number = $4
                  LIMIT 1",
             )
             .bind(provider_id.to_string())
@@ -2678,11 +2879,11 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_episode_tombstones
                  WHERE active = 1
-                   AND media_type = ?
-                   AND normalized_title = ?
-                   AND year = ?
-                   AND season_number = ?
-                   AND episode_number = ?
+                   AND media_type = $1
+                   AND normalized_title = $2
+                   AND year = $3
+                   AND season_number = $4
+                   AND episode_number = $5
                  LIMIT 1",
             )
             .bind(data.media_type.as_str())
@@ -2696,11 +2897,11 @@ impl<'a> ExtensionStore<'a> {
             sqlx::query_scalar::<sqlx::Any, String>(
                 "SELECT tombstone_id FROM managed_episode_tombstones
                  WHERE active = 1
-                   AND media_type = ?
-                   AND normalized_title = ?
+                   AND media_type = $1
+                   AND normalized_title = $2
                    AND year IS NULL
-                   AND season_number = ?
-                   AND episode_number = ?
+                   AND season_number = $3
+                   AND episode_number = $4
                  LIMIT 1",
             )
             .bind(data.media_type.as_str())
@@ -2714,23 +2915,23 @@ impl<'a> ExtensionStore<'a> {
         if let Some(existing_tombstone_id) = existing_tombstone_id {
             sqlx::query::<sqlx::Any>(
                 "UPDATE managed_episode_tombstones
-                 SET media_type = ?,
-                     title = ?,
-                     normalized_title = ?,
-                     year = ?,
-                     external_ids_json = COALESCE(?, external_ids_json),
-                     manager_provider_id = ?,
-                     manager_item_id = ?,
-                     manager_label = ?,
-                     manager_implementation = ?,
-                     season_number = ?,
-                     episode_number = ?,
-                     absolute_episode_number = COALESCE(?, absolute_episode_number),
-                     action = ?,
+                 SET media_type = $1,
+                     title = $2,
+                     normalized_title = $3,
+                     year = $4,
+                     external_ids_json = COALESCE($5, external_ids_json),
+                     manager_provider_id = $6,
+                     manager_item_id = $7,
+                     manager_label = $8,
+                     manager_implementation = $9,
+                     season_number = $10,
+                     episode_number = $11,
+                     absolute_episode_number = COALESCE($12, absolute_episode_number),
+                     action = $13,
                      active = 1,
                      cleared_at = NULL,
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE tombstone_id = ?",
+                 WHERE tombstone_id = $14",
             )
             .bind(data.media_type.as_str())
             .bind(&data.title)
@@ -2772,7 +2973,7 @@ impl<'a> ExtensionStore<'a> {
                 absolute_episode_number,
                 action,
                 active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 1)",
         )
         .bind(tombstone_id.to_string())
         .bind(data.media_type.as_str())
@@ -2835,7 +3036,7 @@ impl<'a> ExtensionStore<'a> {
              SET active = 0,
                  cleared_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE tombstone_id = ?",
+             WHERE tombstone_id = $1",
         )
         .bind(tombstone_id.to_string())
         .execute(self.pool)
@@ -2845,7 +3046,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn upsert_secret(&self, data: &NewSecret) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO secrets (secret_id, scope, scope_id, key, value_encrypted, rotatable) VALUES (?, ?, ?, ?, ?, ?) \n             ON CONFLICT(scope, scope_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, rotatable = excluded.rotatable",
+            "INSERT INTO secrets (secret_id, scope, scope_id, key, value_encrypted, rotatable) VALUES ($1, $2, $3, $4, $5, $6) \n             ON CONFLICT(scope, scope_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, rotatable = excluded.rotatable",
         )
         .bind(data.secret_id.to_string())
         .bind(data.scope.as_str())
@@ -2866,7 +3067,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<Option<Secret>> {
         let row = if let Some(scope_id) = scope_id {
             sqlx::query(
-                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(rotatable AS INTEGER) as rotatable FROM secrets WHERE scope = ? AND scope_id = ? AND key = ? LIMIT 1",
+                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id = $2 AND key = $3 LIMIT 1",
             )
             .bind(scope.as_str())
             .bind(scope_id.to_string())
@@ -2875,7 +3076,7 @@ impl<'a> ExtensionStore<'a> {
             .await?
         } else {
             sqlx::query(
-                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(rotatable AS INTEGER) as rotatable FROM secrets WHERE scope = ? AND scope_id IS NULL AND key = ? LIMIT 1",
+                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id IS NULL AND key = $2 LIMIT 1",
             )
             .bind(scope.as_str())
             .bind(key)
@@ -2887,7 +3088,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_secret_by_id(&self, secret_id: Uuid) -> Result<Option<Secret>> {
         let row = sqlx::query(
-            "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(rotatable AS INTEGER) as rotatable FROM secrets WHERE secret_id = ? LIMIT 1",
+            "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE secret_id = $1 LIMIT 1",
         )
         .bind(secret_id.to_string())
         .fetch_optional(self.pool)
@@ -2901,29 +3102,38 @@ impl<'a> ExtensionStore<'a> {
         scope_id: Option<Uuid>,
         key: Option<&str>,
     ) -> Result<Vec<Secret>> {
-        let mut builder = QueryBuilder::<sqlx::Any>::new(
-            "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(rotatable AS INTEGER) as rotatable FROM secrets",
-        );
+        let mut sql = "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets".to_string();
         let mut has_where = false;
-        if let Some(scope) = scope {
-            builder.push(if has_where { " AND " } else { " WHERE " });
-            builder.push("scope = ");
-            builder.push_bind(scope.as_str());
+        let mut position = 1;
+        if scope.is_some() {
+            sql.push_str(if has_where { " AND " } else { " WHERE " });
+            sql.push_str(&format!("scope = ${position}"));
+            position += 1;
             has_where = true;
         }
-        if let Some(scope_id) = scope_id {
-            builder.push(if has_where { " AND " } else { " WHERE " });
-            builder.push("scope_id = ");
-            builder.push_bind(scope_id.to_string());
+        if scope_id.is_some() {
+            sql.push_str(if has_where { " AND " } else { " WHERE " });
+            sql.push_str(&format!("scope_id = ${position}"));
+            position += 1;
             has_where = true;
         }
-        if let Some(key) = key {
-            builder.push(if has_where { " AND " } else { " WHERE " });
-            builder.push("key = ");
-            builder.push_bind(key);
+        if key.is_some() {
+            sql.push_str(if has_where { " AND " } else { " WHERE " });
+            sql.push_str(&format!("key = ${position}"));
         }
 
-        let rows = builder.build().fetch_all(self.pool).await?;
+        let mut query = sqlx::query(&sql);
+        if let Some(scope) = scope {
+            query = query.bind(scope.as_str());
+        }
+        if let Some(scope_id) = scope_id {
+            query = query.bind(scope_id.to_string());
+        }
+        if let Some(key) = key {
+            query = query.bind(key);
+        }
+
+        let rows = query.fetch_all(self.pool).await?;
         let mut secrets = Vec::with_capacity(rows.len());
         for row in rows {
             secrets.push(map_secret(&row)?);
@@ -2932,7 +3142,7 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn delete_secret(&self, secret_id: Uuid) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE secret_id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE secret_id = $1")
             .bind(secret_id.to_string())
             .execute(self.pool)
             .await?;
@@ -2946,7 +3156,7 @@ impl<'a> ExtensionStore<'a> {
         rotatable: bool,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE secrets SET value_encrypted = ?, rotatable = ? WHERE secret_id = ?",
+            "UPDATE secrets SET value_encrypted = $1, rotatable = $2 WHERE secret_id = $3",
         )
         .bind(value_encrypted)
         .bind(rotatable)
@@ -2959,7 +3169,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_run(&self, data: &NewOrchestratorRun) -> Result<()> {
         let plan_json = json_to_string(data.plan_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO orchestrator_runs (run_id, source, status, phase, plan_json, error, started_at) VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            "INSERT INTO orchestrator_runs (run_id, source, status, phase, plan_json, error, started_at) VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7 = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
         )
         .bind(data.run_id.to_string())
         .bind(&data.source)
@@ -2980,7 +3190,7 @@ impl<'a> ExtensionStore<'a> {
         ttl: Duration,
     ) -> Result<bool> {
         let insert = sqlx::query::<sqlx::Any>(
-            "INSERT INTO orchestrator_locks (lock_name, owner_id) VALUES (?, ?)",
+            "INSERT INTO orchestrator_locks (lock_name, owner_id) VALUES ($1, $2)",
         )
         .bind(lock_name)
         .bind(owner_id)
@@ -3000,7 +3210,7 @@ impl<'a> ExtensionStore<'a> {
         let stale_before = Utc::now() - chrono::Duration::seconds(ttl_seconds as i64);
         let stale_str = stale_before.format("%Y-%m-%d %H:%M:%S").to_string();
         let updated = sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_locks SET owner_id = ?, locked_at = CURRENT_TIMESTAMP WHERE lock_name = ? AND locked_at < ?",
+            "UPDATE orchestrator_locks SET owner_id = $1, locked_at = CURRENT_TIMESTAMP WHERE lock_name = $2 AND locked_at < $3",
         )
         .bind(owner_id)
         .bind(lock_name)
@@ -3013,7 +3223,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn touch_lock(&self, lock_name: &str, owner_id: &str) -> Result<bool> {
         let updated = sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_locks SET locked_at = CURRENT_TIMESTAMP WHERE lock_name = ? AND owner_id = ?",
+            "UPDATE orchestrator_locks SET locked_at = CURRENT_TIMESTAMP WHERE lock_name = $1 AND owner_id = $2",
         )
         .bind(lock_name)
         .bind(owner_id)
@@ -3024,7 +3234,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn release_lock(&self, lock_name: &str, owner_id: &str) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "DELETE FROM orchestrator_locks WHERE lock_name = ? AND owner_id = ?",
+            "DELETE FROM orchestrator_locks WHERE lock_name = $1 AND owner_id = $2",
         )
         .bind(lock_name)
         .bind(owner_id)
@@ -3034,10 +3244,11 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn force_release_lock(&self, lock_name: &str) -> Result<u64> {
-        let result = sqlx::query::<sqlx::Any>("DELETE FROM orchestrator_locks WHERE lock_name = ?")
-            .bind(lock_name)
-            .execute(self.pool)
-            .await?;
+        let result =
+            sqlx::query::<sqlx::Any>("DELETE FROM orchestrator_locks WHERE lock_name = $1")
+                .bind(lock_name)
+                .execute(self.pool)
+                .await?;
         Ok(result.rows_affected())
     }
 
@@ -3049,7 +3260,7 @@ impl<'a> ExtensionStore<'a> {
         error: Option<&str>,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_runs SET status = ?, phase = ?, error = ?, started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, finished_at = CASE WHEN ? IN ('failed', 'completed', 'canceled') THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE run_id = ?",
+            "UPDATE orchestrator_runs SET status = $1, phase = $2, error = $3, started_at = CASE WHEN $4 = 'running' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, finished_at = CASE WHEN $5 IN ('failed', 'completed', 'canceled') THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE run_id = $6",
         )
         .bind(status.as_str())
         .bind(phase)
@@ -3064,7 +3275,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn update_run_plan(&self, run_id: Uuid, plan_json: serde_json::Value) -> Result<()> {
         let plan_json = json_to_string(Some(&plan_json))?;
-        sqlx::query::<sqlx::Any>("UPDATE orchestrator_runs SET plan_json = ? WHERE run_id = ?")
+        sqlx::query::<sqlx::Any>("UPDATE orchestrator_runs SET plan_json = $1 WHERE run_id = $2")
             .bind(plan_json)
             .bind(run_id.to_string())
             .execute(self.pool)
@@ -3078,7 +3289,7 @@ impl<'a> ExtensionStore<'a> {
         error: Option<&str>,
     ) -> Result<u64> {
         let updated = sqlx::query::<sqlx::Any>(
-            "UPDATE orchestrator_runs SET status = 'canceled', phase = 'canceled', error = ?, finished_at = CURRENT_TIMESTAMP WHERE source = ? AND status = 'pending'",
+            "UPDATE orchestrator_runs SET status = 'canceled', phase = 'canceled', error = $1, finished_at = CURRENT_TIMESTAMP WHERE source = $2 AND status = 'pending'",
         )
         .bind(error)
         .bind(source)
@@ -3090,7 +3301,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn list_runs(&self, limit: Option<i64>) -> Result<Vec<OrchestratorRun>> {
         let rows = if let Some(limit) = limit {
             sqlx::query(
-                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC LIMIT ?",
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs ORDER BY created_at DESC LIMIT $1",
             )
             .bind(limit)
             .fetch_all(self.pool)
@@ -3120,7 +3331,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_latest_run_by_phase(&self, phase: &str) -> Result<Option<OrchestratorRun>> {
         let row = sqlx::query(
-            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE phase = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE phase = $1 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(phase)
         .fetch_optional(self.pool)
@@ -3135,7 +3346,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<Option<OrchestratorRun>> {
         let row = if let Some(status) = status {
             sqlx::query(
-                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = $1 AND status = $2 ORDER BY created_at DESC LIMIT 1",
             )
             .bind(source)
             .bind(status.as_str())
@@ -3143,7 +3354,7 @@ impl<'a> ExtensionStore<'a> {
             .await?
         } else {
             sqlx::query(
-                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE source = $1 ORDER BY created_at DESC LIMIT 1",
             )
             .bind(source)
             .fetch_optional(self.pool)
@@ -3160,7 +3371,7 @@ impl<'a> ExtensionStore<'a> {
         let rows = sqlx::query(
             "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at
              FROM orchestrator_runs
-             WHERE source = ? AND status = ?
+             WHERE source = $1 AND status = $2
              ORDER BY created_at DESC",
         )
         .bind(source)
@@ -3176,7 +3387,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn get_run(&self, run_id: Uuid) -> Result<Option<OrchestratorRun>> {
         let row = sqlx::query(
-            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE run_id = ? LIMIT 1",
+            "SELECT run_id, CAST(source AS TEXT) as source, status, CAST(phase AS TEXT) as phase, CAST(plan_json AS TEXT) as plan_json, CAST(error AS TEXT) as error, CAST(created_at AS TEXT) as created_at, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM orchestrator_runs WHERE run_id = $1 LIMIT 1",
         )
         .bind(run_id.to_string())
         .fetch_optional(self.pool)
@@ -3193,14 +3404,14 @@ impl<'a> ExtensionStore<'a> {
         sqlx::query::<sqlx::Any>(
             "UPDATE operation_steps
              SET status = 'failed',
-                 error = COALESCE(error, ?),
+                 error = COALESCE(error, $1),
                  finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
              WHERE status = 'running'
                AND run_id IN (
                    SELECT run_id
                    FROM orchestrator_runs
                    WHERE status = 'running'
-                     AND created_at < ?
+                     AND created_at < $2
                )",
         )
         .bind(reason)
@@ -3212,10 +3423,10 @@ impl<'a> ExtensionStore<'a> {
             "UPDATE orchestrator_runs
              SET status = 'failed',
                  phase = COALESCE(phase, 'reconcile'),
-                 error = COALESCE(error, ?),
+                 error = COALESCE(error, $1),
                  finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
              WHERE status = 'running'
-               AND created_at < ?",
+               AND created_at < $2",
         )
         .bind(reason)
         .bind(&stale_str)
@@ -3228,7 +3439,7 @@ impl<'a> ExtensionStore<'a> {
     pub async fn create_step(&self, data: &NewOperationStep) -> Result<()> {
         let action_json = json_to_string(data.action_json.as_ref())?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO operation_steps (step_id, run_id, step_index, action_type, action_json, status, error, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            "INSERT INTO operation_steps (step_id, run_id, step_index, action_type, action_json, status, error, started_at) VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $8 = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END)",
         )
         .bind(data.step_id.to_string())
         .bind(data.run_id.to_string())
@@ -3250,7 +3461,7 @@ impl<'a> ExtensionStore<'a> {
         error: Option<&str>,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "UPDATE operation_steps SET status = ?, error = ?, started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, finished_at = CASE WHEN ? IN ('failed', 'completed', 'skipped') THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE step_id = ?",
+            "UPDATE operation_steps SET status = $1, error = $2, started_at = CASE WHEN $3 = 'running' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, finished_at = CASE WHEN $4 IN ('failed', 'completed', 'skipped') THEN CURRENT_TIMESTAMP ELSE finished_at END WHERE step_id = $5",
         )
         .bind(status.as_str())
         .bind(error)
@@ -3264,7 +3475,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn list_steps(&self, run_id: Uuid) -> Result<Vec<OperationStep>> {
         let rows = sqlx::query(
-            "SELECT step_id, run_id, step_index, action_type, CAST(action_json AS TEXT) as action_json, status, CAST(error AS TEXT) as error, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at, CAST(created_at AS TEXT) as created_at FROM operation_steps WHERE run_id = ? ORDER BY step_index",
+            "SELECT step_id, run_id, step_index, action_type, CAST(action_json AS TEXT) as action_json, status, CAST(error AS TEXT) as error, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at, CAST(created_at AS TEXT) as created_at FROM operation_steps WHERE run_id = $1 ORDER BY step_index",
         )
         .bind(run_id.to_string())
         .fetch_all(self.pool)
@@ -3278,7 +3489,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn create_runtime_log(&self, data: &NewRuntimeLog) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO runtime_logs (log_id, instance_id, log_uri) VALUES (?, ?, ?)",
+            "INSERT INTO runtime_logs (log_id, instance_id, log_uri) VALUES ($1, $2, $3)",
         )
         .bind(data.log_id.to_string())
         .bind(data.instance_id.to_string())
@@ -3290,7 +3501,7 @@ impl<'a> ExtensionStore<'a> {
 
     pub async fn list_runtime_logs(&self, instance_id: Uuid) -> Result<Vec<RuntimeLog>> {
         let rows = sqlx::query(
-            "SELECT log_id, instance_id, log_uri, CAST(created_at AS TEXT) as created_at FROM runtime_logs WHERE instance_id = ? ORDER BY created_at DESC",
+            "SELECT log_id, instance_id, log_uri, CAST(created_at AS TEXT) as created_at FROM runtime_logs WHERE instance_id = $1 ORDER BY created_at DESC",
         )
         .bind(instance_id.to_string())
         .fetch_all(self.pool)
@@ -3314,7 +3525,7 @@ impl<'a> ExtensionStore<'a> {
         key: &str,
     ) -> Result<Option<ExtensionSettingRecord>> {
         let row = sqlx::query(
-            "SELECT setting_key, CAST(value_json AS TEXT) as value_json, CAST(updated_at AS TEXT) as updated_at FROM extension_settings WHERE setting_key = ? LIMIT 1",
+            "SELECT setting_key, CAST(value_json AS TEXT) as value_json, CAST(updated_at AS TEXT) as updated_at FROM extension_settings WHERE setting_key = $1 LIMIT 1",
         )
         .bind(key)
         .fetch_optional(self.pool)
@@ -3330,7 +3541,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         let value_json = json_to_string(Some(value))?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO extension_settings (setting_key, value_json) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO extension_settings (setting_key, value_json) VALUES ($1, $2) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(key)
         .bind(value_json)
@@ -3340,7 +3551,7 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn delete_extension_setting(&self, key: &str) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM extension_settings WHERE setting_key = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM extension_settings WHERE setting_key = $1")
             .bind(key)
             .execute(self.pool)
             .await?;
@@ -3365,7 +3576,7 @@ impl<'a> ExtensionStore<'a> {
                 etag,
                 last_modified,
                 metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT(instance_id, registry_key) DO UPDATE SET
                 registry_type = excluded.registry_type,
                 trust_class = excluded.trust_class,
@@ -3411,9 +3622,9 @@ impl<'a> ExtensionStore<'a> {
                     trust_class,
                     display_name,
                     CAST(url AS TEXT) AS url,
-                    CAST(enabled AS INTEGER) AS enabled,
-                    CAST(auto_refresh AS INTEGER) AS auto_refresh,
-                    CAST(trusted_for_executable_updates AS INTEGER) AS trusted_for_executable_updates,
+                    CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) AS enabled,
+                    CAST(CASE WHEN auto_refresh THEN 1 ELSE 0 END AS BIGINT) AS auto_refresh,
+                    CAST(CASE WHEN trusted_for_executable_updates THEN 1 ELSE 0 END AS BIGINT) AS trusted_for_executable_updates,
                     CAST(etag AS TEXT) AS etag,
                     CAST(last_modified AS TEXT) AS last_modified,
                     last_fetch_status,
@@ -3423,7 +3634,7 @@ impl<'a> ExtensionStore<'a> {
                     CAST(created_at AS TEXT) AS created_at,
                     CAST(updated_at AS TEXT) AS updated_at
                  FROM extension_source_registries
-                 WHERE instance_id = ?
+                 WHERE instance_id = $1
                  ORDER BY created_at ASC",
             )
             .bind(instance_id.to_string())
@@ -3439,9 +3650,9 @@ impl<'a> ExtensionStore<'a> {
                     trust_class,
                     display_name,
                     CAST(url AS TEXT) AS url,
-                    CAST(enabled AS INTEGER) AS enabled,
-                    CAST(auto_refresh AS INTEGER) AS auto_refresh,
-                    CAST(trusted_for_executable_updates AS INTEGER) AS trusted_for_executable_updates,
+                    CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) AS enabled,
+                    CAST(CASE WHEN auto_refresh THEN 1 ELSE 0 END AS BIGINT) AS auto_refresh,
+                    CAST(CASE WHEN trusted_for_executable_updates THEN 1 ELSE 0 END AS BIGINT) AS trusted_for_executable_updates,
                     CAST(etag AS TEXT) AS etag,
                     CAST(last_modified AS TEXT) AS last_modified,
                     last_fetch_status,
@@ -3474,13 +3685,13 @@ impl<'a> ExtensionStore<'a> {
         )?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_registries
-             SET last_fetch_status = ?,
-                 last_fetch_error = ?,
-                 etag = COALESCE(?, etag),
-                 last_modified = COALESCE(?, last_modified),
+             SET last_fetch_status = $1,
+                 last_fetch_error = $2,
+                 etag = COALESCE($3, etag),
+                 last_modified = COALESCE($4, last_modified),
                  last_fetched_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE registry_id = ?",
+             WHERE registry_id = $5",
         )
         .bind(status.trim())
         .bind(error.map(str::trim))
@@ -3500,10 +3711,10 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_registries
-             SET enabled = ?,
-                 auto_refresh = ?,
+             SET enabled = $1,
+                 auto_refresh = $2,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE registry_id = ?",
+             WHERE registry_id = $3",
         )
         .bind(enabled)
         .bind(auto_refresh)
@@ -3526,10 +3737,10 @@ impl<'a> ExtensionStore<'a> {
         )?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_registries
-             SET trust_class = ?,
-                 trusted_for_executable_updates = ?,
+             SET trust_class = $1,
+                 trusted_for_executable_updates = $2,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE registry_id = ?",
+             WHERE registry_id = $3",
         )
         .bind(trust_class.trim())
         .bind(trusted_for_executable_updates)
@@ -3542,11 +3753,11 @@ impl<'a> ExtensionStore<'a> {
     pub async fn delete_source_registry(&self, registry_id: Uuid) -> Result<u64> {
         sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_certification_jobs
-             WHERE registry_id = ?
+             WHERE registry_id = $1
                 OR source_module_id IN (
                     SELECT source_module_id
                     FROM extension_source_modules
-                    WHERE registry_id = ?
+                    WHERE registry_id = $2
                 )",
         )
         .bind(registry_id.to_string())
@@ -3555,16 +3766,16 @@ impl<'a> ExtensionStore<'a> {
         .await?;
         sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_replacement_recommendations
-             WHERE replacement_registry_id = ?
+             WHERE replacement_registry_id = $1
                 OR source_module_id IN (
                     SELECT source_module_id
                     FROM extension_source_modules
-                    WHERE registry_id = ?
+                    WHERE registry_id = $2
                 )
                 OR replacement_source_module_id IN (
                     SELECT source_module_id
                     FROM extension_source_modules
-                    WHERE registry_id = ?
+                    WHERE registry_id = $3
                 )",
         )
         .bind(registry_id.to_string())
@@ -3577,7 +3788,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT source_module_id
                 FROM extension_source_modules
-                WHERE registry_id = ?
+                WHERE registry_id = $1
              )",
         )
         .bind(registry_id.to_string())
@@ -3588,7 +3799,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT source_module_id
                 FROM extension_source_modules
-                WHERE registry_id = ?
+                WHERE registry_id = $1
              )",
         )
         .bind(registry_id.to_string())
@@ -3599,7 +3810,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT source_module_id
                 FROM extension_source_modules
-                WHERE registry_id = ?
+                WHERE registry_id = $1
              )",
         )
         .bind(registry_id.to_string())
@@ -3610,7 +3821,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT source_module_id
                 FROM extension_source_modules
-                WHERE registry_id = ?
+                WHERE registry_id = $1
              )",
         )
         .bind(registry_id.to_string())
@@ -3618,14 +3829,14 @@ impl<'a> ExtensionStore<'a> {
         .await?;
         sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_modules
-             WHERE registry_id = ?",
+             WHERE registry_id = $1",
         )
         .bind(registry_id.to_string())
         .execute(self.pool)
         .await?;
         let affected = sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_registries
-             WHERE registry_id = ?",
+             WHERE registry_id = $1",
         )
         .bind(registry_id.to_string())
         .execute(self.pool)
@@ -3640,7 +3851,7 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<u64> {
         sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_certification_jobs
-             WHERE instance_id = ?
+             WHERE instance_id = $1
                AND (
                     registry_id IS NOT NULL
                     AND NOT EXISTS (
@@ -3651,7 +3862,7 @@ impl<'a> ExtensionStore<'a> {
                     OR source_module_id IN (
                         SELECT module.source_module_id
                         FROM extension_source_modules module
-                        WHERE module.instance_id = ?
+                        WHERE module.instance_id = $2
                           AND NOT EXISTS (
                               SELECT 1
                               FROM extension_source_registries registry
@@ -3669,7 +3880,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                     SELECT module.source_module_id
                     FROM extension_source_modules module
-                    WHERE module.instance_id = ?
+                    WHERE module.instance_id = $1
                       AND NOT EXISTS (
                           SELECT 1
                           FROM extension_source_registries registry
@@ -3679,7 +3890,7 @@ impl<'a> ExtensionStore<'a> {
                 OR replacement_source_module_id IN (
                     SELECT module.source_module_id
                     FROM extension_source_modules module
-                    WHERE module.instance_id = ?
+                    WHERE module.instance_id = $2
                       AND NOT EXISTS (
                           SELECT 1
                           FROM extension_source_registries registry
@@ -3696,7 +3907,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT module.source_module_id
                 FROM extension_source_modules module
-                WHERE module.instance_id = ?
+                WHERE module.instance_id = $1
                   AND NOT EXISTS (
                       SELECT 1
                       FROM extension_source_registries registry
@@ -3712,7 +3923,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT module.source_module_id
                 FROM extension_source_modules module
-                WHERE module.instance_id = ?
+                WHERE module.instance_id = $1
                   AND NOT EXISTS (
                       SELECT 1
                       FROM extension_source_registries registry
@@ -3728,7 +3939,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT module.source_module_id
                 FROM extension_source_modules module
-                WHERE module.instance_id = ?
+                WHERE module.instance_id = $1
                   AND NOT EXISTS (
                       SELECT 1
                       FROM extension_source_registries registry
@@ -3744,7 +3955,7 @@ impl<'a> ExtensionStore<'a> {
              WHERE source_module_id IN (
                 SELECT module.source_module_id
                 FROM extension_source_modules module
-                WHERE module.instance_id = ?
+                WHERE module.instance_id = $1
                   AND NOT EXISTS (
                       SELECT 1
                       FROM extension_source_registries registry
@@ -3757,7 +3968,7 @@ impl<'a> ExtensionStore<'a> {
         .await?;
         let affected = sqlx::query::<sqlx::Any>(
             "DELETE FROM extension_source_modules
-             WHERE instance_id = ?
+             WHERE instance_id = $1
                AND NOT EXISTS (
                    SELECT 1
                    FROM extension_source_registries registry
@@ -3803,7 +4014,7 @@ impl<'a> ExtensionStore<'a> {
                 replacement_recommendation_key,
                 last_error,
                 metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
              ON CONFLICT(instance_id, module_key) DO UPDATE SET
                 registry_id = excluded.registry_id,
                 display_name = excluded.display_name,
@@ -3878,11 +4089,11 @@ impl<'a> ExtensionStore<'a> {
                 CAST(language_tags_json AS TEXT) AS language_tags_json,
                 CAST(region_tags_json AS TEXT) AS region_tags_json,
                 CAST(source_domains_json AS TEXT) AS source_domains_json,
-                CAST(account_required AS INTEGER) AS account_required,
-                CAST(unsupported AS INTEGER) AS unsupported,
+                CAST(CASE WHEN account_required THEN 1 ELSE 0 END AS BIGINT) AS account_required,
+                CAST(CASE WHEN unsupported THEN 1 ELSE 0 END AS BIGINT) AS unsupported,
                 CAST(unsupported_reason AS TEXT) AS unsupported_reason,
-                CAST(enabled AS INTEGER) AS enabled,
-                CAST(installed AS INTEGER) AS installed,
+                CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) AS enabled,
+                CAST(CASE WHEN installed THEN 1 ELSE 0 END AS BIGINT) AS installed,
                 CAST(pinned_version AS TEXT) AS pinned_version,
                 health_state,
                 CAST(replacement_recommendation_key AS TEXT) AS replacement_recommendation_key,
@@ -3893,38 +4104,37 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
             FROM extension_source_modules";
-        let rows = match (instance_id, registry_id) {
-            (Some(instance_id), Some(registry_id)) => {
-                sqlx::query(&format!(
-                    "{base} WHERE instance_id = ? AND registry_id = ? ORDER BY display_name ASC"
+        let rows =
+            match (instance_id, registry_id) {
+                (Some(instance_id), Some(registry_id)) => sqlx::query(&format!(
+                    "{base} WHERE instance_id = $1 AND registry_id = $2 ORDER BY display_name ASC"
                 ))
                 .bind(instance_id.to_string())
                 .bind(registry_id.to_string())
                 .fetch_all(self.pool)
-                .await?
-            }
-            (Some(instance_id), None) => {
-                sqlx::query(&format!(
-                    "{base} WHERE instance_id = ? ORDER BY display_name ASC"
-                ))
-                .bind(instance_id.to_string())
-                .fetch_all(self.pool)
-                .await?
-            }
-            (None, Some(registry_id)) => {
-                sqlx::query(&format!(
-                    "{base} WHERE registry_id = ? ORDER BY display_name ASC"
-                ))
-                .bind(registry_id.to_string())
-                .fetch_all(self.pool)
-                .await?
-            }
-            (None, None) => {
-                sqlx::query(&format!("{base} ORDER BY display_name ASC"))
+                .await?,
+                (Some(instance_id), None) => {
+                    sqlx::query(&format!(
+                        "{base} WHERE instance_id = $1 ORDER BY display_name ASC"
+                    ))
+                    .bind(instance_id.to_string())
                     .fetch_all(self.pool)
                     .await?
-            }
-        };
+                }
+                (None, Some(registry_id)) => {
+                    sqlx::query(&format!(
+                        "{base} WHERE registry_id = $1 ORDER BY display_name ASC"
+                    ))
+                    .bind(registry_id.to_string())
+                    .fetch_all(self.pool)
+                    .await?
+                }
+                (None, None) => {
+                    sqlx::query(&format!("{base} ORDER BY display_name ASC"))
+                        .fetch_all(self.pool)
+                        .await?
+                }
+            };
         rows.iter().map(map_source_module).collect()
     }
 
@@ -3947,20 +4157,20 @@ impl<'a> ExtensionStore<'a> {
         let clears_last_error = matches!(health_state, "available" | "healthy");
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET enabled = ?,
+             SET enabled = $1,
                  health_state = CASE
-                    WHEN unsupported = 1 THEN 'unsupported'
-                    WHEN account_required = 1 THEN 'account_required'
-                    ELSE ?
+                    WHEN unsupported THEN 'unsupported'
+                    WHEN account_required THEN 'account_required'
+                    ELSE $2
                  END,
-                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+                 last_failure_at = CASE WHEN $3 = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
                  last_error = CASE
-                    WHEN ? = 1 THEN COALESCE(?, ?)
-                    WHEN ? = 1 THEN NULL
+                    WHEN $4 = 1 THEN COALESCE($5, $6)
+                    WHEN $7 = 1 THEN NULL
                     ELSE last_error
                  END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE registry_id = ?",
+             WHERE registry_id = $8",
         )
         .bind(enabled)
         .bind(health_state.trim())
@@ -3983,11 +4193,11 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET active_version = ?,
-                 rollback_version = ?,
-                 installed = CASE WHEN ? IS NULL THEN installed ELSE 1 END,
+             SET active_version = $1,
+                 rollback_version = $2,
+                 installed = CASE WHEN $3 IS NULL THEN installed ELSE TRUE END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $4",
         )
         .bind(active_version.map(str::trim))
         .bind(rollback_version.map(str::trim))
@@ -4005,9 +4215,9 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET pinned_version = ?,
+             SET pinned_version = $1,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $2",
         )
         .bind(pinned_version.map(str::trim))
         .bind(source_module_id.to_string())
@@ -4035,16 +4245,16 @@ impl<'a> ExtensionStore<'a> {
         let clears_last_error = matches!(health_state, "available" | "healthy");
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET enabled = ?,
-                 health_state = ?,
-                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+             SET enabled = $1,
+                 health_state = $2,
+                 last_failure_at = CASE WHEN $3 = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
                  last_error = CASE
-                    WHEN ? = 1 THEN COALESCE(?, ?)
-                    WHEN ? = 1 THEN NULL
+                    WHEN $4 = 1 THEN COALESCE($5, $6)
+                    WHEN $7 = 1 THEN NULL
                     ELSE last_error
                  END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $8",
         )
         .bind(enabled)
         .bind(health_state.trim())
@@ -4079,17 +4289,17 @@ impl<'a> ExtensionStore<'a> {
         let clears_last_error = matches!(health_state, "available" | "healthy");
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET installed = ?,
-                 active_version = ?,
-                 health_state = ?,
-                 last_failure_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
+             SET installed = $1,
+                 active_version = $2,
+                 health_state = $3,
+                 last_failure_at = CASE WHEN $4 = 1 THEN CURRENT_TIMESTAMP ELSE last_failure_at END,
                  last_error = CASE
-                    WHEN ? = 1 THEN COALESCE(?, ?)
-                    WHEN ? = 1 THEN NULL
+                    WHEN $5 = 1 THEN COALESCE($6, $7)
+                    WHEN $8 = 1 THEN NULL
                     ELSE last_error
                  END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $9",
         )
         .bind(installed)
         .bind(active_version.map(str::trim))
@@ -4112,9 +4322,9 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET replacement_recommendation_key = ?,
+             SET replacement_recommendation_key = $1,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $2",
         )
         .bind(recommendation_key.map(str::trim))
         .bind(source_module_id.to_string())
@@ -4146,7 +4356,7 @@ impl<'a> ExtensionStore<'a> {
                 installed_at,
                 activated_at,
                 metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT(source_module_id, version) DO UPDATE SET
                 artifact_url = excluded.artifact_url,
                 artifact_sha256 = excluded.artifact_sha256,
@@ -4200,7 +4410,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_module_versions
-             WHERE source_module_id = ?
+             WHERE source_module_id = $1
              ORDER BY created_at ASC",
         )
         .bind(source_module_id.to_string())
@@ -4228,11 +4438,11 @@ impl<'a> ExtensionStore<'a> {
         )?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_module_versions
-             SET install_state = ?,
-                 smoke_status = ?,
-                 smoke_error = ?,
+             SET install_state = $1,
+                 smoke_status = $2,
+                 smoke_error = $3,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE version_id = ?",
+             WHERE version_id = $4",
         )
         .bind(install_state.trim())
         .bind(smoke_status.trim())
@@ -4266,7 +4476,7 @@ impl<'a> ExtensionStore<'a> {
                 reason,
                 evidence_json,
                 observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, CURRENT_TIMESTAMP))",
         )
         .bind(data.health_event_id.to_string())
         .bind(data.source_module_id.to_string())
@@ -4287,16 +4497,16 @@ impl<'a> ExtensionStore<'a> {
         let clears_last_error = matches!(state, "available" | "healthy");
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_modules
-             SET health_state = ?,
-                 last_success_at = CASE WHEN ? = 1 THEN COALESCE(?, CURRENT_TIMESTAMP) ELSE last_success_at END,
-                 last_failure_at = CASE WHEN ? = 1 THEN COALESCE(?, CURRENT_TIMESTAMP) ELSE last_failure_at END,
+             SET health_state = $1,
+                 last_success_at = CASE WHEN $2 = 1 THEN COALESCE($3, CURRENT_TIMESTAMP) ELSE last_success_at END,
+                 last_failure_at = CASE WHEN $4 = 1 THEN COALESCE($5, CURRENT_TIMESTAMP) ELSE last_failure_at END,
                  last_error = CASE
-                    WHEN ? = 1 THEN COALESCE(?, ?)
-                    WHEN ? = 1 THEN NULL
+                    WHEN $6 = 1 THEN COALESCE($7, $8)
+                    WHEN $9 = 1 THEN NULL
                     ELSE last_error
                  END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE source_module_id = ?",
+             WHERE source_module_id = $10",
         )
         .bind(state)
         .bind(if success_event { 1_i64 } else { 0_i64 })
@@ -4330,9 +4540,9 @@ impl<'a> ExtensionStore<'a> {
                 CAST(observed_at AS TEXT) AS observed_at,
                 CAST(created_at AS TEXT) AS created_at
              FROM extension_source_health_events
-             WHERE source_module_id = ?
+             WHERE source_module_id = $1
              ORDER BY observed_at DESC, created_at DESC
-             LIMIT ?",
+             LIMIT $2",
         )
         .bind(source_module_id.to_string())
         .bind(limit.max(1))
@@ -4372,7 +4582,7 @@ impl<'a> ExtensionStore<'a> {
                 policy_version,
                 certified_at,
                 expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT(source_module_id, source_module_version_id, instance_id, adapter) DO UPDATE SET
                 certification_id = excluded.certification_id,
                 artifact_sha256 = excluded.artifact_sha256,
@@ -4437,7 +4647,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_module_certifications
-             WHERE instance_id = ?
+             WHERE instance_id = $1
              ORDER BY updated_at DESC, created_at DESC",
         )
         .bind(instance_id.to_string())
@@ -4481,7 +4691,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_module_certifications
-             WHERE source_module_id = ?
+             WHERE source_module_id = $1
              ORDER BY updated_at DESC, created_at DESC
              LIMIT 1",
         )
@@ -4520,9 +4730,9 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_module_certifications
-             WHERE source_module_id = ?
+             WHERE source_module_id = $1
              ORDER BY updated_at DESC, created_at DESC
-             LIMIT ?",
+             LIMIT $2",
         )
         .bind(source_module_id.to_string())
         .bind(limit.max(1))
@@ -4552,7 +4762,7 @@ impl<'a> ExtensionStore<'a> {
                 marketplace_state,
                 summary,
                 last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(data.job_id.to_string())
         .bind(data.instance_id.to_string())
@@ -4581,7 +4791,7 @@ impl<'a> ExtensionStore<'a> {
             "SELECT
                 job_id
              FROM extension_source_certification_jobs
-             WHERE instance_id = ?
+             WHERE instance_id = $1
                AND status = 'queued'
                AND attempts < max_attempts
              ORDER BY priority ASC, created_at ASC, updated_at ASC
@@ -4602,7 +4812,7 @@ impl<'a> ExtensionStore<'a> {
                  started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
                  finished_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE job_id = ?
+             WHERE job_id = $1
                AND status = 'queued'
                AND attempts < max_attempts",
         )
@@ -4641,7 +4851,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_certification_jobs
-             WHERE job_id = ?",
+             WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .fetch_optional(self.pool)
@@ -4657,11 +4867,11 @@ impl<'a> ExtensionStore<'a> {
         let affected = sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_certification_jobs
              SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
-                 summary = ?,
-                 last_error = ?,
+                 summary = $1,
+                 last_error = $2,
                  finished_at = CASE WHEN attempts >= max_attempts THEN CURRENT_TIMESTAMP ELSE NULL END,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE instance_id = ?
+             WHERE instance_id = $3
                AND status = 'running'",
         )
         .bind(reason.trim())
@@ -4688,13 +4898,13 @@ impl<'a> ExtensionStore<'a> {
         )?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_certification_jobs
-             SET status = ?,
-                 marketplace_state = COALESCE(?, marketplace_state),
-                 summary = ?,
-                 last_error = ?,
+             SET status = $1,
+                 marketplace_state = COALESCE($2, marketplace_state),
+                 summary = $3,
+                 last_error = $4,
                  finished_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE job_id = ?",
+             WHERE job_id = $5",
         )
         .bind(status.trim())
         .bind(marketplace_state.map(str::trim))
@@ -4717,13 +4927,13 @@ impl<'a> ExtensionStore<'a> {
             (Some(registry_id), Some(source_module_id)) => sqlx::query::<sqlx::Any>(
                 "UPDATE extension_source_certification_jobs
                      SET status = 'cancelled',
-                         summary = ?,
-                         last_error = ?,
+                         summary = $1,
+                         last_error = $2,
                          finished_at = CURRENT_TIMESTAMP,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE instance_id = ?
-                       AND registry_id = ?
-                       AND source_module_id = ?
+                     WHERE instance_id = $3
+                       AND registry_id = $4
+                       AND source_module_id = $5
                        AND status IN ('queued', 'running')",
             )
             .bind(reason.trim())
@@ -4737,12 +4947,12 @@ impl<'a> ExtensionStore<'a> {
             (Some(registry_id), None) => sqlx::query::<sqlx::Any>(
                 "UPDATE extension_source_certification_jobs
                      SET status = 'cancelled',
-                         summary = ?,
-                         last_error = ?,
+                         summary = $1,
+                         last_error = $2,
                          finished_at = CURRENT_TIMESTAMP,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE instance_id = ?
-                       AND registry_id = ?
+                     WHERE instance_id = $3
+                       AND registry_id = $4
                        AND status IN ('queued', 'running')",
             )
             .bind(reason.trim())
@@ -4755,12 +4965,12 @@ impl<'a> ExtensionStore<'a> {
             (None, Some(source_module_id)) => sqlx::query::<sqlx::Any>(
                 "UPDATE extension_source_certification_jobs
                      SET status = 'cancelled',
-                         summary = ?,
-                         last_error = ?,
+                         summary = $1,
+                         last_error = $2,
                          finished_at = CURRENT_TIMESTAMP,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE instance_id = ?
-                       AND source_module_id = ?
+                     WHERE instance_id = $3
+                       AND source_module_id = $4
                        AND status IN ('queued', 'running')",
             )
             .bind(reason.trim())
@@ -4773,11 +4983,11 @@ impl<'a> ExtensionStore<'a> {
             (None, None) => sqlx::query::<sqlx::Any>(
                 "UPDATE extension_source_certification_jobs
                      SET status = 'cancelled',
-                         summary = ?,
-                         last_error = ?,
+                         summary = $1,
+                         last_error = $2,
                          finished_at = CURRENT_TIMESTAMP,
                          updated_at = CURRENT_TIMESTAMP
-                     WHERE instance_id = ?
+                     WHERE instance_id = $3
                        AND status IN ('queued', 'running')",
             )
             .bind(reason.trim())
@@ -4815,7 +5025,7 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_certification_jobs
-             WHERE instance_id = ?
+             WHERE instance_id = $1
              ORDER BY updated_at DESC, created_at DESC",
         )
         .bind(instance_id.to_string())
@@ -4863,9 +5073,9 @@ impl<'a> ExtensionStore<'a> {
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_certification_jobs
-             WHERE registry_id = ?
+             WHERE registry_id = $1
              ORDER BY updated_at DESC, created_at DESC
-             LIMIT ?",
+             LIMIT $2",
         )
         .bind(registry_id.to_string())
         .bind(limit.max(1))
@@ -4895,7 +5105,7 @@ impl<'a> ExtensionStore<'a> {
                 reason,
                 evidence_json,
                 expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11)
              ON CONFLICT(source_module_id, source_module_version_id, failure_class, hoster_domain, candidate_fingerprint, media_type)
              DO UPDATE SET
                 failure_count = extension_source_module_quarantines.failure_count + 1,
@@ -4940,7 +5150,7 @@ impl<'a> ExtensionStore<'a> {
                 reason,
                 metadata_json,
                 active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT(source_module_id, recommendation_key) DO UPDATE SET
                 replacement_source_module_id = excluded.replacement_source_module_id,
                 replacement_registry_id = excluded.replacement_registry_id,
@@ -4982,39 +5192,40 @@ impl<'a> ExtensionStore<'a> {
                 CAST(recommended_version AS TEXT) AS recommended_version,
                 CAST(reason AS TEXT) AS reason,
                 CAST(metadata_json AS TEXT) AS metadata_json,
-                CAST(active AS INTEGER) AS active,
+                CAST(CASE WHEN active THEN 1 ELSE 0 END AS BIGINT) AS active,
                 CAST(applied_at AS TEXT) AS applied_at,
                 CAST(created_at AS TEXT) AS created_at,
                 CAST(updated_at AS TEXT) AS updated_at
              FROM extension_source_replacement_recommendations";
-        let rows = match (source_module_id, active_only) {
-            (Some(source_module_id), true) => {
-                sqlx::query(&format!(
-                    "{base} WHERE source_module_id = ? AND active = 1 ORDER BY created_at DESC"
+        let rows =
+            match (source_module_id, active_only) {
+                (Some(source_module_id), true) => sqlx::query(&format!(
+                    "{base} WHERE source_module_id = $1 AND active = TRUE ORDER BY created_at DESC"
                 ))
                 .bind(source_module_id.to_string())
                 .fetch_all(self.pool)
-                .await?
-            }
-            (Some(source_module_id), false) => {
-                sqlx::query(&format!(
-                    "{base} WHERE source_module_id = ? ORDER BY created_at DESC"
-                ))
-                .bind(source_module_id.to_string())
-                .fetch_all(self.pool)
-                .await?
-            }
-            (None, true) => {
-                sqlx::query(&format!("{base} WHERE active = 1 ORDER BY created_at DESC"))
+                .await?,
+                (Some(source_module_id), false) => {
+                    sqlx::query(&format!(
+                        "{base} WHERE source_module_id = $1 ORDER BY created_at DESC"
+                    ))
+                    .bind(source_module_id.to_string())
                     .fetch_all(self.pool)
                     .await?
-            }
-            (None, false) => {
-                sqlx::query(&format!("{base} ORDER BY created_at DESC"))
+                }
+                (None, true) => {
+                    sqlx::query(&format!(
+                        "{base} WHERE active = TRUE ORDER BY created_at DESC"
+                    ))
                     .fetch_all(self.pool)
                     .await?
-            }
-        };
+                }
+                (None, false) => {
+                    sqlx::query(&format!("{base} ORDER BY created_at DESC"))
+                        .fetch_all(self.pool)
+                        .await?
+                }
+            };
         rows.iter()
             .map(map_source_replacement_recommendation)
             .collect()
@@ -5026,10 +5237,10 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_source_replacement_recommendations
-             SET active = 0,
+             SET active = FALSE,
                  applied_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE recommendation_id = ?",
+             WHERE recommendation_id = $1",
         )
         .bind(recommendation_id.to_string())
         .execute(self.pool)
@@ -5711,6 +5922,138 @@ fn map_provider(row: &AnyRow) -> Result<Provider> {
     })
 }
 
+fn map_ready_live_catalog_provider(row: &AnyRow) -> Result<ReadyLiveCatalogProvider> {
+    let provider = map_provider(row)?;
+    let extension_id: String = row.try_get("extension_id")?;
+    let extension_version: String = row.try_get("extension_version")?;
+    let trust_raw: String = row.try_get("trust_level")?;
+    let manifest_raw: String = row.try_get("manifest_json")?;
+    let manifest_value = parse_json(&manifest_raw, "extensions.manifest_json")?;
+    let manifest: ExtensionManifest = serde_json::from_value(manifest_value)
+        .context("deserializing installed live provider manifest")?;
+    manifest
+        .validate()
+        .context("validating installed live provider manifest")?;
+    if manifest.id != extension_id {
+        anyhow::bail!(
+            "installed manifest id '{}' does not match extension id '{}'",
+            manifest.id,
+            extension_id
+        );
+    }
+
+    let provide = manifest
+        .provides
+        .iter()
+        .find(|provide| {
+            provide.capability == LIVE_CATALOG_PROVIDER_CAPABILITY
+                && provide.slot == provider.slot_id
+                && provide.implementation == provider.implementation
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider row has no matching live.catalog_provider declaration in installed manifest"
+            )
+        })?;
+    if provide.contract_version != Some(LIVE_CATALOG_PROVIDER_CONTRACT_VERSION) {
+        anyhow::bail!(
+            "unsupported live catalog provider contract version {:?}",
+            provide.contract_version
+        );
+    }
+    let declared_scope = provide
+        .scope
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("live catalog provider scope is absent"))?;
+    let persisted_scope = provider
+        .scope_json
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("live catalog provider persisted scope is absent"))?;
+    let expected_scope = serde_json::to_value(&declared_scope)
+        .context("serializing declared live provider scope")?;
+    if persisted_scope != &expected_scope {
+        anyhow::bail!("persisted live provider scope does not match installed manifest");
+    }
+    validate_live_runtime_endpoint(provider.endpoint_json.as_ref())?;
+    let declared_endpoint = provide
+        .endpoint
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("live catalog provider endpoint is absent"))?;
+    let healthcheck = provide
+        .healthcheck
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("live catalog provider healthcheck is absent"))?;
+
+    Ok(ReadyLiveCatalogProvider {
+        provider,
+        extension_id,
+        extension_version,
+        extension_installed_at: parse_datetime(
+            &row.try_get::<String, _>("extension_installed_at")?,
+            "extensions.installed_at",
+        )?,
+        instance_updated_at: parse_datetime(
+            &row.try_get::<String, _>("instance_updated_at")?,
+            "extension_instances.updated_at",
+        )?,
+        readiness_updated_at: parse_datetime(
+            &row.try_get::<String, _>("readiness_updated_at")?,
+            "provider_readiness.updated_at",
+        )?,
+        trust_level: parse_enum(&trust_raw, "extensions.trust_level")?,
+        contract_version: LIVE_CATALOG_PROVIDER_CONTRACT_VERSION,
+        permissions: manifest.permissions.clone(),
+        instance_config: parse_json_opt(
+            row_get_opt_string(row, "instance_config_json")?,
+            "extension_instances.config_json",
+        )?,
+        declared_scope,
+        declared_endpoint,
+        healthcheck,
+    })
+}
+
+fn validate_live_runtime_endpoint(endpoint: Option<&serde_json::Value>) -> Result<()> {
+    let endpoint = endpoint
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("live catalog provider runtime endpoint is absent"))?;
+    let scheme = endpoint
+        .get("scheme")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let host = endpoint
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let port = endpoint
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let base_path = endpoint
+        .get("base_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(scheme, "http" | "https")
+        || host.trim().is_empty()
+        || !(1..=u16::MAX as u64).contains(&port)
+        || !base_path.starts_with('/')
+    {
+        anyhow::bail!("live catalog provider runtime endpoint is invalid");
+    }
+    Ok(())
+}
+
+fn map_provider_revocation_target(row: &AnyRow) -> Result<ProviderRevocationTarget> {
+    let provider_id_raw: String = row.try_get("provider_id")?;
+    let instance_id_raw: String = row.try_get("instance_id")?;
+    Ok(ProviderRevocationTarget {
+        provider_id: parse_uuid(&provider_id_raw, "providers.provider_id")?,
+        instance_id: parse_uuid(&instance_id_raw, "providers.instance_id")?,
+        extension_id: row.try_get("extension_id")?,
+        capability: row.try_get("capability")?,
+    })
+}
+
 fn map_provider_detail(row: &AnyRow) -> Result<ProviderDetails> {
     let provider = map_provider(row)?;
     let extension_id: String = row.try_get("extension_id")?;
@@ -6377,6 +6720,224 @@ mod tests {
         Ok((database, instance_id))
     }
 
+    fn live_extension_manifest() -> serde_json::Value {
+        json!({
+            "id": "example.live",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Example Live",
+            "permissions": [
+                "live.catalog.read",
+                "live.stream.resolve",
+                "live.artwork.fetch"
+            ],
+            "provides": [{
+                "capability": "live.catalog_provider",
+                "slot": "default",
+                "cardinality": "many",
+                "implementation": "example_live",
+                "contract_version": 1,
+                "scope": {
+                    "actions": ["catalog", "meta", "resolve", "refresh"],
+                    "live_item_types": ["event", "channel"],
+                    "stream_protocols": ["hls", "dash"],
+                    "requires_account": false,
+                    "required_fields": []
+                },
+                "endpoint": {
+                    "type": "http",
+                    "scheme": "http",
+                    "port": 8110,
+                    "base_path": "/"
+                },
+                "healthcheck": {"type": "http", "path": "/health"}
+            }],
+            "runtime": {
+                "type": "container",
+                "image": "example/live:1.0.0",
+                "security": {
+                    "run_as_non_root": true,
+                    "read_only_rootfs": true,
+                    "no_new_privileges": true,
+                    "drop_capabilities": ["ALL"],
+                    "prohibit_docker_socket": true,
+                    "prohibit_host_media_mounts": true
+                }
+            },
+            "networking": {
+                "service_port": {"scheme": "http", "container_port": 8110}
+            }
+        })
+    }
+
+    async fn seed_ready_live_provider(store: &ExtensionStore<'_>) -> Result<(Uuid, Uuid)> {
+        let manifest_json = live_extension_manifest();
+        let manifest: ExtensionManifest = serde_json::from_value(manifest_json.clone())?;
+        manifest.validate()?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: "example.live".to_string(),
+                name: "Example Live".to_string(),
+                version: "1.0.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: Some("Example".to_string()),
+                signing_key_id: Some("example-key".to_string()),
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json,
+                package_hash: Some("fixture-hash".to_string()),
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "example.live".to_string(),
+                instance_name: "default".to_string(),
+                config_json: Some(json!({"region": "us"})),
+                enabled: true,
+            })
+            .await?;
+        let provider_id = Uuid::new_v4();
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: LIVE_CATALOG_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::Many,
+                implementation: Some("example_live".to_string()),
+                scope_json: Some(serde_json::to_value(
+                    manifest.provides[0].scope.as_ref().unwrap(),
+                )?),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "example-live-default",
+                    "port": 8110,
+                    "base_path": "/",
+                    "network": "elixir_net"
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        store
+            .upsert_provider_readiness(
+                provider_id,
+                ProviderReadinessPhase::DriverReady,
+                Some("live_provider_v1"),
+            )
+            .await?;
+        Ok((instance_id, provider_id))
+    }
+
+    #[tokio::test]
+    async fn f10_live_provider_directory_requires_every_runtime_readiness_predicate() -> Result<()>
+    {
+        let (database, _) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (instance_id, provider_id) = seed_ready_live_provider(&store).await?;
+
+        let ready = store.list_ready_live_catalog_providers().await?;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].provider.provider_id, provider_id);
+        assert_eq!(ready[0].contract_version, 1);
+        assert_eq!(ready[0].instance_config, Some(json!({"region": "us"})));
+
+        store
+            .update_provider_health(provider_id, ProviderHealthState::Degraded)
+            .await?;
+        assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+        store
+            .update_provider_health(provider_id, ProviderHealthState::Healthy)
+            .await?;
+
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::BootstrapReady, None)
+            .await?;
+        assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
+            .await?;
+
+        store.set_instance_enabled(instance_id, false).await?;
+        assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+        store.set_instance_enabled(instance_id, true).await?;
+        assert_eq!(store.list_ready_live_catalog_providers().await?.len(), 1);
+
+        store.set_extension_enabled("example.live", false).await?;
+        assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+        store.set_extension_enabled("example.live", true).await?;
+        assert_eq!(store.list_ready_live_catalog_providers().await?.len(), 1);
+
+        let manifest: ExtensionManifest = serde_json::from_value(live_extension_manifest())?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: LIVE_CATALOG_PROVIDER_CAPABILITY.to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::Many,
+                implementation: Some("example_live".to_string()),
+                scope_json: Some(json!({"actions": ["catalog"]})),
+                endpoint_json: Some(json!({
+                    "scheme": "http",
+                    "host": "example-live-default",
+                    "port": 8110,
+                    "base_path": "/"
+                })),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        assert!(manifest.validate().is_ok());
+        assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f10_provider_disable_and_delete_expose_generic_revocation_targets() -> Result<()> {
+        let (database, _) = test_store().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let (instance_id, provider_id) = seed_ready_live_provider(&store).await?;
+
+        let instance_change = store.set_instance_enabled(instance_id, false).await?;
+        assert_eq!(instance_change.unavailable_providers.len(), 1);
+        assert_eq!(
+            instance_change.unavailable_providers[0].provider_id,
+            provider_id
+        );
+        assert!(
+            store
+                .set_instance_enabled(instance_id, false)
+                .await?
+                .unavailable_providers
+                .is_empty()
+        );
+
+        store.set_instance_enabled(instance_id, true).await?;
+        let extension_change = store.set_extension_enabled("example.live", false).await?;
+        assert_eq!(extension_change.unavailable_providers.len(), 1);
+        assert_eq!(
+            extension_change.unavailable_providers[0].capability,
+            LIVE_CATALOG_PROVIDER_CAPABILITY
+        );
+
+        store.set_extension_enabled("example.live", true).await?;
+        let delete_change = store.delete_provider(provider_id).await?;
+        assert_eq!(delete_change.unavailable_providers.len(), 1);
+        assert_eq!(
+            delete_change.unavailable_providers[0].instance_id,
+            instance_id
+        );
+        assert!(
+            store
+                .delete_provider(provider_id)
+                .await?
+                .unavailable_providers
+                .is_empty()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cs1_source_registry_model_round_trips_update_health_and_replacement_state()
     -> Result<()> {
@@ -6830,7 +7391,7 @@ mod tests {
             .await?;
 
         let count = sqlx::query_scalar::<_, i64>(
-            "SELECT failure_count FROM extension_source_module_quarantines WHERE source_module_id = ?",
+            "SELECT failure_count FROM extension_source_module_quarantines WHERE source_module_id = $1",
         )
         .bind(source_module_id.to_string())
         .fetch_one(&database.pool)
@@ -7042,7 +7603,7 @@ mod tests {
         sqlx::query("PRAGMA foreign_keys = OFF;")
             .execute(&database.pool)
             .await?;
-        sqlx::query("DELETE FROM extension_source_registries WHERE registry_id = ?")
+        sqlx::query("DELETE FROM extension_source_registries WHERE registry_id = $1")
             .bind(registry_id.to_string())
             .execute(&database.pool)
             .await?;

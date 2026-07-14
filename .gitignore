@@ -2,3 +2,4 @@ check_output.txt
 data/
 config/local.toml
 target/
+/file:*

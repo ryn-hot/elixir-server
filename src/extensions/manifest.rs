@@ -10,6 +10,13 @@ use crate::extensions::managed_paths::{
     QBITTORRENT_INCOMPLETE_DIR,
 };
 
+pub const LIVE_CATALOG_PROVIDER_CAPABILITY: &str = "live.catalog_provider";
+pub const LIVE_CATALOG_PROVIDER_CONTRACT_VERSION: u32 = 1;
+pub const LIVE_CATALOG_READ_PERMISSION: &str = "live.catalog.read";
+pub const LIVE_STREAM_RESOLVE_PERMISSION: &str = "live.stream.resolve";
+pub const LIVE_ARTWORK_FETCH_PERMISSION: &str = "live.artwork.fetch";
+pub const LIVE_NETWORK_PRIVATE_PERMISSION: &str = "live.network.private";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub id: String,
@@ -90,7 +97,10 @@ impl ExtensionManifest {
             validate_scope_actions_for_capability(&provide.capability, provide.scope.as_ref())?;
             validate_segment_provider_contract(self, provide)?;
             validate_debrid_provider_contract(self, provide)?;
+            validate_live_catalog_provider_contract(self, provide)?;
         }
+
+        validate_live_provider_identity_isolation(&self.provides)?;
 
         self.requires.validate()?;
 
@@ -329,6 +339,8 @@ pub struct ManifestProvide {
     pub cardinality: Option<SlotCardinality>,
     #[serde(default)]
     pub implementation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
     #[serde(default)]
     pub scope: Option<ManifestProviderScope>,
     #[serde(default)]
@@ -532,6 +544,12 @@ pub struct ManifestProviderScope {
     pub segment_types: Vec<String>,
     #[serde(default)]
     pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_item_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stream_protocols: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub protocol_feature_requirements: HashMap<String, String>,
     #[serde(default)]
     pub requires_account: bool,
     #[serde(default)]
@@ -566,10 +584,17 @@ impl ManifestProviderScope {
             ensure_non_empty(action, "provides.scope.actions")?;
             if !matches!(
                 action.trim().to_ascii_lowercase().as_str(),
-                "search" | "add" | "monitor" | "resolve" | "lookup"
+                "search"
+                    | "add"
+                    | "monitor"
+                    | "resolve"
+                    | "lookup"
+                    | "catalog"
+                    | "meta"
+                    | "refresh"
             ) {
                 bail!(
-                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor|resolve|lookup",
+                    "unsupported provides.scope.actions value '{}'; expected search|add|monitor|resolve|lookup|catalog|meta|refresh",
                     action
                 );
             }
@@ -2255,6 +2280,16 @@ fn validate_scope_actions_for_capability(
             .collect();
     }
     let capability = capability.trim().to_ascii_lowercase();
+    if capability != LIVE_CATALOG_PROVIDER_CAPABILITY
+        && actions
+            .iter()
+            .any(|value| matches!(value.as_str(), "catalog" | "meta" | "refresh"))
+    {
+        bail!(
+            "live catalog actions are only valid for capability '{}'",
+            LIVE_CATALOG_PROVIDER_CAPABILITY
+        );
+    }
     if capability.starts_with("media.manager.") && !actions.iter().any(|value| value == "add") {
         bail!(
             "manager capability '{}' requires provides.scope.actions to include 'add'",
@@ -2417,6 +2452,313 @@ fn validate_debrid_provider_contract(
     }
     if provide.healthcheck.is_none() {
         bail!("debrid.resolver providers must declare a healthcheck for readiness");
+    }
+    Ok(())
+}
+
+fn validate_live_catalog_provider_contract(
+    manifest: &ExtensionManifest,
+    provide: &ManifestProvide,
+) -> Result<()> {
+    let is_live = provide
+        .capability
+        .trim()
+        .eq_ignore_ascii_case(LIVE_CATALOG_PROVIDER_CAPABILITY);
+    if !is_live {
+        if let Some(scope) = provide.scope.as_ref()
+            && (!scope.live_item_types.is_empty()
+                || !scope.stream_protocols.is_empty()
+                || !scope.protocol_feature_requirements.is_empty())
+        {
+            bail!(
+                "live provider scope fields are only valid for capability '{}'",
+                LIVE_CATALOG_PROVIDER_CAPABILITY
+            );
+        }
+        return Ok(());
+    }
+    if provide.capability != LIVE_CATALOG_PROVIDER_CAPABILITY {
+        bail!(
+            "live catalog capability must be declared exactly as '{}'",
+            LIVE_CATALOG_PROVIDER_CAPABILITY
+        );
+    }
+
+    if manifest.kind != ExtensionKind::Module {
+        bail!("live.catalog_provider must be provided by a module extension");
+    }
+    if provide.slot.chars().count() > 128 {
+        bail!("live.catalog_provider provides.slot must be at most 128 characters");
+    }
+    if provide.cardinality != Some(SlotCardinality::Many) {
+        bail!("live.catalog_provider providers must declare cardinality 'many'");
+    }
+    if provide.contract_version != Some(LIVE_CATALOG_PROVIDER_CONTRACT_VERSION) {
+        bail!(
+            "live.catalog_provider providers must declare contract_version {}",
+            LIVE_CATALOG_PROVIDER_CONTRACT_VERSION
+        );
+    }
+
+    let implementation = provide
+        .implementation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider requires provides.implementation"))?;
+    if !valid_live_implementation_id(implementation) {
+        bail!(
+            "live.catalog_provider provides.implementation must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$"
+        );
+    }
+
+    let scope = provide
+        .scope
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider requires provides.scope"))?;
+    if !scope.media_types.is_empty() || !scope.segment_types.is_empty() {
+        bail!("live.catalog_provider scope must not declare media or segment types");
+    }
+    validate_exact_unique_values(
+        &scope.actions,
+        "provides.scope.actions",
+        &["catalog", "meta", "resolve", "refresh"],
+        3,
+        4,
+    )?;
+    for required in ["catalog", "meta", "resolve"] {
+        if !scope.actions.iter().any(|value| value == required) {
+            bail!(
+                "live.catalog_provider provides.scope.actions must include '{}'",
+                required
+            );
+        }
+    }
+    validate_exact_unique_values(
+        &scope.live_item_types,
+        "provides.scope.live_item_types",
+        &["event", "channel"],
+        1,
+        2,
+    )?;
+    validate_exact_unique_values(
+        &scope.stream_protocols,
+        "provides.scope.stream_protocols",
+        &["hls", "dash", "http_progressive", "mpeg_ts", "rtmp", "srt"],
+        1,
+        6,
+    )?;
+    validate_live_protocol_feature_requirements(scope)?;
+
+    if scope.required_fields.len() > 32 {
+        bail!("live.catalog_provider provides.scope.required_fields allows at most 32 values");
+    }
+    let mut required_fields = std::collections::HashSet::new();
+    for field in &scope.required_fields {
+        if field.trim() != field || field.is_empty() || field.chars().count() > 128 {
+            bail!(
+                "live.catalog_provider required field names must be 1-128 non-whitespace-bounded characters"
+            );
+        }
+        if !required_fields.insert(field.as_str()) {
+            bail!("live.catalog_provider required field names must be unique");
+        }
+    }
+    if !scope.requires_account && !scope.required_fields.is_empty() {
+        bail!("live.catalog_provider required_fields requires requires_account=true");
+    }
+    if scope.download_broker.is_some() || scope.broker.is_some() {
+        bail!("live.catalog_provider must not declare download broker scope");
+    }
+    if !manifest.requires.downloads.is_empty() {
+        bail!("live.catalog_provider modules must not declare download requirements");
+    }
+
+    validate_live_endpoint(provide.endpoint.as_ref())?;
+    validate_live_healthcheck(provide.healthcheck.as_ref())?;
+    if let Some(networking) = manifest.networking.as_ref() {
+        let endpoint = provide.endpoint.as_ref().expect("validated live endpoint");
+        let endpoint_scheme = endpoint.scheme.as_deref().expect("validated live scheme");
+        let endpoint_port = endpoint.port.expect("validated live port");
+        if networking.service_port.container_port == 0 {
+            bail!("live.catalog_provider networking.service_port.container_port must be non-zero");
+        }
+        if networking.service_port.scheme != endpoint_scheme
+            || networking.service_port.container_port != endpoint_port
+        {
+            bail!(
+                "live.catalog_provider endpoint and networking.service_port must use the same scheme and port"
+            );
+        }
+    }
+
+    let runtime = manifest
+        .runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider requires a module runtime"))?;
+    if runtime.r#type != "container" {
+        bail!("live.catalog_provider v1 requires a container runtime");
+    }
+    let security = &runtime.security;
+    if !security.run_as_non_root
+        || !security.read_only_rootfs
+        || !security.no_new_privileges
+        || !security
+            .drop_capabilities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("ALL"))
+        || !security.prohibit_docker_socket
+        || !security.prohibit_host_media_mounts
+    {
+        bail!(
+            "live.catalog_provider requires non-root, read-only, no-new-privileges, drop-ALL, no-Docker-socket, and no-host-media runtime security"
+        );
+    }
+    if runtime
+        .volumes
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains("docker.sock"))
+    {
+        bail!("live.catalog_provider runtime must not mount the Docker socket");
+    }
+
+    let permissions = manifest
+        .permissions
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for required in [
+        LIVE_CATALOG_READ_PERMISSION,
+        LIVE_STREAM_RESOLVE_PERMISSION,
+        LIVE_ARTWORK_FETCH_PERMISSION,
+    ] {
+        if !permissions.contains(required) {
+            bail!("live.catalog_provider requires manifest permission '{required}'");
+        }
+    }
+
+    Ok(())
+}
+
+fn valid_live_implementation_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_exact_unique_values(
+    values: &[String],
+    field: &str,
+    allowed: &[&str],
+    minimum: usize,
+    maximum: usize,
+) -> Result<()> {
+    if values.len() < minimum || values.len() > maximum {
+        bail!("{field} must contain between {minimum} and {maximum} values");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        if !allowed.contains(&value.as_str()) {
+            bail!("unsupported {field} value '{value}'");
+        }
+        if !seen.insert(value.as_str()) {
+            bail!("{field} values must be unique");
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_protocol_feature_requirements(scope: &ManifestProviderScope) -> Result<()> {
+    for (protocol, requirement) in &scope.protocol_feature_requirements {
+        let expected = match protocol.as_str() {
+            "rtmp" => "live.rtmp_remux_enabled",
+            "srt" => "live.srt_remux_enabled",
+            _ => bail!("unsupported provides.scope.protocol_feature_requirements key '{protocol}'"),
+        };
+        if requirement != expected {
+            bail!("provides.scope.protocol_feature_requirements.{protocol} must be '{expected}'");
+        }
+    }
+    for (protocol, requirement) in [
+        ("rtmp", "live.rtmp_remux_enabled"),
+        ("srt", "live.srt_remux_enabled"),
+    ] {
+        if scope.stream_protocols.iter().any(|value| value == protocol)
+            && scope
+                .protocol_feature_requirements
+                .get(protocol)
+                .map(String::as_str)
+                != Some(requirement)
+        {
+            bail!("stream protocol '{protocol}' requires protocol feature '{requirement}'");
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_endpoint(endpoint: Option<&ManifestEndpoint>) -> Result<()> {
+    let endpoint = endpoint
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider requires provides.endpoint"))?;
+    if endpoint.r#type != "http" {
+        bail!("live.catalog_provider endpoint.type must be 'http'");
+    }
+    if !matches!(endpoint.scheme.as_deref(), Some("http" | "https")) {
+        bail!("live.catalog_provider endpoint.scheme must be 'http' or 'https'");
+    }
+    if endpoint.port == Some(0) || endpoint.port.is_none() {
+        bail!("live.catalog_provider endpoint.port must be between 1 and 65535");
+    }
+    let base_path = endpoint
+        .base_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider endpoint.base_path is required"))?;
+    if !base_path.starts_with('/') || base_path.chars().count() > 256 {
+        bail!(
+            "live.catalog_provider endpoint.base_path must start with '/' and be at most 256 characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_live_healthcheck(healthcheck: Option<&ManifestHealthcheck>) -> Result<()> {
+    let healthcheck = healthcheck
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider requires provides.healthcheck"))?;
+    if healthcheck.r#type != "http" {
+        bail!("live.catalog_provider healthcheck.type must be 'http'");
+    }
+    let path = healthcheck
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live.catalog_provider healthcheck.path is required"))?;
+    if !path.starts_with('/') || path.chars().count() > 256 {
+        bail!(
+            "live.catalog_provider healthcheck.path must start with '/' and be at most 256 characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_live_provider_identity_isolation(provides: &[ManifestProvide]) -> Result<()> {
+    for live in provides.iter().filter(|provide| {
+        provide
+            .capability
+            .trim()
+            .eq_ignore_ascii_case(LIVE_CATALOG_PROVIDER_CAPABILITY)
+    }) {
+        let live_implementation = live.implementation.as_deref().unwrap_or_default();
+        if provides.iter().any(|provide| {
+            provide
+                .capability
+                .trim()
+                .eq_ignore_ascii_case("acquisition.stream_candidate_provider")
+                && provide.slot == live.slot
+                && provide.implementation.as_deref() == Some(live_implementation)
+        }) {
+            bail!(
+                "a live.catalog_provider identity must not also provide acquisition.stream_candidate_provider"
+            );
+        }
     }
     Ok(())
 }
@@ -3145,6 +3487,169 @@ runtime:
 "#;
         let err = parse_manifest_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("runtime.security.seccomp_profile"));
+    }
+
+    fn valid_live_manifest_json() -> Value {
+        json!({
+            "id": "example.live",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Example Live",
+            "permissions": [
+                LIVE_CATALOG_READ_PERMISSION,
+                LIVE_STREAM_RESOLVE_PERMISSION,
+                LIVE_ARTWORK_FETCH_PERMISSION
+            ],
+            "provides": [{
+                "capability": LIVE_CATALOG_PROVIDER_CAPABILITY,
+                "slot": "default",
+                "cardinality": "many",
+                "implementation": "example_live",
+                "contract_version": LIVE_CATALOG_PROVIDER_CONTRACT_VERSION,
+                "scope": {
+                    "actions": ["catalog", "meta", "resolve", "refresh"],
+                    "live_item_types": ["event", "channel"],
+                    "stream_protocols": ["hls", "dash", "http_progressive"],
+                    "requires_account": false,
+                    "required_fields": []
+                },
+                "endpoint": {
+                    "type": "http",
+                    "scheme": "http",
+                    "port": 8110,
+                    "base_path": "/"
+                },
+                "healthcheck": {"type": "http", "path": "/health"}
+            }],
+            "runtime": {
+                "type": "container",
+                "image": "example/live:1.0.0",
+                "security": {
+                    "run_as_non_root": true,
+                    "read_only_rootfs": true,
+                    "no_new_privileges": true,
+                    "drop_capabilities": ["ALL"],
+                    "prohibit_docker_socket": true,
+                    "prohibit_host_media_mounts": true
+                }
+            },
+            "networking": {
+                "service_port": {
+                    "scheme": "http",
+                    "container_port": 8110
+                }
+            }
+        })
+    }
+
+    fn validate_manifest_json(value: Value) -> Result<ExtensionManifest> {
+        let manifest: ExtensionManifest = serde_json::from_value(value)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    #[test]
+    fn f10_live_manifest_v1_is_valid_and_legacy_defaults_are_additive() -> Result<()> {
+        let manifest = validate_manifest_json(valid_live_manifest_json())?;
+        let provide = &manifest.provides[0];
+        assert_eq!(provide.contract_version, Some(1));
+        assert_eq!(
+            provide.scope.as_ref().unwrap().live_item_types,
+            ["event", "channel"]
+        );
+
+        let legacy = parse_manifest_yaml(
+            r#"
+id: example.search
+version: 1.0.0
+kind: module
+name: Legacy Search
+provides:
+  - capability: media.search.movies
+    slot: default
+    cardinality: many
+    implementation: legacy_search
+    scope:
+      actions: [search]
+      media_types: [movies]
+    endpoint:
+      type: http
+      scheme: http
+      port: 8080
+runtime:
+  type: container
+  image: example/search:1
+"#,
+        )?
+        .manifest;
+        assert_eq!(legacy.provides[0].contract_version, None);
+        let legacy_scope = legacy.provides[0].scope.as_ref().unwrap();
+        assert!(legacy_scope.live_item_types.is_empty());
+        assert!(legacy_scope.stream_protocols.is_empty());
+        assert!(legacy_scope.protocol_feature_requirements.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn f10_live_manifest_v1_rejects_contract_and_security_violations() {
+        let mut cases = Vec::new();
+
+        let mut wrong_version = valid_live_manifest_json();
+        wrong_version["provides"][0]["contract_version"] = json!(2);
+        cases.push(wrong_version);
+
+        let mut missing_action = valid_live_manifest_json();
+        missing_action["provides"][0]["scope"]["actions"] = json!(["catalog", "meta", "refresh"]);
+        cases.push(missing_action);
+
+        let mut duplicate_item_type = valid_live_manifest_json();
+        duplicate_item_type["provides"][0]["scope"]["live_item_types"] = json!(["event", "event"]);
+        cases.push(duplicate_item_type);
+
+        let mut unguarded_rtmp = valid_live_manifest_json();
+        unguarded_rtmp["provides"][0]["scope"]["stream_protocols"] = json!(["rtmp"]);
+        cases.push(unguarded_rtmp);
+
+        let mut download_coupling = valid_live_manifest_json();
+        download_coupling["requires"] = json!({
+            "downloads": [{"kind": "torrent"}]
+        });
+        cases.push(download_coupling);
+
+        let mut missing_permission = valid_live_manifest_json();
+        missing_permission["permissions"] =
+            json!([LIVE_CATALOG_READ_PERMISSION, LIVE_STREAM_RESOLVE_PERMISSION]);
+        cases.push(missing_permission);
+
+        let mut weak_runtime = valid_live_manifest_json();
+        weak_runtime["runtime"]["security"]["read_only_rootfs"] = json!(false);
+        cases.push(weak_runtime);
+
+        for manifest in cases {
+            assert!(validate_manifest_json(manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn f10_live_manifest_v1_rejects_acquisition_provider_identity_reuse() {
+        let mut manifest = valid_live_manifest_json();
+        manifest["provides"].as_array_mut().unwrap().push(json!({
+            "capability": "acquisition.stream_candidate_provider",
+            "slot": "default",
+            "cardinality": "many",
+            "implementation": "example_live",
+            "scope": {
+                "actions": ["search"],
+                "media_types": ["movies", "tv", "anime"]
+            },
+            "endpoint": {
+                "type": "http",
+                "scheme": "http",
+                "port": 8110,
+                "base_path": "/"
+            }
+        }));
+        assert!(validate_manifest_json(manifest).is_err());
     }
 
     #[test]

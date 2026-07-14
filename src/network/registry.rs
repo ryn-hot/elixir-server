@@ -11,7 +11,7 @@ pub async fn ensure_server_instance(
     user_id: Uuid,
 ) -> Result<Uuid> {
     if let Some(existing) = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM server_instances WHERE user_id = ? LIMIT 1",
+        "SELECT id FROM server_instances WHERE user_id = $1 LIMIT 1",
     )
     .bind(user_id.to_string())
     .fetch_optional(pool)
@@ -31,7 +31,7 @@ pub async fn ensure_server_instance(
     let lan_addresses =
         serde_json::to_string(&vec![lan_address]).unwrap_or_else(|_| "[]".to_string());
 
-    sqlx::query::<sqlx::Any>("INSERT INTO server_instances (id, user_id, device_name, lan_addresses, last_seen_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)")
+    sqlx::query::<sqlx::Any>("INSERT INTO server_instances (id, user_id, device_name, lan_addresses, last_seen_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)")
         .bind(server_id.to_string())
         .bind(user_id.to_string())
         .bind(device_name)

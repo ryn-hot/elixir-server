@@ -777,11 +777,11 @@ pub async fn pause_anidb_channel_for_ban_until(
     ensure_anidb_channel_state(pool, channel).await?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_anidb_channel_state
-         SET banned_until = ?,
-             ban_reason = ?,
+         SET banned_until = $1,
+             ban_reason = $2,
              backoff_until = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE channel = ?",
+         WHERE channel = $3",
     )
     .bind(db_datetime_string(banned_until))
     .bind(reason.as_ref().trim())
@@ -803,11 +803,11 @@ pub async fn record_anidb_channel_transport_failure(
     let backoff_until = now + transport_failure_backoff(failures);
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_anidb_channel_state
-         SET backoff_until = ?,
-             last_failure_reason = ?,
-             consecutive_failures = ?,
+         SET backoff_until = $1,
+             last_failure_reason = $2,
+             consecutive_failures = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE channel = ?",
+         WHERE channel = $4",
     )
     .bind(db_datetime_string(backoff_until))
     .bind(reason.as_ref().trim())
@@ -832,7 +832,7 @@ pub async fn clear_anidb_channel_pause(
              last_failure_reason = NULL,
              consecutive_failures = 0,
              updated_at = CURRENT_TIMESTAMP
-         WHERE channel = ?",
+         WHERE channel = $1",
     )
     .bind(channel.as_str())
     .execute(pool)
@@ -1227,7 +1227,7 @@ async fn ensure_anidb_channel_state(
 ) -> Result<AniDbChannelState> {
     sqlx::query::<sqlx::Any>(
         "INSERT INTO acquisition_anidb_channel_state (channel)
-         VALUES (?)
+         VALUES ($1)
          ON CONFLICT(channel) DO NOTHING",
     )
     .bind(channel.as_str())
@@ -1246,7 +1246,7 @@ async fn ensure_anidb_channel_state(
                 CAST(last_request_at AS TEXT) AS last_request_at,
                 request_count
          FROM acquisition_anidb_channel_state
-         WHERE channel = ?
+         WHERE channel = $1
          LIMIT 1",
     )
     .bind(channel.as_str())
@@ -1282,14 +1282,14 @@ async fn update_anidb_channel_request(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_anidb_channel_state
-         SET active_since = ?,
-             last_request_at = ?,
-             request_count = ?,
+         SET active_since = $1,
+             last_request_at = $2,
+             request_count = $3,
              backoff_until = NULL,
              last_failure_reason = NULL,
              consecutive_failures = 0,
              updated_at = CURRENT_TIMESTAMP
-         WHERE channel = ?",
+         WHERE channel = $4",
     )
     .bind(db_datetime_string(active_since))
     .bind(db_datetime_string(request_at))

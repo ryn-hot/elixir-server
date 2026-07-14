@@ -2023,9 +2023,9 @@ async fn stale_release_retry_target_ids(
     let rows = sqlx::query(
         "SELECT CAST(target_id AS TEXT) AS target_id
          FROM acquisition_targets
-         WHERE subscription_id = ?
-           AND selected_route_logical_id = ?
-           AND download_id = ?
+         WHERE subscription_id = $1
+           AND selected_route_logical_id = $2
+           AND download_id = $3
            AND state = 'submitted'",
     )
     .bind(subscription_id.to_string())
@@ -2136,9 +2136,9 @@ async fn update_release_file_provider_metadata(
     let metadata_json = serde_json::to_string(&metadata)?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_files
-         SET provider_metadata_json = ?,
+         SET provider_metadata_json = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_file_id = ?",
+         WHERE release_file_id = $2",
     )
     .bind(metadata_json)
     .bind(release_file_id.to_string())
@@ -3090,15 +3090,15 @@ async fn update_qbittorrent_release_refinement(
     let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET release_kind = ?,
-             resolver_kind = ?,
-             resolver_version = ?,
-             confidence = ?,
-             state = ?,
-             state_reason = ?,
-             coverage_plan_json = ?,
+         SET release_kind = $1,
+             resolver_kind = $2,
+             resolver_version = $3,
+             confidence = $4,
+             state = $5,
+             state_reason = $6,
+             coverage_plan_json = $7,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $8",
     )
     .bind(refinement.release_kind.as_str())
     .bind(refinement.resolver_kind.as_str())
@@ -3125,12 +3125,12 @@ async fn update_qbittorrent_release_job_state(
     };
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
-         SET state = ?,
-             state_reason = ?,
-             active = ?,
+         SET state = $1,
+             state_reason = $2,
+             active = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND download_id = ?",
+         WHERE release_id = $4
+           AND download_id = $5",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -3152,10 +3152,10 @@ async fn mark_qbittorrent_release_resumed(
 ) -> anyhow::Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $3",
     )
     .bind(AcquisitionReleaseState::Downloading.as_str())
     .bind("qBittorrent accepted deterministic file priorities and resumed.")
@@ -3273,11 +3273,11 @@ async fn update_qbittorrent_release_state_only(
     let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
-             coverage_plan_json = ?,
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $4",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -3298,11 +3298,11 @@ async fn update_http_stream_release_state_only(
     let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
-             coverage_plan_json = ?,
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $4",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -3320,10 +3320,10 @@ async fn update_release_file_selected(
 ) -> anyhow::Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_files
-         SET selected = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE release_file_id = ?",
+         SET selected = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE release_file_id = $2",
     )
-    .bind(selected)
+    .bind(if selected { 1_i64 } else { 0_i64 })
     .bind(release_file_id.to_string())
     .execute(pool)
     .await?;

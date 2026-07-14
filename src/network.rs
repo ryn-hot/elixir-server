@@ -1,3 +1,4 @@
+pub mod gateway;
 pub mod protection;
 pub mod registry;
 pub mod vpn;

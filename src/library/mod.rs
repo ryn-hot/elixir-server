@@ -399,7 +399,7 @@ async fn load_local_series_catalog_identity(
         "SELECT title, year, library_type, external_imdb, external_tvdb_series, external_anilist,
                 CAST(metadata_json AS TEXT) AS metadata_json
          FROM series
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(media_item_id.to_string())
@@ -495,10 +495,10 @@ async fn load_local_acquisition_target_scaffold_rows(
          JOIN acquisition_subscriptions s ON s.subscription_id = t.subscription_id
          WHERE t.media_type IN ('series', 'anime')
            AND (
-                LOWER(s.title) = LOWER(?)
-                OR CAST(s.external_ids_json AS TEXT) LIKE ?
-                OR CAST(s.external_ids_json AS TEXT) LIKE ?
-                OR CAST(s.external_ids_json AS TEXT) LIKE ?
+                LOWER(s.title) = LOWER($1)
+                OR CAST(s.external_ids_json AS TEXT) LIKE $2
+                OR CAST(s.external_ids_json AS TEXT) LIKE $3
+                OR CAST(s.external_ids_json AS TEXT) LIKE $4
            )",
     )
     .bind(&series.title)
@@ -2022,7 +2022,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
                 for (season_number, season_id) in &season_ids {
                     if !season_anilist_seeds.contains_key(season_number) {
                         if let Some(raw) = sqlx::query_scalar::<sqlx::Any, String>(
-                            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = ? LIMIT 1",
+                            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = $1 LIMIT 1",
                         )
                         .bind(season_id.to_string())
                         .fetch_optional(pool)
@@ -2286,7 +2286,7 @@ pub async fn run_full_scan_with_metadata_and_linkers(
     for path in existing_paths {
         if !seen_paths.contains(&path) && media_file_path_is_missing(&path).await {
             sqlx::query::<sqlx::Any>(
-                "UPDATE media_files SET scan_state = 'missing' WHERE path = ?",
+                "UPDATE media_files SET scan_state = 'missing' WHERE path = $1",
             )
             .bind(path)
             .execute(pool)
@@ -2444,7 +2444,7 @@ async fn load_managed_identity_lock_for_files(
             "SELECT mf.media_item_id
              FROM media_files mf
              JOIN managed_library_provenance mlp ON mlp.media_item_id = mf.media_item_id
-             WHERE mf.path = ?
+             WHERE mf.path = $1
              LIMIT 1",
         )
         .bind(&file.descriptor.path)
@@ -2811,7 +2811,7 @@ async fn load_existing_classification_for_path(
     expected_type: MediaType,
 ) -> Result<Option<ExistingFileClassification>> {
     let media_file_id: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM media_files WHERE path = ? LIMIT 1",
+        "SELECT id FROM media_files WHERE path = $1 LIMIT 1",
     )
     .bind(path)
     .fetch_optional(pool)
@@ -2821,7 +2821,7 @@ async fn load_existing_classification_for_path(
     };
 
     let mut movie_id: Option<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT movie_id FROM movie_files WHERE media_file_id = ? LIMIT 1",
+        "SELECT movie_id FROM movie_files WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(&media_file_id)
     .fetch_optional(pool)
@@ -2830,14 +2830,14 @@ async fn load_existing_classification_for_path(
     let mut episode_row = sqlx::query(
         "SELECT e.series_id as series_id, e.season_id as season_id \
          FROM episode_files ef JOIN episodes e ON e.id = ef.episode_id \
-         WHERE ef.media_file_id = ? LIMIT 1",
+         WHERE ef.media_file_id = $1 LIMIT 1",
     )
     .bind(&media_file_id)
     .fetch_optional(pool)
     .await?;
 
     let has_review: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
-        "SELECT 1 FROM review_queue WHERE media_file_id = ? LIMIT 1",
+        "SELECT 1 FROM review_queue WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(&media_file_id)
     .fetch_optional(pool)
@@ -2869,7 +2869,7 @@ async fn load_existing_classification_for_path(
 
     if let Some(movie_id) = movie_id {
         if let Some(row) =
-            sqlx::query("SELECT external_imdb, external_tmdb FROM movies WHERE id = ? LIMIT 1")
+            sqlx::query("SELECT external_imdb, external_tmdb FROM movies WHERE id = $1 LIMIT 1")
                 .bind(&movie_id)
                 .fetch_optional(pool)
                 .await?
@@ -2885,7 +2885,7 @@ async fn load_existing_classification_for_path(
 
         if let Some(series_row) = sqlx::query(
             "SELECT external_imdb, external_tvdb_series, external_anilist \
-             FROM series WHERE id = ? LIMIT 1",
+             FROM series WHERE id = $1 LIMIT 1",
         )
         .bind(&series_id)
         .fetch_optional(pool)
@@ -2899,7 +2899,7 @@ async fn load_existing_classification_for_path(
         }
 
         if let Some(season_row) =
-            sqlx::query("SELECT external_anilist FROM seasons WHERE id = ? LIMIT 1")
+            sqlx::query("SELECT external_anilist FROM seasons WHERE id = $1 LIMIT 1")
                 .bind(&season_id)
                 .fetch_optional(pool)
                 .await?
@@ -4136,7 +4136,7 @@ async fn lookup_override_for_path(
     }
 
     let row = sqlx::query(
-        "SELECT imdb_id, anilist_id, tvdb_id FROM classifier_overrides WHERE library_type = ? AND normalized_key = ? LIMIT 1",
+        "SELECT imdb_id, anilist_id, tvdb_id FROM classifier_overrides WHERE library_type = $1 AND normalized_key = $2 LIMIT 1",
     )
     .bind(library_type)
     .bind(&key)
@@ -4184,7 +4184,7 @@ async fn persist_review_outcome(
 
 async fn mark_review_applied(pool: &AnyPool, media_file_id: Uuid) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE review_queue SET status = 'applied', updated_at = CURRENT_TIMESTAMP WHERE media_file_id = ?",
+        "UPDATE review_queue SET status = 'applied', updated_at = CURRENT_TIMESTAMP WHERE media_file_id = $1",
     )
     .bind(media_file_id.to_string())
     .execute(pool)
@@ -4198,7 +4198,7 @@ async fn upsert_review_queue_entry(
     outcome: &ReviewOutcome,
 ) -> Result<()> {
     let existing = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM review_queue WHERE media_file_id = ? LIMIT 1",
+        "SELECT id FROM review_queue WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id.to_string())
     .fetch_optional(pool)
@@ -4206,7 +4206,7 @@ async fn upsert_review_queue_entry(
 
     if let Some(id) = existing {
         sqlx::query::<sqlx::Any>(
-            "UPDATE review_queue SET status = ?, confidence = ?, hint_json = ?, candidates_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE review_queue SET status = $1, confidence = $2, hint_json = $3, candidates_json = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5",
         )
         .bind(outcome.status.as_str())
         .bind(outcome.confidence)
@@ -4217,7 +4217,7 @@ async fn upsert_review_queue_entry(
         .await?;
     } else {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO review_queue (id, media_file_id, status, confidence, hint_json, candidates_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO review_queue (id, media_file_id, status, confidence, hint_json, candidates_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(media_file_id.to_string())
@@ -4247,7 +4247,7 @@ async fn should_refresh_metadata(
             let mut existing = None;
             if let Some(imdb) = identity.external_ids.imdb.as_ref() {
                 existing = sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_imdb = ? LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_imdb = $1 LIMIT 1",
                 )
                 .bind(imdb)
                 .fetch_optional(pool)
@@ -4264,7 +4264,7 @@ async fn should_refresh_metadata(
                         "SELECT m.metadata_json, CAST(m.updated_at AS TEXT) as updated_at
                      FROM movies m
                      JOIN movie_external_ids mei ON mei.movie_id = m.id
-                     WHERE mei.provider = 'tvdb' AND mei.external_id = ?
+                     WHERE mei.provider = 'tvdb' AND mei.external_id = $1
                      LIMIT 1",
                     )
                     .bind(tvdb)
@@ -4275,7 +4275,7 @@ async fn should_refresh_metadata(
             if existing.is_none() {
                 if let Some(tmdb) = identity.external_ids.tmdb.as_ref() {
                     existing = sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_tmdb = ? LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE external_tmdb = $1 LIMIT 1",
                 )
                 .bind(tmdb)
                 .fetch_optional(pool)
@@ -4284,7 +4284,7 @@ async fn should_refresh_metadata(
             }
             if existing.is_none() {
                 existing = sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM movies WHERE title = $1 AND (year = $2 OR (year IS NULL AND $3 IS NULL)) LIMIT 1",
                 )
                 .bind(&identity.title)
                 .bind(identity.year)
@@ -4298,7 +4298,7 @@ async fn should_refresh_metadata(
             let library_type = identity.r#type.as_str();
             if let Some(anilist) = identity.external_ids.anilist.as_ref() {
                 sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_anilist = ? LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = $1 AND external_anilist = $2 LIMIT 1",
                 )
                 .bind(library_type)
                 .bind(anilist)
@@ -4311,7 +4311,7 @@ async fn should_refresh_metadata(
                 .or(identity.external_ids.tvdb.as_ref())
             {
                 sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_tvdb_series = ? LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = $1 AND external_tvdb_series = $2 LIMIT 1",
                 )
                 .bind(library_type)
                 .bind(tvdb)
@@ -4319,7 +4319,7 @@ async fn should_refresh_metadata(
                 .await?
             } else if let Some(imdb) = identity.external_ids.imdb.as_ref() {
                 sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND external_imdb = ? LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = $1 AND external_imdb = $2 LIMIT 1",
                 )
                 .bind(library_type)
                 .bind(imdb)
@@ -4327,7 +4327,7 @@ async fn should_refresh_metadata(
                 .await?
             } else {
                 sqlx::query::<sqlx::Any>(
-                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = ? AND title = ? AND (year IS ? OR year = ?) LIMIT 1",
+                    "SELECT metadata_json, CAST(updated_at AS TEXT) as updated_at FROM series WHERE library_type = $1 AND title = $2 AND (year = $3 OR (year IS NULL AND $4 IS NULL)) LIMIT 1",
                 )
                 .bind(library_type)
                 .bind(&identity.title)
@@ -4401,7 +4401,7 @@ async fn upsert_movie(
     let mut existing = None;
     if let Some(imdb) = merged_ids.imdb.as_ref() {
         existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM movies WHERE external_imdb = ? LIMIT 1",
+            "SELECT id FROM movies WHERE external_imdb = $1 LIMIT 1",
         )
         .bind(imdb)
         .fetch_optional(pool)
@@ -4410,7 +4410,7 @@ async fn upsert_movie(
     if existing.is_none() {
         if let Some(tvdb) = merged_ids.tvdb_movie.as_ref().or(merged_ids.tvdb.as_ref()) {
             existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT movie_id FROM movie_external_ids WHERE provider = 'tvdb' AND external_id = ? LIMIT 1",
+            "SELECT movie_id FROM movie_external_ids WHERE provider = 'tvdb' AND external_id = $1 LIMIT 1",
         )
         .bind(tvdb)
         .fetch_optional(pool)
@@ -4420,7 +4420,7 @@ async fn upsert_movie(
     if existing.is_none() {
         if let Some(tmdb) = merged_ids.tmdb.as_ref() {
             existing = sqlx::query_scalar::<sqlx::Any, String>(
-                "SELECT id FROM movies WHERE external_tmdb = ? LIMIT 1",
+                "SELECT id FROM movies WHERE external_tmdb = $1 LIMIT 1",
             )
             .bind(tmdb)
             .fetch_optional(pool)
@@ -4429,7 +4429,7 @@ async fn upsert_movie(
     }
     if existing.is_none() {
         existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM movies WHERE title = ? AND (year IS ? OR year = ?) LIMIT 1",
+            "SELECT id FROM movies WHERE title = $1 AND (year = $2 OR (year IS NULL AND $3 IS NULL)) LIMIT 1",
         )
         .bind(&identity.title)
         .bind(identity.year)
@@ -4452,7 +4452,7 @@ async fn upsert_movie(
             }
         }
         sqlx::query::<sqlx::Any>(
-            "UPDATE movies SET title = ?, year = ?, external_imdb = ?, external_tmdb = ?, metadata_json = COALESCE(?, metadata_json), runtime_seconds = COALESCE(?, runtime_seconds), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE movies SET title = $1, year = $2, external_imdb = $3, external_tmdb = $4, metadata_json = COALESCE($5, metadata_json), runtime_seconds = COALESCE($6, runtime_seconds), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
         )
         .bind(&title)
         .bind(year)
@@ -4468,7 +4468,7 @@ async fn upsert_movie(
 
     let id = Uuid::new_v4();
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO movies (id, title, year, external_imdb, external_tmdb, metadata_json, runtime_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO movies (id, title, year, external_imdb, external_tmdb, metadata_json, runtime_seconds, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(id.to_string())
     .bind(&identity.title)
@@ -4490,7 +4490,7 @@ async fn upsert_series(
 ) -> Result<Uuid> {
     let existing = if let Some(anilist) = merged_ids.anilist.as_ref() {
         let by_external = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT series_id FROM series_external_ids WHERE provider = 'anilist' AND external_id = ? LIMIT 1",
+            "SELECT series_id FROM series_external_ids WHERE provider = 'anilist' AND external_id = $1 LIMIT 1",
         )
         .bind(anilist)
         .fetch_optional(pool)
@@ -4499,7 +4499,7 @@ async fn upsert_series(
             by_external
         } else {
             sqlx::query_scalar::<sqlx::Any, String>(
-                "SELECT id FROM series WHERE external_anilist = ? LIMIT 1",
+                "SELECT id FROM series WHERE external_anilist = $1 LIMIT 1",
             )
             .bind(anilist)
             .fetch_optional(pool)
@@ -4507,21 +4507,21 @@ async fn upsert_series(
         }
     } else if let Some(imdb) = merged_ids.imdb.as_ref() {
         sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM series WHERE external_imdb = ? LIMIT 1",
+            "SELECT id FROM series WHERE external_imdb = $1 LIMIT 1",
         )
         .bind(imdb)
         .fetch_optional(pool)
         .await?
     } else if let Some(tvdb) = merged_ids.tvdb_series.as_ref().or(merged_ids.tvdb.as_ref()) {
         sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM series WHERE external_tvdb_series = ? LIMIT 1",
+            "SELECT id FROM series WHERE external_tvdb_series = $1 LIMIT 1",
         )
         .bind(tvdb)
         .fetch_optional(pool)
         .await?
     } else {
         // Fallback: match by title, allowing for loose type/year matching
-        let rows = sqlx::query("SELECT id, year FROM series WHERE title = ?")
+        let rows = sqlx::query("SELECT id, year FROM series WHERE title = $1")
             .bind(&identity.title)
             .fetch_all(pool)
             .await?;
@@ -4561,7 +4561,7 @@ async fn upsert_series(
             }
         }
         sqlx::query::<sqlx::Any>(
-            "UPDATE series SET title = ?, year = ?, library_type = ?, external_imdb = ?, external_tvdb_series = ?, external_anilist = ?, metadata_json = COALESCE(?, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE series SET title = $1, year = $2, library_type = $3, external_imdb = $4, external_tvdb_series = $5, external_anilist = $6, metadata_json = COALESCE($7, metadata_json), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
         )
         .bind(&title)
         .bind(year)
@@ -4578,7 +4578,7 @@ async fn upsert_series(
 
     let id = Uuid::new_v4();
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(id.to_string())
     .bind(&identity.title)
@@ -4595,7 +4595,7 @@ async fn upsert_series(
 
 async fn upsert_season(pool: &AnyPool, series_id: Uuid, season_number: i32) -> Result<Uuid> {
     if let Some(id_str) = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM seasons WHERE series_id = ? AND season_number = ? LIMIT 1",
+        "SELECT id FROM seasons WHERE series_id = $1 AND season_number = $2 LIMIT 1",
     )
     .bind(series_id.to_string())
     .bind(season_number)
@@ -4603,7 +4603,7 @@ async fn upsert_season(pool: &AnyPool, series_id: Uuid, season_number: i32) -> R
     .await?
     {
         let id = Uuid::parse_str(&id_str)?;
-        sqlx::query::<sqlx::Any>("UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query::<sqlx::Any>("UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE id = $1")
             .bind(id_str)
             .execute(pool)
             .await?;
@@ -4612,7 +4612,7 @@ async fn upsert_season(pool: &AnyPool, series_id: Uuid, season_number: i32) -> R
 
     let id = Uuid::new_v4();
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO seasons (id, series_id, season_number, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO seasons (id, series_id, season_number, created_at, updated_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(id.to_string())
     .bind(series_id.to_string())
@@ -4631,7 +4631,7 @@ async fn upsert_episode(
     absolute_episode_number: Option<i32>,
 ) -> Result<Uuid> {
     if let Some(id_str) = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM episodes WHERE series_id = ? AND season_number = ? AND episode_number = ? LIMIT 1",
+        "SELECT id FROM episodes WHERE series_id = $1 AND season_number = $2 AND episode_number = $3 LIMIT 1",
     )
     .bind(series_id.to_string())
     .bind(season_number)
@@ -4641,7 +4641,7 @@ async fn upsert_episode(
     {
         let id = Uuid::parse_str(&id_str)?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE episodes SET absolute_episode_number = COALESCE(?, absolute_episode_number), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE episodes SET absolute_episode_number = COALESCE($1, absolute_episode_number), updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(absolute_episode_number)
         .bind(id_str)
@@ -4652,7 +4652,7 @@ async fn upsert_episode(
 
     let id = Uuid::new_v4();
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, absolute_episode_number, has_file, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, absolute_episode_number, has_file, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(id.to_string())
     .bind(series_id.to_string())
@@ -4673,7 +4673,7 @@ async fn upsert_legacy_media_item(
     meta: Option<&MetadataResult>,
 ) -> Result<()> {
     let existing =
-        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = ? LIMIT 1")
+        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = $1 LIMIT 1")
             .bind(id.to_string())
             .fetch_optional(pool)
             .await?;
@@ -4681,7 +4681,7 @@ async fn upsert_legacy_media_item(
     let external_ids_json = serde_json::to_string(merged_ids)?;
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
-            "UPDATE media_items SET type = ?, title = ?, year = ?, external_ids = ?, metadata_json = COALESCE(?, metadata_json), runtime_seconds = COALESCE(?, runtime_seconds), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE media_items SET type = $1, title = $2, year = $3, external_ids = $4, metadata_json = COALESCE($5, metadata_json), runtime_seconds = COALESCE($6, runtime_seconds), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
         )
         .bind(identity.r#type.as_str())
         .bind(&identity.title)
@@ -4694,7 +4694,7 @@ async fn upsert_legacy_media_item(
         .await?;
     } else {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, runtime_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO media_items (id, type, external_ids, title, year, season, episode, metadata_json, runtime_seconds, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(id.to_string())
         .bind(identity.r#type.as_str())
@@ -4747,7 +4747,7 @@ async fn upsert_media_file(
     if hash_dedupe {
         if let Some(hash) = &file.hash {
             existing = sqlx::query::<sqlx::Any>(
-                "SELECT id, source_config_id FROM media_files WHERE hash = ? LIMIT 1",
+                "SELECT id, source_config_id FROM media_files WHERE hash = $1 LIMIT 1",
             )
             .bind(hash)
             .fetch_optional(pool)
@@ -4756,7 +4756,7 @@ async fn upsert_media_file(
     }
     if existing.is_none() {
         existing = sqlx::query::<sqlx::Any>(
-            "SELECT id, source_config_id FROM media_files WHERE path = ? LIMIT 1",
+            "SELECT id, source_config_id FROM media_files WHERE path = $1 LIMIT 1",
         )
         .bind(&file.path)
         .fetch_optional(pool)
@@ -4772,7 +4772,7 @@ async fn upsert_media_file(
             (Some(current), _) => Some(current),
             _ => None,
         };
-        sqlx::query::<sqlx::Any>("UPDATE media_files SET media_item_id = ?, size_bytes = ?, container = ?, video_codec = ?, audio_codec = ?, width = COALESCE(?, width), height = COALESCE(?, height), bitrate_bps = COALESCE(?, bitrate_bps), hash = COALESCE(?, hash), extension_metadata = COALESCE(?, extension_metadata), updated_at = CURRENT_TIMESTAMP, scan_state = 'ok', source_config_id = COALESCE(source_config_id, ?) WHERE id = ?")
+        sqlx::query::<sqlx::Any>("UPDATE media_files SET media_item_id = $1, size_bytes = $2, container = $3, video_codec = $4, audio_codec = $5, width = COALESCE($6, width), height = COALESCE($7, height), bitrate_bps = COALESCE($8, bitrate_bps), hash = COALESCE($9, hash), extension_metadata = COALESCE($10, extension_metadata), updated_at = CURRENT_TIMESTAMP, scan_state = 'ok', source_config_id = COALESCE(source_config_id, $11) WHERE id = $12")
             .bind(legacy_item_id.to_string())
             .bind(file.size_bytes)
             .bind(metadata.and_then(|m| m.container.as_ref()).or(file.container.as_ref()))
@@ -4806,7 +4806,7 @@ async fn upsert_media_file(
     }
 
     let id = Uuid::new_v4();
-    sqlx::query::<sqlx::Any>("INSERT INTO media_files (id, media_item_id, source_config_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, hash, extension_metadata, scan_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+    sqlx::query::<sqlx::Any>("INSERT INTO media_files (id, media_item_id, source_config_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, hash, extension_metadata, scan_state, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'ok', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
         .bind(id.to_string())
         .bind(legacy_item_id.to_string())
         .bind(source_config_id.map(|u| u.to_string()))
@@ -4866,7 +4866,7 @@ async fn sync_media_tracks(
         return Ok(());
     }
 
-    sqlx::query::<sqlx::Any>("DELETE FROM media_tracks WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM media_tracks WHERE media_file_id = $1")
         .bind(media_file_id.to_string())
         .execute(pool)
         .await?;
@@ -4894,7 +4894,7 @@ async fn sync_media_tracks(
             == 1;
 
         let id = Uuid::new_v4();
-        sqlx::query::<sqlx::Any>("INSERT INTO media_tracks (id, media_file_id, track_type, language, title, codec, channels, is_default, is_forced, stream_index, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+        sqlx::query::<sqlx::Any>("INSERT INTO media_tracks (id, media_file_id, track_type, language, title, codec, channels, is_default, is_forced, stream_index, metadata_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(id.to_string())
             .bind(media_file_id.to_string())
             .bind(track_type)
@@ -4930,14 +4930,14 @@ async fn sync_external_subtitles(
         }
     };
 
-    sqlx::query::<sqlx::Any>("DELETE FROM external_subtitles WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM external_subtitles WHERE media_file_id = $1")
         .bind(media_file_id.to_string())
         .execute(pool)
         .await?;
 
     for subtitle in subtitles {
         let id = Uuid::new_v4();
-        sqlx::query::<sqlx::Any>("INSERT INTO external_subtitles (id, media_file_id, path, language, title, format, is_default, is_forced, is_hearing_impaired, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+        sqlx::query::<sqlx::Any>("INSERT INTO external_subtitles (id, media_file_id, path, language, title, format, is_default, is_forced, is_hearing_impaired, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(id.to_string())
             .bind(media_file_id.to_string())
             .bind(subtitle.path)
@@ -5738,7 +5738,7 @@ async fn link_movie_file(pool: &AnyPool, movie_id: Uuid, media_file_id: Uuid) ->
     unlink_stale_movie_links_for_media_file(pool, &media_file_id_str, &movie_id.to_string())
         .await?;
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO movie_files (movie_id, media_file_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO movie_files (movie_id, media_file_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(movie_id.to_string())
     .bind(media_file_id_str)
@@ -5753,7 +5753,7 @@ async fn unlink_stale_movie_links_for_media_file(
     keep_movie_id: &str,
 ) -> Result<()> {
     let stale_movie_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT movie_id FROM movie_files WHERE media_file_id = ? AND movie_id != ?",
+        "SELECT movie_id FROM movie_files WHERE media_file_id = $1 AND movie_id != $2",
     )
     .bind(media_file_id)
     .bind(keep_movie_id)
@@ -5767,7 +5767,7 @@ async fn unlink_stale_movie_links_for_media_file(
         stale_movie_count = stale_movie_ids.len(),
         "removing stale movie links for reclassified file"
     );
-    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = ? AND movie_id != ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = $1 AND movie_id != $2")
         .bind(media_file_id)
         .bind(keep_movie_id)
         .execute(pool)
@@ -5782,7 +5782,7 @@ async fn link_episode_file(pool: &AnyPool, episode_id: Uuid, media_file_id: Uuid
     let media_file_id_str = media_file_id.to_string();
     unlink_movie_links_for_media_file(pool, &media_file_id_str).await?;
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO episode_files (episode_id, media_file_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO episode_files (episode_id, media_file_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(episode_id.to_string())
     .bind(media_file_id_str)
@@ -5793,13 +5793,13 @@ async fn link_episode_file(pool: &AnyPool, episode_id: Uuid, media_file_id: Uuid
 
 async fn mark_series_as_anime(pool: &AnyPool, series_id: Uuid) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE series SET library_type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND library_type != 'anime'",
+        "UPDATE series SET library_type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND library_type != 'anime'",
     )
     .bind(series_id.to_string())
     .execute(pool)
     .await?;
     let _ = sqlx::query::<sqlx::Any>(
-        "UPDATE media_items SET type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE media_items SET type = 'anime', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(series_id.to_string())
     .execute(pool)
@@ -5809,7 +5809,7 @@ async fn mark_series_as_anime(pool: &AnyPool, series_id: Uuid) -> Result<()> {
 
 async fn unlink_movie_links_for_media_file(pool: &AnyPool, media_file_id: &str) -> Result<()> {
     let movie_ids: Vec<String> = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT movie_id FROM movie_files WHERE media_file_id = ?",
+        "SELECT movie_id FROM movie_files WHERE media_file_id = $1",
     )
     .bind(media_file_id)
     .fetch_all(pool)
@@ -5822,7 +5822,7 @@ async fn unlink_movie_links_for_media_file(pool: &AnyPool, media_file_id: &str) 
         movie_count = movie_ids.len(),
         "removing movie links for episode-classified file"
     );
-    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM movie_files WHERE media_file_id = $1")
         .bind(media_file_id)
         .execute(pool)
         .await?;
@@ -5834,7 +5834,7 @@ async fn unlink_movie_links_for_media_file(pool: &AnyPool, media_file_id: &str) 
 
 async fn unlink_episode_links_for_media_file(pool: &AnyPool, media_file_id: &str) -> Result<()> {
     let has_episode: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
-        "SELECT 1 FROM episode_files WHERE media_file_id = ? LIMIT 1",
+        "SELECT 1 FROM episode_files WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -5846,7 +5846,7 @@ async fn unlink_episode_links_for_media_file(pool: &AnyPool, media_file_id: &str
         media_file_id = %media_file_id,
         "removing episode links for movie-classified file"
     );
-    sqlx::query::<sqlx::Any>("DELETE FROM episode_files WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM episode_files WHERE media_file_id = $1")
         .bind(media_file_id)
         .execute(pool)
         .await?;
@@ -5855,7 +5855,7 @@ async fn unlink_episode_links_for_media_file(pool: &AnyPool, media_file_id: &str
 
 async fn cleanup_orphan_movie(pool: &AnyPool, movie_id: &str) -> Result<()> {
     let has_file: Option<i64> = sqlx::query_scalar::<sqlx::Any, i64>(
-        "SELECT 1 FROM movie_files WHERE movie_id = ? LIMIT 1",
+        "SELECT 1 FROM movie_files WHERE movie_id = $1 LIMIT 1",
     )
     .bind(movie_id)
     .fetch_optional(pool)
@@ -5864,11 +5864,11 @@ async fn cleanup_orphan_movie(pool: &AnyPool, movie_id: &str) -> Result<()> {
         return Ok(());
     }
     tracing::info!(movie_id = %movie_id, "removing orphan movie");
-    sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = $1")
         .bind(movie_id)
         .execute(pool)
         .await?;
-    let _ = sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
+    let _ = sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = $1")
         .bind(movie_id)
         .execute(pool)
         .await;
@@ -5881,7 +5881,7 @@ async fn update_movie_runtime_if_missing(
     duration_seconds: i32,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE movies SET runtime_seconds = COALESCE(runtime_seconds, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE movies SET runtime_seconds = COALESCE(runtime_seconds, $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(duration_seconds)
     .bind(movie_id.to_string())
@@ -5889,7 +5889,7 @@ async fn update_movie_runtime_if_missing(
     .await?;
 
     let _ = sqlx::query::<sqlx::Any>(
-        "UPDATE media_items SET runtime_seconds = COALESCE(runtime_seconds, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE media_items SET runtime_seconds = COALESCE(runtime_seconds, $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(duration_seconds)
     .bind(movie_id.to_string())
@@ -5905,7 +5905,7 @@ async fn update_episode_runtime_if_missing(
     duration_seconds: i32,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE episodes SET runtime_seconds = COALESCE(runtime_seconds, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE episodes SET runtime_seconds = COALESCE(runtime_seconds, $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(duration_seconds)
     .bind(episode_id.to_string())
@@ -5920,7 +5920,7 @@ async fn update_episode_title_if_missing(
     title: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE episodes SET title = COALESCE(title, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE episodes SET title = COALESCE(title, $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(title)
     .bind(episode_id.to_string())
@@ -5931,7 +5931,7 @@ async fn update_episode_title_if_missing(
 
 async fn mark_episode_has_file(pool: &AnyPool, episode_id: Uuid) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE episodes SET has_file = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE episodes SET has_file = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(episode_id.to_string())
     .execute(pool)
@@ -5941,7 +5941,7 @@ async fn mark_episode_has_file(pool: &AnyPool, episode_id: Uuid) -> Result<()> {
 
 async fn refresh_episode_file_state(pool: &AnyPool) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE episodes SET has_file = CASE WHEN EXISTS (SELECT 1 FROM episode_files ef JOIN media_files mf ON mf.id = ef.media_file_id WHERE ef.episode_id = episodes.id AND mf.scan_state = 'ok') THEN 1 ELSE 0 END",
+        "UPDATE episodes SET has_file = CASE WHEN EXISTS (SELECT 1 FROM episode_files ef JOIN media_files mf ON mf.id = ef.media_file_id WHERE ef.episode_id = episodes.id AND mf.scan_state = 'ok') THEN TRUE ELSE FALSE END",
     )
     .execute(pool)
     .await?;
@@ -5955,7 +5955,7 @@ pub(crate) async fn apply_external_ids_to_movie(
     source: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE movies SET external_imdb = COALESCE(?, external_imdb), external_tmdb = COALESCE(?, external_tmdb), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE movies SET external_imdb = COALESCE($1, external_imdb), external_tmdb = COALESCE($2, external_tmdb), updated_at = CURRENT_TIMESTAMP WHERE id = $3",
     )
     .bind(ids.imdb.as_ref())
     .bind(ids.tmdb.as_ref())
@@ -5981,7 +5981,7 @@ pub(crate) async fn apply_external_ids_to_series(
     );
     let tvdb = ids.tvdb_series.as_ref().or(ids.tvdb.as_ref()).cloned();
     sqlx::query::<sqlx::Any>(
-        "UPDATE series SET external_imdb = COALESCE(?, external_imdb), external_tvdb_series = COALESCE(?, external_tvdb_series), external_anilist = COALESCE(?, external_anilist), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE series SET external_imdb = COALESCE($1, external_imdb), external_tvdb_series = COALESCE($2, external_tvdb_series), external_anilist = COALESCE($3, external_anilist), updated_at = CURRENT_TIMESTAMP WHERE id = $4",
     )
     .bind(ids.imdb.as_ref())
     .bind(tvdb.as_ref())
@@ -6009,7 +6009,7 @@ pub(crate) async fn apply_external_ids_to_season(
     );
     if let Some(new_id) = ids.anilist.as_ref() {
         let existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = ? LIMIT 1",
+            "SELECT COALESCE(external_anilist, '') FROM seasons WHERE id = $1 LIMIT 1",
         )
         .bind(season_id.to_string())
         .fetch_optional(pool)
@@ -6025,7 +6025,7 @@ pub(crate) async fn apply_external_ids_to_season(
                 should_update = true;
             } else if let Some(new_confidence) = confidence {
                 let existing_confidence = sqlx::query_scalar::<sqlx::Any, f32>(
-                    "SELECT MAX(confidence) FROM season_external_ids WHERE season_id = ? AND provider = 'anilist' AND external_id = ?",
+                    "SELECT MAX(confidence) FROM season_external_ids WHERE season_id = $1 AND provider = 'anilist' AND external_id = $2",
                 )
                 .bind(season_id.to_string())
                 .bind(existing_id)
@@ -6040,7 +6040,7 @@ pub(crate) async fn apply_external_ids_to_season(
 
         if should_update {
             sqlx::query::<sqlx::Any>(
-                "UPDATE seasons SET external_anilist = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE seasons SET external_anilist = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             )
             .bind(new_id)
             .bind(season_id.to_string())
@@ -6073,7 +6073,7 @@ async fn persist_movie_external_ids(
     let stored_count = entries.len();
     for (provider, external_id) in entries {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO movie_external_ids (id, movie_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO movie_external_ids (id, movie_id, provider, external_id, confidence, source) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(movie_id.to_string())
@@ -6126,7 +6126,7 @@ async fn persist_series_external_ids(
     let stored_count = entries.len();
     for (provider, external_id) in entries {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(series_id.to_string())
@@ -6176,7 +6176,7 @@ async fn persist_season_external_ids(
             1.0
         };
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO season_external_ids (id, season_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO season_external_ids (id, season_id, provider, external_id, confidence, source) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(season_id.to_string())
@@ -6340,11 +6340,11 @@ async fn update_episode_details(
     let raw_json = serde_json::to_string(raw).ok();
     sqlx::query::<sqlx::Any>(
         "UPDATE episodes
-         SET title = COALESCE(?, NULLIF(TRIM(title), ''), title),
-             runtime_seconds = COALESCE(?, runtime_seconds),
-             metadata_json = COALESCE(?, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
+         SET title = COALESCE($1, NULLIF(TRIM(title), ''), title),
+             runtime_seconds = COALESCE($2, runtime_seconds),
+             metadata_json = COALESCE($3, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $4",
     )
     .bind(title)
     .bind(runtime_seconds)
@@ -6363,7 +6363,7 @@ async fn insert_episode_external_id(
     source: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO episode_external_ids (id, episode_id, provider, external_id, confidence, source) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO episode_external_ids (id, episode_id, provider, external_id, confidence, source) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(episode_id.to_string())
@@ -6385,7 +6385,7 @@ async fn upsert_anime_episode_meta(
     let raw_json = serde_json::to_string(&episode.raw).ok();
     let duration_seconds = minutes_to_seconds(episode.runtime_minutes);
     let existing = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT id FROM anime_episode_meta WHERE season_id = ? AND episode_number = ? LIMIT 1",
+        "SELECT id FROM anime_episode_meta WHERE season_id = $1 AND episode_number = $2 LIMIT 1",
     )
     .bind(season_id.to_string())
     .bind(episode_number)
@@ -6394,7 +6394,7 @@ async fn upsert_anime_episode_meta(
 
     if let Some(id_str) = existing {
         sqlx::query::<sqlx::Any>(
-            "UPDATE anime_episode_meta SET title = COALESCE(?, title), snapshot_url = COALESCE(?, snapshot_url), duration_seconds = COALESCE(?, duration_seconds), raw_json = COALESCE(?, raw_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE anime_episode_meta SET title = COALESCE($1, title), snapshot_url = COALESCE($2, snapshot_url), duration_seconds = COALESCE($3, duration_seconds), raw_json = COALESCE($4, raw_json), updated_at = CURRENT_TIMESTAMP WHERE id = $5",
         )
         .bind(episode.title.as_deref())
         .bind(episode.image.as_deref())
@@ -6408,7 +6408,7 @@ async fn upsert_anime_episode_meta(
 
     let id = Uuid::new_v4();
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO anime_episode_meta (id, season_id, episode_number, title, snapshot_url, duration_seconds, raw_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO anime_episode_meta (id, season_id, episode_number, title, snapshot_url, duration_seconds, raw_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(id.to_string())
     .bind(season_id.to_string())
@@ -6429,7 +6429,7 @@ async fn insert_episode_provider_key(
     provider_key: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO episode_provider_keys (id, episode_id, provider, provider_key) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO episode_provider_keys (id, episode_id, provider, provider_key) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(episode_id.to_string())
@@ -6607,7 +6607,7 @@ async fn update_series_metadata_from_tvdb(
         return Ok(());
     };
     let existing = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = ? LIMIT 1",
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = $1 LIMIT 1",
     )
     .bind(series_id.to_string())
     .fetch_optional(pool)
@@ -6640,7 +6640,7 @@ async fn update_series_metadata_from_tvdb(
     };
 
     sqlx::query::<sqlx::Any>(
-        "UPDATE series SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE series SET metadata_json = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(merged_json)
     .bind(series_id.to_string())
@@ -6664,7 +6664,7 @@ async fn update_season_metadata_from_tvdb(
         let title = extract_tvdb_season_title(season_meta);
         let raw_json = serde_json::to_string(season_meta).ok();
         let existing = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = $1 LIMIT 1",
         )
         .bind(season_id.to_string())
         .fetch_optional(pool)
@@ -6691,7 +6691,7 @@ async fn update_season_metadata_from_tvdb(
         }
 
         sqlx::query::<sqlx::Any>(
-            "UPDATE seasons SET title = COALESCE(?, title), metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE seasons SET title = COALESCE($1, title), metadata_json = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
         )
         .bind(title.as_deref())
         .bind(serde_json::to_string(&merged).ok())
@@ -6746,7 +6746,7 @@ fn extract_tvdb_season_year(value: &serde_json::Value) -> Option<i32> {
 
 async fn season_scaffolded(pool: &AnyPool, season_id: Uuid) -> Result<bool> {
     let meta = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = $1 LIMIT 1",
     )
     .bind(season_id.to_string())
     .fetch_optional(pool)
@@ -6782,7 +6782,7 @@ async fn season_scaffolded_recent(
 
     let row = sqlx::query(
         "SELECT COALESCE(CAST(metadata_json AS TEXT), '') as meta, CAST(updated_at AS TEXT) as updated_at \
-         FROM seasons WHERE id = ? LIMIT 1",
+         FROM seasons WHERE id = $1 LIMIT 1",
     )
     .bind(season_id.to_string())
     .fetch_optional(pool)
@@ -6848,7 +6848,7 @@ async fn series_seasons_scaffolded_recent(
         return Ok(false);
     }
     let season_ids: Vec<String> =
-        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM seasons WHERE series_id = ?")
+        sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM seasons WHERE series_id = $1")
             .bind(series_id.to_string())
             .fetch_all(pool)
             .await?;
@@ -6868,7 +6868,7 @@ async fn series_seasons_scaffolded_recent(
 
 async fn mark_season_scaffolded(pool: &AnyPool, season_id: Uuid, provider: &str) -> Result<()> {
     let existing = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = ? LIMIT 1",
+        "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM seasons WHERE id = $1 LIMIT 1",
     )
     .bind(season_id.to_string())
     .fetch_optional(pool)
@@ -6896,7 +6896,7 @@ async fn mark_season_scaffolded(pool: &AnyPool, season_id: Uuid, provider: &str)
     }
 
     sqlx::query::<sqlx::Any>(
-        "UPDATE seasons SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE seasons SET metadata_json = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(serde_json::to_string(&meta).ok())
     .bind(season_id.to_string())
@@ -6944,7 +6944,7 @@ async fn load_managed_identity_lock(
     let Some(row) = sqlx::query(
         "SELECT media_type, title, year, CAST(external_ids_json AS TEXT) AS external_ids_json
          FROM managed_library_provenance
-         WHERE media_item_id = ?
+         WHERE media_item_id = $1
          LIMIT 1",
     )
     .bind(media_item_id)
@@ -7447,7 +7447,7 @@ mod tests {
         .await?;
 
         let imported_state: String =
-            sqlx::query_scalar("SELECT scan_state FROM media_files WHERE path = ?")
+            sqlx::query_scalar("SELECT scan_state FROM media_files WHERE path = $1")
                 .bind(&imported_path)
                 .fetch_one(&database.pool)
                 .await?;
@@ -7581,7 +7581,7 @@ mod tests {
         let normalized = derive_override_key("movie", media_path).expect("override key");
 
         sqlx::query(
-            "INSERT INTO classifier_overrides (id, library_type, normalized_key, imdb_id, anilist_id, tvdb_id) VALUES (?, ?, ?, ?, NULL, NULL)",
+            "INSERT INTO classifier_overrides (id, library_type, normalized_key, imdb_id, anilist_id, tvdb_id) VALUES ($1, $2, $3, $4, NULL, NULL)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("movie")
@@ -7646,7 +7646,7 @@ mod tests {
             "INSERT INTO managed_ingest_intents (
                 intent_id, media_type, title, normalized_title, year, external_ids_json,
                 manager_provider_id, manager_item_id, manager_label, source, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("movie")
@@ -7862,7 +7862,7 @@ mod tests {
             "INSERT INTO managed_ingest_intents (
                 intent_id, media_type, title, normalized_title, year, external_ids_json,
                 manager_provider_id, manager_item_id, manager_label, source, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("movie")
@@ -8056,7 +8056,7 @@ mod tests {
         assert_eq!(row.get::<i32, _>("runtime_seconds"), 144 * 60);
 
         let artwork_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = ?",
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = $1",
         )
         .bind(linked.expect("linked movie").to_string())
         .fetch_one(&database.pool)
@@ -8190,7 +8190,7 @@ mod tests {
         );
 
         let tvdb_movie_id: String = sqlx::query_scalar(
-            "SELECT external_id FROM movie_external_ids WHERE movie_id = ? AND provider = 'tvdb' LIMIT 1",
+            "SELECT external_id FROM movie_external_ids WHERE movie_id = $1 AND provider = 'tvdb' LIMIT 1",
         )
         .bind(movie_id.to_string())
         .fetch_one(&database.pool)
@@ -8198,7 +8198,7 @@ mod tests {
         assert_eq!(tvdb_movie_id, "12345");
 
         let tvdb_artwork_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = ? AND provider = 'tvdb'",
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'movie' AND owner_id = $1 AND provider = 'tvdb'",
         )
         .bind(movie_id.to_string())
         .fetch_one(&database.pool)
@@ -8263,7 +8263,7 @@ mod tests {
         let _ = tvdb_shutdown_tx.send(());
 
         let row = sqlx::query(
-            "SELECT external_tvdb_series, metadata_json FROM series WHERE id = ? LIMIT 1",
+            "SELECT external_tvdb_series, metadata_json FROM series WHERE id = $1 LIMIT 1",
         )
         .bind(result.media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8282,7 +8282,7 @@ mod tests {
         );
 
         let season_row = sqlx::query(
-            "SELECT title, metadata_json FROM seasons WHERE series_id = ? AND season_number = 1 LIMIT 1",
+            "SELECT title, metadata_json FROM seasons WHERE series_id = $1 AND season_number = 1 LIMIT 1",
         )
         .bind(result.media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8302,7 +8302,7 @@ mod tests {
         );
 
         let artwork_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'series' AND owner_id = ? AND provider = 'tvdb'",
+            "SELECT COUNT(*) FROM artwork_refs WHERE owner_type = 'series' AND owner_id = $1 AND provider = 'tvdb'",
         )
         .bind(result.media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8310,7 +8310,7 @@ mod tests {
         assert_eq!(artwork_count, 3);
 
         let cached_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artwork_cache c INNER JOIN artwork_refs r ON r.id = c.artwork_id WHERE r.owner_type = 'series' AND r.owner_id = ?",
+            "SELECT COUNT(*) FROM artwork_cache c INNER JOIN artwork_refs r ON r.id = c.artwork_id WHERE r.owner_type = 'series' AND r.owner_id = $1",
         )
         .bind(result.media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8486,7 +8486,7 @@ mod tests {
             "INSERT INTO managed_ingest_intents (
                 intent_id, media_type, title, normalized_title, year, external_ids_json,
                 manager_provider_id, manager_item_id, manager_label, source, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("anime")
@@ -8595,7 +8595,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
-             VALUES (?, 'series', ?, 'Star Wars: Clone Wars', 2003, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, 'series', $2, 'Star Wars: Clone Wars', 2003, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(media_item_id.to_string())
         .bind(&external_ids_json)
@@ -8604,7 +8604,7 @@ mod tests {
         .await?;
         sqlx::query(
             "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at)
-             VALUES (?, 'Star Wars: Clone Wars', 2003, 'series', 'tt0361243', '72244', NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, 'Star Wars: Clone Wars', 2003, 'series', 'tt0361243', '72244', NULL, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(media_item_id.to_string())
         .bind(&series_metadata_json)
@@ -8615,7 +8615,7 @@ mod tests {
         let existing_episode_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO seasons (id, series_id, season_number, created_at, updated_at)
-             VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(existing_season_id.to_string())
         .bind(media_item_id.to_string())
@@ -8623,7 +8623,7 @@ mod tests {
         .await?;
         sqlx::query(
             "INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, title, metadata_json, has_file, created_at, updated_at)
-             VALUES (?, ?, ?, 1, 1, '', '', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, 1, 1, '', '', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(existing_episode_id.to_string())
         .bind(media_item_id.to_string())
@@ -8741,7 +8741,7 @@ mod tests {
         assert_eq!(result.subscription_ids, vec![subscription.subscription_id]);
 
         let season_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM seasons WHERE series_id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM seasons WHERE series_id = $1")
                 .bind(media_item_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -8750,7 +8750,7 @@ mod tests {
         let s1: (String, String, i64) = sqlx::query_as(
             "SELECT title, metadata_json, runtime_seconds
              FROM episodes
-             WHERE series_id = ? AND season_number = 1 AND episode_number = 1",
+             WHERE series_id = $1 AND season_number = 1 AND episode_number = 1",
         )
         .bind(media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8766,7 +8766,7 @@ mod tests {
         let s2: (String, String, i64) = sqlx::query_as(
             "SELECT title, metadata_json, runtime_seconds
              FROM episodes
-             WHERE series_id = ? AND season_number = 2 AND episode_number = 1",
+             WHERE series_id = $1 AND season_number = 2 AND episode_number = 1",
         )
         .bind(media_item_id.to_string())
         .fetch_one(&database.pool)
@@ -8782,7 +8782,7 @@ mod tests {
         let s3: (String, String) = sqlx::query_as(
             "SELECT title, metadata_json
              FROM episodes
-             WHERE series_id = ? AND season_number = 3 AND episode_number = 1",
+             WHERE series_id = $1 AND season_number = 3 AND episode_number = 1",
         )
         .bind(media_item_id.to_string())
         .fetch_one(&database.pool)

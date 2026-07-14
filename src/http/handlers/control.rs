@@ -54,7 +54,7 @@ pub async fn register(
     let lan_addresses =
         serde_json::to_string(&body.lan_addresses).unwrap_or_else(|_| "[]".to_string());
 
-    sqlx::query::<sqlx::Any>("INSERT INTO server_registry (id, user_id, server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'online', CURRENT_TIMESTAMP) ON CONFLICT(user_id, server_id) DO UPDATE SET device_name = excluded.device_name, lan_addresses = excluded.lan_addresses, wan_direct_endpoint = excluded.wan_direct_endpoint, overlay_endpoint = excluded.overlay_endpoint, status = 'online', last_seen_at = CURRENT_TIMESTAMP")
+    sqlx::query::<sqlx::Any>("INSERT INTO server_registry (id, user_id, server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'online', CURRENT_TIMESTAMP) ON CONFLICT(user_id, server_id) DO UPDATE SET device_name = excluded.device_name, lan_addresses = excluded.lan_addresses, wan_direct_endpoint = excluded.wan_direct_endpoint, overlay_endpoint = excluded.overlay_endpoint, status = 'online', last_seen_at = CURRENT_TIMESTAMP")
         .bind(Uuid::new_v4().to_string())
         .bind(user.user_id.to_string())
         .bind(server_id.to_string())
@@ -84,7 +84,7 @@ pub async fn list(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> ApiResult<Json<Vec<RegistryEntry>>> {
-    let rows = sqlx::query("SELECT server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, datetime(last_seen_at) as last_seen_at FROM server_registry WHERE user_id = ? ORDER BY last_seen_at DESC")
+    let rows = sqlx::query("SELECT server_id, device_name, lan_addresses, wan_direct_endpoint, overlay_endpoint, status, CAST(last_seen_at AS TEXT) as last_seen_at FROM server_registry WHERE user_id = $1 ORDER BY last_seen_at DESC")
         .bind(user.user_id.to_string())
     .fetch_all(&state.db_pool)
     .await

@@ -54,7 +54,7 @@ pub async fn record_acquisition_audit_event(
             state,
             reason,
             evidence_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(audit_event_id.to_string())
     .bind(data.event_type.trim())
@@ -83,8 +83,8 @@ pub async fn count_acquisition_audit_events(
     sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT COUNT(*)
          FROM acquisition_audit_events
-         WHERE release_id = ?
-           AND event_type = ?",
+         WHERE release_id = $1
+           AND event_type = $2",
     )
     .bind(release_id.to_string())
     .bind(event_type)
@@ -102,8 +102,8 @@ pub async fn count_acquisition_audit_events_for_subscription(
     sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT COUNT(*)
          FROM acquisition_audit_events
-         WHERE subscription_id = ?
-           AND event_type = ?",
+         WHERE subscription_id = $1
+           AND event_type = $2",
     )
     .bind(subscription_id.to_string())
     .bind(event_type)

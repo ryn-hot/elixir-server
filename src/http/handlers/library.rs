@@ -813,7 +813,7 @@ pub async fn list_seasons(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<SeasonResponse>>> {
     let preferred_languages = parse_language_header(&headers);
-    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM series WHERE id = ? LIMIT 1")
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM series WHERE id = $1 LIMIT 1")
         .bind(&series_id)
         .fetch_optional(&state.db_pool)
         .await
@@ -826,7 +826,7 @@ pub async fn list_seasons(
     ensure_series_episode_catalog_for_read(&state, &series_id).await?;
 
     let rows = sqlx::query(
-        "SELECT s.id, s.season_number, s.title, COUNT(e.id) as episode_count, COALESCE(SUM(CASE WHEN e.has_file THEN 1 ELSE 0 END), 0) as file_count FROM seasons s LEFT JOIN episodes e ON e.season_id = s.id WHERE s.series_id = ? GROUP BY s.id ORDER BY s.season_number",
+        "SELECT s.id, s.season_number, s.title, COUNT(e.id) as episode_count, COALESCE(SUM(CASE WHEN e.has_file THEN 1 ELSE 0 END), 0) as file_count FROM seasons s LEFT JOIN episodes e ON e.season_id = s.id WHERE s.series_id = $1 GROUP BY s.id ORDER BY s.season_number",
     )
     .bind(&series_id)
     .fetch_all(&state.db_pool)
@@ -900,7 +900,7 @@ pub async fn list_episodes(
     .await?;
 
     let rows = sqlx::query(
-        "SELECT e.id, e.season_number, e.episode_number, e.absolute_episode_number, e.title, e.runtime_seconds, CAST(e.has_file AS INTEGER) AS has_file, e.metadata_json, aem.title as anime_title, aem.duration_seconds as anime_duration, aem.snapshot_url FROM episodes e LEFT JOIN anime_episode_meta aem ON aem.season_id = e.season_id AND aem.episode_number = e.episode_number WHERE e.season_id = ? ORDER BY e.episode_number",
+        "SELECT e.id, e.season_number, e.episode_number, e.absolute_episode_number, e.title, e.runtime_seconds, CAST(CASE WHEN e.has_file THEN 1 ELSE 0 END AS BIGINT) AS has_file, e.metadata_json, aem.title as anime_title, aem.duration_seconds as anime_duration, aem.snapshot_url FROM episodes e LEFT JOIN anime_episode_meta aem ON aem.season_id = e.season_id AND aem.episode_number = e.episode_number WHERE e.season_id = $1 ORDER BY e.episode_number",
     )
     .bind(&season_id)
     .fetch_all(&state.db_pool)
@@ -1035,7 +1035,7 @@ async fn load_library_item_playback_states(
     let mut states = HashMap::new();
 
     if !movie_ids.is_empty() {
-        let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+        let sql = format!(
             "SELECT item_id AS library_item_id, item_type, item_id,
                     series_id, season_id, resume_seconds, duration_seconds,
                     CASE WHEN watched THEN 1 ELSE 0 END AS watched,
@@ -1043,21 +1043,18 @@ async fn load_library_item_playback_states(
                     CAST(last_played_at AS TEXT) AS last_played_at,
                     state_source
              FROM user_media_state
-             WHERE user_id = ",
+             WHERE user_id = $1
+               AND item_type = 'movie'
+               AND item_id IN ({})
+             ORDER BY last_played_at DESC, updated_at DESC",
+            crate::db::numbered_bind_list(2, movie_ids.len()),
         );
-        query.push_bind(user_id.to_string());
-        query.push(" AND item_type = 'movie' AND item_id IN (");
-        {
-            let mut separated = query.separated(", ");
-            for movie_id in movie_ids {
-                separated.push_bind(movie_id.as_str());
-            }
-            separated.push_unseparated(")");
+        let mut query = sqlx::query(&sql).bind(user_id.to_string());
+        for movie_id in movie_ids {
+            query = query.bind(movie_id.as_str());
         }
-        query.push(" ORDER BY last_played_at DESC, updated_at DESC");
 
         let rows = query
-            .build()
             .fetch_all(pool)
             .await
             .map_err(|err| ApiError::internal(err.to_string()))?;
@@ -1071,7 +1068,7 @@ async fn load_library_item_playback_states(
     }
 
     if !series_ids.is_empty() {
-        let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+        let sql = format!(
             "SELECT series_id AS library_item_id, item_type, item_id,
                     series_id, season_id, resume_seconds, duration_seconds,
                     CASE WHEN watched THEN 1 ELSE 0 END AS watched,
@@ -1079,21 +1076,18 @@ async fn load_library_item_playback_states(
                     CAST(last_played_at AS TEXT) AS last_played_at,
                     state_source
              FROM user_media_state
-             WHERE user_id = ",
+             WHERE user_id = $1
+               AND item_type = 'episode'
+               AND series_id IN ({})
+             ORDER BY last_played_at DESC, updated_at DESC",
+            crate::db::numbered_bind_list(2, series_ids.len()),
         );
-        query.push_bind(user_id.to_string());
-        query.push(" AND item_type = 'episode' AND series_id IN (");
-        {
-            let mut separated = query.separated(", ");
-            for series_id in series_ids {
-                separated.push_bind(series_id.as_str());
-            }
-            separated.push_unseparated(")");
+        let mut query = sqlx::query(&sql).bind(user_id.to_string());
+        for series_id in series_ids {
+            query = query.bind(series_id.as_str());
         }
-        query.push(" ORDER BY last_played_at DESC, updated_at DESC");
 
         let rows = query
-            .build()
             .fetch_all(pool)
             .await
             .map_err(|err| ApiError::internal(err.to_string()))?;
@@ -1170,25 +1164,24 @@ async fn load_episode_playback_states(
     if episode_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
+    let sql = format!(
         "SELECT item_id, resume_seconds, duration_seconds,
                 CASE WHEN watched THEN 1 ELSE 0 END AS watched,
                 CAST(watched_at AS TEXT) AS watched_at,
                 CAST(last_played_at AS TEXT) AS last_played_at,
                 state_source
          FROM user_media_state
-         WHERE user_id = ",
+         WHERE user_id = $1
+           AND item_type = 'episode'
+           AND item_id IN ({})",
+        crate::db::numbered_bind_list(2, episode_ids.len()),
     );
-    query.push_bind(user_id.to_string());
-    query.push(" AND item_type = 'episode' AND item_id IN (");
-    let mut separated = query.separated(", ");
+    let mut query = sqlx::query(&sql).bind(user_id.to_string());
     for episode_id in episode_ids {
-        separated.push_bind(episode_id);
+        query = query.bind(episode_id);
     }
-    separated.push_unseparated(")");
 
     let rows = query
-        .build()
         .fetch_all(pool)
         .await
         .map_err(|err| ApiError::internal(err.to_string()))?;
@@ -1345,7 +1338,7 @@ pub async fn season_detail(
 ) -> ApiResult<Json<SeasonDetailResponse>> {
     let preferred_languages = parse_language_header(&headers);
     let row = sqlx::query(
-        "SELECT id, series_id, season_number, title, metadata_json FROM seasons WHERE id = ? LIMIT 1",
+        "SELECT id, series_id, season_number, title, metadata_json FROM seasons WHERE id = $1 LIMIT 1",
     )
     .bind(&season_id)
     .fetch_optional(&state.db_pool)
@@ -1409,7 +1402,7 @@ pub async fn detail(
 ) -> ApiResult<Json<LibraryDetailResponse>> {
     let preferred_languages = parse_language_header(&headers);
     let movie = sqlx::query(
-        "SELECT id, title, year, external_imdb, external_tmdb, CAST(runtime_seconds AS TEXT) as runtime_seconds, metadata_json FROM movies WHERE id = ? LIMIT 1",
+        "SELECT id, title, year, external_imdb, external_tmdb, CAST(runtime_seconds AS TEXT) as runtime_seconds, metadata_json FROM movies WHERE id = $1 LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&state.db_pool)
@@ -1441,7 +1434,7 @@ pub async fn detail(
             )
         } else {
             let series = sqlx::query(
-            "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json FROM series WHERE id = ? LIMIT 1",
+            "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json FROM series WHERE id = $1 LIMIT 1",
         )
         .bind(&id)
         .fetch_optional(&state.db_pool)
@@ -1480,13 +1473,13 @@ pub async fn detail(
         };
 
     let files = if item_type == "movie" {
-        sqlx::query("SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, mf.size_bytes, mf.scan_state, mf.source_config_id, mf.extension_metadata FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = ?")
+        sqlx::query("SELECT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, mf.size_bytes, mf.scan_state, mf.source_config_id, mf.extension_metadata FROM media_files mf JOIN movie_files mlf ON mlf.media_file_id = mf.id WHERE mlf.movie_id = $1")
             .bind(&id)
             .fetch_all(&state.db_pool)
             .await
             .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?
     } else {
-        sqlx::query("SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, mf.size_bytes, mf.scan_state, mf.source_config_id, mf.extension_metadata FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = ?")
+        sqlx::query("SELECT DISTINCT mf.id, mf.path, mf.container, mf.video_codec, mf.audio_codec, mf.size_bytes, mf.scan_state, mf.source_config_id, mf.extension_metadata FROM media_files mf JOIN episode_files ef ON ef.media_file_id = mf.id JOIN episodes e ON e.id = ef.episode_id WHERE e.series_id = $1")
             .bind(&id)
             .fetch_all(&state.db_pool)
             .await
@@ -2329,7 +2322,7 @@ async fn load_library_delete_target(
     let movie = sqlx::query(
         "SELECT id, title, year, external_imdb, external_tmdb
          FROM movies
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(item_id)
@@ -2353,7 +2346,7 @@ async fn load_library_delete_target(
         let series = sqlx::query(
             "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist
              FROM series
-             WHERE id = ?
+             WHERE id = $1
              LIMIT 1",
         )
         .bind(item_id)
@@ -2390,7 +2383,7 @@ async fn load_library_delete_target(
             "SELECT mf.path
              FROM media_files mf
              JOIN movie_files mlf ON mlf.media_file_id = mf.id
-             WHERE mlf.movie_id = ?",
+             WHERE mlf.movie_id = $1",
         )
         .bind(item_id)
         .fetch_all(pool)
@@ -2402,7 +2395,7 @@ async fn load_library_delete_target(
              FROM media_files mf
              JOIN episode_files ef ON ef.media_file_id = mf.id
              JOIN episodes e ON e.id = ef.episode_id
-             WHERE e.series_id = ?",
+             WHERE e.series_id = $1",
         )
         .bind(item_id)
         .fetch_all(pool)
@@ -2416,7 +2409,7 @@ async fn load_library_delete_target(
              FROM external_subtitles es
              JOIN media_files mf ON mf.id = es.media_file_id
              JOIN movie_files mlf ON mlf.media_file_id = mf.id
-             WHERE mlf.movie_id = ?",
+             WHERE mlf.movie_id = $1",
         )
         .bind(item_id)
         .fetch_all(pool)
@@ -2429,7 +2422,7 @@ async fn load_library_delete_target(
              JOIN media_files mf ON mf.id = es.media_file_id
              JOIN episode_files ef ON ef.media_file_id = mf.id
              JOIN episodes e ON e.id = ef.episode_id
-             WHERE e.series_id = ?",
+             WHERE e.series_id = $1",
         )
         .bind(item_id)
         .fetch_all(pool)
@@ -2462,21 +2455,21 @@ async fn delete_library_item_locally(
 
     match target.media_type {
         MediaType::Movie => {
-            sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = ?")
+            sqlx::query::<sqlx::Any>("DELETE FROM movies WHERE id = $1")
                 .bind(item_id)
                 .execute(&state.db_pool)
                 .await
                 .map_err(|error| ApiError::internal(error.to_string()))?;
         }
         MediaType::Series | MediaType::Anime => {
-            sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = ?")
+            sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = $1")
                 .bind(item_id)
                 .execute(&state.db_pool)
                 .await
                 .map_err(|error| ApiError::internal(error.to_string()))?;
         }
     }
-    sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM media_items WHERE id = $1")
         .bind(item_id)
         .execute(&state.db_pool)
         .await
@@ -2529,7 +2522,7 @@ async fn load_series_identity_for_item(
     let series = sqlx::query(
         "SELECT id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist
          FROM series
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(item_id)
@@ -2568,7 +2561,7 @@ async fn load_series_identity_for_season(
     season_id: &str,
 ) -> ApiResult<SeriesIdentityContext> {
     let series_id = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT series_id FROM seasons WHERE id = ? LIMIT 1",
+        "SELECT series_id FROM seasons WHERE id = $1 LIMIT 1",
     )
     .bind(season_id)
     .fetch_optional(pool)
@@ -2585,7 +2578,7 @@ async fn load_episode_delete_target(
     let row = sqlx::query(
         "SELECT e.id, e.series_id, e.season_number, e.episode_number, e.absolute_episode_number
          FROM episodes e
-         WHERE e.id = ?
+         WHERE e.id = $1
          LIMIT 1",
     )
     .bind(episode_id)
@@ -2610,7 +2603,7 @@ async fn load_episode_delete_target(
         .map(|value| value as i32);
 
     let media_file_ids = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT media_file_id FROM episode_files WHERE episode_id = ?",
+        "SELECT media_file_id FROM episode_files WHERE episode_id = $1",
     )
     .bind(episode_id)
     .fetch_all(pool)
@@ -2619,7 +2612,7 @@ async fn load_episode_delete_target(
 
     for media_file_id in &media_file_ids {
         let linked_episode_count: i64 = sqlx::query_scalar::<sqlx::Any, i64>(
-            "SELECT COUNT(*) FROM episode_files WHERE media_file_id = ?",
+            "SELECT COUNT(*) FROM episode_files WHERE media_file_id = $1",
         )
         .bind(media_file_id)
         .fetch_one(pool)
@@ -2635,15 +2628,15 @@ async fn load_episode_delete_target(
     let file_paths = if media_file_ids.is_empty() {
         Vec::new()
     } else {
-        let mut builder =
-            sqlx::QueryBuilder::<sqlx::Any>::new("SELECT path FROM media_files WHERE id IN (");
-        let mut separated = builder.separated(", ");
+        let sql = format!(
+            "SELECT path FROM media_files WHERE id IN ({})",
+            crate::db::numbered_bind_list(1, media_file_ids.len()),
+        );
+        let mut query = sqlx::query_scalar::<sqlx::Any, String>(&sql);
         for media_file_id in &media_file_ids {
-            separated.push_bind(media_file_id);
+            query = query.bind(media_file_id);
         }
-        separated.push_unseparated(")");
-        builder
-            .build_query_scalar::<String>()
+        query
             .fetch_all(pool)
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?
@@ -2652,16 +2645,15 @@ async fn load_episode_delete_target(
     let subtitle_paths = if media_file_ids.is_empty() {
         Vec::new()
     } else {
-        let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT path FROM external_subtitles WHERE media_file_id IN (",
+        let sql = format!(
+            "SELECT path FROM external_subtitles WHERE media_file_id IN ({})",
+            crate::db::numbered_bind_list(1, media_file_ids.len()),
         );
-        let mut separated = builder.separated(", ");
+        let mut query = sqlx::query_scalar::<sqlx::Any, String>(&sql);
         for media_file_id in &media_file_ids {
-            separated.push_bind(media_file_id);
+            query = query.bind(media_file_id);
         }
-        separated.push_unseparated(")");
-        builder
-            .build_query_scalar::<String>()
+        query
             .fetch_all(pool)
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?
@@ -2688,7 +2680,7 @@ async fn delete_episode_locally(state: &AppState, target: &EpisodeDeleteTarget) 
     }
 
     for media_file_id in &target.media_file_ids {
-        sqlx::query::<sqlx::Any>("DELETE FROM media_files WHERE id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM media_files WHERE id = $1")
             .bind(media_file_id)
             .execute(&state.db_pool)
             .await
@@ -2731,11 +2723,11 @@ async fn refresh_episode_has_file_state(pool: &sqlx::AnyPool, episode_id: &str) 
              SELECT 1
              FROM episode_files ef
              JOIN media_files mf ON mf.id = ef.media_file_id
-             WHERE ef.episode_id = ?
+             WHERE ef.episode_id = $1
                AND mf.scan_state = 'ok'
-         ) THEN 1 ELSE 0 END,
+         ) THEN TRUE ELSE FALSE END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $2",
     )
     .bind(episode_id)
     .bind(episode_id)
@@ -2808,17 +2800,22 @@ async fn load_media_tracks(
         return Ok(by_file);
     }
 
-    let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-        "SELECT id, media_file_id, track_type, language, title, codec, channels, CAST(is_default AS INTEGER) AS is_default, CAST(is_forced AS INTEGER) AS is_forced, stream_index FROM media_tracks WHERE media_file_id IN (",
+    let sql = format!(
+        "SELECT id, media_file_id, track_type, language, title, codec, channels,
+                CAST(CASE WHEN is_default THEN 1 ELSE 0 END AS BIGINT) AS is_default,
+                CAST(CASE WHEN is_forced THEN 1 ELSE 0 END AS BIGINT) AS is_forced,
+                stream_index
+         FROM media_tracks
+         WHERE media_file_id IN ({})
+         ORDER BY media_file_id, track_type, stream_index",
+        crate::db::numbered_bind_list(1, file_ids.len()),
     );
-    let mut separated = builder.separated(", ");
+    let mut query = sqlx::query(&sql);
     for id in file_ids {
-        separated.push_bind(id);
+        query = query.bind(id);
     }
-    separated.push_unseparated(") ORDER BY media_file_id, track_type, stream_index");
 
-    let rows = builder
-        .build()
+    let rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
@@ -2861,17 +2858,22 @@ async fn load_external_subtitles(
         return Ok(by_file);
     }
 
-    let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-        "SELECT id, media_file_id, path, language, title, format, CAST(is_default AS INTEGER) AS is_default, CAST(is_forced AS INTEGER) AS is_forced, CAST(is_hearing_impaired AS INTEGER) AS is_hearing_impaired FROM external_subtitles WHERE media_file_id IN (",
+    let sql = format!(
+        "SELECT id, media_file_id, path, language, title, format,
+                CAST(CASE WHEN is_default THEN 1 ELSE 0 END AS BIGINT) AS is_default,
+                CAST(CASE WHEN is_forced THEN 1 ELSE 0 END AS BIGINT) AS is_forced,
+                CAST(CASE WHEN is_hearing_impaired THEN 1 ELSE 0 END AS BIGINT) AS is_hearing_impaired
+         FROM external_subtitles
+         WHERE media_file_id IN ({})
+         ORDER BY media_file_id, path",
+        crate::db::numbered_bind_list(1, file_ids.len()),
     );
-    let mut separated = builder.separated(", ");
+    let mut query = sqlx::query(&sql);
     for id in file_ids {
-        separated.push_bind(id);
+        query = query.bind(id);
     }
-    separated.push_unseparated(") ORDER BY media_file_id, path");
 
-    let rows = builder
-        .build()
+    let rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
@@ -2931,21 +2933,20 @@ async fn load_primary_artwork(
         return Ok(by_owner);
     }
 
-    let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-        "SELECT owner_id, id, url, language, provider, score, width, height FROM artwork_refs WHERE owner_type = ",
+    let sql = format!(
+        "SELECT owner_id, id, url, language, provider, score, width, height
+         FROM artwork_refs
+         WHERE owner_type = $1
+           AND kind = $2
+           AND owner_id IN ({})",
+        crate::db::numbered_bind_list(3, owner_ids.len()),
     );
-    builder.push_bind(owner_type);
-    builder.push(" AND kind = ");
-    builder.push_bind(kind);
-    builder.push(" AND owner_id IN (");
-    let mut separated = builder.separated(", ");
+    let mut query = sqlx::query(&sql).bind(owner_type).bind(kind);
     for id in owner_ids {
-        separated.push_bind(id);
+        query = query.bind(id);
     }
-    separated.push_unseparated(")");
 
-    let rows = builder
-        .build()
+    let rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;

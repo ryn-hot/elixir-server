@@ -2166,7 +2166,7 @@ async fn seed_prism_recommended_pack_for_instances(
     Ok(())
 }
 
-fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
+pub(crate) fn trigger_extensions_reconcile(state: &AppState, reason: &str) {
     let state = state.clone();
     let reason = reason.to_string();
     tokio::spawn(async move {

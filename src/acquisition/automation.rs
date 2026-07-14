@@ -8781,7 +8781,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extensions (
                 extension_id, name, version, kind, trust_level, manifest_json, enabled
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(extension_id)
         .bind(extension_name)
@@ -8795,7 +8795,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extension_instances (
                 instance_id, extension_id, instance_name, config_json, enabled
-             ) VALUES (?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(instance_id.to_string())
         .bind(extension_id)
@@ -8807,7 +8807,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO providers (
                 provider_id, instance_id, capability, slot_id, cardinality, implementation, health_state
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(provider_id.to_string())
         .bind(instance_id.to_string())
@@ -8823,7 +8823,7 @@ mod tests {
 
     async fn test_provider_ref_exists(pool: &sqlx::AnyPool, provider_id: Uuid) -> Result<bool> {
         Ok(sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT CAST(provider_id AS TEXT) FROM providers WHERE CAST(provider_id AS TEXT) = ?",
+            "SELECT CAST(provider_id AS TEXT) FROM providers WHERE CAST(provider_id AS TEXT) = $1",
         )
         .bind(provider_id.to_string())
         .fetch_optional(pool)
@@ -11344,7 +11344,7 @@ mod tests {
         )
         .await?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE acquisition_targets SET search_attempts = 2 WHERE target_id = ?",
+            "UPDATE acquisition_targets SET search_attempts = 2 WHERE target_id = $1",
         )
         .bind(targets[0].target_id.to_string())
         .execute(&state.db_pool)
@@ -11392,7 +11392,7 @@ mod tests {
         let tracking_started_at: Option<String> = sqlx::query_scalar(
             "SELECT CAST(tracking_started_at AS TEXT)
              FROM acquisition_subscriptions
-             WHERE subscription_id = ?",
+             WHERE subscription_id = $1",
         )
         .bind(subscription.subscription_id.to_string())
         .fetch_one(&state.db_pool)

@@ -121,7 +121,7 @@ pub async fn load_sonarr_sources(
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
 
-    let rows = sqlx::query("SELECT id, config_json FROM source_configs WHERE extension_id = 'elixir.sonarr' AND enabled = 1")
+    let rows = sqlx::query("SELECT id, config_json FROM source_configs WHERE extension_id = 'elixir.sonarr' AND enabled = TRUE")
         .fetch_all(pool)
         .await
         .unwrap_or_default();

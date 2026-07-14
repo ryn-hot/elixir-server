@@ -43,32 +43,32 @@ pub async fn upsert_release(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_releases
-             SET subscription_id = ?,
-                 source_provider_id = ?,
-                 source_extension_id = ?,
-                 owner_id = ?,
-                 media_type = ?,
-                 title = ?,
-                 release_title = ?,
-                 source = ?,
-                 source_kind = ?,
-                 info_hash = ?,
-                 fingerprint = ?,
-                 release_kind = ?,
-                 resolver_kind = ?,
-                 resolver_version = ?,
-                 confidence = ?,
-                 score = ?,
-                 selected_route_logical_id = ?,
-                 selected_provider_id = ?,
-                 download_id = ?,
-                 remote_release_id = ?,
-                 state = ?,
-                 state_reason = ?,
-                 selected_candidate_json = ?,
-                 coverage_plan_json = ?,
+             SET subscription_id = $1,
+                 source_provider_id = $2,
+                 source_extension_id = $3,
+                 owner_id = $4,
+                 media_type = $5,
+                 title = $6,
+                 release_title = $7,
+                 source = $8,
+                 source_kind = $9,
+                 info_hash = $10,
+                 fingerprint = $11,
+                 release_kind = $12,
+                 resolver_kind = $13,
+                 resolver_version = $14,
+                 confidence = $15,
+                 score = $16,
+                 selected_route_logical_id = $17,
+                 selected_provider_id = $18,
+                 download_id = $19,
+                 remote_release_id = $20,
+                 state = $21,
+                 state_reason = $22,
+                 selected_candidate_json = $23,
+                 coverage_plan_json = $24,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE release_id = ?",
+             WHERE release_id = $25",
         )
         .bind(data.subscription_id.map(|value| value.to_string()))
         .bind(data.source_provider_id.map(|value| value.to_string()))
@@ -126,7 +126,7 @@ pub async fn upsert_release(
                 state_reason,
                 selected_candidate_json,
                 coverage_plan_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
         )
         .bind(release_id.to_string())
         .bind(data.subscription_id.map(|value| value.to_string()))
@@ -258,11 +258,11 @@ pub async fn update_release_review_state(
     let coverage_plan_json = json_to_string(coverage_plan.as_ref())?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
-             coverage_plan_json = ?,
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $4",
     )
     .bind(state.as_str())
     .bind(state_reason.as_deref())
@@ -296,31 +296,31 @@ pub async fn upsert_release_file(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_release_files
-             SET release_id = ?,
-                 file_index = ?,
-                 file_id = ?,
-                 provider_file_id = ?,
-                 path = ?,
-                 basename = ?,
-                 size_bytes = ?,
-                 selectable = ?,
-                 selected = ?,
-                 parsed_title = ?,
-                 parsed_season_number = ?,
-                 parsed_episode_number = ?,
-                 parsed_episode_end_number = ?,
-                 parsed_absolute_episode_number = ?,
-                 parsed_absolute_episode_end_number = ?,
-                 parsed_air_date = ?,
-                 parsed_quality = ?,
-                 parsed_language = ?,
-                 parsed_release_group = ?,
-                 parser_confidence = ?,
-                 parser_reason = ?,
-                 raw_json = ?,
-                 provider_metadata_json = ?,
+             SET release_id = $1,
+                 file_index = $2,
+                 file_id = $3,
+                 provider_file_id = $4,
+                 path = $5,
+                 basename = $6,
+                 size_bytes = $7,
+                 selectable = $8,
+                 selected = $9,
+                 parsed_title = $10,
+                 parsed_season_number = $11,
+                 parsed_episode_number = $12,
+                 parsed_episode_end_number = $13,
+                 parsed_absolute_episode_number = $14,
+                 parsed_absolute_episode_end_number = $15,
+                 parsed_air_date = $16,
+                 parsed_quality = $17,
+                 parsed_language = $18,
+                 parsed_release_group = $19,
+                 parser_confidence = $20,
+                 parser_reason = $21,
+                 raw_json = $22,
+                 provider_metadata_json = $23,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE release_file_id = ?",
+             WHERE release_file_id = $24",
         )
         .bind(data.release_id.to_string())
         .bind(data.file_index)
@@ -329,8 +329,8 @@ pub async fn upsert_release_file(
         .bind(data.path.trim())
         .bind(basename)
         .bind(data.size_bytes)
-        .bind(data.selectable)
-        .bind(data.selected)
+        .bind(if data.selectable { 1_i64 } else { 0_i64 })
+        .bind(data.selected.map(|value| if value { 1_i64 } else { 0_i64 }))
         .bind(data.parsed_title.as_deref())
         .bind(data.parsed_season_number)
         .bind(data.parsed_episode_number)
@@ -376,7 +376,7 @@ pub async fn upsert_release_file(
                 parser_reason,
                 raw_json,
                 provider_metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
         )
         .bind(release_file_id.to_string())
         .bind(data.release_id.to_string())
@@ -386,8 +386,8 @@ pub async fn upsert_release_file(
         .bind(data.path.trim())
         .bind(basename)
         .bind(data.size_bytes)
-        .bind(data.selectable)
-        .bind(data.selected)
+        .bind(if data.selectable { 1_i64 } else { 0_i64 })
+        .bind(data.selected.map(|value| if value { 1_i64 } else { 0_i64 }))
         .bind(data.parsed_title.as_deref())
         .bind(data.parsed_season_number)
         .bind(data.parsed_episode_number)
@@ -430,11 +430,11 @@ pub async fn update_release_file_selection(
 ) -> Result<Option<AcquisitionReleaseFile>> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_files
-         SET selected = ?,
+         SET selected = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_file_id = ?",
+         WHERE release_file_id = $2",
     )
-    .bind(selected)
+    .bind(selected.map(|value| if value { 1_i64 } else { 0_i64 }))
     .bind(release_file_id.to_string())
     .execute(pool)
     .await
@@ -457,17 +457,17 @@ pub async fn upsert_release_coverage(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_release_coverage
-             SET release_id = ?,
-                 release_file_id = ?,
-                 target_id = ?,
-                 coverage_kind = ?,
-                 confidence = ?,
-                 score = ?,
-                 reason = ?,
-                 state = ?,
-                 verified_by = ?,
+             SET release_id = $1,
+                 release_file_id = $2,
+                 target_id = $3,
+                 coverage_kind = $4,
+                 confidence = $5,
+                 score = $6,
+                 reason = $7,
+                 state = $8,
+                 verified_by = $9,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE coverage_id = ?",
+             WHERE coverage_id = $10",
         )
         .bind(data.release_id.to_string())
         .bind(data.release_file_id.map(|value| value.to_string()))
@@ -495,7 +495,7 @@ pub async fn upsert_release_coverage(
                 reason,
                 state,
                 verified_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(coverage_id.to_string())
         .bind(data.release_id.to_string())
@@ -539,11 +539,11 @@ pub async fn update_release_coverage_review_state(
 ) -> Result<Option<AcquisitionReleaseCoverage>> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_coverage
-         SET state = ?,
-             reason = ?,
-             verified_by = ?,
+         SET state = $1,
+             reason = $2,
+             verified_by = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE coverage_id = ?",
+         WHERE coverage_id = $4",
     )
     .bind(state.as_str())
     .bind(reason.as_deref())
@@ -571,18 +571,18 @@ pub async fn upsert_release_job(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_release_jobs
-             SET release_id = ?,
-                 route_logical_id = ?,
-                 provider_id = ?,
-                 download_id = ?,
-                 remote_release_id = ?,
-                 state = ?,
-                 state_reason = ?,
-                 active = ?,
-                 started_at = ?,
-                 completed_at = ?,
+             SET release_id = $1,
+                 route_logical_id = $2,
+                 provider_id = $3,
+                 download_id = $4,
+                 remote_release_id = $5,
+                 state = $6,
+                 state_reason = $7,
+                 active = $8,
+                 started_at = $9,
+                 completed_at = $10,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE release_job_id = ?",
+             WHERE release_job_id = $11",
         )
         .bind(data.release_id.to_string())
         .bind(data.route_logical_id.trim())
@@ -591,7 +591,7 @@ pub async fn upsert_release_job(
         .bind(data.remote_release_id.as_deref())
         .bind(data.state.as_str())
         .bind(data.state_reason.as_deref())
-        .bind(data.active)
+        .bind(if data.active { 1_i64 } else { 0_i64 })
         .bind(data.started_at.map(db_datetime_string))
         .bind(data.completed_at.map(db_datetime_string))
         .bind(release_job_id.to_string())
@@ -612,7 +612,7 @@ pub async fn upsert_release_job(
                 active,
                 started_at,
                 completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(release_job_id.to_string())
         .bind(data.release_id.to_string())
@@ -622,7 +622,7 @@ pub async fn upsert_release_job(
         .bind(data.remote_release_id.as_deref())
         .bind(data.state.as_str())
         .bind(data.state_reason.as_deref())
-        .bind(data.active)
+        .bind(if data.active { 1_i64 } else { 0_i64 })
         .bind(data.started_at.map(db_datetime_string))
         .bind(data.completed_at.map(db_datetime_string))
         .execute(pool)
@@ -646,18 +646,22 @@ pub async fn update_release_job_state(
     let completed_at = update.completed_at.or(existing.completed_at);
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
-         SET state = ?,
-             state_reason = ?,
-             active = ?,
-             download_id = ?,
-             remote_release_id = ?,
-             completed_at = ?,
+         SET state = $1,
+             state_reason = $2,
+             active = $3,
+             download_id = $4,
+             remote_release_id = $5,
+             completed_at = $6,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_job_id = ?",
+         WHERE release_job_id = $7",
     )
     .bind(update.state.as_str())
     .bind(update.state_reason.or(existing.state_reason))
-    .bind(update.active.unwrap_or(existing.active))
+    .bind(if update.active.unwrap_or(existing.active) {
+        1_i64
+    } else {
+        0_i64
+    })
     .bind(update.download_id.or(existing.download_id))
     .bind(update.remote_release_id.or(existing.remote_release_id))
     .bind(completed_at.map(db_datetime_string))
@@ -688,7 +692,7 @@ pub async fn count_active_release_jobs_by_route(
         "SELECT COUNT(*)
          FROM acquisition_release_jobs
          WHERE active = 1
-           AND route_logical_id = ?
+           AND route_logical_id = $1
            AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
     )
     .bind(route_logical_id.trim())
@@ -720,7 +724,7 @@ pub async fn count_active_release_jobs_by_subscription(
          FROM acquisition_release_jobs j
          JOIN acquisition_releases r ON r.release_id = j.release_id
          WHERE j.active = 1
-           AND r.subscription_id = ?
+           AND r.subscription_id = $1
            AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
     )
     .bind(subscription_id.to_string())
@@ -740,8 +744,8 @@ pub async fn count_active_release_jobs_by_subscription_route(
          FROM acquisition_release_jobs j
          JOIN acquisition_releases r ON r.release_id = j.release_id
          WHERE j.active = 1
-           AND j.route_logical_id = ?
-           AND r.subscription_id = ?
+           AND j.route_logical_id = $1
+           AND r.subscription_id = $2
            AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
     )
     .bind(route_logical_id.trim())
@@ -761,7 +765,7 @@ pub async fn count_stale_active_release_jobs(
          FROM acquisition_release_jobs
          WHERE active = 1
            AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
-           AND updated_at <= ?",
+           AND updated_at <= $1",
     )
     .bind(db_datetime_string(stale_before))
     .fetch_one(pool)
@@ -787,20 +791,20 @@ pub async fn upsert_anime_graph_snapshot(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_anime_graph_snapshots
-             SET subscription_id = ?,
-                 owner_id = ?,
-                 media_type = ?,
-                 anilist_root_id = ?,
-                 anilist_season_id = ?,
-                 anilist_status = ?,
-                 anilist_next_airing_at = ?,
-                 tvdb_series_id = ?,
-                 anidb_anime_id = ?,
-                 fingerprint = ?,
-                 graph_json = ?,
-                 aliases_json = ?,
+             SET subscription_id = $1,
+                 owner_id = $2,
+                 media_type = $3,
+                 anilist_root_id = $4,
+                 anilist_season_id = $5,
+                 anilist_status = $6,
+                 anilist_next_airing_at = $7,
+                 tvdb_series_id = $8,
+                 anidb_anime_id = $9,
+                 fingerprint = $10,
+                 graph_json = $11,
+                 aliases_json = $12,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE graph_snapshot_id = ?",
+             WHERE graph_snapshot_id = $13",
         )
         .bind(data.subscription_id.map(|value| value.to_string()))
         .bind(data.owner_id.trim())
@@ -834,7 +838,7 @@ pub async fn upsert_anime_graph_snapshot(
                 fingerprint,
                 graph_json,
                 aliases_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(graph_snapshot_id.to_string())
         .bind(data.subscription_id.map(|value| value.to_string()))
@@ -888,16 +892,16 @@ pub async fn upsert_anime_candidate_parse(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_anime_candidate_parses
-             SET release_id = ?,
-                 source_provider_id = ?,
-                 source_candidate_id = ?,
-                 release_title = ?,
-                 normalized_title = ?,
-                 parsed_json = ?,
-                 confidence = ?,
-                 review_reasons_json = ?,
+             SET release_id = $1,
+                 source_provider_id = $2,
+                 source_candidate_id = $3,
+                 release_title = $4,
+                 normalized_title = $5,
+                 parsed_json = $6,
+                 confidence = $7,
+                 review_reasons_json = $8,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE candidate_parse_id = ?",
+             WHERE candidate_parse_id = $9",
         )
         .bind(data.release_id.to_string())
         .bind(data.source_provider_id.map(|value| value.to_string()))
@@ -923,7 +927,7 @@ pub async fn upsert_anime_candidate_parse(
                 parsed_json,
                 confidence,
                 review_reasons_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(candidate_parse_id.to_string())
         .bind(data.release_id.to_string())
@@ -972,19 +976,19 @@ pub async fn upsert_file_hash(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_file_hashes
-             SET release_file_id = ?,
-                 local_file_id = ?,
-                 file_path = ?,
-                 size_bytes = ?,
-                 mtime_fingerprint = ?,
-                 ed2k = ?,
-                 crc32 = ?,
-                 hash_status = ?,
-                 hash_computed_at = ?,
-                 hash_invalidated_at = ?,
-                 filename_history_json = ?,
+             SET release_file_id = $1,
+                 local_file_id = $2,
+                 file_path = $3,
+                 size_bytes = $4,
+                 mtime_fingerprint = $5,
+                 ed2k = $6,
+                 crc32 = $7,
+                 hash_status = $8,
+                 hash_computed_at = $9,
+                 hash_invalidated_at = $10,
+                 filename_history_json = $11,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE file_hash_id = ?",
+             WHERE file_hash_id = $12",
         )
         .bind(data.release_file_id.map(|value| value.to_string()))
         .bind(data.local_file_id.as_deref())
@@ -1016,7 +1020,7 @@ pub async fn upsert_file_hash(
                 hash_computed_at,
                 hash_invalidated_at,
                 filename_history_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(file_hash_id.to_string())
         .bind(data.release_file_id.map(|value| value.to_string()))
@@ -1112,29 +1116,29 @@ pub async fn upsert_anidb_file_cache(
     {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_anidb_file_cache
-             SET ed2k = ?,
-                 size_bytes = ?,
-                 lookup_status = ?,
-                 anidb_file_id = ?,
-                 anidb_anime_id = ?,
-                 anidb_episode_ids_json = ?,
-                 anidb_group_id = ?,
-                 anidb_group_name = ?,
-                 anidb_group_short_name = ?,
-                 anidb_version = ?,
-                 anidb_source = ?,
-                 anidb_quality = ?,
-                 anidb_audio_languages_json = ?,
-                 anidb_subtitle_languages_json = ?,
-                 anidb_state_flags_json = ?,
-                 anidb_original_filename = ?,
-                 released_at = ?,
-                 raw_response = ?,
-                 positive_cached_at = ?,
-                 negative_cached_until = ?,
-                 last_lookup_attempt_at = ?,
+             SET ed2k = $1,
+                 size_bytes = $2,
+                 lookup_status = $3,
+                 anidb_file_id = $4,
+                 anidb_anime_id = $5,
+                 anidb_episode_ids_json = $6,
+                 anidb_group_id = $7,
+                 anidb_group_name = $8,
+                 anidb_group_short_name = $9,
+                 anidb_version = $10,
+                 anidb_source = $11,
+                 anidb_quality = $12,
+                 anidb_audio_languages_json = $13,
+                 anidb_subtitle_languages_json = $14,
+                 anidb_state_flags_json = $15,
+                 anidb_original_filename = $16,
+                 released_at = $17,
+                 raw_response = $18,
+                 positive_cached_at = $19,
+                 negative_cached_until = $20,
+                 last_lookup_attempt_at = $21,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE lookup_key = ?",
+             WHERE lookup_key = $22",
         )
         .bind(data.ed2k.trim().to_ascii_lowercase())
         .bind(data.size_bytes)
@@ -1186,7 +1190,7 @@ pub async fn upsert_anidb_file_cache(
                 positive_cached_at,
                 negative_cached_until,
                 last_lookup_attempt_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(data.lookup_key.trim())
         .bind(data.ed2k.trim().to_ascii_lowercase())
@@ -1246,22 +1250,22 @@ pub async fn upsert_anidb_file_xref(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_anidb_file_xrefs
-             SET lookup_key = ?,
-                 release_file_id = ?,
-                 anidb_file_id = ?,
-                 anidb_anime_id = ?,
-                 anidb_episode_id = ?,
-                 episode_type = ?,
-                 percentage_start = ?,
-                 percentage_end = ?,
-                 episode_order = ?,
-                 provider = ?,
-                 confidence = ?,
-                 is_manual_override = ?,
-                 created_from_release_id = ?,
-                 created_from_target_id = ?,
+             SET lookup_key = $1,
+                 release_file_id = $2,
+                 anidb_file_id = $3,
+                 anidb_anime_id = $4,
+                 anidb_episode_id = $5,
+                 episode_type = $6,
+                 percentage_start = $7,
+                 percentage_end = $8,
+                 episode_order = $9,
+                 provider = $10,
+                 confidence = $11,
+                 is_manual_override = $12,
+                 created_from_release_id = $13,
+                 created_from_target_id = $14,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE xref_id = ?",
+             WHERE xref_id = $15",
         )
         .bind(data.lookup_key.trim())
         .bind(data.release_file_id.map(|value| value.to_string()))
@@ -1274,7 +1278,11 @@ pub async fn upsert_anidb_file_xref(
         .bind(data.episode_order)
         .bind(data.provider.trim())
         .bind(data.confidence.as_str())
-        .bind(data.is_manual_override)
+        .bind(if data.is_manual_override {
+            1_i64
+        } else {
+            0_i64
+        })
         .bind(data.created_from_release_id.map(|value| value.to_string()))
         .bind(data.created_from_target_id.map(|value| value.to_string()))
         .bind(xref_id.to_string())
@@ -1299,7 +1307,7 @@ pub async fn upsert_anidb_file_xref(
                 is_manual_override,
                 created_from_release_id,
                 created_from_target_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(xref_id.to_string())
         .bind(data.lookup_key.trim())
@@ -1313,7 +1321,11 @@ pub async fn upsert_anidb_file_xref(
         .bind(data.episode_order)
         .bind(data.provider.trim())
         .bind(data.confidence.as_str())
-        .bind(data.is_manual_override)
+        .bind(if data.is_manual_override {
+            1_i64
+        } else {
+            0_i64
+        })
         .bind(data.created_from_release_id.map(|value| value.to_string()))
         .bind(data.created_from_target_id.map(|value| value.to_string()))
         .execute(pool)
@@ -1377,7 +1389,7 @@ pub async fn create_anime_match_attempt(
             verified_targets_json,
             outcome,
             rejection_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(match_attempt_id.to_string())
     .bind(data.release_id.map(|value| value.to_string()))
@@ -1447,7 +1459,7 @@ pub async fn create_anime_identity_mismatch(
             confidence,
             state,
             reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(mismatch_id.to_string())
     .bind(data.release_id.map(|value| value.to_string()))
@@ -2553,48 +2565,48 @@ CAST(updated_at AS TEXT) AS updated_at"
 const RELEASE_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE release_id = ? LIMIT 1"
+    " FROM acquisition_releases WHERE release_id = $1 LIMIT 1"
 );
 
 const RELEASE_SELECT_BY_FINGERPRINT: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE owner_id = ? AND source_extension_id = ? AND fingerprint = ? LIMIT 1"
+    " FROM acquisition_releases WHERE owner_id = $1 AND source_extension_id = $2 AND fingerprint = $3 LIMIT 1"
 );
 const RELEASE_SELECT_BY_DOWNLOAD_ID: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE download_id = ? ORDER BY updated_at DESC LIMIT 1"
+    " FROM acquisition_releases WHERE download_id = $1 ORDER BY updated_at DESC LIMIT 1"
 );
 const RELEASE_SELECT_RECENT: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases ORDER BY updated_at DESC LIMIT ?"
+    " FROM acquisition_releases ORDER BY updated_at DESC LIMIT $1"
 );
 const RELEASE_SELECT_BY_SUBSCRIPTION: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE subscription_id = ? ORDER BY updated_at DESC LIMIT ?"
+    " FROM acquisition_releases WHERE subscription_id = $1 ORDER BY updated_at DESC LIMIT $2"
 );
 const RELEASE_SELECT_BY_STATE: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE state = ? ORDER BY updated_at DESC LIMIT ?"
+    " FROM acquisition_releases WHERE state = $1 ORDER BY updated_at DESC LIMIT $2"
 );
 const RELEASE_SELECT_BY_SUBSCRIPTION_AND_STATE: &str = concat!(
     "SELECT ",
     release_columns!(),
-    " FROM acquisition_releases WHERE subscription_id = ? AND state = ? ORDER BY updated_at DESC LIMIT ?"
+    " FROM acquisition_releases WHERE subscription_id = $1 AND state = $2 ORDER BY updated_at DESC LIMIT $3"
 );
 const RELEASE_SELECT_ACTIVE_BY_ROUTE: &str = concat!(
     "SELECT ",
     release_columns!(),
     " FROM acquisition_releases
-         WHERE selected_route_logical_id = ?
+         WHERE selected_route_logical_id = $1
            AND download_id IS NOT NULL
            AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
          ORDER BY created_at ASC
-         LIMIT ?"
+         LIMIT $2"
 );
 
 macro_rules! release_file_columns {
@@ -2631,32 +2643,32 @@ CAST(updated_at AS TEXT) AS updated_at"
 const RELEASE_FILE_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_file_id = ? LIMIT 1"
+    " FROM acquisition_release_files WHERE release_file_id = $1 LIMIT 1"
 );
 const RELEASE_FILE_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_id = ? ORDER BY file_index, path"
+    " FROM acquisition_release_files WHERE release_id = $1 ORDER BY file_index, path"
 );
 const RELEASE_FILE_SELECT_BY_FILE_ID: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_id = ? AND file_id = ? LIMIT 1"
+    " FROM acquisition_release_files WHERE release_id = $1 AND file_id = $2 LIMIT 1"
 );
 const RELEASE_FILE_SELECT_BY_PROVIDER_FILE_ID: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_id = ? AND provider_file_id = ? LIMIT 1"
+    " FROM acquisition_release_files WHERE release_id = $1 AND provider_file_id = $2 LIMIT 1"
 );
 const RELEASE_FILE_SELECT_BY_FILE_INDEX: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_id = ? AND file_index = ? LIMIT 1"
+    " FROM acquisition_release_files WHERE release_id = $1 AND file_index = $2 LIMIT 1"
 );
 const RELEASE_FILE_SELECT_BY_PATH: &str = concat!(
     "SELECT ",
     release_file_columns!(),
-    " FROM acquisition_release_files WHERE release_id = ? AND path = ? LIMIT 1"
+    " FROM acquisition_release_files WHERE release_id = $1 AND path = $2 LIMIT 1"
 );
 
 macro_rules! release_coverage_columns {
@@ -2679,22 +2691,22 @@ CAST(updated_at AS TEXT) AS updated_at"
 const RELEASE_COVERAGE_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     release_coverage_columns!(),
-    " FROM acquisition_release_coverage WHERE coverage_id = ? LIMIT 1"
+    " FROM acquisition_release_coverage WHERE coverage_id = $1 LIMIT 1"
 );
 const RELEASE_COVERAGE_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     release_coverage_columns!(),
-    " FROM acquisition_release_coverage WHERE release_id = ? ORDER BY target_id, release_file_id"
+    " FROM acquisition_release_coverage WHERE release_id = $1 ORDER BY target_id, release_file_id"
 );
 const RELEASE_COVERAGE_SELECT_BY_FILE_TARGET: &str = concat!(
     "SELECT ",
     release_coverage_columns!(),
-    " FROM acquisition_release_coverage WHERE release_id = ? AND target_id = ? AND release_file_id = ? LIMIT 1"
+    " FROM acquisition_release_coverage WHERE release_id = $1 AND target_id = $2 AND release_file_id = $3 LIMIT 1"
 );
 const RELEASE_COVERAGE_SELECT_BY_TARGET_WITHOUT_FILE: &str = concat!(
     "SELECT ",
     release_coverage_columns!(),
-    " FROM acquisition_release_coverage WHERE release_id = ? AND target_id = ? AND release_file_id IS NULL LIMIT 1"
+    " FROM acquisition_release_coverage WHERE release_id = $1 AND target_id = $2 AND release_file_id IS NULL LIMIT 1"
 );
 
 macro_rules! release_job_columns {
@@ -2718,22 +2730,22 @@ CAST(updated_at AS TEXT) AS updated_at"
 const RELEASE_JOB_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     release_job_columns!(),
-    " FROM acquisition_release_jobs WHERE release_job_id = ? LIMIT 1"
+    " FROM acquisition_release_jobs WHERE release_job_id = $1 LIMIT 1"
 );
 const RELEASE_JOB_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     release_job_columns!(),
-    " FROM acquisition_release_jobs WHERE release_id = ? ORDER BY created_at"
+    " FROM acquisition_release_jobs WHERE release_id = $1 ORDER BY created_at"
 );
 const RELEASE_JOB_SELECT_BY_DOWNLOAD_ID: &str = concat!(
     "SELECT ",
     release_job_columns!(),
-    " FROM acquisition_release_jobs WHERE release_id = ? AND download_id = ? LIMIT 1"
+    " FROM acquisition_release_jobs WHERE release_id = $1 AND download_id = $2 LIMIT 1"
 );
 const RELEASE_JOB_SELECT_BY_REMOTE_ID: &str = concat!(
     "SELECT ",
     release_job_columns!(),
-    " FROM acquisition_release_jobs WHERE release_id = ? AND remote_release_id = ? LIMIT 1"
+    " FROM acquisition_release_jobs WHERE release_id = $1 AND remote_release_id = $2 LIMIT 1"
 );
 
 macro_rules! anime_graph_columns {
@@ -2759,17 +2771,17 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIME_GRAPH_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     anime_graph_columns!(),
-    " FROM acquisition_anime_graph_snapshots WHERE graph_snapshot_id = ? LIMIT 1"
+    " FROM acquisition_anime_graph_snapshots WHERE graph_snapshot_id = $1 LIMIT 1"
 );
 const ANIME_GRAPH_SELECT_BY_SUBSCRIPTION_FINGERPRINT: &str = concat!(
     "SELECT ",
     anime_graph_columns!(),
-    " FROM acquisition_anime_graph_snapshots WHERE subscription_id = ? AND fingerprint = ? LIMIT 1"
+    " FROM acquisition_anime_graph_snapshots WHERE subscription_id = $1 AND fingerprint = $2 LIMIT 1"
 );
 const ANIME_GRAPH_SELECT_BY_OWNER_FINGERPRINT: &str = concat!(
     "SELECT ",
     anime_graph_columns!(),
-    " FROM acquisition_anime_graph_snapshots WHERE subscription_id IS NULL AND owner_id = ? AND fingerprint = ? LIMIT 1"
+    " FROM acquisition_anime_graph_snapshots WHERE subscription_id IS NULL AND owner_id = $1 AND fingerprint = $2 LIMIT 1"
 );
 
 macro_rules! anime_candidate_parse_columns {
@@ -2791,17 +2803,17 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIME_CANDIDATE_PARSE_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     anime_candidate_parse_columns!(),
-    " FROM acquisition_anime_candidate_parses WHERE candidate_parse_id = ? LIMIT 1"
+    " FROM acquisition_anime_candidate_parses WHERE candidate_parse_id = $1 LIMIT 1"
 );
 const ANIME_CANDIDATE_PARSE_SELECT_BY_SOURCE_ID: &str = concat!(
     "SELECT ",
     anime_candidate_parse_columns!(),
-    " FROM acquisition_anime_candidate_parses WHERE release_id = ? AND source_candidate_id = ? LIMIT 1"
+    " FROM acquisition_anime_candidate_parses WHERE release_id = $1 AND source_candidate_id = $2 LIMIT 1"
 );
 const ANIME_CANDIDATE_PARSE_SELECT_BY_RELEASE_TITLE: &str = concat!(
     "SELECT ",
     anime_candidate_parse_columns!(),
-    " FROM acquisition_anime_candidate_parses WHERE release_id = ? AND source_candidate_id IS NULL AND release_title = ? LIMIT 1"
+    " FROM acquisition_anime_candidate_parses WHERE release_id = $1 AND source_candidate_id IS NULL AND release_title = $2 LIMIT 1"
 );
 
 macro_rules! file_hash_columns {
@@ -2826,27 +2838,27 @@ CAST(updated_at AS TEXT) AS updated_at"
 const FILE_HASH_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     file_hash_columns!(),
-    " FROM acquisition_file_hashes WHERE file_hash_id = ? LIMIT 1"
+    " FROM acquisition_file_hashes WHERE file_hash_id = $1 LIMIT 1"
 );
 const FILE_HASH_SELECT_BY_PATH: &str = concat!(
     "SELECT ",
     file_hash_columns!(),
-    " FROM acquisition_file_hashes WHERE file_path = ? LIMIT 1"
+    " FROM acquisition_file_hashes WHERE file_path = $1 LIMIT 1"
 );
 const FILE_HASH_SELECT_BY_LOCAL_FILE_ID: &str = concat!(
     "SELECT ",
     file_hash_columns!(),
-    " FROM acquisition_file_hashes WHERE local_file_id = ? LIMIT 1"
+    " FROM acquisition_file_hashes WHERE local_file_id = $1 LIMIT 1"
 );
 const FILE_HASH_SELECT_BY_ED2K_SIZE: &str = concat!(
     "SELECT ",
     file_hash_columns!(),
-    " FROM acquisition_file_hashes WHERE ed2k = ? AND size_bytes = ? LIMIT 1"
+    " FROM acquisition_file_hashes WHERE ed2k = $1 AND size_bytes = $2 LIMIT 1"
 );
 const FILE_HASH_SELECT_WORK: &str = concat!(
     "SELECT ",
     file_hash_columns!(),
-    " FROM acquisition_file_hashes WHERE hash_status IN ('pending', 'invalidated') ORDER BY updated_at, created_at LIMIT ?"
+    " FROM acquisition_file_hashes WHERE hash_status IN ('pending', 'invalidated') ORDER BY updated_at, created_at LIMIT $1"
 );
 
 macro_rules! anidb_file_cache_columns {
@@ -2881,7 +2893,7 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIDB_FILE_CACHE_SELECT_BY_KEY: &str = concat!(
     "SELECT ",
     anidb_file_cache_columns!(),
-    " FROM acquisition_anidb_file_cache WHERE lookup_key = ? LIMIT 1"
+    " FROM acquisition_anidb_file_cache WHERE lookup_key = $1 LIMIT 1"
 );
 
 macro_rules! anidb_file_xref_columns {
@@ -2909,17 +2921,17 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIDB_FILE_XREF_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     anidb_file_xref_columns!(),
-    " FROM acquisition_anidb_file_xrefs WHERE xref_id = ? LIMIT 1"
+    " FROM acquisition_anidb_file_xrefs WHERE xref_id = $1 LIMIT 1"
 );
 const ANIDB_FILE_XREF_SELECT_BY_IDENTITY: &str = concat!(
     "SELECT ",
     anidb_file_xref_columns!(),
-    " FROM acquisition_anidb_file_xrefs WHERE lookup_key = ? AND anidb_episode_id = ? AND percentage_start = ? AND percentage_end = ? AND episode_order = ? LIMIT 1"
+    " FROM acquisition_anidb_file_xrefs WHERE lookup_key = $1 AND anidb_episode_id = $2 AND percentage_start = $3 AND percentage_end = $4 AND episode_order = $5 LIMIT 1"
 );
 const ANIDB_FILE_XREF_SELECT_BY_LOOKUP: &str = concat!(
     "SELECT ",
     anidb_file_xref_columns!(),
-    " FROM acquisition_anidb_file_xrefs WHERE lookup_key = ? ORDER BY episode_order, anidb_episode_id"
+    " FROM acquisition_anidb_file_xrefs WHERE lookup_key = $1 ORDER BY episode_order, anidb_episode_id"
 );
 
 macro_rules! anime_match_attempt_columns {
@@ -2944,12 +2956,12 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIME_MATCH_ATTEMPT_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     anime_match_attempt_columns!(),
-    " FROM acquisition_anime_match_attempts WHERE match_attempt_id = ? LIMIT 1"
+    " FROM acquisition_anime_match_attempts WHERE match_attempt_id = $1 LIMIT 1"
 );
 const ANIME_MATCH_ATTEMPT_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     anime_match_attempt_columns!(),
-    " FROM acquisition_anime_match_attempts WHERE release_id = ? ORDER BY created_at"
+    " FROM acquisition_anime_match_attempts WHERE release_id = $1 ORDER BY created_at"
 );
 
 macro_rules! anime_identity_mismatch_columns {
@@ -2972,12 +2984,12 @@ CAST(updated_at AS TEXT) AS updated_at"
 const ANIME_IDENTITY_MISMATCH_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     anime_identity_mismatch_columns!(),
-    " FROM acquisition_anime_identity_mismatches WHERE mismatch_id = ? LIMIT 1"
+    " FROM acquisition_anime_identity_mismatches WHERE mismatch_id = $1 LIMIT 1"
 );
 const ANIME_IDENTITY_MISMATCH_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     anime_identity_mismatch_columns!(),
-    " FROM acquisition_anime_identity_mismatches WHERE release_id = ? ORDER BY created_at"
+    " FROM acquisition_anime_identity_mismatches WHERE release_id = $1 ORDER BY created_at"
 );
 
 #[cfg(test)]
@@ -3563,8 +3575,8 @@ mod tests {
         );
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_release_jobs
-             SET updated_at = ?
-             WHERE download_id = ?",
+             SET updated_at = $1
+             WHERE download_id = $2",
         )
         .bind(db_datetime_string(Utc::now() - chrono::Duration::hours(8)))
         .bind("torrent-a")

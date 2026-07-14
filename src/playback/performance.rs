@@ -253,8 +253,8 @@ pub async fn load_playback_performance_envelopes(
             invalidation_fingerprint,
             last_observed_at
          FROM playback_performance_envelopes
-         WHERE host_fingerprint = ?
-           AND elixir_version = ?
+         WHERE host_fingerprint = $1
+           AND elixir_version = $2
          ORDER BY workload_class_id, pipeline_signature, confidence DESC, updated_at DESC",
     )
     .bind(host_fingerprint)
@@ -313,7 +313,7 @@ pub async fn upsert_playback_performance_envelope(
             last_observed_at,
             created_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
         ON CONFLICT(host_fingerprint, workload_class_id, pipeline_signature, invalidation_fingerprint)
         DO UPDATE SET
             id = excluded.id,
@@ -412,21 +412,21 @@ pub async fn record_playback_performance_observation(
         serde_json::to_string(&envelope.remediation_codes).context("serialize remediation")?;
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE playback_performance_envelopes
-         SET support_decision = ?,
-             performance_decision = ?,
-             confidence = ?,
-             p50_realtime_factor_millis = ?,
-             p95_realtime_factor_millis = ?,
-             startup_latency_ms = ?,
-             first_segment_latency_ms = ?,
-             failure_count = ?,
-             sample_count = ?,
-             reasons_json = ?,
-             warnings_json = ?,
-             remediation_json = ?,
-             last_observed_at = ?,
-             updated_at = ?
-         WHERE id = ?",
+         SET support_decision = $1,
+             performance_decision = $2,
+             confidence = $3,
+             p50_realtime_factor_millis = $4,
+             p95_realtime_factor_millis = $5,
+             startup_latency_ms = $6,
+             first_segment_latency_ms = $7,
+             failure_count = $8,
+             sample_count = $9,
+             reasons_json = $10,
+             warnings_json = $11,
+             remediation_json = $12,
+             last_observed_at = $13,
+             updated_at = $14
+         WHERE id = $15",
     )
     .bind(envelope.support_decision.as_str())
     .bind(envelope.performance_decision.as_str())
@@ -1571,7 +1571,7 @@ async fn load_playback_performance_envelope_by_id(
             invalidation_fingerprint,
             last_observed_at
          FROM playback_performance_envelopes
-         WHERE id = ?",
+         WHERE id = $1",
     )
     .bind(envelope_id)
     .fetch_optional(pool)
@@ -2359,10 +2359,10 @@ fn envelope_from_row(row: sqlx::any::AnyRow) -> Result<PlaybackPerformanceEnvelo
         support_decision: parse_support_decision(&support_decision),
         performance_decision: parse_performance_decision(&performance_decision),
         confidence: parse_confidence(&confidence),
-        p50_realtime_factor_millis: optional_i32_column(&row, "p50_realtime_factor_millis"),
-        p95_realtime_factor_millis: optional_i32_column(&row, "p95_realtime_factor_millis"),
-        startup_latency_ms: optional_i64_column(&row, "startup_latency_ms"),
-        first_segment_latency_ms: optional_i64_column(&row, "first_segment_latency_ms"),
+        p50_realtime_factor_millis: optional_i32_column(&row, "p50_realtime_factor_millis")?,
+        p95_realtime_factor_millis: optional_i32_column(&row, "p95_realtime_factor_millis")?,
+        startup_latency_ms: optional_i64_column(&row, "startup_latency_ms")?,
+        first_segment_latency_ms: optional_i64_column(&row, "first_segment_latency_ms")?,
         failure_count: row.try_get("failure_count")?,
         sample_count: row.try_get("sample_count")?,
         invalidation_fingerprint: row.try_get("invalidation_fingerprint")?,
@@ -2402,12 +2402,15 @@ fn parse_confidence(raw: &str) -> PlaybackPerformanceConfidence {
     }
 }
 
-fn optional_i32_column(row: &sqlx::any::AnyRow, column: &str) -> Option<i32> {
-    optional_i64_column(row, column).and_then(|value| i32::try_from(value).ok())
+fn optional_i32_column(row: &sqlx::any::AnyRow, column: &str) -> Result<Option<i32>> {
+    optional_i64_column(row, column)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(Into::into)
 }
 
-fn optional_i64_column(row: &sqlx::any::AnyRow, column: &str) -> Option<i64> {
-    row.try_get::<i64, _>(column).ok()
+fn optional_i64_column(row: &sqlx::any::AnyRow, column: &str) -> Result<Option<i64>> {
+    row.try_get(column).map_err(Into::into)
 }
 
 fn parse_string_list(raw: &str) -> Result<Vec<String>> {

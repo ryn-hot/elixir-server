@@ -677,6 +677,7 @@ impl<'a> Executor<'a> {
             .map(|port| PortMapping {
                 container_port: port.container,
                 host_port: port.host,
+                host_ip: None,
                 protocol: None,
             })
             .collect();
@@ -9056,7 +9057,7 @@ mod tests {
             })
             .await?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind("cloudflare-warp")
         .bind("Cloudflare WARP")
@@ -9077,7 +9078,7 @@ mod tests {
         .execute(&database.pool)
         .await?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO download_warp_enrollments (id, profile_id, enrollment_id, identity_secret_ref, status, disclosure_version) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO download_warp_enrollments (id, profile_id, enrollment_id, identity_secret_ref, status, disclosure_version) VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("cloudflare-warp")
@@ -9182,7 +9183,7 @@ mod tests {
         assert!(app.ports.is_empty());
 
         let status: String = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT status FROM download_warp_enrollments WHERE profile_id = ?",
+            "SELECT status FROM download_warp_enrollments WHERE profile_id = $1",
         )
         .bind("cloudflare-warp")
         .fetch_one(&database.pool)
@@ -12136,6 +12137,7 @@ PersistentKeepalive = 25
                 vec![PortMapping {
                     container_port: 8080,
                     host_port: Some(0),
+                    host_ip: None,
                     protocol: None,
                 }]
             },

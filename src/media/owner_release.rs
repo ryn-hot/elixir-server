@@ -549,10 +549,10 @@ async fn release_acquisition_owner(
     let target_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
          SET state = 'excluded',
-             state_reason = ?,
+             state_reason = $1,
              next_search_after = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $2
            AND state IN ('pending', 'searching', 'blocked', 'submitted')",
     )
     .bind("Released by media owner request.")
@@ -568,7 +568,7 @@ async fn release_acquisition_owner(
              candidate_search_after = CURRENT_TIMESTAMP,
              metadata_refresh_after = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription_id.to_string())
     .execute(&state.db_pool)
@@ -578,13 +578,13 @@ async fn release_acquisition_owner(
     let job_result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
          SET active = 0,
-             state_reason = ?,
+             state_reason = $1,
              updated_at = CURRENT_TIMESTAMP
          WHERE active = 1
            AND release_id IN (
                SELECT release_id
                FROM acquisition_releases
-               WHERE subscription_id = ?
+               WHERE subscription_id = $2
            )",
     )
     .bind("Owner release stopped monitoring for this media item.")
@@ -624,16 +624,16 @@ async fn block_acquisition_episode_target(
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
          SET state = 'excluded',
-             state_reason = ?,
+             state_reason = $1,
              next_search_after = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?
+         WHERE subscription_id = $2
            AND state IN ('pending', 'searching', 'blocked', 'submitted')
            AND (
-               (season_number = ? AND episode_number = ?)
-               OR absolute_episode_number = ?
-               OR target_key = ?
-               OR target_key = ?
+               (season_number = $3 AND episode_number = $4)
+               OR absolute_episode_number = $5
+               OR target_key = $6
+               OR target_key = $7
            )",
     )
     .bind("Excluded by episode owner-release request.")

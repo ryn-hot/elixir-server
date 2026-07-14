@@ -33,7 +33,7 @@ pub async fn get_artwork(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let row = sqlx::query(
-        "SELECT ar.url, ar.kind, ac.local_path FROM artwork_refs ar LEFT JOIN artwork_cache ac ON ac.artwork_id = ar.id WHERE ar.id = ? LIMIT 1",
+        "SELECT ar.url, ar.kind, ac.local_path FROM artwork_refs ar LEFT JOIN artwork_cache ac ON ac.artwork_id = ar.id WHERE ar.id = $1 LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&state.db_pool)

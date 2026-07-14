@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -8,6 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use config::{Config, Environment as ConfigEnvironment, File};
 use serde::{Deserialize, Serialize};
+
+use crate::live::config::LiveConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
@@ -36,6 +39,8 @@ pub struct Settings {
     #[serde(default)]
     pub media_interactions: MediaInteractionsConfig,
     #[serde(default)]
+    pub live: LiveConfig,
+    #[serde(default)]
     pub telemetry: TelemetryConfig,
 }
 
@@ -54,6 +59,7 @@ impl Default for Settings {
             classifier: ClassifierConfig::default(),
             playback: PlaybackConfig::default(),
             media_interactions: MediaInteractionsConfig::default(),
+            live: LiveConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
     }
@@ -114,6 +120,17 @@ impl Settings {
                 default_access_token_ttl_minutes(),
             )?
             .set_default("auth.access_token_secret", default_access_token_secret())?
+            .set_default(
+                "auth.remembered_device_ttl_days",
+                default_remembered_device_ttl_days(),
+            )?
+            .set_default("auth.refresh_token_secret", None::<String>)?
+            .set_default("auth.csrf_secret", None::<String>)?
+            .set_default("auth.refresh_token_rotation", true)?
+            .set_default(
+                "auth.require_recent_auth_seconds",
+                default_require_recent_auth_seconds(),
+            )?
             .set_default("library.local_root", default_local_root())?
             .set_default(
                 "library.scan_interval_seconds",
@@ -289,6 +306,7 @@ impl Settings {
             .set_default("playback.max_temp_dir_bytes", None::<u64>)?
             .set_default("playback.max_ffmpeg_log_bytes", None::<u64>)?
             .set_default("media_interactions.support_api_enabled", default_false())?
+            .set_default("live.enabled", default_false())?
             .set_default("telemetry.log_directives", default_log_directives())?
             .add_source(File::from(config_paths.default_file.clone()).required(false))
             .add_source(File::from(config_paths.local_file.clone()).required(false))
@@ -306,6 +324,14 @@ impl Settings {
             .try_deserialize()
             .context("configuration deserialization failed")?;
         settings.normalize_paths(&config_paths.base_dir)?;
+        settings
+            .auth
+            .validate(&settings.environment)
+            .context("invalid auth configuration")?;
+        settings
+            .live
+            .validate()
+            .context("invalid Live configuration")?;
 
         Ok(settings)
     }
@@ -323,6 +349,7 @@ impl Settings {
             .iter()
             .map(|path| normalize_path(path, base_dir))
             .collect();
+        self.live.remux.temp_root = normalize_path(&self.live.remux.temp_root, base_dir);
         if self.metadata.tvdb_base_url.trim().is_empty() {
             self.metadata.tvdb_base_url = self.classifier.tvdb_base_url.clone();
         }
@@ -471,12 +498,22 @@ impl Default for DatabaseConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     #[serde(default = "default_access_token_secret")]
     pub access_token_secret: String,
     #[serde(default = "default_access_token_ttl_minutes")]
     pub access_token_ttl_minutes: u64,
+    #[serde(default = "default_remembered_device_ttl_days")]
+    pub remembered_device_ttl_days: u64,
+    #[serde(default)]
+    pub refresh_token_secret: Option<String>,
+    #[serde(default)]
+    pub csrf_secret: Option<String>,
+    #[serde(default = "default_true")]
+    pub refresh_token_rotation: bool,
+    #[serde(default = "default_require_recent_auth_seconds")]
+    pub require_recent_auth_seconds: u64,
 }
 
 impl Default for AuthConfig {
@@ -484,8 +521,126 @@ impl Default for AuthConfig {
         Self {
             access_token_secret: default_access_token_secret(),
             access_token_ttl_minutes: default_access_token_ttl_minutes(),
+            remembered_device_ttl_days: default_remembered_device_ttl_days(),
+            refresh_token_secret: None,
+            csrf_secret: None,
+            refresh_token_rotation: true,
+            require_recent_auth_seconds: default_require_recent_auth_seconds(),
         }
     }
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("access_token_secret", &"[REDACTED]")
+            .field("access_token_ttl_minutes", &self.access_token_ttl_minutes)
+            .field(
+                "remembered_device_ttl_days",
+                &self.remembered_device_ttl_days,
+            )
+            .field(
+                "refresh_token_secret_configured",
+                &self.refresh_token_secret.is_some(),
+            )
+            .field("csrf_secret_configured", &self.csrf_secret.is_some())
+            .field("refresh_token_rotation", &self.refresh_token_rotation)
+            .field(
+                "require_recent_auth_seconds",
+                &self.require_recent_auth_seconds,
+            )
+            .finish()
+    }
+}
+
+impl AuthConfig {
+    pub(crate) fn validate(&self, environment: &RunEnvironment) -> Result<()> {
+        if self.access_token_secret.is_empty() {
+            anyhow::bail!("auth.access_token_secret must not be empty");
+        }
+        if self.access_token_ttl_minutes == 0 {
+            anyhow::bail!("auth.access_token_ttl_minutes must be positive");
+        }
+        if self.remembered_device_ttl_days == 0 {
+            anyhow::bail!("auth.remembered_device_ttl_days must be positive");
+        }
+        if self.require_recent_auth_seconds == 0 {
+            anyhow::bail!("auth.require_recent_auth_seconds must be positive");
+        }
+        let access_ttl_seconds = self
+            .access_token_ttl_minutes
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("auth.access_token_ttl_minutes is too large"))?;
+        validate_auth_duration("auth.access_token_ttl_minutes", access_ttl_seconds, true)?;
+        let remembered_ttl_seconds = self
+            .remembered_device_ttl_days
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("auth.remembered_device_ttl_days is too large"))?;
+        validate_auth_duration(
+            "auth.remembered_device_ttl_days",
+            remembered_ttl_seconds,
+            true,
+        )?;
+        validate_auth_duration(
+            "auth.require_recent_auth_seconds",
+            self.require_recent_auth_seconds,
+            false,
+        )?;
+        if !self.refresh_token_rotation {
+            anyhow::bail!("auth.refresh_token_rotation must remain enabled");
+        }
+
+        match (&self.refresh_token_secret, &self.csrf_secret) {
+            (None, None) if *environment == RunEnvironment::Development => return Ok(()),
+            (Some(refresh), Some(csrf)) => {
+                validate_auth_secret("auth.refresh_token_secret", refresh)?;
+                validate_auth_secret("auth.csrf_secret", csrf)?;
+                if refresh.as_bytes() == csrf.as_bytes() {
+                    anyhow::bail!("auth refresh-token and CSRF secrets must be distinct");
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "auth.refresh_token_secret and auth.csrf_secret must be configured together"
+                );
+            }
+        }
+
+        if *environment == RunEnvironment::Production {
+            validate_auth_secret("auth.access_token_secret", &self.access_token_secret)?;
+            let (Some(refresh), Some(csrf)) = (
+                self.refresh_token_secret.as_deref(),
+                self.csrf_secret.as_deref(),
+            ) else {
+                anyhow::bail!("production requires auth.refresh_token_secret and auth.csrf_secret");
+            };
+            if self.access_token_secret.as_bytes() == refresh.as_bytes()
+                || self.access_token_secret.as_bytes() == csrf.as_bytes()
+            {
+                anyhow::bail!("all auth signing secrets must be distinct");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_auth_secret(label: &str, secret: &str) -> Result<()> {
+    if secret.as_bytes().len() < 32 {
+        anyhow::bail!("{label} must contain at least 32 bytes");
+    }
+    Ok(())
+}
+
+fn validate_auth_duration(label: &str, seconds: u64, require_future_timestamp: bool) -> Result<()> {
+    let seconds = i64::try_from(seconds).with_context(|| format!("{label} is too large"))?;
+    let duration =
+        chrono::Duration::try_seconds(seconds).with_context(|| format!("{label} is too large"))?;
+    if require_future_timestamp && chrono::Utc::now().checked_add_signed(duration).is_none() {
+        anyhow::bail!("{label} is too large");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -983,7 +1138,15 @@ fn default_connect_timeout_seconds() -> u64 {
 }
 
 fn default_access_token_ttl_minutes() -> u64 {
-    60
+    24 * 60
+}
+
+fn default_remembered_device_ttl_days() -> u64 {
+    180
+}
+
+fn default_require_recent_auth_seconds() -> u64 {
+    15 * 60
 }
 
 fn default_local_root() -> String {
@@ -1331,6 +1494,7 @@ mod tests {
         settings.extensions.storage_root = "data/extensions".to_string();
         settings.extensions.bundled_dir = "extensions/bundled".to_string();
         settings.playback.performance_envelope_artifacts = vec!["certifications/local".to_string()];
+        settings.live.remux.temp_root = "data/live-remux".to_string();
 
         settings.normalize_paths(base.path())?;
 
@@ -1366,6 +1530,10 @@ mod tests {
                     .to_string()
             ]
         );
+        assert_eq!(
+            PathBuf::from(&settings.live.remux.temp_root),
+            base.path().join("data/live-remux")
+        );
 
         Ok(())
     }
@@ -1385,5 +1553,69 @@ mod tests {
         let url = normalize_database_url("sqlite::memory:?cache=shared", base.path())?;
         assert_eq!(url, "sqlite::memory:?cache=shared");
         Ok(())
+    }
+
+    #[test]
+    fn auth_defaults_are_long_lived_and_debug_redacts_secrets() {
+        let refresh_secret = "refresh-debug-secret-value-000000000000000";
+        let csrf_secret = "csrf-debug-secret-value-000000000000000000";
+        let mut auth = AuthConfig::default();
+        auth.refresh_token_secret = Some(refresh_secret.to_string());
+        auth.csrf_secret = Some(csrf_secret.to_string());
+        assert_eq!(auth.access_token_ttl_minutes, 24 * 60);
+        assert_eq!(auth.remembered_device_ttl_days, 180);
+        assert!(auth.refresh_token_rotation);
+        assert_eq!(auth.require_recent_auth_seconds, 15 * 60);
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(&auth.access_token_secret));
+        assert!(!debug.contains(refresh_secret));
+        assert!(!debug.contains(csrf_secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn production_auth_requires_three_distinct_256_bit_secrets() {
+        let mut auth = AuthConfig::default();
+        assert!(auth.validate(&RunEnvironment::Production).is_err());
+
+        auth.access_token_secret = "a".repeat(32);
+        auth.refresh_token_secret = Some("b".repeat(32));
+        auth.csrf_secret = Some("c".repeat(32));
+        assert!(auth.validate(&RunEnvironment::Production).is_ok());
+
+        auth.csrf_secret = auth.refresh_token_secret.clone();
+        assert!(auth.validate(&RunEnvironment::Production).is_err());
+        auth.csrf_secret = Some("short".to_string());
+        assert!(auth.validate(&RunEnvironment::Production).is_err());
+        assert!(
+            AuthConfig::default()
+                .validate(&RunEnvironment::Development)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn auth_validation_rejects_partial_keys_disabled_rotation_and_invalid_ttls() {
+        let mut auth = AuthConfig {
+            refresh_token_secret: Some("r".repeat(32)),
+            csrf_secret: Some("c".repeat(32)),
+            ..AuthConfig::default()
+        };
+        assert!(auth.validate(&RunEnvironment::Development).is_ok());
+
+        auth.csrf_secret = None;
+        assert!(auth.validate(&RunEnvironment::Development).is_err());
+        auth.csrf_secret = Some("c".repeat(32));
+        auth.refresh_token_rotation = false;
+        assert!(auth.validate(&RunEnvironment::Development).is_err());
+        auth.refresh_token_rotation = true;
+        auth.require_recent_auth_seconds = 0;
+        assert!(auth.validate(&RunEnvironment::Development).is_err());
+        auth.require_recent_auth_seconds = 1;
+        auth.access_token_ttl_minutes = u64::MAX;
+        assert!(auth.validate(&RunEnvironment::Development).is_err());
+        auth.access_token_ttl_minutes = 1;
+        auth.remembered_device_ttl_days = u64::MAX;
+        assert!(auth.validate(&RunEnvironment::Development).is_err());
     }
 }

@@ -1860,7 +1860,7 @@ async fn ensure_find_media_scoped_movie(
     )
     .await?;
 
-    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM movies WHERE id = ? LIMIT 1")
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM movies WHERE id = $1 LIMIT 1")
         .bind(media_item_id.to_string())
         .fetch_optional(pool)
         .await?
@@ -1868,13 +1868,13 @@ async fn ensure_find_media_scoped_movie(
     {
         sqlx::query::<sqlx::Any>(
             "UPDATE movies
-             SET title = COALESCE(NULLIF(TRIM(title), ''), ?),
-                 year = COALESCE(year, ?),
-                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), ?),
-                 external_tmdb = COALESCE(NULLIF(TRIM(external_tmdb), ''), ?),
-                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+             SET title = COALESCE(NULLIF(TRIM(title), ''), $1),
+                 year = COALESCE(year, $2),
+                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), $3),
+                 external_tmdb = COALESCE(NULLIF(TRIM(external_tmdb), ''), $4),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), $5),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $6",
         )
         .bind(media.title.trim())
         .bind(media.year)
@@ -1887,7 +1887,7 @@ async fn ensure_find_media_scoped_movie(
     } else {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO movies (id, title, year, external_imdb, external_tmdb, metadata_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(media_item_id.to_string())
         .bind(media.title.trim())
@@ -1928,7 +1928,7 @@ async fn ensure_find_media_scoped_series(
         MediaType::Anime => "anime",
         _ => "series",
     };
-    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM series WHERE id = ? LIMIT 1")
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM series WHERE id = $1 LIMIT 1")
         .bind(media_item_id.to_string())
         .fetch_optional(pool)
         .await?
@@ -1936,15 +1936,15 @@ async fn ensure_find_media_scoped_series(
     {
         sqlx::query::<sqlx::Any>(
             "UPDATE series
-             SET title = COALESCE(NULLIF(TRIM(title), ''), ?),
-                 year = COALESCE(year, ?),
-                 library_type = ?,
-                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), ?),
-                 external_tvdb_series = COALESCE(NULLIF(TRIM(external_tvdb_series), ''), ?),
-                 external_anilist = COALESCE(NULLIF(TRIM(external_anilist), ''), ?),
-                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+             SET title = COALESCE(NULLIF(TRIM(title), ''), $1),
+                 year = COALESCE(year, $2),
+                 library_type = $3,
+                 external_imdb = COALESCE(NULLIF(TRIM(external_imdb), ''), $4),
+                 external_tvdb_series = COALESCE(NULLIF(TRIM(external_tvdb_series), ''), $5),
+                 external_anilist = COALESCE(NULLIF(TRIM(external_anilist), ''), $6),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), $7),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $8",
         )
         .bind(media.title.trim())
         .bind(media.year)
@@ -1961,7 +1961,7 @@ async fn ensure_find_media_scoped_series(
     } else {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO series (id, title, year, library_type, external_imdb, external_tvdb_series, external_anilist, metadata_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(media_item_id.to_string())
         .bind(media.title.trim())
@@ -1989,7 +1989,7 @@ async fn upsert_media_item_preserving_metadata(
     external_ids_json: &str,
     metadata_json: &str,
 ) -> AnyResult<()> {
-    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = ? LIMIT 1")
+    if sqlx::query_scalar::<sqlx::Any, String>("SELECT id FROM media_items WHERE id = $1 LIMIT 1")
         .bind(media_item_id.to_string())
         .fetch_optional(pool)
         .await?
@@ -1997,13 +1997,13 @@ async fn upsert_media_item_preserving_metadata(
     {
         sqlx::query::<sqlx::Any>(
             "UPDATE media_items
-             SET type = ?,
-                 title = COALESCE(NULLIF(TRIM(title), ''), ?),
-                 year = COALESCE(year, ?),
-                 external_ids = COALESCE(NULLIF(TRIM(external_ids), ''), ?),
-                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), ?),
+             SET type = $1,
+                 title = COALESCE(NULLIF(TRIM(title), ''), $2),
+                 year = COALESCE(year, $3),
+                 external_ids = COALESCE(NULLIF(TRIM(external_ids), ''), $4),
+                 metadata_json = COALESCE(NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), $5),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             WHERE id = $6",
         )
         .bind(media_type.as_str())
         .bind(title.trim())
@@ -2016,7 +2016,7 @@ async fn upsert_media_item_preserving_metadata(
     } else {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO media_items (id, type, external_ids, title, year, metadata_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .bind(media_item_id.to_string())
         .bind(media_type.as_str())
@@ -2038,11 +2038,11 @@ async fn find_existing_movie_id(
 ) -> AnyResult<Option<Uuid>> {
     for (query, value) in [
         (
-            "SELECT id FROM movies WHERE external_imdb = ? LIMIT 1",
+            "SELECT id FROM movies WHERE external_imdb = $1 LIMIT 1",
             trim_external_id(ids.imdb.as_deref()),
         ),
         (
-            "SELECT id FROM movies WHERE external_tmdb = ? LIMIT 1",
+            "SELECT id FROM movies WHERE external_tmdb = $1 LIMIT 1",
             trim_external_id(ids.tmdb.as_deref()),
         ),
     ] {
@@ -2069,15 +2069,15 @@ async fn find_existing_series_id(
 ) -> AnyResult<Option<Uuid>> {
     for (query, value) in [
         (
-            "SELECT id FROM series WHERE external_anilist = ? LIMIT 1",
+            "SELECT id FROM series WHERE external_anilist = $1 LIMIT 1",
             trim_external_id(ids.anilist.as_deref()),
         ),
         (
-            "SELECT id FROM series WHERE external_tvdb_series = ? LIMIT 1",
+            "SELECT id FROM series WHERE external_tvdb_series = $1 LIMIT 1",
             trim_external_id(ids.tvdb_series.as_deref().or(ids.tvdb.as_deref())),
         ),
         (
-            "SELECT id FROM series WHERE external_imdb = ? LIMIT 1",
+            "SELECT id FROM series WHERE external_imdb = $1 LIMIT 1",
             trim_external_id(ids.imdb.as_deref()),
         ),
     ] {
@@ -2121,7 +2121,7 @@ async fn find_existing_external_id_owner(
 ) -> AnyResult<Option<Uuid>> {
     for (provider, external_id) in external_id_pairs(ids) {
         let query = format!(
-            "SELECT {owner_column} FROM {table} WHERE provider = ? AND external_id = ? LIMIT 1"
+            "SELECT {owner_column} FROM {table} WHERE provider = $1 AND external_id = $2 LIMIT 1"
         );
         if let Some(id) = sqlx::query_scalar::<sqlx::Any, String>(&query)
             .bind(provider)
@@ -2151,7 +2151,7 @@ async fn find_existing_media_by_title(
     }
     let rows = if let Some(library_type) = library_type {
         sqlx::query::<sqlx::Any>(&format!(
-            "SELECT {id_column} AS id, title, year FROM {table} WHERE library_type = ?"
+            "SELECT {id_column} AS id, title, year FROM {table} WHERE library_type = $1"
         ))
         .bind(library_type)
         .fetch_all(pool)
@@ -2188,7 +2188,7 @@ async fn insert_movie_external_ids(
     for (provider, external_id) in external_id_pairs(ids) {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO movie_external_ids (id, movie_id, provider, external_id, confidence, source)
-             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(movie_id.to_string())
@@ -2210,7 +2210,7 @@ async fn insert_series_external_ids(
     for (provider, external_id) in external_id_pairs(ids) {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO series_external_ids (id, series_id, provider, external_id, confidence, source)
-             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(series_id.to_string())
@@ -2235,7 +2235,7 @@ async fn load_scoped_catalog_episode_ids(
             continue;
         };
         let Some(id) = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT id FROM episodes WHERE series_id = ? AND season_number = ? AND episode_number = ? LIMIT 1",
+            "SELECT id FROM episodes WHERE series_id = $1 AND season_number = $2 AND episode_number = $3 LIMIT 1",
         )
         .bind(media_item_id.to_string())
         .bind(season)
@@ -6631,7 +6631,7 @@ async fn managed_library_needs_hydration(
     let row = sqlx::query(
         "SELECT media_item_id, media_type
          FROM managed_library_provenance
-         WHERE intent_id = ?
+         WHERE intent_id = $1
          ORDER BY updated_at DESC
          LIMIT 1",
     )
@@ -6650,14 +6650,14 @@ async fn managed_library_needs_hydration(
     };
     let metadata_json: Option<String> = if owner_type == "movie" {
         sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM movies WHERE id = ? LIMIT 1",
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM movies WHERE id = $1 LIMIT 1",
         )
         .bind(&media_item_id)
         .fetch_optional(pool)
         .await?
     } else {
         sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = ? LIMIT 1",
+            "SELECT COALESCE(CAST(metadata_json AS TEXT), '') FROM series WHERE id = $1 LIMIT 1",
         )
         .bind(&media_item_id)
         .fetch_optional(pool)
@@ -6670,8 +6670,8 @@ async fn managed_library_needs_hydration(
     let artwork_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM artwork_refs
-         WHERE owner_type = ?
-           AND owner_id = ?
+         WHERE owner_type = $1
+           AND owner_id = $2
            AND kind IN ('poster', 'backdrop', 'banner')",
     )
     .bind(owner_type)
@@ -11811,7 +11811,7 @@ mod tests {
             load_scoped_catalog_episode_ids(&database.pool, media_item_id, &selected).await?;
 
         let episode_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = $1")
                 .bind(media_item_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -11822,9 +11822,9 @@ mod tests {
         assert!(!selected_episode_ids.contains_key("S01E03"));
 
         let row = sqlx::query(
-            "SELECT title, runtime_seconds, CAST(has_file AS INTEGER) AS has_file, CAST(metadata_json AS TEXT) AS metadata_json
+            "SELECT title, runtime_seconds, CAST(CASE WHEN has_file THEN 1 ELSE 0 END AS BIGINT) AS has_file, CAST(metadata_json AS TEXT) AS metadata_json
              FROM episodes
-             WHERE series_id = ? AND season_number = 1 AND episode_number = 10
+             WHERE series_id = $1 AND season_number = 1 AND episode_number = 10
              LIMIT 1",
         )
         .bind(media_item_id.to_string())
@@ -11933,7 +11933,7 @@ mod tests {
                 resolver_version,
                 confidence,
                 state
-            ) VALUES (?, 'torrentio', 'anime', 'Fullmetal Alchemist Brotherhood',
+            ) VALUES ($1, 'torrentio', 'anime', 'Fullmetal Alchemist Brotherhood',
                 '[Erai-raws] Fullmetal Alchemist Brotherhood Batch', 'torrentio',
                 'magnet', 'release-fingerprint', 'season_pack', 'anime_shoko_style',
                 'test', 'medium', 'submitted')",
@@ -11955,7 +11955,7 @@ mod tests {
                     download_id,
                     state,
                     active
-                ) VALUES (?, ?, 'acquisition.debrid.default', ?, 'submitted', 1)",
+                ) VALUES ($1, $2, 'acquisition.debrid.default', $3, 'submitted', 1)",
             )
             .bind(format!("job-{job_suffix}"))
             .bind(release_id.to_string())

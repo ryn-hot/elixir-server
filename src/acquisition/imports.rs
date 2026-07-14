@@ -385,16 +385,16 @@ pub async fn list_import_pending_release_jobs(
             CAST(j.updated_at AS TEXT) AS updated_at
          FROM acquisition_release_jobs j
          JOIN acquisition_releases r ON r.release_id = j.release_id
-         WHERE j.state = ?
-           AND r.state = ?
+         WHERE j.state = $1
+           AND r.state = $2
            AND NOT EXISTS (
                 SELECT 1
                 FROM acquisition_import_runs ir
                 WHERE ir.release_job_id = j.release_job_id
-                  AND ir.state IN (?, ?, ?, ?, ?)
+                  AND ir.state IN ($3, $4, $5, $6, $7)
            )
          ORDER BY COALESCE(j.completed_at, j.updated_at), j.release_job_id
-         LIMIT ?",
+         LIMIT $8",
     )
     .bind(ReleaseJobState::Completed.as_str())
     .bind("completed")
@@ -2250,10 +2250,10 @@ async fn quarantine_anime_import_mismatch(
     .await?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $3",
     )
     .bind("review_required")
     .bind(reason)
@@ -2555,11 +2555,11 @@ async fn apply_target_episode_metadata(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE episodes
-         SET title = COALESCE(?, NULLIF(title, ''), title),
-             runtime_seconds = COALESCE(?, runtime_seconds),
-             metadata_json = COALESCE(?, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
+         SET title = COALESCE($1, NULLIF(title, ''), title),
+             runtime_seconds = COALESCE($2, runtime_seconds),
+             metadata_json = COALESCE($3, NULLIF(TRIM(CAST(metadata_json AS TEXT)), ''), metadata_json),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $4",
     )
     .bind(title)
     .bind(runtime_seconds)
@@ -2729,13 +2729,13 @@ async fn mark_release_coverage_imported(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_coverage
-         SET state = ?,
-             reason = ?,
-             verified_by = COALESCE(verified_by, ?),
+         SET state = $1,
+             reason = $2,
+             verified_by = COALESCE(verified_by, $3),
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND release_file_id = ?
-           AND target_id = ?",
+         WHERE release_id = $4
+           AND release_file_id = $5
+           AND target_id = $6",
     )
     .bind(ReleaseCoverageState::Imported.as_str())
     .bind("Imported into the Elixir library.")
@@ -2756,9 +2756,9 @@ async fn mark_release_and_job_imported(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state_reason = ?,
+         SET state_reason = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $2",
     )
     .bind("Imported into the Elixir library.")
     .bind(release_id.to_string())
@@ -2768,10 +2768,10 @@ async fn mark_release_and_job_imported(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
-         SET state_reason = ?,
+         SET state_reason = $1,
              active = 0,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_job_id = ?",
+         WHERE release_job_id = $2",
     )
     .bind("Imported into the Elixir library.")
     .bind(release_job_id.to_string())
@@ -2798,7 +2798,7 @@ async fn update_subscription_completion_if_ready(
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM acquisition_targets
-         WHERE subscription_id = ?
+         WHERE subscription_id = $1
            AND state NOT IN ('imported', 'excluded')",
     )
     .bind(subscription.subscription_id.to_string())
@@ -2824,7 +2824,7 @@ async fn update_subscription_completion_if_ready(
          SET status = 'completed',
              active = 0,
              updated_at = CURRENT_TIMESTAMP
-         WHERE subscription_id = ?",
+         WHERE subscription_id = $1",
     )
     .bind(subscription.subscription_id.to_string())
     .execute(pool)
@@ -2894,10 +2894,10 @@ async fn lookup_debrid_job_local_path(
     let row = sqlx::query(
         "SELECT COALESCE(CAST(local_path AS TEXT), '') AS local_path
          FROM debrid_download_jobs
-         WHERE job_id = ?
-            OR remote_release_id = ?
-            OR remote_torrent_id = ?
-            OR remote_download_id = ?
+         WHERE job_id = $1
+            OR remote_release_id = $2
+            OR remote_torrent_id = $3
+            OR remote_download_id = $4
          ORDER BY updated_at DESC
          LIMIT 1",
     )
@@ -2963,7 +2963,7 @@ pub async fn create_or_get_import_run(
             provenance_json,
             started_at,
             completed_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(import_run_id.to_string())
     .bind(data.release_id.to_string())
@@ -3028,12 +3028,12 @@ pub async fn transition_import_run_state(
     .then(db_datetime_string_now);
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_import_runs
-         SET state = ?,
-             state_reason = ?,
-             mismatch_class = COALESCE(?, mismatch_class),
-             completed_at = COALESCE(?, completed_at),
+         SET state = $1,
+             state_reason = $2,
+             mismatch_class = COALESCE($3, mismatch_class),
+             completed_at = COALESCE($4, completed_at),
              updated_at = CURRENT_TIMESTAMP
-         WHERE import_run_id = ?",
+         WHERE import_run_id = $5",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -3063,20 +3063,20 @@ pub async fn upsert_import_file_link(
     if existing.is_some() {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_import_file_links
-             SET release_id = ?,
-                 release_file_id = ?,
-                 target_id = ?,
-                 local_path = ?,
-                 media_file_id = ?,
-                 movie_id = ?,
-                 episode_id = ?,
-                 state = ?,
-                 state_reason = ?,
-                 verification_state = ?,
-                 mismatch_class = ?,
-                 evidence_json = ?,
+             SET release_id = $1,
+                 release_file_id = $2,
+                 target_id = $3,
+                 local_path = $4,
+                 media_file_id = $5,
+                 movie_id = $6,
+                 episode_id = $7,
+                 state = $8,
+                 state_reason = $9,
+                 verification_state = $10,
+                 mismatch_class = $11,
+                 evidence_json = $12,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE import_link_id = ?",
+             WHERE import_link_id = $13",
         )
         .bind(data.release_id.to_string())
         .bind(data.release_file_id.map(|value| value.to_string()))
@@ -3111,7 +3111,7 @@ pub async fn upsert_import_file_link(
                 verification_state,
                 mismatch_class,
                 evidence_json
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(import_link_id.to_string())
         .bind(data.import_run_id.to_string())
@@ -3187,16 +3187,16 @@ pub async fn reset_import_runs_for_release(
     };
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_import_file_links
-         SET state = ?,
-             state_reason = ?,
-             verification_state = CASE WHEN ? THEN NULL ELSE verification_state END,
+         SET state = $1,
+             state_reason = $2,
+             verification_state = CASE WHEN $3 THEN NULL ELSE verification_state END,
              mismatch_class = NULL,
              media_file_id = NULL,
              movie_id = NULL,
              episode_id = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND state <> ?",
+         WHERE release_id = $4
+           AND state <> $5",
     )
     .bind(AcquisitionImportFileLinkState::Pending.as_str())
     .bind(link_reason)
@@ -3216,12 +3216,12 @@ pub async fn reset_import_runs_for_release(
              WHERE release_file_id IN (
                 SELECT release_file_id
                 FROM acquisition_release_files
-                WHERE release_id = ?
+                WHERE release_id = $1
              )
              OR file_path IN (
                 SELECT local_path
                 FROM acquisition_import_file_links
-                WHERE release_id = ?
+                WHERE release_id = $2
                   AND local_path IS NOT NULL
              )",
         )
@@ -3234,14 +3234,14 @@ pub async fn reset_import_runs_for_release(
 
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_import_runs
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              mismatch_class = NULL,
              retry_count = retry_count + 1,
              completed_at = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND state <> ?",
+         WHERE release_id = $3
+           AND state <> $4",
     )
     .bind(AcquisitionImportRunState::Pending.as_str())
     .bind(reason)
@@ -3260,11 +3260,11 @@ pub async fn cancel_import_runs_for_release(
 ) -> Result<usize> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_import_file_links
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND state <> ?",
+         WHERE release_id = $3
+           AND state <> $4",
     )
     .bind(AcquisitionImportFileLinkState::Skipped.as_str())
     .bind(reason)
@@ -3276,12 +3276,12 @@ pub async fn cancel_import_runs_for_release(
 
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_import_runs
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              completed_at = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND state NOT IN (?, ?)",
+         WHERE release_id = $3
+           AND state NOT IN ($4, $5)",
     )
     .bind(AcquisitionImportRunState::Cancelled.as_str())
     .bind(reason)
@@ -3877,19 +3877,19 @@ CAST(updated_at AS TEXT) AS updated_at"
 const IMPORT_RUN_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     import_run_columns!(),
-    " FROM acquisition_import_runs WHERE import_run_id = ? LIMIT 1"
+    " FROM acquisition_import_runs WHERE import_run_id = $1 LIMIT 1"
 );
 
 const IMPORT_RUN_SELECT_BY_RELEASE_JOB: &str = concat!(
     "SELECT ",
     import_run_columns!(),
-    " FROM acquisition_import_runs WHERE release_job_id = ? LIMIT 1"
+    " FROM acquisition_import_runs WHERE release_job_id = $1 LIMIT 1"
 );
 
 const IMPORT_RUN_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     import_run_columns!(),
-    " FROM acquisition_import_runs WHERE release_id = ? ORDER BY created_at, import_run_id"
+    " FROM acquisition_import_runs WHERE release_id = $1 ORDER BY created_at, import_run_id"
 );
 
 macro_rules! import_file_link_columns {
@@ -3916,31 +3916,31 @@ CAST(updated_at AS TEXT) AS updated_at"
 const IMPORT_FILE_LINK_SELECT_BY_ID: &str = concat!(
     "SELECT ",
     import_file_link_columns!(),
-    " FROM acquisition_import_file_links WHERE import_link_id = ? LIMIT 1"
+    " FROM acquisition_import_file_links WHERE import_link_id = $1 LIMIT 1"
 );
 
 const IMPORT_FILE_LINK_SELECT_BY_RUN: &str = concat!(
     "SELECT ",
     import_file_link_columns!(),
-    " FROM acquisition_import_file_links WHERE import_run_id = ? ORDER BY target_id, release_file_id"
+    " FROM acquisition_import_file_links WHERE import_run_id = $1 ORDER BY target_id, release_file_id"
 );
 
 const IMPORT_FILE_LINK_SELECT_BY_RELEASE: &str = concat!(
     "SELECT ",
     import_file_link_columns!(),
-    " FROM acquisition_import_file_links WHERE release_id = ? ORDER BY target_id, release_file_id"
+    " FROM acquisition_import_file_links WHERE release_id = $1 ORDER BY target_id, release_file_id"
 );
 
 const IMPORT_FILE_LINK_SELECT_BY_FILE_TARGET: &str = concat!(
     "SELECT ",
     import_file_link_columns!(),
-    " FROM acquisition_import_file_links WHERE import_run_id = ? AND release_file_id = ? AND target_id = ? LIMIT 1"
+    " FROM acquisition_import_file_links WHERE import_run_id = $1 AND release_file_id = $2 AND target_id = $3 LIMIT 1"
 );
 
 const IMPORT_FILE_LINK_SELECT_BY_TARGET_WITHOUT_FILE: &str = concat!(
     "SELECT ",
     import_file_link_columns!(),
-    " FROM acquisition_import_file_links WHERE import_run_id = ? AND release_file_id IS NULL AND target_id = ? LIMIT 1"
+    " FROM acquisition_import_file_links WHERE import_run_id = $1 AND release_file_id IS NULL AND target_id = $2 LIMIT 1"
 );
 
 #[cfg(test)]
@@ -4887,7 +4887,7 @@ mod tests {
         assert_eq!(imported_target.state, AcquisitionTargetState::Imported);
         assert_eq!(imported_target.import_event_id, Some(run.import_run_id));
         let subscription_status: String = sqlx::query_scalar(
-            "SELECT status FROM acquisition_subscriptions WHERE subscription_id = ?",
+            "SELECT status FROM acquisition_subscriptions WHERE subscription_id = $1",
         )
         .bind(subscription.subscription_id.to_string())
         .fetch_one(&database.pool)
@@ -5107,7 +5107,7 @@ mod tests {
         )
         .await?;
         sqlx::query(
-            "UPDATE acquisition_releases SET selected_candidate_json = ? WHERE release_id = ?",
+            "UPDATE acquisition_releases SET selected_candidate_json = $1 WHERE release_id = $2",
         )
         .bind(serde_json::to_string(&json!({
             "title": "Movie.2024.1080p.WEB-DL-GROUP",
@@ -5215,7 +5215,7 @@ mod tests {
         )
         .await?;
         sqlx::query(
-            "UPDATE acquisition_releases SET selected_candidate_json = ? WHERE release_id = ?",
+            "UPDATE acquisition_releases SET selected_candidate_json = $1 WHERE release_id = $2",
         )
         .bind(serde_json::to_string(&json!({
             "title": "Primer.2004.1080p.WEB-DL-GROUP",
@@ -5415,7 +5415,7 @@ mod tests {
             Some("https://example.invalid/episode-1.jpg")
         );
         let scaffolded_missing: (i64, String, String) = sqlx::query_as(
-            "SELECT CAST(has_file AS INTEGER), title, metadata_json
+            "SELECT CAST(CASE WHEN has_file THEN 1 ELSE 0 END AS BIGINT), title, metadata_json
              FROM episodes
              WHERE season_number = 1 AND episode_number = 4",
         )
@@ -5717,7 +5717,7 @@ mod tests {
             Some("anime_hash_identity_mismatch")
         );
         let release_state: String =
-            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = $1")
                 .bind(release_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -5792,7 +5792,7 @@ mod tests {
             Some("anidb_lookup_rate_limited")
         );
         let release_state: String =
-            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = $1")
                 .bind(release_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -5995,7 +5995,7 @@ mod tests {
             Some("anime_hash_identity_mismatch")
         );
         let release_state: String =
-            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = ?")
+            sqlx::query_scalar("SELECT state FROM acquisition_releases WHERE release_id = $1")
                 .bind(release_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -6277,7 +6277,7 @@ mod tests {
                 imported_files_json,
                 raw_manager_payload_json,
                 status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind("arr-event-key")

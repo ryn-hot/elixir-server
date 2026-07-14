@@ -1634,14 +1634,14 @@ async fn claim_direct_file_job(
 ) -> Result<Option<AcquisitionReleaseJob>> {
     let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
-         SET state = ?,
-             state_reason = ?,
+         SET state = $1,
+             state_reason = $2,
              active = 1,
              started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_job_id = ?
+         WHERE release_job_id = $3
            AND active = 1
-           AND state IN (?, ?, ?)",
+           AND state IN ($4, $5, $6)",
     )
     .bind(ReleaseJobState::Materializing.as_str())
     .bind("Direct HTTP stream file is materializing through Elixir.".to_string())
@@ -3252,9 +3252,9 @@ async fn persist_resolved_stream_candidate(
         serde_json::to_string(candidate).context("serializing late-resolved stream candidate")?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET selected_candidate_json = ?,
+         SET selected_candidate_json = $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $2",
     )
     .bind(selected_candidate_json)
     .bind(release_id.to_string())
@@ -4952,10 +4952,10 @@ async fn mark_stream_release_targets_failed(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_coverage
-         SET state = ?,
-             reason = ?,
+         SET state = $1,
+             reason = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $3",
     )
     .bind(ReleaseCoverageState::Rejected.as_str())
     .bind(reason)
@@ -4966,17 +4966,17 @@ async fn mark_stream_release_targets_failed(
 
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
-         SET state = ?,
-             state_reason = ?,
-             selected_route_logical_id = COALESCE(selected_route_logical_id, ?),
-             download_id = COALESCE(download_id, ?),
+         SET state = $1,
+             state_reason = $2,
+             selected_route_logical_id = COALESCE(selected_route_logical_id, $3),
+             download_id = COALESCE(download_id, $4),
              next_search_after = NULL,
              updated_at = CURRENT_TIMESTAMP
          WHERE state NOT IN ('imported', 'excluded')
            AND target_id IN (
                SELECT target_id
                FROM acquisition_release_coverage
-               WHERE release_id = ?
+               WHERE release_id = $5
            )",
     )
     .bind(crate::acquisition::subscriptions::AcquisitionTargetState::Blocked.as_str())
@@ -4991,18 +4991,18 @@ async fn mark_stream_release_targets_failed(
     if let Some(subscription_id) = pending.release.subscription_id {
         sqlx::query::<sqlx::Any>(
             "UPDATE acquisition_targets
-             SET state = ?,
-                 state_reason = ?,
-                 selected_route_logical_id = COALESCE(selected_route_logical_id, ?),
-                 download_id = COALESCE(download_id, ?),
+             SET state = $1,
+                 state_reason = $2,
+                 selected_route_logical_id = COALESCE(selected_route_logical_id, $3),
+                 download_id = COALESCE(download_id, $4),
                  next_search_after = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE subscription_id = ?
+             WHERE subscription_id = $5
                AND state NOT IN ('imported', 'excluded')
                AND NOT EXISTS (
                    SELECT 1
                    FROM acquisition_release_coverage
-                   WHERE release_id = ?
+                   WHERE release_id = $6
                )",
         )
         .bind(crate::acquisition::subscriptions::AcquisitionTargetState::Blocked.as_str())
@@ -5032,11 +5032,11 @@ async fn update_http_stream_release_state(
         .context("serializing HTTP stream coverage plan")?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
-             coverage_plan_json = ?,
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $4",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -5052,7 +5052,7 @@ async fn job_cancelled(pool: &AnyPool, release_job_id: Uuid) -> Result<bool> {
     let row = sqlx::query(
         "SELECT state, active
          FROM acquisition_release_jobs
-         WHERE release_job_id = ?
+         WHERE release_job_id = $1
          LIMIT 1",
     )
     .bind(release_job_id.to_string())
@@ -6452,7 +6452,7 @@ mod tests {
 
     async fn seed_active_wireguard_stream_profile(pool: &AnyPool) -> Result<()> {
         sqlx::query(
-            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind("hse-wireguard")
         .bind("HSE WireGuard")
@@ -6468,7 +6468,7 @@ mod tests {
         .execute(pool)
         .await?;
         sqlx::query(
-            "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES (?, ?, ?)",
+            "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES ($1, $2, $3)",
         )
         .bind("hse-wireguard")
         .bind("wireguard_config")

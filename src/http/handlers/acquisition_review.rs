@@ -1703,7 +1703,7 @@ async fn resume_debrid_job_after_manual_approval(pool: &AnyPool, release_id: Uui
              selection_error = NULL,
              last_error = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
+         WHERE release_id = $1
            AND status = 'review_required'",
     )
     .bind(release_id.to_string())
@@ -3395,7 +3395,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extensions (
                 extension_id, name, version, kind, trust_level, manifest_json, enabled
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&extension_id)
         .bind("Test Review Debrid")
@@ -3409,7 +3409,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extension_instances (
                 instance_id, extension_id, instance_name, config_json, enabled
-             ) VALUES (?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(instance_id.to_string())
         .bind(&extension_id)
@@ -3421,7 +3421,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO providers (
                 provider_id, instance_id, capability, slot_id, cardinality, implementation
-             ) VALUES (?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(provider_id.to_string())
         .bind(instance_id.to_string())
@@ -5169,7 +5169,7 @@ mod tests {
                 job_id, provider_id, instance_id, owner_id, source, source_kind,
                 status, remote_release_status, selected_file_ids_json,
                 skipped_file_ids_json, selection_error, last_error, release_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(job_id.to_string())
         .bind(provider_id.to_string())
@@ -5207,7 +5207,7 @@ mod tests {
                     CASE WHEN selection_error IS NULL THEN 1 ELSE 0 END AS selection_error_null,
                     CASE WHEN last_error IS NULL THEN 1 ELSE 0 END AS last_error_null
              FROM debrid_download_jobs
-             WHERE job_id = ?",
+             WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .fetch_one(&database.pool)
@@ -6192,11 +6192,12 @@ mod tests {
             .await?
             .expect("target");
         assert_eq!(target.state, AcquisitionTargetState::Blocked);
-        let run_state: String =
-            sqlx::query_scalar("SELECT state FROM acquisition_import_runs WHERE import_run_id = ?")
-                .bind(run_id.to_string())
-                .fetch_one(&database.pool)
-                .await?;
+        let run_state: String = sqlx::query_scalar(
+            "SELECT state FROM acquisition_import_runs WHERE import_run_id = $1",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
         assert_eq!(run_state, AcquisitionImportRunState::Cancelled.as_str());
         let links = list_import_file_links(&database.pool, run_id).await?;
         assert_eq!(links.len(), 1);

@@ -136,6 +136,7 @@ pub struct User {
 pub struct ServerInstance {
     pub id: Uuid,
     pub user_id: Uuid,
+    pub home_id: Option<Uuid>,
     pub device_name: String,
     pub lan_addresses: Json<Vec<String>>,
     pub wan_direct_endpoint: Option<String>,

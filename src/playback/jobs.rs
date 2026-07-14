@@ -1521,8 +1521,8 @@ impl PlaybackJobManager {
         if matches!(state, Some(PlaybackJobState::Failed)) {
             sqlx::query::<sqlx::Any>(
                 "UPDATE playback_sessions
-                 SET job_state_json = ?, transcode_state = ?, state = 'error', updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?",
+                 SET job_state_json = $1, transcode_state = $2, state = 'error', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $3",
             )
             .bind(&job_state)
             .bind(&job_state)
@@ -1532,8 +1532,8 @@ impl PlaybackJobManager {
         } else {
             sqlx::query::<sqlx::Any>(
                 "UPDATE playback_sessions
-                 SET job_state_json = ?, transcode_state = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?",
+                 SET job_state_json = $1, transcode_state = $2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $3",
             )
             .bind(&job_state)
             .bind(&job_state)
@@ -1551,8 +1551,8 @@ impl PlaybackJobManager {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE playback_sessions
-             SET playback_plan_json = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+             SET playback_plan_json = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2",
         )
         .bind(playback_plan.to_string())
         .bind(session_id.to_string())
@@ -2372,7 +2372,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let media_item_id = Uuid::new_v4();
         let media_file_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
             .bind(user_id.to_string())
             .bind(format!("{session_id}@example.com"))
             .bind("hashed")
@@ -2380,7 +2380,7 @@ mod tests {
             .await?;
         sqlx::query(
             "INSERT INTO media_items (id, type, external_ids, title, year)
-             VALUES (?, 'movie', '{}', 'Playback Job Test', 2024)",
+             VALUES ($1, 'movie', '{}', 'Playback Job Test', 2024)",
         )
         .bind(media_item_id.to_string())
         .execute(pool)
@@ -2388,7 +2388,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO media_files
                 (id, media_item_id, path, size_bytes, container, video_codec, audio_codec, width, height, bitrate_bps, scan_state)
-             VALUES (?, ?, ?, 1, 'mkv', 'h264', 'aac', 1920, 1080, 1000000, 'ok')",
+             VALUES ($1, $2, $3, 1, 'mkv', 'h264', 'aac', 1920, 1080, 1000000, 'ok')",
         )
         .bind(media_file_id.to_string())
         .bind(media_item_id.to_string())
@@ -2398,7 +2398,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO playback_sessions
                 (id, user_id, media_file_id, mode, state, network_type, logical_position_seconds, duration_seconds, token)
-             VALUES (?, ?, ?, 'transcode', 'active', 'lan', 0, 60, 'test-session-token')",
+             VALUES ($1, $2, $3, 'transcode', 'active', 'lan', 0, 60, 'test-session-token')",
         )
         .bind(session_id.to_string())
         .bind(user_id.to_string())
@@ -2701,7 +2701,7 @@ mod tests {
             Some("1")
         );
         let stored: Option<String> =
-            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = ?")
+            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = $1")
                 .bind(session_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -2733,7 +2733,7 @@ mod tests {
 
         assert!(fs::metadata(&temp_path).await.is_err());
         let stored: Option<String> =
-            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = ?")
+            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = $1")
                 .bind(session_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;
@@ -3006,7 +3006,7 @@ mod tests {
             .await;
 
         let stored: Option<String> =
-            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = ?")
+            sqlx::query_scalar("SELECT job_state_json FROM playback_sessions WHERE id = $1")
                 .bind(session_id.to_string())
                 .fetch_one(&database.pool)
                 .await?;

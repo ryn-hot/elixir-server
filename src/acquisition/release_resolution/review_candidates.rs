@@ -771,7 +771,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extensions (
                 extension_id, name, version, kind, trust_level, manifest_json, enabled
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&extension_id)
         .bind("Test Torrentio")
@@ -785,7 +785,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extension_instances (
                 instance_id, extension_id, instance_name, config_json, enabled
-             ) VALUES (?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(instance_id.to_string())
         .bind(&extension_id)
@@ -797,7 +797,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO providers (
                 provider_id, instance_id, capability, slot_id, cardinality, implementation, health_state
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(provider_id.to_string())
         .bind(instance_id.to_string())

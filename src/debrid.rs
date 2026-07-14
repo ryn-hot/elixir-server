@@ -5182,8 +5182,8 @@ fn debrid_service_endpoint(service: DebridServiceKind) -> Result<ProviderEndpoin
 async fn migrate_legacy_real_debrid_extension(pool: &sqlx::AnyPool) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE extension_instances
-         SET extension_id = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE extension_id = ?",
+         SET extension_id = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE extension_id = $2",
     )
     .bind(DEBRID_EXTENSION_ID)
     .bind(LEGACY_REAL_DEBRID_EXTENSION_ID)
@@ -5191,7 +5191,7 @@ async fn migrate_legacy_real_debrid_extension(pool: &sqlx::AnyPool) -> Result<()
     .await
     .context("migrating legacy Real-Debrid instances to canonical Debrid extension id")?;
 
-    sqlx::query::<sqlx::Any>("DELETE FROM extensions WHERE extension_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM extensions WHERE extension_id = $1")
         .bind(LEGACY_REAL_DEBRID_EXTENSION_ID)
         .execute(pool)
         .await
@@ -5213,12 +5213,12 @@ async fn disable_non_active_debrid_resolver_providers(
     }))?;
     sqlx::query::<sqlx::Any>(
         "UPDATE providers
-         SET scope_json = ?,
-             health_state = ?,
+         SET scope_json = $1,
+             health_state = $2,
              updated_at = CURRENT_TIMESTAMP
          WHERE capability = 'debrid.resolver'
            AND slot_id = 'default'
-           AND instance_id <> ?",
+           AND instance_id <> $3",
     )
     .bind(disabled_scope)
     .bind(ProviderHealthState::Unknown.as_str())
@@ -5358,7 +5358,7 @@ pub async fn debrid_concurrent_downloads_for_instance(
     let raw_config = sqlx::query_scalar::<sqlx::Any, Option<String>>(
         "SELECT CAST(config_json AS TEXT) AS config_json
          FROM extension_instances
-         WHERE instance_id = ?
+         WHERE instance_id = $1
          LIMIT 1",
     )
     .bind(instance_id.to_string())
@@ -5378,8 +5378,8 @@ pub async fn active_debrid_concurrent_downloads(pool: &sqlx::AnyPool) -> Result<
     let raw_config = sqlx::query_scalar::<sqlx::Any, Option<String>>(
         "SELECT CAST(config_json AS TEXT) AS config_json
          FROM extension_instances
-         WHERE (extension_id = ? OR extension_id = ?)
-           AND enabled = ?
+         WHERE (extension_id = $1 OR extension_id = $2)
+           AND enabled = $3
          ORDER BY CASE WHEN LOWER(instance_name) = 'default' THEN 0 ELSE 1 END,
                   instance_name ASC
          LIMIT 1",
@@ -8024,13 +8024,13 @@ async fn update_debrid_job_selection_decision(
     let error = (!decision.is_approved()).then(|| decision.review_reasons.join(","));
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET selected_file_ids_json = ?,
-             skipped_file_ids_json = ?,
-             selection_error = ?,
-             status = CASE WHEN ? THEN status ELSE 'review_required' END,
-             remote_release_status = CASE WHEN ? THEN remote_release_status ELSE 'review_required' END,
+         SET selected_file_ids_json = $1,
+             skipped_file_ids_json = $2,
+             selection_error = $3,
+             status = CASE WHEN $4 THEN status ELSE 'review_required' END,
+             remote_release_status = CASE WHEN $5 THEN remote_release_status ELSE 'review_required' END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         WHERE job_id = $6",
     )
     .bind(selected)
     .bind(skipped)
@@ -8050,10 +8050,10 @@ async fn update_release_file_selected(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_files
-         SET selected = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE release_file_id = ?",
+         SET selected = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE release_file_id = $2",
     )
-    .bind(selected)
+    .bind(if selected { 1_i64 } else { 0_i64 })
     .bind(release_file_id.to_string())
     .execute(pool)
     .await?;
@@ -8085,11 +8085,11 @@ async fn update_release_state(
         .context("serializing debrid selection evidence")?;
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
-         SET state = ?,
-             state_reason = ?,
-             coverage_plan_json = COALESCE(?, coverage_plan_json),
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = COALESCE($3, coverage_plan_json),
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?",
+         WHERE release_id = $4",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -8113,13 +8113,13 @@ async fn update_debrid_release_job_selection_state(
     );
     sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
-         SET state = ?,
-             state_reason = ?,
-             active = ?,
-             completed_at = CASE WHEN ? THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+         SET state = $1,
+             state_reason = $2,
+             active = $3,
+             completed_at = CASE WHEN $4 THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = ?
-           AND download_id = ?",
+         WHERE release_id = $5
+           AND download_id = $6",
     )
     .bind(state.as_str())
     .bind(reason)
@@ -9485,7 +9485,7 @@ async fn insert_debrid_job(pool: &sqlx::AnyPool, job: &DebridDownloadJob) -> Res
             provider_implementation, remote_release_id, remote_release_status,
             provider_capabilities_json, provider_status_json, selection_mode,
             selected_file_ids_json, skipped_file_ids_json, selection_error, release_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
     )
     .bind(job.job_id.to_string())
     .bind(job.provider_id.to_string())
@@ -9561,7 +9561,7 @@ async fn list_debrid_jobs_for_provider(
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE provider_id = ?
+         WHERE provider_id = $1
          ORDER BY updated_at DESC
          LIMIT 100"
     ))
@@ -9587,7 +9587,7 @@ async fn list_active_debrid_jobs(
                )
          )
          ORDER BY updated_at ASC
-         LIMIT ?"
+         LIMIT $1"
     ))
     .bind(limit)
     .fetch_all(pool)
@@ -9602,7 +9602,7 @@ async fn count_active_debrid_jobs_for_instance(
     let count = sqlx::query_scalar::<sqlx::Any, i64>(
         "SELECT COUNT(*)
          FROM debrid_download_jobs
-         WHERE instance_id = ?
+         WHERE instance_id = $1
            AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required')",
     )
     .bind(instance_id.to_string())
@@ -9620,7 +9620,7 @@ async fn list_refreshable_debrid_jobs(
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE provider_id = ?
+         WHERE provider_id = $1
            AND (remote_torrent_id IS NOT NULL OR remote_release_id IS NOT NULL)
            AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
          ORDER BY updated_at DESC
@@ -9641,8 +9641,8 @@ async fn find_debrid_job(
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE provider_id = ?
-           AND (job_id = ? OR remote_torrent_id = ? OR remote_download_id = ? OR remote_release_id = ?)
+         WHERE provider_id = $1
+           AND (job_id = $2 OR remote_torrent_id = $3 OR remote_download_id = $4 OR remote_release_id = $5)
          LIMIT 1"
     ))
     .bind(provider_id.to_string())
@@ -9660,7 +9660,7 @@ async fn load_debrid_job(pool: &sqlx::AnyPool, job_id: Uuid) -> Result<Option<De
         "SELECT ",
         debrid_job_columns!(),
         " FROM debrid_download_jobs
-         WHERE job_id = ?
+         WHERE job_id = $1
          LIMIT 1"
     ))
     .bind(job_id.to_string())
@@ -9818,8 +9818,8 @@ async fn persist_debrid_provider_cleanup_evidence(
         .context("serializing debrid provider cleanup evidence")?;
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET provider_status_json = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         SET provider_status_json = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $2",
     )
     .bind(provider_status_json)
     .bind(job_id.to_string())
@@ -9878,19 +9878,19 @@ async fn update_debrid_job_from_inspection(
     let progress = inspection.progress.as_ref();
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET status = ?, remote_release_status = ?, display_name = COALESCE(display_name, ?),
-             links_json = CASE WHEN ? != '[]' THEN ? ELSE links_json END,
-             progress = ?, downloaded_bytes = ?, total_bytes = ?, download_rate_bps = ?,
-             provider_implementation = ?,
-             remote_release_id = COALESCE(remote_release_id, ?),
-             provider_capabilities_json = ?,
-             provider_status_json = ?,
-             last_error = ?,
-             selection_mode = ?,
-             selected_file_ids_json = CASE WHEN ? != '[]' THEN ? ELSE selected_file_ids_json END,
-             skipped_file_ids_json = CASE WHEN ? != '[]' THEN ? ELSE skipped_file_ids_json END,
+         SET status = $1, remote_release_status = $2, display_name = COALESCE(display_name, $3),
+             links_json = CASE WHEN $4 != '[]' THEN $5 ELSE links_json END,
+             progress = $6, downloaded_bytes = $7, total_bytes = $8, download_rate_bps = $9,
+             provider_implementation = $10,
+             remote_release_id = COALESCE(remote_release_id, $11),
+             provider_capabilities_json = $12,
+             provider_status_json = $13,
+             last_error = $14,
+             selection_mode = $15,
+             selected_file_ids_json = CASE WHEN $16 != '[]' THEN $17 ELSE selected_file_ids_json END,
+             skipped_file_ids_json = CASE WHEN $18 != '[]' THEN $19 ELSE skipped_file_ids_json END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         WHERE job_id = $20",
     )
     .bind(&status)
     .bind(inspection.release.status.as_str())
@@ -9945,7 +9945,7 @@ async fn update_debrid_job_links(
     links: &[String],
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE debrid_download_jobs SET links_json = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+        "UPDATE debrid_download_jobs SET links_json = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2",
     )
     .bind(serde_json::to_string(links)?)
     .bind(job_id.to_string())
@@ -9963,9 +9963,9 @@ async fn update_debrid_job_download_progress(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET status = 'materializing', downloaded_bytes = ?, total_bytes = COALESCE(?, total_bytes),
-             progress = ?, download_rate_bps = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         SET status = 'materializing', downloaded_bytes = $1, total_bytes = COALESCE($2, total_bytes),
+             progress = $3, download_rate_bps = $4, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $5",
     )
     .bind(u64_to_i64(downloaded))
     .bind(total.and_then(u64_to_i64))
@@ -9983,7 +9983,7 @@ async fn update_debrid_job_local_path(
     path: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE debrid_download_jobs SET local_path = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+        "UPDATE debrid_download_jobs SET local_path = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2",
     )
     .bind(path)
     .bind(job_id.to_string())
@@ -10000,8 +10000,8 @@ async fn mark_debrid_job_status(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET status = ?, remote_release_status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         SET status = $1, remote_release_status = $2, last_error = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $4",
     )
     .bind(status)
     .bind(status)
@@ -10032,7 +10032,7 @@ async fn mark_debrid_job_status(
 
 async fn update_debrid_job_error(pool: &sqlx::AnyPool, job_id: Uuid, error: &str) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE debrid_download_jobs SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+        "UPDATE debrid_download_jobs SET last_error = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2",
     )
     .bind(error)
     .bind(job_id.to_string())
@@ -10136,9 +10136,9 @@ async fn mark_debrid_job_completed(
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
-         SET status = 'completed', local_path = COALESCE(?, local_path), progress = 1.0,
+         SET status = 'completed', local_path = COALESCE($1, local_path), progress = 1.0,
              download_rate_bps = 0, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = ?",
+         WHERE job_id = $2",
     )
     .bind(local_path)
     .bind(job_id.to_string())
@@ -10289,7 +10289,7 @@ async fn target_ids_for_download_id(pool: &sqlx::AnyPool, download_id: &str) -> 
     let rows = sqlx::query_scalar::<sqlx::Any, String>(
         "SELECT target_id
          FROM acquisition_targets
-         WHERE download_id = ?",
+         WHERE download_id = $1",
     )
     .bind(download_id)
     .fetch_all(pool)
@@ -12789,7 +12789,7 @@ mod tests {
         )
         .await?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE debrid_download_jobs SET remote_release_id = NULL WHERE job_id = ?",
+            "UPDATE debrid_download_jobs SET remote_release_id = NULL WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .execute(&database.pool)
@@ -13348,7 +13348,7 @@ mod tests {
             "INSERT INTO download_provider_bindings
              (id, logical_role, owner_id, binding_kind, provider_id, profile_id, category,
               download_path, allow_shared_path, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(route_binding_id.to_string())
         .bind(DEBRID_DEFAULT_LOGICAL_ID)
@@ -13983,8 +13983,8 @@ mod tests {
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "UPDATE debrid_download_jobs
-             SET remote_torrent_id = ?, remote_release_id = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE job_id = ?",
+             SET remote_torrent_id = $1, remote_release_id = $2, updated_at = CURRENT_TIMESTAMP
+             WHERE job_id = $3",
         )
         .bind(remote_release_id)
         .bind(remote_release_id)
@@ -14001,7 +14001,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extensions (
                 extension_id, name, version, kind, trust_level, manifest_json, enabled
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&extension_id)
         .bind("Test Debrid")
@@ -14015,7 +14015,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO extension_instances (
                 instance_id, extension_id, instance_name, config_json, enabled
-             ) VALUES (?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(instance_id.to_string())
         .bind(&extension_id)
@@ -14027,7 +14027,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO providers (
                 provider_id, instance_id, capability, slot_id, cardinality, implementation
-             ) VALUES (?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(provider_id.to_string())
         .bind(instance_id.to_string())
@@ -14047,7 +14047,7 @@ mod tests {
                 subscription_id, media_type, title, normalized_title, monitor_policy,
                 route_policy, release_delay_seconds, metadata_refresh_after,
                 candidate_search_after, status, active
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8, $9)",
         )
         .bind(subscription_id.to_string())
         .bind("series")
@@ -14065,7 +14065,7 @@ mod tests {
                 "INSERT INTO acquisition_targets (
                     target_id, subscription_id, target_key, media_type, title,
                     season_number, episode_number, state
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(Uuid::new_v4().to_string())
             .bind(subscription_id.to_string())
@@ -14091,7 +14091,7 @@ mod tests {
                 subscription_id, media_type, title, normalized_title, monitor_policy,
                 route_policy, release_delay_seconds, metadata_refresh_after,
                 candidate_search_after, status, active
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8, $9)",
         )
         .bind(subscription_id.to_string())
         .bind("movie")
@@ -14107,7 +14107,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO acquisition_targets (
                 target_id, subscription_id, target_key, media_type, title, state
-             ) VALUES (?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(subscription_id.to_string())
@@ -15779,8 +15779,8 @@ mod tests {
         let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
         sqlx::query::<sqlx::Any>(
             "UPDATE extension_instances
-             SET config_json = ?
-             WHERE instance_id = ?",
+             SET config_json = $1
+             WHERE instance_id = $2",
         )
         .bind(json!({ "maxConcurrentDownloads": 2 }).to_string())
         .bind(instance_id.to_string())
@@ -16349,7 +16349,7 @@ mod tests {
         let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
         let target_id = sqlx::query_scalar::<sqlx::Any, String>(
             "SELECT target_id FROM acquisition_targets
-             WHERE subscription_id = ? AND target_key = 'S01E01'
+             WHERE subscription_id = $1 AND target_key = 'S01E01'
              LIMIT 1",
         )
         .bind(subscription_id.to_string())
@@ -17634,7 +17634,7 @@ mod tests {
         );
 
         sqlx::query::<sqlx::Any>(
-            "UPDATE debrid_download_jobs SET provider_implementation = NULL WHERE job_id = ?",
+            "UPDATE debrid_download_jobs SET provider_implementation = NULL WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .execute(&state.db_pool)
@@ -18933,7 +18933,7 @@ mod tests {
             "INSERT INTO debrid_download_jobs (
                 job_id, provider_id, instance_id, owner_id, source, source_kind,
                 remote_torrent_id, status, links_json
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(legacy_job_id.to_string())
         .bind(provider_id.to_string())
@@ -19502,7 +19502,7 @@ mod tests {
         let submitted_targets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM acquisition_targets
-             WHERE subscription_id = ?
+             WHERE subscription_id = $1
                AND state = 'submitted'",
         )
         .bind(subscription_id.to_string())
@@ -19557,7 +19557,7 @@ mod tests {
         let imported_targets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM acquisition_targets
-             WHERE subscription_id = ?
+             WHERE subscription_id = $1
                AND state = 'imported'",
         )
         .bind(subscription_id.to_string())
@@ -19635,7 +19635,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "UPDATE debrid_download_jobs
              SET selection_error = 'no_selected_files'
-             WHERE job_id = ?",
+             WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .execute(&database.pool)
@@ -19649,7 +19649,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "UPDATE debrid_download_jobs
              SET selection_error = 'ambiguous_target_file_match'
-             WHERE job_id = ?",
+             WHERE job_id = $1",
         )
         .bind(job_id.to_string())
         .execute(&database.pool)

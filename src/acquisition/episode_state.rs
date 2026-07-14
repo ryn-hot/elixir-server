@@ -163,7 +163,7 @@ pub async fn sync_library_episode_acquisition_state_for_target(
             selected_release_title,
             last_attempt_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, CURRENT_TIMESTAMP)
         ON CONFLICT(episode_id) DO UPDATE SET
             media_item_id = excluded.media_item_id,
             season_id = excluded.season_id,
@@ -266,7 +266,7 @@ pub async fn get_library_episode_acquisition_projection(
             CAST(last_attempt_at AS TEXT) AS last_attempt_at,
             CAST(updated_at AS TEXT) AS updated_at
          FROM library_episode_acquisition_state
-         WHERE episode_id = ?
+         WHERE episode_id = $1
          LIMIT 1",
     )
     .bind(episode_id.to_string())
@@ -285,9 +285,7 @@ pub async fn list_library_episode_acquisition_projections(
         return Ok(HashMap::new());
     }
 
-    let placeholders = std::iter::repeat_n("?", episode_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders = crate::db::numbered_bind_list(1, episode_ids.len());
     let sql = format!(
         "SELECT
             episode_id,
@@ -350,7 +348,7 @@ async fn resolve_episode_projection_context(
         sqlx::query(
             "SELECT id, series_id, season_id
              FROM episodes
-             WHERE series_id = ? AND season_number = ? AND episode_number = ?
+             WHERE series_id = $1 AND season_number = $2 AND episode_number = $3
              LIMIT 1",
         )
         .bind(series_id.to_string())
@@ -362,7 +360,7 @@ async fn resolve_episode_projection_context(
         sqlx::query(
             "SELECT id, series_id, season_id
              FROM episodes
-             WHERE series_id = ? AND absolute_episode_number = ?
+             WHERE series_id = $1 AND absolute_episode_number = $2
              LIMIT 1",
         )
         .bind(series_id.to_string())
@@ -390,7 +388,7 @@ async fn load_episode_projection_context(
     let row = sqlx::query(
         "SELECT id, series_id, season_id
          FROM episodes
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1",
     )
     .bind(episode_id.to_string())
@@ -467,9 +465,9 @@ async fn resolve_series_id_from_target_or_subscription(
     let row = sqlx::query(
         "SELECT id
          FROM series
-         WHERE (? IS NOT NULL AND external_tvdb_series = ?)
-            OR (? IS NOT NULL AND external_imdb = ?)
-            OR (? IS NOT NULL AND external_anilist = ?)
+         WHERE ($1 IS NOT NULL AND external_tvdb_series = $2)
+            OR ($3 IS NOT NULL AND external_imdb = $4)
+            OR ($5 IS NOT NULL AND external_anilist = $6)
          ORDER BY updated_at DESC
          LIMIT 1",
     )
@@ -607,7 +605,7 @@ async fn load_provider_label(
          FROM providers p
          LEFT JOIN extension_instances i ON i.instance_id = p.instance_id
          LEFT JOIN extensions e ON e.extension_id = i.extension_id
-         WHERE p.provider_id = ?
+         WHERE p.provider_id = $1
          LIMIT 1",
     )
     .bind(provider_id.to_string())
@@ -635,7 +633,7 @@ async fn load_target_release_evidence(
             CAST(j.release_job_id AS TEXT) AS job_id
          FROM acquisition_release_coverage c
          LEFT JOIN acquisition_release_jobs j ON j.release_id = c.release_id
-         WHERE c.target_id = ?
+         WHERE c.target_id = $1
          ORDER BY c.updated_at DESC, j.updated_at DESC
          LIMIT 1",
     )
@@ -877,7 +875,7 @@ mod tests {
         let season_id = Uuid::new_v4();
         let episode_id = Uuid::new_v4();
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO series (id, title, year, library_type) VALUES (?, ?, ?, ?)",
+            "INSERT INTO series (id, title, year, library_type) VALUES ($1, $2, $3, $4)",
         )
         .bind(series_id.to_string())
         .bind("Projection Show")
@@ -886,7 +884,7 @@ mod tests {
         .execute(pool)
         .await?;
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO seasons (id, series_id, season_number, title) VALUES (?, ?, ?, ?)",
+            "INSERT INTO seasons (id, series_id, season_number, title) VALUES ($1, $2, $3, $4)",
         )
         .bind(season_id.to_string())
         .bind(series_id.to_string())
@@ -897,7 +895,7 @@ mod tests {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO episodes (
                 id, series_id, season_id, season_number, episode_number, title, has_file
-            ) VALUES (?, ?, ?, ?, ?, ?, 0)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, 0)",
         )
         .bind(episode_id.to_string())
         .bind(series_id.to_string())
@@ -940,7 +938,7 @@ mod tests {
         let row = sqlx::query::<sqlx::Any>(
             "SELECT COUNT(*) AS count
              FROM library_episode_acquisition_state
-             WHERE episode_id = ?",
+             WHERE episode_id = $1",
         )
         .bind(episode_id.to_string())
         .fetch_one(pool)
@@ -997,7 +995,7 @@ mod tests {
         assert_eq!(projection.target_key, "S01E01");
         assert_eq!(projection.media_item_id, series_id);
 
-        sqlx::query::<sqlx::Any>("DELETE FROM episodes WHERE id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM episodes WHERE id = $1")
             .bind(episode_id.to_string())
             .execute(&database.pool)
             .await?;
@@ -1019,7 +1017,7 @@ mod tests {
         .await?;
         assert_eq!(count_projection_rows(&database.pool, episode_id).await?, 1);
 
-        sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = ?")
+        sqlx::query::<sqlx::Any>("DELETE FROM series WHERE id = $1")
             .bind(series_id.to_string())
             .execute(&database.pool)
             .await?;
@@ -1126,7 +1124,7 @@ mod tests {
         );
 
         sqlx::query::<sqlx::Any>(
-            "DELETE FROM library_episode_acquisition_state WHERE episode_id = ?",
+            "DELETE FROM library_episode_acquisition_state WHERE episode_id = $1",
         )
         .bind(episode_id.to_string())
         .execute(&database.pool)

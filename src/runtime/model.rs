@@ -96,6 +96,8 @@ pub enum VolumeMountSourceKind {
 pub struct PortMapping {
     pub container_port: u16,
     pub host_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
     #[serde(default)]
     pub protocol: Option<String>,
 }
@@ -214,6 +216,7 @@ pub fn container_spec_fingerprint(spec: &ContainerSpec) -> String {
         left.container_port
             .cmp(&right.container_port)
             .then_with(|| left.host_port.cmp(&right.host_port))
+            .then_with(|| left.host_ip.cmp(&right.host_ip))
             .then_with(|| left.protocol.cmp(&right.protocol))
     });
 

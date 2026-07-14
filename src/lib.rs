@@ -1,6 +1,7 @@
 pub mod acquisition;
 pub mod artwork;
 pub mod auth;
+pub mod authz;
 pub mod config;
 pub mod db;
 pub mod debrid;
@@ -9,6 +10,7 @@ pub mod drivers;
 pub mod extensions;
 pub mod http;
 pub mod library;
+pub mod live;
 pub mod media;
 pub mod media_interactions;
 pub mod metadata;

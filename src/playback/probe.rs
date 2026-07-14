@@ -199,7 +199,7 @@ pub async fn ensure_media_file_probe(
                 CAST(source_size_bytes AS TEXT) AS source_size_bytes_text,
                 CAST(source_mtime_ms AS TEXT) AS source_mtime_ms_text,
                 error
-         FROM media_file_probes WHERE media_file_id = ? LIMIT 1",
+         FROM media_file_probes WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -284,7 +284,7 @@ pub async fn upsert_media_file_probe_success(
         Some(metadata.raw_json.to_string())
     };
 
-    sqlx::query::<sqlx::Any>("DELETE FROM media_file_probes WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM media_file_probes WHERE media_file_id = $1")
         .bind(media_file_id)
         .execute(pool)
         .await?;
@@ -293,7 +293,7 @@ pub async fn upsert_media_file_probe_success(
             (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
              source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
              created_at, updated_at)
-         VALUES (?, ?, ?, 'ok', CURRENT_TIMESTAMP, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, $3, 'ok', CURRENT_TIMESTAMP, $4, $5, $6, $7, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_file_id)
     .bind(MEDIA_CAPABILITIES_PROBE_VERSION)
@@ -329,7 +329,7 @@ pub async fn upsert_media_file_probe_failure(
     error: &str,
 ) -> anyhow::Result<()> {
     let signature = probe_signature(path).await.ok();
-    sqlx::query::<sqlx::Any>("DELETE FROM media_file_probes WHERE media_file_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM media_file_probes WHERE media_file_id = $1")
         .bind(media_file_id)
         .execute(pool)
         .await?;
@@ -338,7 +338,7 @@ pub async fn upsert_media_file_probe_failure(
             (media_file_id, probe_version, ffprobe_version, probe_status, probed_at,
              source_mtime_ms, source_size_bytes, normalized_json, raw_json, error,
              created_at, updated_at)
-         VALUES (?, ?, NULL, 'probe_failed', CURRENT_TIMESTAMP, ?, ?, NULL, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+         VALUES ($1, $2, NULL, 'probe_failed', CURRENT_TIMESTAMP, $3, $4, NULL, NULL, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(media_file_id)
     .bind(MEDIA_CAPABILITIES_PROBE_VERSION)
@@ -357,14 +357,14 @@ pub async fn update_media_file_probe_projection(
 ) -> anyhow::Result<()> {
     sqlx::query::<sqlx::Any>(
         "UPDATE media_files
-         SET container = COALESCE(?, container),
-             video_codec = COALESCE(?, video_codec),
-             audio_codec = COALESCE(?, audio_codec),
-             width = COALESCE(?, width),
-             height = COALESCE(?, height),
-             bitrate_bps = COALESCE(?, bitrate_bps),
+         SET container = COALESCE($1, container),
+             video_codec = COALESCE($2, video_codec),
+             audio_codec = COALESCE($3, audio_codec),
+             width = COALESCE($4, width),
+             height = COALESCE($5, height),
+             bitrate_bps = COALESCE($6, bitrate_bps),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = $7",
     )
     .bind(metadata.container.as_ref())
     .bind(

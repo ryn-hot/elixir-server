@@ -1782,7 +1782,7 @@ async fn cleanup_stale_sessions(state: &crate::state::AppState, ttl_seconds: u64
         PLAYBACK_SESSION_EXPIRATIONS
             .with_label_values(&["ttl"])
             .inc();
-        sqlx::query("DELETE FROM playback_sessions WHERE id = ?")
+        sqlx::query("DELETE FROM playback_sessions WHERE id = $1")
             .bind(id.to_string())
             .execute(&state.db_pool)
             .await

@@ -486,7 +486,7 @@ pub async fn upsert_acquisition_route(
     }
 
     sqlx::query::<sqlx::Any>(
-        "DELETE FROM download_provider_bindings WHERE logical_role = ? AND owner_id = ?",
+        "DELETE FROM download_provider_bindings WHERE logical_role = $1 AND owner_id = $2",
     )
     .bind(logical_id)
     .bind(&owner_id)
@@ -494,7 +494,7 @@ pub async fn upsert_acquisition_route(
     .await
     .context("clearing previous acquisition route binding")?;
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_provider_bindings (id, logical_role, owner_id, binding_kind, provider_id, profile_id, category, download_path, allow_shared_path, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO download_provider_bindings (id, logical_role, owner_id, binding_kind, provider_id, profile_id, category, download_path, allow_shared_path, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(logical_id)
@@ -549,7 +549,7 @@ async fn load_route_binding(
     owner_id: &str,
 ) -> Result<Option<StoredRouteBinding>> {
     let row = sqlx::query::<sqlx::Any>(
-        "SELECT binding_kind, COALESCE(CAST(provider_id AS TEXT), '') as provider_id, COALESCE(CAST(profile_id AS TEXT), '') as profile_id, COALESCE(CAST(category AS TEXT), '') as category, COALESCE(CAST(download_path AS TEXT), '') as download_path, CASE WHEN LOWER(CAST(allow_shared_path AS TEXT)) IN ('1', 'true', 't') THEN 1 ELSE 0 END as allow_shared_path, status FROM download_provider_bindings WHERE logical_role = ? AND owner_id = ? ORDER BY updated_at DESC LIMIT 1",
+        "SELECT binding_kind, COALESCE(CAST(provider_id AS TEXT), '') as provider_id, COALESCE(CAST(profile_id AS TEXT), '') as profile_id, COALESCE(CAST(category AS TEXT), '') as category, COALESCE(CAST(download_path AS TEXT), '') as download_path, CASE WHEN LOWER(CAST(allow_shared_path AS TEXT)) IN ('1', 'true', 't') THEN 1 ELSE 0 END as allow_shared_path, status FROM download_provider_bindings WHERE logical_role = $1 AND owner_id = $2 ORDER BY updated_at DESC LIMIT 1",
     )
     .bind(logical_id)
     .bind(owner_id)

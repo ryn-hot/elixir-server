@@ -19,10 +19,17 @@ use crate::download_broker::{
 use crate::drivers::DownloaderTorrentPatch;
 use crate::extensions::auto_managed::{is_nzbget_extension_id, is_qbittorrent_extension_id};
 use crate::extensions::store::{ExtensionStore, NewSecret};
-use crate::runtime::model::{
-    ContainerSpec, EnvVar, VolumeMount, VolumeMountSourceKind, apply_container_spec_fingerprint,
-};
+use crate::runtime::model::ContainerSpec;
 use crate::secrets::SecretsManager;
+
+pub use crate::network::gateway::{
+    CloudflareWarpGatewayRuntime, GatewayRuntime, GluetunOpenvpnGatewayRuntime,
+    GluetunWireguardGatewayRuntime,
+};
+use crate::network::gateway::{
+    CompiledGatewayTopology, GatewayTopologyCompileInput, GatewayTopologyLabels,
+    GatewayTopologyProfile, compile_gateway_topology,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -528,36 +535,6 @@ pub struct DownloadProtectionProfile {
     pub runtime: GatewayRuntime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum GatewayRuntime {
-    None,
-    GluetunWireguard(GluetunWireguardGatewayRuntime),
-    GluetunOpenvpn(GluetunOpenvpnGatewayRuntime),
-    CloudflareWarp(CloudflareWarpGatewayRuntime),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GluetunWireguardGatewayRuntime {
-    pub image: String,
-    pub config_host_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GluetunOpenvpnGatewayRuntime {
-    pub image: String,
-    pub config_host_path: String,
-    pub auth_host_path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloudflareWarpGatewayRuntime {
-    pub image: String,
-    pub state_volume_name: String,
-    pub enrollment_id: String,
-    pub identity_secret_ref: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct DownloadProtectionCompileInput<'a> {
     pub app_container_name: &'a str,
@@ -565,11 +542,7 @@ pub struct DownloadProtectionCompileInput<'a> {
     pub base_labels: &'a HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct CompiledDownloadProtectionProfile {
-    pub gateway_spec: Option<ContainerSpec>,
-    pub protected_app_spec: ContainerSpec,
-}
+pub type CompiledDownloadProtectionProfile = CompiledGatewayTopology;
 
 #[derive(Debug, Clone)]
 struct ManagedDownloaderInventory {
@@ -649,59 +622,14 @@ enum SecretCheck {
     Unknown(String),
 }
 
-trait GatewayRuntimeCompiler {
-    fn compile(
-        &self,
-        profile: &DownloadProtectionProfile,
-        input: DownloadProtectionCompileInput<'_>,
-    ) -> Result<CompiledDownloadProtectionProfile>;
-}
-
 pub(crate) const DOWNLOAD_NETWORK_PROFILE_ID_LABEL: &str = "elixir.download_network.profile_id";
 pub(crate) const DOWNLOAD_NETWORK_PROFILE_KIND_LABEL: &str = "elixir.download_network.profile_kind";
 pub(crate) const DOWNLOAD_NETWORK_RUNTIME_KIND_LABEL: &str = "elixir.download_network.runtime_kind";
 pub(crate) const DOWNLOAD_NETWORK_EXPOSED_PORTS_LABEL: &str =
     "elixir.download_network.exposed_ports";
 
-fn stamp_download_network_labels(
-    spec: &mut ContainerSpec,
-    profile: &DownloadProtectionProfile,
-    runtime_kind: &str,
-    source_app_spec: &ContainerSpec,
-) {
-    spec.labels.insert(
-        DOWNLOAD_NETWORK_PROFILE_ID_LABEL.to_string(),
-        profile.id.clone(),
-    );
-    spec.labels.insert(
-        DOWNLOAD_NETWORK_PROFILE_KIND_LABEL.to_string(),
-        profile_kind_as_str(&profile.kind).to_string(),
-    );
-    spec.labels.insert(
-        DOWNLOAD_NETWORK_RUNTIME_KIND_LABEL.to_string(),
-        runtime_kind.to_string(),
-    );
-    spec.labels.insert(
-        DOWNLOAD_NETWORK_EXPOSED_PORTS_LABEL.to_string(),
-        exposed_container_ports_label(source_app_spec),
-    );
-    apply_container_spec_fingerprint(spec);
-}
-
 pub(crate) fn exposed_container_ports_label(spec: &ContainerSpec) -> String {
-    let mut ports = spec
-        .ports
-        .iter()
-        .map(|port| {
-            format!(
-                "{}/{}",
-                port.container_port,
-                port.protocol.as_deref().unwrap_or("tcp")
-            )
-        })
-        .collect::<Vec<_>>();
-    ports.sort();
-    ports.join(",")
+    crate::network::gateway::exposed_container_ports_label(spec)
 }
 
 impl DownloadProtectionProfile {
@@ -765,405 +693,26 @@ impl DownloadProtectionProfile {
         &self,
         input: DownloadProtectionCompileInput<'_>,
     ) -> Result<CompiledDownloadProtectionProfile> {
-        match &self.runtime {
-            GatewayRuntime::None => {
-                let mut protected_app_spec = input.app_spec.clone();
-                stamp_download_network_labels(
-                    &mut protected_app_spec,
-                    self,
-                    "direct",
-                    input.app_spec,
-                );
-                Ok(CompiledDownloadProtectionProfile {
-                    gateway_spec: None,
-                    protected_app_spec,
-                })
-            }
-            GatewayRuntime::GluetunWireguard(runtime) => runtime.compile(self, input),
-            GatewayRuntime::GluetunOpenvpn(runtime) => runtime.compile(self, input),
-            GatewayRuntime::CloudflareWarp(runtime) => runtime.compile(self, input),
-        }
-    }
-}
-
-impl GatewayRuntimeCompiler for GluetunWireguardGatewayRuntime {
-    fn compile(
-        &self,
-        profile: &DownloadProtectionProfile,
-        input: DownloadProtectionCompileInput<'_>,
-    ) -> Result<CompiledDownloadProtectionProfile> {
-        let image = self.image.trim();
-        if image.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty gateway image",
-                profile.id
-            );
-        }
-        let config_host_path = self.config_host_path.trim();
-        if config_host_path.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty WireGuard config path",
-                profile.id
-            );
-        }
-        let app_container_name = input.app_container_name.trim();
-        if app_container_name.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty app container name",
-                profile.id
-            );
-        }
-
-        let gateway_name = format!("{app_container_name}-vpn");
-        let mut labels = input.base_labels.clone();
-        labels.insert(
-            "elixir.network_role".to_string(),
-            "wireguard_gateway".to_string(),
-        );
-
-        let mut sysctls = HashMap::new();
-        sysctls.insert(
-            "net.ipv4.conf.all.src_valid_mark".to_string(),
-            "1".to_string(),
-        );
-
-        let input_ports = input
-            .app_spec
-            .ports
-            .iter()
-            .map(|port| port.container_port.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut gateway_env = vec![
-            EnvVar {
-                name: "VPN_SERVICE_PROVIDER".to_string(),
-                value: "custom".to_string(),
+        compile_gateway_topology(
+            GatewayTopologyProfile {
+                id: &self.id,
+                kind: profile_kind_as_str(&self.kind),
+                runtime: &self.runtime,
             },
-            EnvVar {
-                name: "VPN_TYPE".to_string(),
-                value: "wireguard".to_string(),
-            },
-            EnvVar {
-                name: "WIREGUARD_CONF_FILE".to_string(),
-                value: "wg0.conf".to_string(),
-            },
-            EnvVar {
-                name: "FIREWALL_OUTBOUND_SUBNETS".to_string(),
-                value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".to_string(),
-            },
-        ];
-        if !input_ports.is_empty() {
-            gateway_env.push(EnvVar {
-                name: "FIREWALL_INPUT_PORTS".to_string(),
-                value: input_ports,
-            });
-        }
-
-        let mut gateway_spec = ContainerSpec {
-            name: gateway_name.clone(),
-            image: image.to_string(),
-            network: input.app_spec.network.clone(),
-            network_mode: None,
-            aliases: input.app_spec.aliases.clone(),
-            env: gateway_env,
-            volumes: vec![VolumeMount {
-                source_kind: VolumeMountSourceKind::Bind,
-                host_path: config_host_path.to_string(),
-                container_path: "/gluetun/wireguard/wg0.conf".to_string(),
-                read_only: true,
-            }],
-            ports: input.app_spec.ports.clone(),
-            labels,
-            command: Vec::new(),
-            cap_add: vec!["NET_ADMIN".to_string()],
-            cap_drop: Vec::new(),
-            devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
-            sysctls,
-            security: Default::default(),
-        };
-
-        let mut protected_app_spec = input.app_spec.clone();
-        protected_app_spec.network_mode = Some(format!("container:{gateway_name}"));
-        protected_app_spec.aliases.clear();
-        protected_app_spec.ports.clear();
-        stamp_download_network_labels(
-            &mut gateway_spec,
-            profile,
-            "gluetun_wireguard",
-            input.app_spec,
-        );
-        stamp_download_network_labels(
-            &mut protected_app_spec,
-            profile,
-            "gluetun_wireguard",
-            input.app_spec,
-        );
-
-        Ok(CompiledDownloadProtectionProfile {
-            gateway_spec: Some(gateway_spec),
-            protected_app_spec,
-        })
-    }
-}
-
-impl GatewayRuntimeCompiler for GluetunOpenvpnGatewayRuntime {
-    fn compile(
-        &self,
-        profile: &DownloadProtectionProfile,
-        input: DownloadProtectionCompileInput<'_>,
-    ) -> Result<CompiledDownloadProtectionProfile> {
-        let image = self.image.trim();
-        if image.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty OpenVPN gateway image",
-                profile.id
-            );
-        }
-        let config_host_path = self.config_host_path.trim();
-        if config_host_path.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty OpenVPN config path",
-                profile.id
-            );
-        }
-        let app_container_name = input.app_container_name.trim();
-        if app_container_name.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty app container name",
-                profile.id
-            );
-        }
-
-        let gateway_name = format!("{app_container_name}-vpn");
-        let mut labels = input.base_labels.clone();
-        labels.insert(
-            "elixir.network_role".to_string(),
-            "openvpn_gateway".to_string(),
-        );
-
-        let input_ports = input
-            .app_spec
-            .ports
-            .iter()
-            .map(|port| port.container_port.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut gateway_env = vec![
-            EnvVar {
-                name: "VPN_SERVICE_PROVIDER".to_string(),
-                value: "custom".to_string(),
-            },
-            EnvVar {
-                name: "VPN_TYPE".to_string(),
-                value: "openvpn".to_string(),
-            },
-            EnvVar {
-                name: "OPENVPN_CUSTOM_CONFIG".to_string(),
-                value: "/gluetun/custom.conf".to_string(),
-            },
-            EnvVar {
-                name: "FIREWALL_OUTBOUND_SUBNETS".to_string(),
-                value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".to_string(),
-            },
-        ];
-        if !input_ports.is_empty() {
-            gateway_env.push(EnvVar {
-                name: "FIREWALL_INPUT_PORTS".to_string(),
-                value: input_ports,
-            });
-        }
-
-        let mut volumes = vec![VolumeMount {
-            source_kind: VolumeMountSourceKind::Bind,
-            host_path: config_host_path.to_string(),
-            container_path: "/gluetun/custom.conf".to_string(),
-            read_only: true,
-        }];
-        if let Some(auth_host_path) = self
-            .auth_host_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            volumes.push(VolumeMount {
-                source_kind: VolumeMountSourceKind::Bind,
-                host_path: auth_host_path.to_string(),
-                container_path: "/gluetun/auth.txt".to_string(),
-                read_only: true,
-            });
-        }
-
-        let mut gateway_spec = ContainerSpec {
-            name: gateway_name.clone(),
-            image: image.to_string(),
-            network: input.app_spec.network.clone(),
-            network_mode: None,
-            aliases: input.app_spec.aliases.clone(),
-            env: gateway_env,
-            volumes,
-            ports: input.app_spec.ports.clone(),
-            labels,
-            command: Vec::new(),
-            cap_add: vec!["NET_ADMIN".to_string()],
-            cap_drop: Vec::new(),
-            devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
-            sysctls: HashMap::new(),
-            security: Default::default(),
-        };
-
-        let mut protected_app_spec = input.app_spec.clone();
-        protected_app_spec.network_mode = Some(format!("container:{gateway_name}"));
-        protected_app_spec.aliases.clear();
-        protected_app_spec.ports.clear();
-        stamp_download_network_labels(
-            &mut gateway_spec,
-            profile,
-            "gluetun_openvpn",
-            input.app_spec,
-        );
-        stamp_download_network_labels(
-            &mut protected_app_spec,
-            profile,
-            "gluetun_openvpn",
-            input.app_spec,
-        );
-
-        Ok(CompiledDownloadProtectionProfile {
-            gateway_spec: Some(gateway_spec),
-            protected_app_spec,
-        })
-    }
-}
-
-impl GatewayRuntimeCompiler for CloudflareWarpGatewayRuntime {
-    fn compile(
-        &self,
-        profile: &DownloadProtectionProfile,
-        input: DownloadProtectionCompileInput<'_>,
-    ) -> Result<CompiledDownloadProtectionProfile> {
-        let image = self.image.trim();
-        if image.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty WARP gateway image",
-                profile.id
-            );
-        }
-        let state_volume_name = self.state_volume_name.trim();
-        if state_volume_name.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty WARP state volume",
-                profile.id
-            );
-        }
-        let enrollment_id = self.enrollment_id.trim();
-        if enrollment_id.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty WARP enrollment id",
-                profile.id
-            );
-        }
-        let identity_secret_ref = self.identity_secret_ref.trim();
-        if identity_secret_ref.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty WARP identity secret reference",
-                profile.id
-            );
-        }
-        let app_container_name = input.app_container_name.trim();
-        if app_container_name.is_empty() {
-            bail!(
-                "download protection profile '{}' has an empty app container name",
-                profile.id
-            );
-        }
-
-        let gateway_name = format!("{app_container_name}-vpn");
-        let mut labels = input.base_labels.clone();
-        labels.insert(
-            "elixir.network_role".to_string(),
-            "warp_gateway".to_string(),
-        );
-        labels.insert("elixir.warp.profile_id".to_string(), profile.id.clone());
-        labels.insert(
-            "elixir.warp.enrollment_id".to_string(),
-            enrollment_id.to_string(),
-        );
-
-        let mut sysctls = HashMap::new();
-        sysctls.insert(
-            "net.ipv6.conf.all.disable_ipv6".to_string(),
-            "0".to_string(),
-        );
-        sysctls.insert(
-            "net.ipv4.conf.all.src_valid_mark".to_string(),
-            "1".to_string(),
-        );
-        sysctls.insert("net.ipv4.ip_forward".to_string(), "1".to_string());
-        sysctls.insert("net.ipv6.conf.all.forwarding".to_string(), "1".to_string());
-        sysctls.insert("net.ipv6.conf.all.accept_ra".to_string(), "2".to_string());
-
-        let mut gateway_spec = ContainerSpec {
-            name: gateway_name.clone(),
-            image: image.to_string(),
-            network: input.app_spec.network.clone(),
-            network_mode: None,
-            aliases: input.app_spec.aliases.clone(),
-            env: vec![
-                EnvVar {
-                    name: "WARP_SLEEP".to_string(),
-                    value: "2".to_string(),
+            GatewayTopologyCompileInput {
+                app_container_name: input.app_container_name,
+                app_spec: input.app_spec,
+                base_labels: input.base_labels,
+                labels: GatewayTopologyLabels {
+                    role: "elixir.network_role",
+                    profile_id: DOWNLOAD_NETWORK_PROFILE_ID_LABEL,
+                    profile_kind: DOWNLOAD_NETWORK_PROFILE_KIND_LABEL,
+                    runtime_kind: DOWNLOAD_NETWORK_RUNTIME_KIND_LABEL,
+                    exposed_ports: DOWNLOAD_NETWORK_EXPOSED_PORTS_LABEL,
                 },
-                EnvVar {
-                    name: "WARP_ENABLE_NAT".to_string(),
-                    value: "1".to_string(),
-                },
-                EnvVar {
-                    name: "ELIXIR_WARP_ENROLLMENT_ID".to_string(),
-                    value: enrollment_id.to_string(),
-                },
-                EnvVar {
-                    name: "ELIXIR_WARP_IDENTITY_SECRET_REF".to_string(),
-                    value: identity_secret_ref.to_string(),
-                },
-            ],
-            volumes: vec![VolumeMount {
-                source_kind: VolumeMountSourceKind::NamedVolume,
-                host_path: state_volume_name.to_string(),
-                container_path: "/var/lib/cloudflare-warp".to_string(),
-                read_only: false,
-            }],
-            ports: input.app_spec.ports.clone(),
-            labels,
-            command: Vec::new(),
-            cap_add: vec![
-                "NET_ADMIN".to_string(),
-                "MKNOD".to_string(),
-                "AUDIT_WRITE".to_string(),
-            ],
-            cap_drop: Vec::new(),
-            devices: vec!["/dev/net/tun:/dev/net/tun".to_string()],
-            sysctls,
-            security: Default::default(),
-        };
-
-        let mut protected_app_spec = input.app_spec.clone();
-        protected_app_spec.network_mode = Some(format!("container:{gateway_name}"));
-        protected_app_spec.aliases.clear();
-        protected_app_spec.ports.clear();
-        stamp_download_network_labels(&mut gateway_spec, profile, "warp_gateway", input.app_spec);
-        stamp_download_network_labels(
-            &mut protected_app_spec,
-            profile,
-            "warp_gateway",
-            input.app_spec,
-        );
-
-        Ok(CompiledDownloadProtectionProfile {
-            gateway_spec: Some(gateway_spec),
-            protected_app_spec,
-        })
+                error_subject: "download protection profile",
+            },
+        )
     }
 }
 
@@ -4681,7 +4230,7 @@ async fn load_active_download_network_profile(
     pool: &AnyPool,
 ) -> Result<Option<StoredDownloadNetworkProfile>> {
     let row = sqlx::query::<sqlx::Any>(
-        "SELECT id, name, kind, CAST(enabled AS INTEGER) as enabled, CAST(strict AS INTEGER) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(active AS INTEGER) as active FROM download_network_profiles WHERE active = TRUE ORDER BY updated_at DESC LIMIT 1",
+        "SELECT id, name, kind, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled, CAST(CASE WHEN strict THEN 1 ELSE 0 END AS BIGINT) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(CASE WHEN active THEN 1 ELSE 0 END AS BIGINT) as active FROM download_network_profiles WHERE active = TRUE ORDER BY updated_at DESC LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
@@ -4694,7 +4243,7 @@ async fn load_download_network_profile(
     profile_id: &str,
 ) -> Result<Option<StoredDownloadNetworkProfile>> {
     let row = sqlx::query::<sqlx::Any>(
-        "SELECT id, name, kind, CAST(enabled AS INTEGER) as enabled, CAST(strict AS INTEGER) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(active AS INTEGER) as active FROM download_network_profiles WHERE id = ? LIMIT 1",
+        "SELECT id, name, kind, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled, CAST(CASE WHEN strict THEN 1 ELSE 0 END AS BIGINT) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(CASE WHEN active THEN 1 ELSE 0 END AS BIGINT) as active FROM download_network_profiles WHERE id = $1 LIMIT 1",
     )
     .bind(profile_id)
     .fetch_optional(pool)
@@ -4707,7 +4256,7 @@ async fn list_stored_download_network_profiles(
     pool: &AnyPool,
 ) -> Result<Vec<StoredDownloadNetworkProfile>> {
     let rows = sqlx::query::<sqlx::Any>(
-        "SELECT id, name, kind, CAST(enabled AS INTEGER) as enabled, CAST(strict AS INTEGER) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(active AS INTEGER) as active FROM download_network_profiles ORDER BY active DESC, updated_at DESC, name ASC",
+        "SELECT id, name, kind, CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT) as enabled, CAST(CASE WHEN strict THEN 1 ELSE 0 END AS BIGINT) as strict, scope, CAST(provider AS TEXT) as provider, CAST(gateway_runtime AS TEXT) as gateway_runtime, CAST(config_json AS TEXT) as config_json, status, CAST(CASE WHEN active THEN 1 ELSE 0 END AS BIGINT) as active FROM download_network_profiles ORDER BY active DESC, updated_at DESC, name ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -4722,7 +4271,7 @@ async fn load_profile_secret_ref(
     key: &str,
 ) -> Result<Option<String>> {
     sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT secret_ref FROM download_network_profile_secrets WHERE profile_id = ? AND key = ? LIMIT 1",
+        "SELECT secret_ref FROM download_network_profile_secrets WHERE profile_id = $1 AND key = $2 LIMIT 1",
     )
     .bind(profile_id)
     .bind(key)
@@ -4738,7 +4287,7 @@ async fn upsert_profile_secret_ref(
     secret_ref: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES (?, ?, ?)
+        "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES ($1, $2, $3)
          ON CONFLICT(profile_id, key) DO UPDATE SET secret_ref = excluded.secret_ref",
     )
     .bind(profile_id)
@@ -4762,7 +4311,7 @@ async fn upsert_imported_download_profile(
     status: DownloadProtectionState,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+        "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = TRUE, strict = excluded.strict, scope = excluded.scope, provider = excluded.provider, gateway_runtime = excluded.gateway_runtime, config_json = excluded.config_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP",
     )
     .bind(profile_id)
@@ -4822,7 +4371,7 @@ async fn upsert_cloudflare_warp_profile(
         }
     });
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+        "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = TRUE, strict = TRUE, scope = excluded.scope, provider = excluded.provider, gateway_runtime = excluded.gateway_runtime, config_json = excluded.config_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP",
     )
     .bind(profile_id)
@@ -4953,7 +4502,7 @@ async fn ensure_cloudflare_warp_enrollment(
         .context("storing Cloudflare WARP per-server identity")?;
 
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_warp_enrollments (id, profile_id, enrollment_id, identity_secret_ref, status, disclosure_version) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO download_warp_enrollments (id, profile_id, enrollment_id, identity_secret_ref, status, disclosure_version) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(profile_id)
@@ -4975,7 +4524,7 @@ async fn load_cloudflare_warp_enrollment(
     profile_id: &str,
 ) -> Result<Option<StoredWarpEnrollment>> {
     let row = sqlx::query::<sqlx::Any>(
-        "SELECT profile_id, enrollment_id, identity_secret_ref, status, disclosure_version, CAST(disclosure_accepted_at AS TEXT) as disclosure_accepted_at, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(last_error AS TEXT) as last_error FROM download_warp_enrollments WHERE profile_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT profile_id, enrollment_id, identity_secret_ref, status, disclosure_version, CAST(disclosure_accepted_at AS TEXT) as disclosure_accepted_at, CAST(last_checked_at AS TEXT) as last_checked_at, CAST(last_error AS TEXT) as last_error FROM download_warp_enrollments WHERE profile_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
     .bind(profile_id)
     .fetch_optional(pool)
@@ -4987,14 +4536,14 @@ async fn load_cloudflare_warp_enrollment(
 pub async fn mark_cloudflare_warp_runtime_ready(pool: &AnyPool, profile_id: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_warp_enrollments SET status = 'ready', last_checked_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
+        "UPDATE download_warp_enrollments SET status = 'ready', last_checked_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE profile_id = $1",
     )
     .bind(profile_id)
     .execute(&mut *tx)
     .await
     .context("marking Cloudflare WARP runtime ready")?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_network_profiles SET status = 'protected', last_verified_at = CURRENT_TIMESTAMP, last_applied_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE download_network_profiles SET status = 'protected', last_verified_at = CURRENT_TIMESTAMP, last_applied_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(profile_id)
     .execute(&mut *tx)
@@ -5017,7 +4566,7 @@ pub async fn mark_cloudflare_warp_runtime_unavailable(
     };
     let mut tx = pool.begin().await?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_warp_enrollments SET status = 'unavailable', last_checked_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
+        "UPDATE download_warp_enrollments SET status = 'unavailable', last_checked_at = CURRENT_TIMESTAMP, last_error = $1, updated_at = CURRENT_TIMESTAMP WHERE profile_id = $2",
     )
     .bind(detail)
     .bind(profile_id)
@@ -5025,7 +4574,7 @@ pub async fn mark_cloudflare_warp_runtime_unavailable(
     .await
     .context("marking Cloudflare WARP runtime unavailable")?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_network_profiles SET status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE download_network_profiles SET status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(profile_id)
     .execute(&mut *tx)
@@ -5099,13 +4648,13 @@ pub async fn reset_cloudflare_warp_profile(
         store.delete_secret(secret.secret_id).await?;
     }
 
-    sqlx::query::<sqlx::Any>("DELETE FROM download_warp_enrollments WHERE profile_id = ?")
+    sqlx::query::<sqlx::Any>("DELETE FROM download_warp_enrollments WHERE profile_id = $1")
         .bind(profile_id)
         .execute(pool)
         .await
         .context("deleting Cloudflare WARP enrollment")?;
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_network_profiles SET active = FALSE, status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE download_network_profiles SET active = FALSE, status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(profile_id)
     .execute(pool)
@@ -5183,14 +4732,14 @@ async fn activate_download_network_profile(
     .await?;
     if profile_requires_protected_egress(&profile.kind) {
         sqlx::query::<sqlx::Any>(
-            "UPDATE download_network_profiles SET active = TRUE, status = 'unknown', last_applied_at = CURRENT_TIMESTAMP, last_verified_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE download_network_profiles SET active = TRUE, status = 'unknown', last_applied_at = CURRENT_TIMESTAMP, last_verified_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
         )
         .bind(&profile.id)
         .execute(&mut *tx)
         .await?;
     } else {
         sqlx::query::<sqlx::Any>(
-            "UPDATE download_network_profiles SET active = TRUE, status = ?, last_applied_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE download_network_profiles SET active = TRUE, status = $1, last_applied_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(protection_state_as_str(activation_state_for_profile(profile)))
         .bind(&profile.id)
@@ -5211,7 +4760,7 @@ async fn mark_download_network_profile_verified(
         activation_state_for_profile(profile)
     };
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_network_profiles SET status = ?, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE download_network_profiles SET status = $1, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(protection_state_as_str(state))
     .bind(&profile.id)
@@ -5223,7 +4772,7 @@ async fn mark_download_network_profile_verified(
 
 async fn mark_download_network_profile_blocked(pool: &AnyPool, profile_id: &str) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE download_network_profiles SET status = 'blocked', last_verified_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE download_network_profiles SET status = 'blocked', last_verified_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(profile_id)
     .execute(pool)
@@ -5309,7 +4858,7 @@ async fn restore_active_download_network_profile(
 
     if let (Some(previous_profile_id), Some(previous)) = (previous_profile_id, previous.as_ref()) {
         sqlx::query::<sqlx::Any>(
-            "UPDATE download_network_profiles SET active = TRUE, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE download_network_profiles SET active = TRUE, status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(protection_state_as_str(activation_state_for_profile(&previous)))
         .bind(previous_profile_id)
@@ -5329,7 +4878,7 @@ async fn record_download_network_event(
     evidence: &serde_json::Value,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO download_network_events (id, profile_id, operation, status, evidence_json, finished_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        "INSERT INTO download_network_events (id, profile_id, operation, status, evidence_json, finished_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(profile_id)
@@ -5348,7 +4897,7 @@ pub async fn list_download_network_events(
 ) -> Result<Vec<DownloadNetworkEventRecord>> {
     let limit = limit.clamp(1, 200);
     let rows = sqlx::query::<sqlx::Any>(
-        "SELECT id, CAST(profile_id AS TEXT) as profile_id, operation, status, evidence_json, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM download_network_events ORDER BY started_at DESC LIMIT ?",
+        "SELECT id, CAST(profile_id AS TEXT) as profile_id, operation, status, evidence_json, CAST(started_at AS TEXT) as started_at, CAST(finished_at AS TEXT) as finished_at FROM download_network_events ORDER BY started_at DESC LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -6436,7 +5985,7 @@ mod tests {
     };
     use crate::extensions::store::{NewExtension, NewExtensionInstance, NewProvider, NewSecret};
     use crate::orchestrator::model::ProviderEndpoint;
-    use crate::runtime::model::PortMapping;
+    use crate::runtime::model::{PortMapping, VolumeMountSourceKind};
     use serde_json::json;
     use std::sync::{
         Arc,
@@ -7999,7 +7548,7 @@ mod tests {
         )
         .await?;
         sqlx::query::<sqlx::Any>(
-            "UPDATE download_network_profiles SET active = TRUE, status = 'blocked' WHERE id = ?",
+            "UPDATE download_network_profiles SET active = TRUE, status = 'blocked' WHERE id = $1",
         )
         .bind(CLOUDFLARE_WARP_PROFILE_ID)
         .execute(&database.pool)
@@ -8304,7 +7853,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
-    fn direct_profile_compiler_leaves_app_spec_unwrapped() -> Result<()> {
+    fn n10_direct_profile_compiler_leaves_app_spec_unwrapped() -> Result<()> {
         let app = compiler_test_app_spec();
         let profile = DownloadProtectionProfile::direct("legacy-direct", "Legacy Direct");
 
@@ -8322,7 +7871,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
-    fn wireguard_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
+    fn n10_wireguard_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
         let app = compiler_test_app_spec();
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), "instance-1".to_string());
@@ -8382,7 +7931,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
-    fn warp_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
+    fn n10_warp_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
         let app = compiler_test_app_spec();
         let mut labels = HashMap::new();
         labels.insert("elixir.instance_id".to_string(), "instance-1".to_string());
@@ -8450,7 +7999,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
-    fn openvpn_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
+    fn n10_openvpn_profile_compiler_renders_gateway_namespace_pair() -> Result<()> {
         let app = compiler_test_app_spec();
         let profile = DownloadProtectionProfile::openvpn_config(
             "imported-openvpn",
@@ -8513,11 +8062,13 @@ AllowedIPs = 0.0.0.0/0, ::/0
                 PortMapping {
                     container_port: 8080,
                     host_port: None,
+                    host_ip: None,
                     protocol: None,
                 },
                 PortMapping {
                     container_port: 9090,
                     host_port: Some(19090),
+                    host_ip: None,
                     protocol: None,
                 },
             ],
@@ -8648,7 +8199,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
         config_json: serde_json::Value,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(id)
         .bind(name)
@@ -8673,7 +8224,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
         secret_ref: &str,
     ) -> Result<()> {
         sqlx::query::<sqlx::Any>(
-            "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES (?, ?, ?)",
+            "INSERT INTO download_network_profile_secrets (profile_id, key, secret_ref) VALUES ($1, $2, $3)",
         )
         .bind(profile_id)
         .bind(key)
@@ -8734,7 +8285,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 
     async fn profile_status(pool: &AnyPool, profile_id: &str) -> Result<String> {
         let status = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT status FROM download_network_profiles WHERE id = ?",
+            "SELECT status FROM download_network_profiles WHERE id = $1",
         )
         .bind(profile_id)
         .fetch_one(pool)

@@ -375,6 +375,7 @@ pub static AUTOPLAY_TRANSITIONS: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 pub fn init_metrics() {
+    crate::live::metrics::register(&REGISTRY);
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
     REGISTRY.register(Box::new(TRANSCODE_STARTS.clone())).ok();
     REGISTRY.register(Box::new(REGISTRY_ACTIONS.clone())).ok();

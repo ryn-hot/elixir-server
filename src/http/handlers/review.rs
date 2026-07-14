@@ -145,20 +145,20 @@ pub async fn list_queue(
     let limit = params.limit.unwrap_or(100).min(200) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
 
-    let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(
-        "SELECT rq.id, rq.media_file_id, rq.status, rq.confidence, CAST(rq.created_at AS TEXT) as created_at, CAST(rq.updated_at AS TEXT) as updated_at, mf.path, mf.scan_state FROM review_queue rq LEFT JOIN media_files mf ON mf.id = rq.media_file_id",
-    );
-    if let Some(status) = params.status.as_ref() {
-        builder.push(" WHERE rq.status = ");
-        builder.push_bind(status);
+    let status = params.status.as_deref();
+    let sql = if status.is_some() {
+        "SELECT rq.id, rq.media_file_id, rq.status, rq.confidence, CAST(rq.created_at AS TEXT) as created_at, CAST(rq.updated_at AS TEXT) as updated_at, mf.path, mf.scan_state FROM review_queue rq LEFT JOIN media_files mf ON mf.id = rq.media_file_id WHERE rq.status = $1 ORDER BY rq.updated_at DESC LIMIT $2 OFFSET $3"
+    } else {
+        "SELECT rq.id, rq.media_file_id, rq.status, rq.confidence, CAST(rq.created_at AS TEXT) as created_at, CAST(rq.updated_at AS TEXT) as updated_at, mf.path, mf.scan_state FROM review_queue rq LEFT JOIN media_files mf ON mf.id = rq.media_file_id ORDER BY rq.updated_at DESC LIMIT $1 OFFSET $2"
+    };
+    let mut query = sqlx::query(sql);
+    if let Some(status) = status {
+        query = query.bind(status);
     }
-    builder.push(" ORDER BY rq.updated_at DESC LIMIT ");
-    builder.push_bind(limit);
-    builder.push(" OFFSET ");
-    builder.push_bind(offset);
 
-    let rows = builder
-        .build()
+    let rows = query
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -186,7 +186,7 @@ pub async fn queue_detail(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReviewQueueDetail>> {
     let row = sqlx::query(
-        "SELECT rq.id, rq.media_file_id, rq.status, rq.confidence, rq.hint_json, rq.candidates_json, CAST(rq.created_at AS TEXT) as created_at, CAST(rq.updated_at AS TEXT) as updated_at, mf.path, mf.scan_state, mf.size_bytes FROM review_queue rq LEFT JOIN media_files mf ON mf.id = rq.media_file_id WHERE rq.id = ? LIMIT 1",
+        "SELECT rq.id, rq.media_file_id, rq.status, rq.confidence, rq.hint_json, rq.candidates_json, CAST(rq.created_at AS TEXT) as created_at, CAST(rq.updated_at AS TEXT) as updated_at, mf.path, mf.scan_state, mf.size_bytes FROM review_queue rq LEFT JOIN media_files mf ON mf.id = rq.media_file_id WHERE rq.id = $1 LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&state.db_pool)
@@ -251,7 +251,7 @@ pub async fn apply_review(
         ));
     }
 
-    let row = sqlx::query("SELECT media_file_id FROM review_queue WHERE id = ? LIMIT 1")
+    let row = sqlx::query("SELECT media_file_id FROM review_queue WHERE id = $1 LIMIT 1")
         .bind(&id)
         .fetch_optional(&state.db_pool)
         .await
@@ -259,7 +259,7 @@ pub async fn apply_review(
     let row = row.ok_or_else(|| ApiError::not_found("review entry not found"))?;
     let media_file_id: String = row.get("media_file_id");
     let media_path: String = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT path FROM media_files WHERE id = ? LIMIT 1",
+        "SELECT path FROM media_files WHERE id = $1 LIMIT 1",
     )
     .bind(&media_file_id)
     .fetch_optional(&state.db_pool)
@@ -320,7 +320,7 @@ pub async fn apply_review(
     upsert_override(&state.db_pool, library_type, &normalized_key, &override_ids).await?;
 
     sqlx::query::<sqlx::Any>(
-        "UPDATE review_queue SET status = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE review_queue SET status = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(&id)
     .execute(&state.db_pool)
@@ -385,7 +385,7 @@ async fn upsert_override(
     ids: &OverrideIds,
 ) -> ApiResult<()> {
     sqlx::query::<sqlx::Any>(
-        "INSERT INTO classifier_overrides (id, library_type, normalized_key, imdb_id, anilist_id, tvdb_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(library_type, normalized_key) DO UPDATE SET imdb_id = excluded.imdb_id, anilist_id = excluded.anilist_id, tvdb_id = excluded.tvdb_id, updated_at = CURRENT_TIMESTAMP",
+        "INSERT INTO classifier_overrides (id, library_type, normalized_key, imdb_id, anilist_id, tvdb_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(library_type, normalized_key) DO UPDATE SET imdb_id = excluded.imdb_id, anilist_id = excluded.anilist_id, tvdb_id = excluded.tvdb_id, updated_at = CURRENT_TIMESTAMP",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(library_type)
@@ -404,7 +404,7 @@ async fn load_current_match(
     media_file_id: &str,
 ) -> ApiResult<Option<ReviewMatchInfo>> {
     if let Some(row) = sqlx::query(
-        "SELECT m.id, m.title, m.year FROM movies m JOIN movie_files mf ON mf.movie_id = m.id WHERE mf.media_file_id = ? LIMIT 1",
+        "SELECT m.id, m.title, m.year FROM movies m JOIN movie_files mf ON mf.movie_id = m.id WHERE mf.media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -420,7 +420,7 @@ async fn load_current_match(
     }
 
     if let Some(row) = sqlx::query(
-        "SELECT s.id, s.title, s.year, s.library_type FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = ? LIMIT 1",
+        "SELECT s.id, s.title, s.year, s.library_type FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -454,7 +454,7 @@ async fn resolve_review_target(
     media_file_id: &str,
 ) -> ApiResult<ReviewTarget> {
     if let Some(movie_id) = sqlx::query_scalar::<sqlx::Any, String>(
-        "SELECT movie_id FROM movie_files WHERE media_file_id = ? LIMIT 1",
+        "SELECT movie_id FROM movie_files WHERE media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)
@@ -467,7 +467,7 @@ async fn resolve_review_target(
     }
 
     if let Some(row) = sqlx::query(
-        "SELECT s.id, s.library_type, e.season_id FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = ? LIMIT 1",
+        "SELECT s.id, s.library_type, e.season_id FROM series s JOIN episodes e ON e.series_id = s.id JOIN episode_files ef ON ef.episode_id = e.id WHERE ef.media_file_id = $1 LIMIT 1",
     )
     .bind(media_file_id)
     .fetch_optional(pool)

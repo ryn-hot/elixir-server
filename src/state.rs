@@ -7,6 +7,7 @@ use crate::{
     db::{Database, DatabaseDriver},
     extensions::ExtensionManager,
     library::LinkerService,
+    live::service::LiveService,
     metadata::MetadataService,
     orchestrator::OrchestratorService,
     playback::{
@@ -44,6 +45,7 @@ pub struct AppState {
     pub playback_performance_probes: Arc<PlaybackPerformanceProbeScheduler>,
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
+    pub live: Arc<LiveService>,
 }
 
 impl AppState {
@@ -176,6 +178,13 @@ impl AppState {
                 Some(hardware_failure_callback),
             ),
         );
+        let live = Arc::new(LiveService::new_with_runtime(
+            settings.live.clone(),
+            settings.environment.clone(),
+            db_pool.clone(),
+            secrets.clone(),
+            orchestrator.runtime_manager(),
+        ));
         Self {
             settings: Arc::new(settings),
             db_driver: database.driver,
@@ -193,6 +202,7 @@ impl AppState {
             playback_performance_probes,
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),
+            live,
         }
     }
 }

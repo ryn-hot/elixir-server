@@ -3,6 +3,9 @@ FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
+COPY docs ./docs
+COPY extensions ./extensions
 COPY elixir-server ./elixir-server
 RUN cargo build --release -p elixir-server --bin elixir-http-stream-worker
 
