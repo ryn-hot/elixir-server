@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::runtime::model::{
-    ContainerHandle, ContainerRuntimeState, ContainerSpec, ContainerState, PrivateFileVolumeSpec,
+    ContainerHandle, ContainerRuntimeState, ContainerSpec, ContainerState,
+    OwnedDirectoryVolumeSpec, PrivateFileVolumeSpec,
 };
 
 pub mod docker;
@@ -71,6 +72,12 @@ pub trait RuntimeManager: Send + Sync {
         _spec: &PrivateFileVolumeSpec,
     ) -> anyhow::Result<()> {
         anyhow::bail!("runtime does not support private file volumes")
+    }
+    async fn ensure_owned_directory_volume(
+        &self,
+        _spec: &OwnedDirectoryVolumeSpec,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("runtime does not support owned directory volumes")
     }
     async fn private_file_volume_owned(
         &self,

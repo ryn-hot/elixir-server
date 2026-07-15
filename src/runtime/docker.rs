@@ -15,8 +15,9 @@ use crate::runtime::model::{
     CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerPublishedPort, ContainerRuntimeMount,
     ContainerRuntimeSecurityState, ContainerRuntimeState, ContainerRuntimeTmpfsMount,
     ContainerSpec, ContainerState, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
-    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, PortMapping,
-    PrivateFileVolumeSpec, VolumeMount, VolumeMountSourceKind,
+    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL,
+    OwnedDirectoryVolumeSpec, PortMapping, PrivateFileVolumeSpec, VolumeMount,
+    VolumeMountSourceKind,
 };
 
 const REQUIRED_LABELS: [&str; 2] = [ELIXIR_INSTANCE_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL];
@@ -253,6 +254,35 @@ impl DockerRuntimeManager {
             .context("reading private volume source metadata")?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             bail!("private file volume source must be a regular non-symbolic file");
+        }
+        Ok(())
+    }
+
+    fn validate_owned_directory_volume_spec(spec: &OwnedDirectoryVolumeSpec) -> Result<()> {
+        fn safe_name(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+        }
+
+        if !safe_name(&spec.name)
+            || spec.image.trim().is_empty()
+            || spec.image.len() > 512
+            || spec.owner_uid == 0
+            || spec.owner_gid == 0
+            || spec.labels.is_empty()
+            || spec.labels.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 128
+                    || value.is_empty()
+                    || value.len() > 256
+                    || key.contains(['\r', '\n', '='])
+                    || value.contains(['\r', '\n'])
+            })
+        {
+            bail!("owned directory volume specification is invalid");
         }
         Ok(())
     }
@@ -1804,6 +1834,100 @@ impl RuntimeManager for DockerRuntimeManager {
         Ok(())
     }
 
+    async fn ensure_owned_directory_volume(&self, spec: &OwnedDirectoryVolumeSpec) -> Result<()> {
+        Self::validate_owned_directory_volume_spec(spec)?;
+        let existing = self.inspect_named_volume(&spec.name).await?;
+        let created = existing.is_none();
+        if let Some(volume) = existing {
+            if !Self::private_volume_labels_match(&volume, &spec.labels) {
+                bail!("owned directory volume ownership labels do not match");
+            }
+        } else {
+            let mut create_args = vec!["volume".to_string(), "create".to_string()];
+            let mut labels = spec.labels.iter().collect::<Vec<_>>();
+            labels.sort_by(|left, right| left.0.cmp(right.0));
+            for (key, value) in labels {
+                create_args.push("--label".to_string());
+                create_args.push(format!("{key}={value}"));
+            }
+            create_args.push(spec.name.clone());
+            let created_name = self.run_stdout(&create_args).await?;
+            if created_name.trim() != spec.name {
+                bail!("Docker created an unexpected owned volume identity");
+            }
+            let Some(volume) = self.inspect_named_volume(&spec.name).await? else {
+                bail!("owned directory volume disappeared after creation");
+            };
+            if !Self::private_volume_labels_match(&volume, &spec.labels) {
+                bail!("owned directory volume ownership labels do not match");
+            }
+        }
+
+        let initialize_script = concat!(
+            "set -eu; ",
+            "root=/run/elixir-owned-volume; ",
+            "entry=\"$(find \"$root\" -mindepth 1 -maxdepth 1 -print -quit)\"; ",
+            "if [ -z \"$entry\" ]; then ",
+            "chmod 0700 \"$root\"; chown \"$1:$2\" \"$root\"; ",
+            "else test \"$(stat -c '%u:%g:%a' \"$root\")\" = \"$1:$2:700\"; fi; ",
+            "test \"$(stat -c '%u:%g:%a' \"$root\")\" = \"$1:$2:700\""
+        );
+        let initialize_args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--pull".to_string(),
+            "never".to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "--read-only".to_string(),
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
+            "--cap-add".to_string(),
+            "CHOWN".to_string(),
+            "--cap-add".to_string(),
+            "DAC_OVERRIDE".to_string(),
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
+            "--pids-limit".to_string(),
+            "32".to_string(),
+            "--memory".to_string(),
+            "64m".to_string(),
+            "--user".to_string(),
+            "0:0".to_string(),
+            "--tmpfs".to_string(),
+            "/tmp:size=16m".to_string(),
+            "--label".to_string(),
+            format!("{ELIXIR_MANAGED_LABEL}=true"),
+            "--label".to_string(),
+            "elixir.runtime.role=owned_directory_volume_initialize".to_string(),
+            "-v".to_string(),
+            format!("{}:/run/elixir-owned-volume", spec.name),
+            "--entrypoint".to_string(),
+            "/bin/sh".to_string(),
+            spec.image.clone(),
+            "-c".to_string(),
+            initialize_script.to_string(),
+            "--".to_string(),
+            spec.owner_uid.to_string(),
+            spec.owner_gid.to_string(),
+        ];
+        if let Err(initialize_error) = self.run_capture(&initialize_args).await {
+            if created {
+                let cleanup = self
+                    .remove_private_file_volume(&spec.name, &spec.labels)
+                    .await;
+                return match cleanup {
+                    Ok(()) => Err(initialize_error.context("initializing owned directory volume")),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(
+                        "initializing owned directory volume failed: {initialize_error}; cleanup failed: {cleanup_error}"
+                    )),
+                };
+            }
+            return Err(initialize_error.context("verifying owned directory volume"));
+        }
+        Ok(())
+    }
+
     async fn private_file_volume_owned(
         &self,
         name: &str,
@@ -2427,6 +2551,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn owned_directory_volume_requires_non_root_identity_and_labels() {
+        let spec = OwnedDirectoryVolumeSpec {
+            name: "elixir_live_warp_state".to_string(),
+            image: "elixir-live-egress-worker:test".to_string(),
+            owner_uid: 1_000,
+            owner_gid: 1_000,
+            labels: HashMap::from([("elixir.managed".to_string(), "true".to_string())]),
+        };
+        DockerRuntimeManager::validate_owned_directory_volume_spec(&spec)
+            .expect("valid owned directory volume");
+        for invalid in [
+            OwnedDirectoryVolumeSpec {
+                name: "../unsafe".to_string(),
+                ..spec.clone()
+            },
+            OwnedDirectoryVolumeSpec {
+                owner_uid: 0,
+                ..spec.clone()
+            },
+            OwnedDirectoryVolumeSpec {
+                labels: HashMap::new(),
+                ..spec.clone()
+            },
+        ] {
+            assert!(DockerRuntimeManager::validate_owned_directory_volume_spec(&invalid).is_err());
+        }
+    }
+
     #[tokio::test]
     #[ignore = "live Docker private-volume test; set ELIXIR_LIVE_EGRESS_DOCKER_TESTS=1 to run"]
     async fn n11_private_file_volume_is_portable_when_configured() -> Result<()> {
@@ -2513,6 +2666,120 @@ mod tests {
             .remove_private_file_volume(&volume_name, &labels)
             .await;
         check?;
+        cleanup?;
+        assert!(
+            !runtime
+                .private_file_volume_owned(&volume_name, &labels)
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "live Docker owned-volume test; set ELIXIR_LIVE_EGRESS_DOCKER_TESTS=1 to run"]
+    async fn n11_owned_directory_volume_is_portable_when_configured() -> Result<()> {
+        if std::env::var("ELIXIR_LIVE_EGRESS_DOCKER_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping Live owned-volume test: ELIXIR_LIVE_EGRESS_DOCKER_TESTS=1 is not set"
+            );
+            return Ok(());
+        }
+        let image = std::env::var("ELIXIR_LIVE_EGRESS_WORKER_IMAGE")
+            .context("ELIXIR_LIVE_EGRESS_WORKER_IMAGE is required")?;
+        let runtime = DockerRuntimeManager::new(None);
+        runtime.server_version().await?;
+        let volume_name = format!("elixir_live_owned_test_{}", Uuid::new_v4().simple());
+        let labels = HashMap::from([
+            (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
+            (
+                "elixir.live.egress.role".to_string(),
+                "warp_state".to_string(),
+            ),
+            (
+                "elixir.live.egress.policy_id".to_string(),
+                Uuid::new_v4().to_string(),
+            ),
+        ]);
+        let spec = OwnedDirectoryVolumeSpec {
+            name: volume_name.clone(),
+            image: image.clone(),
+            owner_uid: 1_000,
+            owner_gid: 1_000,
+            labels: labels.clone(),
+        };
+
+        let verification = async {
+            runtime.ensure_owned_directory_volume(&spec).await?;
+            runtime
+                .run_capture(&[
+                    "run".to_string(),
+                    "--rm".to_string(),
+                    "--pull".to_string(),
+                    "never".to_string(),
+                    "--network".to_string(),
+                    "none".to_string(),
+                    "--read-only".to_string(),
+                    "--cap-drop".to_string(),
+                    "ALL".to_string(),
+                    "--security-opt".to_string(),
+                    "no-new-privileges".to_string(),
+                    "--user".to_string(),
+                    "1000:1000".to_string(),
+                    "-v".to_string(),
+                    format!("{volume_name}:/var/lib/cloudflare-warp"),
+                    "--entrypoint".to_string(),
+                    "/bin/sh".to_string(),
+                    image.clone(),
+                    "-c".to_string(),
+                    concat!(
+                        "set -eu; umask 077; ",
+                        "test \"$(stat -c '%u:%g:%a' /var/lib/cloudflare-warp)\" = '1000:1000:700'; ",
+                        "printf state > /var/lib/cloudflare-warp/registration; ",
+                        "test \"$(stat -c '%u:%g:%a' /var/lib/cloudflare-warp/registration)\" = '1000:1000:600'"
+                    )
+                    .to_string(),
+                ])
+                .await?;
+
+            // Re-admission verifies an existing nonempty state volume without mutating it.
+            runtime.ensure_owned_directory_volume(&spec).await?;
+            runtime
+                .run_capture(&[
+                    "run".to_string(),
+                    "--rm".to_string(),
+                    "--pull".to_string(),
+                    "never".to_string(),
+                    "--network".to_string(),
+                    "none".to_string(),
+                    "--read-only".to_string(),
+                    "--cap-drop".to_string(),
+                    "ALL".to_string(),
+                    "--security-opt".to_string(),
+                    "no-new-privileges".to_string(),
+                    "--user".to_string(),
+                    "1000:1000".to_string(),
+                    "-v".to_string(),
+                    format!("{volume_name}:/var/lib/cloudflare-warp:ro"),
+                    "--entrypoint".to_string(),
+                    "/bin/sh".to_string(),
+                    image,
+                    "-c".to_string(),
+                    concat!(
+                        "set -eu; ",
+                        "test \"$(stat -c '%u:%g:%a' /var/lib/cloudflare-warp)\" = '1000:1000:700'; ",
+                        "test \"$(stat -c '%u:%g:%a' /var/lib/cloudflare-warp/registration)\" = '1000:1000:600'; ",
+                        "test \"$(cat /var/lib/cloudflare-warp/registration)\" = state"
+                    )
+                    .to_string(),
+                ])
+                .await?;
+            Result::<()>::Ok(())
+        }
+        .await;
+        let cleanup = runtime
+            .remove_private_file_volume(&volume_name, &labels)
+            .await;
+        verification?;
         cleanup?;
         assert!(
             !runtime

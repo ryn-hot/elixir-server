@@ -33,8 +33,9 @@ use crate::{
         RuntimeManager,
         model::{
             ContainerHandle, ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount,
-            ELIXIR_MANAGED_LABEL, EnvVar, PortMapping, PrivateFileVolumeSpec, VolumeMount,
-            VolumeMountSourceKind, apply_container_spec_fingerprint,
+            ELIXIR_MANAGED_LABEL, EnvVar, OwnedDirectoryVolumeSpec, PortMapping,
+            PrivateFileVolumeSpec, VolumeMount, VolumeMountSourceKind,
+            apply_container_spec_fingerprint,
         },
     },
 };
@@ -42,6 +43,11 @@ use crate::{
 use super::{
     ProtectedEgressTransport,
     control::{ControlKeys, ControlSecretDocument, WorkerReadinessConfig},
+    material::{
+        GATEWAY_CONFIG_ROLE, OPENVPN_CONFIG_PATH, OPENVPN_CONFIG_ROOT, OPENVPN_PASSWORD_PATH,
+        OPENVPN_PASSWORD_ROLE, OPENVPN_PASSWORD_ROOT, OPENVPN_USERNAME_PATH, OPENVPN_USERNAME_ROLE,
+        OPENVPN_USERNAME_ROOT, WIREGUARD_CONFIG_ROOT, prepare_gateway_material,
+    },
     policy::{
         EffectiveEgressPolicy, EgressPolicyMode, EgressPolicySelectionError, EgressPolicySource,
         PolicyCandidate, SessionEgressPolicyRequest, select_effective_policy,
@@ -62,6 +68,8 @@ const WORKER_SECRET_PATH: &str = "/run/elixir-live-egress/control.json";
 const WORKER_SECRET_ROOT: &str = "/run/elixir-live-egress";
 const WORKER_UID: u32 = 65_532;
 const WORKER_GID: u32 = 65_532;
+const WARP_UID: u32 = 1_000;
+const WARP_GID: u32 = 1_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveEgressError {
@@ -571,6 +579,24 @@ impl LiveEgressService {
         let worker_name = worker_name(session.id);
         let gateway_name = format!("{worker_name}-vpn");
         let result = async {
+            let gateway_material = prepare_gateway_material(&profile)
+                .await
+                .map_err(|_| LiveEgressError::InvalidPolicy)?;
+            if profile.kind == LiveEgressProfileKind::Warp {
+                self.runtime
+                    .ensure_owned_directory_volume(&OwnedDirectoryVolumeSpec {
+                        name: profile
+                            .state_volume_name
+                            .clone()
+                            .ok_or(LiveEgressError::InvalidPolicy)?,
+                        image: self.config.worker_image.clone(),
+                        owner_uid: WARP_UID,
+                        owner_gid: WARP_GID,
+                        labels: warp_state_volume_labels(&profile),
+                    })
+                    .await
+                    .map_err(|_| LiveEgressError::Runtime)?;
+            }
             let permit = self
                 .capacity
                 .clone()
@@ -602,6 +628,28 @@ impl LiveEgressService {
                 })
                 .await
                 .map_err(|_| LiveEgressError::Runtime)?;
+            for material in &gateway_material {
+                let staged_path = secret_dir.join(material.file_name);
+                write_private_file(&staged_path, material.contents())?;
+                self.runtime
+                    .create_private_file_volume(&PrivateFileVolumeSpec {
+                        name: material_volume_name(binding_id, material.role),
+                        image: self.config.worker_image.clone(),
+                        source_path: staged_path.to_string_lossy().into_owned(),
+                        file_name: material.file_name.to_string(),
+                        owner_uid: WORKER_UID,
+                        owner_gid: WORKER_GID,
+                        labels: private_volume_labels(
+                            session.id,
+                            binding_id,
+                            session.control_fencing_token,
+                            policy_id,
+                            material.role,
+                        ),
+                    })
+                    .await
+                    .map_err(|_| LiveEgressError::Runtime)?;
+            }
             remove_secret_dir(&secret_dir).await?;
             let topology = self.compile_topology(
                 session,
@@ -1076,21 +1124,36 @@ impl LiveEgressService {
         let binding_uuid = binding_id
             .parse::<Uuid>()
             .map_err(|_| LiveEgressError::Cleanup)?;
-        let private_volume_name = control_volume_name(binding_uuid);
-        let private_volume_labels =
-            control_volume_labels(session_id, binding_uuid, control_fencing_token, policy_id);
-        let private_volume_present = self
-            .runtime
-            .private_file_volume_owned(&private_volume_name, &private_volume_labels)
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    volume = private_volume_name,
-                    error = %error,
-                    "refusing cleanup without exact Live egress control-volume ownership"
-                );
-                LiveEgressError::Cleanup
-            })?;
+        let mut owned_private_volumes = Vec::new();
+        for role in private_volume_roles(expected_gateway_role) {
+            let name = if *role == "control_secret" {
+                control_volume_name(binding_uuid)
+            } else {
+                material_volume_name(binding_uuid, role)
+            };
+            let labels = private_volume_labels(
+                session_id,
+                binding_uuid,
+                control_fencing_token,
+                policy_id,
+                role,
+            );
+            let present = self
+                .runtime
+                .private_file_volume_owned(&name, &labels)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        volume = name,
+                        error = %error,
+                        "refusing cleanup without exact Live egress private-volume ownership"
+                    );
+                    LiveEgressError::Cleanup
+                })?;
+            if present {
+                owned_private_volumes.push((name, labels));
+            }
+        }
         let expected = [
             (worker_name, "worker"),
             (gateway_name, expected_gateway_role),
@@ -1191,18 +1254,23 @@ impl LiveEgressService {
         if cleanup_failed {
             return Err(LiveEgressError::Cleanup);
         }
-        if private_volume_present {
-            self.runtime
-                .remove_private_file_volume(&private_volume_name, &private_volume_labels)
+        let mut volume_cleanup_failed = false;
+        for (name, labels) in owned_private_volumes {
+            if let Err(error) = self
+                .runtime
+                .remove_private_file_volume(&name, &labels)
                 .await
-                .map_err(|error| {
-                    tracing::error!(
-                        volume = private_volume_name,
-                        error = %error,
-                        "Live egress control-volume cleanup failed"
-                    );
-                    LiveEgressError::Cleanup
-                })?;
+            {
+                tracing::error!(
+                    volume = name,
+                    error = %error,
+                    "Live egress private-volume cleanup failed"
+                );
+                volume_cleanup_failed = true;
+            }
+        }
+        if volume_cleanup_failed {
+            return Err(LiveEgressError::Cleanup);
         }
         Ok(())
     }
@@ -1229,14 +1297,57 @@ fn control_volume_labels(
     control_fencing_token: i64,
     policy_id: &str,
 ) -> HashMap<String, String> {
+    private_volume_labels(
+        session_id,
+        binding_id,
+        control_fencing_token,
+        policy_id,
+        "control_secret",
+    )
+}
+
+fn material_volume_name(binding_id: Uuid, role: &str) -> String {
+    format!("elixir_live_egress_{role}_{}", binding_id.simple())
+}
+
+fn private_volume_labels(
+    session_id: Uuid,
+    binding_id: Uuid,
+    control_fencing_token: i64,
+    policy_id: &str,
+    role: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
-        (ROLE_LABEL.to_string(), "control_secret".to_string()),
+        (ROLE_LABEL.to_string(), role.to_string()),
         (SESSION_LABEL.to_string(), session_id.to_string()),
         (BINDING_LABEL.to_string(), binding_id.to_string()),
         (POLICY_LABEL.to_string(), policy_id.to_string()),
         (FENCE_LABEL.to_string(), control_fencing_token.to_string()),
     ])
+}
+
+fn warp_state_volume_labels(profile: &LiveEgressProfileConfig) -> HashMap<String, String> {
+    HashMap::from([
+        (ELIXIR_MANAGED_LABEL.to_string(), "true".to_string()),
+        (ROLE_LABEL.to_string(), "warp_state".to_string()),
+        (POLICY_LABEL.to_string(), profile.id.clone()),
+        (POLICY_KIND_LABEL.to_string(), "warp".to_string()),
+    ])
+}
+
+fn private_volume_roles(expected_gateway_role: &str) -> &'static [&'static str] {
+    match expected_gateway_role {
+        "wireguard_gateway" => &["control_secret", GATEWAY_CONFIG_ROLE],
+        "openvpn_gateway" => &[
+            "control_secret",
+            GATEWAY_CONFIG_ROLE,
+            OPENVPN_USERNAME_ROLE,
+            OPENVPN_PASSWORD_ROLE,
+        ],
+        "warp_gateway" => &["control_secret"],
+        _ => &[],
+    }
 }
 
 fn profile_kind(kind: LiveEgressProfileKind) -> &'static str {
@@ -1420,8 +1531,81 @@ fn compile_live_topology(
     gateway
         .env
         .retain(|value| value.name != "FIREWALL_OUTBOUND_SUBNETS");
+    if profile.kind == LiveEgressProfileKind::Wireguard {
+        gateway.sysctls.insert(
+            "net.ipv6.conf.all.disable_ipv6".to_string(),
+            "0".to_string(),
+        );
+    }
+    apply_live_material_mounts(gateway, profile, binding_id)?;
     apply_container_spec_fingerprint(gateway);
     Ok(topology)
+}
+
+fn apply_live_material_mounts(
+    gateway: &mut ContainerSpec,
+    profile: &LiveEgressProfileConfig,
+    binding_id: Uuid,
+) -> Result<(), LiveEgressError> {
+    match profile.kind {
+        LiveEgressProfileKind::Warp => {}
+        LiveEgressProfileKind::Wireguard => {
+            let mount = gateway
+                .volumes
+                .iter_mut()
+                .find(|mount| mount.container_path == "/gluetun/wireguard/wg0.conf")
+                .ok_or(LiveEgressError::InvalidPolicy)?;
+            mount.source_kind = VolumeMountSourceKind::NamedVolume;
+            mount.host_path = material_volume_name(binding_id, GATEWAY_CONFIG_ROLE);
+            mount.container_path = WIREGUARD_CONFIG_ROOT.to_string();
+            mount.read_only = true;
+        }
+        LiveEgressProfileKind::Openvpn => {
+            gateway.volumes.retain(|mount| {
+                mount.container_path != "/gluetun/custom.conf"
+                    && mount.container_path != "/gluetun/auth.txt"
+            });
+            gateway.volumes.push(VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: material_volume_name(binding_id, GATEWAY_CONFIG_ROLE),
+                container_path: OPENVPN_CONFIG_ROOT.to_string(),
+                read_only: true,
+            });
+            let config = gateway
+                .env
+                .iter_mut()
+                .find(|value| value.name == "OPENVPN_CUSTOM_CONFIG")
+                .ok_or(LiveEgressError::InvalidPolicy)?;
+            config.value = OPENVPN_CONFIG_PATH.to_string();
+            if profile.auth_host_path.is_some() {
+                gateway.volumes.extend([
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::NamedVolume,
+                        host_path: material_volume_name(binding_id, OPENVPN_USERNAME_ROLE),
+                        container_path: OPENVPN_USERNAME_ROOT.to_string(),
+                        read_only: true,
+                    },
+                    VolumeMount {
+                        source_kind: VolumeMountSourceKind::NamedVolume,
+                        host_path: material_volume_name(binding_id, OPENVPN_PASSWORD_ROLE),
+                        container_path: OPENVPN_PASSWORD_ROOT.to_string(),
+                        read_only: true,
+                    },
+                ]);
+                gateway.env.extend([
+                    EnvVar {
+                        name: "OPENVPN_USER_SECRETFILE".to_string(),
+                        value: OPENVPN_USERNAME_PATH.to_string(),
+                    },
+                    EnvVar {
+                        name: "OPENVPN_PASSWORD_SECRETFILE".to_string(),
+                        value: OPENVPN_PASSWORD_PATH.to_string(),
+                    },
+                ]);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify_runtime_state(
@@ -1481,16 +1665,62 @@ fn verify_runtime_state(
             && mount.destination == WORKER_SECRET_ROOT
             && mount.read_only
     });
+    let gateway_material_match = gateway_material_mounts_match(profile, &binding_id, gateway);
     if worker.network_mode.as_deref() != Some(expected_network.as_str())
         || !worker_labels_match
         || !gateway_labels_match
         || !security_match
         || !control_volume_match
+        || !gateway_material_match
         || !port_match
     {
         return Err(LiveEgressError::Runtime);
     }
     Ok(())
+}
+
+fn gateway_material_mounts_match(
+    profile: &LiveEgressProfileConfig,
+    binding_id: &str,
+    gateway: &crate::runtime::model::ContainerRuntimeState,
+) -> bool {
+    let Ok(binding_id) = binding_id.parse::<Uuid>() else {
+        return false;
+    };
+    let expected = match profile.kind {
+        LiveEgressProfileKind::Warp => return true,
+        LiveEgressProfileKind::Wireguard => vec![(
+            material_volume_name(binding_id, GATEWAY_CONFIG_ROLE),
+            WIREGUARD_CONFIG_ROOT,
+        )],
+        LiveEgressProfileKind::Openvpn => {
+            let mut expected = vec![(
+                material_volume_name(binding_id, GATEWAY_CONFIG_ROLE),
+                OPENVPN_CONFIG_ROOT,
+            )];
+            if profile.auth_host_path.is_some() {
+                expected.extend([
+                    (
+                        material_volume_name(binding_id, OPENVPN_USERNAME_ROLE),
+                        OPENVPN_USERNAME_ROOT,
+                    ),
+                    (
+                        material_volume_name(binding_id, OPENVPN_PASSWORD_ROLE),
+                        OPENVPN_PASSWORD_ROOT,
+                    ),
+                ]);
+            }
+            expected
+        }
+    };
+    expected.iter().all(|(name, destination)| {
+        gateway.mounts.iter().any(|mount| {
+            mount.mount_type == "volume"
+                && mount.name.as_deref() == Some(name.as_str())
+                && mount.destination == *destination
+                && mount.read_only
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1604,6 +1834,13 @@ fn write_control_secret(
         .map_err(|_| LiveEgressError::Runtime)?;
     let body =
         Zeroizing::new(serde_json::to_vec(secret).map_err(|_| LiveEgressError::InvalidPolicy)?);
+    write_private_file(path, &body)
+}
+
+fn write_private_file(path: &Path, body: &[u8]) -> Result<(), LiveEgressError> {
+    if body.is_empty() {
+        return Err(LiveEgressError::InvalidPolicy);
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1616,7 +1853,7 @@ fn write_control_secret(
         .map_err(|_| LiveEgressError::Runtime)?;
     file.sync_all().map_err(|_| LiveEgressError::Runtime)?;
     #[cfg(unix)]
-    std::fs::File::open(directory)
+    std::fs::File::open(path.parent().ok_or(LiveEgressError::Runtime)?)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| LiveEgressError::Runtime)?;
     container_identity(path).map(|_| ())
@@ -1939,14 +2176,22 @@ mod tests {
         let binding_uuid = binding_id.parse::<Uuid>().expect("binding UUID");
         let policy_id = "protected-policy";
         let fence = 7;
-        runtime
-            .private_volumes
-            .lock()
-            .expect("private volume lock")
-            .insert(
-                control_volume_name(binding_uuid),
-                control_volume_labels(session_id, binding_uuid, fence, policy_id),
-            );
+        let mut volumes = runtime.private_volumes.lock().expect("private volume lock");
+        volumes.insert(
+            control_volume_name(binding_uuid),
+            control_volume_labels(session_id, binding_uuid, fence, policy_id),
+        );
+        volumes.insert(
+            material_volume_name(binding_uuid, GATEWAY_CONFIG_ROLE),
+            private_volume_labels(
+                session_id,
+                binding_uuid,
+                fence,
+                policy_id,
+                GATEWAY_CONFIG_ROLE,
+            ),
+        );
+        drop(volumes);
         runtime.insert(
             "worker",
             cleanup_labels(session_id, &binding_id, fence, policy_id, "worker"),
@@ -1998,7 +2243,7 @@ mod tests {
                 .lock()
                 .expect("private volume lock")
                 .len(),
-            1
+            2
         );
 
         runtime.remove_fails.store(false, StdOrdering::Release);
@@ -2190,6 +2435,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn n11_cleanup_runtime_never_mutates_with_a_foreign_gateway_material_volume() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
+        let runtime = Arc::new(CleanupRuntime::default());
+        let session_id = Uuid::new_v4();
+        let binding_uuid = Uuid::new_v4();
+        let binding_id = binding_uuid.to_string();
+        let policy_id = "protected-policy";
+        let fence = 17;
+        runtime.insert(
+            "worker",
+            cleanup_labels(session_id, &binding_id, fence, policy_id, "worker"),
+        );
+        runtime.insert(
+            "gateway",
+            cleanup_labels(session_id, &binding_id, fence, policy_id, "openvpn_gateway"),
+        );
+        let mut volumes = runtime.private_volumes.lock().expect("private volume lock");
+        volumes.insert(
+            control_volume_name(binding_uuid),
+            control_volume_labels(session_id, binding_uuid, fence, policy_id),
+        );
+        volumes.insert(
+            material_volume_name(binding_uuid, GATEWAY_CONFIG_ROLE),
+            private_volume_labels(
+                session_id,
+                Uuid::new_v4(),
+                fence,
+                policy_id,
+                GATEWAY_CONFIG_ROLE,
+            ),
+        );
+        drop(volumes);
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = LiveEgressConfig {
+            control_root: temporary
+                .path()
+                .join("control")
+                .to_string_lossy()
+                .into_owned(),
+            ..LiveEgressConfig::default()
+        };
+        let audit = Arc::new(LiveAuditChain::new(
+            crate::live::admin::LiveAuditKey::new("n11-material-ownership", [31_u8; 32])
+                .expect("audit key"),
+        ));
+        let service =
+            LiveEgressService::new(pool, runtime.clone(), config, audit).expect("egress service");
+
+        assert!(
+            service
+                .cleanup_runtime(
+                    session_id,
+                    &binding_id,
+                    fence,
+                    policy_id,
+                    "worker",
+                    "gateway",
+                    "openvpn_gateway",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .stop_calls
+                .lock()
+                .expect("stop call lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .remove_calls
+                .lock()
+                .expect("remove call lock")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .volume_remove_calls
+                .lock()
+                .expect("private volume remove call lock")
+                .is_empty()
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn n11_control_root_and_secret_cleanup_reject_public_or_symbolic_paths() {
@@ -2320,6 +2652,25 @@ mod tests {
                 .iter()
                 .all(|value| value.name != "FIREWALL_OUTBOUND_SUBNETS")
         );
+        assert!(gateway.volumes.iter().any(|volume| {
+            volume.source_kind == VolumeMountSourceKind::NamedVolume
+                && volume.host_path == material_volume_name(binding_id, GATEWAY_CONFIG_ROLE)
+                && volume.container_path == WIREGUARD_CONFIG_ROOT
+                && volume.read_only
+        }));
+        assert!(
+            gateway
+                .volumes
+                .iter()
+                .all(|volume| volume.source_kind != VolumeMountSourceKind::Bind)
+        );
+        assert_eq!(
+            gateway
+                .sysctls
+                .get("net.ipv6.conf.all.disable_ipv6")
+                .map(String::as_str),
+            Some("0")
+        );
         assert_eq!(app.image, "elixir-live-egress-worker:test");
         assert_eq!(app.volumes.len(), 1);
         assert_eq!(app.volumes[0].container_path, WORKER_SECRET_ROOT);
@@ -2362,5 +2713,138 @@ mod tests {
                     && !mount.container_path.contains("docker.sock")
             }));
         }
+    }
+
+    #[test]
+    fn n11_warp_state_volume_has_persistent_profile_ownership() {
+        let profile = LiveEgressProfileConfig {
+            id: "warp-live-test".to_string(),
+            kind: LiveEgressProfileKind::Warp,
+            ..LiveEgressProfileConfig::default()
+        };
+        let labels = warp_state_volume_labels(&profile);
+        assert_eq!(
+            labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            labels.get(ROLE_LABEL).map(String::as_str),
+            Some("warp_state")
+        );
+        assert_eq!(
+            labels.get(POLICY_LABEL).map(String::as_str),
+            Some("warp-live-test")
+        );
+        assert_eq!(
+            labels.get(POLICY_KIND_LABEL).map(String::as_str),
+            Some("warp")
+        );
+        assert!(!labels.contains_key(SESSION_LABEL));
+        assert!(!labels.contains_key(BINDING_LABEL));
+        assert!(!labels.contains_key(FENCE_LABEL));
+    }
+
+    #[test]
+    fn n11_openvpn_topology_uses_secret_files_without_host_binds_or_credential_values() {
+        let session = session();
+        let config = LiveEgressConfig {
+            worker_image: "elixir-live-egress-worker:test".to_string(),
+            network: "elixir_live_egress_test".to_string(),
+            ..LiveEgressConfig::default()
+        };
+        let profile = LiveEgressProfileConfig {
+            id: "openvpn-live-test".to_string(),
+            name: "OpenVPN Live test".to_string(),
+            kind: LiveEgressProfileKind::Openvpn,
+            gateway_image: "gluetun:test".to_string(),
+            config_host_path: Some("/private/provider.ovpn".to_string()),
+            auth_host_path: Some("/private/provider.auth".to_string()),
+            expected_egress_ips: vec!["1.1.1.1".parse().unwrap()],
+            ..LiveEgressProfileConfig::default()
+        };
+        let worker = worker_name(session.id);
+        let binding_id = Uuid::new_v4();
+        let topology = compile_live_topology(
+            &config,
+            &session,
+            binding_id,
+            &profile,
+            &worker,
+            &control_volume_name(binding_id),
+        )
+        .expect("compile OpenVPN Live topology");
+        let gateway = topology.gateway_spec.expect("OpenVPN gateway");
+
+        assert!(
+            gateway
+                .volumes
+                .iter()
+                .all(|volume| volume.source_kind == VolumeMountSourceKind::NamedVolume)
+        );
+        for (role, root) in [
+            (GATEWAY_CONFIG_ROLE, OPENVPN_CONFIG_ROOT),
+            (OPENVPN_USERNAME_ROLE, OPENVPN_USERNAME_ROOT),
+            (OPENVPN_PASSWORD_ROLE, OPENVPN_PASSWORD_ROOT),
+        ] {
+            assert!(gateway.volumes.iter().any(|volume| {
+                volume.host_path == material_volume_name(binding_id, role)
+                    && volume.container_path == root
+                    && volume.read_only
+            }));
+        }
+        for (name, path) in [
+            ("OPENVPN_CUSTOM_CONFIG", OPENVPN_CONFIG_PATH),
+            ("OPENVPN_USER_SECRETFILE", OPENVPN_USERNAME_PATH),
+            ("OPENVPN_PASSWORD_SECRETFILE", OPENVPN_PASSWORD_PATH),
+        ] {
+            assert!(
+                gateway
+                    .env
+                    .iter()
+                    .any(|value| { value.name == name && value.value == path })
+            );
+        }
+        assert!(gateway.volumes.iter().all(|volume| {
+            volume.host_path != "/private/provider.ovpn"
+                && volume.host_path != "/private/provider.auth"
+                && volume.container_path != "/gluetun/auth.txt"
+        }));
+        assert!(
+            gateway.env.iter().all(|value| {
+                value.value != "service-user" && value.value != "service-password"
+            })
+        );
+
+        let mut runtime_state = crate::runtime::model::ContainerRuntimeState {
+            name: gateway.name,
+            network_mode: None,
+            labels: gateway.labels,
+            mounts: gateway
+                .volumes
+                .iter()
+                .map(|mount| crate::runtime::model::ContainerRuntimeMount {
+                    mount_type: "volume".to_string(),
+                    source: None,
+                    name: Some(mount.host_path.clone()),
+                    destination: mount.container_path.clone(),
+                    read_only: mount.read_only,
+                })
+                .collect(),
+            published_ports: Vec::new(),
+            security: Default::default(),
+        };
+        assert!(gateway_material_mounts_match(
+            &profile,
+            &binding_id.to_string(),
+            &runtime_state,
+        ));
+        runtime_state
+            .mounts
+            .retain(|mount| mount.destination != OPENVPN_PASSWORD_ROOT);
+        assert!(!gateway_material_mounts_match(
+            &profile,
+            &binding_id.to_string(),
+            &runtime_state,
+        ));
     }
 }

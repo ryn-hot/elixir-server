@@ -2,6 +2,7 @@
 
 mod connector;
 mod control;
+mod material;
 mod policy;
 mod repository;
 mod service;

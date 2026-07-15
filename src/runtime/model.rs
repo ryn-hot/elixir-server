@@ -95,6 +95,15 @@ pub struct PrivateFileVolumeSpec {
     pub labels: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnedDirectoryVolumeSpec {
+    pub name: String,
+    pub image: String,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub labels: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeMountSourceKind {

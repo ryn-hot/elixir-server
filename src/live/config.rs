@@ -528,12 +528,27 @@ impl LiveEgressConfig {
         }
 
         let mut ids = HashSet::new();
+        let mut warp_state_volumes = HashSet::new();
         for profile in &self.profiles {
             profile.validate()?;
             if !ids.insert(profile.id.as_str()) {
                 return Err(LiveConfigError::InvalidValue(
                     "egress profile IDs must be unique",
                 ));
+            }
+            if profile.kind == LiveEgressProfileKind::Warp {
+                let state_volume =
+                    profile
+                        .state_volume_name
+                        .as_deref()
+                        .ok_or(LiveConfigError::InvalidValue(
+                            "WARP runtime identity is invalid",
+                        ))?;
+                if !warp_state_volumes.insert(state_volume) {
+                    return Err(LiveConfigError::InvalidValue(
+                        "egress WARP state volume names must be unique",
+                    ));
+                }
             }
         }
         if !enabled {
@@ -1106,6 +1121,30 @@ mod tests {
             config.validate(),
             Err(LiveConfigError::InvalidValue(
                 "egress fallback is valid only for prefer_protected"
+            ))
+        );
+    }
+
+    #[test]
+    fn n11_protected_egress_rejects_shared_warp_state_volumes() {
+        let first = valid_egress_profile(LiveEgressProfileKind::Warp);
+        let mut second = first.clone();
+        second.id = "live-egress-test-two".to_string();
+        second.name = "Live egress test two".to_string();
+        second.enrollment_id = Some("live-warp-enrollment-two".to_string());
+        let mut config = LiveConfig {
+            enabled: true,
+            catalog_enabled: true,
+            playback_enabled: true,
+            relay_enabled: true,
+            protected_egress_enabled: true,
+            ..LiveConfig::default()
+        };
+        config.egress.profiles = vec![first, second];
+        assert_eq!(
+            config.validate(),
+            Err(LiveConfigError::InvalidValue(
+                "egress WARP state volume names must be unique"
             ))
         );
     }
