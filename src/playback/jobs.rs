@@ -291,7 +291,7 @@ impl WindowsJobObject {
         };
 
         let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(std::io::Error::last_os_error()).context("creating Windows job object");
         }
 
