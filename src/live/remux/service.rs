@@ -448,9 +448,10 @@ impl LiveRemuxService {
         session: &SessionRecord,
     ) -> Result<(), LiveRemuxError> {
         let result = self.admit_session_inner(session).await;
-        if matches!(result, Err(LiveRemuxError::CapacityExhausted)) {
+        let rejection = result.as_ref().err().and_then(remux_admission_rejection);
+        if let Some(reason) = rejection {
             crate::live::metrics::ADMISSION_REJECTIONS
-                .with_label_values(&["remux", "capacity_exhausted"])
+                .with_label_values(&["remux", reason])
                 .inc();
         }
         result
@@ -1574,6 +1575,15 @@ fn normalize_temp_root(configured: &str) -> Result<PathBuf, LiveRemuxBuildError>
         return Err(LiveRemuxBuildError::InvalidTempRoot);
     }
     Ok(path)
+}
+
+pub(super) fn remux_admission_rejection(error: &LiveRemuxError) -> Option<&'static str> {
+    match error {
+        LiveRemuxError::CapacityExhausted => Some("capacity_exhausted"),
+        LiveRemuxError::DiskPressure => Some("disk_pressure"),
+        LiveRemuxError::StaleControlFence => Some("stale_fence"),
+        _ => None,
+    }
 }
 
 async fn create_private_job_dir(path: &Path) -> Result<(), LiveRemuxError> {

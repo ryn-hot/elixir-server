@@ -587,7 +587,15 @@ impl LiveRelayService {
     }
 
     pub async fn admit_session(&self, session: &SessionRecord) -> Result<(), LiveRelayError> {
-        self.ensure_session(session).await.map(|_| ())
+        let result = self.ensure_session(session).await.map(|_| ());
+        if let Err(error) = &result
+            && let Some(reason) = relay_admission_rejection(error)
+        {
+            crate::live::metrics::ADMISSION_REJECTIONS
+                .with_label_values(&["relay", reason])
+                .inc();
+        }
+        result
     }
 
     pub(crate) async fn prepare_remux_source(
@@ -1411,6 +1419,14 @@ fn relay_response_headers(upstream: &HeaderMap) -> HeaderMap {
     output
 }
 
+fn relay_admission_rejection(error: &LiveRelayError) -> Option<&'static str> {
+    match error {
+        LiveRelayError::CapacityExhausted => Some("capacity_exhausted"),
+        LiveRelayError::StaleControlFence => Some("stale_fence"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,6 +1457,22 @@ mod tests {
         assert_eq!(
             validate_content_range(&malformed, "bytes=0-"),
             Err(LiveRelayError::RangeRejected)
+        );
+    }
+
+    #[test]
+    fn o10_relay_admission_rejections_have_bounded_alert_labels() {
+        assert_eq!(
+            relay_admission_rejection(&LiveRelayError::CapacityExhausted),
+            Some("capacity_exhausted")
+        );
+        assert_eq!(
+            relay_admission_rejection(&LiveRelayError::StaleControlFence),
+            Some("stale_fence")
+        );
+        assert_eq!(
+            relay_admission_rejection(&LiveRelayError::Unavailable),
+            None
         );
     }
 }

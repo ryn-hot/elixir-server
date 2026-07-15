@@ -27,9 +27,30 @@ use crate::live::{
 };
 
 use super::{
-    LiveRemuxPayloadBody, LiveRemuxService,
+    LiveRemuxError, LiveRemuxPayloadBody, LiveRemuxService,
     profile::{CopyRemuxProfile, ffmpeg_args, ffprobe_args, parse_probe},
+    service::remux_admission_rejection,
 };
+
+#[test]
+fn o10_remux_admission_rejections_have_bounded_alert_labels() {
+    assert_eq!(
+        remux_admission_rejection(&LiveRemuxError::CapacityExhausted),
+        Some("capacity_exhausted")
+    );
+    assert_eq!(
+        remux_admission_rejection(&LiveRemuxError::DiskPressure),
+        Some("disk_pressure")
+    );
+    assert_eq!(
+        remux_admission_rejection(&LiveRemuxError::StaleControlFence),
+        Some("stale_fence")
+    );
+    assert_eq!(
+        remux_admission_rejection(&LiveRemuxError::Unavailable),
+        None
+    );
+}
 
 #[test]
 fn m10_copy_profiles_are_loopback_only_and_cannot_generate_transcoding_arguments() {
@@ -254,6 +275,9 @@ async fn real_copy_remux_mode(protocol: SessionProtocol, mode: RemuxFixtureMode)
     if mode == RemuxFixtureMode::DiskPressure {
         limits.temp_budget_bytes = 1;
     }
+    let disk_pressure_before = crate::live::metrics::ADMISSION_REJECTIONS
+        .with_label_values(&["remux", "disk_pressure"])
+        .get();
     let remux = Arc::new(LiveRemuxService::new(
         repository.clone(),
         relay,
@@ -270,6 +294,12 @@ async fn real_copy_remux_mode(protocol: SessionProtocol, mode: RemuxFixtureMode)
     match mode {
         RemuxFixtureMode::DiskPressure => {
             assert_eq!(admission, Err(super::LiveRemuxError::DiskPressure));
+            assert!(
+                crate::live::metrics::ADMISSION_REJECTIONS
+                    .with_label_values(&["remux", "disk_pressure"])
+                    .get()
+                    >= disk_pressure_before + 1
+            );
             tokio::fs::remove_file(pressure_file).await?;
             assert_eq!(remux.available_capacity(), 1);
             assert_eq!(remux.snapshot().await.active_jobs, 0);
