@@ -1402,7 +1402,7 @@ unsafe impl Send for WindowsJobObject {}
 #[cfg(windows)]
 impl WindowsJobObject {
     fn assign(child: &Child) -> std::io::Result<Self> {
-        use std::{ffi::c_void, mem, os::windows::io::AsRawHandle as _, ptr};
+        use std::{ffi::c_void, mem, ptr};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
             System::JobObjects::{
@@ -1430,7 +1430,13 @@ impl WindowsJobObject {
             unsafe { CloseHandle(handle) };
             return Err(error);
         }
-        if unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) } == 0 {
+        let process_handle = child.raw_handle().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "child process handle unavailable",
+            )
+        })? as HANDLE;
+        if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
             let error = std::io::Error::last_os_error();
             unsafe { CloseHandle(handle) };
             return Err(error);
