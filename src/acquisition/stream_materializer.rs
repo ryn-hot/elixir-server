@@ -4123,7 +4123,7 @@ fn hls_tag_reference_kind(line: &str) -> &'static str {
 
 fn dash_manifest_references(base_url: &Url, body: &str) -> Result<Vec<StreamManifestReference>> {
     let mut reader = Reader::from_str(body);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut references = Vec::new();
     let mut current_text_element: Option<Vec<u8>> = None;
@@ -4145,7 +4145,9 @@ fn dash_manifest_references(base_url: &Url, body: &str) -> Result<Vec<StreamMani
             }
             Ok(Event::Text(text)) => {
                 if let Some(name) = current_text_element.as_deref() {
-                    let raw = text.unescape().context("unescaping DASH manifest text")?;
+                    let decoded = text.decode().context("decoding DASH manifest text")?;
+                    let raw = quick_xml::escape::unescape(&decoded)
+                        .context("unescaping DASH manifest text")?;
                     let raw = raw.trim();
                     if !raw.is_empty() {
                         let kind = if name == b"BaseURL" {
@@ -4186,7 +4188,7 @@ fn collect_dash_attribute_references(
             continue;
         }
         let value = attr
-            .unescape_value()
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .context("unescaping DASH manifest attribute")?;
         let value = value.trim();
         if value.is_empty() || value.contains('$') {

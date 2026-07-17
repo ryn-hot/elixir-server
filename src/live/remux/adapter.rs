@@ -316,7 +316,7 @@ fn rewrite_dash_manifest(
     state: &mut DashState,
 ) -> Result<Vec<u8>, RemuxAdapterError> {
     let mut reader = Reader::from_reader(body);
-    reader.trim_text(false);
+    reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::with_capacity(body.len().saturating_add(512)));
     let mut buffer = Vec::new();
     let mut depth = 0usize;
@@ -365,7 +365,9 @@ fn rewrite_dash_manifest(
                     .map_err(|_| RemuxAdapterError::Manifest)?;
             }
             Event::Text(event) if base_url_depth == Some(depth) => {
-                let value = event.unescape().map_err(|_| RemuxAdapterError::Manifest)?;
+                let decoded = event.decode().map_err(|_| RemuxAdapterError::Manifest)?;
+                let value = quick_xml::escape::unescape(&decoded)
+                    .map_err(|_| RemuxAdapterError::Manifest)?;
                 let parent = bases
                     .get(depth.saturating_sub(1))
                     .cloned()
@@ -420,7 +422,7 @@ fn rewrite_start(
             let key = String::from_utf8(attribute.key.as_ref().to_vec())
                 .map_err(|_| RemuxAdapterError::Manifest)?;
             let mut value = attribute
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|_| RemuxAdapterError::Manifest)?
                 .into_owned();
             let local_name = key.rsplit(':').next().unwrap_or(&key);

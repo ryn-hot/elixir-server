@@ -1,5 +1,5 @@
 ARG RUST_IMAGE=rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2
-ARG RUNTIME_IMAGE=debian:bookworm-20260623-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot-amd64@sha256:471dbca9cad607b9a32c10e9c31fb09ffaeb2d460e0afbff86c27abbc80b1b98
 FROM ${RUST_IMAGE} AS builder
 
 WORKDIR /src

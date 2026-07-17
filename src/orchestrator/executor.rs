@@ -4428,7 +4428,7 @@ async fn read_arr_api_key(
 
 fn parse_arr_api_key(xml: &str) -> Result<Option<String>> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut in_key = false;
     loop {
@@ -4444,7 +4444,8 @@ fn parse_arr_api_key(xml: &str) -> Result<Option<String>> {
                 }
             }
             Ok(Event::Text(event)) if in_key => {
-                let value = event.unescape().context("decoding ApiKey")?;
+                let decoded = event.decode().context("decoding ApiKey text")?;
+                let value = quick_xml::escape::unescape(&decoded).context("decoding ApiKey")?;
                 return Ok(Some(value.to_string()));
             }
             Ok(Event::Eof) => break,
@@ -7495,6 +7496,7 @@ mod tests {
             &secrets,
         );
 
+        executor.bootstrap_gate(provider_id, 5).await?;
         executor.health_gate(provider_id, 5).await?;
 
         let provider = store.get_provider(provider_id).await?.expect("provider");
