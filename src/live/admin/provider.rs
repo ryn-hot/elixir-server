@@ -9,13 +9,12 @@ use crate::{
     auth::revocation::{
         NewAuthorizationRevocation, RevocationError, append_authorization_revocation_in_transaction,
     },
+    extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY,
     live::{
         admin::{ActorSnapshot, AdminAction, AuditReference, LiveAuditChain, LiveAuditError},
         contract::StreamProtocol,
     },
 };
-
-const LIVE_PROVIDER_CAPABILITY: &str = "live.catalog_provider/v1";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,7 +84,7 @@ impl LiveProviderAdminRepository {
              LIMIT 200",
         )
         .bind(home_id.to_string())
-        .bind(LIVE_PROVIDER_CAPABILITY)
+        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -172,7 +171,7 @@ impl LiveProviderAdminRepository {
              LIMIT 1",
         )
         .bind(provider_id.to_string())
-        .bind(LIVE_PROVIDER_CAPABILITY)
+        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(LiveProviderAdminError::NotFound)?;
@@ -264,7 +263,7 @@ impl LiveProviderAdminRepository {
              ORDER BY provider_id LIMIT 200",
         )
         .bind(&instance_id)
-        .bind(LIVE_PROVIDER_CAPABILITY)
+        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
         .fetch_all(&mut *transaction)
         .await?;
         let mut revocation_event_ids = Vec::with_capacity(affected.len());

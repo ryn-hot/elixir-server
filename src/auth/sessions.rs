@@ -879,7 +879,7 @@ const PRINCIPAL_QUERY: &str = "SELECT
             CAST(CASE WHEN s.remember_device THEN 1 ELSE 0 END AS BIGINT) AS remember_device,
             s.csrf_revision,
             CAST(s.last_seen_at AS TEXT) AS last_seen_at,
-            authorization.revision AS capability_revision,
+            authorization_revision.revision AS capability_revision,
             CAST(s.expires_at AS TEXT) AS session_expires_at
          FROM account_sessions AS s
          JOIN profiles AS p
@@ -889,9 +889,9 @@ const PRINCIPAL_QUERY: &str = "SELECT
            ON hm.home_id = s.home_id
           AND hm.user_id = s.user_id
           AND hm.status = 'active'
-         JOIN profile_authorization_revisions AS authorization
-           ON authorization.profile_id = s.active_profile_id
-          AND authorization.home_id = s.home_id
+         JOIN profile_authorization_revisions AS authorization_revision
+           ON authorization_revision.profile_id = s.active_profile_id
+          AND authorization_revision.home_id = s.home_id
          WHERE s.user_id = $1
            AND s.id = $2
            AND s.revoked_at IS NULL

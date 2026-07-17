@@ -19,6 +19,7 @@ use crate::{
     config::DatabaseConfig,
     db::Database,
     live::{
+        admin::{ActorSnapshot, LiveAuditChain, LiveAuditKey},
         contract::{
             ArtworkSource, CacheHint, CatalogPage, CatalogPageRequest, CatalogSet, Fact,
             FilterValue, LiveItem, LiveItemStatus, LiveItemType, MetaRequest,
@@ -132,7 +133,7 @@ async fn seed_fixture(database: Database) -> Result<Fixture> {
     .await?;
     sqlx::query(
         "INSERT INTO providers (provider_id, instance_id, capability, cardinality)
-         VALUES ($1, $2, 'live.catalog_provider/v1', 'many')",
+         VALUES ($1, $2, 'live.catalog_provider', 'many')",
     )
     .bind(provider_id.to_string())
     .bind(instance_id.to_string())
@@ -740,6 +741,21 @@ async fn s12_postgres_cache_restart_and_concurrent_grants_when_configured() -> R
         first.as_ref().err().or(second.as_ref().err()),
         Some(LiveProviderGrantError::RevisionChanged)
     ));
+    let actor = ActorSnapshot::new(fixture.owner_id, "S12 Owner", HomeRole::Owner)?;
+    let audit = LiveAuditChain::new(LiveAuditKey::new("s12-postgres", [12_u8; 32])?);
+    let audited = repository
+        .set_grant_audited(
+            &actor,
+            fixture.profile_id,
+            fixture.provider_id,
+            true,
+            false,
+            1,
+            None,
+            &audit,
+        )
+        .await?;
+    assert_eq!(audited.revision, 2);
 
     let key = CacheKey::for_test("live-cache-v1:s12-postgres-restart");
     let now = Utc::now();

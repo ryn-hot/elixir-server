@@ -31,12 +31,12 @@ use crate::{
         contract::{
             ProviderOperation, ProviderRequestContext, RefreshFailure, RefreshFailureCategory,
             RefreshRequest as ProviderRefreshRequest, RefreshSessionContext, ResolveRequest,
-            ResolvedSources, SensitiveString, ServerEgress, SourceDescriptor, StreamProtocol,
+            ResolvedSources, SensitiveString, SourceDescriptor, StreamProtocol,
         },
         crypto::{CorrelationHashPurpose, SecretBytes},
         egress::{
             EffectiveEgressPolicy, EgressPolicyMode, EgressPolicySource, LiveEgressOutcome,
-            SessionEgressPolicyRequest, apply_provider_hint,
+            SessionEgressPolicyRequest,
         },
         planner::{
             ClientCapabilities, DeliveryPlan, DirectDisclosureRule, PlannerInput, PlannerPolicy,
@@ -424,7 +424,7 @@ pub async fn create(
             now,
         };
         let cancellation = CancellationToken::new();
-        let mut resolved = provider_client
+        let resolved = provider_client
             .resolve(
                 &provider,
                 principal.user_id,
@@ -438,11 +438,10 @@ pub async fn create(
             .await
             .map_err(map_provider_error)?;
         let selected_egress = select_session_egress_policy(&state, &principal, &request).await?;
-        apply_effective_egress(&mut resolved, &selected_egress);
         let loaded_policy = load_policy(&state, principal.home_id, request.provider_id).await?;
         let client = planner_capabilities(&request.client)?;
         let mut planner_policy = planner_policy(&state, &provider, &loaded_policy).await;
-        planner_policy.protected_egress_ready &= selected_egress.protected();
+        planner_policy.protected_egress_mode = selected_egress.mode;
         let plan = plan_delivery(&PlannerInput {
             sources: &resolved,
             client: &client,
@@ -459,8 +458,6 @@ pub async fn create(
             plan.mode.as_str(),
             session_protocol(selected.protocol).as_str(),
         ));
-        let selected_egress = apply_provider_hint(selected_egress, selected.server_egress)
-            .map_err(|_| egress_required())?;
         match plan.mode {
             DeliveryMode::ClientDirect => {
                 preflight_direct(selected, loaded_policy.preflight_rules, {
@@ -1400,9 +1397,8 @@ async fn prepare_recovery_plan(
     let egress = stored_egress
         .to_effective()
         .map_err(|_| contract_invalid())?;
-    apply_effective_egress(&mut resolved, &egress);
     let mut planner_policy = planner_policy.clone();
-    planner_policy.protected_egress_ready &= egress.protected();
+    planner_policy.protected_egress_mode = egress.mode;
     let plan = plan_delivery(&PlannerInput {
         sources: &resolved,
         client,
@@ -1417,8 +1413,6 @@ async fn prepare_recovery_plan(
     if selected.stream_id != preferred_source_id {
         return Err(stream_unavailable());
     }
-    let egress =
-        apply_provider_hint(egress, selected.server_egress).map_err(|_| egress_required())?;
     match plan.mode {
         DeliveryMode::ClientDirect => {
             preflight_direct(selected, loaded_policy.preflight_rules.clone(), {
@@ -2278,6 +2272,7 @@ async fn planner_policy(
             .live
             .remux_service()
             .is_some_and(|remux| remux.available_capacity() > 0),
+        protected_egress_mode: EgressPolicyMode::Off,
         protected_egress_ready: ready(LiveComponent::ProtectedEgress),
         allow_private_lan_sources: ready(LiveComponent::PrivateLanSources),
         provider_private_network_permission: provider.permits_private_network(),
@@ -2560,21 +2555,6 @@ async fn select_session_egress_policy(
         )
         .await
         .map_err(|_| egress_unavailable())
-}
-
-fn apply_effective_egress(resolved: &mut ResolvedSources, policy: &EffectiveEgressPolicy) {
-    for source in std::iter::once(&mut resolved.descriptor).chain(resolved.alternatives.iter_mut())
-    {
-        source.server_egress = match policy.mode {
-            EgressPolicyMode::RequireProtected => ServerEgress::Required,
-            EgressPolicyMode::PreferProtected
-                if source.server_egress == ServerEgress::NotRequired =>
-            {
-                ServerEgress::Preferred
-            }
-            EgressPolicyMode::Off | EgressPolicyMode::PreferProtected => source.server_egress,
-        };
-    }
 }
 
 fn requested_egress_mode(requested: EgressModeRequest) -> RequestedEgressMode {
@@ -2868,15 +2848,6 @@ fn delivery_runtime_unavailable(mode: DeliveryMode) -> LiveHttpRejection {
         ),
     };
     LiveHttpRejection::new(StatusCode::SERVICE_UNAVAILABLE, code, message, true)
-}
-
-fn egress_required() -> LiveHttpRejection {
-    LiveHttpRejection::new(
-        StatusCode::CONFLICT,
-        "LIVE_EGRESS_REQUIRED",
-        "This Live stream requires a protected egress policy.",
-        false,
-    )
 }
 
 fn egress_unavailable() -> LiveHttpRejection {

@@ -195,7 +195,7 @@ async fn s10_live_streaming_sqlite_migration_is_additive_and_enforces_guards() -
     sqlx::query(
         "INSERT INTO providers
             (provider_id, instance_id, capability, slot_id, cardinality, health_state)
-         VALUES ($1, $2, 'live.catalog_provider/v1', 'default', 'one', 'healthy')",
+         VALUES ($1, $2, 'live.catalog_provider', 'default', 'one', 'healthy')",
     )
     .bind(provider_id.to_string())
     .bind(instance_id.to_string())
@@ -1853,6 +1853,9 @@ async fn auth_sessions_postgres_upgrade_rollback_restart_and_concurrency_when_co
         postgres_migrator_through(54)?.run(&database.pool),
     )
     .await??;
+    database.pool.close().await;
+    let database = Database::connect(&config).await?;
+    postgres_migrator_through(55)?.run(&database.pool).await?;
 
     let user_id = Uuid::new_v4();
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
@@ -1879,6 +1882,10 @@ async fn auth_sessions_postgres_upgrade_rollback_restart_and_concurrency_when_co
             },
         )
         .await?;
+    let access_claims = auth.verify_access_claims(tokens.access_token.expose_secret())?;
+    let principal = auth.load_principal(&database.pool, &access_claims).await?;
+    assert_eq!(principal.user_id, user_id);
+    assert_eq!(principal.account_session_id, tokens.session_id);
     let token = tokens.refresh_token.expose_secret().to_string();
     let first = auth.refresh_session(&database.pool, &token, LoginContext::default());
     let second = auth.refresh_session(&database.pool, &token, LoginContext::default());
@@ -1906,7 +1913,7 @@ async fn auth_sessions_postgres_upgrade_rollback_restart_and_concurrency_when_co
     let applied_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&database.pool)
         .await?;
-    assert_eq!(applied_count, 55);
+    assert_eq!(applied_count, 56);
     let revoked_reason: String =
         sqlx::query_scalar("SELECT revoked_reason FROM account_sessions WHERE id = $1")
             .bind(tokens.session_id.to_string())

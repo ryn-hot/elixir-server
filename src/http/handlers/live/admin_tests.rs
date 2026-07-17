@@ -921,7 +921,7 @@ async fn seed_provider(database: &Database) -> Result<Uuid> {
     sqlx::query(
         "INSERT INTO providers (
             provider_id, instance_id, capability, slot_id, cardinality, health_state
-         ) VALUES ($1, $2, 'live.catalog_provider/v1', 'default', 'one', 'healthy')",
+         ) VALUES ($1, $2, 'live.catalog_provider', 'default', 'one', 'healthy')",
     )
     .bind(provider_id.to_string())
     .bind(instance_id.to_string())

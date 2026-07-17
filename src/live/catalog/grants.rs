@@ -306,20 +306,32 @@ impl LiveProviderGrantRepository {
             return Err(LiveProviderGrantError::RevisionChanged);
         }
 
-        let required_role = audit.map(|(_, actor, _)| actor.home_role.as_str());
-        let authorized: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM home_members
-             WHERE home_id = $1 AND user_id = $2
-               AND status = 'active'
-               AND ($3 IS NULL AND role = 'owner' OR $3 IS NOT NULL AND role = $3)
-             LIMIT 1",
-        )
-        .bind(home_id.to_string())
-        .bind(actor_user_id.to_string())
-        .bind(required_role)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let authorized: Option<i64> = if let Some((_, actor, _)) = audit {
+            sqlx::query_scalar(
+                "SELECT 1
+                 FROM home_members
+                 WHERE home_id = $1 AND user_id = $2
+                   AND status = 'active' AND role = $3
+                 LIMIT 1",
+            )
+            .bind(home_id.to_string())
+            .bind(actor_user_id.to_string())
+            .bind(actor.home_role.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT 1
+                 FROM home_members
+                 WHERE home_id = $1 AND user_id = $2
+                   AND status = 'active' AND role = 'owner'
+                 LIMIT 1",
+            )
+            .bind(home_id.to_string())
+            .bind(actor_user_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+        };
         if authorized.is_none() {
             return Err(LiveProviderGrantError::Forbidden);
         }

@@ -331,7 +331,10 @@ fn snapshot_from_ready(
     {
         return Err(invalid_snapshot());
     }
-    let config = ready.instance_config.clone().unwrap_or_else(|| json!({}));
+    let mut config = ready.instance_config.clone().unwrap_or_else(|| json!({}));
+    if let Some(config) = config.as_object_mut() {
+        config.remove("runtime");
+    }
     validate_provider_config(&config).map_err(map_contract_error)?;
 
     let revision_value = json!({

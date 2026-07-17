@@ -428,10 +428,12 @@ async fn update_config(database: &Database, instance_id: Uuid, config: Value) ->
 async fn s11_native_fixture_discovery_happy_path_late_resolve_refresh_and_faults() -> Result<()> {
     let fixture = NativeFixture::start().await?;
     let database = test_database().await?;
-    let (instance_id, provider_id) = seed_provider(&database, fixture.port, json!({})).await?;
+    let (instance_id, provider_id) =
+        seed_provider(&database, fixture.port, json!({"runtime": {"volumes": []}})).await?;
     let client = build_client(&database, None);
     let cancellation = CancellationToken::new();
     let provider = client.directory().get(provider_id).await?;
+    assert_eq!(provider.config(), &json!({}));
 
     let health = client.health(&provider, &cancellation).await?;
     assert_eq!(

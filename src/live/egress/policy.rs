@@ -1,7 +1,5 @@
 use uuid::Uuid;
 
-use crate::live::contract::ServerEgress;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressPolicyMode {
     Off,
@@ -190,24 +188,6 @@ pub(crate) fn validate_effective_policy(
     })
 }
 
-pub fn apply_provider_hint(
-    mut selected: EffectiveEgressPolicy,
-    hint: ServerEgress,
-) -> Result<EffectiveEgressPolicy, EgressPolicySelectionError> {
-    match hint {
-        ServerEgress::NotRequired => Ok(selected),
-        ServerEgress::Preferred => Ok(selected),
-        ServerEgress::Required => {
-            if selected.policy_id.is_none() {
-                return Err(EgressPolicySelectionError::PolicyRequired);
-            }
-            selected.mode = EgressPolicyMode::RequireProtected;
-            selected.allow_fallback = false;
-            Ok(selected)
-        }
-    }
-}
-
 fn validate_candidate(candidate: &PolicyCandidate) -> Result<(), EgressPolicySelectionError> {
     if candidate.revision < 1
         || candidate
@@ -290,26 +270,6 @@ mod tests {
         assert_eq!(selected.policy_id.as_deref(), Some("profile-vpn"));
         assert_eq!(selected.source, EgressPolicySource::ProfileAssignment);
         assert!(selected.strict());
-    }
-
-    #[test]
-    fn n11_provider_hint_can_strengthen_but_never_select_a_gateway() {
-        let off = select_effective_policy([]).unwrap();
-        assert_eq!(
-            apply_provider_hint(off, ServerEgress::Required).unwrap_err(),
-            EgressPolicySelectionError::PolicyRequired
-        );
-        let preferred = select_effective_policy([candidate(
-            EgressPolicyMode::PreferProtected,
-            Some("owner-selected"),
-            true,
-            EgressPolicySource::ServerConfig,
-        )])
-        .unwrap();
-        let required = apply_provider_hint(preferred, ServerEgress::Required).unwrap();
-        assert_eq!(required.policy_id.as_deref(), Some("owner-selected"));
-        assert!(required.strict());
-        assert!(!required.allow_fallback);
     }
 
     #[test]

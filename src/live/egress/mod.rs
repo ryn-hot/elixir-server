@@ -12,8 +12,7 @@ pub(crate) use connector::ProtectedEgressTransport;
 pub(crate) use policy::validate_effective_policy;
 pub use policy::{
     EffectiveEgressPolicy, EgressPolicyMode, EgressPolicySelectionError, EgressPolicySource,
-    PolicyCandidate, PolicyScope, SessionEgressPolicyRequest, apply_provider_hint,
-    select_effective_policy,
+    PolicyCandidate, PolicyScope, SessionEgressPolicyRequest, select_effective_policy,
 };
 pub use repository::{EgressPolicyRepository, EgressPolicyRepositoryError, StoredPolicyAssignment};
 pub use service::{

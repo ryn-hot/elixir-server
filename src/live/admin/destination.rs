@@ -10,6 +10,7 @@ use crate::auth::revocation::{
     AuthorizationRevocationEvent, NewAuthorizationRevocation, RevocationError,
     append_authorization_revocation_in_transaction,
 };
+use crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY;
 
 use super::{ActorSnapshot, AdminAction, AuditReference, LiveAuditChain, LiveAuditError};
 
@@ -620,10 +621,11 @@ async fn require_owner_and_provider(
     }
     let provider: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM providers
-         WHERE provider_id = $1 AND capability = 'live.catalog_provider/v1'
+         WHERE provider_id = $1 AND capability = $2
          LIMIT 1",
     )
     .bind(provider_id.to_string())
+    .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
     .fetch_optional(&mut **transaction)
     .await?;
     if provider.is_none() {

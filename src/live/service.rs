@@ -706,6 +706,15 @@ impl LiveService {
                                     None,
                                 )
                                 .await;
+                                if self.config.allow_private_lan_sources {
+                                    self.set_component_readiness(
+                                        LiveComponent::PrivateLanSources,
+                                        true,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                }
                             }
                             if self.config.remux_enabled {
                                 let remux = self
@@ -1590,6 +1599,8 @@ mod tests {
                 catalog_enabled: true,
                 playback_enabled: true,
                 client_direct_enabled: true,
+                relay_enabled: true,
+                allow_private_lan_sources: true,
                 ..LiveConfig::default()
             },
             RunEnvironment::Development,
@@ -1605,7 +1616,12 @@ mod tests {
         );
 
         let after = service.initialize().await?;
-        for component in [LiveComponent::Playback, LiveComponent::ClientDirect] {
+        for component in [
+            LiveComponent::Playback,
+            LiveComponent::ClientDirect,
+            LiveComponent::Relay,
+            LiveComponent::PrivateLanSources,
+        ] {
             let feature = after
                 .features
                 .iter()

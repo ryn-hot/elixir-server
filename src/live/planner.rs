@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::live::{
     contract::{ClientDisclosure, ResolvedSources, ServerEgress, SourceDescriptor, StreamProtocol},
+    egress::EgressPolicyMode,
     session::DeliveryMode,
 };
 
@@ -25,6 +26,8 @@ pub enum PlannerReason {
     SensitiveRefererRequireRelay,
     SensitiveUrlRequireRelay,
     RefreshHandleRequiresRelay,
+    ProviderServerEgressRequiresRelay,
+    ProviderServerEgressPreferredRelay,
     ProtectedEgressRequiresRelay,
     ProtectedEgressPreferredRelay,
     PrivateNetworkRequiresRelay,
@@ -46,6 +49,8 @@ impl PlannerReason {
             Self::SensitiveRefererRequireRelay => "sensitive_referer_requires_relay",
             Self::SensitiveUrlRequireRelay => "sensitive_url_requires_relay",
             Self::RefreshHandleRequiresRelay => "refresh_handle_requires_relay",
+            Self::ProviderServerEgressRequiresRelay => "provider_server_egress_requires_relay",
+            Self::ProviderServerEgressPreferredRelay => "provider_server_egress_preferred_relay",
             Self::ProtectedEgressRequiresRelay => "protected_egress_requires_relay",
             Self::ProtectedEgressPreferredRelay => "protected_egress_preferred_relay",
             Self::PrivateNetworkRequiresRelay => "private_network_requires_relay",
@@ -302,6 +307,7 @@ pub struct PlannerPolicy {
     pub remux_enabled: bool,
     pub relay_capacity_available: bool,
     pub remux_capacity_available: bool,
+    pub protected_egress_mode: EgressPolicyMode,
     pub protected_egress_ready: bool,
     pub allow_private_lan_sources: bool,
     pub provider_private_network_permission: bool,
@@ -410,10 +416,12 @@ fn evaluate_source(
     {
         return Err(PlannerRejectionCode::PrivateNetworkForbidden);
     }
-    if source.private_network && source.server_egress != ServerEgress::NotRequired {
+    if source.private_network && input.policy.protected_egress_mode != EgressPolicyMode::Off {
         return Err(PlannerRejectionCode::ProtectedEgressUnavailable);
     }
-    if source.server_egress == ServerEgress::Required && !input.policy.protected_egress_ready {
+    if input.policy.protected_egress_mode != EgressPolicyMode::Off
+        && !input.policy.protected_egress_ready
+    {
         return Err(PlannerRejectionCode::ProtectedEgressUnavailable);
     }
     if !input.client.supports_codecs(source) {
@@ -475,11 +483,20 @@ fn direct_constraint(
     if source.private_network {
         return Some(PlannerReason::PrivateNetworkRequiresRelay);
     }
+    match policy.protected_egress_mode {
+        EgressPolicyMode::RequireProtected => {
+            return Some(PlannerReason::ProtectedEgressRequiresRelay);
+        }
+        EgressPolicyMode::PreferProtected => {
+            return Some(PlannerReason::ProtectedEgressPreferredRelay);
+        }
+        EgressPolicyMode::Off => {}
+    }
     if source.server_egress == ServerEgress::Required {
-        return Some(PlannerReason::ProtectedEgressRequiresRelay);
+        return Some(PlannerReason::ProviderServerEgressRequiresRelay);
     }
     if source.server_egress == ServerEgress::Preferred {
-        return Some(PlannerReason::ProtectedEgressPreferredRelay);
+        return Some(PlannerReason::ProviderServerEgressPreferredRelay);
     }
     if !source.request_headers.is_empty() {
         return Some(PlannerReason::SensitiveHeadersRequireRelay);
@@ -577,9 +594,7 @@ fn plan_remux(
 fn source_egress(source: &SourceDescriptor, policy: &PlannerPolicy) -> EgressMode {
     if source.private_network {
         EgressMode::PrivateLan
-    } else if source.server_egress == ServerEgress::Required
-        || (source.server_egress == ServerEgress::Preferred && policy.protected_egress_ready)
-    {
+    } else if policy.protected_egress_mode != EgressPolicyMode::Off {
         EgressMode::Protected
     } else {
         EgressMode::ServerDefault
@@ -702,6 +717,7 @@ mod tests {
             remux_enabled: true,
             relay_capacity_available: true,
             remux_capacity_available: true,
+            protected_egress_mode: EgressPolicyMode::Off,
             protected_egress_ready: true,
             allow_private_lan_sources: false,
             provider_private_network_permission: false,
@@ -861,21 +877,31 @@ mod tests {
         let mut policy = policy();
         let mut private = source(StreamProtocol::Hls, "https://10.0.0.10/live/main.m3u8");
         private.private_network = true;
+        private.server_egress = ServerEgress::Required;
         assert_eq!(
             plan(private.clone(), &policy, &client).unwrap_err().code,
             PlannerRejectionCode::PrivateNetworkForbidden
         );
         policy.allow_private_lan_sources = true;
         policy.provider_private_network_permission = true;
-        let private_plan = plan(private, &policy, &client).unwrap();
+        let private_plan = plan(private.clone(), &policy, &client).unwrap();
         assert_eq!(private_plan.mode, DeliveryMode::ServerRelay);
         assert_eq!(private_plan.egress, Some(EgressMode::PrivateLan));
+        assert_eq!(
+            private_plan.reason,
+            PlannerReason::PrivateNetworkRequiresRelay
+        );
 
-        let mut protected = source(
+        policy.protected_egress_mode = EgressPolicyMode::RequireProtected;
+        assert_eq!(
+            plan(private, &policy, &client).unwrap_err().code,
+            PlannerRejectionCode::ProtectedEgressUnavailable
+        );
+
+        let protected = source(
             StreamProtocol::Hls,
             "https://media.example.invalid/live/main.m3u8",
         );
-        protected.server_egress = ServerEgress::Required;
         policy.protected_egress_ready = false;
         assert_eq!(
             plan(protected.clone(), &policy, &client).unwrap_err().code,
@@ -889,14 +915,19 @@ mod tests {
             PlannerReason::ProtectedEgressRequiresRelay
         );
 
-        let mut preferred = source(
+        let preferred = source(
             StreamProtocol::Hls,
             "https://media.example.invalid/live/main.m3u8",
         );
-        preferred.server_egress = ServerEgress::Preferred;
+        policy.protected_egress_mode = EgressPolicyMode::PreferProtected;
         policy.protected_egress_ready = false;
+        assert_eq!(
+            plan(preferred.clone(), &policy, &client).unwrap_err().code,
+            PlannerRejectionCode::ProtectedEgressUnavailable
+        );
+        policy.protected_egress_ready = true;
         let preferred_plan = plan(preferred, &policy, &client).unwrap();
-        assert_eq!(preferred_plan.egress, Some(EgressMode::ServerDefault));
+        assert_eq!(preferred_plan.egress, Some(EgressMode::Protected));
         assert_eq!(
             preferred_plan.reason,
             PlannerReason::ProtectedEgressPreferredRelay
@@ -905,6 +936,32 @@ mod tests {
             DirectDisclosureRule::new("https", "10.0.0.10", 443, "/live/main.m3u8", true, true,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn p11_provider_server_egress_hint_never_selects_protected_policy() {
+        let client = client();
+        let policy = policy();
+        for (hint, reason) in [
+            (
+                ServerEgress::Required,
+                PlannerReason::ProviderServerEgressRequiresRelay,
+            ),
+            (
+                ServerEgress::Preferred,
+                PlannerReason::ProviderServerEgressPreferredRelay,
+            ),
+        ] {
+            let mut hinted = source(
+                StreamProtocol::Hls,
+                "https://media.example.invalid/live/main.m3u8",
+            );
+            hinted.server_egress = hint;
+            let planned = plan(hinted, &policy, &client).unwrap();
+            assert_eq!(planned.mode, DeliveryMode::ServerRelay);
+            assert_eq!(planned.reason, reason);
+            assert_eq!(planned.egress, Some(EgressMode::ServerDefault));
+        }
     }
 
     #[test]

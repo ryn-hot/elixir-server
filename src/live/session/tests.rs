@@ -107,7 +107,7 @@ async fn seed_fixture(database: Database) -> Result<Fixture> {
     .await?;
     sqlx::query(
         "INSERT INTO providers (provider_id, instance_id, capability, cardinality)
-         VALUES ($1, $2, 'live.catalog_provider/v1', 'many')",
+         VALUES ($1, $2, 'live.catalog_provider', 'many')",
     )
     .bind(provider_id.to_string())
     .bind(instance_id.to_string())
